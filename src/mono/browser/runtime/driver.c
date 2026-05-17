@@ -420,6 +420,7 @@ mono_wasm_profiler_init_browser_devtools (const char *desc)
 
 #ifdef ENABLE_LOG_PROFILER
 
+/*
 void mono_profiler_init_log (const char *desc);
 
 EMSCRIPTEN_KEEPALIVE void
@@ -427,6 +428,7 @@ mono_wasm_profiler_init_log (const char *desc)
 {
 	mono_profiler_init_log (desc);
 }
+*/
 
 #endif
 
