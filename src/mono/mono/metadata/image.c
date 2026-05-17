@@ -31,6 +31,8 @@
 #include <mono/metadata/exception-internals.h>
 #include <mono/utils/checked-build.h>
 #include <mono/utils/mono-logger-internals.h>
+#include <mono/utils/mono-threads-api.h>
+#include <mono/utils/mono-threads-coop.h>
 #include <mono/utils/mono-errno.h>
 #include <mono/utils/mono-path.h>
 #include <mono/utils/mono-mmap.h>
@@ -2810,7 +2812,35 @@ mono_g_slist_append_image (MonoImage *image, GSList *list, gpointer data)
 void
 mono_image_lock (MonoImage *image)
 {
-	mono_locks_os_acquire (&image->lock, ImageDataLock);
+	/* The image lock is contended across threads that can each be in
+	 * different GC states (running managed code, or already in a coop
+	 * blocking section from an icall wrapper). On wasm coop, a thread
+	 * parked in pthread_mutex_lock (Atomics.wait) can't process a
+	 * suspend request — its worker mainloop is blocked — so we have
+	 * to ensure every waiter is suspend-cooperative. */
+	MonoThreadInfo *info = mono_thread_info_current_unchecked ();
+	int state = info ? mono_thread_info_current_state (info) : -1;
+
+	if (state == STATE_RUNNING) {
+		/* Running managed/unsafe code: enter a GC-safe region for the
+		 * wait so the GC can suspend us while we're blocked on the
+		 * mutex. dynamic_image_lock uses this same pattern. */
+		MONO_ENTER_GC_SAFE;
+		mono_os_mutex_lock (&image->lock);
+		MONO_EXIT_GC_SAFE;
+	} else {
+		/* Already in a non-running state (typically STATE_BLOCKING from
+		 * an icall trampoline). MONO_ENTER_GC_SAFE would assert here
+		 * ("Cannot transition from STATE_BLOCKING with DO_BLOCKING").
+		 * A straight pthread_mutex_lock would also be wrong: blocking
+		 * inside it prevents the wasm worker mainloop from processing
+		 * a GC suspend, so the GC initiator hangs waiting for us to
+		 * ack. Use a trylock loop with mono_threads_safepoint() between
+		 * attempts so we can ack suspends while waiting. */
+		while (mono_os_mutex_trylock (&image->lock) != 0)
+			mono_threads_safepoint ();
+	}
+	mono_locks_lock_acquired (ImageDataLock, &image->lock);
 }
 
 void
