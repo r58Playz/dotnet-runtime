@@ -3246,6 +3246,7 @@ interp_inline_newobj (TransformData *td, MonoMethod *target_method, MonoMethodSi
 	InterpInst *newobj_fast, *prev_last_ins;
 	int dreg, this_reg = -1;
 	int prev_sp_offset;
+	StackInfo *saved_prefix = NULL;
 	MonoClass *klass = target_method->klass;
 	MonoMethodHeader *mheader = NULL;
 
@@ -3259,6 +3260,10 @@ interp_inline_newobj (TransformData *td, MonoMethod *target_method, MonoMethodSi
 
 	prev_last_ins = td->cbb->last_ins;
 	prev_sp_offset = GPTRDIFF_TO_INT (td->sp - td->stack);
+	if (prev_sp_offset > 0) {
+		saved_prefix = (StackInfo*)mono_mempool_alloc (td->mempool, sizeof (StackInfo) * prev_sp_offset);
+		memcpy (saved_prefix, td->stack, sizeof (StackInfo) * prev_sp_offset);
+	}
 
 	// Allocate var holding the newobj result. We do it here, because the var has to be alive
 	// before the call, since newobj writes to it before executing the call.
@@ -3318,6 +3323,11 @@ interp_inline_newobj (TransformData *td, MonoMethod *target_method, MonoMethodSi
 		goto fail;
 	td->ip += 5;
 
+	// Constructor inlining must preserve stack entries below ctor args.
+	if (saved_prefix)
+		memcpy (td->stack, saved_prefix, sizeof (StackInfo) * prev_sp_offset);
+	td->sp = td->stack + prev_sp_offset;
+
 	td->headers_to_free = g_slist_prepend_mempool (td->mempool, td->headers_to_free, mheader);
 
 	push_var (td, dreg);
@@ -3326,6 +3336,8 @@ fail:
 	td->ip += 5;
 	mono_metadata_free_mh (mheader);
 	// Restore the state
+	if (saved_prefix)
+		memcpy (td->stack, saved_prefix, sizeof (StackInfo) * prev_sp_offset);
 	td->sp = td->stack + prev_sp_offset;
 	td->last_ins = prev_last_ins;
 	td->cbb->last_ins = prev_last_ins;
@@ -3640,7 +3652,9 @@ interp_transform_call (TransformData *td, MonoMethod *method, MonoMethod *target
 	if (target_method == NULL) {
 		if (calli) {
 			CHECK_STACK_RET(td, 1, FALSE);
-			if (method->wrapper_type != MONO_WRAPPER_NONE)
+			if (token == 0xF0F0F0F0)
+				csignature = method->signature;
+			else if (method->wrapper_type != MONO_WRAPPER_NONE)
 				csignature = (MonoMethodSignature *)mono_method_get_wrapper_data (method, token);
 			else {
 				csignature = mono_metadata_parse_signature_checked (image, token, error);
@@ -5951,7 +5965,7 @@ retry_emit:
 			if (td->sp > td->stack)
 				g_warning ("CEE_JMP: stack must be empty");
 			token = read32 (td->ip + 1);
-			m = mono_get_method_checked (image, token, NULL, generic_context, error);
+			m = interp_get_method (method, token, NULL, generic_context, error);
 			goto_if_nok (error, exit);
 			interp_add_ins (td, MINT_JMP);
 			td->last_ins->data [0] = get_data_item_index_imethod (td, mono_interp_get_imethod (m));

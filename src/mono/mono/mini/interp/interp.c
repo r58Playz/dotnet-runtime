@@ -2390,6 +2390,16 @@ interp_entry (InterpEntryData *data)
 			return;
 		}
 	} else {
+#ifdef TARGET_WASM
+		if (context->has_resume_state) {
+			/*
+			 * On wasm, native frames between this callback and the handler frame
+			 * cannot be skipped during EH. Return to native code and let EH
+			 * continue when control reaches the interpreter again.
+			 */
+			return;
+		}
+#endif
 		g_assert (!context->has_resume_state);
 	}
 
@@ -9266,6 +9276,12 @@ mono_jiterp_interp_entry (JiterpEntryData *_data, void *res)
 			return;
 		}
 	} else {
+#ifdef TARGET_WASM
+		if (header.context->has_resume_state) {
+			/* Same as interp_entry (): return so outer interp can resume EH. */
+			return;
+		}
+#endif
 		g_assert (!header.context->has_resume_state);
 	}
 

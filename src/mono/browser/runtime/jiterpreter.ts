@@ -876,6 +876,12 @@ function generate_wasm (
         // Get the exported trace function
         const fn = traceInstance.exports[traceName];
 
+        if (!fn) {
+            mono_log_warn(`Jiterpreter didn't find ${traceName} in exports of traceInstance`);
+            rejected = true;
+            return 0;
+        }
+
         rejected = false;
 
         let idx: number;
