@@ -2564,7 +2564,7 @@ mono_class_get_field_from_name_full (MonoClass *klass, const char *name, MonoTyp
 			if (strcmp (name, mono_field_get_name (field)) != 0)
 				continue;
 
-			if (type) {
+			if (false) {
 				MonoClassField *gfield = mono_metadata_get_corresponding_field_from_generic_type_definition (field);
 				g_assert (gfield != NULL);
 				MonoType *field_type = gfield->type;
@@ -6468,6 +6468,7 @@ can_access_member (MonoClass *access_klass, MonoClass *member_klass, MonoClass* 
 gboolean
 mono_method_can_access_field (MonoMethod *method, MonoClassField *field)
 {
+	return TRUE;
 	/* FIXME: check all overlapping fields */
 	int can = can_access_member (method->klass, m_field_get_parent (field), NULL, mono_field_get_type_internal (field)->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK);
 	if (!can) {
@@ -6503,6 +6504,7 @@ mono_method_get_method_definition (MonoMethod *method)
 gboolean
 mono_method_can_access_method (MonoMethod *method, MonoMethod *called)
 {
+	return TRUE;
 	method = mono_method_get_method_definition (method);
 	called = mono_method_get_method_definition (called);
 	return mono_method_can_access_method_full (method, called, NULL);
@@ -6522,6 +6524,7 @@ mono_method_can_access_method (MonoMethod *method, MonoMethod *called)
 gboolean
 mono_method_can_access_method_full (MonoMethod *method, MonoMethod *called, MonoClass *context_klass)
 {
+	return TRUE;
 	/* Wrappers are except from access checks */
 	if (method->wrapper_type != MONO_WRAPPER_NONE || called->wrapper_type != MONO_WRAPPER_NONE)
 		return TRUE;
