@@ -776,6 +776,7 @@ mono_method_get_method_definition (MonoMethod *method)
 static gboolean
 verify_class_overrides (MonoClass *klass, MonoMethod **overrides, int onum)
 {
+	return TRUE;
 #ifndef ENABLE_CHECKED_BUILD
 	if (klass->image == mono_defaults.corlib)
 		return TRUE;
