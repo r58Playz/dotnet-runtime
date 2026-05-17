@@ -252,6 +252,8 @@ mono_reflection_lookup_dynamic_token (MonoImage *image, guint32 token, gboolean 
 
 	lookup_dyn_token (assembly, token, &obj);
 	if (MONO_HANDLE_IS_NULL (obj)) {
+		g_warning ("[dyn-token] NOT FOUND token=0x%08x image=%s valid_token=%d",
+			token, image ? image->name : "<null>", valid_token);
 		if (valid_token)
 			g_error ("Could not find required dynamic token 0x%08x", token);
 		else {
@@ -263,6 +265,12 @@ mono_reflection_lookup_dynamic_token (MonoImage *image, guint32 token, gboolean 
 	if (!handle_class)
 		handle_class = &klass;
 	gpointer const result = mono_reflection_resolve_object_handle (image, obj, handle_class, context, error);
+	if (!result) {
+		MonoObject *_o = MONO_HANDLE_RAW (obj);
+		const char *_oklass = (_o && _o->vtable && _o->vtable->klass) ? m_class_get_name (_o->vtable->klass) : "<null>";
+		g_warning ("[dyn-token] RESOLVE returned NULL token=0x%08x image=%s obj.class=%s error_ok=%d",
+			token, image ? image->name : "<null>", _oklass, is_ok (error) ? 1 : 0);
+	}
 	HANDLE_FUNCTION_RETURN_VAL (result);
 }
 #else /* DISABLE_REFLECTION_EMIT */

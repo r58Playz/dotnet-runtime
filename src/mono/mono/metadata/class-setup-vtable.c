@@ -909,6 +909,18 @@ mono_class_setup_vtable_full (MonoClass *klass, GList *in_setup)
 	if (klass->vtable)
 		return;
 
+	/*
+	 * Refuse to publish vtable state on a TypeBuilder shell (managed
+	 * RuntimeTypeBuilder backing, CreateType not yet finished). Computing the
+	 * vtable here would observe interface methods whose slots are still the
+	 * methodbuilder default (-1) and write to wrong vtable indices, leaving
+	 * the intended slots NULL. ensure_runtime_vtable populates slots and
+	 * mono_class_setup_vtable_general runs later from CreateType once the
+	 * type is finalized.
+	 */
+	if (mono_class_get_ref_info_handle (klass) != 0 && !m_class_was_typebuilder (klass))
+		return;
+
 	if (MONO_CLASS_IS_INTERFACE_INTERNAL (klass)) {
 		/* This sets method->slot for all methods if this is an interface */
 		mono_class_setup_methods (klass);
