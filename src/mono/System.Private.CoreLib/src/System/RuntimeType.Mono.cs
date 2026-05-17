@@ -1774,7 +1774,8 @@ namespace System
         {
             ArgumentNullException.ThrowIfNull(fromNoninstanciated);
             var this_type = this;
-            return (ConstructorInfo)GetCorrespondingInflatedMethod(new QCallTypeHandle(ref this_type), fromNoninstanciated);
+            var x = GetCorrespondingInflatedMethod(new QCallTypeHandle(ref this_type), fromNoninstanciated);
+            return (ConstructorInfo)x!;
         }
 
         [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2085:UnrecognizedReflectionPattern",
@@ -1784,7 +1785,47 @@ namespace System
             /* create sensible flags from given FieldInfo */
             BindingFlags flags = fromNoninstanciated.IsStatic ? BindingFlags.Static : BindingFlags.Instance;
             flags |= fromNoninstanciated.IsPublic ? BindingFlags.Public : BindingFlags.NonPublic;
-            return GetField(fromNoninstanciated.Name, flags)!;
+            /* DeclaredOnly so AmbiguousMatch can't fire on inherited shadows. */
+            flags |= BindingFlags.DeclaredOnly;
+            FieldInfo? field = null;
+            try
+            {
+                field = GetField(fromNoninstanciated.Name, flags);
+            }
+            catch (AmbiguousMatchException)
+            {
+                /* fall through to iteration below */
+            }
+            if (field == null)
+            {
+                /* GetField(name, flags) can return null for SRE-emitted synthetic
+                 * fields (e.g. IKVM's __<>invokeCache defined via DefineField
+                 * with non-standard flags). Iterate and match by name+type. */
+                Type wantedType = fromNoninstanciated.FieldType;
+                foreach (FieldInfo f in GetFields(flags))
+                {
+                    if (f.Name == fromNoninstanciated.Name && f.FieldType == wantedType)
+                    {
+                        field = f;
+                        break;
+                    }
+                }
+                /* Final fallback: name-only match. FieldType comparison may fail
+                 * if the field's type went through a TypeBuilder shell→finalized
+                 * transition that changed Type identity. */
+                if (field == null)
+                {
+                    foreach (FieldInfo f in GetFields(flags))
+                    {
+                        if (f.Name == fromNoninstanciated.Name)
+                        {
+                            field = f;
+                            break;
+                        }
+                    }
+                }
+            }
+            return field!;
         }
 
         private string? GetDefaultMemberName()

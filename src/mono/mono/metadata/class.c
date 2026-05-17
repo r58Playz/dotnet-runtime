@@ -4883,8 +4883,8 @@ mono_ldtoken_checked (MonoImage *image, guint32 token, MonoClass **handle_class,
 	if (image_is_dynamic (image)) {
 		MonoClass *tmp_handle_class;
 		gpointer obj = mono_lookup_dynamic_token_class (image, token, TRUE, &tmp_handle_class, context, error);
-
-		mono_error_assert_ok (error);
+		if (!is_ok (error))
+			return NULL;
 		g_assert (tmp_handle_class);
 		if (handle_class)
 			*handle_class = tmp_handle_class;

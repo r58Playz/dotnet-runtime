@@ -91,6 +91,26 @@ namespace System.Reflection.Emit.Tests
             Assert.Throws<NotSupportedException>(() => type.CreateTypeInfo());
         }
 
+        [Fact]
+        public void SetParent_AfterShellMaterialization_UsesLatestParent()
+        {
+            ModuleBuilder module = Helpers.DynamicModule();
+
+            TypeBuilder child = module.DefineType("Child", TypeAttributes.Public);
+            TypeBuilder holder = module.DefineType("Holder", TypeAttributes.Public);
+            holder.DefineField("Ref", child.AsType(), FieldAttributes.Public);
+
+            holder.CreateTypeInfo();
+
+            TypeBuilder parentBuilder = module.DefineType("Parent", TypeAttributes.Public);
+            Type parent = parentBuilder.CreateTypeInfo().AsType();
+
+            child.SetParent(parent);
+            Type createdChild = child.CreateTypeInfo().AsType();
+
+            Assert.Equal(parent, createdChild.BaseType);
+        }
+
         [Theory]
         [InlineData(typeof(void))]
         [InlineData(typeof(EmptyNonGenericStruct))]

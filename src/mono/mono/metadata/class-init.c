@@ -270,6 +270,15 @@ mono_class_setup_fields (MonoClass *klass)
 	if (klass->fields_inited)
 		return;
 
+	/*
+	 * Refuse to publish layout state on a TypeBuilder shell. typebuilder_setup_fields
+	 * is the legitimate publisher during CreateType; running setup_fields here would
+	 * compute instance_size against a provisional parent (and set fields_inited=1,
+	 * blocking CreateType's recomputation via the idempotency check above).
+	 */
+	if (mono_class_get_ref_info_handle (klass) != 0 && !m_class_was_typebuilder (klass))
+		return;
+
 	if (gklass && image_is_dynamic (gklass->container_class->image) && !gklass->container_class->wastypebuilder) {
 		/*
 		 * This happens when a generic instance of an unfinished generic typebuilder
