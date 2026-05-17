@@ -455,6 +455,58 @@ exit:
 	HANDLE_FUNCTION_RETURN_REF (MonoReflectionAssembly, MONO_HANDLE_CAST (MonoReflectionAssembly, ret));
 }
 
+MonoReflectionAssemblyHandle
+mono_domain_try_type_resolve_typebuilder (MonoAssembly *requesting_assembly, MonoReflectionTypeBuilderHandle typebuilder, MonoError *error)
+{
+	MonoObjectHandle ret;
+	MonoReflectionAssemblyHandle requesting_assembly_handle;
+
+	HANDLE_FUNCTION_ENTER ();
+
+	MONO_STATIC_POINTER_INIT (MonoMethod, method)
+
+		static gboolean inited;
+		// avoid repeatedly calling mono_class_get_method_from_name_checked
+		if (!inited) {
+			ERROR_DECL (local_error);
+			MonoClass *alc_class = mono_class_get_assembly_load_context_class ();
+			g_assert (alc_class);
+			method = mono_class_get_method_from_name_checked (alc_class, "OnTypeBuilderResolve", -1, 0, local_error);
+			mono_error_cleanup (local_error);
+			inited = TRUE;
+		}
+
+	MONO_STATIC_POINTER_INIT_END (MonoMethod, method)
+
+	if (!method)
+		goto return_null;
+
+	g_assert (MONO_HANDLE_BOOL (typebuilder));
+
+	if (mono_runtime_get_no_exec ())
+		goto return_null;
+
+	if (requesting_assembly) {
+		requesting_assembly_handle = mono_assembly_get_object_handle (requesting_assembly, error);
+		goto_if_nok (error, return_null);
+	} else {
+		requesting_assembly_handle = MONO_HANDLE_CAST (MonoReflectionAssembly, NULL_HANDLE);
+	}
+
+	gpointer args [2];
+	args [0] = MONO_HANDLE_RAW (requesting_assembly_handle);
+	args [1] = MONO_HANDLE_RAW (typebuilder);
+	ret = mono_runtime_try_invoke_handle (method, NULL_HANDLE, args, error);
+	goto_if_nok (error, return_null);
+	goto exit;
+
+return_null:
+	ret = NULL_HANDLE;
+
+exit:
+	HANDLE_FUNCTION_RETURN_REF (MonoReflectionAssembly, MONO_HANDLE_CAST (MonoReflectionAssembly, ret));
+}
+
 MonoAssembly*
 mono_try_assembly_resolve (MonoAssemblyLoadContext *alc, const char *fname_raw, MonoAssembly *requesting, MonoError *error)
 {

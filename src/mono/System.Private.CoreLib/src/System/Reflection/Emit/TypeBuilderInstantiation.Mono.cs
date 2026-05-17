@@ -56,23 +56,30 @@ namespace System.Reflection.Emit
         }
 
         // Called from the runtime to return the corresponding finished Type object
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2055:UnrecognizedReflectionPattern",
+            Justification = "Reflection.Emit is not subject to trimming")]
         internal override Type RuntimeResolve()
         {
-            if (_genericType is TypeBuilder tb && !tb.IsCreated())
-                throw new NotImplementedException();
+            System.Reflection.Assembly? requestingAssembly = _genericType.Assembly;
+
+            Type gtd = RuntimeTypeBuilder.RuntimeResolveType(_genericType, requestingAssembly);
+
+            Type[] args = new Type[_typeArguments.Length];
             for (int i = 0; i < _typeArguments.Length; ++i)
             {
-                Type t = _typeArguments[i];
-                if (t is TypeBuilder ttb && !ttb.IsCreated())
-                    throw new NotImplementedException();
+                args[i] = RuntimeTypeBuilder.RuntimeResolveType(_typeArguments[i], requestingAssembly);
             }
-            return InternalResolve();
+
+            return gtd.MakeGenericType(args);
         }
 
         internal override bool IsUserType
         {
             get
             {
+                if (_genericType.IsUserType)
+                    return true;
+
                 foreach (Type t in _typeArguments)
                 {
                     if (t.IsUserType)

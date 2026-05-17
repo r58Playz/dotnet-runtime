@@ -21,6 +21,7 @@
 #include <mono/metadata/object.h>
 #include "assembly-internals.h"
 #include "external-only.h"
+#include <mono/metadata/reflection-internals.h>
 #include <mono/metadata/threads.h>
 #include <mono/metadata/mono-private-unstable.h>
 #include "threads-types.h"
@@ -674,14 +675,20 @@ mono_domain_try_type_resolve (MonoDomain *domain, char *name, MonoObject *typebu
 
 	MonoReflectionAssemblyHandle ret = NULL_HANDLE_INIT;
 
-	// This will not work correctly on netcore
 	if (name) {
 		MonoStringHandle name_handle = mono_string_new_handle (name, error);
 		goto_if_nok (error, exit);
 		ret = mono_domain_try_type_resolve_name (NULL, name_handle, error);
 	} else {
-		// TODO: make this work on netcore when working on SRE.TypeBuilder
-		g_assert_not_reached ();
+		MonoReflectionTypeBuilderHandle typebuilder = MONO_HANDLE_NEW (MonoReflectionTypeBuilder, (MonoReflectionTypeBuilder*)typebuilder_raw);
+		MonoType *type = mono_reflection_type_get_type (&MONO_HANDLE_RAW (typebuilder)->type);
+
+		ret = mono_domain_try_type_resolve_typebuilder (NULL, typebuilder, error);
+		goto_if_nok (error, exit);
+
+		MonoClass *klass = m_type_data_get_klass (type);
+		if (!klass->wastypebuilder)
+			ret = MONO_HANDLE_CAST (MonoReflectionAssembly, NULL_HANDLE);
 	}
 
 exit:

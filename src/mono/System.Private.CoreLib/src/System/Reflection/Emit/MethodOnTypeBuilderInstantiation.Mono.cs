@@ -95,13 +95,15 @@ namespace System.Reflection.Emit
                 "Callers of the outer calls to MakeGenericMethod will be warned as appropriate.")]
         internal MethodInfo RuntimeResolve()
         {
-            Type type = _type.InternalResolve();
+            System.Reflection.Assembly? requestingAssembly = _type.Assembly;
+
+            Type type = RuntimeTypeBuilder.RuntimeResolveType(_type, requestingAssembly);
             MethodInfo m = type.GetMethod(_method);
             if (_typeArguments != null)
             {
                 var args = new Type[_typeArguments.Length];
                 for (int i = 0; i < _typeArguments.Length; ++i)
-                    args[i] = _typeArguments[i].InternalResolve();
+                    args[i] = RuntimeTypeBuilder.RuntimeResolveType(_typeArguments[i], requestingAssembly);
                 m = m.MakeGenericMethod(args);
             }
             return m;

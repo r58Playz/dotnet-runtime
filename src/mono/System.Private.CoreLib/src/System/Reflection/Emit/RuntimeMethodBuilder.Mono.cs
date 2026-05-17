@@ -239,9 +239,14 @@ namespace System.Reflection.Emit
 
         public override ParameterInfo[] GetParameters()
         {
-            if (!type.is_created)
-                throw NotSupported();
-
+            /*
+             * Standard CoreCLR throws NotSupported_DynamicModule before
+             * CreateType. IKVM's TypeBuilder Finish path needs to query
+             * parameters mid-resolve (HasMethodImplCompatibleSignature),
+             * before is_created is set. The parameter Types are populated
+             * at MethodBuilder construction and don't depend on CreateType
+             * having run, so it's safe to return them.
+             */
             return GetParametersInternal();
         }
 
@@ -271,9 +276,47 @@ namespace System.Reflection.Emit
             return parameters![pos];
         }
 
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2075:UnrecognizedReflectionPattern",
+            Justification = "Reflection.Emit runtime resolution is not subject to trimming")]
         internal MethodBase RuntimeResolve()
         {
-            return type.RuntimeResolve().GetMethod(this);
+            Type resolvedType = type.RuntimeResolve();
+
+            if (Name != ConstructorInfo.ConstructorName && Name != ConstructorInfo.TypeConstructorName)
+            {
+                MethodInfo? gm = resolvedType.GetMethod(this);
+                if (gm == null)
+                    System.IO.File.WriteAllText("/dev/stderr", $"[RuntimeMethodBuilder.RuntimeResolve] GetMethod path returned null: name={Name} declaring={resolvedType.FullName} token=0x{MetadataToken:X8}\n");
+                return gm!;
+            }
+
+            if (mhandle.Value != IntPtr.Zero)
+            {
+                MethodBase? fromHandle = MethodBase.GetMethodFromHandle(mhandle, resolvedType.TypeHandle);
+                if (fromHandle == null)
+                    System.IO.File.WriteAllText("/dev/stderr", $"[RuntimeMethodBuilder.RuntimeResolve] GetMethodFromHandle returned null: name={Name} declaring={resolvedType.FullName} mhandle.Value=0x{mhandle.Value.ToInt64():X} typeHandle.Value=0x{resolvedType.TypeHandle.Value.ToInt64():X}\n");
+                return fromHandle!;
+            }
+
+            const BindingFlags bindingFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+            int metadataToken = MetadataToken;
+
+            foreach (MethodInfo method in resolvedType.GetMethods(bindingFlags))
+            {
+                if (method.MetadataToken == metadataToken)
+                    return method;
+            }
+
+            foreach (ConstructorInfo ctor in resolvedType.GetConstructors(bindingFlags))
+            {
+                if (ctor.MetadataToken == metadataToken)
+                    return ctor;
+            }
+
+            System.IO.File.WriteAllText("/dev/stderr", $"[RuntimeMethodBuilder.RuntimeResolve] fallback iteration failed: name={Name} declaring={resolvedType.FullName} metadataToken=0x{metadataToken:X8} mhandle.Value=0x{mhandle.Value.ToInt64():X}\n");
+            string typeName = type.FullName ?? type.Name;
+            string assemblyName = type.Assembly.FullName ?? SR.IO_UnknownFileName;
+            throw new TypeLoadException(SR.Format(SR.ClassLoad_General, typeName, assemblyName));
         }
 
         internal Module GetModule()

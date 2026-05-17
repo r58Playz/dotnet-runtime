@@ -22,6 +22,9 @@ TYPED_HANDLE_DECL (MonoReflectionTypeBuilder)
 MonoReflectionAssemblyHandle
 mono_domain_try_type_resolve_name (MonoAssembly *assembly, MonoStringHandle name, MonoError *error);
 
+MonoReflectionAssemblyHandle
+mono_domain_try_type_resolve_typebuilder (MonoAssembly *requesting_assembly, MonoReflectionTypeBuilderHandle typebuilder, MonoError *error);
+
 MonoReflectionTypeBuilderHandle
 mono_class_get_ref_info (MonoClass *klass);
 

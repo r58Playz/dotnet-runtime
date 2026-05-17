@@ -704,6 +704,7 @@ namespace System.Reflection.Emit
         // Called from the runtime to return the corresponding finished reflection object
         internal static object RuntimeResolve(object obj)
         {
+            try {
             if (obj is RuntimeMethodBuilder mb)
                 return mb.RuntimeResolve();
             if (obj is RuntimeConstructorBuilder cb)
@@ -721,6 +722,10 @@ namespace System.Reflection.Emit
             if (obj is Type t)
                 return t.RuntimeResolve();
             throw new NotImplementedException(obj.GetType().FullName);
+            } catch (Exception err) {
+                System.IO.File.WriteAllText("/dev/stderr", $"[:3] RuntimeResolve FAILED! {obj} {err}\n");
+                throw;
+            }
         }
 
         internal string FileName
@@ -849,10 +854,8 @@ namespace System.Reflection.Emit
             return base.GetHashCode();
         }
 
-        public override bool IsDefined(Type attributeType, bool inherit)
-        {
-            return base.IsDefined(attributeType, inherit);
-        }
+        public override bool IsDefined(Type attributeType, bool inherit) =>
+            CustomAttribute.IsDefined(this, attributeType, inherit);
 
         public override object[] GetCustomAttributes(bool inherit) => CustomAttribute.GetCustomAttributes(this, inherit);
 
