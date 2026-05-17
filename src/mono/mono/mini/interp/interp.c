@@ -5991,7 +5991,9 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 		}
 		MINT_IN_CASE(MINT_NEWOBJ) {
 			MonoVTable *vtable = (MonoVTable*) frame->imethod->data_items [ip [4]];
-			INIT_VTABLE (vtable);
+			if (!mono_class_is_before_field_init (vtable->klass)) {
+				INIT_VTABLE (vtable);
+			}
 			guint16 imethod_index = ip [3];
 			return_offset = ip [1];
 			call_args_offset = ip [2];
@@ -6015,7 +6017,9 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 		}
 		MINT_IN_CASE(MINT_NEWOBJ_INLINED) {
 			MonoVTable *vtable = (MonoVTable*) frame->imethod->data_items [ip [2]];
-			INIT_VTABLE (vtable);
+			if (!mono_class_is_before_field_init (vtable->klass)) {
+				INIT_VTABLE (vtable);
+			}
 
 			// FIXME push/pop LMF
 			MonoObject *o = mono_gc_alloc_obj (vtable, m_class_get_instance_size (vtable->klass));
@@ -6064,7 +6068,7 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 
 			// FIXME push/pop LMF
 			MonoVTable *vtable = mono_class_vtable_checked (newobj_class, error);
-			if (!is_ok (error) || !mono_runtime_class_init_full (vtable, error)) {
+			if (!is_ok (error) || (!mono_class_is_before_field_init (vtable->klass) && !mono_runtime_class_init_full (vtable, error))) {
 				MonoException *exc = interp_error_convert_to_exception (frame, error, ip);
 				g_assert (exc);
 				THROW_EX (exc, ip);

@@ -3004,6 +3004,39 @@ is_metadata_update_disabled (void)
 }
 
 static gboolean
+interp_method_needs_precise_cctor_run (MonoMethod *method)
+{
+	MonoClass *klass = method->klass;
+
+	if (mono_class_is_before_field_init (klass))
+		return FALSE;
+
+	if (!mono_class_needs_cctor_run (klass, method))
+		return FALSE;
+
+	if (method->flags & METHOD_ATTRIBUTE_STATIC)
+		return TRUE;
+
+	if (!mono_method_is_constructor (method) && !m_class_is_valuetype (klass) && !m_class_is_interface (klass))
+		return FALSE;
+
+	return TRUE;
+}
+
+static void
+interp_emit_special_static_init_check (TransformData *td, MonoVTable *vtable)
+{
+	if (!vtable->initialized) {
+		int cctor_check_var = interp_create_var (td, mono_get_object_type ());
+
+		interp_add_ins (td, MINT_LDSFLDA);
+		interp_ins_set_dreg (td->last_ins, cctor_check_var);
+		td->last_ins->data [0] = get_data_item_index (td, vtable);
+		td->last_ins->data [1] = get_data_item_index (td, NULL);
+	}
+}
+
+static gboolean
 interp_method_check_inlining (TransformData *td, MonoMethod *method, MonoMethodSignature *csignature)
 {
 	MonoMethodHeaderSummary header;
@@ -4865,6 +4898,8 @@ interp_emit_ldsflda (TransformData *td, MonoClassField *field, MonoError *error)
 
 	push_simple_type (td, STACK_TYPE_MP);
 	if (mono_class_field_is_special_static (field)) {
+		interp_emit_special_static_init_check (td, vtable);
+
 		guint32 offset = GPOINTER_TO_UINT (mono_special_static_field_get_offset (field, error));
 		mono_error_assert_ok (error);
 		g_assert (offset);
@@ -4943,6 +4978,8 @@ interp_emit_sfld_access (TransformData *td, MonoClassField *field, MonoClass *fi
 	}
 
 	if (mono_class_field_is_special_static (field)) {
+		interp_emit_special_static_init_check (td, vtable);
+
 		guint32 offset = GPOINTER_TO_UINT (mono_special_static_field_get_offset (field, error));
 		mono_error_assert_ok (error);
 		g_assert (offset && (offset & 0x80000000) == 0);
@@ -10034,7 +10071,7 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 	method_class_vt = mono_class_vtable_checked (imethod->method->klass, error);
 	return_if_nok (error);
 
-	if (!method_class_vt->initialized) {
+	if (!method_class_vt->initialized && interp_method_needs_precise_cctor_run (method)) {
 		mono_runtime_class_init_full (method_class_vt, error);
 		return_if_nok (error);
 	}

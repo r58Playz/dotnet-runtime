@@ -1558,16 +1558,16 @@ mono_resolve_patch_target_ext (MonoMemoryManager *mem_manager, MonoMethod *metho
 	}
 	case MONO_PATCH_INFO_SFLDA: {
 		MonoVTable *vtable = mono_class_vtable_checked (m_field_get_parent (patch_info->data.field), error);
+		gpointer special_static_offset = NULL;
 		mono_error_assert_ok (error);
 
 		if (mono_class_field_is_special_static (patch_info->data.field)) {
-			gpointer addr = mono_special_static_field_get_offset (patch_info->data.field, error);
+			special_static_offset = mono_special_static_field_get_offset (patch_info->data.field, error);
 			mono_error_assert_ok (error);
-			g_assert (addr);
-			return addr;
+			g_assert (special_static_offset);
 		}
 
-		if (!vtable->initialized && !mono_class_is_before_field_init (vtable->klass) && (!method || mono_class_needs_cctor_run (vtable->klass, method)))
+		if (!vtable->initialized && !mono_class_is_before_field_init (vtable->klass) && (method && mono_class_needs_cctor_run (vtable->klass, method)))
 			/* Done by the generated code */
 			;
 		else {
@@ -1577,6 +1577,10 @@ mono_resolve_patch_target_ext (MonoMemoryManager *mem_manager, MonoMethod *metho
 				}
 			}
 		}
+
+		if (special_static_offset)
+			return special_static_offset;
+
 		target = mono_static_field_get_addr (vtable, patch_info->data.field);
 		break;
 	}
@@ -2682,6 +2686,9 @@ compile_special (MonoMethod *method, MonoError *error)
 	return NULL;
 }
 
+static gboolean
+method_needs_precise_cctor_run (MonoMethod *method);
+
 static gpointer
 mono_jit_compile_method_with_opt (MonoMethod *method, guint32 opt, gboolean jit_only, MonoError *error)
 {
@@ -2747,8 +2754,10 @@ lookup_start:
 		if (!is_ok (error))
 			return NULL;
 		g_assert (vtable);
-		if (!mono_runtime_class_init_full (vtable, error))
-			return NULL;
+		if (!vtable->initialized && method_needs_precise_cctor_run (method)) {
+			if (!mono_runtime_class_init_full (vtable, error))
+				return NULL;
+		}
 
 		code = MINI_ADDR_TO_FTNPTR (info->code_start);
 		return mono_create_ftnptr (code);
@@ -2779,8 +2788,10 @@ lookup_start:
 			if (!mono_llvm_only && !mono_class_is_open_constructed_type (m_class_get_byval_arg (method->klass))) {
 				vtable = mono_class_vtable_checked (method->klass, error);
 				mono_error_assert_ok (error);
-				if (!mono_runtime_class_init_full (vtable, error))
-					return NULL;
+				if (!vtable->initialized && method_needs_precise_cctor_run (method)) {
+					if (!mono_runtime_class_init_full (vtable, error))
+						return NULL;
+				}
 			}
 		}
 		if (!is_ok (error))
@@ -2858,6 +2869,30 @@ lookup_start:
 	}
 
 	return p;
+}
+
+static gboolean
+method_needs_precise_cctor_run (MonoMethod *method)
+{
+	MonoClass *klass = method->klass;
+
+	if (mono_class_is_before_field_init (klass))
+		return FALSE;
+
+	if (!mono_class_needs_cctor_run (klass, method))
+		return FALSE;
+
+	if (method->flags & METHOD_ATTRIBUTE_STATIC)
+		return TRUE;
+
+	/*
+	 * Keep compatibility with CoreCLR behavior: skip the check for non-.ctor
+	 * instance methods on non-valuetype, non-interface classes.
+	 */
+	if (!mono_method_is_constructor (method) && !m_class_is_valuetype (klass) && !m_class_is_interface (klass))
+		return FALSE;
+
+	return TRUE;
 }
 
 typedef struct {
@@ -3563,10 +3598,12 @@ mono_jit_runtime_invoke (MonoMethod *method, void *obj, void **params, MonoObjec
 	 * We need this here because mono_marshal_get_runtime_invoke can place
 	 * the helper method in System.Object and not the target class.
 	 */
-	if (!mono_runtime_class_init_full (info->vtable, error)) {
-		if (exc)
-			*exc = (MonoObject*) mono_error_convert_to_exception (error);
-		return NULL;
+	if (!info->vtable->initialized && method_needs_precise_cctor_run (method)) {
+		if (!mono_runtime_class_init_full (info->vtable, error)) {
+			if (exc)
+				*exc = (MonoObject*) mono_error_convert_to_exception (error);
+			return NULL;
+		}
 	}
 
 	/* If coop is enabled, and the caller didn't ask for the exception to be caught separately,
