@@ -7,7 +7,7 @@
 #include <mono/mini/mini-runtime.h>
 
 #ifdef TARGET_WASM
-#define INTERP_ICALL_TRAMP_IARGS 12
+#define INTERP_ICALL_TRAMP_IARGS 16
 #define INTERP_ICALL_TRAMP_FARGS 12
 #else
 #define INTERP_ICALL_TRAMP_IARGS 12
