@@ -1266,6 +1266,8 @@ ves_icall_System_ValueType_InternalGetHashCode (MonoObjectHandle this_obj, MonoA
 	 */
 	iter = NULL;
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			continue;
 		if (mono_field_is_deleted (field))
@@ -1347,6 +1349,8 @@ ves_icall_System_ValueType_Equals (MonoObjectHandle this_obj, MonoObjectHandle t
 	 */
 	iter = NULL;
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			continue;
 		if (mono_field_is_deleted (field))
@@ -3798,7 +3802,7 @@ get_enum_field (MonoArrayHandle names, MonoArrayHandle values, int base_type, Mo
 	const char *p;
 	MonoTypeEnum def_type;
 
-	if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
+	if (!field->type || !(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
 		goto leave;
 	if (strcmp ("value__", mono_field_get_name (field)) == 0)
 		goto leave;

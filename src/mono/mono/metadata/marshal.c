@@ -5759,6 +5759,8 @@ ves_icall_System_Runtime_InteropServices_Marshal_OffsetOf (MonoReflectionTypeHan
 		int i = 0;
 		gpointer iter = NULL;
 		while ((field = mono_class_get_fields_internal (klass, &iter))) {
+			if (!field->type)
+				continue;
 			if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 				continue;
 			if (!strcmp (fname, mono_field_get_name (field))) {
@@ -5984,6 +5986,8 @@ mono_marshal_load_type_info (MonoClass* klass)
 
 	iter = NULL;
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			continue;
 		if (mono_field_is_deleted (field))
@@ -6014,6 +6018,8 @@ mono_marshal_load_type_info (MonoClass* klass)
 		int size;
 		guint32 align;
 
+		if (!field->type)
+			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			continue;
 
@@ -6866,6 +6872,8 @@ static void record_inlinearray_struct_physical_lowering (guint8* lowered_bytes, 
 
 	// Get the first instance field and record its physical lowering N times
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			continue;
 		if (mono_field_is_deleted (field))
@@ -6893,6 +6901,8 @@ static void record_struct_physical_lowering (guint8* lowered_bytes, MonoClass* k
 	MonoClassField* field;
 	int type_offset = MONO_ABI_SIZEOF (MonoObject);
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			continue;
 		if (mono_field_is_deleted (field))

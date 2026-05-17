@@ -2849,6 +2849,8 @@ is_scalar_vtype (MonoType *type)
 	int nfields = 0;
 	field = NULL;
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			continue;
 		nfields ++;

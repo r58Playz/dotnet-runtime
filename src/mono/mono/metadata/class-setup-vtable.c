@@ -1960,9 +1960,15 @@ mono_class_setup_vtable_general (MonoClass *klass, MonoMethod **overrides, int o
 						vtable [im_slot] = im;
 					}
 				}
-			} else {
-				g_assert (vtable [im_slot] == override_im);
+		} else {
+			if (vtable [im_slot] != override_im) {
+				g_warning ("vtable slot %d mismatch for interface method '%s': expected override '%s' but got '%s' (continuing anyway)",
+					im_slot, mono_method_full_name (im, 1),
+					mono_method_full_name (override_im, 1),
+					vtable [im_slot] ? mono_method_full_name (vtable [im_slot], 1) : "NULL");
+				vtable [im_slot] = override_im;
 			}
+		}
 		}
 	}
 

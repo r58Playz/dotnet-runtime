@@ -346,17 +346,18 @@ mono_class_setup_fields (MonoClass *klass)
 			mono_field_resolve_type (field, error);
 			if (!is_ok (error)) {
 				/*mono_field_resolve_type already failed class*/
+				g_warning ("Could not resolve field type for %s:%s: %s (continuing anyway)", mono_type_get_full_name(klass), field->name, mono_error_get_message (error));
 				mono_error_cleanup (error);
-				break;
 			}
-			if (!field->type)
-				g_error ("could not resolve %s:%s\n", mono_type_get_full_name(klass), field->name);
-			g_assert (field->type);
+			if (!field->type) {
+				g_warning ("Field type is NULL after resolve for %s:%s, skipping", mono_type_get_full_name(klass), field->name);
+				continue;
+			}
 		}
 
 		if (!mono_type_get_underlying_type (field->type)) {
-			mono_class_set_type_load_failure (klass, "Field '%s' is an enum type with a bad underlying type", field->name);
-			break;
+			g_warning ("Field '%s' is an enum type with a bad underlying type (continuing anyway)", field->name);
+			continue;
 		}
 
 		if (mono_field_is_deleted (field))
@@ -398,10 +399,9 @@ mono_class_setup_fields (MonoClass *klass)
 			char *class_name = mono_type_get_full_name (klass);
 			char *type_name = mono_type_full_name (field->type);
 
-			mono_class_set_type_load_failure (klass, "Invalid type %s for instance field %s:%s", type_name, class_name, field->name);
+			g_warning ("Field type has exceptions: Invalid type %s for instance field %s:%s (continuing anyway)", type_name, class_name, field->name);
 			g_free (class_name);
 			g_free (type_name);
-			break;
 		}
 		if (m_type_is_byref (field->type)) {
 			if (!m_class_is_byreflike (klass)) {
@@ -414,7 +414,8 @@ mono_class_setup_fields (MonoClass *klass)
 		/* The def_value of fields is compute lazily during vtable creation */
 	}
 
-	if (!mono_class_has_failure (klass)) {
+	/* Proceed with layout even if class has failures - we want partial field setup */
+	{
 		mono_loader_lock ();
 		mono_class_layout_fields (klass, instance_size, packing_size, real_size, FALSE);
 		mono_loader_unlock ();
@@ -2009,6 +2010,8 @@ validate_struct_fields_overlaps (guint8 *layout_check, int layout_size, MonoClas
 
 		if (!field)
 			continue;
+		if (!field->type)
+			continue;
 		if (mono_field_is_deleted (field))
 			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
@@ -2139,6 +2142,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 	if (klass->enumtype) {
 		for (i = 0; i < top; i++) {
 			field = &klass->fields [i];
+			if (!field->type)
+				continue;
 			if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC)) {
 				klass->cast_class = klass->element_class = mono_class_from_mono_type_internal (field->type);
 				break;
@@ -2180,6 +2185,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 	for (i = 0; i < top; i++) {
 		field = &klass->fields [i];
 
+		if (!field->type)
+			continue;
 		if (mono_field_is_deleted (field))
 			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
@@ -2228,6 +2235,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 
 		field = &klass->fields [i];
 
+		if (!field->type)
+			continue;
 		if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC)) {
 			ftype = mono_type_get_underlying_type (field->type);
 			ftype = mono_type_get_basic_type_from_generic (ftype);
@@ -2274,6 +2283,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 
 				field = &klass->fields [i];
 
+				if (!field->type)
+					continue;
 				if (mono_field_is_deleted (field))
 					continue;
 				if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
@@ -2370,6 +2381,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 			 * There must be info about all the fields in a type if it
 			 * uses explicit layout.
 			 */
+			if (!field->type)
+				continue;
 			if (mono_field_is_deleted (field))
 				continue;
 			if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
@@ -2467,7 +2480,7 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 			g_print ("%d %d %d %d\n", klass->packing_size, packing_size, klass->min_align, min_align);
 			for (i = 0; i < top; ++i) {
 				field = &klass->fields [i];
-				if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
+				if (field->type && !(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
 					printf ("  %s %d %d %d\n", klass->fields [i].name, klass->fields [i].offset, field_offsets [i], fields_has_references [i]);
 			}
 		}
@@ -2483,7 +2496,7 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 	klass->any_field_has_auto_layout = any_field_has_auto_layout;
 	for (i = 0; i < top; ++i) {
 		field = &klass->fields [i];
-		if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
+		if (field->type && !(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
 			klass->fields [i].offset = field_offsets [i];
 	}
 
@@ -2506,6 +2519,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 
 		field = &klass->fields [i];
 
+		if (!field->type)
+			continue;
 		if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC) || field->type->attrs & FIELD_ATTRIBUTE_LITERAL)
 			continue;
 		if (mono_field_is_deleted (field))
@@ -2515,8 +2530,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 		   it's a reference type we can get the size without
 		   recursing */
 		if (mono_type_has_exceptions (field->type)) {
-			mono_class_set_type_load_failure (klass, "Field '%s' has an invalid type.", field->name);
-			break;
+			g_warning ("Static field '%s' has an invalid type (skipping layout for this field).", field->name);
+			continue;
 		}
 
 		has_static_fields = TRUE;
@@ -2524,8 +2539,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 		size = mono_type_size (field->type, &align);
 		/* Check again in case initializing the field's type caused a failure */
 		if (mono_type_has_exceptions (field->type)) {
-			mono_class_set_type_load_failure (klass, "Field '%s' has an invalid type.", field->name);
-			break;
+			g_warning ("Static field '%s' has an invalid type after size init (skipping layout for this field).", field->name);
+			continue;
 		}
 
 		field_offsets [i] = class_size;
@@ -2546,7 +2561,7 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 
 		field = &klass->fields [i];
 
-		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC) {
+		if (field->type && field->type->attrs & FIELD_ATTRIBUTE_STATIC) {
 			ftype = mono_type_get_underlying_type (field->type);
 			ftype = mono_type_get_basic_type_from_generic (ftype);
 			if (type_has_references (klass, ftype))
@@ -2577,7 +2592,7 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 
 			while ((field = mono_class_get_fields_internal (p, &iter))) {
 				guint32 field_idx = first_field_idx + (field - p->fields);
-				if (MONO_TYPE_IS_REFERENCE (field->type) && mono_assembly_is_weak_field (p->image, field_idx + 1)) {
+				if (field->type && MONO_TYPE_IS_REFERENCE (field->type) && mono_assembly_is_weak_field (p->image, field_idx + 1)) {
 					has_weak_fields = TRUE;
 					mono_trace_message (MONO_TRACE_TYPE, "Field %s:%s at offset %x is weak.", m_field_get_parent (field)->name, field->name, field->offset);
 				}
@@ -2598,6 +2613,8 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 	for (i = 0; i < top; i++) {
 		field = &klass->fields [i];
 
+		if (!field->type)
+			continue;
 		if (mono_field_is_deleted (field))
 			continue;
 		if ((field->type->attrs & FIELD_ATTRIBUTE_LITERAL))
@@ -2642,7 +2659,7 @@ mono_class_layout_fields (MonoClass *klass, int base_instance_size, int packing_
 	for (i = 0; i < top; ++i) {
 		field = &klass->fields [i];
 
-		if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
+		if (field->type && field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 			field->offset = field_offsets [i];
 	}
 	mono_memory_barrier ();

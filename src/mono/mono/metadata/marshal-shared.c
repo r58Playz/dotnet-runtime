@@ -335,6 +335,8 @@ mono_marshal_shared_offset_of_first_nonstatic_field (MonoClass *klass)
 	gpointer iter = NULL;
 	MonoClassField *field;
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC) && !mono_field_is_deleted (field)) {
 			/*
 			 * metadata-update: adding fields to existing structs isn't supported.  In

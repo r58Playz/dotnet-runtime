@@ -885,6 +885,10 @@ compute_class_bitmap (MonoClass *klass, gsize *bitmap, int size, int offset, int
 			if (m_field_is_from_update (field))
 				continue;
 
+			/* Skip fields with unresolved types */
+			if (!field->type)
+				continue;
+
 			if (static_fields) {
 				if (!(field->type->attrs & (FIELD_ATTRIBUTE_STATIC | FIELD_ATTRIBUTE_HAS_FIELD_RVA)))
 					continue;
@@ -1024,6 +1028,8 @@ compute_class_non_ref_bitmap (MonoClass *klass, gsize *bitmap, int size, int off
 		while ((field = mono_class_get_fields_internal (p, &iter))) {
 			MonoType *type;
 
+			if (!field->type)
+				continue;
 			if (field->type->attrs & (FIELD_ATTRIBUTE_STATIC | FIELD_ATTRIBUTE_HAS_FIELD_RVA))
 				continue;
 			/* FIXME: should not happen, flag as type load error */
@@ -1220,7 +1226,7 @@ mono_class_compute_gc_descriptor (MonoClass *klass)
 					MonoImage *p_image = m_class_get_image (p);
 					while ((field = mono_class_get_fields_internal (p, &iter))) {
 						guint32 field_idx = first_field_idx + (field - p_fields);
-						if (MONO_TYPE_IS_REFERENCE (field->type) && mono_assembly_is_weak_field (p_image, field_idx + 1)) {
+						if (field->type && MONO_TYPE_IS_REFERENCE (field->type) && mono_assembly_is_weak_field (p_image, field_idx + 1)) {
 							int pos = field->offset / sizeof (gpointer);
 							if (pos + 1 > weak_bitmap_nbits)
 								weak_bitmap_nbits = pos + 1;
@@ -1947,6 +1953,8 @@ allocate_collectible_static_fields (MonoVTable *vt, MonoMemoryManager *mem_manag
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
 		MonoType *type;
 
+		if (!field->type)
+			continue;
 		if (!(field->type->attrs & (FIELD_ATTRIBUTE_STATIC | FIELD_ATTRIBUTE_HAS_FIELD_RVA)))
 			continue;
 		if (field->type->attrs & FIELD_ATTRIBUTE_LITERAL)
@@ -2248,6 +2256,8 @@ mono_class_create_runtime_vtable (MonoClass *klass, MonoError *error)
 		/* metadata-update: added fields are stored external to the object, and don't contribute to the bitmap */
 		if (m_field_is_from_update (field))
 			continue;
+		if (!field->type)
+			continue;
 		if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
 			continue;
 		if (mono_field_is_deleted (field))
@@ -2423,7 +2433,7 @@ mono_class_field_is_special_static (MonoClassField *field)
 {
 	MONO_REQ_GC_NEUTRAL_MODE
 
-	if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
+	if (!field->type || !(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
 		return FALSE;
 	if (mono_field_is_deleted (field))
 		return FALSE;
@@ -2445,7 +2455,7 @@ mono_class_field_get_special_static_type (MonoClassField *field)
 {
 	MONO_REQ_GC_NEUTRAL_MODE
 
-	if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
+	if (!field->type || !(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
 		return SPECIAL_STATIC_NONE;
 	if (mono_field_is_deleted (field))
 		return SPECIAL_STATIC_NONE;
@@ -2979,7 +2989,7 @@ mono_field_set_value_internal (MonoObject *obj, MonoClassField *field, void *val
 {
 	void *dest;
 
-	if ((field->type->attrs & FIELD_ATTRIBUTE_STATIC))
+	if (!field->type || (field->type->attrs & FIELD_ATTRIBUTE_STATIC))
 		return;
 
 	if (G_UNLIKELY (m_field_is_from_update (field))) {
@@ -3016,7 +3026,7 @@ mono_field_static_set_value_internal (MonoVTable *vt, MonoClassField *field, voi
 {
 	void *dest;
 
-	if ((field->type->attrs & FIELD_ATTRIBUTE_STATIC) == 0)
+	if (!field->type || (field->type->attrs & FIELD_ATTRIBUTE_STATIC) == 0)
 		return;
 	/* you cant set a constant! */
 	if ((field->type->attrs & FIELD_ATTRIBUTE_LITERAL))
@@ -3075,7 +3085,7 @@ mono_field_get_addr (MonoObject *obj, MonoVTable *vt, MonoClassField *field)
 {
 	MONO_REQ_GC_UNSAFE_MODE;
 
-	if (field->type->attrs & FIELD_ATTRIBUTE_STATIC)
+	if (field->type && field->type->attrs & FIELD_ATTRIBUTE_STATIC)
 		return mono_static_field_get_addr (vt, field);
 	else {
 		if (G_LIKELY (!m_field_is_from_update (field)))
@@ -3103,7 +3113,7 @@ mono_static_field_get_addr (MonoVTable *vt, MonoClassField *field)
 
 	guint8 *src;
 
-	g_assert (field->type->attrs & FIELD_ATTRIBUTE_STATIC);
+	g_assert (field->type && field->type->attrs & FIELD_ATTRIBUTE_STATIC);
 	if (field->offset == -1) {
 		if (G_UNLIKELY (m_field_is_from_update (field))) {
 			return mono_metadata_update_get_static_field_addr (field);
@@ -3160,7 +3170,7 @@ mono_field_get_value_internal (MonoObject *obj, MonoClassField *field, void *val
 
 	g_assert (obj);
 
-	g_return_if_fail (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC));
+	g_return_if_fail (field->type && !(field->type->attrs & FIELD_ATTRIBUTE_STATIC));
 
 	if (G_UNLIKELY (m_field_is_from_update (field))) {
 		ERROR_DECL (error);
@@ -3478,7 +3488,7 @@ mono_field_static_get_value_for_thread (MonoInternalThread *thread, MonoVTable *
 
 	error_init (error);
 
-	g_return_if_fail (field->type->attrs & FIELD_ATTRIBUTE_STATIC);
+	g_return_if_fail (field->type && field->type->attrs & FIELD_ATTRIBUTE_STATIC);
 
 	if (field->type->attrs & FIELD_ATTRIBUTE_LITERAL) {
 		get_default_field_value (field, value, string_handle, error);
