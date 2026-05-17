@@ -2555,12 +2555,14 @@ mono_class_get_field_from_name_full (MonoClass *klass, const char *name, MonoTyp
 
 	mono_class_setup_fields (klass);
 	if (mono_class_has_failure (klass))
-		return NULL;
+		g_warning ("mono_class_get_field_from_name_full: class %s.%s has failure, attempting field lookup anyway for field '%s'", m_class_get_name_space (klass), m_class_get_name (klass), name);
 
 	while (klass) {
 		gpointer iter = NULL;
 		MonoClassField *field;
 		while ((field = mono_class_get_fields_internal (klass, &iter))) {
+			if (!field->type)
+				continue;
 			if (strcmp (name, mono_field_get_name (field)) != 0)
 				continue;
 
@@ -2649,7 +2651,7 @@ mono_class_get_field_default_value (MonoClassField *field, MonoTypeEnum *def_typ
 	MonoClass *klass = m_field_get_parent (field);
 	MonoFieldDefaultValue *def_values;
 
-	g_assert (field->type->attrs & FIELD_ATTRIBUTE_HAS_DEFAULT);
+	g_assert (field->type && field->type->attrs & FIELD_ATTRIBUTE_HAS_DEFAULT);
 
 	def_values = mono_class_get_field_def_values (klass);
 	if (!def_values) {
@@ -5298,8 +5300,7 @@ mono_class_get_fields_internal (MonoClass *klass, gpointer *iter)
 	MonoImage *image = m_class_get_image (klass);
 	if (!*iter) {
 		mono_class_setup_fields (klass);
-		if (mono_class_has_failure (klass))
-			return NULL;
+		/* Continue even if class has failure - fields may still be partially usable */
 		/* start from the first */
 		if (mono_class_get_field_count (klass)) {
 			MonoClassField *klass_fields = m_class_get_fields (klass);
@@ -5753,7 +5754,7 @@ mono_field_get_rva (MonoClassField *field, int swizzle)
 	MonoClass *klass = m_field_get_parent (field);
 	MonoFieldDefaultValue *def_values;
 
-	g_assert (field->type->attrs & FIELD_ATTRIBUTE_HAS_FIELD_RVA);
+	g_assert (field->type && field->type->attrs & FIELD_ATTRIBUTE_HAS_FIELD_RVA);
 
 	/* metadata-update: added static fields with initializers don't seem to get here */
 	g_assert (!m_field_is_from_update (field));
@@ -5826,11 +5827,11 @@ mono_field_get_rva (MonoClassField *field, int swizzle)
 const char *
 mono_field_get_data (MonoClassField *field)
 {
-	if (field->type->attrs & FIELD_ATTRIBUTE_HAS_DEFAULT) {
+	if (field->type && field->type->attrs & FIELD_ATTRIBUTE_HAS_DEFAULT) {
 		MonoTypeEnum def_type;
 
 		return mono_class_get_field_default_value (field, &def_type);
-	} else if (field->type->attrs & FIELD_ATTRIBUTE_HAS_FIELD_RVA) {
+	} else if (field->type && field->type->attrs & FIELD_ATTRIBUTE_HAS_FIELD_RVA) {
 		return mono_field_get_rva (field, 1);
 	} else {
 		return NULL;
@@ -6586,11 +6587,11 @@ mono_method_can_access_field_full (MonoMethod *method, MonoClassField *field, Mo
 	MonoClass *access_class = method->klass;
 	MonoClass *member_class = m_field_get_parent (field);
 	/* FIXME: check all overlapping fields */
-	int can = can_access_member (access_class, member_class, context_klass, field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK);
+	int can = can_access_member (access_class, member_class, context_klass, field->type ? field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK : FIELD_ATTRIBUTE_PUBLIC);
 	if (!can) {
 		MonoClass *nested = m_class_get_nested_in (access_class);
 		while (nested) {
-			can = can_access_member (nested, member_class, context_klass, field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK);
+			can = can_access_member (nested, member_class, context_klass, field->type ? field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK : FIELD_ATTRIBUTE_PUBLIC);
 			if (can)
 				break;
 			nested = m_class_get_nested_in (nested);
@@ -6688,6 +6689,8 @@ mono_class_is_valid_enum (MonoClass *klass)
 		return FALSE;
 
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {
+		if (!field->type)
+			continue;
 		if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC)) {
 			if (found_base_field)
 				return FALSE;
@@ -6735,14 +6738,14 @@ mono_field_resolve_type (MonoClassField *field, MonoError *error)
 		MonoType *gtype = mono_field_get_type_checked (gfield, error);
 		if (!is_ok (error)) {
 			char *full_name = mono_type_get_full_name (gtd);
-			mono_class_set_type_load_failure (klass, "Could not load generic type of field '%s:%s' (%d) due to: %s", full_name, gfield->name, field_idx, mono_error_get_message (error));
+			g_warning ("Could not load generic type of field '%s:%s' (%d) due to: %s", full_name, gfield->name, field_idx, mono_error_get_message (error));
 			g_free (full_name);
 		}
 
 		ftype = mono_class_inflate_generic_type_no_copy (image, gtype, mono_class_get_context (klass), error);
 		if (!is_ok (error)) {
 			char *full_name = mono_type_get_full_name (klass);
-			mono_class_set_type_load_failure (klass, "Could not load instantiated type of field '%s:%s' (%d) due to: %s", full_name, field->name, field_idx, mono_error_get_message (error));
+			g_warning ("Could not load instantiated type of field '%s:%s' (%d) due to: %s", full_name, field->name, field_idx, mono_error_get_message (error));
 			g_free (full_name);
 		}
 	} else {
@@ -6779,7 +6782,7 @@ mono_field_resolve_type (MonoClassField *field, MonoError *error)
 		ftype = mono_metadata_parse_type_checked (image, container, cols [MONO_FIELD_FLAGS], FALSE, sig + 1, &sig, error);
 		if (!ftype) {
 			char *full_name = mono_type_get_full_name (klass);
-			mono_class_set_type_load_failure (klass, "Could not load type of field '%s:%s' (%d) due to: %s", full_name, field->name, field_idx, mono_error_get_message (error));
+			g_warning ("Could not load type of field '%s:%s' (%d) due to: %s", full_name, field->name, field_idx, mono_error_get_message (error));
 			g_free (full_name);
 		}
 	}
