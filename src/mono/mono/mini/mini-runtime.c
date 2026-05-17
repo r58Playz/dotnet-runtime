@@ -2715,9 +2715,13 @@ mono_jit_compile_method_with_opt (MonoMethod *method, guint32 opt, gboolean jit_
 		return_val_if_nok (error, NULL);
 	}
 
-	if (mono_llvm_only)
-		/* Should be handled by the caller */
-		g_assert (!(method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED));
+	if (mono_llvm_only && (method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
+		/* Callers normally wrap synchronized methods, but partial AOT can
+		 * route an unwrapped synchronized method here (e.g. via
+		 * MONO_PATCH_INFO_METHOD_FTNDESC or mono_create_jump_trampoline in
+		 * llvm_only mode). Wrap defensively so the synchronized semantics
+		 * are preserved. */
+		method = mono_marshal_get_synchronized_wrapper (method);
 
 	/*
 	 * ICALL wrappers are handled specially, since there is only one copy of them

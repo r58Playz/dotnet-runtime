@@ -2,7 +2,6 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
-import BuildConfiguration from "consts:configuration";
 
 import type { GCHandle, MonoThreadMessage, PThreadInfo, PThreadPtr } from "../types/internal";
 
@@ -59,7 +58,7 @@ export function update_thread_info (): void {
     // this is just to make debugging easier by naming the thread debugger window.
     // It's not CSP compliant and possibly not performant, that's why it's only enabled in debug builds
     // in Release configuration, it would be a trimmed by rollup
-    if (WasmEnableThreads && BuildConfiguration === "Debug" && !runtimeHelpers.cspPolicy) {
+    if (WasmEnableThreads && !runtimeHelpers.cspPolicy) {
         monoThreadInfo.updateCount++;
         try {
             const url = `//# sourceURL=https://dotnet/thread/${monoThreadInfo.updateCount}-${monoThreadInfo.threadPrefix}`;

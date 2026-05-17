@@ -3255,6 +3255,26 @@ interp_inline_method (TransformData *td, MonoMethod *target_method, MonoMethodHe
 		td->cbb->next_bb = prev_cbb->next_bb;
 		prev_cbb->next_bb = td->entry_bb;
 		prev_cbb->emit_state = BB_STATE_EMITTED;
+
+		/* Force td->sp to the outer-visible exit state of the call:
+		 *     prev_sp_offset - nargs + (non_void ? 1 : 0)
+		 *
+		 * Mono's main loop normally self-corrects td->sp from the next
+		 * bblock's stack_state on every transition (see ~line 5742), so
+		 * inlined bodies whose internal sp drifts from this expected
+		 * value are tolerated when the next outer opcode lives in a
+		 * different bblock. When the next outer opcode is in the SAME
+		 * bblock as the call (straight-line code with no branches), no
+		 * transition happens and the body's drift leaks out as a CHECK_STACK
+		 * underflow. Setting sp here keeps the outer's tracking correct
+		 * regardless. Observed with dmb.b (Options.save) inlining
+		 * StringBuilder.append(double) into a printwriter.println("...:"+x)
+		 * chain. */
+		{
+			int expected = prev_sp_offset - nargs +
+				((csignature->ret && csignature->ret->type != MONO_TYPE_VOID) ? 1 : 0);
+			td->sp = td->stack + expected;
+		}
 	}
 
 	td->ip = prev_ip;
@@ -5602,7 +5622,6 @@ retry_emit:
 		in_offset = GPTRDIFF_TO_INT (td->ip - header->code);
 		if (!inlining)
 			td->current_il_offset = in_offset;
-
 		InterpBasicBlock *new_bb = td->offset_to_bb [in_offset];
 		if (new_bb != NULL && td->cbb != new_bb) {
 			if (td->verbose_level)
@@ -6823,6 +6842,16 @@ retry_emit:
 			m = interp_get_method (method, token, image, generic_context, error);
 			goto_if_nok (error, exit);
 
+			if (G_UNLIKELY (!m)) {
+				char *_caller_full = mono_method_full_name (method, TRUE);
+				g_warning ("[transform] CEE_NEWOBJ resolved to NULL: token=0x%08x caller=%s image=%s",
+					token, _caller_full ? _caller_full : "<null>",
+					image ? image->name : "<null>");
+				g_free (_caller_full);
+				mono_error_set_bad_image (error, image, "CEE_NEWOBJ token 0x%08x resolved to NULL method", token);
+				goto exit;
+			}
+
 			csignature = mono_method_signature_internal (m);
 			klass = m->klass;
 
@@ -7292,7 +7321,7 @@ retry_emit:
 
 			MonoClass *field_klass = mono_class_from_mono_type_internal (ftype);
 			mt = mono_mint_type (ftype);
-			int field_size = mono_class_value_size (field_klass, NULL);
+			int field_size = mt == MINT_TYPE_VT ? mono_class_value_size (field_klass, NULL) : 0;
 
 			{
 				if (is_static) {

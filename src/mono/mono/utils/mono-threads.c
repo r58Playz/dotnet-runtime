@@ -326,14 +326,26 @@ mono_threads_wait_pending_operations (void)
 		for (gsize i = 0; i < pending_suspends; ++i) {
 			THREADS_SUSPEND_DEBUG ("[INITIATOR-WAIT-WAITING]\n");
 			mono_atomic_inc_i32 (&waits_done);
-			if (mono_os_sem_timedwait (&suspend_semaphore, sleepAbortDuration, MONO_SEM_FLAGS_NONE) == MONO_SEM_TIMEDWAIT_RET_SUCCESS)
+			// First wait up to sleepWarnDuration (~ sleepAbortDuration/20).
+			// If that times out, dump the threads (which one is blocking?)
+			// then keep waiting up to the abort deadline. Only abort if the
+			// remaining wait also times out.
+			if (mono_os_sem_timedwait (&suspend_semaphore, sleepWarnDuration, MONO_SEM_FLAGS_NONE) == MONO_SEM_TIMEDWAIT_RET_SUCCESS)
 				continue;
-			mono_stopwatch_stop (&suspension_time);
 
+			g_async_safe_printf ("suspend_thread: still waiting for %d threads after %d ms (%zu suspended so far), dumping state:\n",
+				(int)pending_suspends, sleepWarnDuration, i);
 			dump_threads ();
 
-			g_async_safe_printf ("WAITING for %d threads, got %zu suspended\n", (int)pending_suspends, i);
-			g_error ("suspend_thread suspend took %d ms, which is more than the allowed %d ms", (int)mono_stopwatch_elapsed_ms (&suspension_time), sleepAbortDuration);
+			guint32 remaining = (sleepAbortDuration > sleepWarnDuration)
+				? (sleepAbortDuration - sleepWarnDuration)
+				: 0;
+			if (remaining == 0 || mono_os_sem_timedwait (&suspend_semaphore, remaining, MONO_SEM_FLAGS_NONE) != MONO_SEM_TIMEDWAIT_RET_SUCCESS) {
+				mono_stopwatch_stop (&suspension_time);
+				dump_threads ();
+				g_async_safe_printf ("WAITING for %d threads, got %zu suspended\n", (int)pending_suspends, i);
+				g_error ("suspend_thread suspend took %d ms, which is more than the allowed %d ms", (int)mono_stopwatch_elapsed_ms (&suspension_time), sleepAbortDuration);
+			}
 		}
 		mono_stopwatch_stop (&suspension_time);
 		THREADS_SUSPEND_DEBUG ("Suspending %d threads took %d ms.\n", (int)pending_suspends, (int)mono_stopwatch_elapsed_ms (&suspension_time));

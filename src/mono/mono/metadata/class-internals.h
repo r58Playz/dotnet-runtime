@@ -702,6 +702,9 @@ mono_class_get_implemented_interfaces (MonoClass *klass, MonoError *error);
 int
 mono_class_get_vtable_size (MonoClass *klass);
 
+int
+mono_vtable_alloc_slots (MonoVTable *vt);
+
 MONO_COMPONENT_API gboolean
 mono_class_is_open_constructed_type (MonoType *t);
 

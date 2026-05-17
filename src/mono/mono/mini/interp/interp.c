@@ -5991,6 +5991,27 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 		}
 		MINT_IN_CASE(MINT_NEWOBJ) {
 			MonoVTable *vtable = (MonoVTable*) frame->imethod->data_items [ip [4]];
+			/* If the cached vtable was allocated with fewer slots than the
+			 * class currently has (TypeBuilder shell vtable, finalized later
+			 * to a larger vtable_size), refetch from the class. The
+			 * CreateType path nulls klass->runtime_vtable for this case so
+			 * the next mono_class_vtable_checked allocates a properly sized
+			 * one. Update data_items in place so subsequent dispatches use
+			 * the fresh vtable too. */
+			{
+				int _alloc = mono_vtable_alloc_slots (vtable);
+				int _vts_now = m_class_get_vtable_size (vtable->klass);
+				if (G_UNLIKELY (_alloc >= 0 && _vts_now > _alloc)) {
+					ERROR_DECL (_e);
+					MonoVTable *fresh = mono_class_vtable_checked (vtable->klass, _e);
+					if (is_ok (_e) && fresh && fresh != vtable) {
+						frame->imethod->data_items [ip [4]] = fresh;
+						vtable = fresh;
+					} else {
+						mono_error_cleanup (_e);
+					}
+				}
+			}
 			if (!mono_class_is_before_field_init (vtable->klass)) {
 				INIT_VTABLE (vtable);
 			}
@@ -6017,6 +6038,20 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 		}
 		MINT_IN_CASE(MINT_NEWOBJ_INLINED) {
 			MonoVTable *vtable = (MonoVTable*) frame->imethod->data_items [ip [2]];
+			{
+				int _alloc = mono_vtable_alloc_slots (vtable);
+				int _vts_now = m_class_get_vtable_size (vtable->klass);
+				if (G_UNLIKELY (_alloc >= 0 && _vts_now > _alloc)) {
+					ERROR_DECL (_e);
+					MonoVTable *fresh = mono_class_vtable_checked (vtable->klass, _e);
+					if (is_ok (_e) && fresh && fresh != vtable) {
+						frame->imethod->data_items [ip [2]] = fresh;
+						vtable = fresh;
+					} else {
+						mono_error_cleanup (_e);
+					}
+				}
+			}
 			if (!mono_class_is_before_field_init (vtable->klass)) {
 				INIT_VTABLE (vtable);
 			}
