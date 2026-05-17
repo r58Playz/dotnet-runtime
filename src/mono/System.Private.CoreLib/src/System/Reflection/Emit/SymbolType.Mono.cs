@@ -37,7 +37,7 @@ namespace System.Reflection.Emit
     [StructLayout(LayoutKind.Sequential)]
     internal partial class SymbolType
     {
-        // Sequence of _baseType, _typeKind and _rank fields should kept in sync with MonoReflectionSymbolType in object-internals.h
+        // Sequence of fields is kept in sync with MonoReflectionSymbolType in object-internals.h.
 
         internal override Type InternalResolve()
         {
@@ -46,7 +46,7 @@ namespace System.Reflection.Emit
                 case TypeKind.IsArray:
                     {
                         Type et = _baseType.InternalResolve();
-                        if (_rank == 1)
+                        if (_rank <= 1 && _isSzArray)
                             return et.MakeArrayType();
                         return et.MakeArrayType(_rank);
                     }
@@ -60,18 +60,27 @@ namespace System.Reflection.Emit
         // Called from the runtime to return the corresponding finished Type object
         internal override Type RuntimeResolve()
         {
+            Type resolvedBaseType = RuntimeTypeBuilder.RuntimeResolveType(_baseType, _baseType.Assembly);
+
             if (_typeKind == TypeKind.IsArray)
             {
-                Type et = _baseType.RuntimeResolve();
-                if (_rank == 1)
+                if (_rank <= 1 && _isSzArray)
                 {
-                    return et.MakeArrayType();
+                    return resolvedBaseType.MakeArrayType();
                 }
 
-                return et.MakeArrayType(_rank);
+                return resolvedBaseType.MakeArrayType(_rank);
             }
 
-            return InternalResolve();
+            if (_typeKind == TypeKind.IsByRef)
+                return resolvedBaseType.MakeByRefType();
+
+            if (_typeKind == TypeKind.IsPointer)
+                return resolvedBaseType.MakePointerType();
+
+            throw new NotSupportedException();
         }
+
+        internal override bool IsUserType => _baseType.IsUserType;
     }
 }

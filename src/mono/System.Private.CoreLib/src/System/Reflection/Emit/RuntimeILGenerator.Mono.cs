@@ -347,8 +347,8 @@ namespace System.Reflection.Emit
         {
             if (!InExceptionBlock)
                 throw new NotSupportedException(SR.Argument_NotInExceptionBlock);
-            if (exceptionType != null && exceptionType.IsUserType)
-                throw new NotSupportedException(SR.PlatformNotSupported_UserDefinedSubclassesOfType);
+            if (exceptionType != null)
+                exceptionType = RuntimeTypeBuilder.NormalizeTypeForRuntimeEmit(exceptionType);
             if (ex_handlers![cur_block].LastClauseType() == ILExceptionBlock.FILTER_START)
             {
                 if (exceptionType != null)
@@ -439,8 +439,7 @@ namespace System.Reflection.Emit
         public override LocalBuilder DeclareLocal(Type localType, bool pinned)
         {
             ArgumentNullException.ThrowIfNull(localType);
-            if (localType.IsUserType)
-                throw new NotSupportedException(SR.PlatformNotSupported_UserDefinedSubclassesOfType);
+            localType = RuntimeTypeBuilder.NormalizeTypeForRuntimeEmit(localType);
             RuntimeLocalBuilder res = new RuntimeLocalBuilder(localType, this);
             res.is_pinned = pinned;
 
