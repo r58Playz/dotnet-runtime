@@ -541,6 +541,7 @@ retry_top:
 			mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_TYPE, "Running class .cctor for %s from '%s'", type_name, m_class_get_image (klass)->name);
 			g_free (type_name);
 		}
+
 		/* We are holding the per-vtable lock, do the actual initialization */
 
 		mono_threads_begin_abort_protected_block ();
@@ -2072,6 +2073,37 @@ mono_class_try_get_vtable (MonoClass *klass)
 	return NULL;
 }
 
+/* Side channel: vtable pointer -> at-allocation slot count. Used by
+ * mono_vtable_alloc_slots() to detect when MINT_CALLVIRT_FAST is about to
+ * dispatch through a slot index that exceeds what the vtable was actually
+ * allocated for (which happens when a TypeBuilder shell's vtable_size was 0
+ * at runtime_vtable allocation, then grew post-CreateType). */
+static GHashTable *vtable_alloc_slots_table;
+
+static void
+vtable_record_alloc_slots (MonoVTable *vt, int slots)
+{
+	mono_loader_lock ();
+	if (!vtable_alloc_slots_table)
+		vtable_alloc_slots_table = g_hash_table_new (mono_aligned_addr_hash, NULL);
+	g_hash_table_insert (vtable_alloc_slots_table, vt, GINT_TO_POINTER (slots));
+	mono_loader_unlock ();
+}
+
+int
+mono_vtable_alloc_slots (MonoVTable *vt)
+{
+	int slots = -1;
+	mono_loader_lock ();
+	if (vtable_alloc_slots_table) {
+		gpointer val;
+		if (g_hash_table_lookup_extended (vtable_alloc_slots_table, vt, NULL, &val))
+			slots = GPOINTER_TO_INT (val);
+	}
+	mono_loader_unlock ();
+	return slots;
+}
+
 static gpointer*
 alloc_vtable (MonoClass *klass, size_t vtable_size, size_t imt_table_bytes)
 {
@@ -2201,6 +2233,10 @@ mono_class_create_runtime_vtable (MonoClass *klass, MonoError *error)
 	if (use_interpreter)
 		interface_offsets = (gpointer*)((char*)interface_offsets + imt_table_bytes / 2);
 	g_assert (!((gsize)vt & 7));
+	/* Record the slot count this vtable was allocated for, so MINT_CALLVIRT_FAST
+	 * can detect dispatch past the allocation when vtable_size grew after
+	 * the runtime_vtable was created (TypeBuilder shell + Option B gate). */
+	vtable_record_alloc_slots (vt, vtable_slots);
 
 	mem_manager = m_class_get_mem_manager (klass);
 

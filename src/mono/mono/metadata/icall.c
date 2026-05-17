@@ -3309,6 +3309,30 @@ ves_icall_RuntimeType_GetCorrespondingInflatedMethod (MonoQCallTypeHandle type_h
 		}
 	}
 
+	/* Fallback: token comparison can miss when an SRE MethodBuilder was
+	 * registered with a pseudo-token and the corresponding MonoMethod in
+	 * the resolved class ended up with a different token (e.g., when the
+	 * resolved class is the inflated version of a generic definition).
+	 * Try name + signature match as a last resort. */
+	if (MONO_HANDLE_IS_NULL (ret) && generic_method) {
+		MonoMethodSignature *gsig = mono_method_signature_internal (generic_method);
+		iter = NULL;
+		while ((method = mono_class_get_methods (klass, &iter))) {
+			if (method->name && generic_method->name &&
+				strcmp (method->name, generic_method->name) == 0) {
+				MonoMethodSignature *msig = mono_method_signature_internal (method);
+				if (gsig && msig && mono_metadata_signature_equal (gsig, msig)) {
+					ret = mono_method_get_object_handle (method, klass, error);
+					return_val_if_nok (error, MONO_HANDLE_CAST (MonoReflectionMethod, NULL_HANDLE));
+					break;
+				}
+			}
+		}
+		if (!MONO_HANDLE_IS_NULL (ret))
+			g_warning ("[get-corresponding] token mismatch resolved via name+sig: klass=%s name=%s gen_token=0x%08x",
+				m_class_get_name (klass), generic_method->name, generic_method->token);
+	}
+
 	return ret;
 }
 
@@ -4009,7 +4033,7 @@ mono_class_get_methods_by_name (MonoClass *klass, const char *name, guint32 bfla
 		method_slots = method_slots_default;
 		memset (method_slots, 0, sizeof (method_slots_default));
 	}
-handle_parent:
+	handle_parent:
 	mono_class_setup_methods (klass);
 	mono_class_setup_vtable (klass);
 	if (mono_class_has_failure (klass))

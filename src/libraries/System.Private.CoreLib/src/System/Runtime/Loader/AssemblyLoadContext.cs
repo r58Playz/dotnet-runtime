@@ -7,6 +7,9 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Reflection;
+#if MONO
+using System.Reflection.Emit;
+#endif
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Threading;
@@ -32,6 +35,11 @@ namespace System.Runtime.Loader
 
         private static Dictionary<long, WeakReference<AssemblyLoadContext>>? s_allContexts;
         private static long s_nextId;
+
+#if MONO
+        [ThreadStatic]
+        private static HashSet<string>? t_typeBuilderResolveInProgress;
+#endif
 
         [MemberNotNull(nameof(s_allContexts))]
         private static Dictionary<long, WeakReference<AssemblyLoadContext>> AllContexts =>
@@ -244,6 +252,7 @@ namespace System.Runtime.Loader
         // Occurs when resolution of type fails
 #if MONO
         [method: DynamicDependency(nameof(OnTypeResolve))]
+        [method: DynamicDependency(nameof(OnTypeBuilderResolve))]
 #endif
         internal static event ResolveEventHandler? TypeResolve;
 
@@ -696,6 +705,29 @@ namespace System.Runtime.Loader
         {
             return InvokeResolveEvent(TypeResolve, assembly, typeName);
         }
+
+#if MONO
+        // This method is called by the VM.
+        internal static RuntimeAssembly? OnTypeBuilderResolve(Assembly? requestingAssembly, RuntimeTypeBuilder typeBuilder)
+        {
+            string? typeName = typeBuilder.FullName;
+            if (typeName == null)
+                return null;
+
+            HashSet<string> inProgress = t_typeBuilderResolveInProgress ??= new HashSet<string>(StringComparer.Ordinal);
+            if (!inProgress.Add(typeName))
+                return null;
+
+            try
+            {
+                return InvokeResolveEvent(TypeResolve, GetRuntimeAssembly(requestingAssembly), typeName);
+            }
+            finally
+            {
+                inProgress.Remove(typeName);
+            }
+        }
+#endif
 
         // This method is called by the VM.
         private static RuntimeAssembly? OnAssemblyResolve(RuntimeAssembly? assembly, string assemblyFullName)

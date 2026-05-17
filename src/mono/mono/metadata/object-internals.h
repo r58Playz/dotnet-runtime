@@ -1280,6 +1280,10 @@ typedef struct {
 	MonoReflectionType *element_type;
 	gint32 type_kind;
 	gint32 rank;
+	MonoArray *lower_bounds;
+	MonoArray *upper_bounds;
+	MonoString *format;
+	MonoBoolean is_szarray;
 } MonoReflectionSymbolType;
 
 /* Safely access System.Reflection.Emit.SymbolType from native code */

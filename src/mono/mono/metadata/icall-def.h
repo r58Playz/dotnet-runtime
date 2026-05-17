@@ -325,6 +325,7 @@ HANDLES(MODULEB_9, "set_wrappers_type", ves_icall_ModuleBuilder_set_wrappers_typ
 
 ICALL_TYPE(TYPEB, "System.Reflection.Emit.RuntimeTypeBuilder", TYPEB_1)
 HANDLES(TYPEB_1, "create_runtime_class", ves_icall_TypeBuilder_create_runtime_class, MonoReflectionType, 1, (MonoReflectionTypeBuilder))
+HANDLES(TYPEB_2, "propagate_parent_native", ves_icall_TypeBuilder_propagate_parent_native, void, 1, (MonoReflectionTypeBuilder))
 
 ICALL_TYPE(SIGH, "System.Reflection.Emit.SignatureHelper", SIGH_1)
 HANDLES(SIGH_1, "get_signature_field", ves_icall_SignatureHelper_get_signature_field, MonoArray, 1, (MonoReflectionSigHelper))

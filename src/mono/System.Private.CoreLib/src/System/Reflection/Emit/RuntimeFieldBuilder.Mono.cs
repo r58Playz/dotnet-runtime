@@ -253,9 +253,7 @@ namespace System.Reflection.Emit
 
         internal FieldInfo RuntimeResolve()
         {
-            // typeb.CreateType() populates this.handle
-            var type_handle = new RuntimeTypeHandle((typeb.CreateType() as RuntimeType)!);
-            return GetFieldFromHandle(handle, type_handle);
+            return typeb.RuntimeResolve().GetField(this);
         }
 
         public override Module Module

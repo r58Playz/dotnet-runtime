@@ -44,7 +44,7 @@ namespace System.Reflection.Emit
             Justification = "Reflection.Emit is not subject to trimming")]
         internal ConstructorInfo RuntimeResolve()
         {
-            Type type = _type.InternalResolve();
+            Type type = RuntimeTypeBuilder.RuntimeResolveType(_type, _type.Assembly);
             return type.GetConstructor(_ctor);
         }
 

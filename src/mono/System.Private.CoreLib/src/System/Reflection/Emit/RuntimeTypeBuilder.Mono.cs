@@ -41,6 +41,8 @@ using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Loader;
+using System.Threading;
 
 namespace System.Reflection.Emit
 {
@@ -84,6 +86,15 @@ namespace System.Reflection.Emit
         private ITypeName fullname;
         private bool createTypeCalled;
         private Type? underlying_type;
+        // Synchronizes CreateTypeInfoCore/TryResolveForRuntime on the same
+        // instance so a second thread can't observe createTypeCalled=true while
+        // created is mid-flight and trip the "poisoned" ClassLoad_General path.
+        // Only the short state-transition critical sections hold the lock; the
+        // heavy work (OnTypeBuilderResolve / create_runtime_class) runs without
+        // it because those callouts cross into IKVM, which has its own per-type
+        // locks — holding both directions creates a lock-ordering cycle.
+        private readonly object resolveLock = new object();
+        private Thread? resolveOwner;
 
         protected override TypeAttributes GetAttributeFlagsImpl()
         {
@@ -681,9 +692,31 @@ namespace System.Reflection.Emit
         [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)]
         protected override TypeInfo CreateTypeInfoCore()
         {
+            Thread self = Thread.CurrentThread;
+            lock (resolveLock)
+            {
+                // Same-thread re-entry: return whatever's cached, matching the
+                // original guard's semantics.
+                if (resolveOwner == self)
+                    return created!;
+                // Another thread is already creating this instance — wait for
+                // it to finish, then publish its result.
+#if FEATURE_WASM_MANAGED_THREADS || !TARGET_BROWSER
+                while (resolveOwner != null)
+                    Monitor.Wait(resolveLock);
+#endif
+                if (createTypeCalled)
+                    return created ?? (TypeInfo)this;
+                // Claim ownership but DO NOT set createTypeCalled here:
+                // accessors like FullName check is_created and assume
+                // `created` is non-null once it's true. The body sets
+                // createTypeCalled at its original point below.
+                resolveOwner = self;
+            }
+
+            try
+            {
             /* handle nesting_type */
-            if (createTypeCalled)
-                return created!;
 
             if (!IsInterface && (parent == null) && (this != typeof(object)) && (FullName != "<Module>"))
             {
@@ -702,9 +735,10 @@ namespace System.Reflection.Emit
                     if (!fb.IsStatic && (ft is RuntimeTypeBuilder builder) && ft.IsValueType && (ft != this) && is_nested_in(ft))
                     {
                         RuntimeTypeBuilder tb = builder;
-                        if (!tb.is_created)
+                        if (tb.created == null)
                         {
-                            throw new NotImplementedException();
+                            if (!tb.TryResolveForRuntime(Assembly))
+                                throw GetTypeLoadException(tb);
                         }
                     }
                 }
@@ -739,15 +773,15 @@ namespace System.Reflection.Emit
                 throw new TypeLoadException(SR.Format(SR.TypeLoad_AssemblyEnumContainsMethodsError, fullname.DisplayName, Assembly));
             if (interfaces != null)
             {
-                foreach (Type iface in interfaces)
+                for (int i = 0; i < interfaces.Length; i++)
                 {
+                    Type iface = NormalizeTypeForRuntimeEmit(interfaces[i]);
+                    interfaces[i] = iface;
                     if (iface.IsNestedPrivate && iface.Assembly != Assembly)
                         throw new TypeLoadException(SR.Format(SR.TypeLoad_AssemblyInaccessibleInterfaceError, fullname.DisplayName, Assembly, iface.FullName));
                     if (iface.IsGenericTypeDefinition)
                         throw new BadImageFormatException();
                     if (!iface.IsInterface)
-                        throw new TypeLoadException();
-                    if (iface is RuntimeTypeBuilder builder && !builder.is_created)
                         throw new TypeLoadException();
                 }
             }
@@ -773,7 +807,18 @@ namespace System.Reflection.Emit
 
             ResolveUserTypes();
 
-            created = create_runtime_class();
+            try
+            {
+                created = create_runtime_class();
+            }
+            catch (Exception ex)
+            {
+                System.IO.File.WriteAllText("/dev/stderr", $"[CreateTypeInfoCore] create_runtime_class threw for {FullName}: {ex.GetType().Name}: {ex.Message}\n");
+                throw;
+            }
+
+            if (created == null)
+                System.IO.File.WriteAllText("/dev/stderr", $"[CreateTypeInfoCore] create_runtime_class returned null for {FullName} (no exception)\n");
 
             if (is_hidden_global_type)
             {
@@ -783,6 +828,15 @@ namespace System.Reflection.Emit
             if (created != null)
                 return created;
             return this;
+            }
+            finally
+            {
+                lock (resolveLock)
+                {
+                    resolveOwner = null;
+                    Monitor.PulseAll(resolveLock);
+                }
+            }
         }
 
         [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2074:UnrecognizedReflectionPattern",
@@ -819,6 +873,37 @@ namespace System.Reflection.Emit
             if (types != null)
                 for (int i = 0; i < types.Length; ++i)
                     types[i] = ResolveUserType(types[i]);
+        }
+
+        internal static Type ValidateTypeForRuntimeEmit(Type type)
+        {
+            if (type.IsUserType)
+                throw new NotSupportedException(SR.PlatformNotSupported_UserDefinedSubclassesOfType);
+
+            return type;
+        }
+
+        internal static void ValidateTypesForRuntimeEmit(Type[]? types)
+        {
+            if (types == null)
+                return;
+
+            for (int i = 0; i < types.Length; ++i)
+                ValidateTypeForRuntimeEmit(types[i]);
+        }
+
+        internal static Type NormalizeTypeForRuntimeEmit(Type type)
+        {
+            return ValidateTypeForRuntimeEmit(ResolveUserType(type)!);
+        }
+
+        internal static void NormalizeTypesForRuntimeEmit(Type[]? types)
+        {
+            if (types == null)
+                return;
+
+            for (int i = 0; i < types.Length; ++i)
+                types[i] = NormalizeTypeForRuntimeEmit(types[i]);
         }
 
         [return: NotNullIfNotNull(nameof(t))]
@@ -1191,11 +1276,13 @@ namespace System.Reflection.Emit
 
         protected override bool HasElementTypeImpl()
         {
-            // a TypeBuilder can never represent an array, pointer
-            if (!is_created)
-                return false;
-
-            return created!.HasElementType;
+            // A TypeBuilder can never represent an array/pointer/byref. Once
+            // materialized we can answer from the runtime type; before that
+            // (including the createTypeCalled=true / created=null in-flight
+            // window) the answer is always false. Querying `created` only
+            // when non-null avoids NREs from callers that touch FullName
+            // mid-creation (e.g. diagnostic logs).
+            return created != null && created.HasElementType;
         }
 
         [DynamicallyAccessedMembers(InvokeMemberMembers)]
@@ -1489,7 +1576,20 @@ namespace System.Reflection.Emit
                 this.parent = parent;
             }
             this.parent = ResolveUserType(this.parent);
+
+            // If this TypeBuilder has already been materialized into a runtime klass
+            // shell (e.g., another type referenced it before SetParent was called),
+            // propagate the new parent to klass->parent immediately so subsequent
+            // reads see the right value rather than the stale provisional parent.
+            propagate_parent_native();
         }
+
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2110:ReflectionToDynamicallyAccessedMembers",
+            Justification = "For instance member internal calls, the linker preserves all fields of the declaring type. " +
+            "The parent and created fields have DynamicallyAccessedMembersAttribute requirements, but propagating the parent is safe " +
+            "because the annotations fully preserve the parent type, and the type built via Reflection.Emit is not subject to trimming.")]
+        [MethodImplAttribute(MethodImplOptions.InternalCall)]
+        private extern void propagate_parent_native();
 
         internal int get_next_table_index(int table, int count)
         {
@@ -1512,8 +1612,72 @@ namespace System.Reflection.Emit
 
         internal override Type RuntimeResolve()
         {
-            check_created();
+            if (!TryResolveForRuntime(Assembly))
+                throw GetTypeLoadException(this);
+
             return created!;
+        }
+
+        internal bool TryResolveForRuntime(Assembly? requestingAssembly)
+        {
+            // Fast path without lock for the common case where another thread already finished.
+            if (created != null)
+                return true;
+
+            Thread self = Thread.CurrentThread;
+            lock (resolveLock)
+            {
+                // Same-thread re-entry from inside CreateTypeInfoCore: report
+                // current state without re-driving resolution.
+                if (resolveOwner == self)
+                    return created != null;
+
+                // Another thread is doing the work — wait for it.
+#if FEATURE_WASM_MANAGED_THREADS || !TARGET_BROWSER
+                while (resolveOwner != null)
+                    Monitor.Wait(resolveLock);
+#endif
+
+                // Re-check now that we're alone.
+                if (created != null)
+                    return true;
+
+                if (createTypeCalled)
+                {
+                    System.IO.File.WriteAllText("/dev/stderr", $"[TryResolveForRuntime] poisoned: createTypeCalled=true created=null for {FullName}\n");
+                    return false;
+                }
+            }
+
+            // Outside the lock: calling into IKVM here while holding resolveLock
+            // creates a lock-ordering cycle with IKVM's per-type Finish lock.
+            AssemblyLoadContext.OnTypeBuilderResolve(requestingAssembly, this);
+            if (created == null)
+                System.IO.File.WriteAllText("/dev/stderr", $"[TryResolveForRuntime] handler returned, created still null for {FullName} (createTypeCalled={createTypeCalled})\n");
+            return created != null;
+        }
+
+        internal static Type RuntimeResolveType(Type type, Assembly? requestingAssembly)
+        {
+            if (type is RuntimeTypeBuilder typeBuilder)
+            {
+                if (!typeBuilder.TryResolveForRuntime(requestingAssembly))
+                    throw GetTypeLoadException(typeBuilder);
+
+                return typeBuilder.created!;
+            }
+
+            if (type is TypeBuilderInstantiation || type is SymbolType || type is RuntimeGenericTypeParameterBuilder || type is RuntimeEnumBuilder)
+                return type.RuntimeResolve();
+
+            return type.InternalResolve();
+        }
+
+        private static TypeLoadException GetTypeLoadException(RuntimeTypeBuilder typeBuilder)
+        {
+            string typeName = typeBuilder.FullName ?? typeBuilder.Name;
+            string assemblyName = typeBuilder.Assembly.FullName ?? SR.IO_UnknownFileName;
+            return new TypeLoadException(SR.Format(SR.ClassLoad_General, typeName, assemblyName));
         }
 
         internal bool is_created
