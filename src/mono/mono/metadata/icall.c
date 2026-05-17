@@ -5614,15 +5614,81 @@ ves_icall_System_Reflection_RuntimeModule_InternalGetTypes (MonoImage *image, Mo
 		MonoArrayHandle res = mono_module_get_types (image, exceptions, FALSE, error);
 		return_val_if_nok (error, MONO_HANDLE_CAST(MonoArray, NULL_HANDLE));
 
-		int n = GUINTPTR_TO_INT (mono_array_handle_length (exceptions));
-		MonoExceptionHandle ex = MONO_HANDLE_NEW (MonoException, NULL);
-		for (int i = 0; i < n; ++i) {
-			MONO_HANDLE_ARRAY_GETREF(ex, exceptions, i);
-			if (!MONO_HANDLE_IS_NULL (ex)) {
-				mono_error_set_exception_handle (error, ex);
-				return MONO_HANDLE_CAST(MonoArray, NULL_HANDLE);
+		int i;
+		MonoTableInfo *table = &image->tables [MONO_TABLE_FILE];
+
+		/* Append data from all modules in the assembly */
+		int rows = table_info_get_rows (table);
+		for (i = 0; i < rows; ++i) {
+			if (!(mono_metadata_decode_row_col (table, i, MONO_FILE_FLAGS) & FILE_CONTAINS_NO_METADATA)) {
+				MonoImage *loaded_image = mono_assembly_load_module_checked (image->assembly, i + 1, error);
+				return_val_if_nok (error, MONO_HANDLE_CAST(MonoArray, NULL_HANDLE));
+
+				if (loaded_image) {
+					append_module_types (res, exceptions, loaded_image, FALSE, error);
+					return_val_if_nok (error, MONO_HANDLE_CAST(MonoArray, NULL_HANDLE));
+				}
 			}
 		}
+
+		/* the ReflectionTypeLoadException must have all the types (Types property),
+		 * NULL replacing types which throws an exception. The LoaderException must
+		 * contain all exceptions for NULL items.
+		 */
+
+		int len = GUINTPTR_TO_INT (mono_array_handle_length (res));
+
+		int ex_count = 0;
+		GList *list = NULL;
+		MonoReflectionTypeHandle t = MONO_HANDLE_NEW (MonoReflectionType, NULL);
+		for (i = 0; i < len; i++) {
+			MONO_HANDLE_ARRAY_GETREF (t, res, i);
+
+			if (!MONO_HANDLE_IS_NULL (t)) {
+				MonoClass *klass = mono_type_get_class_internal (MONO_HANDLE_GETVAL (t, type));
+				if ((klass != NULL) && mono_class_has_failure (klass)) {
+					/* keep the class in the list */
+					list = g_list_append (list, klass);
+					/* and replace Type with NULL */
+					MONO_HANDLE_ARRAY_SETREF (res, i, NULL_HANDLE);
+				}
+			} else {
+				ex_count ++;
+			}
+		}
+
+		if (list || ex_count) {
+			GList *tmp = NULL;
+			int length = g_list_length (list) + ex_count;
+
+			MonoArrayHandle exl = mono_array_new_handle (mono_defaults.exception_class, length, error);
+			if (!is_ok (error)) {
+				g_list_free (list);
+				return MONO_HANDLE_CAST(MonoArray, NULL_HANDLE);
+			}
+			/* Types for which mono_class_get_checked () succeeded */
+			MonoExceptionHandle exc = MONO_HANDLE_NEW (MonoException, NULL);
+			for (i = 0, tmp = list; tmp; i++, tmp = tmp->next) {
+				set_class_failure_in_array (exl, i, (MonoClass*)tmp->data);
+			}
+			/* Types for which it don't */
+			for (uintptr_t j = 0; j < mono_array_handle_length (exceptions); ++j) {
+				MONO_HANDLE_ARRAY_GETREF (exc, exceptions, j);
+				if (!MONO_HANDLE_IS_NULL (exc)) {
+					g_assert (i < length);
+					MONO_HANDLE_ARRAY_SETREF (exl, i, exc);
+					i ++;
+				}
+			}
+			g_list_free (list);
+			list = NULL;
+
+			MONO_HANDLE_ASSIGN (exc, mono_get_exception_reflection_type_load_checked (res, exl, error));
+			return_val_if_nok (error, MONO_HANDLE_CAST(MonoArray, NULL_HANDLE));
+			mono_error_set_exception_handle (error, exc);
+			return MONO_HANDLE_CAST(MonoArray, NULL_HANDLE);
+		}
+
 		return res;
 	}
 }
