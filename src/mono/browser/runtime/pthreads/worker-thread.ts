@@ -120,6 +120,7 @@ export function mono_wasm_pthread_on_pthread_created (): void {
 /// Called in the worker thread (not main thread) from mono when a pthread becomes registered to the mono runtime.
 export function mono_wasm_pthread_on_pthread_registered (pthread_id: PThreadPtr): void {
     if (!WasmEnableThreads) return;
+    (pthread_id as any) >>>= 0;
     try {
         mono_assert(monoThreadInfo !== null && monoThreadInfo.pthreadId == pthread_id, "expected monoThreadInfo to be set already when registering");
         monoThreadInfo.isRegistered = true;
@@ -139,6 +140,7 @@ export function mono_wasm_pthread_on_pthread_registered (pthread_id: PThreadPtr)
 /// Called in the worker thread (not main thread) from mono when a pthread becomes attached to the mono runtime.
 export function mono_wasm_pthread_on_pthread_attached (pthread_id: PThreadPtr, thread_name: CharPtr, background_thread: number, threadpool_thread: number, external_eventloop: number, debugger_thread: number): void {
     if (!WasmEnableThreads) return;
+    (pthread_id as any) >>>= 0;
     try {
         mono_assert(monoThreadInfo !== null && monoThreadInfo.pthreadId == pthread_id, "expected monoThreadInfo to be set already when attaching");
 
@@ -181,6 +183,7 @@ export function mono_wasm_pthread_set_name (name: CharPtr): void {
 /// Called in the worker thread (not main thread) from mono when a pthread becomes detached from the mono runtime.
 export function mono_wasm_pthread_on_pthread_unregistered (pthread_id: PThreadPtr): void {
     if (!WasmEnableThreads) return;
+    (pthread_id as any) >>>= 0;
     try {
         mono_assert(pthread_id === monoThreadInfo.pthreadId, "expected pthread_id to match when un-registering");
         postRunWorker();

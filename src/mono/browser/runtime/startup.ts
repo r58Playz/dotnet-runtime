@@ -309,6 +309,11 @@ async function onRuntimeInitializedAsync (userOnRuntimeInitialized: (module:Emsc
             monoThreadInfo.isAttached = true;
             monoThreadInfo.isRegistered = true;
 
+            // The UI thread can execute reverse-P/Invoke callbacks (for example via
+            // native event bridges), so it must reserve and initialize the jiterpreter
+            // table ranges as well.
+            jiterpreter_allocate_tables();
+
             runtimeHelpers.runtimeReady = true;
             update_thread_info();
             bindings_init();
@@ -368,7 +373,7 @@ async function postRunAsync (userpostRun: ((module:EmscriptenModule) => void)[])
 
         // create /usr/share folder which is SpecialFolder.CommonApplicationData
         Module["FS_createPath"]("/", "usr", true, true);
-        Module["FS_createPath"]("/", "usr/share", true, true);
+        Module["FS_createPath"]("/usr", "share", true, true);
 
         // all user Module.postRun callbacks
         userpostRun.map(fn => fn(Module));
