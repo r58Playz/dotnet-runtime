@@ -10443,6 +10443,7 @@ calli_end:
 
 			/* STATIC CASE */
 			context_used = mini_class_check_context_used (cfg, klass);
+			MonoVTable *klass_vtable = NULL;
 
 			if (ftype->attrs & FIELD_ATTRIBUTE_LITERAL) {
 				mono_error_set_field_missing (cfg->error, m_field_get_parent (field), field->name, NULL, "Using static instructions with literal field");
@@ -10453,7 +10454,7 @@ calli_end:
 			 * to be called here.
 			 */
 			if (!context_used) {
-				mono_class_vtable_checked (klass, cfg->error);
+				klass_vtable = mono_class_vtable_checked (klass, cfg->error);
 				CHECK_CFG_ERROR;
 				CHECK_TYPELOAD (klass);
 			}
@@ -10465,6 +10466,21 @@ calli_end:
 				CHECK_TYPELOAD (klass);
 			} else {
 				addr = NULL;
+			}
+
+			if (is_special_static) {
+				if (context_used || cfg->compile_aot) {
+					if (mono_class_needs_cctor_run (klass, method)) {
+						emit_class_init (cfg, klass, TRUE);
+						CHECK_TYPELOAD (klass);
+					}
+				} else if (mini_field_access_needs_cctor_run (cfg, method, klass, klass_vtable)) {
+					if (!(g_slist_find (class_inits, klass))) {
+						emit_class_init (cfg, klass, TRUE);
+						CHECK_TYPELOAD (klass);
+						class_inits = g_slist_prepend (class_inits, klass);
+					}
+				}
 			}
 
 			if (is_special_static && ((gsize)addr & 0x80000000) == 0)

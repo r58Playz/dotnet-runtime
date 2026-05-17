@@ -175,6 +175,32 @@ coop_cond_timedwait_alertable (MonoCoopCond *cond, MonoCoopMutex *mutex, guint32
 	return res;
 }
 
+static gboolean
+should_skip_finalizer_due_to_failed_precise_cctor (MonoObject *obj)
+{
+	MonoClass *obj_class;
+	MonoClass *klass;
+
+	obj_class = mono_object_class (obj);
+
+	for (klass = obj_class; klass; klass = m_class_get_parent (klass)) {
+		MonoVTable *vtable;
+
+		if (!m_class_has_cctor (klass) || mono_class_is_before_field_init (klass))
+			continue;
+
+		if (klass == obj_class)
+			vtable = obj->vtable;
+		else
+			vtable = mono_class_try_get_vtable (klass);
+
+		if (vtable && vtable->init_failed)
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
 /*
  * actually, we might want to queue the finalize requests in a separate thread,
  * but we need to be careful about the execution domain of the thread...
@@ -259,6 +285,14 @@ mono_gc_run_finalize (void *obj, void *data)
 	}
 
 	if (mono_runtime_get_no_exec ())
+		return;
+
+	/*
+	 * Match CoreCLR behavior: if a precise-init (.cctor without beforefieldinit)
+	 * constructor failed on the object's class hierarchy, do not run the finalizer.
+	 * Running instance code would violate CLI initialization rules.
+	 */
+	if (should_skip_finalizer_due_to_failed_precise_cctor (o))
 		return;
 
 	/* speedup later... and use a timeout */
