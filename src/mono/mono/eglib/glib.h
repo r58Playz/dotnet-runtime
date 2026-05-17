@@ -743,19 +743,11 @@ G_ATTR_NORETURN void
                mono_assertion_message_unreachable (const char *file, int line);
 const char *   g_get_assertion_message (void);
 
-#ifndef DISABLE_ASSERT_MESSAGES
 #define g_error(...) do { g_log (G_LOG_DOMAIN, G_LOG_LEVEL_ERROR, __VA_ARGS__); eg_unreachable (); } while (0)
 #define g_critical(...) g_log (G_LOG_DOMAIN, G_LOG_LEVEL_CRITICAL, __VA_ARGS__)
 #define g_warning(...)  g_log (G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, __VA_ARGS__)
 #define g_message(...)  g_log (G_LOG_DOMAIN, G_LOG_LEVEL_MESSAGE, __VA_ARGS__)
 #define g_debug(...)    g_log (G_LOG_DOMAIN, G_LOG_LEVEL_DEBUG, __VA_ARGS__)
-#else
-#define g_error(...)    do { g_log_disabled (G_LOG_DOMAIN, G_LOG_LEVEL_ERROR, __FILE__, __LINE__); eg_unreachable (); } while (0)
-#define g_critical(...) g_log_disabled (G_LOG_DOMAIN, G_LOG_LEVEL_CRITICAL, __FILE__, __LINE__)
-#define g_warning(...)  g_log_disabled (G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, __FILE__, __LINE__)
-#define g_message(...)  g_log_disabled (G_LOG_DOMAIN, G_LOG_LEVEL_MESSAGE, __FILE__, __LINE__)
-#define g_debug(...)    g_log_disabled (G_LOG_DOMAIN, G_LOG_LEVEL_DEBUG, __FILE__, __LINE__)
-#endif
 #define g_warning_dont_trim(...)  g_log (G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, __VA_ARGS__)
 
 typedef void (*GLogFunc) (const gchar *log_domain, GLogLevelFlags log_level, const gchar *message, gpointer user_data);
@@ -795,12 +787,7 @@ gpointer g_convert_error_quark(void);
 #endif
 
 /* g_assert is a boolean expression; the precise value is not preserved, just true or false. */
-#ifdef DISABLE_ASSERT_MESSAGES
-// This is smaller than the equivalent mono_assertion_message (..."disabled");
-#define g_assert(x) (G_LIKELY((x)) ? 1 : (mono_assertion_message_disabled (__FILE__, __LINE__), 0))
-#else
 #define g_assert(x) (G_LIKELY((x)) ? 1 : (mono_assertion_message (__FILE__, __LINE__, #x), 0))
-#endif
 
 #if defined(__cplusplus) || (defined (__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
 #define g_static_assert(x) static_assert (x, "")
@@ -830,13 +817,7 @@ gpointer g_convert_error_quark(void);
  * format must be a string literal, in order to be concatenated.
  * If this is too restrictive, g_error remains.
  */
-#ifdef DISABLE_ASSERT_MESSAGES
-#define g_assertf(x, format, ...) (G_LIKELY((x)) ? 1 : (mono_assertion_message_disabled (__FILE__, __LINE__), 0))
-#elif defined(_MSC_VER) && (_MSC_VER < 1910)
-#define g_assertf(x, format, ...) (G_LIKELY((x)) ? 1 : (g_assertion_message ("* Assertion at %s:%d, condition `%s' not met, function:%s, " format "\n", __FILE__, __LINE__, #x, __func__, __VA_ARGS__), 0))
-#else
 #define g_assertf(x, format, ...) (G_LIKELY((x)) ? 1 : (g_assertion_message ("* Assertion at %s:%d, condition `%s' not met, function:%s, " format "\n", __FILE__, __LINE__, #x, __func__, ##__VA_ARGS__), 0))
-#endif
 
 /*
  * Unicode conversion

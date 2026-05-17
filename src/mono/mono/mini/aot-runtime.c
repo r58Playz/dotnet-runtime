@@ -6014,16 +6014,12 @@ get_new_unbox_arbitrary_trampoline_frome_page (gpointer addr)
 static gpointer
 get_numerous_trampoline (MonoAotTrampoline tramp_type, int n_got_slots, MonoAotModule **out_amodule, guint32 *got_offset, guint32 *out_tramp_size)
 {
-#ifndef DISABLE_ASSERT_MESSAGES
 	MonoImage *image;
-#endif
 	MonoAotModule *amodule = get_mscorlib_aot_module ();
 	int index, tramp_size;
 
-#ifndef DISABLE_ASSERT_MESSAGES
 	/* Currently, we keep all trampolines in the mscorlib AOT image */
 	image = mono_defaults.corlib;
-#endif
 
 	*out_amodule = amodule;
 
