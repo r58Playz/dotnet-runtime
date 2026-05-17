@@ -1473,7 +1473,7 @@ mono_get_frame_info (gint32 skip,
 
 	g_assert (skip >= 0);
 
-	if (mono_llvm_only) {
+	if (mono_llvm_only && mono_aot_mode != MONO_AOT_MODE_LLVMONLY_INTERP) {
 		GSList *l, *ips;
 		guint8 *frame_ip = NULL;
 
@@ -1533,12 +1533,22 @@ mono_get_frame_info (gint32 skip,
 					continue;
 				skip--;
 				break;
+			case FRAME_TYPE_IL_STATE:
+				ji = frame.ji;
+				*native_offset = frame.native_offset;
+				jmethod = frame.method;
+				il_offset = ((MonoMethodILState*)frame.il_state)->il_offset;
+
+				if (jmethod->wrapper_type != MONO_WRAPPER_NONE && jmethod->wrapper_type != MONO_WRAPPER_DYNAMIC_METHOD && jmethod->wrapper_type != MONO_WRAPPER_MANAGED_TO_NATIVE)
+					continue;
+				skip--;
+				break;
 			default:
 				g_assert_not_reached ();
 			}
 		} while (skip >= 0);
 
-		if (frame.type == FRAME_TYPE_INTERP) {
+		if (frame.type == FRAME_TYPE_INTERP || frame.type == FRAME_TYPE_IL_STATE) {
 			jmethod = frame.method;
 			actual_method = frame.actual_method;
 		} else {

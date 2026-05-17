@@ -28,6 +28,18 @@ mini_llvmonly_load_method (MonoMethod *method, gboolean caller_gsharedvt, gboole
 	if (addr) {
 		return mini_llvmonly_add_method_wrappers (method, (gpointer)addr, caller_gsharedvt, need_unbox, out_arg);
 	} else {
+
+#ifdef HOST_WASM
+		if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
+			addr = mini_get_interp_callbacks ()->create_method_pointer (method, TRUE, error);
+			return_val_if_nok (error, NULL);
+			if (addr) {
+				*out_arg = NULL;
+				return addr;
+			}
+		}
+#endif
+
 		MonoFtnDesc *desc = mini_get_interp_callbacks ()->create_method_pointer_llvmonly (method, need_unbox, error);
 		return_val_if_nok (error, NULL);
 		*out_arg = desc->arg;
@@ -50,6 +62,16 @@ mini_llvmonly_load_method_ftndesc (MonoMethod *method, gboolean caller_gsharedvt
 		// FIXME: Cache this
 		return mini_llvmonly_create_ftndesc (method, addr, arg);
 	} else {
+
+#ifdef HOST_WASM
+		if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
+			addr = mini_get_interp_callbacks ()->create_method_pointer (method, TRUE, error);
+			return_val_if_nok (error, NULL);
+			if (addr)
+				return mini_llvmonly_create_ftndesc (method, addr, NULL);
+		}
+#endif
+
 		MonoFtnDesc *ftndesc = mini_get_interp_callbacks ()->create_method_pointer_llvmonly (method, need_unbox, error);
 		return_val_if_nok (error, NULL);
 		return ftndesc;
@@ -72,6 +94,18 @@ mini_llvmonly_load_method_delegate (MonoMethod *method, gboolean caller_gsharedv
 		*out_arg = mini_llvmonly_get_delegate_arg (method, addr);
 		return addr;
 	} else {
+
+#ifdef HOST_WASM
+		if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
+			addr = mini_get_interp_callbacks ()->create_method_pointer (method, TRUE, error);
+			return_val_if_nok (error, NULL);
+			if (addr) {
+				*out_arg = NULL;
+				return addr;
+			}
+		}
+#endif
+
 		MonoFtnDesc *desc = mini_get_interp_callbacks ()->create_method_pointer_llvmonly (method, need_unbox, error);
 		return_val_if_nok (error, NULL);
 

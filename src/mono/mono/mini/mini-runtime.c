@@ -2702,6 +2702,12 @@ mono_jit_compile_method_with_opt (MonoMethod *method, guint32 opt, gboolean jit_
 
 	if (mono_ee_features.force_use_interpreter && !jit_only)
 		use_interp = TRUE;
+
+#ifdef HOST_WASM
+	if (!jit_only && mono_use_interpreter && method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED)
+		use_interp = TRUE;
+#endif
+
 	if (!use_interp && mono_interp_only_classes) {
 		for (GSList *l = mono_interp_only_classes; l; l = l->next) {
 			if (!strcmp (m_class_get_name (method->klass), (char*)l->data))
@@ -3561,6 +3567,9 @@ mono_jit_runtime_invoke (MonoMethod *method, void *obj, void **params, MonoObjec
 			use_interp = TRUE;
 
 		if (callee) {
+			if (mono_llvm_only && (callee->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
+				callee = mono_marshal_get_synchronized_wrapper (callee);
+
 			compiled_method = mono_jit_compile_method_jit_only (callee, error);
 			if (!compiled_method) {
 				if (!mono_opt_llvm_emulate_unwind)
