@@ -433,8 +433,27 @@ callvirt_to_call (int opcode)
 static gboolean
 can_enter_interp (MonoCompile *cfg, MonoMethod *method, gboolean virtual_)
 {
-	if (method->wrapper_type)
+	if (method->wrapper_type) {
+		/*
+		 * Synchronized inner wrappers are dummy stubs that the runtime
+		 * unwraps back to the original method during method-pointer
+		 * resolution (mini-runtime.c, SYNCHRONIZED_INNER case). In
+		 * profile-only AOT (LLVM-only + profile-only) the wrapped method
+		 * may not be AOT'd, in which case a direct call from the outer
+		 * synchronized wrapper to the inner wrapper's empty AOT body
+		 * would resolve to a null function pointer. Treat this wrapper
+		 * subtype as interp-enterable so the call is emitted as an
+		 * indirect dispatch through the function-descriptor table,
+		 * letting the runtime route to either the AOT'd body or an
+		 * interp trampoline for the wrapped method.
+		 */
+		if (method->wrapper_type == MONO_WRAPPER_OTHER) {
+			WrapperInfo *info = mono_marshal_get_wrapper_info (method);
+			if (info && info->subtype == WRAPPER_SUBTYPE_SYNCHRONIZED_INNER)
+				return TRUE;
+		}
 		return FALSE;
+	}
 
 	if (m_class_get_image (method->klass) == m_class_get_image (cfg->method->klass)) {
 		/* When using AOT profiling, the method might not be AOTed */

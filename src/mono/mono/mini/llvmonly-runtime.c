@@ -10,6 +10,40 @@
 #include "aot-runtime.h"
 
 /*
+ * SYNCHRONIZED_INNER wrappers are dummy stubs whose IL just throws
+ * ExecutionEngineException ("Shouldn't be called."). The runtime is expected
+ * to substitute the wrapped method during method-pointer resolution
+ * (mini-runtime.c handles this inside mono_jit_compile_method_with_opt).
+ *
+ * mono_compile_method_checked does the substitution before AOT lookup, but
+ * if AOT lookup fails (e.g. profile-only AOT where the wrapped method isn't
+ * compiled), it returns NULL and the caller falls back to creating an interp
+ * pointer. That fallback uses the original SYNCHRONIZED_INNER wrapper, which
+ * would interp the dummy stub and throw at runtime.
+ *
+ * Apply the same unwrap before the interp fallback so we end up interpreting
+ * the wrapped method's real IL. Synchronization is preserved by the
+ * out-of-line outer synchronized wrapper.
+ */
+static MonoMethod *
+unwrap_synchronized_inner (MonoMethod *method, MonoError *error)
+{
+	if (method->wrapper_type != MONO_WRAPPER_OTHER)
+		return method;
+	WrapperInfo *info = mono_marshal_get_wrapper_info (method);
+	if (!info || info->subtype != WRAPPER_SUBTYPE_SYNCHRONIZED_INNER)
+		return method;
+	MonoMethod *unwrapped = info->d.synchronized_inner.method;
+	if (method->is_inflated) {
+		MonoGenericContext *ctx = mono_method_get_context (method);
+		unwrapped = mono_class_inflate_generic_method_checked (unwrapped, ctx, error);
+		if (!is_ok (error))
+			return method;
+	}
+	return unwrapped;
+}
+
+/*
  * mini_llvmonly_load_method:
  *
  *   Return the AOT-ed code METHOD, or an interpreter entry for it.
@@ -28,6 +62,8 @@ mini_llvmonly_load_method (MonoMethod *method, gboolean caller_gsharedvt, gboole
 	if (addr) {
 		return mini_llvmonly_add_method_wrappers (method, (gpointer)addr, caller_gsharedvt, need_unbox, out_arg);
 	} else {
+		method = unwrap_synchronized_inner (method, error);
+		return_val_if_nok (error, NULL);
 
 #ifdef HOST_WASM
 		if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
@@ -62,6 +98,8 @@ mini_llvmonly_load_method_ftndesc (MonoMethod *method, gboolean caller_gsharedvt
 		// FIXME: Cache this
 		return mini_llvmonly_create_ftndesc (method, addr, arg);
 	} else {
+		method = unwrap_synchronized_inner (method, error);
+		return_val_if_nok (error, NULL);
 
 #ifdef HOST_WASM
 		if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
@@ -94,6 +132,8 @@ mini_llvmonly_load_method_delegate (MonoMethod *method, gboolean caller_gsharedv
 		*out_arg = mini_llvmonly_get_delegate_arg (method, addr);
 		return addr;
 	} else {
+		method = unwrap_synchronized_inner (method, error);
+		return_val_if_nok (error, NULL);
 
 #ifdef HOST_WASM
 		if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
