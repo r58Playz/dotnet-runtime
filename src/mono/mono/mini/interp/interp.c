@@ -3624,10 +3624,28 @@ interp_create_method_pointer (MonoMethod *method, gboolean compile, MonoError *e
 
 		/*
 		 * These are called from native code. Ask the host app for a trampoline.
+		 *
+		 * Fast path: if the wrapper has an AOT-compiled native body, install it
+		 * directly into the slot with the WASM_N2M_AOT_DIRECT_ARG sentinel (the
+		 * generated wasm_native_to_interp_* stub branches on this). This skips
+		 * the per-call interp_entry + mono_interp_exec_method round-trip for
+		 * every [MonoPInvokeCallback]/[UnmanagedCallersOnly] wrapper that landed
+		 * in the AOT image. The wrapper IS the wrapper MonoMethod we got from
+		 * mono_marshal_get_managed_wrapper above, so it matches the one
+		 * add_native_to_managed_wrappers added to the image (both go through
+		 * the per-method wrapper cache, which is keyed on the target method).
 		 */
 		MonoFtnDesc *ftndesc = g_new0 (MonoFtnDesc, 1);
-		ftndesc->addr = entry_func;
-		ftndesc->arg = imethod;
+		ERROR_DECL (aot_err);
+		gpointer aot_body = mono_aot_get_method (method, aot_err);
+		mono_error_cleanup (aot_err);
+		if (aot_body) {
+			ftndesc->addr = aot_body;
+			ftndesc->arg = (gpointer)(intptr_t)-1; /* WASM_N2M_AOT_DIRECT_ARG */
+		} else {
+			ftndesc->addr = entry_func;
+			ftndesc->arg = imethod;
+		}
 
 		addr = mono_wasm_get_native_to_interp_trampoline (orig_method, ftndesc);
 		if (addr) {

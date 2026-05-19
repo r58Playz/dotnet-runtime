@@ -367,6 +367,20 @@ internal sealed class PInvokeTableGenerator
             entryArgs.AddRange(cb.Parameters.Select((_, i) => $"(int*)&arg{i}"));
             entryArgs.Add($"(int*)wasm_native_to_interp_ftndescs [{cb_index}].arg");
 
+            // The signature of the AOT-compiled native-to-managed wrapper body. Its
+            // calling convention matches the native function pointer the callers expect,
+            // so we can dispatch directly without packing args through the gsharedvt
+            // (int*, ...) interp entry. The runtime opts into this path by storing the
+            // AOT body in .func and the WASM_N2M_AOT_DIRECT_ARG sentinel in .arg
+            // (see mono_wasm_marshal_get_managed_wrapper).
+            string nativeSigParams = cb.Parameters.Length == 0
+                ? "void"
+                : $"{cb.Parameters.Join(", ", info => MapType(info.ParameterType))}";
+            string nativeCallArgs = $"{cb.Parameters.Join(", ", (_, i) => $"arg{i}")}";
+            string nativeDirectCall = cb.IsVoid
+                ? $"((NativeSig_T{cb_index})wasm_native_to_interp_ftndescs [{cb_index}].func) ({nativeCallArgs});{w.NewLine}        return;"
+                : $"return ((NativeSig_T{cb_index})wasm_native_to_interp_ftndescs [{cb_index}].func) ({nativeCallArgs});";
+
             // Methods with at most MAX_INTERP_ENTRY_ARGS (8) arguments use a specialized
             // interp entry function that receives the arguments individually. Methods with
             // more arguments use the generic interp_entry_general entry point, which takes
@@ -398,6 +412,11 @@ internal sealed class PInvokeTableGenerator
                             mono_wasm_marshal_get_managed_wrapper ("{{EscapeLiteral(cb.AssemblyName)}}", "{{EscapeLiteral(cb.Namespace)}}", "{{EscapeLiteral(cb.TypeName)}}", "{{EscapeLiteral(cb.MethodName)}}", {{cb.Token}}, {{cb.Parameters.Length}});
                         }
 
+                        typedef {{MapType(cb.ReturnType)}} (*NativeSig_T{{cb_index}}) ({{nativeSigParams}});
+                        if (wasm_native_to_interp_ftndescs [{{cb_index}}].arg == WASM_N2M_AOT_DIRECT_ARG) {
+                            {{nativeDirectCall}}
+                        }
+
                         typedef void (*InterpEntryGeneral_T{{cb_index}}) (void*, void*, void**, void*);
                         ((InterpEntryGeneral_T{{cb_index}})wasm_native_to_interp_ftndescs [{{cb_index}}].func) ((void*)0, {{resArg}}, wasm_interp_args{{cb_index}}, wasm_native_to_interp_ftndescs [{{cb_index}}].arg);{{
                         (!cb.IsVoid ?  $"{w.NewLine}    return result;" : "")}}
@@ -415,12 +434,17 @@ internal sealed class PInvokeTableGenerator
                 $"__attribute__((export_name(\"{EscapeLiteral(cb.EntryPoint!)}\"))){w.NewLine}" : "")}}{{
                 MapType(cb.ReturnType)}}
                 {{cb.EntrySymbol}} ({{cb.Parameters.Join(", ", (info, i) => $"{MapType(info.ParameterType)} arg{i}")}}) {
-                    typedef void (*InterpEntry_T{{cb_index}}) ({{entryArgs.Join(", ", _ => "int*")}});{{
+                    typedef void (*InterpEntry_T{{cb_index}}) ({{entryArgs.Join(", ", _ => "int*")}});
+                    typedef {{MapType(cb.ReturnType)}} (*NativeSig_T{{cb_index}}) ({{nativeSigParams}});{{
                     (!cb.IsVoid ? $"{w.NewLine}    {MapType(cb.ReturnType)} result;" : "")}}
 
-                    if (!(InterpEntry_T{{cb_index}})wasm_native_to_interp_ftndescs [{{cb_index}}].func) {{{
+                    if (!wasm_native_to_interp_ftndescs [{{cb_index}}].func) {{{
                         (cb.IsExport && _isLibraryMode ? $"initialize_runtime();{w.NewLine}" : "")}}
                         mono_wasm_marshal_get_managed_wrapper ("{{EscapeLiteral(cb.AssemblyName)}}", "{{EscapeLiteral(cb.Namespace)}}", "{{EscapeLiteral(cb.TypeName)}}", "{{EscapeLiteral(cb.MethodName)}}", {{cb.Token}}, {{cb.Parameters.Length}});
+                    }
+
+                    if (wasm_native_to_interp_ftndescs [{{cb_index}}].arg == WASM_N2M_AOT_DIRECT_ARG) {
+                        {{nativeDirectCall}}
                     }
 
                     ((InterpEntry_T{{cb_index}})wasm_native_to_interp_ftndescs [{{cb_index}}].func) ({{entryArgs.Join(", ")}});{{
