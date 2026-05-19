@@ -25,6 +25,15 @@ typedef struct {
 	void *arg;
 } InterpFtnDesc;
 
+/*
+ * Sentinel value stored in InterpFtnDesc.arg when .func points directly to an
+ * AOT-compiled native-to-managed wrapper body, callable with the native
+ * signature instead of the gsharedvt-style (int*, int*, ...) interp entry
+ * convention. The generated wasm_native_to_interp_* stubs use this to decide
+ * which calling path to take.
+ */
+#define WASM_N2M_AOT_DIRECT_ARG ((void*)(uintptr_t)-1)
+
 void*
 wasm_dl_lookup_pinvoke_table (const char *name);
 
