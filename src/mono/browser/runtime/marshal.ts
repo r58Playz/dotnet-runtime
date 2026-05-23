@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 
 import { js_owned_gc_handle_symbol, teardown_managed_proxy } from "./gc-handles";
 import { Module, loaderHelpers, mono_assert, runtimeHelpers } from "./globals";
@@ -419,10 +420,13 @@ export class ManagedError extends Error implements IDisposable {
             this.managed_stack = "... omitted managed stack trace.\n" + this.getSuperStack();
             return this.managed_stack;
         }
-        if (!WasmEnableThreads || runtimeHelpers.proxyGCHandle) {
+        if (!WasmEnableJSPI && (!WasmEnableThreads || runtimeHelpers.proxyGCHandle)) {
+            // Under JSPI, get_managed_stack_trace returns a Promise — but .stack
+            // access is synchronous, so we can't await here. Fall back to the JS-side
+            // super stack only when JSPI is on.
             const gc_handle = (<any>this)[js_owned_gc_handle_symbol];
             if (gc_handle !== GCHandleNull) {
-                const managed_stack = get_managed_stack_trace(gc_handle);
+                const managed_stack = get_managed_stack_trace(gc_handle) as string | null;
                 if (managed_stack) {
                     this.managed_stack = managed_stack + "\n" + this.getSuperStack();
                     return this.managed_stack;

@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 
 import { GCHandle, GCHandleNull, JSMarshalerArguments, JSThreadBlockingMode, MarshalerToCs, MarshalerToJs, MarshalerType, MonoMethod, PThreadPtr } from "./types/internal";
 import cwraps, { threads_c_functions as twraps } from "./cwraps";
@@ -46,6 +47,9 @@ export function init_managed_exports (): void {
 // the marshaled signature is: Task<int>? CallEntrypoint(char* mainAssemblyName, string[] args)
 export function call_entry_point (main_assembly_name: string, program_args: string[] | undefined, waitForDebugger: boolean): Promise<number> {
     loaderHelpers.assert_runtime_running();
+    if (WasmEnableJSPI) {
+        return call_entry_point_jspi(main_assembly_name, program_args, waitForDebugger);
+    }
     const sp = Module.stackSave();
     try {
         const size = 5;
@@ -79,9 +83,43 @@ export function call_entry_point (main_assembly_name: string, program_args: stri
     }
 }
 
+async function call_entry_point_jspi (main_assembly_name: string, program_args: string[] | undefined, waitForDebugger: boolean): Promise<number> {
+    const sp = Module.stackSave();
+    try {
+        const size = 5;
+        const args = alloc_stack_frame(size);
+        const res = get_arg(args, 1);
+        const arg1 = get_arg(args, 2);
+        const arg2 = get_arg(args, 3);
+        const arg3 = get_arg(args, 4);
+        const main_assembly_name_ptr = stringToUTF8Ptr(main_assembly_name);
+        marshal_intptr_to_cs(arg1, main_assembly_name_ptr);
+        marshal_array_to_cs_impl(arg2, program_args && !program_args.length ? undefined : program_args, MarshalerType.String);
+        marshal_bool_to_cs(arg3, waitForDebugger);
+
+        let promise = begin_marshal_task_to_js(res, MarshalerType.TaskPreCreated, marshal_int32_to_js);
+
+        await (invoke_async_jsexport(runtimeHelpers.managedThreadTID, managedExports.CallEntrypoint, args, size) as Promise<void>);
+
+        promise = end_marshal_task_to_js(args, marshal_int32_to_js, promise);
+
+        if (promise === null || promise === undefined) {
+            promise = Promise.resolve(0);
+        }
+        (promise as any)[do_not_force_dispose] = true;
+
+        return await promise;
+    } finally {
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
 // the marshaled signature is: void LoadSatelliteAssembly(byte[] dll)
-export function load_satellite_assembly (dll: Uint8Array): void {
+export function load_satellite_assembly (dll: Uint8Array): void | Promise<void> {
     loaderHelpers.assert_runtime_running();
+    if (WasmEnableJSPI) {
+        return load_satellite_assembly_jspi(dll);
+    }
     const sp = Module.stackSave();
     try {
         const size = 3;
@@ -96,9 +134,26 @@ export function load_satellite_assembly (dll: Uint8Array): void {
     }
 }
 
+async function load_satellite_assembly_jspi (dll: Uint8Array): Promise<void> {
+    const sp = Module.stackSave();
+    try {
+        const size = 3;
+        const args = alloc_stack_frame(size);
+        const arg1 = get_arg(args, 2);
+        set_arg_type(arg1, MarshalerType.Array);
+        marshal_array_to_cs(arg1, dll, MarshalerType.Byte);
+        await (invoke_sync_jsexport(managedExports.LoadSatelliteAssembly, args) as Promise<void>);
+    } finally {
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
 // the marshaled signature is: void LoadLazyAssembly(byte[] dll, byte[] pdb)
-export function load_lazy_assembly (dll: Uint8Array, pdb: Uint8Array | null): void {
+export function load_lazy_assembly (dll: Uint8Array, pdb: Uint8Array | null): void | Promise<void> {
     loaderHelpers.assert_runtime_running();
+    if (WasmEnableJSPI) {
+        return load_lazy_assembly_jspi(dll, pdb);
+    }
     const sp = Module.stackSave();
     try {
         const size = 4;
@@ -116,10 +171,30 @@ export function load_lazy_assembly (dll: Uint8Array, pdb: Uint8Array | null): vo
     }
 }
 
+async function load_lazy_assembly_jspi (dll: Uint8Array, pdb: Uint8Array | null): Promise<void> {
+    const sp = Module.stackSave();
+    try {
+        const size = 4;
+        const args = alloc_stack_frame(size);
+        const arg1 = get_arg(args, 2);
+        const arg2 = get_arg(args, 3);
+        set_arg_type(arg1, MarshalerType.Array);
+        set_arg_type(arg2, MarshalerType.Array);
+        marshal_array_to_cs(arg1, dll, MarshalerType.Byte);
+        marshal_array_to_cs(arg2, pdb, MarshalerType.Byte);
+        await (invoke_sync_jsexport(managedExports.LoadLazyAssembly, args) as Promise<void>);
+    } finally {
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
 // the marshaled signature is: void ReleaseJSOwnedObjectByGCHandle(GCHandle gcHandle)
-export function release_js_owned_object_by_gc_handle (gc_handle: GCHandle) {
+export function release_js_owned_object_by_gc_handle (gc_handle: GCHandle): void | Promise<void> {
     mono_assert(gc_handle, "Must be valid gc_handle");
     loaderHelpers.assert_runtime_running();
+    if (WasmEnableJSPI) {
+        return release_js_owned_object_by_gc_handle_jspi(gc_handle);
+    }
     const sp = Module.stackSave();
     try {
         const size = 3;
@@ -140,9 +215,30 @@ export function release_js_owned_object_by_gc_handle (gc_handle: GCHandle) {
     }
 }
 
+async function release_js_owned_object_by_gc_handle_jspi (gc_handle: GCHandle): Promise<void> {
+    const sp = Module.stackSave();
+    try {
+        const size = 3;
+        const args = alloc_stack_frame(size);
+        const arg1 = get_arg(args, 2);
+        set_arg_type(arg1, MarshalerType.Object);
+        set_gc_handle(arg1, gc_handle);
+        if (!WasmEnableThreads || is_gcv_handle(gc_handle) || !monoThreadInfo.isUI) {
+            await (invoke_sync_jsexport(managedExports.ReleaseJSOwnedObjectByGCHandle, args) as Promise<void>);
+        } else {
+            await (invoke_async_jsexport(runtimeHelpers.ioThreadTID, managedExports.ReleaseJSOwnedObjectByGCHandle, args, size) as Promise<void>);
+        }
+    } finally {
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
 // the marshaled signature is: void CompleteTask<T>(GCHandle holder, Exception? exceptionResult, T? result)
-export function complete_task (holder_gc_handle: GCHandle, error?: any, data?: any, res_converter?: MarshalerToCs) {
+export function complete_task (holder_gc_handle: GCHandle, error?: any, data?: any, res_converter?: MarshalerToCs): void | Promise<void> {
     loaderHelpers.assert_runtime_running();
+    if (WasmEnableJSPI) {
+        return complete_task_jspi(holder_gc_handle, error, data, res_converter);
+    }
     const sp = Module.stackSave();
     try {
         const size = 5;
@@ -166,6 +262,29 @@ export function complete_task (holder_gc_handle: GCHandle, error?: any, data?: a
     }
 }
 
+async function complete_task_jspi (holder_gc_handle: GCHandle, error?: any, data?: any, res_converter?: MarshalerToCs): Promise<void> {
+    const sp = Module.stackSave();
+    try {
+        const size = 5;
+        const args = alloc_stack_frame(size);
+        const arg1 = get_arg(args, 2);
+        set_arg_type(arg1, MarshalerType.Object);
+        set_gc_handle(arg1, holder_gc_handle);
+        const arg2 = get_arg(args, 3);
+        if (error) {
+            marshal_exception_to_cs(arg2, error);
+        } else {
+            set_arg_type(arg2, MarshalerType.None);
+            const arg3 = get_arg(args, 4);
+            mono_assert(res_converter, "res_converter missing");
+            res_converter(arg3, data);
+        }
+        await (invoke_async_jsexport(runtimeHelpers.ioThreadTID, managedExports.CompleteTask, args, size) as Promise<void>);
+    } finally {
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
 // the marshaled signature is: TRes? CallDelegate<T1,T2,T3,TRes>(GCHandle callback, T1? arg1, T2? arg2, T3? arg3)
 export function call_delegate (callback_gc_handle: GCHandle, arg1_js: any, arg2_js: any, arg3_js: any, res_converter?: MarshalerToJs, arg1_converter?: MarshalerToCs, arg2_converter?: MarshalerToCs, arg3_converter?: MarshalerToCs) {
     loaderHelpers.assert_runtime_running();
@@ -177,6 +296,9 @@ export function call_delegate (callback_gc_handle: GCHandle, arg1_js: any, arg2_
                 throw new Error("Cannot call synchronous C# method from inside a synchronous call to a JS method.");
             }
         }
+    }
+    if (WasmEnableJSPI) {
+        return call_delegate_jspi(callback_gc_handle, arg1_js, arg2_js, arg3_js, res_converter, arg1_converter, arg2_converter, arg3_converter);
     }
     const sp = Module.stackSave();
     try {
@@ -213,9 +335,46 @@ export function call_delegate (callback_gc_handle: GCHandle, arg1_js: any, arg2_
     }
 }
 
+async function call_delegate_jspi (callback_gc_handle: GCHandle, arg1_js: any, arg2_js: any, arg3_js: any, res_converter?: MarshalerToJs, arg1_converter?: MarshalerToCs, arg2_converter?: MarshalerToCs, arg3_converter?: MarshalerToCs): Promise<any> {
+    const sp = Module.stackSave();
+    try {
+        const size = 6;
+        const args = alloc_stack_frame(size);
+
+        const arg1 = get_arg(args, 2);
+        set_arg_type(arg1, MarshalerType.Object);
+        set_gc_handle(arg1, callback_gc_handle);
+
+        if (arg1_converter) {
+            const arg2 = get_arg(args, 3);
+            arg1_converter(arg2, arg1_js);
+        }
+        if (arg2_converter) {
+            const arg3 = get_arg(args, 4);
+            arg2_converter(arg3, arg2_js);
+        }
+        if (arg3_converter) {
+            const arg4 = get_arg(args, 5);
+            arg3_converter(arg4, arg3_js);
+        }
+
+        await (invoke_sync_jsexport(managedExports.CallDelegate, args) as Promise<void>);
+
+        if (res_converter) {
+            const res = get_arg(args, 1);
+            return res_converter(res);
+        }
+    } finally {
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
 // the marshaled signature is: string GetManagedStackTrace(GCHandle exception)
-export function get_managed_stack_trace (exception_gc_handle: GCHandle) {
+export function get_managed_stack_trace (exception_gc_handle: GCHandle): string | null | Promise<string | null> {
     loaderHelpers.assert_runtime_running();
+    if (WasmEnableJSPI) {
+        return get_managed_stack_trace_jspi(exception_gc_handle);
+    }
     const sp = Module.stackSave();
     try {
         const size = 3;
@@ -234,10 +393,31 @@ export function get_managed_stack_trace (exception_gc_handle: GCHandle) {
     }
 }
 
+async function get_managed_stack_trace_jspi (exception_gc_handle: GCHandle): Promise<string | null> {
+    const sp = Module.stackSave();
+    try {
+        const size = 3;
+        const args = alloc_stack_frame(size);
+
+        const arg1 = get_arg(args, 2);
+        set_arg_type(arg1, MarshalerType.Exception);
+        set_gc_handle(arg1, exception_gc_handle);
+
+        await (invoke_sync_jsexport(managedExports.GetManagedStackTrace, args) as Promise<void>);
+        const res = get_arg(args, 1);
+        return marshal_string_to_js(res);
+    } finally {
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
 // GCHandle InstallMainSynchronizationContext(nint jsNativeTID, JSThreadBlockingMode jsThreadBlockingMode)
-export function install_main_synchronization_context (jsThreadBlockingMode: JSThreadBlockingMode): GCHandle {
+export function install_main_synchronization_context (jsThreadBlockingMode: JSThreadBlockingMode): GCHandle | Promise<GCHandle> {
     if (!WasmEnableThreads) return GCHandleNull;
     assert_c_interop();
+    if (WasmEnableJSPI) {
+        return install_main_synchronization_context_jspi(jsThreadBlockingMode);
+    }
 
     try {
         // this block is like alloc_stack_frame() but without set_args_context()
@@ -281,8 +461,42 @@ export function install_main_synchronization_context (jsThreadBlockingMode: JSTh
     }
 }
 
-export function invoke_async_jsexport (managedTID: PThreadPtr, method: MonoMethod, args: JSMarshalerArguments, size: number): void {
+async function install_main_synchronization_context_jspi (jsThreadBlockingMode: JSThreadBlockingMode): Promise<GCHandle> {
+    try {
+        const bytes = JavaScriptMarshalerArgSize * 4;
+        const args = Module.stackAlloc(bytes) as any;
+        _zero_region(args, bytes);
+
+        const res = get_arg(args, 1);
+        const arg1 = get_arg(args, 2);
+        const arg2 = get_arg(args, 3);
+        set_arg_intptr(arg1, mono_wasm_main_thread_ptr() as any);
+
+        switch (jsThreadBlockingMode) {
+            case JSThreadBlockingMode.PreventSynchronousJSExport: set_arg_i32(arg2, 0); break;
+            case JSThreadBlockingMode.ThrowWhenBlockingWait: set_arg_i32(arg2, 1); break;
+            case JSThreadBlockingMode.WarnWhenBlockingWait: set_arg_i32(arg2, 2); break;
+            case JSThreadBlockingMode.DangerousAllowBlockingWait: set_arg_i32(arg2, 100); break;
+            default: throw new Error("Invalid jsThreadBlockingMode");
+        }
+
+        await (cwraps.mono_wasm_invoke_jsexport as any)(managedExports.InstallMainSynchronizationContext!, args);
+        if (is_args_exception(args)) {
+            const exc = get_arg(args, 0);
+            throw marshal_exception_to_js(exc);
+        }
+        return get_arg_gc_handle(res) as any;
+    } catch (e) {
+        mono_log_error("install_main_synchronization_context failed", e);
+        throw e;
+    }
+}
+
+export function invoke_async_jsexport (managedTID: PThreadPtr, method: MonoMethod, args: JSMarshalerArguments, size: number): void | Promise<void> {
     assert_js_interop();
+    if (WasmEnableJSPI) {
+        return invoke_async_jsexport_jspi(managedTID, method, args, size);
+    }
     if (!WasmEnableThreads || runtimeHelpers.isManagedRunningOnCurrentThread) {
         cwraps.mono_wasm_invoke_jsexport(method, args as any);
         if (is_args_exception(args)) {
@@ -298,8 +512,27 @@ export function invoke_async_jsexport (managedTID: PThreadPtr, method: MonoMetho
     }
 }
 
-export function invoke_sync_jsexport (method: MonoMethod, args: JSMarshalerArguments): void {
+async function invoke_async_jsexport_jspi (managedTID: PThreadPtr, method: MonoMethod, args: JSMarshalerArguments, size: number): Promise<void> {
+    if (!WasmEnableThreads || runtimeHelpers.isManagedRunningOnCurrentThread) {
+        await (cwraps.mono_wasm_invoke_jsexport as any)(method, args as any);
+        if (is_args_exception(args)) {
+            const exc = get_arg(args, 0);
+            throw marshal_exception_to_js(exc);
+        }
+    } else {
+        set_receiver_should_free(args);
+        const bytes = JavaScriptMarshalerArgSize * size;
+        const cpy = malloc(bytes) as any;
+        copyBytes(args as any, cpy, bytes);
+        await (twraps.mono_wasm_invoke_jsexport_async_post as any)(managedTID, method, cpy);
+    }
+}
+
+export function invoke_sync_jsexport (method: MonoMethod, args: JSMarshalerArguments): void | Promise<void> {
     assert_js_interop();
+    if (WasmEnableJSPI) {
+        return invoke_sync_jsexport_jspi(method, args);
+    }
     if (!WasmEnableThreads) {
         cwraps.mono_wasm_invoke_jsexport(method, args as any);
     } else {
@@ -324,9 +557,36 @@ export function invoke_sync_jsexport (method: MonoMethod, args: JSMarshalerArgum
     }
 }
 
+async function invoke_sync_jsexport_jspi (method: MonoMethod, args: JSMarshalerArguments): Promise<void> {
+    if (!WasmEnableThreads) {
+        await (cwraps.mono_wasm_invoke_jsexport as any)(method, args as any);
+    } else {
+        if (monoThreadInfo.isUI) {
+            if (runtimeHelpers.config.jsThreadBlockingMode == JSThreadBlockingMode.PreventSynchronousJSExport) {
+                throw new Error("Cannot call synchronous C# methods.");
+            } else if (runtimeHelpers.isPendingSynchronousCall) {
+                throw new Error("Cannot call synchronous C# method from inside a synchronous call to a JS method.");
+            }
+        }
+        if (runtimeHelpers.isManagedRunningOnCurrentThread) {
+            await (twraps.mono_wasm_invoke_jsexport_sync as any)(method, args as any);
+        } else {
+            await (twraps.mono_wasm_invoke_jsexport_sync_send as any)(runtimeHelpers.managedThreadTID, method, args as any);
+        }
+    }
+
+    if (is_args_exception(args)) {
+        const exc = get_arg(args, 0);
+        throw marshal_exception_to_js(exc);
+    }
+}
+
 // the marshaled signature is: Task BindAssemblyExports(string assemblyName)
 export function bind_assembly_exports (assemblyName: string): Promise<void> {
     loaderHelpers.assert_runtime_running();
+    if (WasmEnableJSPI) {
+        return bind_assembly_exports_jspi(assemblyName);
+    }
     const sp = Module.stackSave();
     try {
         const size = 3;
@@ -349,6 +609,30 @@ export function bind_assembly_exports (assemblyName: string): Promise<void> {
         return promise;
     } finally {
         // synchronously
+        if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+    }
+}
+
+async function bind_assembly_exports_jspi (assemblyName: string): Promise<void> {
+    const sp = Module.stackSave();
+    try {
+        const size = 3;
+        const args = alloc_stack_frame(size);
+        const res = get_arg(args, 1);
+        const arg1 = get_arg(args, 2);
+        marshal_string_to_cs(arg1, assemblyName);
+
+        let promise = begin_marshal_task_to_js(res, MarshalerType.TaskPreCreated);
+
+        await (invoke_async_jsexport(runtimeHelpers.managedThreadTID, managedExports.BindAssemblyExports, args, size) as Promise<void>);
+
+        promise = end_marshal_task_to_js(args, marshal_int32_to_js, promise);
+
+        if (promise === null || promise === undefined) {
+            promise = Promise.resolve();
+        }
+        return await promise;
+    } finally {
         if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
     }
 }

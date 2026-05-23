@@ -402,6 +402,8 @@
       <EmscriptenEnvVars Include="WASM_ENABLE_EVENTPIPE=0" Condition="'$(EnableDiagnostics)' != 'true'" />
       <EmscriptenEnvVars Include="WASM_ENABLE_EH=1" Condition="'$(WasmEnableExceptionHandling)' != 'false'" />
       <EmscriptenEnvVars Include="WASM_ENABLE_EH=0" Condition="'$(WasmEnableExceptionHandling)' == 'false'" />
+      <EmscriptenEnvVars Include="WASM_ENABLE_JSPI=1" Condition="'$(WasmEnableJSPI)' == 'true'" />
+      <EmscriptenEnvVars Include="WASM_ENABLE_JSPI=0" Condition="'$(WasmEnableJSPI)' != 'true'" />
       <EmscriptenEnvVars Include="ENABLE_AOT_PROFILER=$([System.Convert]::ToInt32($(WasmProfilers.Contains('aot'))))" />
       <EmscriptenEnvVars Include="ENABLE_DEVTOOLS_PROFILER=$([System.Convert]::ToInt32($(WasmProfilers.Contains('browser'))))" />
       <EmscriptenEnvVars Include="ENABLE_LOG_PROFILER=$([System.Convert]::ToInt32($(WasmProfilers.Contains('log'))))" />

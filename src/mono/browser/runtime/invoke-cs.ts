@@ -3,6 +3,7 @@
 
 import BuildConfiguration from "consts:configuration";
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 
 import { Module, loaderHelpers, mono_assert, runtimeHelpers } from "./globals";
 import { bind_arg_marshal_to_cs } from "./marshal-to-cs";
@@ -112,6 +113,22 @@ function bind_fn_0V (closure: BindingClosure) {
     const method = closure.method;
     const fqn = closure.fullyQualifiedName;
     if (!WasmEnableThreads) (<any>closure) = null;
+    if (WasmEnableJSPI) {
+        return async function bound_fn_0V_jspi () {
+            const mark = startMeasure();
+            loaderHelpers.assert_runtime_running();
+            mono_assert(!WasmEnableThreads || !closure.isDisposed, "The function was already disposed");
+            const sp = Module.stackSave();
+            try {
+                const size = 2;
+                const args = alloc_stack_frame(size);
+                await (invoke_sync_jsexport(method, args) as Promise<void>);
+            } finally {
+                if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+                endMeasure(mark, MeasuredBlock.callCsFunction, fqn);
+            }
+        };
+    }
     return function bound_fn_0V () {
         const mark = startMeasure();
         loaderHelpers.assert_runtime_running();
@@ -135,6 +152,23 @@ function bind_fn_1V (closure: BindingClosure) {
     const marshaler1 = closure.arg_marshalers[0]!;
     const fqn = closure.fullyQualifiedName;
     if (!WasmEnableThreads) (<any>closure) = null;
+    if (WasmEnableJSPI) {
+        return async function bound_fn_1V_jspi (arg1: any) {
+            const mark = startMeasure();
+            loaderHelpers.assert_runtime_running();
+            mono_assert(!WasmEnableThreads || !closure.isDisposed, "The function was already disposed");
+            const sp = Module.stackSave();
+            try {
+                const size = 3;
+                const args = alloc_stack_frame(size);
+                marshaler1(args, arg1);
+                await (invoke_sync_jsexport(method, args) as Promise<void>);
+            } finally {
+                if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+                endMeasure(mark, MeasuredBlock.callCsFunction, fqn);
+            }
+        };
+    }
     return function bound_fn_1V (arg1: any) {
         const mark = startMeasure();
         loaderHelpers.assert_runtime_running();
@@ -161,6 +195,24 @@ function bind_fn_1R (closure: BindingClosure) {
     const res_converter = closure.res_converter!;
     const fqn = closure.fullyQualifiedName;
     if (!WasmEnableThreads) (<any>closure) = null;
+    if (WasmEnableJSPI) {
+        return async function bound_fn_1R_jspi (arg1: any) {
+            const mark = startMeasure();
+            loaderHelpers.assert_runtime_running();
+            mono_assert(!WasmEnableThreads || !closure.isDisposed, "The function was already disposed");
+            const sp = Module.stackSave();
+            try {
+                const size = 3;
+                const args = alloc_stack_frame(size);
+                marshaler1(args, arg1);
+                await (invoke_sync_jsexport(method, args) as Promise<void>);
+                return res_converter(args);
+            } finally {
+                if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+                endMeasure(mark, MeasuredBlock.callCsFunction, fqn);
+            }
+        };
+    }
     return function bound_fn_1R (arg1: any) {
         const mark = startMeasure();
         loaderHelpers.assert_runtime_running();
@@ -190,6 +242,27 @@ function bind_fn_1RA (closure: BindingClosure) {
     const res_converter = closure.res_converter!;
     const fqn = closure.fullyQualifiedName;
     if (!WasmEnableThreads) (<any>closure) = null;
+    if (WasmEnableJSPI) {
+        return async function bind_fn_1RA_jspi (arg1: any) {
+            const mark = startMeasure();
+            loaderHelpers.assert_runtime_running();
+            mono_assert(!WasmEnableThreads || !closure.isDisposed, "The function was already disposed");
+            const sp = Module.stackSave();
+            try {
+                const size = 3;
+                const args = alloc_stack_frame(size);
+                marshaler1(args, arg1);
+
+                let promise = res_converter(args);
+                await (invoke_async_jsexport(runtimeHelpers.managedThreadTID, method, args, size) as Promise<void>);
+                promise = end_marshal_task_to_js(args, undefined, promise);
+                return await promise;
+            } finally {
+                if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+                endMeasure(mark, MeasuredBlock.callCsFunction, fqn);
+            }
+        };
+    }
     return function bind_fn_1RA (arg1: any) {
         const mark = startMeasure();
         loaderHelpers.assert_runtime_running();
@@ -225,6 +298,25 @@ function bind_fn_2R (closure: BindingClosure) {
     const res_converter = closure.res_converter!;
     const fqn = closure.fullyQualifiedName;
     if (!WasmEnableThreads) (<any>closure) = null;
+    if (WasmEnableJSPI) {
+        return async function bound_fn_2R_jspi (arg1: any, arg2: any) {
+            const mark = startMeasure();
+            loaderHelpers.assert_runtime_running();
+            mono_assert(!WasmEnableThreads || !closure.isDisposed, "The function was already disposed");
+            const sp = Module.stackSave();
+            try {
+                const size = 4;
+                const args = alloc_stack_frame(size);
+                marshaler1(args, arg1);
+                marshaler2(args, arg2);
+                await (invoke_sync_jsexport(method, args) as Promise<void>);
+                return res_converter(args);
+            } finally {
+                if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+                endMeasure(mark, MeasuredBlock.callCsFunction, fqn);
+            }
+        };
+    }
     return function bound_fn_2R (arg1: any, arg2: any) {
         const mark = startMeasure();
         loaderHelpers.assert_runtime_running();
@@ -256,6 +348,28 @@ function bind_fn_2RA (closure: BindingClosure) {
     const res_converter = closure.res_converter!;
     const fqn = closure.fullyQualifiedName;
     if (!WasmEnableThreads) (<any>closure) = null;
+    if (WasmEnableJSPI) {
+        return async function bind_fn_2RA_jspi (arg1: any, arg2: any) {
+            const mark = startMeasure();
+            loaderHelpers.assert_runtime_running();
+            mono_assert(!WasmEnableThreads || !closure.isDisposed, "The function was already disposed");
+            const sp = Module.stackSave();
+            try {
+                const size = 4;
+                const args = alloc_stack_frame(size);
+                marshaler1(args, arg1);
+                marshaler2(args, arg2);
+
+                let promise = res_converter(args);
+                await (invoke_async_jsexport(runtimeHelpers.managedThreadTID, method, args, size) as Promise<void>);
+                promise = end_marshal_task_to_js(args, undefined, promise);
+                return await promise;
+            } finally {
+                if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+                endMeasure(mark, MeasuredBlock.callCsFunction, fqn);
+            }
+        };
+    }
     return function bind_fn_2RA (arg1: any, arg2: any) {
         const mark = startMeasure();
         loaderHelpers.assert_runtime_running();
@@ -294,6 +408,47 @@ function bind_fn (closure: BindingClosure) {
     const is_async = closure.is_async;
     const is_discard_no_wait = closure.is_discard_no_wait;
     if (!WasmEnableThreads) (<any>closure) = null;
+    if (WasmEnableJSPI) {
+        return async function bound_fn_jspi (...js_args: any[]) {
+            const mark = startMeasure();
+            loaderHelpers.assert_runtime_running();
+            mono_assert(!WasmEnableThreads || !closure.isDisposed, "The function was already disposed");
+            const sp = Module.stackSave();
+            try {
+                const size = 2 + args_count;
+                const args = alloc_stack_frame(size);
+                for (let index = 0; index < args_count; index++) {
+                    const marshaler = arg_marshalers[index];
+                    if (marshaler) {
+                        const js_arg = js_args[index];
+                        marshaler(args, js_arg);
+                    }
+                }
+                let js_result: any = undefined;
+                if (is_async) {
+                    js_result = res_converter!(args);
+                }
+
+                if (is_async) {
+                    await (invoke_async_jsexport(runtimeHelpers.managedThreadTID, method, args, size) as Promise<void>);
+                    js_result = end_marshal_task_to_js(args, undefined, js_result);
+                    return await js_result;
+                } else if (is_discard_no_wait) {
+                    await (invoke_async_jsexport(runtimeHelpers.managedThreadTID, method, args, size) as Promise<void>);
+                    return undefined;
+                } else {
+                    await (invoke_sync_jsexport(method, args) as Promise<void>);
+                    if (res_converter) {
+                        return res_converter(args);
+                    }
+                    return undefined;
+                }
+            } finally {
+                if (loaderHelpers.is_runtime_running()) Module.stackRestore(sp);
+                endMeasure(mark, MeasuredBlock.callCsFunction, fqn);
+            }
+        };
+    }
     return function bound_fn (...js_args: any[]) {
         const mark = startMeasure();
         loaderHelpers.assert_runtime_running();

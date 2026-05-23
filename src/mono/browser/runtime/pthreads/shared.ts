@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 
 import type { GCHandle, MonoThreadMessage, PThreadInfo, PThreadPtr } from "../types/internal";
 
@@ -71,11 +72,40 @@ export function update_thread_info (): void {
     }
 }
 
+// Guards re-entrant pump scheduling under JSPI: the pump can suspend mid-execution
+// (when managed code awaits a Suspending import), and we must not start a second pump
+// from the safeSetTimeout queue before the previous one has settled.
+let _jspi_pump_in_flight = false;
+
 export function exec_synchronization_context_pump (): void {
     if (!loaderHelpers.is_runtime_running()) {
         return;
     }
     forceThreadMemoryViewRefresh();
+    if (WasmEnableJSPI) {
+        if (_jspi_pump_in_flight) return;
+        _jspi_pump_in_flight = true;
+        try {
+            const ret = tcwraps.mono_wasm_synchronization_context_pump() as unknown as Promise<void> | void;
+            if (ret && typeof (ret as Promise<void>).then === "function") {
+                (ret as Promise<void>).then(
+                    () => {
+                        _jspi_pump_in_flight = false;
+                    },
+                    (ex) => {
+                        _jspi_pump_in_flight = false;
+                        loaderHelpers.mono_exit(1, ex);
+                    },
+                );
+            } else {
+                _jspi_pump_in_flight = false;
+            }
+        } catch (ex) {
+            _jspi_pump_in_flight = false;
+            loaderHelpers.mono_exit(1, ex);
+        }
+        return;
+    }
     try {
         tcwraps.mono_wasm_synchronization_context_pump();
     } catch (ex) {

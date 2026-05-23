@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 import BuildConfiguration from "consts:configuration";
 
 import { loaderHelpers, mono_assert } from "./globals";
@@ -163,7 +164,13 @@ export function teardown_managed_proxy (owner: any, gc_handle: GCHandle, skipMan
     }
     if (gc_handle !== GCHandleNull && _js_owned_object_table.delete(gc_handle) && !skipManaged) {
         if (loaderHelpers.is_runtime_running() && !force_dispose_proxies_in_progress) {
-            release_js_owned_object_by_gc_handle(gc_handle);
+            if (WasmEnableJSPI) {
+                // Fire-and-forget under JSPI: finalization runs on the wasm-suspending stack but
+                // callers (FinalizationRegistry) are synchronous JS callbacks that can't await.
+                (release_js_owned_object_by_gc_handle(gc_handle) as Promise<void>).catch(() => { /* swallow */ });
+            } else {
+                release_js_owned_object_by_gc_handle(gc_handle);
+            }
         }
     }
     if (is_gcv_handle(gc_handle)) {

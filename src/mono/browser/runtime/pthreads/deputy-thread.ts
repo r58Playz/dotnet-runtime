@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 import BuildConfiguration from "consts:configuration";
 
 import { mono_log_error, mono_log_info } from "../logging";
@@ -48,7 +49,11 @@ export function mono_wasm_start_deputy_thread_async () {
 
                 await runtimeHelpers.allAssetsInMemory.promise;
 
-                runtimeHelpers.proxyGCHandle = install_main_synchronization_context(runtimeHelpers.config.jsThreadBlockingMode!);
+                if (WasmEnableJSPI) {
+                    runtimeHelpers.proxyGCHandle = await (install_main_synchronization_context(runtimeHelpers.config.jsThreadBlockingMode!) as Promise<any>);
+                } else {
+                    runtimeHelpers.proxyGCHandle = install_main_synchronization_context(runtimeHelpers.config.jsThreadBlockingMode!) as any;
+                }
 
                 postMessageToMain({
                     monoCmd: WorkerToMainMessageType.deputyReady,

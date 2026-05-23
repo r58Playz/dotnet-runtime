@@ -19,6 +19,7 @@ const productVersion = process.env.ProductVersion || "8.0.0-dev";
 const nativeBinDir = process.env.NativeBinDir ? process.env.NativeBinDir.replace(/"/g, "") : "bin";
 const wasmObjDir = process.env.WasmObjDir ? process.env.WasmObjDir.replace(/"/g, "") : "obj";
 const wasmEnableThreads = process.env.WasmEnableThreads === "true" ? true : false;
+const wasmEnableJSPI = process.env.WasmEnableJSPI === "true" ? true : false;
 const wasmEnableSIMD = process.env.WASM_ENABLE_SIMD === "1" ? true : false;
 const wasmEnableExceptionHandling = process.env.WASM_ENABLE_EH === "1" ? true : false;
 const wasmEnableJsInteropByValue = process.env.ENABLE_JS_INTEROP_BY_VALUE == "1" ? true : false;
@@ -112,6 +113,7 @@ const envConstants = {
     productVersion,
     configuration,
     wasmEnableThreads,
+    wasmEnableJSPI,
     wasmEnableSIMD,
     wasmEnableExceptionHandling,
     gitHash,

@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 
 import { _lookup_js_owned_object, teardown_managed_proxy, upgrade_managed_proxy_to_strong_ref } from "./gc-handles";
 import { createPromiseController, loaderHelpers, mono_assert } from "./globals";
@@ -175,7 +176,13 @@ export class PromiseHolder extends ManagedObject {
             teardown_managed_proxy(this, this.gc_handle, /*skipManaged: */ true);
             // order of operations with teardown_managed_proxy matters
             // so that managed user code running in the continuation could allocate the same GCHandle number and the local registry would be already ok with that
-            complete_task(this.gc_handle, reason, data, this.res_converter || marshal_cs_object_to_cs);
+            if (WasmEnableJSPI) {
+                // Fire-and-forget under JSPI: the Promise resolves when the wasm side finishes.
+                // We're already inside a Promise resolve/reject callback (no caller to await us).
+                (complete_task(this.gc_handle, reason, data, this.res_converter || marshal_cs_object_to_cs) as Promise<void>).catch(() => { /* swallow */ });
+            } else {
+                complete_task(this.gc_handle, reason, data, this.res_converter || marshal_cs_object_to_cs);
+            }
         } catch (ex) {
             try {
                 loaderHelpers.mono_exit(1, ex);

@@ -432,6 +432,8 @@
       <_CmakeEnvironmentVariable Include="WASM_ENABLE_EVENTPIPE=0" Condition="'$(EnableDiagnostics)' != 'true'" />
       <_CmakeEnvironmentVariable Include="WASM_ENABLE_EH=1" Condition="'$(WasmEnableExceptionHandling)' != 'false'" />
       <_CmakeEnvironmentVariable Include="WASM_ENABLE_EH=0" Condition="'$(WasmEnableExceptionHandling)' == 'false'" />
+      <_CmakeEnvironmentVariable Include="WASM_ENABLE_JSPI=1" Condition="'$(WasmEnableJSPI)' == 'true'" />
+      <_CmakeEnvironmentVariable Include="WASM_ENABLE_JSPI=0" Condition="'$(WasmEnableJSPI)' != 'true'" />
       <_CmakeEnvironmentVariable Include="RUN_AOT_COMPILATION=1" Condition="'$(RunAOTCompilation)' == 'true'" />
       <_CmakeEnvironmentVariable Include="RUN_AOT_COMPILATION=0" Condition="'$(RunAOTCompilation)' != 'true'" />
       <_CmakeEnvironmentVariable Include="EM_CACHE=$(WasmCachePath)" Condition="'$(WasmCachePath)' != ''" />
@@ -574,6 +576,7 @@
       <_MonoRollupEnvironmentVariable Include="WasmObjDir:$(WasmObjDir)" />
       <_MonoRollupEnvironmentVariable Include="ProductVersion:$(RuntimePackProductVersion)" />
       <_MonoRollupEnvironmentVariable Include="WasmEnableThreads:$(WasmEnableThreads)" />
+      <_MonoRollupEnvironmentVariable Include="WasmEnableJSPI:$(WasmEnableJSPI)" />
       <_MonoRollupEnvironmentVariable Include="WASM_ENABLE_SIMD:1" Condition="'$(WasmEnableSIMD)' != 'false'" />
       <_MonoRollupEnvironmentVariable Include="WASM_ENABLE_SIMD:0" Condition="'$(WasmEnableSIMD)' == 'false'" />
       <_MonoRollupEnvironmentVariable Include="WASM_ENABLE_EH:1" Condition="'$(WasmEnableExceptionHandling)' != 'false'" />

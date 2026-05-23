@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 
 import type {
     MonoAssembly, MonoClass,
@@ -279,6 +280,18 @@ export const enum I52Error {
 
 const fastCwrapTypes = ["void", "number", null];
 
+// Exports whose entry-from-JS must be wrapped with WebAssembly.promising under JSPI,
+// so that any Suspending import called transitively from managed code can suspend the wasm stack.
+// See plan: src/mono/browser/runtime/cwraps.ts is the single chokepoint for both main thread
+// and per-worker instance binding (init_c_exports runs in both via mono_wasm_pre_init_essential).
+const jspiPromisingExports = WasmEnableJSPI ? new Set<string>([
+    "mono_wasm_invoke_jsexport",
+    "mono_wasm_invoke_jsexport_sync",
+    "mono_wasm_invoke_jsexport_sync_send",
+    "mono_wasm_invoke_jsexport_async_post",
+    "mono_wasm_synchronization_context_pump",
+]) : null;
+
 function cwrap (name: string, returnType: string | null, argTypes: string[] | undefined, opts: any): Function {
     // Attempt to bypass emscripten's generated wrapper if it is safe to do so
     let fce =
@@ -306,6 +319,23 @@ function cwrap (name: string, returnType: string | null, argTypes: string[] | un
     if (typeof (fce) !== "function") {
         const msg = `cwrap ${name} not found or not a function`;
         throw new Error(msg);
+    }
+
+    if (WasmEnableJSPI && jspiPromisingExports && jspiPromisingExports.has(name)) {
+        // init_c_exports() runs during preInit, before wasm instantiation completes,
+        // so Module.wasmExports may not be populated yet. Defer the WebAssembly.promising
+        // wrap until first invocation, then memoize.
+        let cached: Function | undefined;
+        return function jspiPromisingLazy (...args: any[]) {
+            if (!cached) {
+                const raw = (<any>Module["wasmExports"])[name];
+                mono_assert(typeof raw === "function", () => `cwrap ${name} raw export missing for JSPI wrap`);
+                mono_assert(typeof (<any>WebAssembly).promising === "function",
+                    "WebAssembly.promising is not available; rebuild with WasmEnableJSPI=false or run in a browser with JSPI support");
+                cached = (<any>WebAssembly).promising(raw);
+            }
+            return cached!(...args);
+        };
     }
     return fce;
 }

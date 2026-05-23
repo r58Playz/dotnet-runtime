@@ -285,6 +285,7 @@ export type EmscriptenBuildOptions = {
     enableEventPipe: boolean,
     runAOTCompilation: boolean,
     wasmEnableThreads: boolean,
+    wasmEnableJSPI: boolean,
     gitHash: string,
 };
 export type EmscriptenInternals = {

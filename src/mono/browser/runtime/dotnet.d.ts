@@ -731,6 +731,7 @@ type RuntimeAPI = {
         gitHash: string;
         buildConfiguration: string;
         wasmEnableThreads: boolean;
+        wasmEnableJSPI: boolean;
         wasmEnableSIMD: boolean;
         wasmEnableExceptionHandling: boolean;
     };

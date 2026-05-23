@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 import BuildConfiguration from "consts:configuration";
 
 import { DotnetModuleInternal, CharPtrNull, MainToWorkerMessageType } from "./types/internal";
@@ -146,8 +147,60 @@ async function instantiateWasmWorker (
     // Instantiate from the module posted from the main thread.
     // We can just use sync instantiation in the worker.
     const instance = new WebAssembly.Instance(Module.wasmModule!, imports);
-    successCallback(instance, undefined);
+    successCallback(maybeWrapInstanceForJSPI(instance), undefined);
     Module.wasmModule = null;
+}
+
+// Emscripten-internal exports that JS code (in dotnet.native.<hash>.js) calls
+// directly to enter wasm — these must be WebAssembly.promising-wrapped under JSPI
+// so the stack rooted at them is suspendable. Examples that get reached:
+//   _emscripten_check_mailbox  — worker mailbox tick that drives async JSExport
+//                                dispatch (mono_wasm_invoke_jsexport_async_post_cb)
+//
+// These are also SERIALIZED with the helper below: if a mailbox tick suspends
+// (e.g., glfwSwapBuffers awaits requestAnimationFrame), Mono's thread state
+// machine doesn't allow another mailbox tick to deliver a callback that
+// re-enters managed code on the same worker — it traps with
+// "Cannot transition thread 0 from STARTING with DONE_BLOCKING". So we hold
+// each mailbox call until the previous one's Promise has fully resolved.
+const JSPI_EMSCRIPTEN_EXPORTS = WasmEnableJSPI ? new Set<string>([
+    "_emscripten_check_mailbox",
+    "emscripten_check_mailbox",
+]) : null;
+
+function wrapPromisingSerialized (rawFn: Function): Function {
+    const promising = (<any>WebAssembly).promising(rawFn);
+    // Monotonic queue tail. Each call appends to the tail; the next call won't
+    // start its promising frame until the previous one's Promise has settled
+    // (resolved OR rejected — `.catch(() => {})` ensures a rejection doesn't
+    // stall the queue).
+    let tail: Promise<any> = Promise.resolve();
+    return function serializedMailbox (this: any, ...args: any[]) {
+        const next = tail.then(() => promising.apply(this, args));
+        tail = next.catch(() => undefined);
+        return next;
+    };
+}
+
+function maybeWrapInstanceForJSPI (instance: WebAssembly.Instance): WebAssembly.Instance {
+    if (!WasmEnableJSPI || !JSPI_EMSCRIPTEN_EXPORTS) return instance;
+    if (typeof (WebAssembly as any).promising !== "function") return instance;
+
+    // instance.exports is frozen — build a fresh object with the JSPI-wrapped
+    // entries replaced, then hand emscripten a synthetic instance whose
+    // .exports points at it. emscripten's receiveInstance only reads
+    // instance.exports (preamble.js:920), so this swap is safe for the
+    // non-MAIN_MODULE build.
+    const wrappedExports: any = {};
+    for (const key of Object.keys(instance.exports)) {
+        const orig = (<any>instance.exports)[key];
+        if (typeof orig === "function" && JSPI_EMSCRIPTEN_EXPORTS.has(key)) {
+            wrappedExports[key] = wrapPromisingSerialized(orig);
+        } else {
+            wrappedExports[key] = orig;
+        }
+    }
+    return <WebAssembly.Instance>{ exports: wrappedExports };
 }
 
 function preInit (userPreInit: ((module:EmscriptenModule) => void)[]) {
@@ -503,7 +556,7 @@ async function instantiate_wasm_module (
         replace_linker_placeholders(imports);
         const compiledModule = await loaderHelpers.wasmCompilePromise.promise;
         const compiledInstance = await WebAssembly.instantiate(compiledModule, imports);
-        successCallback(compiledInstance, compiledModule);
+        successCallback(maybeWrapInstanceForJSPI(compiledInstance), compiledModule);
 
         mono_log_debug("instantiate_wasm_module done");
 
@@ -528,6 +581,13 @@ async function ensureUsedWasmFeatures () {
     }
     if (runtimeHelpers.emscriptenBuildOptions.wasmEnableEH) {
         mono_assert(runtimeHelpers.featureWasmEh, "This browser/engine doesn't support WASM exception handling. Please use a modern version. See also https://aka.ms/dotnet-wasm-features");
+    }
+    if (runtimeHelpers.emscriptenBuildOptions.wasmEnableJSPI) {
+        const hasPromising = typeof (WebAssembly as any).promising === "function";
+        const hasSuspending = typeof (WebAssembly as any).Suspending === "function";
+        mono_assert(hasPromising && hasSuspending,
+            "This browser doesn't support WebAssembly JS Promise Integration (WebAssembly.promising / WebAssembly.Suspending). "
+            + "Use Chrome 137+ or rebuild with WasmEnableJSPI=false.");
     }
 }
 

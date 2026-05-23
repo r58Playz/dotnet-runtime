@@ -4,6 +4,7 @@
 import ProductVersion from "consts:productVersion";
 import BuildConfiguration from "consts:configuration";
 import WasmEnableThreads from "consts:wasmEnableThreads";
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 import WasmEnableSIMD from "consts:wasmEnableSIMD";
 import WasmEnableExceptionHandling from "consts:wasmEnableExceptionHandling";
 
@@ -62,6 +63,7 @@ function initializeExports (globalObjects: GlobalObjects): RuntimeAPI {
             gitHash: runtimeHelpers.gitHash,
             buildConfiguration: BuildConfiguration,
             wasmEnableThreads: WasmEnableThreads,
+            wasmEnableJSPI: WasmEnableJSPI,
             wasmEnableSIMD: WasmEnableSIMD,
             wasmEnableExceptionHandling: WasmEnableExceptionHandling,
         },

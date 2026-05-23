@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+import WasmEnableJSPI from "consts:wasmEnableJSPI";
 import { loaderHelpers } from "./globals";
 import { load_lazy_assembly } from "./managed-exports";
 import { type AssemblyAsset, type PdbAsset } from "./types";
@@ -73,6 +74,10 @@ export async function loadLazyAssembly (assemblyNameToLoad: string): Promise<boo
         pdb = null;
     }
 
-    load_lazy_assembly(dll, pdb);
+    if (WasmEnableJSPI) {
+        await (load_lazy_assembly(dll, pdb) as Promise<void>);
+    } else {
+        load_lazy_assembly(dll, pdb);
+    }
     return true;
 }
