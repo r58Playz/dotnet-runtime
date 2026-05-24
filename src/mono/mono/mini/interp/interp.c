@@ -2814,7 +2814,9 @@ init_jit_call_info (InterpMethod *rmethod, MonoError *error)
 #if HOST_BROWSER
 EMSCRIPTEN_KEEPALIVE void
 mono_jiterp_register_jit_call_thunk (void *cinfo, WasmJitCallThunk thunk) {
-	((JitCallInfo*)cinfo)->jiterp_thunk = thunk;
+	// Release-store the thunk pointer so threads that observe non-NULL also see the
+	//  fully-published compiled WASM function. Paired with the acquire-load in do_jit_call.
+	mono_atomic_store_ptr ((volatile gpointer *)&((JitCallInfo*)cinfo)->jiterp_thunk, (gpointer)thunk);
 }
 #endif
 
@@ -2843,8 +2845,9 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 	//  enough to justify it. At that point we can invoke the thunk to efficiently do most of
 	//  the work that would normally be done by do_jit_call
 	if (mono_opt_jiterpreter_jit_call_enabled) {
-		// FIXME: Thread safety for the thunk pointer
-		WasmJitCallThunk thunk = cinfo->jiterp_thunk;
+		// Acquire-load paired with the release-store in mono_jiterp_register_jit_call_thunk so
+		//  that observing a non-NULL pointer guarantees the compiled WASM function is visible.
+		WasmJitCallThunk thunk = (WasmJitCallThunk)mono_atomic_load_ptr ((volatile gpointer *)&cinfo->jiterp_thunk);
 		if (thunk) {
 			MonoFtnDesc ftndesc = {0};
 			ftndesc.addr = cinfo->addr;
@@ -9379,16 +9382,15 @@ mono_jiterp_isinst (MonoObject* object, MonoClass* klass)
 //  in the correct place and compute the stack offset, then it passes that in to this
 //  function in order to actually enter the interpreter and process the return value
 EMSCRIPTEN_KEEPALIVE void
-mono_jiterp_interp_entry (JiterpEntryData *_data, void *res)
+mono_jiterp_interp_entry (void *res)
 {
 	JiterpEntryDataHeader header;
 	MonoType *type;
 
-	// Copy the scratch buffer into a local variable. This is necessary for us to be
+	// Copy the thread-local header into a local variable. This is necessary for us to be
 	//  reentrant-safe because mono_interp_exec_method could end up hitting the trampoline
-	//  again
-	g_assert(_data);
-	header = _data->header;
+	//  again on the same thread.
+	header = mono_jiterp_get_interp_entry_data ()->header;
 
 	g_assert(header.rmethod);
 	g_assert(header.rmethod->method);

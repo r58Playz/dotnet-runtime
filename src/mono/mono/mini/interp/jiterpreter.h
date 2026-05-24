@@ -3,11 +3,9 @@
 
 #ifdef HOST_BROWSER
 
-#ifdef DISABLE_THREADS
+// Safe in MT because jiterp_thunk publication uses atomic release/acquire (see
+//  mono_jiterp_register_jit_call_thunk and the matching load in do_jit_call).
 #define JITERPRETER_ENABLE_JIT_CALL_TRAMPOLINES 1
-#else
-#define JITERPRETER_ENABLE_JIT_CALL_TRAMPOLINES 0
-#endif // DISABLE_THREADS
 
 // mono_interp_tier_prepare_jiterpreter will return these special values if it doesn't
 //  have a function pointer for a specific entry point.
@@ -212,7 +210,10 @@ void
 mono_jiterp_prof_leave (InterpFrame *frame, guint16 *ip);
 
 void
-mono_jiterp_interp_entry (JiterpEntryData *_data, void *res);
+mono_jiterp_interp_entry (void *res);
+
+JiterpEntryData *
+mono_jiterp_get_interp_entry_data (void);
 
 gpointer
 mono_jiterp_imethod_to_ftnptr (InterpMethod *imethod);
