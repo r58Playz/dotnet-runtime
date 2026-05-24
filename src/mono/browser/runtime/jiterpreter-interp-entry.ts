@@ -5,8 +5,7 @@ import { MonoMethod, MonoType } from "./types/internal";
 import { NativePointer } from "./types/emscripten";
 import { mono_assert } from "./globals";
 import {
-    setI32, getU32_unaligned, _zero_region,
-    malloc,
+    getU32_unaligned,
     free
 } from "./memory";
 import { WasmOpcode } from "./jiterpreter-opcodes";
@@ -15,14 +14,14 @@ import {
     WasmBuilder, addWasmFunctionPointer,
     _now, getRawCwrap, importDef,
     getWasmFunctionTable, recordFailure, getOptions,
-    JiterpreterOptions, getMemberOffset,
+    JiterpreterOptions,
     getCounter, modifyCounter
 } from "./jiterpreter-support";
 import { WasmValtype } from "./jiterpreter-opcodes";
 import { mono_log_error, mono_log_info } from "./logging";
 import { utf8ToString } from "./strings";
 import {
-    JiterpreterTable, JiterpCounter, JiterpMember, JitQueue
+    JiterpreterTable, JiterpCounter, JitQueue
 } from "./jiterpreter-enums";
 
 // Controls miscellaneous diagnostic output.
@@ -50,9 +49,7 @@ typedef struct {
 */
 
 const
-    maxInlineArgs = 16,
-    // just allocate a bunch of extra space
-    sizeOfJiterpEntryData = 64;
+    maxInlineArgs = 16;
 
 const maxJitQueueLength = 4,
     queueFlushDelayMs = 10;
@@ -283,15 +280,15 @@ function flush_wasm_entry_trampoline_jit_queue () {
         builder.defineType(
             "interp_entry_prologue",
             {
-                "pData": WasmValtype.i32,
+                "rmethod": WasmValtype.i32,
                 "this_arg": WasmValtype.i32,
+                "params_count": WasmValtype.i32,
             },
             WasmValtype.i32, true
         );
         builder.defineType(
             "interp_entry",
             {
-                "pData": WasmValtype.i32,
                 "res": WasmValtype.i32,
             },
             WasmValtype.void, true
@@ -390,7 +387,6 @@ function flush_wasm_entry_trampoline_jit_queue () {
             builder.beginFunction(traceName, {
                 "sp_args": WasmValtype.i32,
                 "need_unbox": WasmValtype.i32,
-                "scratchBuffer": WasmValtype.i32,
             });
 
             const ok = generate_wasm_body(builder, info);
@@ -551,23 +547,7 @@ function append_stackval_from_data (
 function generate_wasm_body (
     builder: WasmBuilder, info: TrampolineInfo
 ): boolean {
-    // FIXME: This is not thread-safe, but the alternative of alloca makes the trampoline
-    //  more expensive
-    // The solution is likely to put the address of the scratch buffer in a global that we provide
-    //  at module instantiation time, so each thread can malloc its own copy of the buffer
-    //  and then pass it in when instantiating instead of compiling the constant into the module
-    // FIXME: Pre-allocate these buffers and their constant slots at the start before we
-    //  generate function bodies, so that even if we run out of constant slots for MonoType we
-    //  will always have put the buffers in a constant slot. This will be necessary for thread safety
-    const scratchBuffer = <any>malloc(sizeOfJiterpEntryData);
-    _zero_region(scratchBuffer, sizeOfJiterpEntryData);
-
-    // Initialize the parameter count in the data blob. This is used to calculate the new value of sp
-    //  before entering the interpreter
-    setI32(
-        scratchBuffer + getMemberOffset(JiterpMember.ParamsCount),
-        info.paramTypes.length + (info.hasThisReference ? 1 : 0)
-    );
+    const paramsCount = info.paramTypes.length + (info.hasThisReference ? 1 : 0);
 
     // the this-reference may be a boxed struct that needs to be unboxed, for example calling
     //  methods like object.ToString on structs will end up with the unbox flag set
@@ -590,27 +570,22 @@ function generate_wasm_body (
         builder.endBlock();
     }
 
-    // Populate the scratch buffer containing call data
-    builder.ptr_const(scratchBuffer);
-    builder.local("scratchBuffer", WasmOpcode.tee_local);
+    // prologue(rmethod, this_arg, params_count) -> sp_args
+    // The prologue uses a thread-local JiterpEntryData for header state and delegate-invoke
+    //  caching, so no per-wrapper scratch buffer needs to be passed in. This is what makes
+    //  the wrapper safe to invoke concurrently from multiple threads.
 
     builder.local("rmethod");
     // Clear the unbox-this-reference flag if present (see above) so that rmethod is a valid ptr
     builder.i32_const(~0x1);
     builder.appendU8(WasmOpcode.i32_and);
 
-    // Store the cleaned up rmethod value into the data.rmethod field of the scratch buffer
-    builder.appendU8(WasmOpcode.i32_store);
-    builder.appendMemarg(getMemberOffset(JiterpMember.Rmethod), 0); // data.rmethod
-
-    // prologue takes data->rmethod and initializes data->context, then returns a value for sp_args
-    // prologue also performs thread attach
-    builder.local("scratchBuffer");
     // prologue takes this_arg so it can handle delegates
     if (info.hasThisReference)
         builder.local("this_arg");
     else
         builder.i32_const(0);
+    builder.i32_const(paramsCount);
     builder.callImport("interp_entry_prologue");
     builder.local("sp_args", WasmOpcode.set_local);
 
@@ -643,7 +618,6 @@ function generate_wasm_body (
         append_stackval_from_data(builder, info.imethod, type, `arg${i}`, i + (info.hasThisReference ? 1 : 0));
     }
 
-    builder.local("scratchBuffer");
     if (info.hasReturnValue)
         builder.local("res");
     else

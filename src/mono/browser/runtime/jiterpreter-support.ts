@@ -20,7 +20,7 @@ export const maxFailures = 2,
     shortNameBase = 36,
     // NOTE: This needs to be big enough to hold the maximum module size since there's no auto-growth
     //  support yet. If that becomes a problem, we should just make it growable
-    blobBuilderCapacity = 24 * 1024,
+    blobBuilderCapacity = 64 * 1024,
     INT32_MIN = -2147483648;
 
 // uint16

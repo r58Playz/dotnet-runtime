@@ -518,29 +518,42 @@ mono_jiterp_adjust_abort_count (MintOpcode opcode, gint32 delta) {
 	return jiterpreter_abort_counts[opcode];
 }
 
-// at the start of a jitted interp_entry wrapper, this is called to perform initial setup
-//  like resolving the target for delegates and setting up the thread context
-// inlining this into the wrappers would make them unnecessarily big and complex
-EMSCRIPTEN_KEEPALIVE stackval *
-mono_jiterp_interp_entry_prologue (JiterpEntryData *data, void *this_arg)
+// Thread-local per-call scratch storage for jitted interp_entry wrappers.
+// The header is per-call (rmethod/context/orig_domain/attach_cookie/params_count),
+//  and the delegate-invoke cache is per-thread too — concurrent calls on different
+//  threads each maintain their own cache, which costs at most one extra delegate
+//  resolution per (thread, wrapper) pair but eliminates the need for cross-thread
+//  synchronization on the cache.
+#ifdef DISABLE_THREADS
+static JiterpEntryData jiterp_entry_data;
+#else
+static __thread JiterpEntryData jiterp_entry_data;
+#endif
+
+JiterpEntryData *
+mono_jiterp_get_interp_entry_data (void)
 {
+	return &jiterp_entry_data;
+}
+
+// at the start of a jitted interp_entry wrapper, this is called to perform initial setup
+//  like resolving the target for delegates and setting up the thread context.
+// rmethod, this_arg, and params_count are passed by value so the wrapper does not need
+//  to share any mutable scratch buffer across threads.
+EMSCRIPTEN_KEEPALIVE stackval *
+mono_jiterp_interp_entry_prologue (InterpMethod *rmethod, void *this_arg, int params_count)
+{
+	JiterpEntryData *data = &jiterp_entry_data;
 	stackval *sp_args;
-	InterpMethod *rmethod;
 	ThreadContext *context;
 
-	// unbox implemented by jit
-
-	jiterp_assert(data);
-	rmethod = data->header.rmethod;
 	jiterp_assert(rmethod);
 
 	// Is this method MulticastDelegate.Invoke?
 	if (rmethod->is_invoke) {
-		// Copy the current state of the cache before using it
-		JiterpEntryDataCache cache = data->cache;
-		if (this_arg && (cache.delegate_invoke_is_for == (MonoDelegate*)this_arg)) {
-			// We previously cached the invoke for this delegate
-			data->header.rmethod = rmethod = cache.delegate_invoke_rmethod;
+		if (this_arg && (data->cache.delegate_invoke_is_for == (MonoDelegate*)this_arg)) {
+			// We previously cached the invoke for this delegate on this thread
+			rmethod = data->cache.delegate_invoke_rmethod;
 		} else {
 			/*
 			* This happens when AOT code for the invoke wrapper is not found.
@@ -548,19 +561,16 @@ mono_jiterp_interp_entry_prologue (JiterpEntryData *data, void *this_arg)
 			*/
 			MonoDelegate *del = (MonoDelegate*)this_arg;
 			MonoMethod *method = mono_marshal_get_delegate_invoke (rmethod->method, del);
-			data->header.rmethod = rmethod = mono_interp_get_imethod (method);
+			rmethod = mono_interp_get_imethod (method);
 
-			// Cache the delegate invoke. This works because data was allocated statically
-			//  when the jitted trampoline was created, so it will stick around.
-			// FIXME: Thread safety
-			data->cache.delegate_invoke_is_for = NULL;
 			data->cache.delegate_invoke = method;
 			data->cache.delegate_invoke_rmethod = rmethod;
 			data->cache.delegate_invoke_is_for = del;
 		}
 	}
 
-	// FIXME: Thread safety
+	data->header.rmethod = rmethod;
+	data->header.params_count = params_count;
 
 	if (rmethod->needs_thread_attach)
 		data->header.orig_domain = mono_threads_attach_coop (mono_domain_get (), &data->header.attach_cookie);
