@@ -6917,8 +6917,8 @@ retry_emit:
 					if (!td->disable_ssa) {
 						// Make sure this arg is defined for SSA optimizations
 						interp_add_ins (td, MINT_DEF);
+						td->last_ins->dreg = call_args [0];
 					}
-					td->last_ins->dreg = call_args [0];
 					for (int i = 0; i < csignature->param_count; i++) {
 						call_args [i + 1] = td->sp [i].var;
 					}
