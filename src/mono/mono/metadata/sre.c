@@ -3366,8 +3366,14 @@ ctorbuilder_to_mono_method (MonoClass *klass, MonoReflectionCtorBuilder* mb, Mon
 	goto_if_nok (error, exit_null);
 	mono_save_custom_attrs (klass->image, mb->mhandle, mb->cattrs);
 
-	/* ilgen is no longer needed */
-	mb->ilgen = NULL;
+	/*
+	 * Keep ilgen alive. A TypeBuilder can be materialized more than once (e.g. it gets
+	 * pulled in as the parent/interface of another type's create_runtime_class before
+	 * its own CreateType runs). Nulling ilgen here makes the second materialization —
+	 * and the managed CreateType's fixup() — observe a builder with no IL, producing a
+	 * zero-length method body / false BadEmptyMethodBody. The generator is released by
+	 * RuntimeTypeBuilder.CreateTypeInfoCore once the declaring type is baked.
+	 */
 	ret = mb->mhandle;
 	goto exit;
 exit_null:
@@ -3405,8 +3411,14 @@ methodbuilder_to_mono_method (MonoClass *klass, MonoReflectionMethodBuilderHandl
 	MONO_HANDLE_SETVAL (ref_mb, mhandle, MonoMethod*, method);
 	mono_save_custom_attrs (klass->image, method, mb->cattrs);
 
-	/* ilgen is no longer needed */
-	mb->ilgen = NULL;
+	/*
+	 * Keep ilgen alive. A TypeBuilder can be materialized more than once (e.g. it gets
+	 * pulled in as the parent/interface of another type's create_runtime_class before
+	 * its own CreateType runs). Nulling ilgen here makes the second materialization —
+	 * and the managed CreateType's fixup() — observe a builder with no IL, producing a
+	 * zero-length method body / false BadEmptyMethodBody. The generator is released by
+	 * RuntimeTypeBuilder.CreateTypeInfoCore once the declaring type is baked.
+	 */
 	ret = method;
 	goto exit;
 exit_null:

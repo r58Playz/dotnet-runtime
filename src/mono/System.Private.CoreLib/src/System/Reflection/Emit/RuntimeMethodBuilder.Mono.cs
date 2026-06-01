@@ -407,6 +407,15 @@ namespace System.Reflection.Emit
             ilgen?.label_fixup(this);
         }
 
+        // Release the IL generator once the declaring type is baked (called from
+        // RuntimeTypeBuilder.CreateTypeInfoCore). It is only needed through
+        // materialization/fixup; a baked type is never re-materialized. This restores
+        // the original post-CreateType state (ilgen == null) that native materialization
+        // used to produce eagerly, but is deferred so a type materialized before its own
+        // CreateType (pulled in via another type's create_runtime_class) keeps its IL for
+        // the second materialization.
+        internal void release_ilgen() => ilgen = null;
+
         internal void ResolveUserTypes()
         {
             rtype = RuntimeTypeBuilder.ResolveUserType(rtype);

@@ -820,6 +820,22 @@ namespace System.Reflection.Emit
             if (created == null)
                 System.IO.File.WriteAllText("/dev/stderr", $"[CreateTypeInfoCore] create_runtime_class returned null for {FullName} (no exception)\n");
 
+            // The type is now baked. Release each member's IL generator: it is only needed
+            // through materialization/fixup, and ensure_runtime_vtable won't re-materialize a
+            // type once wastypebuilder is set (which create_runtime_class just did). Deferring
+            // the release to here — rather than nulling ilgen during native materialization —
+            // keeps the IL available for types materialized before their own CreateType runs
+            // (pulled in via another type's create_runtime_class), while still reclaiming it.
+            if (created != null)
+            {
+                if (methods != null)
+                    for (int i = 0; i < num_methods; ++i)
+                        methods[i].release_ilgen();
+                if (ctors != null)
+                    foreach (RuntimeConstructorBuilder ctor in ctors)
+                        ctor.release_ilgen();
+            }
+
             if (is_hidden_global_type)
             {
                 return null!;

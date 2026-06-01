@@ -314,6 +314,10 @@ namespace System.Reflection.Emit
             ilgen?.label_fixup(this);
         }
 
+        // See RuntimeMethodBuilder.release_ilgen. Called from CreateTypeInfoCore once the
+        // declaring type is baked to reclaim the IL generator.
+        internal void release_ilgen() => ilgen = null;
+
         internal void ResolveUserTypes()
         {
             RuntimeTypeBuilder.ResolveUserTypes(parameters);
