@@ -25,11 +25,13 @@ export function collectCpuSamples (options?:DiagnosticCommandOptions):Promise<Ui
         }, 1000 * (options?.durationSeconds ?? 60));
     }
 
+    (Module as any)._diag_set_step?.(11);
     setupJsClient({
         onClosePromise:onClosePromise.promise_control,
         skipDownload:options.skipDownload,
         commandOnAdvertise: () => commandSampleProfiler(options),
         onSessionStart,
     });
+    (Module as any)._diag_set_step?.(12);
     return onClosePromise.promise;
 }
