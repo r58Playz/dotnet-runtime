@@ -431,3 +431,79 @@ mono_wasm_marshal_get_managed_wrapper (const char* assemblyName, const char* nam
 	mono_compile_method (managedWrapper);
 	MONO_EXIT_GC_UNSAFE;
 }
+
+/* === on-demand MT EventPipe CPU-trace bridge (shared linear memory) ===
+ *
+ * In multi-threaded builds the EventPipe diagnostic server runs on its own worker pthread and
+ * owns the JS `serverSession`, so a trace must be driven from that worker. The worker spends its
+ * idle time parked inside the DS poll loop (Atomics.wait) and never drains the emscripten/mono
+ * proxy queue, so emscripten_dispatch can't reach it; instead it services requests from its own
+ * poll loop (which runs every <=500ms) by reading this control block. All wasm threads share
+ * linear memory, so these statics are visible from the UI thread (which posts the request and
+ * drains the result) and from the DS / sampling / streaming workers (which fulfil it).
+ *
+ * The matching JS lives in src/mono/browser/runtime/diagnostics/ (it calls these as
+ * Module._diag_*); they are exported via EmccExportedFunction in build/BrowserWasmApp.targets so
+ * any app relinking against this runtime pack gets a working MT trace path with no app-side shim.
+ * A consumer drives a collection by: _diag_stream_reset(); _diag_trace_request(ms); poll
+ * _diag_stream_is_done()/_diag_stream_len() until it plateaus; then read _diag_stream_ptr()/len().
+ */
+
+/* UI thread posts a requested collection duration (ms); the DS worker takes it from its poll loop. */
+static volatile int32_t diag_trace_request_ms = 0;
+EMSCRIPTEN_KEEPALIVE void    diag_trace_request (int32_t ms) { diag_trace_request_ms = ms; }
+EMSCRIPTEN_KEEPALIVE int32_t diag_trace_take_request (void) {
+	int32_t v = diag_trace_request_ms;
+	diag_trace_request_ms = 0;
+	return v;
+}
+
+/* Handshake step tracers: worker-side mono_log_warn doesn't reach the UI console, so the JS
+ * diagnostics code records progress here and the UI thread can read it back when debugging. */
+static volatile int32_t diag_step = 0;
+EMSCRIPTEN_KEEPALIVE void    diag_set_step (int32_t s) { diag_step = s; }
+EMSCRIPTEN_KEEPALIVE int32_t diag_get_step (void)      { return diag_step; }
+static volatile int32_t diag_step2 = 0;
+EMSCRIPTEN_KEEPALIVE void    diag_set_step2 (int32_t s) { diag_step2 = s; }
+EMSCRIPTEN_KEEPALIVE int32_t diag_get_step2 (void)      { return diag_step2; }
+
+/* Cross-worker .nettrace accumulator. The EventPipe streaming thread writes the trace stream from
+ * a worker whose JS socket map is uninitialized (only the DS-server worker has it); rather than
+ * fault that thread mid stop-the-world, the JS routes those writes here, in shared linear memory,
+ * and the UI-thread harness drains the result. Single writer (streaming thread); the UI thread
+ * reads only after diag_stream_done is set (or after the length plateaus). */
+static volatile int32_t  diag_stream_done = 0;
+static uint8_t          *diag_stream_buf  = 0;
+static int32_t           diag_stream_size = 0;
+static int32_t           diag_stream_cap  = 0;
+
+EMSCRIPTEN_KEEPALIVE void diag_stream_append (uint8_t *src, int32_t len) {
+	if (len <= 0)
+		return;
+	if (diag_stream_size + len > diag_stream_cap) {
+		int32_t newcap = diag_stream_cap ? diag_stream_cap * 2 : 1 << 16;
+		while (newcap < diag_stream_size + len)
+			newcap *= 2;
+		uint8_t *nb = (uint8_t *)realloc (diag_stream_buf, (size_t)newcap);
+		if (!nb)
+			return; /* OOM: drop the chunk rather than crash */
+		diag_stream_buf = nb;
+		diag_stream_cap = newcap;
+	}
+	memcpy (diag_stream_buf + diag_stream_size, src, (size_t)len);
+	diag_stream_size += len;
+}
+
+EMSCRIPTEN_KEEPALIVE int32_t  diag_stream_len (void)       { return diag_stream_size; }
+EMSCRIPTEN_KEEPALIVE uint8_t *diag_stream_ptr (void)       { return diag_stream_buf; }
+EMSCRIPTEN_KEEPALIVE void     diag_stream_mark_done (void) { diag_stream_done = 1; }
+EMSCRIPTEN_KEEPALIVE int32_t  diag_stream_is_done (void)   { return diag_stream_done; }
+EMSCRIPTEN_KEEPALIVE void     diag_stream_reset (void) {
+	diag_stream_done = 0;
+	if (diag_stream_buf) {
+		free (diag_stream_buf);
+		diag_stream_buf = 0;
+	}
+	diag_stream_size = 0;
+	diag_stream_cap = 0;
+}

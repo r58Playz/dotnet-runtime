@@ -699,6 +699,11 @@ JS_ENGINES = [NODE_JS]
       <_MonoCMakeArgs Include="-DFEATURE_PERFTRACING_DISABLE_PERFTRACING_LISTEN_PORTS=1"/>
       <_MonoCMakeArgs Include="-DFEATURE_PERFTRACING_DISABLE_DEFAULT_LISTEN_PORT=1"/>
       <_MonoCMakeArgs Include="-DFEATURE_PERFTRACING_DISABLE_THREADS=1" Condition="'$(WasmEnableThreads)' != 'true'" />
+      <!-- Pass =0 explicitly (instead of omitting) for the threaded build so a stale CMake
+           cache from a prior single-threaded/cooperative configure is overridden rather than
+           retained — dropping a -D does not clear a cached entry, which otherwise leaves
+           PERFTRACING_DISABLE_THREADS defined and breaks the MT diagnostics build. -->
+      <_MonoCMakeArgs Include="-DFEATURE_PERFTRACING_DISABLE_THREADS=0" Condition="'$(WasmEnableThreads)' == 'true'" />
     </ItemGroup>
 
     <!-- Components -->

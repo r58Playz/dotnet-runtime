@@ -255,7 +255,22 @@ ds_ipc_poll (
 			poll_handles_data [i].events = (uint8_t)IPC_POLL_EVENTS_SIGNALED;
 			return 1;
 		}
+		poll_handles_data [i].events = (uint8_t)IPC_POLL_EVENTS_NONE;
 	}
+
+#ifndef PERFTRACING_DISABLE_THREADS
+	// ds_rt_websocket_poll is non-blocking and this PAL otherwise ignores timeout_ms. With
+	// threads enabled the diagnostic-server thread calls this in a tight !stream loop; when a
+	// client port is connected but idle every iteration returns 0 with no sleep, so the thread
+	// stays in GC-unsafe (running) state and starves the GC's stop-the-world (-> suspend
+	// timeout -> abort). Honor the timeout by sleeping GC-safe (ep_rt_thread_sleep enters
+	// GC-safe mode) for a bounded slice so the thread is suspendable while idle. This also lets
+	// the connect/advertise handshake complete instead of being starved by the spin.
+	uint32_t sleep_ms = (timeout_ms == IPC_TIMEOUT_INFINITE || timeout_ms > DS_IPC_POLL_TIMEOUT_MAX_MS)
+		? DS_IPC_POLL_TIMEOUT_MAX_MS
+		: (timeout_ms < DS_IPC_POLL_TIMEOUT_MIN_MS ? DS_IPC_POLL_TIMEOUT_MIN_MS : timeout_ms);
+	ep_rt_thread_sleep ((uint64_t)sleep_ms * 1000000);
+#endif
 
 	return 0;
 }

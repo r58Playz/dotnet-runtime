@@ -347,6 +347,21 @@
       <_EmccLDFlags Include="-s EXPORT_ES6=1 -lexports.js" />
       <EmccExportedFunction Condition="'$(WasmEnableExceptionHandling)' == 'true'" Include="___cpp_exception" />
 
+      <!-- on-demand MT EventPipe CPU-trace bridge (src/mono/browser/runtime/runtime.c); driven by
+           the diagnostics JS and consumed by app harnesses. See the diag_* block in runtime.c. -->
+      <EmccExportedFunction Include="_diag_trace_request" />
+      <EmccExportedFunction Include="_diag_trace_take_request" />
+      <EmccExportedFunction Include="_diag_set_step" />
+      <EmccExportedFunction Include="_diag_get_step" />
+      <EmccExportedFunction Include="_diag_set_step2" />
+      <EmccExportedFunction Include="_diag_get_step2" />
+      <EmccExportedFunction Include="_diag_stream_append" />
+      <EmccExportedFunction Include="_diag_stream_len" />
+      <EmccExportedFunction Include="_diag_stream_ptr" />
+      <EmccExportedFunction Include="_diag_stream_mark_done" />
+      <EmccExportedFunction Include="_diag_stream_is_done" />
+      <EmccExportedFunction Include="_diag_stream_reset" />
+
       <_RuntimeCDependencies Include="$(_WasmPInvokeHPath);$(_WasmICallTablePath)" />
       <_RuntimeCDependencies Include="$(_DriverGenCPath)" Condition="'$(_DriverGenCNeeded)' == 'true'" />
 
