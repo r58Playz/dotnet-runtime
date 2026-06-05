@@ -710,6 +710,11 @@ typedef struct {
 	gint64 hit_count;
 	JiterpreterThunk thunk;
 	int penalty_total;
+	// The method this trace entry point belongs to. Stored so a cross-thread heat dump can
+	//  resolve method names from C (the JS-side traceInfo with names is per-worker and can't be
+	//  read from another thread). hit_count is already a shared global atomic, so reading this
+	//  table from any thread gives the heat aggregated across every thread that ran the trace.
+	MonoMethod *method;
 } TraceInfo;
 
 // The maximum number of trace segments used to store TraceInfo. This limits
@@ -870,6 +875,8 @@ jiterp_insert_entry_points (void *_imethod, void *_td)
 			} else {
 				td->cbb = bb;
 				imethod->contains_traces = TRUE;
+				// record the owning method so a C-side heat dump can name this trace (see TraceInfo)
+				trace_info_get (trace_index)->method = imethod->method;
 				InterpInst *ins = mono_jiterp_insert_ins (td, NULL, MINT_TIER_PREPARE_JITERPRETER);
 				// [opcode] [relative_fn_ptr] [trace_index_01] [trace_index_23]
 				ins->data[0] = 0;
@@ -913,6 +920,29 @@ jiterp_insert_entry_points (void *_imethod, void *_td)
 EMSCRIPTEN_KEEPALIVE double
 mono_jiterp_get_trace_hit_count (gint32 trace_index) {
 	return trace_info_get (trace_index)->hit_count;
+}
+
+// Cross-thread jiterpreter heat introspection. The TraceInfo table (hit_count + method) is global
+//  shared memory, so these can be called from any thread (e.g. the UI thread) to read the heat
+//  aggregated across every thread that ran each trace. No stop-the-world / per-worker JS needed.
+EMSCRIPTEN_KEEPALIVE gint32
+mono_jiterp_get_trace_count (void) {
+	return trace_count;
+}
+
+EMSCRIPTEN_KEEPALIVE MonoMethod *
+mono_jiterp_get_trace_method (gint32 trace_index) {
+	if (trace_index < 0 || trace_index >= trace_count)
+		return NULL;
+	return trace_info_get (trace_index)->method;
+}
+
+// 1 if a compiled thunk has been installed for this trace, else 0 (hot + 0 => failed to jit).
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_get_trace_is_compiled (gint32 trace_index) {
+	if (trace_index < 0 || trace_index >= trace_count)
+		return 0;
+	return trace_info_get (trace_index)->thunk != NULL ? 1 : 0;
 }
 
 MONO_NEVER_INLINE JiterpreterThunk
