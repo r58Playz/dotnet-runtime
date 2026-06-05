@@ -225,6 +225,8 @@ export function mono_interp_invoke_wasm_jit_call_trampoline (
 //  not waiting in the jit queue
 export function mono_jiterp_free_method_data_jit_call (method: MonoMethod) {
     // FIXME
+    // Normalize so a method pointer >= 2GB matches the unsigned key used by infosByMethod
+    method = method as any >>> 0 as any;
     const infoArray = infosByMethod[<any>method];
     if (!infoArray)
         return;
@@ -289,7 +291,9 @@ export function mono_interp_jit_wasm_jit_call_trampoline (
 export function mono_interp_flush_jitcall_queue (): void {
     const jitQueue: TrampolineInfo[] = [];
     let methodPtr = <MonoMethod><any>0;
-    while ((methodPtr = <any>cwraps.mono_jiterp_tlqueue_next(JitQueue.JitCall)) != 0) {
+    // tlqueue_next returns an i32, so a method pointer >= 2GB comes back as a negative
+    //  number. infosByMethod is keyed by the unsigned value, so normalize before lookup.
+    while ((methodPtr = <any>(cwraps.mono_jiterp_tlqueue_next(JitQueue.JitCall) as any >>> 0)) != 0) {
         const infos = infosByMethod[<any>methodPtr];
         if (!infos) {
             mono_log_info(`Failed to find corresponding info list for method ptr ${methodPtr} from jit queue!`);
