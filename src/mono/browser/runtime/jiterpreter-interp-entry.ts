@@ -158,6 +158,8 @@ let mostRecentOptions: JiterpreterOptions | undefined = undefined;
 //  allocated at that exact memory offset later) and more importantly, ensure it is
 //  not waiting in the jit queue
 export function mono_jiterp_free_method_data_interp_entry (imethod: number) {
+    // Normalize so an imethod pointer >= 2GB matches the unsigned key used by infoTable
+    imethod = imethod >>> 0;
     delete infoTable[imethod];
 }
 
@@ -252,7 +254,9 @@ function ensure_jit_is_scheduled () {
 function flush_wasm_entry_trampoline_jit_queue () {
     const jitQueue : TrampolineInfo[] = [];
     let methodPtr = <MonoMethod><any>0;
-    while ((methodPtr = <any>cwraps.mono_jiterp_tlqueue_next(JitQueue.InterpEntry)) != 0) {
+    // tlqueue_next returns an i32, so an imethod pointer >= 2GB comes back as a negative
+    //  number. infoTable is keyed by the unsigned value, so normalize before lookup.
+    while ((methodPtr = <any>(cwraps.mono_jiterp_tlqueue_next(JitQueue.InterpEntry) as any >>> 0)) != 0) {
         const info = infoTable[<any>methodPtr];
         if (!info) {
             mono_log_info(`Failed to find corresponding info for method ptr ${methodPtr} from jit queue!`);
