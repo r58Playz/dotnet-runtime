@@ -185,6 +185,12 @@ typedef struct {
 //  separately so that we don't have to maintain a sorted table (for bsearch) on an
 //  ongoing basis.
 static interp_pgo_table *loaded_table, *building_table;
+// Methods requested to be tiered at runtime via mono_interp_pgo_add_method (e.g. translated from a
+// version-independent mojmap list). Kept separate from the immutable, lock-free loaded_table;
+// consulted by should_tier_method under building_table_lock. Sorted lazily (dirty flag) so a batch
+// of adds costs one sort rather than one per add.
+static interp_pgo_table *manual_table;
+static gboolean manual_table_dirty;
 // Loaded_table is immutable once loaded, so it has no mutex. Any access to building_table
 //  needs to be performed while holding this mutex.
 static mono_mutex_t building_table_lock;
@@ -241,28 +247,41 @@ table_sort_locked (interp_pgo_table *table) {
 
 static void
 compute_method_hash (MonoMethod *method, uint8_t outbuf[MM3_HASH_BYTE_SIZE]) {
-	// method token + image guid
-	size_t size = sizeof(uint32_t) + 16;
-	uint32_t *inbuf = alloca (size);
-	// method tokens are globally unique within a given assembly
-	inbuf[0] = mono_method_get_token (method);
-	// use the assembly guid as a unique id for the assembly
-	MonoImage *image = m_class_get_image (mono_method_get_class (method));
-	memcpy (inbuf + 1, mono_image_get_guid (image), 16);
-
-	MurmurHash3_128 (inbuf, size, 0x43219876, (uint8_t *)outbuf);
+	// Key the table on the method's stable full name (incl. signature) rather than
+	// (token + assembly MVID). IKVM loads Java classes (Minecraft + libraries) into DYNAMIC
+	// assemblies whose MVID is randomized every run (System.Reflection.Emit), so a token+MVID key
+	// never matches across runs -- PGO can't target interpreted Java code at all that way. The
+	// full name is stable for a given build of the bytecode, so a recorded -- or hand-authored,
+	// name-hashed -- table persists across runs and can be scoped per Minecraft version. The
+	// string here is exactly what mono_interp_pgo_method_was_tiered logs ("added <name> to
+	// table"), so an offline generator can hash those logged names verbatim and match.
+	char *name = mono_method_full_name (method, TRUE);
+	MurmurHash3_128 (name, strlen (name), 0x43219876, outbuf);
+	g_free (name);
 }
 
 gboolean
 mono_interp_pgo_should_tier_method (MonoMethod *method) {
-	// If we didn't load a table, don't bother hashing the method.
-	if (!loaded_table)
+	// If we didn't load a table and nothing was added at runtime, don't bother hashing.
+	if (!loaded_table && !manual_table)
 		return FALSE;
 
 	uint8_t hash[MM3_HASH_BYTE_SIZE];
 	compute_method_hash (method, hash);
 
-	if (table_lookup (loaded_table, hash)) {
+	gboolean found = loaded_table && table_lookup (loaded_table, hash) != NULL;
+	if (!found && manual_table) {
+		// manual_table is mutated at runtime, so guard the lookup; sort lazily once per add-batch.
+		mono_os_mutex_lock (&building_table_lock);
+		if (manual_table_dirty) {
+			table_sort_locked (manual_table);
+			manual_table_dirty = FALSE;
+		}
+		found = table_lookup (manual_table, hash) != NULL;
+		mono_os_mutex_unlock (&building_table_lock);
+	}
+
+	if (found) {
 		if (mono_opt_interp_pgo_logging) {
 			char * name = mono_method_full_name (method, TRUE);
 			g_print ("Tiering %s because it was in the interp_pgo table\n", name);
@@ -273,6 +292,28 @@ mono_interp_pgo_should_tier_method (MonoMethod *method) {
 	}
 
 	return FALSE;
+}
+
+// Add a single method to the active interp_pgo table at runtime so it is compiled optimized
+// (inlined + jiterpreter-traced) from its first call. Intended for building a table at runtime
+// from a curated, version-independent list: resolve each entry to its MonoMethod (e.g. via
+// reflection / mojmap->intermediary) and call this. The hash is computed here, so callers never
+// replicate the name format or MurmurHash. Call before the target methods are first compiled.
+void
+mono_interp_pgo_add_method (MonoMethod *method) {
+	if (!method)
+		return;
+	uint8_t hash[MM3_HASH_BYTE_SIZE] = {0};
+	compute_method_hash (method, hash);
+	mono_os_mutex_lock (&building_table_lock);
+	table_add_locked (&manual_table, hash);
+	manual_table_dirty = TRUE;
+	mono_os_mutex_unlock (&building_table_lock);
+	if (mono_opt_interp_pgo_logging) {
+		char *name = mono_method_full_name (method, TRUE);
+		g_print ("interp_pgo: manually added %s\n", name);
+		g_free (name);
+	}
 }
 
 void
