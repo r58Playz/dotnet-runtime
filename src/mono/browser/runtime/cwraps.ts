@@ -107,6 +107,7 @@ const fn_signatures: SigLine[] = [
     [true, "mono_jiterp_imethod_to_ftnptr", "number", ["number"]],
     [true, "mono_jiterp_debug_count", "number", []],
     [true, "mono_jiterp_get_trace_hit_count", "number", ["number"]],
+    [true, "mono_jiterp_record_trace_abort", "number", ["number", "number"]],
     [true, "mono_jiterp_get_polling_required_address", "number", []],
     [true, "mono_jiterp_get_rejected_trace_count", "number", []],
     [true, "mono_jiterp_boost_back_branch_target", "void", ["number"]],
@@ -234,6 +235,7 @@ export interface t_Cwraps {
     mono_jiterp_imethod_to_ftnptr(imethod: VoidPtr): VoidPtr;
     mono_jiterp_debug_count(): number;
     mono_jiterp_get_trace_hit_count(traceIndex: number): number;
+    mono_jiterp_record_trace_abort(traceIndex: number, abortReason: number): number;
     mono_jiterp_get_polling_required_address(): Int32Ptr;
     mono_jiterp_write_number_unaligned(destination: VoidPtr, value: number, mode: number): void;
     mono_jiterp_get_rejected_trace_count(): number;

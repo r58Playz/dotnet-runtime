@@ -983,10 +983,20 @@ export function trace_operands (a: number, b: number) {
 }
 
 export function record_abort (traceIndex: number, ip: MintOpcodePtr, traceName: string, reason: string | MintOpcode) {
+    // Reason code parked in the shared C TraceInfo so a cross-thread heat dump can attribute, per hot
+    //  uncompiled trace, why it failed to jit. >= 0: the MINT opcode; negatives: string reasons
+    //  (-1 too-small/end-of-body, -2 too-big, -3 other). See mono_jiterp_record_trace_abort.
+    let abortReasonCode: number;
     if (typeof (reason) === "number") {
+        abortReasonCode = reason;
         cwraps.mono_jiterp_adjust_abort_count(reason, 1);
         reason = getOpcodeName(reason);
     } else {
+        abortReasonCode = (reason === "trace-too-big")
+            ? -2
+            : ((reason === "end-of-body") || (reason === "trace-too-small"))
+                ? -1
+                : -3;
         let abortCount = abortCounts[reason];
         if (typeof (abortCount) !== "number")
             abortCount = 1;
@@ -995,6 +1005,8 @@ export function record_abort (traceIndex: number, ip: MintOpcodePtr, traceName: 
 
         abortCounts[reason] = abortCount;
     }
+
+    cwraps.mono_jiterp_record_trace_abort(traceIndex, abortReasonCode);
 
     if ((traceAbortLocations && (reason !== "end-of-body")) || (trace >= 2))
         mono_log_info(`abort #${traceIndex} ${traceName}@${ip} ${reason}`);

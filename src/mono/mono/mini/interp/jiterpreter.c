@@ -715,7 +715,17 @@ typedef struct {
 	//  read from another thread). hit_count is already a shared global atomic, so reading this
 	//  table from any thread gives the heat aggregated across every thread that ran the trace.
 	MonoMethod *method;
+	// Why the most recent generation attempt for this trace entry point ended. Lets a cross-thread
+	//  heat dump show, per hot uncompiled trace, the opcode/reason that kept it from being jitted.
+	//   >= 0 : the MINT opcode that ended generation (resolve via mono_interp_opname)
+	//   -1   : rejected, trace too small / reached end of body
+	//   -2   : trace too big
+	//   -3   : other (string) reason
+	//   -100 : never attempted to compile (JITERP_ABORT_NONE)
+	gint32 abort_reason;
 } TraceInfo;
+
+#define JITERP_ABORT_NONE (-100)
 
 // The maximum number of trace segments used to store TraceInfo. This limits
 //  the maximum total number of traces to MAX_TRACE_SEGMENTS * TRACE_SEGMENT_SIZE
@@ -780,6 +790,7 @@ trace_info_alloc () {
 	TraceInfo *info = trace_info_get (index);
 	info->hit_count = 0;
 	info->thunk = NULL;
+	info->abort_reason = JITERP_ABORT_NONE;
 	return index;
 }
 
@@ -943,6 +954,27 @@ mono_jiterp_get_trace_is_compiled (gint32 trace_index) {
 	if (trace_index < 0 || trace_index >= trace_count)
 		return 0;
 	return trace_info_get (trace_index)->thunk != NULL ? 1 : 0;
+}
+
+// Records why the most recent generation attempt for this trace entry point ended (see
+//  TraceInfo.abort_reason). Called from the TS trace generator's record_abort, so the reason is
+//  parked in the global shared TraceInfo table and a cross-thread heat dump can attribute, per hot
+//  uncompiled trace, the opcode/reason that prevented it from being jitted. Returns the stored value.
+EMSCRIPTEN_KEEPALIVE gint32
+mono_jiterp_record_trace_abort (gint32 trace_index, gint32 abort_reason) {
+	if (trace_index < 0 || trace_index >= trace_count)
+		return JITERP_ABORT_NONE;
+	trace_info_get (trace_index)->abort_reason = abort_reason;
+	return abort_reason;
+}
+
+// Abort/reject reason for this trace entry point (see TraceInfo.abort_reason). JITERP_ABORT_NONE
+//  (-100) if it was never attempted. Lock-free shared read; safe from any thread.
+EMSCRIPTEN_KEEPALIVE gint32
+mono_jiterp_get_trace_abort_reason (gint32 trace_index) {
+	if (trace_index < 0 || trace_index >= trace_count)
+		return JITERP_ABORT_NONE;
+	return trace_info_get (trace_index)->abort_reason;
 }
 
 MONO_NEVER_INLINE JiterpreterThunk
