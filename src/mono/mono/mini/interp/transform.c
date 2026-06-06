@@ -2990,7 +2990,7 @@ interp_get_icall_sig (MonoMethodSignature *sig)
 }
 
 /* larger than mono jit; chosen to ensure that List<T>.get_Item can be inlined */
-#define INLINE_LENGTH_LIMIT 30
+#define INLINE_LENGTH_LIMIT 60
 #define INLINE_DEPTH_LIMIT 10
 // How much imported IL we allow before we stop inlining
 #define INLINE_IL_BUDGET 1000000
