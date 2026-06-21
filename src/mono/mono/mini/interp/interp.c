@@ -2308,6 +2308,17 @@ typedef struct {
 	gpointer *many_args;
 } InterpEntryData;
 
+#if HOST_BROWSER
+/* Set (nested-save/restore) only around the interp_entry call made by the wasm-JIT outbound residual
+ * (mono_wasm_jit_call_interp). Tells interp_entry to store a REFERENCE return into data->res with a
+ * plain store instead of a GC write barrier: data->res is the per-thread scratch buffer, NOT a GC heap
+ * slot, so a barrier would register that transient address in sgen's remembered set and a later GC
+ * would read whatever overwrote it as an object pointer (heap corruption). The returned object stays
+ * live without the barrier — via the interp frame during the call, and via the JIT ref shadow stack
+ * immediately after (the JIT copies it there with no intervening GC safepoint). */
+static __thread gboolean wj_residual_active;
+#endif
+
 /* Main function for entering the interpreter from compiled code */
 // Do not inline in case order of frame addresses matters.
 static MONO_NEVER_INLINE void
@@ -2391,6 +2402,24 @@ interp_entry (InterpEntryData *data)
 	if (rmethod->needs_thread_attach)
 		mono_threads_detach_coop (orig_domain, &attach_cookie);
 
+#if HOST_BROWSER
+	/* This interp_entry was driven by a wasm-JITted method's residual call (mono_wasm_jit_call_interp /
+	 * mono_wasm_jit_vcall_resolve, with wj_residual_active set). If the callee threw and no handler is in
+	 * THIS interp sub-stack (handler_frame == NULL), the default path below (need_native_unwind ->
+	 * mono_llvm_start_native_unwind -> C++ throw) would unwind through the intervening JITted wasm frame,
+	 * which has no landing pad -> the throw escapes uncaught and kills the worker. The real handler is up
+	 * in the OUTER interp stack, reached via the JITted method's entry thunk. So return with
+	 * has_resume_state still set: call_interp returns threw=1 (and mono_wasm_jit_pending_exception sees
+	 * it), the JITted caller bails to its entry thunk, and the interp MINT_CALL that invoked it does
+	 * `goto resume` (CHECK_RESUME_STATE) to continue unwinding to that handler above the JITted frame.
+	 * (When handler_frame IS set, need_native_unwind is already FALSE and the TARGET_WASM branch below
+	 * returns identically, so this only changes the no-local-handler case.) wj_residual_active exists
+	 * only under HOST_BROWSER (the residual path is browser-runtime-only); the cross-compiler defines
+	 * TARGET_WASM but not HOST_BROWSER, so guard on HOST_BROWSER, not TARGET_WASM. */
+	if (wj_residual_active && context->has_resume_state)
+		return;
+#endif
+
 	if (need_native_unwind (context)) {
 		mono_llvm_start_native_unwind ();
 		return;
@@ -2425,12 +2454,347 @@ interp_entry (InterpEntryData *data)
 		// gsharedvt_in_sig wrapper returns the actual type. This check follows the logic in
 		// interp_create_method_pointer_llvmonly and interp_create_method_pointer so we do the
 		// return sign extension only when called from the interp_in wrapper.
+#if HOST_BROWSER
+		if (wj_residual_active && MONO_TYPE_IS_REFERENCE (type)) {
+			/* wasm-JIT residual ref return: plain store, NO write barrier (see wj_residual_active). */
+			*(gpointer *) data->res = frame.stack->data.o;
+		} else
+#endif
 		if (!mono_llvm_only || sig->param_count > MAX_INTERP_ENTRY_ARGS)
 			stackval_to_data_sign_ext (type, frame.stack, data->res, FALSE);
 		else
 			stackval_to_data (type, frame.stack, data->res, FALSE);
 	}
 }
+
+#if HOST_BROWSER
+/*
+ * mono_wasm_jit_vcall_i4:
+ *
+ *   Outbound virtual call from a wasm-JITted method (mini-wasm.c) for the shape
+ * `int VirtualMethod()` (instance, no params, i4/u4 return — e.g. getBlockState-style hot
+ * polymorphic calls). Resolves the override for THIS_OBJ's runtime class and invokes it
+ * through the interpreter via interp_entry().
+ *
+ * This is the interp-only-runtime path: the llvmonly ftndesc dispatch needs an AOT-generated
+ * gsharedvt_in_sig native->interp entry wrapper which doesn't exist here, so instead the JIT
+ * lowers a virtual call to a direct call_indirect of this helper (resolved by its raw C address).
+ * The result is returned by value (res lives on the C stack), so this is reentrant — nested
+ * virtual calls from the callee reuse the C stack frame, no scratch buffer needed.
+ */
+gint32
+mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
+{
+	/* Per-thread inline cache: (vtable, base_method) -> (resolved target imethod, its wasm f-slot).
+	 * The full resolver (mono_object_get_virtual_method_internal — GC handles) + imethod hash lookup
+	 * run only on a miss; after warmup the hot path is a vtable/base compare + a direct f-slot call.
+	 * Sized for the common mono/bi/poly-morphic case; deeper polymorphism just misses more often. */
+#define WJ_IC_BITS 4
+#define WJ_IC_SIZE (1 << WJ_IC_BITS)
+	static __thread MonoVTable *ic_vt [WJ_IC_SIZE];
+	static __thread MonoMethod *ic_base [WJ_IC_SIZE];
+	static __thread InterpMethod *ic_im [WJ_IC_SIZE];
+	static __thread gint32 ic_fslot [WJ_IC_SIZE];
+
+	MonoVTable *vt = this_obj->vtable;
+	guint idx = (guint) ((((gsize) vt >> 4) ^ ((gsize) base_method >> 5)) & (WJ_IC_SIZE - 1));
+	InterpMethod *imethod;
+	gint32 fs;
+
+	if (G_LIKELY (ic_vt [idx] == vt && ic_base [idx] == base_method)) {
+		imethod = ic_im [idx];
+		fs = ic_fslot [idx];
+	} else {
+		MonoMethod *target = mono_object_get_virtual_method_internal (this_obj, base_method);
+		imethod = mono_interp_get_imethod (target);
+		fs = imethod->wasm_jit_fslot;
+		ic_vt [idx] = vt; ic_base [idx] = base_method; ic_im [idx] = imethod; ic_fslot [idx] = fs;
+	}
+
+	/* Fast path: resolved override is wasm-JITted — call its scalar f directly ((this)->i4 table
+	 * index), a ~ns call_indirect with no interpreter re-entry. This is the win: JITted caller →
+	 * JITted callee, devirtualized at runtime. (On wasm a function pointer IS a table index.) */
+	if (G_LIKELY (fs > 0)) {
+		gint32 (*f) (gpointer) = (gint32 (*) (gpointer)) (intptr_t) fs;
+		return f (this_obj);
+	}
+
+	/* Slow path: un-JITted override — re-enter the interpreter via interp_entry. */
+	{
+		ERROR_DECL (error);
+		InterpEntryData data;
+		gint32 res = 0;
+		if (!imethod->transformed) {
+			mono_interp_transform_method (imethod, get_context (), error);
+			mono_error_assert_ok (error);
+		}
+		memset (&data, 0, sizeof (data));
+		data.rmethod = imethod;
+		data.this_arg = this_obj;
+		data.res = &res;
+		interp_entry (&data);
+		return res;
+	}
+}
+
+/*
+ * mono_wasm_jit_alloc_ic:
+ *
+ *   Allocate one inline-cache slot (8 bytes in the wasm heap = linear memory: [i32 vtable, i32
+ * f-slot], zeroed) for a virtual call site in a wasm-JITted method. The address is baked into the
+ * emitted wasm as an i32.const, so the JITted code reads/updates it inline (see mini-wasm.c). One
+ * per virtual call site, allocated once at JIT-emit time. Never freed (bounded: one per JITted
+ * virtual call site).
+ */
+gpointer
+mono_wasm_jit_alloc_ic (void)
+{
+	return g_malloc0 (8);
+}
+
+/*
+ * mono_wasm_jit_vcall_ic_resolve:
+ *
+ *   Generalized inline-cache miss handler for a wasm-JITted virtual call of ANY signature. The
+ * JITted code checks IC[0]==this->vtable inline; on a miss it pushes the method's args, then calls
+ * here to get the resolved override's f-slot, then call_indirects that f-slot with the method's
+ * full functype. So this only RESOLVES + caches (publishing (vtable, f-slot) into the IC, f-slot
+ * first then vtable) and returns the f-slot — the JITted code does the actual typed call. Returns
+ * 0 if the override isn't wasm-JITted (caller then traps; for the current env-gated bring-up the
+ * override is name-targeted so it's JITted during warmup — force-JIT-on-miss is a TODO).
+ */
+gint32
+mono_wasm_jit_vcall_ic_resolve (MonoObject *this_obj, MonoMethod *base_method, gpointer ic)
+{
+	MonoMethod *target = mono_object_get_virtual_method_internal (this_obj, base_method);
+	InterpMethod *imethod = mono_interp_get_imethod (target);
+	gint32 fs = imethod->wasm_jit_fslot;
+	if (fs > 0) {
+		/* Override is wasm-JITted: cache (vtable, f-slot) so the inline hot path dispatches directly. */
+		guint32 *icp = (guint32 *) ic;
+		icp [1] = (guint32) fs;                           /* f-slot */
+		mono_memory_barrier ();
+		icp [0] = (guint32) (gsize) this_obj->vtable;     /* publish vtable last */
+		return fs;
+	}
+	return 0;   /* override not wasm-JITted (legacy inline-IC helper; unused — codegen now uses the
+	             * resolve-before-spill + mono_wasm_jit_call_interp path in mono_wasm_jit_vcall_resolve). */
+}
+
+/*
+ * mono_wasm_jit_vcall_ic_miss:
+ *
+ *   Inline-cache miss handler for a wasm-JITted virtual call (shape (this)->i4). The JITted code
+ * checks IC[0]==this->vtable inline; on a miss it calls here. Resolves the override; if it's
+ * wasm-JITted, publishes (vtable, f-slot) into the IC (f-slot first, then vtable last as the
+ * publish — readers load vtable first) and calls the f-slot directly; otherwise re-enters the
+ * interpreter (and does NOT cache, so un-JITted targets always take this path).
+ *
+ * NOTE: the IC lives in shared linear memory; the i32-pair read/write is benign for the common
+ * case but can tear under concurrent cross-type writes from multiple threads. MT-hardening =
+ * pack into one i64 and use i64.atomic.load (reader) + atomic store (here).
+ */
+gint32
+mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpointer ic)
+{
+	MonoMethod *target = mono_object_get_virtual_method_internal (this_obj, base_method);
+	InterpMethod *imethod = mono_interp_get_imethod (target);
+	gint32 fs = imethod->wasm_jit_fslot;
+
+	if (fs > 0) {
+		guint32 *icp = (guint32 *) ic;
+		icp [1] = (guint32) fs;                                        /* f-slot */
+		mono_memory_barrier ();
+		icp [0] = (guint32) (gsize) this_obj->vtable;                  /* publish vtable last */
+		gint32 (*f) (gpointer) = (gint32 (*) (gpointer)) (intptr_t) fs;
+		return f (this_obj);
+	}
+
+	{
+		ERROR_DECL (error);
+		InterpEntryData data;
+		gint32 res = 0;
+		if (!imethod->transformed) {
+			mono_interp_transform_method (imethod, get_context (), error);
+			mono_error_assert_ok (error);
+		}
+		memset (&data, 0, sizeof (data));
+		data.rmethod = imethod;
+		data.this_arg = this_obj;
+		data.res = &res;
+		interp_entry (&data);
+		return res;
+	}
+}
+
+/*
+ * Per-thread scratch buffer for the outbound interp residual (a call from a wasm-JITted method to a
+ * callee that is NOT itself wasm-JITted). ONE shared per-thread buffer is correct:
+ *  - interp_entry() copies all args out of the buffer onto the interp stack at its very start, before
+ *    it runs the callee, so a reentrant (recursive) call that reuses the buffer can't corrupt args
+ *    that are still needed; and
+ *  - the result slot is written then read in strict nested (LIFO) order across reentrancy.
+ * Per-thread => MT-safe. The address can't be baked into the emitted module (a __thread address
+ * differs per thread), so the JITted code fetches it via mono_wasm_jit_scratch() at each call site. */
+#define WJ_SCRATCH_RET_OFF 192   /* result slot; past the max args (WASM_FUNCTYPE_MAX_PARAMS*8 = 128) */
+#define WJ_SCRATCH_SIZE    256
+static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE];
+
+extern int mono_wasm_jit_stats;
+extern int mono_wasm_jit_residual_count;
+
+gpointer
+mono_wasm_jit_scratch (void)
+{
+	return wj_scratch;
+}
+
+/*
+ * mono_wasm_jit_call_interp:
+ *
+ *   Outbound DIRECT call from a wasm-JITted method to a callee that has no wasm f-slot (un-JITted, or
+ * un-JIT-able because it has EH clauses / an unsupported shape). Instead of bailing the WHOLE caller
+ * to the interpreter, the emitter (mini-wasm.c) keeps the caller JITted and lowers just this call to:
+ * spill the args into the per-thread scratch buffer (the `this` pointer at slot 0 when instance, then
+ * each scalar param value at slot i, 8 bytes per slot), call here, then load the result back from
+ * buf+WJ_SCRATCH_RET_OFF. We drive the target through the interpreter via interp_entry().
+ *
+ * Only scalar (i32/i64/f32/f64; object/pointer = i32 on wasm32) args/returns reach here — the emitter
+ * bails calls with vtype/byref args or returns before this, so interp_entry's by-pointer arg
+ * convention (data.args[i] points at the value) matches the buffer layout directly.
+ *
+ * This is the real-Minecraft coverage lever: a hot JITted method almost always calls some cold or
+ * un-JIT-able callee, and before this it bailed entirely; now only the cold call pays interp re-entry.
+ *
+ * RETURNS 1 if the callee threw (the thread resume-state is set and interp_entry did NOT write the
+ * result — the JITted caller must abort immediately and let the interp unwind via `goto resume`),
+ * else 0. This is the residual's exception path: real code throws (null checks, class init, ...), and
+ * without it the JITted caller would read the stale scratch slot as a garbage object -> OOB.
+ */
+int
+mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
+{
+	ERROR_DECL (error);
+	InterpMethod *imethod = mono_interp_get_imethod (method);
+	MonoMethodSignature *sig = mono_method_signature_internal (method);
+	InterpEntryData data;
+	int idx = 0, i;
+
+	if (G_UNLIKELY (!imethod->transformed)) {
+		mono_interp_transform_method (imethod, get_context (), error);
+		mono_error_assert_ok (error);
+	}
+	memset (&data, 0, sizeof (data));
+	data.rmethod = imethod;
+	if (sig->hasthis) {
+		data.this_arg = *(gpointer *) (buf + 0);
+		idx = 1;
+	}
+	for (i = 0; i < (int) sig->param_count; ++i) {
+		guint8 *slot = buf + (idx + i) * 8;
+		/* interp_entry's arg convention: for a BYREF param, data.args[i] IS the pointer (the byref
+		 * value); for a by-value param it's a POINTER TO the value. The emitter spilled the scalar arg
+		 * value into the slot, so for a byref the slot holds the pointer itself -> deref it. Getting
+		 * this wrong corrupts memory: e.g. Unsafe.Add<byte> -> AddByteOffset(ref byte, IntPtr) would
+		 * receive the address of the scratch slot as its `ref` and clobber the buffer. */
+		data.args [i] = m_type_is_byref (sig->params [i]) ? *(gpointer *) slot : slot;
+	}
+	data.res = buf + WJ_SCRATCH_RET_OFF;
+	/* Zero the result slot before interp_entry writes it. interp_entry marshals the return via
+	 * stackval_to_data[_sign_ext], which writes sub-word returns NARROWLY: bool=1 byte and char=2 bytes
+	 * always (neither has a case in stackval_to_data_sign_ext, so both fall through to the narrow
+	 * stackval_to_data), plus i1/u1/i2/u2 in llvm_only mode. The JITted caller reads this slot with a
+	 * full-width i32.load, so without clearing it first the high bytes carry stale data from a previous
+	 * residual -> e.g. a `false` bool reads as a large nonzero value -> a class-name comparison lies ->
+	 * wrong type resolution. The emitter also sign/zero-extends per the C# return type; this clear is the
+	 * backstop for that. (8 bytes covers every scalar return; byte-wise memset = alignment-safe.) */
+	memset (buf + WJ_SCRATCH_RET_OFF, 0, 8);
+	if (G_UNLIKELY (mono_wasm_jit_stats)) {
+		extern MonoMethod *mono_wasm_jit_ring [];
+		extern int mono_wasm_jit_ring_count, mono_wasm_jit_ring_frozen;
+		mono_wasm_jit_residual_count++;
+		/* trail of recent residual callees (ring buffer); frozen at the recursive-finish so a post-crash
+		 * dump shows the residuals up to the failure (not the crash-report flood that follows) */
+		if (!mono_wasm_jit_ring_frozen) {
+			mono_wasm_jit_ring [mono_wasm_jit_ring_count & 127] = method;
+			mono_wasm_jit_ring_count++;
+		}
+	}
+	{
+		/* Nested save/restore: a residual callee may itself drive another residual (which re-enters
+		 * here) before this interp_entry writes its result. The flag must stay set for the whole nest. */
+		gboolean saved_wj = wj_residual_active;
+		wj_residual_active = TRUE;
+		interp_entry (&data);
+		wj_residual_active = saved_wj;
+	}
+	/* If the callee threw, interp_entry returned with the resume-state set (and without writing the
+	 * result). Tell the JITted caller so it aborts instead of dereferencing the stale scratch slot. */
+	return get_context ()->has_resume_state ? 1 : 0;
+}
+
+/*
+ * mono_wasm_jit_vcall_resolve:
+ *
+ *   Resolve the concrete override of `base_method` for `this_obj`'s runtime type, for a wasm-JITted
+ * virtual/interface call. This is the ONLY thing done here — resolution can allocate / run a cctor /
+ * populate a vtable slot, which can trigger a GC. The JITted code therefore calls this BEFORE it
+ * spills the call's reference arguments into the (GC-invisible) per-thread scratch buffer: until the
+ * spill the ref args still live in the GC-scanned ref shadow stack, so a GC here moves them safely.
+ * `this_obj` is passed by value as a normal managed-call argument (GC-safe across the resolve). After
+ * resolving, the JITted code spills the (now up-to-date) args and invokes via mono_wasm_jit_call_interp
+ * — the same proven, MT-safe path the direct residual uses (no inline cache, no cross-thread table
+ * slot). Returns the resolved MonoMethod* (a runtime structure, not a GC object, so it survives the
+ * subsequent spill + interp entry).
+ */
+gpointer
+mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
+{
+	MonoMethod *target = mono_object_get_virtual_method_internal (this_obj, base_method);
+	/* If the resolved override is synchronized, dispatch its SYNCHRONIZED wrapper (Monitor.Enter/Exit):
+	 * the raw body has no monitor ops, and mono_wasm_jit_call_interp's mono_interp_get_imethod does NOT
+	 * substitute the wrapper (unlike get_virtual_method) -> the body would run without the monitor and a
+	 * notify/wait inside throws IllegalMonitorStateException. Do it HERE (before the JITted code spills
+	 * the call's ref args into the GC-invisible scratch), so the wrapper-creation + transform below can
+	 * allocate/GC while the ref args are still on the GC-scanned shadow stack. */
+	if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
+		target = mono_marshal_get_synchronized_wrapper (target);
+	/* Pre-transform the override here too. The JITted code calls this BEFORE spilling the call's
+	 * reference args into the GC-invisible scratch buffer; BOTH the resolve above AND transforming a
+	 * cold method can allocate -> GC. Doing them now (while the ref args still live in the GC-scanned
+	 * ref shadow stack) lets a GC move them safely. mono_wasm_jit_call_interp then finds the imethod
+	 * already transformed and only does the GC-free marshal + interp_entry, so the (now-spilled)
+	 * scratch pointers stay valid. (Without this, a transform-triggered GC inside call_interp — after
+	 * the spill — would stale the scratch refs, the latent hazard the direct residual rarely hit.) */
+	InterpMethod *imethod = mono_interp_get_imethod (target);
+	if (G_UNLIKELY (!imethod->transformed)) {
+		ERROR_DECL (error);
+		mono_interp_transform_method (imethod, get_context (), error);
+		mono_error_assert_ok (error);
+	}
+	return target;
+}
+
+/*
+ * mono_wasm_jit_pending_exception:
+ *
+ *   TRUE if the current thread has a pending interp resume-state (an exception is unwinding). A
+ * JITted method calls this after any DIRECT call into managed/interp code (an f-slot call_indirect to
+ * another JITted method, a virtual-IC dispatch, a callreg, or a throwing icall) — because that callee
+ * may itself have done a residual interp call that threw, in which case it returned a dummy value and
+ * set the resume-state but could NOT signal "threw" through its typed return. Without this check only
+ * the single JITted frame entered from the interp e-thunk would unwind; a JITted method called by
+ * another JITted method would swallow the exception and run on with a garbage value (and a later
+ * residual would re-enter interp_entry with stale resume-state -> corruption). The JITted caller aborts
+ * (returns a dummy of its own return type) when this returns 1, so the exception unwinds through every
+ * JITted frame exactly like the interpreter does.
+ */
+int
+mono_wasm_jit_pending_exception (void)
+{
+	return get_context ()->has_resume_state ? 1 : 0;
+}
+#endif
 
 static void
 do_icall (MonoMethodSignature *sig, MintICallSig op, stackval *ret_sp, stackval *sp, gpointer ptr, gboolean save_last_error)
@@ -4633,6 +4997,77 @@ jit_call:
 			ip += 5;
 #else
 			ip += 4;
+#endif
+
+#if HOST_BROWSER
+			{
+				/* If the callee was compiled by the runtime wasm JIT, invoke its entry thunk
+				 * e(args_ptr, ret_ptr) via the function-table slot instead of interpreting; the
+				 * thunk marshals args from the call-args stackvals and writes the result back. */
+				{
+					/* Automatic hotness trigger (Phase 5, MONO_WASM_JIT_AUTO): count calls to this
+					 * callee; at the threshold force-compile it to wasm. slot 0 = untried (count),
+					 * -1 = attempted+bailed (skip). Auto off → the && short-circuits, no overhead. */
+					extern int mono_wasm_jit_auto, mono_wasm_jit_thresh;
+					/* slot states: 0=untried (counting); >0=JITted; -1=permanent bail (EH/unsupported/...);
+					 * -2..-5=retry-pending (a "callee not jitted" bail — retry to let a JIT ISLAND form once
+					 * the callee JITs by its own hit count). Eligible to (re)attempt at 0 or a retry state. */
+					if (G_UNLIKELY (mono_wasm_jit_auto > 0) && (cmethod->wasm_jit_slot == 0 || cmethod->wasm_jit_slot <= -2) && ++cmethod->wasm_jit_hits == mono_wasm_jit_thresh) {
+						extern void mono_wasm_force_compile (MonoMethod *m);
+						extern gboolean mono_wasm_jit_name_denied (const char *name);
+						extern __thread int mono_wasm_jit_last_slot, mono_wasm_jit_last_fslot, mono_wasm_jit_last_len, mono_wasm_jit_last_retriable;
+						extern __thread void *mono_wasm_jit_last_bytes;
+						mono_wasm_jit_last_slot = 0; mono_wasm_jit_last_fslot = 0; mono_wasm_jit_last_bytes = NULL; mono_wasm_jit_last_len = 0; mono_wasm_jit_last_retriable = 0;
+						/* Coverage-stable bisection (MONO_WASM_JIT_NO_METHOD): skip wasm-JIT for a denylisted
+						 * simple name so it stays in the interpreter; auto-JIT stays ON (startup/ICU unaffected).
+						 * Deny halves of the registered set to pin the diverging method. */
+						if (!(cmethod->method->name && mono_wasm_jit_name_denied (cmethod->method->name)))
+							mono_wasm_force_compile (cmethod->method);
+						if (mono_wasm_jit_last_slot > 0) {
+							/* publish bytes/fslot first, slot last (the ready flag the invoke + other threads check) */
+							cmethod->wasm_jit_fslot = mono_wasm_jit_last_fslot;
+							cmethod->wasm_jit_bytes = mono_wasm_jit_last_bytes;
+							cmethod->wasm_jit_bytes_len = mono_wasm_jit_last_len;
+							mono_memory_barrier ();
+							cmethod->wasm_jit_slot = mono_wasm_jit_last_slot;
+						} else if (mono_wasm_jit_last_retriable) {
+							/* "callee not jitted": the callee may JIT later (by its own hotness) — re-attempt so
+							 * an island forms and the call becomes a direct f-slot. Bounded (-2..-5, then -1) so a
+							 * call to an un-JIT-able callee gives up after a few tries. Re-count hits to space them. */
+							int s = cmethod->wasm_jit_slot;
+							cmethod->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -1);
+							cmethod->wasm_jit_hits = 0;
+						} else {
+							cmethod->wasm_jit_slot = -1; /* permanent bail (EH/unsupported/synchronized/byref): never retry */
+						}
+					}
+				}
+								if (G_UNLIKELY (cmethod->wasm_jit_slot > 0)) {
+					/* Bring THIS thread's per-thread function table up to date (instantiate any JITted
+					 * methods registered since this thread last synced) before invoking, so both this method
+					 * and any methods it calls via f-slot call_indirect are present in this thread's table. */
+					extern void mono_wasm_jit_sync_thread (void);
+					mono_wasm_jit_sync_thread ();
+					{
+						/* Push an LMF across the interp->JITted-wasm call, same as do_jit_call does for compiled
+						 * code: it marks the managed->native boundary so GC stack-walking and cooperative/JSPI
+						 * suspends triggered inside the JITted method (e.g. its GC safepoint poll) are handled
+						 * correctly. Without it a suspend inside JITted code corrupts coop/suspend state. */
+						MonoLMFExt ext;
+						interp_push_lmf (&ext, frame);
+						((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
+						interp_pop_lmf (&ext);
+					}
+					{ extern int mono_wasm_jit_stats, mono_wasm_jit_invoke_count; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_invoke_count++; }
+					/* If a residual interp call inside the JITted method threw, interp_entry set the
+					 * thread resume-state and the JITted method returned early (a dummy result). Propagate
+					 * the exception through the interp's EH, exactly like do_jit_call does after a thrown
+					 * call — the LMF pushed above lets mono_handle_exception skip the JITted native frame
+					 * to a handler in this frame or above. */
+					CHECK_RESUME_STATE (context);
+					MINT_IN_BREAK;
+				}
+			}
 #endif
 
 interp_call:

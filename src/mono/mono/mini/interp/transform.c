@@ -10079,6 +10079,17 @@ mono_interp_transform_init (void)
 #endif
 }
 
+#if HOST_BROWSER
+/* runtime wasm JIT: the function-table slot of a callee's scalar method fn `f` (0 if the callee
+ * isn't JIT-compiled), so a JITted caller can lower a call to it as a call_indirect. */
+int
+mono_wasm_jit_get_callee_fslot (MonoMethod *method)
+{
+	InterpMethod *im = mono_interp_get_imethod (method);
+	return im ? im->wasm_jit_fslot : 0;
+}
+#endif
+
 void
 mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, MonoError *error)
 {
@@ -10106,6 +10117,48 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 		mono_runtime_class_init_full (method_class_vt, error);
 		return_if_nok (error);
 	}
+
+#if HOST_BROWSER
+	{
+		/* wasm-jit bring-up (v3): drive the runtime wasm JIT emitter for the targeted method so it
+		 * compiles + instantiates + registers its function in the table. Validate-only for now
+		 * (the method still executes via the interpreter); routes through the COMPILE_WASM fork. */
+		extern gpointer mono_jit_compile_method_jit_only (MonoMethod *m, MonoError *e);
+		extern __thread int mono_wasm_jit_last_slot;
+		extern __thread int mono_wasm_jit_last_fslot;
+		extern gboolean mono_wasm_jit_name_targeted (const char *name);
+		extern void mono_wasm_jit_log_main (const char *msg);
+		extern void mono_wasm_jit_auto_init (void);
+		static __thread gboolean wasm_jit_in;
+		mono_wasm_jit_auto_init (); /* one-time: read MONO_WASM_JIT_AUTO / _THRESHOLD into the globals the interp's auto-trigger reads */
+		if (method->name && strstr (method->name, "WasmJit")) {
+			const char *envv = g_getenv ("MONO_WASM_JIT_METHOD");
+			char dbg [256]; snprintf (dbg, sizeof dbg, "WASM_JIT_HOOK name=%s match=%d in=%d env=%s", method->name, mono_wasm_jit_name_targeted (method->name), wasm_jit_in, envv ? envv : "(null)");
+			mono_wasm_jit_log_main (dbg);
+		}
+		if (!wasm_jit_in && method->name && mono_wasm_jit_name_targeted (method->name)) {
+			extern __thread void *mono_wasm_jit_last_bytes;
+			extern __thread int mono_wasm_jit_last_len;
+			ERROR_DECL (wasm_jit_error);
+			wasm_jit_in = TRUE;
+			mono_wasm_jit_last_slot = 0;
+			mono_wasm_jit_last_fslot = 0;
+			mono_wasm_jit_last_bytes = NULL;
+			mono_wasm_jit_last_len = 0;
+			mono_jit_compile_method_jit_only (method, wasm_jit_error);
+			mono_error_cleanup (wasm_jit_error);
+			if (mono_wasm_jit_last_slot > 0) {
+				/* publish bytes/fslot first, then the slot last (the "ready" flag the invoke checks) */
+				imethod->wasm_jit_fslot = mono_wasm_jit_last_fslot;
+				imethod->wasm_jit_bytes = mono_wasm_jit_last_bytes;
+				imethod->wasm_jit_bytes_len = mono_wasm_jit_last_len;
+				mono_memory_barrier ();
+				imethod->wasm_jit_slot = mono_wasm_jit_last_slot; /* survives the tmp_imethod round-trip */
+			}
+			wasm_jit_in = FALSE;
+		}
+	}
+#endif
 
 	MONO_PROFILER_RAISE (jit_begin, (method));
 

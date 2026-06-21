@@ -3353,7 +3353,10 @@ handle_alloc (MonoCompile *cfg, MonoClass *klass, gboolean for_box, int context_
 	if (context_used) {
 		gboolean known_instance_size = !mini_is_gsharedvt_klass (klass);
 
-		MonoMethod *managed_alloc = mono_gc_get_managed_allocator (klass, for_box, known_instance_size);
+		/* The runtime wasm JIT can't use the managed allocator wrapper (it has CEE_MONO_TLS/atomic
+		 * opcodes the interp can't transform, and it gets residualed into the interp on wasm) — fall
+		 * through to the plain alloc icall, which the wasm backend lowers as a direct call_indirect. */
+		MonoMethod *managed_alloc = COMPILE_WASM (cfg) ? NULL : mono_gc_get_managed_allocator (klass, for_box, known_instance_size);
 
 		iargs [0] = mini_emit_get_rgctx_klass (cfg, context_used, klass, MONO_RGCTX_INFO_VTABLE);
 		alloc_ftn = MONO_JIT_ICALL_ves_icall_object_new_specific;
@@ -3385,7 +3388,8 @@ handle_alloc (MonoCompile *cfg, MonoClass *klass, gboolean for_box, int context_
 			return NULL;
 		}
 
-		MonoMethod *managed_alloc = mono_gc_get_managed_allocator (klass, for_box, TRUE);
+		/* wasm JIT: skip the managed allocator wrapper (see above), use the alloc icall. */
+		MonoMethod *managed_alloc = COMPILE_WASM (cfg) ? NULL : mono_gc_get_managed_allocator (klass, for_box, TRUE);
 
 		if (managed_alloc) {
 			int size = mono_class_instance_size (klass);
@@ -4584,7 +4588,10 @@ mini_redirect_call (MonoCompile *cfg, MonoMethod *method,
 
 			mono_error_assert_ok (cfg->error); /*Should not fail since it System.String*/
 #ifndef MONO_CROSS_COMPILE
-			managed_alloc = mono_gc_get_managed_allocator (method->klass, FALSE, FALSE);
+			/* wasm JIT: don't use the managed string allocator wrapper; returning NULL leaves
+			 * FastAllocateString as a normal call the interpreter handles. */
+			if (!COMPILE_WASM (cfg))
+				managed_alloc = mono_gc_get_managed_allocator (method->klass, FALSE, FALSE);
 #endif
 			if (!managed_alloc)
 				return NULL;
@@ -10742,7 +10749,8 @@ field_access_end:
 			if (context_used) {
 				MonoInst *args [3];
 				MonoClass *array_class = mono_class_create_array (klass, 1);
-				MonoMethod *managed_alloc = mono_gc_get_managed_array_allocator (array_class);
+				/* wasm JIT: skip the managed array allocator wrapper, use ves_icall_array_new_specific. */
+				MonoMethod *managed_alloc = COMPILE_WASM (cfg) ? NULL : mono_gc_get_managed_array_allocator (array_class);
 
 				/* FIXME: Use OP_NEWARR and decompose later to help abcrem */
 

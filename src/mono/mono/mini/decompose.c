@@ -1583,7 +1583,9 @@ mono_decompose_array_access_opts (MonoCompile *cfg)
 					ERROR_DECL (vt_error);
 					MonoClass *array_class = mono_class_create_array (ins->inst_newa_class, 1);
 					MonoVTable *vtable = mono_class_vtable_checked (array_class, vt_error);
-					MonoMethod *managed_alloc = mono_gc_get_managed_array_allocator (array_class);
+					/* wasm JIT can't use the managed allocator wrapper (TLS/atomic opcodes the interp
+					 * can't transform, and it gets residualed into the interp); use ves_icall_array_new_specific. */
+					MonoMethod *managed_alloc = COMPILE_WASM (cfg) ? NULL : mono_gc_get_managed_array_allocator (array_class);
 
 					mono_error_assert_ok (vt_error); /*This shall not fail since we check for this condition on OP_NEWARR creation*/
 					NEW_VTABLECONST (cfg, iargs [0], vtable);

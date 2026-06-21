@@ -2133,7 +2133,10 @@ export function jiterpreter_allocate_tables () {
     //  then create special placeholder functions that examine the rmethod to determine which kind
     //  of method is being called.
     const traceTableSize = options.tableSize,
-        jitCallTableSize = runtimeHelpers.emscriptenBuildOptions.runAOTCompilation ? options.tableSize : 1,
+        // With AOT off, do_jit_call is unused, so the runtime wasm JIT (mono_wasm_emit_method)
+        // repurposes the JIT_CALL table for its per-method entry-thunk slots — size it like the
+        // trace table so many JITted methods fit (was hard-capped at 1, which only fit one method).
+        jitCallTableSize = options.tableSize,
         interpEntryTableSize = runtimeHelpers.emscriptenBuildOptions.runAOTCompilation ? options.aotTableSize : 1,
         numInterpEntryTables = JiterpreterTable.LAST - JiterpreterTable.InterpEntryStatic0 + 1,
         totalSize = traceTableSize + jitCallTableSize + (numInterpEntryTables * interpEntryTableSize) + 1,
