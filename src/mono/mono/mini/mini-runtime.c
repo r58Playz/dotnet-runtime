@@ -2836,7 +2836,15 @@ lookup_start:
 			return NULL;
 		}
 
-		if (mono_aot_only) {
+#ifdef TARGET_WASM
+		/* Runtime wasm JIT bring-up: let a method named in MONO_WASM_JIT_METHOD (comma-separated)
+		 * through the aot-only guard so it reaches mini_method_compile and the COMPILE_WASM path. */
+		extern gboolean mono_wasm_jit_name_targeted (const char *name);
+		gboolean is_wasm_jit_target = method->name && mono_wasm_jit_name_targeted (method->name);
+#else
+		gboolean is_wasm_jit_target = FALSE;
+#endif
+		if (mono_aot_only && !is_wasm_jit_target) {
 			char *fullname = mono_method_get_full_name (method);
 			mono_error_set_execution_engine (error, "Attempting to JIT compile method '%s' while running in aot-only mode. See https://learn.microsoft.com/xamarin/ios/internals/limitations for more information.\n", fullname);
 			g_free (fullname);

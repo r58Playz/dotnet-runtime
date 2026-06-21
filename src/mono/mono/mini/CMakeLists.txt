@@ -186,6 +186,8 @@ set(wasm_sources
     mini-wasm.c
     tramp-wasm.c
     exceptions-wasm.c
+    wasm-encoder.c
+    wasm-encoder.h
     cpu-wasm.h)
 
 set(powerpc64_sources

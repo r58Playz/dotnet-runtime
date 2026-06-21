@@ -3295,6 +3295,50 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 	if (cfg->gshared)
 		cfg->rgctx_access = mini_get_rgctx_access_for_method (cfg->method);
 	cfg->compile_llvm = try_llvm;
+#ifdef TARGET_WASM
+	{
+		/* Phase 1 bring-up trigger: force the runtime wasm JIT for methods named
+		 * in MONO_WASM_JIT_METHOD (comma-separated simple-name match). Deciding it
+		 * here routes the method to the COMPILE_WASM fork, bypassing the mono_aot_only
+		 * guard in mono_jit_compile_method that otherwise refuses runtime compilation. */
+		extern gboolean mono_wasm_jit_name_targeted (const char *name);
+		extern gboolean mono_wasm_jit_name_denied (const char *name);
+		extern gboolean mono_wasm_jit_llvmonly_enabled (void);
+		extern __thread gboolean mono_wasm_jit_force;
+		if (cfg->method && cfg->method->name && (mono_wasm_jit_force || mono_wasm_jit_name_targeted (cfg->method->name))
+			&& !mono_wasm_jit_name_denied (cfg->method->name)) {
+			cfg->compile_wasm = TRUE;
+			cfg->compile_llvm = FALSE;
+			try_llvm = FALSE;
+			/* Disable IR optimizations: the wasm backend reads call->args directly at codegen,
+			 * but copyprop/etc. (which assume a native/LLVM emit_call consumes them) mangle the
+			 * call-arg vregs. opt=0 keeps the explicit arg-setup moves so calls lower correctly. */
+			/* Keep MONO_OPT_INTRINS on: without it mini_emit_inst_for_method bails (intrinsics.c),
+				 * so intrinsic-only methods like Unsafe.As<T>(object) — managed body `throw
+				 * PlatformNotSupportedException` — survive as real calls, get residualed, and run that
+				 * throwing/garbage body instead of the intended reinterpret. Intrinsic substitution only
+				 * replaces calls with inline ops, so it doesn't disturb the call-arg-vreg capture that
+				 * the copyprop concern (below) is about. */
+				/* MONO_OPT_FLOAT32 sets cfg->r4fp: floats stay native 32-bit (STACK_R4) instead of
+				 * being promoted to R8 on the stack. Without it, OP_LOADR4_MEMBASE yields a STACK_R8
+				 * value (mono widens the loaded f32 to f64) but the wasm backend loads raw f32 -> an f32
+				 * feeds f64 ops -> "expected f64, found f32" module CompileErrors on every float-math
+				 * method. With r4fp on, the backend's native-f32 load/store/const handling matches and
+				 * float arithmetic lowers to the OP_R* (f32) ops below. */
+				cfg->opt = MONO_OPT_INTRINS | MONO_OPT_FLOAT32;
+			/* Opt-in: emit llvmonly indirect-dispatch IR (ftndesc) for virtual/interp calls.
+			 * Required for virtual dispatch on wasm (the normal vtable-slot dispatch calls a
+			 * fixed-signature trampoline → call_indirect mismatch). The codegen fork still routes
+			 * to COMPILE_WASM since compile_llvm stays FALSE. */
+			if (mono_wasm_jit_llvmonly_enabled ()) {
+				cfg->llvm_only = TRUE;
+				/* llvm_only requires the interp flag (method-to-ir.c asserts it): llvmonly
+				 * dispatch falls back to the interpreter for calls it can't lower directly. */
+				cfg->interp = TRUE;
+			}
+		}
+	}
+#endif
 	cfg->token_info_hash = g_hash_table_new (NULL, NULL);
 	if (cfg->compile_aot)
 		cfg->method_index = aot_method_index;
@@ -3655,7 +3699,10 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 
 	/*g_print ("numblocks = %d\n", cfg->num_bblocks);*/
 
-	if (!COMPILE_LLVM (cfg)) {
+	if (!COMPILE_LLVM (cfg) && !COMPILE_WASM (cfg)) {
+		/* wasm has native i64, so (like LLVM) don't decompose longs into i32 carry-pairs — that
+		 * pass asserts on ops the wasm backend keeps native (decompose.c:905). The emitter lowers
+		 * the native long ops it supports to wasm i64 ops and bails to the interpreter otherwise. */
 		MONO_TIME_TRACK (mono_jit_stats.jit_decompose_long_opts, mono_decompose_long_opts (cfg));
 		mono_cfg_dump_ir (cfg, "decompose_long_opts");
 	}
@@ -3925,7 +3972,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 	 */
 	MONO_TIME_TRACK(mono_jit_stats.jit_liveness_handle_exception_clauses2, mono_liveness_handle_exception_clauses (cfg));
 
-	if (cfg->opt & MONO_OPT_LINEARS) {
+	if ((cfg->opt & MONO_OPT_LINEARS) && !COMPILE_WASM (cfg)) {
 		GList *vars, *regs, *l;
 
 		/* fixme: maybe we can avoid to compute livenesss here if already computed ? */
@@ -3954,7 +4001,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
     //print_dfn (cfg);
 
 	/* variables are allocated after decompose, since decompose could create temps */
-	if (!COMPILE_LLVM (cfg)) {
+	if (!COMPILE_LLVM (cfg) && !COMPILE_WASM (cfg)) {
 		MONO_TIME_TRACK (mono_jit_stats.jit_arch_allocate_vars, mono_arch_allocate_vars (cfg));
 		mono_cfg_dump_ir (cfg, "arch_allocate_vars");
 		if (cfg->exception_type)
@@ -3964,7 +4011,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 	if (cfg->gsharedvt)
 		mono_allocate_gsharedvt_vars (cfg);
 
-	if (!COMPILE_LLVM (cfg)) {
+	if (!COMPILE_LLVM (cfg) && !COMPILE_WASM (cfg)) {
 		gboolean need_local_opts;
 		MONO_TIME_TRACK (mono_jit_stats.jit_spill_global_vars, mono_spill_global_vars (cfg, &need_local_opts));
 		mono_cfg_dump_ir (cfg, "spill_global_vars");
@@ -4031,6 +4078,13 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 					 cfg->native_code, cfg->native_code + cfg->code_len, cfg->code_len);
 			g_free (nm);
 		}
+#endif
+#ifdef TARGET_WASM
+	} else if (COMPILE_WASM (cfg)) {
+		MONO_TIME_TRACK (mono_jit_stats.jit_codegen, mono_wasm_emit_method (cfg));
+		mono_cfg_dump_ir (cfg, "wasm_codegen");
+		if (cfg->exception_type)
+			return cfg;
 #endif
 	} else {
 		MONO_TIME_TRACK (mono_jit_stats.jit_codegen, mono_codegen (cfg));
@@ -4207,6 +4261,40 @@ mono_update_jit_stats (MonoCompile *cfg)
 	mono_jit_stats.inlined_methods += cfg->stat_inlined_methods;
 	mono_jit_stats.code_reallocs += cfg->stat_code_reallocs;
 }
+
+#ifdef TARGET_WASM
+/*
+ * mono_wasm_force_compile:
+ *
+ *   Force-compile METHOD through the wasm-JIT emitter (COMPILE_WASM fork) on demand, for the
+ * automatic hotness trigger (interp.c MINT_CALL) and virtual-miss force-JIT. Calls mini_method_compile
+ * directly — bypassing the compiled-code cache, which would short-circuit for an already-interp'd
+ * method — with the thread-local mono_wasm_jit_force flag set so the trigger in mini_method_compile
+ * routes it to COMPILE_WASM regardless of name targeting. The emitter publishes the table slots via
+ * the mono_wasm_jit_last_slot/fslot thread-locals (the caller reads them). Uses JIT_FLAG_RUN_CCTORS
+ * to match the working transform-hook compile path; the reentrancy guard covers any cctor/init code
+ * that runs during the compile and calls back in (it just skips the nested force-compile).
+ */
+void
+mono_wasm_force_compile (MonoMethod *method)
+{
+	extern __thread gboolean mono_wasm_jit_force;
+	static __thread gboolean reent;
+	MonoCompile *cfg;
+	ERROR_DECL (error);
+
+	if (reent)
+		return;
+	reent = TRUE;
+	mono_wasm_jit_force = TRUE;
+	cfg = mini_method_compile (method, 0, (JitFlags) JIT_FLAG_RUN_CCTORS, 0, -1);
+	mono_wasm_jit_force = FALSE;
+	if (cfg)
+		mono_destroy_compile (cfg);
+	(void) error;
+	reent = FALSE;
+}
+#endif
 
 /*
  * mono_jit_compile_method_inner:

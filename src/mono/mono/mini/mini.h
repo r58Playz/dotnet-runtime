@@ -99,6 +99,14 @@ typedef struct SeqPointInfo SeqPointInfo;
 #define LLVM_ENABLED FALSE
 #endif
 
+#ifdef TARGET_WASM
+/* Runtime WebAssembly JIT backend: emit wasm bytes directly from vreg IR,
+ * as a sibling of the LLVM codegen path (no regalloc / no mono_codegen). */
+#define COMPILE_WASM(cfg) ((cfg)->compile_wasm)
+#else
+#define COMPILE_WASM(cfg) (0)
+#endif
+
 #ifdef MONO_ARCH_SIMD_INTRINSICS
 #define ARCH_SIMD_ENABLED TRUE
 #else
@@ -1458,6 +1466,7 @@ typedef struct {
 	guint            compile_aot : 1;
 	guint            full_aot : 1;
 	guint            compile_llvm : 1;
+	guint            compile_wasm : 1;
 	guint            got_var_allocated : 1;
 	guint            ret_var_is_local : 1;
 	guint            ret_var_set : 1;
@@ -2429,6 +2438,9 @@ char*             mono_get_delegate_virtual_invoke_impl_name (gboolean load_imt_
 gpointer          mono_get_delegate_virtual_invoke_impl  (MonoMethodSignature *sig, MonoMethod *method);
 
 void      mono_codegen                          (MonoCompile *cfg);
+#ifdef TARGET_WASM
+void      mono_wasm_emit_method                 (MonoCompile *cfg);
+#endif
 void mono_call_inst_add_outarg_reg (MonoCompile *cfg, MonoCallInst *call, int vreg, int hreg, int bank);
 void      mono_call_inst_add_outarg_vt          (MonoCompile *cfg, MonoCallInst *call, MonoInst *outarg_vt);
 
