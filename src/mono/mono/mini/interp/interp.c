@@ -602,6 +602,119 @@ interp_pop_lmf (MonoLMFExt *ext)
 	mono_pop_lmf (&ext->lmf);
 }
 
+#if HOST_BROWSER
+/* Global "a thread is compiling" flag. mono_wasm_force_compile -> mini_method_compile is the ONLY
+ * compilation in the interp-only runtime, and it is NOT safe to run concurrently here (the wasm
+ * emitter + cctor execution race on shared state -> corrupt module bytes, seen as
+ * "WebAssembly.Module(): expected magic word, found <garbage>" CompileErrors when a worker
+ * instantiates). The island's burst of cross-worker force-compiles made this frequent (jit82 crash).
+ * Serialize with a NON-BLOCKING try-acquire: a thread that loses the race skips compiling and returns
+ * "retriable" so the method is re-attempted later — never blocks, so coop-GC suspend can't deadlock. */
+static volatile gint32 wj_compiling = 0;
+
+/* Compile im->method to wasm and, on success, publish the result onto its InterpMethod (so callers
+ * see its f-slot). Returns 1 = JITted+published; 0 = retriable bail ("callee not jitted" with the
+ * blocking callee in mono_wasm_jit_last_blocking_callee, OR another thread was compiling); -1 =
+ * permanent bail. Resets the relays. */
+static int
+wasm_jit_compile_publish (InterpMethod *im)
+{
+	extern void mono_wasm_force_compile (MonoMethod *m);
+	extern gboolean mono_wasm_jit_name_denied (const char *name);
+	extern __thread int mono_wasm_jit_last_slot, mono_wasm_jit_last_fslot, mono_wasm_jit_last_len, mono_wasm_jit_last_retriable;
+	extern __thread void *mono_wasm_jit_last_bytes;
+	extern __thread MonoMethod *mono_wasm_jit_last_blocking_callee;
+	mono_wasm_jit_last_slot = 0; mono_wasm_jit_last_fslot = 0; mono_wasm_jit_last_bytes = NULL;
+	mono_wasm_jit_last_len = 0; mono_wasm_jit_last_retriable = 0; mono_wasm_jit_last_blocking_callee = NULL;
+	if (im->method->name && mono_wasm_jit_name_denied (im->method->name))
+		return -1;
+	/* serialize compilation (see wj_compiling): skip + retry if another thread (or a re-entrant cctor
+	 * compile on this thread) holds it. Non-blocking, so it can't deadlock the GC. */
+	if (mono_atomic_cas_i32 (&wj_compiling, 1, 0) != 0)
+		return 0;
+	mono_wasm_force_compile (im->method);
+	mono_atomic_store_i32 (&wj_compiling, 0);
+	if (mono_wasm_jit_last_slot > 0) {
+		im->wasm_jit_fslot = mono_wasm_jit_last_fslot;
+		im->wasm_jit_bytes = mono_wasm_jit_last_bytes;
+		im->wasm_jit_bytes_len = mono_wasm_jit_last_len;
+		mono_memory_barrier ();
+		im->wasm_jit_slot = mono_wasm_jit_last_slot;
+		return 1;
+	}
+	return mono_wasm_jit_last_retriable ? 0 : -1;
+}
+
+/* Eagerly form a JIT island rooted at m: compile it; if it bails because a DIRECT callee isn't JITted
+ * (the islands policy), recursively compile that callee (DFS) and retry — so a hot method's whole
+ * call-tree JITs in one shot instead of slowly bottom-up over many threshold-crosses + retries (the
+ * chunk-mesh getBlockState->index->accessor chains the IL showed). Bounded by depth + a shared compile
+ * budget so a pathological call graph can't run away. Returns the compile_publish code for m (1/0/-1). */
+#define WASM_JIT_ISLAND_MAX_DEPTH 10
+static int
+wasm_jit_force_island (MonoMethod *m, int depth, int *budget)
+{
+	extern __thread MonoMethod *mono_wasm_jit_last_blocking_callee;
+	InterpMethod *im = mono_interp_get_imethod (m);
+	int tries;
+	if (im->wasm_jit_fslot > 0) return 1;          /* already JITted */
+	if (im->wasm_jit_slot == -1) return -1;        /* permanently bailed */
+	if (depth > WASM_JIT_ISLAND_MAX_DEPTH) return 0;
+	for (tries = 0; tries <= WASM_JIT_ISLAND_MAX_DEPTH; tries++) {
+		MonoMethod *callee;
+		int r;
+		if (*budget <= 0) return 0;
+		(*budget)--;
+		r = wasm_jit_compile_publish (im);
+		if (r != 0) return r;                      /* JITted (1) or permanent (-1) */
+		callee = mono_wasm_jit_last_blocking_callee;  /* capture before the recursion clobbers the relay */
+		if (!callee || callee == m) return 0;
+		{
+			/* Hotness guard: only pull a callee into the island if it's actually hot. Cold callees —
+			 * e.g. the exception-constructor chains (new NullPointerException()) in rarely-taken error
+			 * branches — would otherwise be force-compiled for no benefit, bloating compilation + the
+			 * interp<->JIT boundary cost (jit79: registered 1037->1483, fps regressed). */
+			extern int mono_wasm_jit_thresh;
+			InterpMethod *cim = mono_interp_get_imethod (callee);
+			if (cim->wasm_jit_fslot <= 0 && cim->wasm_jit_slot != -1 && cim->wasm_jit_hits < mono_wasm_jit_thresh / 4)
+				return 0;   /* callee too cold to be worth eager island compilation */
+		}
+		if (wasm_jit_force_island (callee, depth + 1, budget) <= 0)
+			return 0;                              /* couldn't JIT the blocking callee -> m stays retriable */
+		/* callee JITted; loop to retry m (it may have further un-JITted direct callees) */
+	}
+	return 0;
+}
+
+/* Auto-JIT hotness trigger for a callee (MONO_WASM_JIT_AUTO): count calls; at the threshold compile it
+ * to wasm (eagerly forming its call-tree island unless MONO_WASM_JIT_ISLAND=0). Slot states: 0=untried
+ * (counting); >0=JITted; -1=permanent bail; -2..-5=retry-pending. Shared by MINT_CALL (direct) and
+ * MINT_CALLVIRT_FAST (virtual) dispatch so virtual targets — the bulk of hot IKVM methods — also JIT. */
+static void
+wasm_jit_maybe_compile (InterpMethod *cmethod)
+{
+	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island;
+	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && (cmethod->wasm_jit_slot == 0 || cmethod->wasm_jit_slot <= -2) && ++cmethod->wasm_jit_hits == mono_wasm_jit_thresh) {
+		int r;
+		if (mono_wasm_jit_island) {
+			int budget = 64;   /* max force-compiles per island attempt; retries continue across crosses */
+			r = wasm_jit_force_island (cmethod->method, 0, &budget);
+		} else {
+			r = wasm_jit_compile_publish (cmethod);
+		}
+		if (r > 0) {
+			return;   /* JITted + published */
+		} else if (r == 0) {   /* retriable: island incomplete (callee bailed / over budget) -> retry later */
+			int s = cmethod->wasm_jit_slot;
+			cmethod->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -1);
+			cmethod->wasm_jit_hits = 0;
+		} else {
+			cmethod->wasm_jit_slot = -1;
+		}
+	}
+}
+#endif
+
 static InterpMethod*
 get_virtual_method (InterpMethod *imethod, MonoVTable *vtable)
 {
@@ -2776,6 +2889,119 @@ mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
 }
 
 /*
+ * mono_wasm_jit_vcall_resolve_fslot:
+ *
+ *   Like mono_wasm_jit_vcall_resolve, but for the FAST virtual-dispatch path: resolve the override,
+ * stash it at scratch+200 (for the call_interp fallback), and if the override is itself wasm-JITted
+ * return its scalar `f` f-slot (after syncing THIS thread's function table so the slot is populated) —
+ * so the JITted caller can call_indirect straight into the override's wasm, no interp re-entry. Returns
+ * 0 when the override isn't JITted (or is a synchronized wrapper, which never gets an f-slot), so the
+ * caller falls back to spill + call_interp (which applies the monitor wrapper). Same GC discipline as
+ * vcall_resolve: the resolve+transform happen here, before the JITted code reads/pushes the call args.
+ *
+ *   INLINE CACHE (ic): a per-call-site 8-byte slot [i32 vtable, i32 InterpMethod*] in shared memory.
+ * The virtual resolve (mono_object_get_virtual_method_internal + mono_interp_get_imethod, ~150ns) is a
+ * pure function of (this->vtable, base_method); base_method is fixed per site, so we cache vtable ->
+ * imethod. On a monomorphic hit we skip the whole resolve and just load the cached imethod — the
+ * dominant per-call cost on BOTH the fast and residual paths. We deliberately keep the C call (+ the
+ * fslot-check + per-thread sync) rather than a pure-inline wasm IC: the wasm function table is
+ * PER-THREAD, so dispatching a cached f-slot inline (no sync) can call_indirect a slot absent on
+ * another worker -> trap. Caching the *resolve* here is MT-safe (sync still runs per fast dispatch).
+ * The (vtable, imethod) pair is published imethod-first then vtable-last; the i32-pair read can tear
+ * under concurrent cross-type writes (benign on the single-threaded render hot path; MT-hardening =
+ * i64.atomic — same TODO as the legacy inline-IC helpers).
+ */
+int
+mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic)
+{
+	guint64 *icp = (guint64 *) ic;
+	MonoVTable *vt = this_obj->vtable;
+	InterpMethod *imethod;
+	MonoMethod *target;
+	/* Read the (vtable | imethod<<32) pair ATOMICALLY. MC builds chunks on worker threads concurrently
+	 * with the render thread, so the same vcall site's IC is written by multiple threads. A non-atomic
+	 * i32-pair read can tear (match an old vtable but read a freshly-written imethod for a DIFFERENT
+	 * receiver type) -> dispatch to the wrong override (NullPointerException) or a wrong-signature f-slot
+	 * call_indirect (traps the worker -> GC can't suspend it). The i64 atomic makes the pair consistent. */
+	extern int mono_wasm_jit_vcall_ic;
+	gboolean use_ic = mono_wasm_jit_vcall_ic;
+	guint64 cached = use_ic ? (guint64) mono_atomic_load_i64 ((volatile gint64 *) icp) : 0;
+	if (use_ic && G_LIKELY ((guint32) cached == (guint32) (gsize) vt)) {
+		imethod = (InterpMethod *) (gsize) (guint32) (cached >> 32);   /* IC hit: skip the resolve + get_imethod */
+		target = imethod->method;
+	} else {
+		target = mono_object_get_virtual_method_internal (this_obj, base_method);
+		if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
+			target = mono_marshal_get_synchronized_wrapper (target);
+		imethod = mono_interp_get_imethod (target);
+		if (G_UNLIKELY (!imethod->transformed)) {
+			ERROR_DECL (error);
+			mono_interp_transform_method (imethod, get_context (), error);
+			mono_error_assert_ok (error);
+		}
+		if (use_ic)
+			mono_atomic_store_i64 ((volatile gint64 *) icp,
+				(gint64) (((guint64) (guint32) (gsize) imethod << 32) | (guint32) (gsize) vt));
+	}
+	*(MonoMethod **) (scratch + 200) = target;   /* for the call_interp fallback (past RET_OFF(192)+8) */
+	/* Force-JIT the hot override so the NEXT vcall to it takes the fast f-slot path instead of falling
+	 * back to interp_entry. An override reached ONLY through JITted callers (this path) never accumulates
+	 * hits at the interp dispatch sites (MINT_CALL/MINT_CALLVIRT_FAST), so without this it would never
+	 * cross the auto-JIT threshold — leaving most virtual calls stuck on the slow residual. Same hit
+	 * counter + threshold + eligibility/bail handling as the interp-dispatch trigger (no-op once the
+	 * override is JITted (slot>0) or permanently bailed (slot==-1); honours MONO_WASM_JIT_AUTO). */
+	if (imethod->wasm_jit_fslot <= 0)
+		wasm_jit_maybe_compile (imethod);
+	if (imethod->wasm_jit_fslot > 0) {
+		extern void mono_wasm_jit_sync_thread (void);
+		extern int mono_wasm_jit_stats, mono_wasm_jit_fastvcall_count;
+		mono_wasm_jit_sync_thread ();
+		if (G_UNLIKELY (mono_wasm_jit_stats))
+			mono_wasm_jit_fastvcall_count++;
+		return imethod->wasm_jit_fslot;
+	}
+	return 0;
+}
+
+/*
+ * mono_wasm_jit_raise_corlib:
+ *
+ *   Raise a corlib exception from a wasm-JITted method — the cold path of an OP_COND_EXC_* check
+ * (overflow / divide-by-zero / array-bounds / null / invalid-cast). exc_id selects the exception (the
+ * emitter's name->id map below). Installs the thread interp resume-state via mono_handle_exception
+ * WITHOUT C++-throwing through the JITted frame: a JITted method never has a LOCAL handler (methods with
+ * EH clauses bail at compile time), so the handler is always an interp frame up the stack, reached by
+ * unwinding the LMF the interp->JIT invoke pushed (ctx.ip==0 -> start from the current top LMF). The
+ * JITted caller then bails via EMIT_PENDING_EXC_CHECK (dummy return + ref_leave) — the same path the
+ * residual-throw uses, so the exception propagates through every JITted frame and resumes in the interp.
+ */
+void
+mono_wasm_jit_raise_corlib (int exc_id)
+{
+	MonoException *ex;
+	MonoContext ctx;
+	switch (exc_id) {
+	case 0:  ex = mono_get_exception_overflow (); break;
+	case 1:  ex = mono_get_exception_divide_by_zero (); break;
+	case 2:  ex = mono_get_exception_index_out_of_range (); break;
+	case 3:  ex = mono_get_exception_invalid_cast (); break;
+	case 4:  ex = mono_get_exception_null_reference (); break;
+	case 5:  ex = mono_get_exception_arithmetic (); break;
+	case 6:  ex = mono_get_exception_array_type_mismatch (); break;
+	default: ex = mono_get_exception_arithmetic (); break;   /* unreachable: emitter only emits ids 0-6 */
+	}
+	memset (&ctx, 0, sizeof (ctx));
+	MONO_CONTEXT_SET_SP (&ctx, &ctx);
+	mono_handle_exception (&ctx, (MonoObject *) ex);
+	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
+		/* handler is in native code (not expected for a JITted method invoked from interp) */
+		mono_restore_context (&ctx);
+		g_assert_not_reached ();
+	}
+	g_assert (get_context ()->has_resume_state);
+}
+
+/*
  * mono_wasm_jit_pending_exception:
  *
  *   TRUE if the current thread has a pending interp resume-state (an exception is unwinding). A
@@ -4942,6 +5168,26 @@ main_loop:
 				LOCAL_VAR (call_args_offset, gpointer) = unboxed;
 			}
 
+#if HOST_BROWSER
+			/* Auto-JIT this resolved VIRTUAL target + invoke its wasm version if compiled, before the
+			 * do_jit_call/interp path — so hot virtual methods (the bulk of IKVM's hot calls) get JITted and
+			 * run in wasm too, not just direct (MINT_CALL) callees. On a non-wasm-JIT target, fall through to
+			 * jit_call (AOT do_jit_call / interp), preserving existing behaviour. */
+			wasm_jit_maybe_compile (cmethod);
+			if (G_UNLIKELY (cmethod->wasm_jit_slot > 0)) {
+				extern void mono_wasm_jit_sync_thread (void);
+				mono_wasm_jit_sync_thread ();
+				{
+					MonoLMFExt ext;
+					interp_push_lmf (&ext, frame);
+					((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
+					interp_pop_lmf (&ext);
+				}
+				{ extern int mono_wasm_jit_stats, mono_wasm_jit_invoke_count; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_invoke_count++; }
+				CHECK_RESUME_STATE (context);
+				MINT_IN_BREAK;
+			}
+#endif
 jit_call:
 			{
 				InterpMethodCodeType code_type = cmethod->code_type;
@@ -5004,44 +5250,10 @@ jit_call:
 				/* If the callee was compiled by the runtime wasm JIT, invoke its entry thunk
 				 * e(args_ptr, ret_ptr) via the function-table slot instead of interpreting; the
 				 * thunk marshals args from the call-args stackvals and writes the result back. */
-				{
-					/* Automatic hotness trigger (Phase 5, MONO_WASM_JIT_AUTO): count calls to this
-					 * callee; at the threshold force-compile it to wasm. slot 0 = untried (count),
-					 * -1 = attempted+bailed (skip). Auto off → the && short-circuits, no overhead. */
-					extern int mono_wasm_jit_auto, mono_wasm_jit_thresh;
-					/* slot states: 0=untried (counting); >0=JITted; -1=permanent bail (EH/unsupported/...);
-					 * -2..-5=retry-pending (a "callee not jitted" bail — retry to let a JIT ISLAND form once
-					 * the callee JITs by its own hit count). Eligible to (re)attempt at 0 or a retry state. */
-					if (G_UNLIKELY (mono_wasm_jit_auto > 0) && (cmethod->wasm_jit_slot == 0 || cmethod->wasm_jit_slot <= -2) && ++cmethod->wasm_jit_hits == mono_wasm_jit_thresh) {
-						extern void mono_wasm_force_compile (MonoMethod *m);
-						extern gboolean mono_wasm_jit_name_denied (const char *name);
-						extern __thread int mono_wasm_jit_last_slot, mono_wasm_jit_last_fslot, mono_wasm_jit_last_len, mono_wasm_jit_last_retriable;
-						extern __thread void *mono_wasm_jit_last_bytes;
-						mono_wasm_jit_last_slot = 0; mono_wasm_jit_last_fslot = 0; mono_wasm_jit_last_bytes = NULL; mono_wasm_jit_last_len = 0; mono_wasm_jit_last_retriable = 0;
-						/* Coverage-stable bisection (MONO_WASM_JIT_NO_METHOD): skip wasm-JIT for a denylisted
-						 * simple name so it stays in the interpreter; auto-JIT stays ON (startup/ICU unaffected).
-						 * Deny halves of the registered set to pin the diverging method. */
-						if (!(cmethod->method->name && mono_wasm_jit_name_denied (cmethod->method->name)))
-							mono_wasm_force_compile (cmethod->method);
-						if (mono_wasm_jit_last_slot > 0) {
-							/* publish bytes/fslot first, slot last (the ready flag the invoke + other threads check) */
-							cmethod->wasm_jit_fslot = mono_wasm_jit_last_fslot;
-							cmethod->wasm_jit_bytes = mono_wasm_jit_last_bytes;
-							cmethod->wasm_jit_bytes_len = mono_wasm_jit_last_len;
-							mono_memory_barrier ();
-							cmethod->wasm_jit_slot = mono_wasm_jit_last_slot;
-						} else if (mono_wasm_jit_last_retriable) {
-							/* "callee not jitted": the callee may JIT later (by its own hotness) — re-attempt so
-							 * an island forms and the call becomes a direct f-slot. Bounded (-2..-5, then -1) so a
-							 * call to an un-JIT-able callee gives up after a few tries. Re-count hits to space them. */
-							int s = cmethod->wasm_jit_slot;
-							cmethod->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -1);
-							cmethod->wasm_jit_hits = 0;
-						} else {
-							cmethod->wasm_jit_slot = -1; /* permanent bail (EH/unsupported/synchronized/byref): never retry */
-						}
-					}
-				}
+					/* hotness trigger: unified with the virtual path — wasm_jit_maybe_compile serializes the
+					 * compile (try-lock) + eagerly forms the call-tree island. (Was an inline copy that called
+					 * mono_wasm_force_compile directly, bypassing both — the jit83 unserialized-compile hole.) */
+					wasm_jit_maybe_compile (cmethod);
 								if (G_UNLIKELY (cmethod->wasm_jit_slot > 0)) {
 					/* Bring THIS thread's per-thread function table up to date (instantiate any JITted
 					 * methods registered since this thread last synced) before invoking, so both this method
