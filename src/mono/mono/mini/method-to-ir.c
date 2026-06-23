@@ -8989,6 +8989,10 @@ calli_end:
 
 			if (COMPILE_LLVM (cfg))
 				use_op_switch = TRUE;
+			/* The wasm backend lowers OP_SWITCH directly (br via the bb dispatch); keep it instead of the
+			 * OP_JUMP_TABLE + computed-branch form (wasm has no computed goto to a code address). */
+			if (COMPILE_WASM (cfg))
+				use_op_switch = TRUE;
 
 			cfg->cbb->has_jump_table = 1;
 
@@ -9400,6 +9404,17 @@ calli_end:
 
 						if (!ins->inst_p0)
 							OUT_OF_MEMORY_FAILURE;
+#ifdef HOST_BROWSER
+						/* wasm JIT: the string is a MOVABLE GC object; a backend-baked immediate of it
+						 * would dangle after a later GC. Capture it into the GC-tracked literal table NOW,
+						 * while the pointer is fresh (no GC since mono_ldstr_checked), and stash the stable
+						 * slot in inst_p1 — the wasm emitter bakes that + an i32.load so every read gets the
+						 * current address. Done here, not at emit, so we never root a stale pointer. */
+						if (cfg->compile_wasm && ins->inst_p0) {
+							extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
+							ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+						}
+#endif
 
 						*sp = ins;
 						MONO_ADD_INS (cfg->cbb, ins);
@@ -9828,6 +9843,14 @@ calli_end:
 							MonoType *klass_type = m_class_get_byval_arg (klass);
 							MonoReflectionType* reflection_type = mono_type_get_object_checked (klass_type, cfg->error);
 							EMIT_NEW_PCONST (cfg, ins, reflection_type);
+#ifdef HOST_BROWSER
+							/* wasm JIT: capture the freshly-resolved movable reflection Type into the GC-tracked
+							 * literal table now; the emitter loads it from the stable slot (see the ldstr site). */
+							if (cfg->compile_wasm && ins->inst_p0) {
+								extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
+								ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+							}
+#endif
 						}
 						ins->type = STACK_OBJ;
 						ins->klass = mono_defaults.systemtype_class;
@@ -11121,6 +11144,14 @@ field_access_end:
 						MonoReflectionType *rt = mono_type_get_object_checked ((MonoType *)handle, cfg->error);
 						CHECK_CFG_ERROR;
 						EMIT_NEW_PCONST (cfg, ins, rt);
+#ifdef HOST_BROWSER
+						/* wasm JIT: capture the freshly-resolved movable reflection Type into the GC-tracked
+						 * literal table now; the emitter loads it from the stable slot (see the ldstr site). */
+						if (cfg->compile_wasm && ins->inst_p0) {
+							extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
+							ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+						}
+#endif
 					}
 					ins->type = STACK_OBJ;
 					ins->klass = mono_defaults.runtimetype_class;

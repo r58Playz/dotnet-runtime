@@ -156,6 +156,7 @@ struct InterpMethod {
 	gint32 wasm_jit_hits;  // runtime wasm JIT: call-count toward the auto-JIT hotness threshold (MONO_WASM_JIT_AUTO)
 	gint32 wasm_jit_bytes_len; // runtime wasm JIT: length of the cached module bytes (for per-thread instantiation)
 	gpointer wasm_jit_bytes;   // runtime wasm JIT: cached emitted module bytes; each thread instantiates its own WebAssembly.Instance from these into its own function table on first invoke (the table is per-thread for dynamically-added entries)
+	gint16 wasm_jit_bail;  // runtime wasm JIT: why this method permanently failed to JIT (set when slot==-1), for the weighted vcall-residual breakdown. 0=n/a; -2=EH clauses; -3=sig(arg/ret) type; -4=other; >0=the unsupported mini opcode number
 	unsigned int param_count;
 	unsigned int hasthis; // boolean
 	MonoProfilerCallInstrumentationFlags prof_flags;

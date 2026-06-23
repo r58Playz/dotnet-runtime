@@ -621,7 +621,7 @@ wasm_jit_compile_publish (InterpMethod *im)
 {
 	extern void mono_wasm_force_compile (MonoMethod *m);
 	extern gboolean mono_wasm_jit_name_denied (const char *name);
-	extern __thread int mono_wasm_jit_last_slot, mono_wasm_jit_last_fslot, mono_wasm_jit_last_len, mono_wasm_jit_last_retriable;
+	extern __thread int mono_wasm_jit_last_slot, mono_wasm_jit_last_fslot, mono_wasm_jit_last_len, mono_wasm_jit_last_retriable, mono_wasm_jit_last_bail;
 	extern __thread void *mono_wasm_jit_last_bytes;
 	extern __thread MonoMethod *mono_wasm_jit_last_blocking_callee;
 	mono_wasm_jit_last_slot = 0; mono_wasm_jit_last_fslot = 0; mono_wasm_jit_last_bytes = NULL;
@@ -642,7 +642,10 @@ wasm_jit_compile_publish (InterpMethod *im)
 		im->wasm_jit_slot = mono_wasm_jit_last_slot;
 		return 1;
 	}
-	return mono_wasm_jit_last_retriable ? 0 : -1;
+	if (mono_wasm_jit_last_retriable)
+		return 0;
+	im->wasm_jit_bail = (gint16) mono_wasm_jit_last_bail;   /* permanent bail: record why, for the vcall-residual breakdown */
+	return -1;
 }
 
 /* Eagerly form a JIT island rooted at m: compile it; if it bails because a DIRECT callee isn't JITted
@@ -696,6 +699,14 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island;
 	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && (cmethod->wasm_jit_slot == 0 || cmethod->wasm_jit_slot <= -2) && ++cmethod->wasm_jit_hits == mono_wasm_jit_thresh) {
 		int r;
+		/* Don't whole-method-JIT a method that already has AOT code — it runs faster as native AOT, reached
+		 * via do_jit_call (the residual / vcall-fallback now routes AOT'd callees there). Mark permanent so
+		 * we stop counting + stop wasting compile attempts (+ ldaddr bails) on already-compiled code. */
+		extern int mono_wasm_jit_aot_residual;
+		if (mono_wasm_jit_aot_residual && mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
+			cmethod->wasm_jit_slot = -1;
+			return;
+		}
 		if (mono_wasm_jit_island) {
 			int budget = 64;   /* max force-compiles per island attempt; retries continue across crosses */
 			r = wasm_jit_force_island (cmethod->method, 0, &budget);
@@ -2432,6 +2443,10 @@ typedef struct {
 static __thread gboolean wj_residual_active;
 #endif
 
+/* fwd-decl: interp_entry's wasm-JIT residual fast path calls do_jit_call (defined below) to run an AOT'd
+ * callee natively instead of interpreting it. */
+static MONO_NEVER_INLINE void do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame *frame, InterpMethod *rmethod, MonoError *error);
+
 /* Main function for entering the interpreter from compiled code */
 // Do not inline in case order of frame addresses matters.
 static MONO_NEVER_INLINE void
@@ -2507,7 +2522,41 @@ interp_entry (InterpEntryData *data)
 	g_assert (context->stack_pointer < context->stack_end);
 
 	MONO_ENTER_GC_UNSAFE;
-	mono_interp_exec_method (&frame, context, NULL);
+#if HOST_BROWSER
+	/* wasm-JIT residual FAST PATH (jit -> AOT): if this call is driven by a wasm-JITted method's residual
+	 * (wj_residual_active) and the callee has AOT code, call it NATIVELY via do_jit_call instead of
+	 * interpreting it. interp_entry has already copied the args onto the GC-scanned interp stack (sp) at
+	 * get_arg_offset_fast offsets — exactly do_jit_call's expected layout — and set up `frame`, so this
+	 * reuses interp_entry's GC-safe setup (no synthesized frame). Without this, a wasm-JITted method's
+	 * residual / vcall-fallback to AOT'd library code (fastutil/java/corlib) was dropped to the interpreter,
+	 * never touching the AOT body. Eligibility is cached on code_type, like the interp's MINT_JIT_CALL. */
+	extern int mono_wasm_jit_aot_residual;
+	gboolean wj_did_jit_call = FALSE;
+	if (G_UNLIKELY (wj_residual_active) && mono_wasm_jit_aot_residual) {
+		InterpMethodCodeType ct = rmethod->code_type;
+		if (ct == IMETHOD_CODE_UNKNOWN) {
+			ct = mono_interp_jit_call_supported (method, sig) ? IMETHOD_CODE_COMPILED : IMETHOD_CODE_INTERP;
+			rmethod->code_type = ct;
+		}
+		if (ct == IMETHOD_CODE_COMPILED) {
+			ERROR_DECL (jit_err);
+			do_jit_call (context, frame.stack, frame.stack, &frame, rmethod, jit_err);
+			if (!is_ok (jit_err)) {
+				/* AOT method threw a fresh exception (do_jit_call set the error rather than resume-state):
+				 * install the interp resume-state so the wj_residual_active path below returns threw=1 and
+				 * the JITted caller unwinds (same model as mono_wasm_jit_raise_corlib). */
+				MonoException *ex = mono_error_convert_to_exception (jit_err);
+				MonoContext ctx;
+				memset (&ctx, 0, sizeof (ctx));
+				MONO_CONTEXT_SET_SP (&ctx, &ctx);
+				mono_handle_exception (&ctx, (MonoObject*) ex);
+			}
+			wj_did_jit_call = TRUE;
+		}
+	}
+	if (!wj_did_jit_call)
+#endif
+		mono_interp_exec_method (&frame, context, NULL);
 	MONO_EXIT_GC_UNSAFE;
 
 	context->stack_pointer = (guchar*)sp;
@@ -2763,6 +2812,97 @@ mono_wasm_jit_scratch (void)
 }
 
 /*
+ * wasm_jit_aot_call_lean:
+ *
+ *   INLINE AOT FASTPATH for the wasm-JIT residual. When the residual callee has AOT code, run it
+ * natively via do_jit_call DIRECTLY — skipping interp_entry's InterpEntryData marshalling layer and
+ * its is_invoke/unbox/many_args machinery. This is the same path the interpreter itself uses to reach
+ * AOT code (MINT_JIT_CALL); the only unavoidable per-call cost is the GC-scanned arg copy plus the
+ * minimal frame do_jit_call's LMF needs. Mirrors interp_entry's wj_residual_active AOT branch exactly,
+ * including the throw->resume-state handoff (so an uncaught throw unwinds to the handler ABOVE the
+ * JITted frame) and the no-write-barrier ref-return store into the scratch.
+ *
+ * Returns 1 if the callee threw (resume-state set; the JITted caller must `goto resume`), else 0.
+ */
+static int
+wasm_jit_aot_call_lean (InterpMethod *imethod, MonoMethodSignature *sig, guint8 *buf)
+{
+	ERROR_DECL (error);
+	ThreadContext *context;
+	stackval *sp;
+	int idx = 0, i;
+	gpointer orig_domain = NULL, attach_cookie;
+
+	if (imethod->needs_thread_attach)
+		orig_domain = mono_threads_attach_coop (mono_domain_get (), &attach_cookie);
+
+	context = get_context ();
+	sp = (stackval*)context->stack_pointer;
+
+	/* Copy `this` + args from the JITted scratch onto the GC-scanned interp stack at the interp arg
+	 * offsets. The copy is required: a ref arg must be a GC root across the AOT call (which can move it),
+	 * and the scratch is not GC-visible. (Same arg convention as the interp_entry residual path.) */
+	if (sig->hasthis) {
+		sp->data.p = *(gpointer*)(buf + 0);
+		idx = 1;
+	}
+	for (i = 0; i < (int) sig->param_count; ++i) {
+		int arg_offset = get_arg_offset_fast (imethod, NULL, idx + i);
+		stackval *sval = STACK_ADD_ALIGNED_BYTES (sp, arg_offset);
+		guint8 *slot = buf + (idx + i) * 8;
+		if (m_type_is_byref (sig->params [i]))
+			sval->data.p = *(gpointer*)slot;
+		else
+			stackval_from_data (sig->params [i], sval, slot, FALSE);
+	}
+
+	InterpFrame frame = {0};
+	frame.imethod = imethod;
+	frame.stack = sp;
+	frame.retval = sp;
+
+	int params_size = get_arg_offset_fast (imethod, NULL, idx + sig->param_count);
+	context->stack_pointer = (guchar*)ALIGN_TO ((guchar*)sp + params_size, MINT_STACK_ALIGNMENT);
+	g_assert (context->stack_pointer < context->stack_end);
+
+	{
+		gboolean saved_wj = wj_residual_active;
+		wj_residual_active = TRUE;
+		MONO_ENTER_GC_UNSAFE;
+		do_jit_call (context, sp, sp, &frame, imethod, error);
+		if (!is_ok (error)) {
+			/* AOT method raised a fresh exception (do_jit_call set the error rather than resume-state):
+			 * install the interp resume-state so the JITted caller unwinds (mirrors interp_entry). */
+			MonoException *ex = mono_error_convert_to_exception (error);
+			MonoContext ctx;
+			memset (&ctx, 0, sizeof (ctx));
+			MONO_CONTEXT_SET_SP (&ctx, &ctx);
+			mono_handle_exception (&ctx, (MonoObject*) ex);
+		}
+		MONO_EXIT_GC_UNSAFE;
+		wj_residual_active = saved_wj;
+	}
+
+	context->stack_pointer = (guchar*)sp;
+
+	if (imethod->needs_thread_attach)
+		mono_threads_detach_coop (orig_domain, &attach_cookie);
+
+	if (context->has_resume_state)
+		return 1;
+
+	/* Write the return value back into the scratch for the JITted caller (mirrors interp_entry exit). */
+	if (sig->ret->type != MONO_TYPE_VOID) {
+		memset (buf + WJ_SCRATCH_RET_OFF, 0, 8);
+		if (MONO_TYPE_IS_REFERENCE (sig->ret))
+			*(gpointer*)(buf + WJ_SCRATCH_RET_OFF) = sp->data.o;   /* no write barrier: scratch is not GC-tracked */
+		else
+			stackval_to_data_sign_ext (sig->ret, sp, buf + WJ_SCRATCH_RET_OFF, FALSE);
+	}
+	return 0;
+}
+
+/*
  * mono_wasm_jit_call_interp:
  *
  *   Outbound DIRECT call from a wasm-JITted method to a callee that has no wasm f-slot (un-JITted, or
@@ -2797,6 +2937,29 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		mono_interp_transform_method (imethod, get_context (), error);
 		mono_error_assert_ok (error);
 	}
+	/* INLINE AOT FASTPATH: if the callee has AOT code, run it natively via do_jit_call directly,
+	 * skipping interp_entry's InterpEntryData marshalling. Covers BOTH the direct-call residual and the
+	 * vcall-fallback (which funnels here after resolve). Cached on code_type like the interp MINT_JIT_CALL.
+	 * mono_wasm_jit_aot_routed / _interp_routed measure the split (how much the fastpath actually fires). */
+	{
+		extern int mono_wasm_jit_aot_residual, mono_wasm_jit_aot_routed, mono_wasm_jit_interp_routed;
+		extern MonoMethod *mono_wasm_jit_ring [];
+		extern int mono_wasm_jit_ring_count, mono_wasm_jit_ring_frozen;
+		InterpMethodCodeType ct = imethod->code_type;
+		if (ct == IMETHOD_CODE_UNKNOWN) {
+			ct = mono_interp_jit_call_supported (method, sig) ? IMETHOD_CODE_COMPILED : IMETHOD_CODE_INTERP;
+			imethod->code_type = ct;
+		}
+		if (mono_wasm_jit_aot_residual && ct == IMETHOD_CODE_COMPILED) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) {
+				mono_wasm_jit_residual_count++;
+				mono_wasm_jit_aot_routed++;
+				if (!mono_wasm_jit_ring_frozen) { mono_wasm_jit_ring [mono_wasm_jit_ring_count & 127] = method; mono_wasm_jit_ring_count++; }
+			}
+			return wasm_jit_aot_call_lean (imethod, sig, buf);
+		}
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_interp_routed++;
+	}
 	memset (&data, 0, sizeof (data));
 	data.rmethod = imethod;
 	if (sig->hasthis) {
@@ -2826,7 +2989,7 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		extern MonoMethod *mono_wasm_jit_ring [];
 		extern int mono_wasm_jit_ring_count, mono_wasm_jit_ring_frozen;
 		mono_wasm_jit_residual_count++;
-		/* trail of recent residual callees (ring buffer); frozen at the recursive-finish so a post-crash
+		/* trail of recent residual callees (ring buffer); frozen at a detected failure so a post-crash
 		 * dump shows the residuals up to the failure (not the crash-report flood that follows) */
 		if (!mono_wasm_jit_ring_frozen) {
 			mono_wasm_jit_ring [mono_wasm_jit_ring_count & 127] = method;
@@ -2911,6 +3074,14 @@ mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
  * under concurrent cross-type writes (benign on the single-threaded render hot path; MT-hardening =
  * i64.atomic — same TODO as the legacy inline-IC helpers).
  */
+/* Field offset of InterpMethod.wasm_jit_fslot, for the emitter's inline virtual-IC fast path (which
+ * loads imethod->wasm_jit_fslot directly in wasm). mini-wasm.c can't see the InterpMethod layout. */
+int
+mono_wasm_jit_imethod_fslot_off (void)
+{
+	return (int) G_STRUCT_OFFSET (InterpMethod, wasm_jit_fslot);
+}
+
 int
 mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic)
 {
@@ -2923,13 +3094,17 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	 * i32-pair read can tear (match an old vtable but read a freshly-written imethod for a DIFFERENT
 	 * receiver type) -> dispatch to the wrong override (NullPointerException) or a wrong-signature f-slot
 	 * call_indirect (traps the worker -> GC can't suspend it). The i64 atomic makes the pair consistent. */
-	extern int mono_wasm_jit_vcall_ic;
+	extern int mono_wasm_jit_vcall_ic, mono_wasm_jit_stats;
+	extern int mono_wasm_jit_vic_hit, mono_wasm_jit_vic_miss, mono_wasm_jit_vfast_had, mono_wasm_jit_vfast_new, mono_wasm_jit_vfb_thresh, mono_wasm_jit_vfb_perm;
+	extern int mono_wasm_jit_vperm_eh, mono_wasm_jit_vperm_ldaddr, mono_wasm_jit_vperm_lcmp, mono_wasm_jit_vperm_otherop, mono_wasm_jit_vperm_other;
 	gboolean use_ic = mono_wasm_jit_vcall_ic;
 	guint64 cached = use_ic ? (guint64) mono_atomic_load_i64 ((volatile gint64 *) icp) : 0;
 	if (use_ic && G_LIKELY ((guint32) cached == (guint32) (gsize) vt)) {
 		imethod = (InterpMethod *) (gsize) (guint32) (cached >> 32);   /* IC hit: skip the resolve + get_imethod */
 		target = imethod->method;
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_vic_hit++;
 	} else {
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_vic_miss++;
 		target = mono_object_get_virtual_method_internal (this_obj, base_method);
 		if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
 			target = mono_marshal_get_synchronized_wrapper (target);
@@ -2950,15 +3125,35 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	 * cross the auto-JIT threshold — leaving most virtual calls stuck on the slow residual. Same hit
 	 * counter + threshold + eligibility/bail handling as the interp-dispatch trigger (no-op once the
 	 * override is JITted (slot>0) or permanently bailed (slot==-1); honours MONO_WASM_JIT_AUTO). */
+	gboolean had_fslot = imethod->wasm_jit_fslot > 0;   /* JITted on entry (vfast_had) vs compiled by the call below (vfast_new) */
 	if (imethod->wasm_jit_fslot <= 0)
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_fslot > 0) {
 		extern void mono_wasm_jit_sync_thread (void);
-		extern int mono_wasm_jit_stats, mono_wasm_jit_fastvcall_count;
+		extern int mono_wasm_jit_fastvcall_count;
 		mono_wasm_jit_sync_thread ();
-		if (G_UNLIKELY (mono_wasm_jit_stats))
+		if (G_UNLIKELY (mono_wasm_jit_stats)) {
 			mono_wasm_jit_fastvcall_count++;
+			if (had_fslot) mono_wasm_jit_vfast_had++; else mono_wasm_jit_vfast_new++;
+		}
 		return imethod->wasm_jit_fslot;
+	}
+	/* Fallback to interp (call_interp). Split by reason: slot==-1 is permanently un-JITtable (EH/unsupported
+	 * opcode/eligibility bail — will NEVER take the fast path); anything else (0 counting, -2..-5 retriable)
+	 * is still below the JIT threshold and SHOULD become fast once it crosses (threshold latency). */
+	if (G_UNLIKELY (mono_wasm_jit_stats)) {
+		if (imethod->wasm_jit_slot == -1) {
+			mono_wasm_jit_vfb_perm++;
+			switch (imethod->wasm_jit_bail) {            /* weighted breakdown of WHY it can't JIT (see mono_wasm_jit_last_bail) */
+			case -2: mono_wasm_jit_vperm_eh++; break;
+			case -5: mono_wasm_jit_vperm_ldaddr++; break;
+			case -6: mono_wasm_jit_vperm_lcmp++; break;
+			default:
+				if (imethod->wasm_jit_bail > 0) mono_wasm_jit_vperm_otherop++;
+				else mono_wasm_jit_vperm_other++;     /* sig / synchronized / byref / other */
+				break;
+			}
+		} else mono_wasm_jit_vfb_thresh++;
 	}
 	return 0;
 }
@@ -2995,6 +3190,41 @@ mono_wasm_jit_raise_corlib (int exc_id)
 	mono_handle_exception (&ctx, (MonoObject *) ex);
 	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
 		/* handler is in native code (not expected for a JITted method invoked from interp) */
+		mono_restore_context (&ctx);
+		g_assert_not_reached ();
+	}
+	g_assert (get_context ()->has_resume_state);
+}
+
+/*
+ * mono_wasm_jit_throw:
+ *
+ *   Throw an arbitrary exception object from a wasm-JITted method (OP_THROW: `throw expr`). Same model
+ * as mono_wasm_jit_raise_corlib — methods with a LOCAL handler (EH clauses) bail at compile time, so a
+ * JITted `throw` never has a catch in its own frame; install the interp resume-state via
+ * mono_handle_exception (ctx.ip==0 -> unwind from the top LMF the interp->JIT invoke pushed) and let the
+ * JITted caller bail via EMIT_REF_LEAVE + dummy return, propagating to the handler up the interp stack.
+ * `throw` is the #1 leaf-method JIT blocker in IKVM (null/argument-validation throws are everywhere), so
+ * supporting it lets throwing leaves JIT and the RESIDUAL=0 islands resolve bottom-up.
+ */
+void
+mono_wasm_jit_throw (MonoObject *exc)
+{
+	ERROR_DECL (error);
+	MonoContext ctx;
+	if (G_UNLIKELY (!exc))
+		exc = (MonoObject *) mono_get_exception_null_reference ();
+	/* fresh throw (not rethrow): clear any captured trace so mono_handle_exception rebuilds it (mirrors interp_throw) */
+	if (mono_object_isinst_checked (exc, mono_defaults.exception_class, error)) {
+		MonoException *mex = (MonoException *) exc;
+		mex->stack_trace = NULL;
+		mex->trace_ips = NULL;
+	}
+	mono_error_cleanup (error);
+	memset (&ctx, 0, sizeof (ctx));
+	MONO_CONTEXT_SET_SP (&ctx, &ctx);
+	mono_handle_exception (&ctx, exc);
+	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
 		mono_restore_context (&ctx);
 		g_assert_not_reached ();
 	}
@@ -3431,6 +3661,14 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 	cinfo = (JitCallInfo*)rmethod->jit_call_info;
 
 #if JITERPRETER_ENABLE_JIT_CALL_TRAMPOLINES
+	/* PROOF (MONO_WASM_JIT_NO_LMF): skip the per-call LMF for a wasm-JITted method's residual AOT call.
+	 * Gated on wj_residual_active so the interp's own MINT_JIT_CALL always keeps its LMF. This validates
+	 * whether the inline-direct-AOT-call plan — which can't cheaply push an LMF — is GC/EH-correct
+	 * (conservative stack GC + local wasm-EH catch should make the LMF unneeded for this transition).
+	 * Inside the JITERPRETER guard (browser-only): wj_residual_active + mono_wasm_jit_no_lmf are
+	 * wasm-runtime-only symbols; the cross-compiler builds interp.c without them. */
+	extern int mono_wasm_jit_no_lmf;
+	gboolean wj_no_lmf = mono_wasm_jit_no_lmf && wj_residual_active;
 	// The jiterpreter will compile a unique thunk for each do_jit_call call site if it is hot
 	//  enough to justify it. At that point we can invoke the thunk to efficiently do most of
 	//  the work that would normally be done by do_jit_call
@@ -3442,7 +3680,7 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 			MonoFtnDesc ftndesc = {0};
 			ftndesc.addr = cinfo->addr;
 			ftndesc.arg = cinfo->extra_arg;
-			interp_push_lmf (&ext, frame);
+			if (!wj_no_lmf) interp_push_lmf (&ext, frame);
 			if (
 				mono_opt_jiterpreter_wasm_eh_enabled ||
 				(mono_aot_mode != MONO_AOT_MODE_LLVMONLY_INTERP)
@@ -3458,7 +3696,7 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 					thunk, ret_sp, sp, &ftndesc, &thrown
 				);
 			}
-			interp_pop_lmf (&ext);
+			if (!wj_no_lmf) interp_pop_lmf (&ext);
 
 			// We reuse do_jit_call's epilogue to do things like propagate thrown exceptions
 			//  and sign-extend return values instead of inlining that logic into every thunk
@@ -3596,6 +3834,80 @@ epilogue:
 		}
 	}
 }
+
+#if HOST_BROWSER
+/* For the inline-direct-AOT-call emitter (mini-wasm.c): ensure the callee's JitCallInfo, then hand back
+ * the two values the emitter bakes as i32 constants — cinfo->addr (the AOT target's table index) and
+ * cinfo->extra_arg (the rgctx). The emitter then emits, inline in the JITted method, the same direct
+ * same-ABI call the jiterpreter's directJitCalls (enableDirect) thunk does: push (this, native-typed
+ * args, rgctx); call_indirect <addr>. cinfo->addr is cross-thread-stable (do_jit_call's generic path
+ * calls it from any thread), so baking it is safe — it's the GOT-slot analog. Returns TRUE only for the
+ * directly-callable case: jit-call-supported AND !no_wrapper (the gsharedvt_out wrapper exists but is
+ * bypassable). no_wrapper (gsharedvt-variable) and unsupported callees return FALSE -> emitter residuals. */
+gboolean
+mono_wasm_jit_aot_call_target (MonoMethod *method, gpointer *out_addr, gpointer *out_rgctx)
+{
+	MonoMethodSignature *sig = mono_method_signature_internal (method);
+	if (!mono_interp_jit_call_supported (method, sig))
+		return FALSE;
+	InterpMethod *imethod = mono_interp_get_imethod (method);
+	if (!imethod->jit_call_info) {
+		ERROR_DECL (error);
+		init_jit_call_info (imethod, error);
+		if (!is_ok (error)) { mono_interp_error_cleanup (error); return FALSE; }
+	}
+	JitCallInfo *cinfo = (JitCallInfo*)imethod->jit_call_info;
+	if (!cinfo || cinfo->no_wrapper)
+		return FALSE;
+	*out_addr = cinfo->addr;
+	*out_rgctx = cinfo->extra_arg;
+	return TRUE;
+}
+
+/*
+ * mono_wasm_jit_aot_caught:
+ *
+ *   Catch handler for the inline-direct-AOT-call (mini-wasm.c). A JITted method wraps the call_indirect
+ * to the AOT target in a wasm try/catch <__cpp_exception>; if the AOT callee throws, the catch block
+ * calls this with the C++ exception pointer. We claim the C++ exception (mono_jiterp_begin_catch /
+ * mono_jiterp_end_catch — the SAME lifecycle the jiterpreter jit-call thunk uses, llvm-runtime.cpp), then
+ * convert the pending native exception into the interp resume-state, mirroring do_jit_call's epilogue
+ * (interp.c, the `if (thrown)` block) and mono_wasm_jit_throw: the JITted method then bails via
+ * EMIT_PENDING_EXC_CHECK and the exception resumes in the interp handler up the stack. No per-call LMF is
+ * needed (jit102 proof): mono_handle_exception with ctx.ip==0 unwinds from the top LMF the interp->JIT
+ * invoke pushed, exactly like a JITted OP_THROW (JITted methods with EH clauses bail at compile time, so
+ * the handler is always an interp frame, never a local one). */
+extern void mono_jiterp_begin_catch (void *exc);
+extern void mono_jiterp_end_catch (void);
+
+void
+mono_wasm_jit_aot_caught (void *cpp_exc)
+{
+	ThreadContext *context = get_context ();
+	/* claim + release the C++ exception object (same lifecycle as the jiterpreter jit-call thunk) */
+	mono_jiterp_begin_catch (cpp_exc);
+	mono_jiterp_end_catch ();
+	/* an already-installed resume-state (interp_entry reraise) propagates as-is */
+	if (context->has_resume_state)
+		return;
+	/* a C++ exception caught by an AOTed frame above us: instruct the interp to unwind */
+	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
+	if (jit_tls->resume_state.il_state) {
+		context->has_resume_state = TRUE;
+		context->handler_frame = NULL;
+		return;
+	}
+	/* convert the pending native exception into the interp resume-state (mirrors mono_wasm_jit_throw) */
+	MonoObject *obj = mini_llvmonly_load_exception ();
+	g_assert (obj);
+	mini_llvmonly_clear_exception ();
+	MonoContext ctx;
+	memset (&ctx, 0, sizeof (ctx));
+	MONO_CONTEXT_SET_SP (&ctx, &ctx);
+	mono_handle_exception (&ctx, obj);
+	g_assert (get_context ()->has_resume_state);
+}
+#endif
 
 static MONO_NEVER_INLINE void
 do_debugger_tramp (void (*tramp) (void), InterpFrame *frame)
@@ -5179,6 +5491,10 @@ main_loop:
 				mono_wasm_jit_sync_thread ();
 				{
 					MonoLMFExt ext;
+					/* Set the resume IP before the call (see the MINT_CALL path): mono_handle_exception reads
+					 * frame->state.ip on THIS frame (reached via the LMF) to match try/catch regions when the
+					 * JITted callee's residual throws. A stale ip skips a catch in this method. */
+					frame->state.ip = ip;
 					interp_push_lmf (&ext, frame);
 					((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
 					interp_pop_lmf (&ext);
@@ -5266,6 +5582,14 @@ jit_call:
 						 * suspends triggered inside the JITted method (e.g. its GC safepoint poll) are handled
 						 * correctly. Without it a suspend inside JITted code corrupts coop/suspend state. */
 						MonoLMFExt ext;
+						/* Record our resume IP BEFORE the call, exactly as do_jit_call does (frame->state.ip = ip).
+						 * If the JITted callee's residual throws, mono_handle_exception walks via the LMF pushed
+						 * below to THIS interp frame and reads frame->state.ip to match the active try/catch regions.
+						 * Without this it reads a stale ip (the frame's entry/prologue), the region match fails, and
+						 * a catch in THIS method (the JITted method's direct interp caller) is skipped — the
+						 * exception escapes past it (the MC RunningOnDifferentThreadException disconnect, and the
+						 * EhCatch repro: throw escaped past the inner catch). */
+						frame->state.ip = ip;
 						interp_push_lmf (&ext, frame);
 						((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
 						interp_pop_lmf (&ext);

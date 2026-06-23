@@ -266,6 +266,7 @@ wasm_module_method_and_entry (
 	const WasmBuf *e_body,
 	const WasmFuncType *extra_types, guint32 nextra,
 	gboolean import_table,
+	gboolean import_eh_tag, guint32 eh_type_idx,
 	WasmBuf *out)
 {
 	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
@@ -309,10 +310,11 @@ wasm_module_method_and_entry (
 	emit_section (out, 1, &sec);
 	wasm_buf_free (&sec);
 
-	/* Import section (2): shared memory m.h (matches the threads runtime heap), and — when the
-	 * method body uses call_indirect — the indirect function table f.f as table 0. */
+	/* Import section (2): shared memory m.h (matches the threads runtime heap); — when the method body
+	 * uses call_indirect — the indirect function table f.f as table 0; and — when it uses try/catch — the
+	 * C++ exception tag x.e (matches the runtime's __cpp_exception export, like the jiterpreter). */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, import_table ? 2 : 1);
+	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0)));
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);   /* memory */
@@ -326,6 +328,13 @@ wasm_module_method_and_entry (
 		wasm_u8 (&sec, (guint8) WASM_FUNCREF); /* element type funcref (0x70) */
 		wasm_u8 (&sec, 0x00);                  /* limits: min only (matches any actual table) */
 		wasm_uleb (&sec, 0);                   /* min 0 */
+	}
+	if (import_eh_tag) {
+		wasm_name (&sec, "x");
+		wasm_name (&sec, "e");
+		wasm_u8 (&sec, 0x04);            /* import kind: tag */
+		wasm_u8 (&sec, 0x00);            /* tag attribute: exception */
+		wasm_uleb (&sec, eh_type_idx);   /* function type index ((i32)->void) */
 	}
 	emit_section (out, 2, &sec);
 	wasm_buf_free (&sec);

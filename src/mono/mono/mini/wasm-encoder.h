@@ -51,6 +51,10 @@ typedef enum {
 	WASM_OP_DROP          = 0x1a,
 	WASM_OP_SELECT        = 0x1b,
 
+	WASM_OP_REF_IS_NULL   = 0xd1,   /* funcref -> i32 (1 if null) — reference-types */
+	WASM_OP_TABLE_GET     = 0x25,   /* [i32 idx] -> funcref; followed by a tableidx uleb — reference-types */
+	WASM_OP_ATOMIC_PREFIX = 0xfe,   /* threads/atomics prefix; i64.atomic.load = 0xfe 0x11 <memarg align=3> (0x01 is wait32!) */
+
 	WASM_OP_LOCAL_GET     = 0x20,
 	WASM_OP_LOCAL_SET     = 0x21,
 	WASM_OP_LOCAL_TEE     = 0x22,
@@ -172,8 +176,14 @@ typedef enum {
 	WASM_OP_I64_EXTEND_I32_U   = 0xad,
 	WASM_OP_F32_CONVERT_I32_S  = 0xb2,
 	WASM_OP_F32_CONVERT_I32_U  = 0xb3,
+	WASM_OP_F32_CONVERT_I64_S  = 0xb4,
 	WASM_OP_F64_CONVERT_I32_S  = 0xb7,
 	WASM_OP_F64_CONVERT_I32_U  = 0xb8,
+	WASM_OP_F64_CONVERT_I64_S  = 0xb9,
+	WASM_OP_I32_REINTERPRET_F32 = 0xbc,
+	WASM_OP_I64_REINTERPRET_F64 = 0xbd,
+	WASM_OP_F32_REINTERPRET_I32 = 0xbe,
+	WASM_OP_F64_REINTERPRET_I64 = 0xbf,
 	WASM_OP_I32_TRUNC_F64_S    = 0xaa,
 	WASM_OP_F32_DEMOTE_F64     = 0xb6,
 	WASM_OP_F64_PROMOTE_F32    = 0xbb,
@@ -247,6 +257,8 @@ void wasm_module_single_func (
  * `extra_types`/`nextra` add callee function types after T0=method, T1=entry (so callee type k
  * is type index 2+k) — referenced by call_indirect in `f_body`. If `import_table` is TRUE the
  * module also imports the indirect function table as `f`.`f` (table 0) for those call_indirects.
+ * If `import_eh_tag` is TRUE the module imports the C++ exception tag as `x`.`e` (kind 0x04) with
+ * function type index `eh_type_idx` ((i32)->void) — for `catch <x.e>` in `f_body` (inline-AOT-call EH).
  */
 void wasm_module_method_and_entry (
 	const WasmValtype *param_types, guint32 nparams,
@@ -256,6 +268,7 @@ void wasm_module_method_and_entry (
 	const WasmBuf *e_body,
 	const WasmFuncType *extra_types, guint32 nextra,
 	gboolean import_table,
+	gboolean import_eh_tag, guint32 eh_type_idx,
 	WasmBuf *out);
 
 /*
