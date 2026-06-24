@@ -2578,8 +2578,12 @@ interp_entry (InterpEntryData *data)
 	 * returns identically, so this only changes the no-local-handler case.) wj_residual_active exists
 	 * only under HOST_BROWSER (the residual path is browser-runtime-only); the cross-compiler defines
 	 * TARGET_WASM but not HOST_BROWSER, so guard on HOST_BROWSER, not TARGET_WASM. */
-	if (wj_residual_active && context->has_resume_state)
-		return;
+	{ extern int mono_wasm_jit_cppeh;
+	if (wj_residual_active && context->has_resume_state && !mono_wasm_jit_cppeh)
+		return;   /* resume-state model: JITted caller bails (no landing pad). Under CPPEH the JITted
+			   * frame HAS a landing pad (its e-thunk boundary catches C++), so fall through to
+			   * need_native_unwind below -> mono_llvm_start_native_unwind (C++ throw) and propagate. */
+	}
 #endif
 
 	if (need_native_unwind (context)) {
@@ -3158,6 +3162,27 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	return 0;
 }
 
+/* AOT-style EH (MONO_WASM_JIT_CPPEH=1): after the throw's FIRST PASS (mono_handle_exception has already
+ * run finally clauses + installed the interp/il_state resume-state for the handler), skip the native
+ * JITted frames between here and that handler in one shot via a C++/wasm-EH native unwind, instead of
+ * returning and letting each JITted frame bail cooperatively (EMIT_PENDING_EXC_CHECK). The unwind is
+ * caught at the nearest landing pad — an in-method wasm catch (milestone 2) or the interp e-thunk
+ * boundary (mono_wasm_jit_invoke_caught), which relies on the resume-state pass 1 already set. NEVER
+ * returns. Called only after a successful pass-1 (has_resume_state asserted), so it does NOT itself
+ * touch thrown_exc/resume-state — pass 1 owns that, exactly like mini_llvmonly_throw_exception. */
+static void
+wasm_jit_cpp_unwind (MonoObject *exc)
+{
+	/* Stash the managed exception in jit_tls->thrown_exc so a JITted in-method `catch <x.e>` landing pad
+	 * can load it (mini_llvmonly_load_exception) for the type check + OP_GET_EX_OBJ. pass 1 set only the
+	 * interp/il_state resume-state (for an OUTER handler), not thrown_exc. */
+	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
+	if (!jit_tls->thrown_exc)
+		jit_tls->thrown_exc = mono_gchandle_new_internal (exc, TRUE);
+	mono_llvm_start_native_unwind ();
+	g_assert_not_reached ();   /* the C++ throw above does not return */
+}
+
 /*
  * mono_wasm_jit_raise_corlib:
  *
@@ -3187,25 +3212,30 @@ mono_wasm_jit_raise_corlib (int exc_id)
 	}
 	memset (&ctx, 0, sizeof (ctx));
 	MONO_CONTEXT_SET_SP (&ctx, &ctx);
-	mono_handle_exception (&ctx, (MonoObject *) ex);
+	mono_handle_exception (&ctx, (MonoObject *) ex);   /* pass 1: run finallys + install resume-state for the handler */
 	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
 		/* handler is in native code (not expected for a JITted method invoked from interp) */
 		mono_restore_context (&ctx);
 		g_assert_not_reached ();
 	}
-	g_assert (get_context ()->has_resume_state);
+	/* AOT-style (cppeh): pass 1 either installed resume-state (handler in an interp/outer frame) OR stopped
+	 * at a JITted island whose OWN wasm landing pad catches the cpp unwind — has_resume_state stays FALSE
+	 * in that case (e.g. a checked-op corlib exception caught by the SAME JITted method). Both are
+	 * delivered by the unwind, so only the resume-state model (non-cppeh) requires has_resume_state. */
+	{ extern int mono_wasm_jit_cppeh;
+	  if (mono_wasm_jit_cppeh) wasm_jit_cpp_unwind ((MonoObject *) ex);   /* C++-unwind to the landing pad; never returns */
+	  g_assert (get_context ()->has_resume_state); }
 }
 
 /*
  * mono_wasm_jit_throw:
  *
  *   Throw an arbitrary exception object from a wasm-JITted method (OP_THROW: `throw expr`). Same model
- * as mono_wasm_jit_raise_corlib — methods with a LOCAL handler (EH clauses) bail at compile time, so a
- * JITted `throw` never has a catch in its own frame; install the interp resume-state via
- * mono_handle_exception (ctx.ip==0 -> unwind from the top LMF the interp->JIT invoke pushed) and let the
- * JITted caller bail via EMIT_REF_LEAVE + dummy return, propagating to the handler up the interp stack.
- * `throw` is the #1 leaf-method JIT blocker in IKVM (null/argument-validation throws are everywhere), so
- * supporting it lets throwing leaves JIT and the RESIDUAL=0 islands resolve bottom-up.
+ * as mono_wasm_jit_raise_corlib: run pass-1 (mono_handle_exception) to find the handler, then C++-unwind.
+ * pass-1 installs interp resume-state for a handler in an interp/outer frame, OR (under EH-in-JIT) stops
+ * at a JITted island — including this method's OWN frame, since EH methods are now JITted — and the wasm
+ * landing pad runs the catch. `throw` is the #1 leaf-method JIT blocker in IKVM (null/argument-validation
+ * throws are everywhere), so supporting it lets throwing leaves JIT and the RESIDUAL=0 islands resolve.
  */
 void
 mono_wasm_jit_throw (MonoObject *exc)
@@ -3223,12 +3253,19 @@ mono_wasm_jit_throw (MonoObject *exc)
 	mono_error_cleanup (error);
 	memset (&ctx, 0, sizeof (ctx));
 	MONO_CONTEXT_SET_SP (&ctx, &ctx);
-	mono_handle_exception (&ctx, exc);
+	mono_handle_exception (&ctx, exc);   /* pass 1: run finallys + install resume-state for the handler */
 	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
 		mono_restore_context (&ctx);
 		g_assert_not_reached ();
 	}
-	g_assert (get_context ()->has_resume_state);
+	/* AOT-style (cppeh): pass 1 either installed resume-state (handler in an interp/outer frame, reached
+	 * when the cpp unwind hits the interp->JIT boundary) OR stopped at a JITted island whose OWN wasm
+	 * landing pad catches the cpp unwind — has_resume_state stays FALSE in that case (e.g. a `throw`
+	 * caught by the SAME JITted method, now that EH methods are JITted). Both are delivered by the unwind,
+	 * so only the resume-state model (non-cppeh) requires has_resume_state. */
+	{ extern int mono_wasm_jit_cppeh;
+	  if (mono_wasm_jit_cppeh) wasm_jit_cpp_unwind (exc);   /* C++-unwind to the landing pad; never returns */
+	  g_assert (get_context ()->has_resume_state); }
 }
 
 /*
@@ -3249,6 +3286,336 @@ int
 mono_wasm_jit_pending_exception (void)
 {
 	return get_context ()->has_resume_state ? 1 : 0;
+}
+
+/* --- AOT-style EH (MONO_WASM_JIT_CPPEH=1): interp->JIT entry-thunk boundary --------------------------
+ * When CPPEH is on, a JITted method that throws (or whose callees throw) C++/wasm-EH-unwinds through all
+ * its frames with no per-call resume-state check. The unwind must be CAUGHT here — the interp e-thunk
+ * boundary is the JITted region's outermost landing pad — and converted back to an interp exception so
+ * the interp's own EH (and any handler in the calling interp frame or above) takes over. Mirrors
+ * do_jit_call's LLVMONLY_INTERP path. */
+typedef struct { gpointer thunk; gpointer args; gpointer ret; } WasmJitEThunkArgs;
+
+static void
+wasm_jit_ethunk_cb (gpointer arg)
+{
+	WasmJitEThunkArgs *a = (WasmJitEThunkArgs *) arg;
+	((void (*)(void *, void *)) a->thunk) (a->args, a->ret);
+}
+
+/* Invoke a JITted method's entry thunk (slot) under a C++ catch. On a caught C++/wasm-EH unwind, ENSURE
+ * the interp resume-state is installed so the caller's CHECK_RESUME_STATE resumes at the handler (in
+ * this interp frame, or re-propagates upward) — mirroring do_jit_call's LLVMONLY_INTERP thrown handling
+ * and mono_wasm_jit_aot_caught EXACTLY. It must NOT THROW_EX a fresh exception: pass 1 of the throw
+ * (mono_handle_exception, run before the native unwind) already installed the resume-state / il_state,
+ * and a second handling would double-process it (the resume_state.ex_gchandle assertion). Also restores
+ * the GC ref shadow-stack SP — the unwound JITted frames skipped their own ref_leave. */
+void
+mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret)
+{
+	extern MonoObject **mono_wasm_jit_ref_sp_save (void);
+	extern void mono_wasm_jit_ref_leave (MonoObject **base);
+	MonoObject **ref_sp_saved = mono_wasm_jit_ref_sp_save ();
+	gboolean saved_wj = wj_residual_active;   /* a residual inside the JITted method that C++-threw skipped its own restore */
+	gboolean thrown = FALSE;
+	WasmJitEThunkArgs a;
+	a.thunk = (gpointer) (intptr_t) slot;
+	a.args = args;
+	a.ret = ret;
+
+	/* AOT-style in-method EH (milestone 2c+): the IL_STATE LMFExt that makes a JITted EH method visible to
+	 * mono's exception pass-1 is now pushed by the method's OWN prologue (mono_wasm_jit_enter_island),
+	 * covering BOTH this interp->JIT boundary AND direct JIT->JIT f-slot calls (which bypass the boundary).
+	 * Here we only snapshot the island-stack depth so a C++ unwind that ESCAPES the method (caught below,
+	 * skipping the method's own leave_island) resets it — belt-and-suspenders against a leaked push. */
+	(void) method;
+	extern int mono_wasm_jit_island_sp_save (void);
+	extern void mono_wasm_jit_island_sp_restore (int sp);
+	int island_sp_saved = mono_wasm_jit_island_sp_save ();
+
+	mono_llvm_catch_exception (wasm_jit_ethunk_cb, &a, &thrown);
+
+	mono_wasm_jit_island_sp_restore (island_sp_saved);
+	wj_residual_active = saved_wj;
+	/* DIAG (loot-NPE bisection): on a catch-taken, non-thrown return, log the return value + the ref-stack
+	 * balance. ret!=saved => intValue's EMIT_REF_LEAVE didn't fully restore the GC ref shadow stack across
+	 * the catch (over/under-scan -> GC corruption). A sane ret with balance==0 => the bug is elsewhere
+	 * (premature pass-1 finally in outer frames). Bounded + STATS-gated. */
+	{ extern int mono_wasm_jit_stats; extern __thread int mono_wasm_jit_eh_caught_flag; extern void mono_wasm_jit_log_main (const char *msg);
+	  if (mono_wasm_jit_stats && mono_wasm_jit_eh_caught_flag) { static int _ivc = 0;
+		MonoObject **now = mono_wasm_jit_ref_sp_save (); int bal = (int) (now - ref_sp_saved);
+		if (_ivc++ < 200) { char *_m = g_strdup_printf ("INVCAUGHT caught ret=%d thrown=%d refbal=%d", ret ? *(gint32 *) ret : -999999, thrown, bal); mono_wasm_jit_log_main (_m); g_free (_m); } }
+	  mono_wasm_jit_eh_caught_flag = 0; }
+	if (!thrown)
+		return;
+	mono_wasm_jit_ref_leave (ref_sp_saved);   /* the unwound JITted frames skipped EMIT_REF_LEAVE */
+	ThreadContext *context = get_context ();
+	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
+	if (context->has_resume_state) {
+		/* pass 1 already installed the interp resume-state. Drop the now-consumed native exception UNLESS the
+		 * handler is a JITted wasm island still ABOVE us — handler_frame==NULL (the interp will
+		 * need_native_unwind to it) with no real il_state — because that island's landing-pad dispatch loads
+		 * the exception from jit_tls->thrown_exc. Clearing it here as a multi-level INNER invoke_caught (e.g.
+		 * nested JITted packet handlers between the throw and the catching method) lost the exception, so the
+		 * outer island's dispatch returned -1 and it escaped uncaught. A cooperative interp handler
+		 * (handler_frame != NULL) resumes without thrown_exc, and a real AOT il_state frame carries its own
+		 * resume_state.ex_gchandle — both can drop it. */
+		if (!(context->handler_frame == NULL && jit_tls->resume_state.il_state == NULL))
+			mini_llvmonly_clear_exception ();
+		return;   /* pass 1 already installed the interp resume-state (handler here or above) */
+	}
+	if (jit_tls->resume_state.il_state) {
+		/* handler is a catch clause in an AOTed frame above us: keep the il_state, just tell the interp
+		 * to unwind (need_native_unwind -> re-throw C++ to that frame). */
+		context->has_resume_state = TRUE;
+		context->handler_frame = NULL;
+		mini_llvmonly_clear_exception ();   /* il_state carries its own resume_state.ex_gchandle; drop thrown_exc */
+		return;
+	}
+	/* no handler installed yet (a bare C++ unwind with no pass-1, shouldn't happen for our throws):
+	 * convert the pending native exception into resume-state, mirroring mono_wasm_jit_aot_caught. */
+	MonoObject *obj = mini_llvmonly_load_exception ();
+	g_assert (obj);
+	mini_llvmonly_clear_exception ();
+	MonoContext ctx;
+	memset (&ctx, 0, sizeof (ctx));
+	MONO_CONTEXT_SET_SP (&ctx, &ctx);
+	mono_handle_exception (&ctx, obj);
+	g_assert (get_context ()->has_resume_state);
+}
+
+/* --- AOT-style EH milestone 2b: make the JITted EH frame VISIBLE to mono's exception pass-1 ------------
+ * The innermost active JITted-EH invocation's MonoMethodILState (pushed as an IL_STATE LMFExt at the
+ * interp->JIT boundary in mono_wasm_jit_invoke_caught). The JITted wasm keeps ->il_offset current (via
+ * mono_wasm_jit_set_il_offset, emitted at each bb) so pass-1 (mono_handle_exception) finds THIS method's
+ * catch as the nearest handler and STOPS there — running no outer frames' finally clauses — instead of
+ * walking past the (otherwise unwinder-invisible) JITted frame. mini-exceptions.c reads this to recognise
+ * the wasm-JIT il_state and defer the actual catch to the wasm landing pad (no interp resume). */
+__thread MonoMethodILState *mono_wasm_jit_cur_island_il_state = NULL;
+
+/* --- AOT-style in-method EH: per-thread "island" stack ------------------------------------------------
+ * A JITted EH method's PROLOGUE calls mono_wasm_jit_enter_island(method) to push an IL_STATE LMFExt that
+ * makes the method visible to mono's exception pass-1 (so pass-1 finds ITS catch as the nearest handler,
+ * stops there, and runs no OUTER finally clauses); every exit calls mono_wasm_jit_leave_island() to pop.
+ * Pushing in the PROLOGUE (not at the interp->JIT boundary) covers direct JIT->JIT f-slot calls too — the
+ * fix for the catch-il_state-at-scale ClassCastException. The il_state data[] is zeroed: the GC scans it
+ * (in bounds), finds NULL -> no roots from this frame, which is correct because the method's live refs
+ * are in the separately-rooted GC ref shadow stack. */
+#define WJ_ISLAND_MAX_DEPTH 512
+#define WJ_ISLAND_DATA      256   /* max args+locals; the emitter bails EH methods exceeding this */
+typedef struct {
+	MonoLMFExt ext;
+	MonoMethodILState *prev;
+	guint8 st [sizeof (MonoMethodILState) + WJ_ISLAND_DATA * sizeof (gpointer)];
+} WjIsland;
+static __thread WjIsland *wj_island_stack = NULL;
+static __thread int wj_island_sp = 0;
+
+void
+mono_wasm_jit_enter_island (MonoMethod *method)
+{
+	WjIsland *is;
+	MonoMethodILState *il;
+	if (G_UNLIKELY (!wj_island_stack))
+		wj_island_stack = (WjIsland *) g_malloc0 (sizeof (WjIsland) * WJ_ISLAND_MAX_DEPTH);
+	if (G_UNLIKELY (wj_island_sp >= WJ_ISLAND_MAX_DEPTH))
+		g_error ("wasm-jit EH island stack overflow (>%d nested JITted EH frames)", WJ_ISLAND_MAX_DEPTH);
+	is = &wj_island_stack [wj_island_sp++];
+	il = (MonoMethodILState *) is->st;
+	memset (is->st, 0, sizeof (is->st));   /* zero method + il_offset + data[] (GC-scanned, kept NULL) */
+	il->method = method;
+	il->il_offset = -1;
+	memset (&is->ext, 0, sizeof (is->ext));
+	is->ext.kind = MONO_LMFEXT_IL_STATE;
+	is->ext.il_state = il;
+	mono_push_lmf (&is->ext);
+	is->prev = mono_wasm_jit_cur_island_il_state;
+	mono_wasm_jit_cur_island_il_state = il;
+}
+
+void
+mono_wasm_jit_leave_island (void)
+{
+	WjIsland *is;
+	if (G_UNLIKELY (wj_island_sp <= 0))
+		return;
+	is = &wj_island_stack [--wj_island_sp];
+	mono_pop_lmf (&is->ext.lmf);
+	mono_wasm_jit_cur_island_il_state = is->prev;
+}
+
+/* boundary safety net: a C++ unwind that escapes a JITted EH method WITHOUT going through its emitted
+ * leave_island (shouldn't happen — every escape is the wasm-catch rethrow, which emits leave_island —
+ * but defensive) leaks island LMFs; the interp->JIT boundary resets the stack to its entry depth. */
+int
+mono_wasm_jit_island_sp_save (void)
+{
+	return wj_island_sp;
+}
+void
+mono_wasm_jit_island_sp_restore (int sp)
+{
+	while (wj_island_sp > sp) {
+		WjIsland *is = &wj_island_stack [--wj_island_sp];
+		mono_pop_lmf (&is->ext.lmf);
+		mono_wasm_jit_cur_island_il_state = is->prev;
+	}
+}
+
+/* Emitted (call_indirect) at each bb of a JITted EH method: record the current IL offset into the active
+ * island's il_state so pass-1's clause walk matches the right try region for a throwing AOT callee. */
+void
+mono_wasm_jit_set_il_offset (int il_offset)
+{
+	if (mono_wasm_jit_cur_island_il_state)
+		mono_wasm_jit_cur_island_il_state->il_offset = il_offset;
+}
+
+/* TRUE if il_state is one of THIS thread's live wasm-JIT EH islands (vs a real AOT il_state emitted by
+ * llvmonly codegen, whose data[] points at addressable locals). mono's exception pass-1 uses this to
+ * recognise a JITted-EH frame regardless of how the throw started — a native throw helper OR a
+ * cooperative interp_throw from a residual interpreted method running inside the JITted method — so it
+ * always defers the handler to the method's wasm landing pad (a native unwind) instead of
+ * run_clause_with_il_state, which would try to interpret the island's zeroed clause frame. The island
+ * stack depth is tiny (JITted-EH nesting), so the linear scan is cheap even on the hot EH path. */
+int
+mono_wasm_jit_is_island (MonoMethodILState *il_state)
+{
+	int i;
+	if (!il_state || !wj_island_stack)
+		return 0;
+	for (i = 0; i < wj_island_sp; ++i)
+		if ((MonoMethodILState *) wj_island_stack [i].st == il_state)
+			return 1;
+	return 0;
+}
+
+/* --- AOT-style EH milestone 2: in-method catch landing-pad dispatch -----------------------------------
+ * Set by mono_wasm_jit_eh_dispatch on a catch match; read by the JITted handler's OP_GET_EX_OBJ (the
+ * emitter bakes this address + i32.loads it). Per-thread: the in-flight caught exception. */
+__thread MonoObject *mono_wasm_jit_caught_exc;
+/* DIAG: set to 1 by the dispatch on a catch match; read+cleared by mono_wasm_jit_invoke_caught to
+ * correlate a catch-taken invocation with its return value + ref-stack balance (loot-NPE bisection). */
+__thread int mono_wasm_jit_eh_caught_flag = 0;
+
+/* Called from a JITted method's `catch <x.e>` landing pad: an exception is unwinding (C++/wasm-EH) and
+ * this method's try region(s) caught it. Walk the clauses enclosing the throwing bb (innermost-out); on
+ * the first CATCH whose type matches, stash the exception for OP_GET_EX_OBJ, consume the in-flight
+ * exception (clear thrown_exc + any resume-state pass-1 picked for an OUTER handler — we handle nearer),
+ * and return the handler's dense bbidx. No match -> -1 (the landing pad rethrows to propagate). */
+int
+mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
+{
+	ERROR_DECL (error);
+	MonoObject *exc = mini_llvmonly_load_exception ();
+	int il, i;
+	if (!exc)
+		return -1;
+	il = (blk >= 0 && blk < t->nbbs) ? t->il_offsets [blk] : -1;
+	{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_stats; static int _ehd = 0;
+	  if (mono_wasm_jit_stats && _ehd++ < 200) {
+		/* DIAG: log the INCOMING resume-state pass-1 installed (if any) BEFORE we clear it. il_state!=0 or
+		 * has_resume_state=1 means the throw ran mono_handle_exception pass-1, which WALKED PAST this JITted
+		 * frame (it's unwinder-invisible) and found an OUTER handler — running any intervening finally
+		 * clauses prematurely. That premature pass-1 processing is the suspected loot-table corruption. */
+		ThreadContext *_ctx = get_context (); MonoJitTlsData *_jt = mono_get_jit_tls (); extern gboolean mono_llvm_only;
+		char *_m = g_strdup_printf ("EHDISP %s blk=%d il=%d ncl=%d exc=%s cl0=[%d,%d)f%d | llvmonly=%d INSTATE hrs=%d hf=%p ctxexc=%d il_state=%p rsexc=%d", t->name ? t->name : "?", blk, il, t->nclauses, exc ? m_class_get_name (mono_object_class (exc)) : "?", t->nclauses > 0 ? t->clauses[0].try_start : -1, t->nclauses > 0 ? t->clauses[0].try_start + t->clauses[0].try_len : -1, t->nclauses > 0 ? t->clauses[0].flags : -1, mono_llvm_only, _ctx->has_resume_state, (void*)_ctx->handler_frame, _ctx->exc_gchandle != 0, (void*)_jt->resume_state.il_state, _jt->resume_state.ex_gchandle != 0); mono_wasm_jit_log_main (_m); g_free (_m); } }
+	if (il < 0)
+		return -1;
+	/* mirror mono's is_address_protected + clause walk: iterate clauses in table order; the first CATCH
+	 * whose try IL-range contains the throwing bb AND whose type matches handles it (nearest-first). */
+	for (i = 0; i < t->nclauses; ++i) {
+		WasmEhClause *c = &t->clauses [i];
+		if (!(il >= c->try_start && il < c->try_start + c->try_len))
+			continue;
+		if (c->flags == MONO_EXCEPTION_CLAUSE_NONE) {   /* a catch clause */
+			if (c->catch_class && mono_object_isinst_checked (exc, (MonoClass *) c->catch_class, error)) {
+				ThreadContext *ctx = get_context ();
+				MonoJitTlsData *jit_tls = mono_get_jit_tls ();
+				mono_wasm_jit_caught_exc = exc;          /* for OP_GET_EX_OBJ in the handler */
+				mono_wasm_jit_eh_caught_flag = 1;        /* DIAG: this invocation took the catch path */
+				mini_llvmonly_clear_exception ();        /* consumed: drop the in-flight native exception (thrown_exc) */
+				/* discard any resume-state pass-1 chose for an OUTER handler — we handle nearer. Cover both
+				 * the interp resume-state (interp outer handler) and the il_state resume-state (AOTed outer
+				 * handler), so a later mono_handle_exception's `!resume_state.ex_gchandle` assert holds. */
+				if (ctx->exc_gchandle) { mono_gchandle_free_internal (ctx->exc_gchandle); ctx->exc_gchandle = 0; }
+				ctx->has_resume_state = FALSE;
+				ctx->handler_frame = NULL;
+				if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
+				jit_tls->resume_state.il_state = NULL;
+				wj_residual_active = FALSE;   /* a residual inside the try that C++-threw skipped its own restore; the handler runs in the method body where wj is FALSE */
+				{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_stats; static int _ehm = 0; if (mono_wasm_jit_stats && _ehm++ < 200) { char *_m = g_strdup_printf ("EHDISP   -> MATCH %s cl%d -> bb%d", t->name ? t->name : "?", i, c->handler_bbidx); mono_wasm_jit_log_main (_m); g_free (_m); } }
+				return c->handler_bbidx;
+			}
+			mono_error_cleanup (error);
+			error_init_reuse (error);
+		} else if (c->flags == MONO_EXCEPTION_CLAUSE_FINALLY) {
+			/* milestone 2c: a FINALLY clause covering the throwing bb. The finally runs in the JITted wasm
+			 * body (landing pad GOTOs handler_bbidx with finally_ind=-1), then OP_ENDFINALLY RE-RAISES the
+			 * exception (mono_wasm_jit_endfinally_rethrow) so it keeps propagating to an outer catch/finally.
+			 * Unlike catch we do NOT clear thrown_exc (it's the GC-rooted source for that re-raise); we only
+			 * drop the resume-state pass-1 may have set for an OUTER handler (the finally runs nearer first;
+			 * after it re-raises, the advanced il_offset lets the re-dispatch find the next clause). */
+			ThreadContext *ctx = get_context ();
+			MonoJitTlsData *jit_tls = mono_get_jit_tls ();
+			if (ctx->exc_gchandle) { mono_gchandle_free_internal (ctx->exc_gchandle); ctx->exc_gchandle = 0; }
+			ctx->has_resume_state = FALSE;
+			ctx->handler_frame = NULL;
+			if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
+			jit_tls->resume_state.il_state = NULL;
+			wj_residual_active = FALSE;
+			{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_stats; static int _ehf = 0; if (mono_wasm_jit_stats && _ehf++ < 200) { char *_m = g_strdup_printf ("EHDISP   -> FINALLY %s cl%d -> bb%d", t->name ? t->name : "?", i, c->handler_bbidx); mono_wasm_jit_log_main (_m); g_free (_m); } }
+			return c->handler_bbidx;
+		}
+		/* FAULT/FILTER clauses come in a later increment; the gate bails methods that have them. */
+	}
+	return -1;   /* no matching handler in this method -> rethrow to propagate */
+}
+
+/* OP_ENDFINALLY rethrow path (finally_ind == -1, i.e. the finally ran on the EXCEPTION path, not a normal
+ * leave): re-raise the still-in-flight exception so it propagates past this finally to the next enclosing
+ * catch/finally (or out of the method). thrown_exc was kept set by the FINALLY dispatch above; reading +
+ * re-throwing here runs pass-1 again from the finally-handler il_offset (now OUTSIDE this finally's try),
+ * so the re-dispatch advances to the outer clause. NEVER returns (mono_wasm_jit_throw C++-unwinds). */
+void
+mono_wasm_jit_endfinally_rethrow (void)
+{
+	extern void mono_wasm_jit_throw (MonoObject *exc);
+	MonoObject *exc = mini_llvmonly_load_exception ();
+	mini_llvmonly_clear_exception ();   /* mono_wasm_jit_throw's pass-1 + native unwind re-installs it */
+	if (!exc)
+		return;   /* nothing in flight (shouldn't happen on the exception path) — fall through */
+	mono_wasm_jit_throw (exc);
+	g_assert_not_reached ();
+}
+
+/* OP_GET_EX_OBJ in a JITted catch handler: return (+ consume) the exception the landing pad's dispatch
+ * stashed. mono_wasm_jit_caught_exc is __thread (per-thread address), so the emitter can't bake a fixed
+ * address — it call_indirects this getter instead. No GC point between the dispatch stash and this read,
+ * and the handler immediately stores the result into the GC-scanned ref shadow stack. */
+MonoObject *
+mono_wasm_jit_get_caught_exc (void)
+{
+	MonoObject *e = mono_wasm_jit_caught_exc;
+	mono_wasm_jit_caught_exc = NULL;
+	return e;
+}
+
+/* MONO_WASM_JIT_BBTRACE=<substr>: the emitter inserts a call to this at the start of every bb of a
+ * matching method, so we can SEE the exact runtime $blk path (and spot a divergence / wrong re-dispatch /
+ * loop). blk>=0 = a bb entry; blk==-1 = the method is returning. Bounded + gated by STATS. Returns blk so
+ * the emitter can `drop` it (reusing the (i32,i32)->i32 dispatch functype). */
+int
+mono_wasm_jit_bbtrace_log (WasmEhTable *t, int blk)
+{
+	static int _n = 0;
+	if (mono_wasm_jit_stats && _n++ < 600) {
+		char *m = (blk == -1)
+			? g_strdup_printf ("BBTRACE %s RETURN", t && t->name ? t->name : "?")
+			: g_strdup_printf ("BBTRACE %s bb=%d", t && t->name ? t->name : "?", blk);
+		mono_wasm_jit_log_main (m); g_free (m);
+	}
+	return blk;
 }
 #endif
 
@@ -5496,8 +5863,16 @@ main_loop:
 					 * JITted callee's residual throws. A stale ip skips a catch in this method. */
 					frame->state.ip = ip;
 					interp_push_lmf (&ext, frame);
-					((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
-					interp_pop_lmf (&ext);
+					{ extern int mono_wasm_jit_cppeh; extern void mono_wasm_jit_invoke_caught (MonoMethod *, gint32, gpointer, gpointer);
+					if (mono_wasm_jit_cppeh) {
+						/* AOT-style: catch a C++/wasm-EH unwind escaping the JITted method; it installs the interp
+						 * resume-state (pass 1 already did) so CHECK_RESUME_STATE below resumes / re-propagates. */
+						mono_wasm_jit_invoke_caught (cmethod->method, (gint32) cmethod->wasm_jit_slot, locals + call_args_offset, locals + return_offset);
+						interp_pop_lmf (&ext);
+					} else {
+						((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
+						interp_pop_lmf (&ext);
+					} }
 				}
 				{ extern int mono_wasm_jit_stats, mono_wasm_jit_invoke_count; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_invoke_count++; }
 				CHECK_RESUME_STATE (context);
@@ -5591,8 +5966,16 @@ jit_call:
 						 * EhCatch repro: throw escaped past the inner catch). */
 						frame->state.ip = ip;
 						interp_push_lmf (&ext, frame);
-						((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
-						interp_pop_lmf (&ext);
+						{ extern int mono_wasm_jit_cppeh; extern void mono_wasm_jit_invoke_caught (MonoMethod *, gint32, gpointer, gpointer);
+						if (mono_wasm_jit_cppeh) {
+							/* AOT-style: catch a C++/wasm-EH unwind escaping the JITted method; it installs the interp
+							 * resume-state (pass 1 already did) so CHECK_RESUME_STATE below resumes / re-propagates. */
+							mono_wasm_jit_invoke_caught (cmethod->method, (gint32) cmethod->wasm_jit_slot, locals + call_args_offset, locals + return_offset);
+							interp_pop_lmf (&ext);
+						} else {
+							((void (*)(void*, void*))(intptr_t)cmethod->wasm_jit_slot) (locals + call_args_offset, locals + return_offset);
+							interp_pop_lmf (&ext);
+						} }
 					}
 					{ extern int mono_wasm_jit_stats, mono_wasm_jit_invoke_count; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_invoke_count++; }
 					/* If a residual interp call inside the JITted method threw, interp_entry set the

@@ -2499,6 +2499,37 @@ mono_handle_exception_internal (MonoContext *ctx, MonoObject *obj, gboolean resu
 
 					mini_set_abort_threshold (&frame);
 
+#ifdef HOST_BROWSER
+					{
+						/* AOT-style wasm-JIT in-method EH: this catch is in a JITted wasm method's il_state frame
+						 * (an "island", pushed by the method prologue). Its handler runs in the method's OWN wasm
+						 * landing pad, reached by a native (C++/wasm-EH) unwind — NOT the interpreter (the island
+						 * il_state has no frame data, so run_clause_with_il_state can't run it). STOP pass-1 here
+						 * (this island is the nearest handler) so no outer frame's finally runs and we never fall
+						 * into the IL_STATE path below. Keyed on is_island (ANY active island, not just the
+						 * innermost) so a handler in an OUTER nested JITted method is delivered the same way.
+						 *
+						 * Set up the landing-pad handoff UNCONDITIONALLY — identical for a native throw and a
+						 * cooperative interp_throw, so no native-unwinding flag is needed (which also removes its
+						 * nested-throw reentrancy hazard): (1) jit_tls->thrown_exc is what the landing pad's
+						 * dispatch (mini_llvmonly_load_exception) reads — a native thrower re-sets it after pass-1
+						 * (idempotent), a cooperative interp_throw never would (that missing set was the
+						 * uncaught-WebAssembly.Exception escape); (2) interp resume-state with a NULL handler_frame
+						 * makes a cooperative throw's need_native_unwind perform the unwind, and is harmless for a
+						 * native throw (the thrower unwinds directly; the dispatch clears the resume-state on the
+						 * catch). Leave jit_tls->lmf as-is so the island LMF stays live for the landing pad. */
+						extern int mono_wasm_jit_is_island (MonoMethodILState *il_state);
+						if (frame.type == FRAME_TYPE_IL_STATE && mono_wasm_jit_is_island (frame.il_state)) {
+							if (jit_tls->thrown_exc)
+								mono_gchandle_set_target (jit_tls->thrown_exc, obj);
+							else
+								jit_tls->thrown_exc = mono_gchandle_new_internal (obj, TRUE);
+							mini_get_interp_callbacks ()->set_resume_state (jit_tls, ex_obj, ei, NULL, NULL);
+							return 0;
+						}
+					}
+#endif
+
 					if (frame.type == FRAME_TYPE_IL_STATE) {
 						if (mono_trace_is_enabled () && mono_trace_eval (method))
 							g_print ("EXCEPTION: catch clause found in AOTed code.\n");
@@ -2560,6 +2591,25 @@ mono_handle_exception_internal (MonoContext *ctx, MonoObject *obj, gboolean resu
 					MONO_PROFILER_RAISE_EXCEPTION_LEAVE;
 				}
 				if (ei->flags == MONO_EXCEPTION_CLAUSE_FAULT || ei->flags == MONO_EXCEPTION_CLAUSE_FINALLY) {
+#ifdef HOST_BROWSER
+					{
+						/* A finally in a JITted wasm island frame: it runs in the method's wasm landing pad
+						 * (reached by the native unwind), then OP_ENDFINALLY re-raises (a fresh native throw) to
+						 * continue unwinding to the next enclosing clause. STOP pass-1 here (no OUTER finally runs
+						 * prematurely, and we never interpret the island's zeroed clause frame via
+						 * run_clause_with_il_state). Same unconditional landing-pad handoff as the catch stop above —
+						 * thrown_exc is also read by the OP_ENDFINALLY re-raise. Leave jit_tls->lmf as-is. */
+						extern int mono_wasm_jit_is_island (MonoMethodILState *il_state);
+						if (frame.type == FRAME_TYPE_IL_STATE && mono_wasm_jit_is_island (frame.il_state)) {
+							if (jit_tls->thrown_exc)
+								mono_gchandle_set_target (jit_tls->thrown_exc, obj);
+							else
+								jit_tls->thrown_exc = mono_gchandle_new_internal (obj, TRUE);
+							mini_get_interp_callbacks ()->set_resume_state (jit_tls, ex_obj, ei, NULL, NULL);
+							return 0;
+						}
+					}
+#endif
 					mono_set_lmf (lmf);
 					if (ji->from_llvm) {
 						/*

@@ -2440,6 +2440,25 @@ gpointer          mono_get_delegate_virtual_invoke_impl  (MonoMethodSignature *s
 void      mono_codegen                          (MonoCompile *cfg);
 #ifdef TARGET_WASM
 void      mono_wasm_emit_method                 (MonoCompile *cfg);
+/* In-method EH (wasm-JIT, MONO_WASM_JIT_EH): the per-method clause table that the catch landing pad's
+ * dispatch helper walks to map a throwing bb -> the handler bb (or rethrow). Built by
+ * mono_wasm_emit_method (g_malloc'd, persists with the JITted method), read by mono_wasm_jit_eh_dispatch
+ * (interp.c, which can touch the interp ThreadContext that mini-wasm.c can't). */
+typedef struct {
+	gint16 flags;           /* MonoExceptionClause.flags: 0=NONE(catch) 1=FILTER 2=FINALLY 4=FAULT */
+	gint32 try_start;       /* clause try IL offset range [try_start, try_start+try_len) */
+	gint32 try_len;
+	gint32 handler_bbidx;   /* dense dispatch index ($blk) of the handler's entry bb */
+	gpointer catch_class;   /* MonoClass* for a catch (NONE) clause; NULL otherwise */
+} WasmEhClause;
+typedef struct {
+	gint32 nbbs, nclauses;
+	gint32 *il_offsets;     /* [nbbs]: IL offset of each bb (dense-indexed); -1 if synthetic/unknown */
+	WasmEhClause *clauses;  /* [nclauses], in table (innermost/first-checked) order */
+	const char *name;       /* method full name (diagnostics only) */
+} WasmEhTable;
+/* Returns the dense bbidx of the handler to dispatch to (>=0), or -1 to rethrow (no local handler). */
+int       mono_wasm_jit_eh_dispatch             (WasmEhTable *table, int blk);
 #endif
 void mono_call_inst_add_outarg_reg (MonoCompile *cfg, MonoCallInst *call, int vreg, int hreg, int bank);
 void      mono_call_inst_add_outarg_vt          (MonoCompile *cfg, MonoCallInst *call, MonoInst *outarg_vt);
