@@ -4228,6 +4228,24 @@ mono_wasm_jit_aot_call_target (MonoMethod *method, gpointer *out_addr, gpointer 
 		return FALSE;
 	*out_addr = cinfo->addr;
 	*out_rgctx = cinfo->extra_arg;
+	/* In a non-llvm_only runtime (this one is INTERP_ONLY) init_jit_call_info leaves extra_arg=NULL and
+	 * addr=the raw AOT body. But wasm AOT code uses the llvm_only ABI, so a generic-shared callee reads its
+	 * runtime generic context from a trailing arg — the one the INLINE_AOT emitter always pushes. Recover
+	 * that rgctx exactly as mini_llvmonly_add_method_wrappers does (it asserts mono_llvm_only, so it can't be
+	 * called here): a gsharedvt-VARIABLE callee needs the gsharedvt-in wrapper (its raw body has a variable
+	 * signature, not callable with the fixed this+args+rgctx ABI) -> bail so the caller routes it through the
+	 * residual (do_jit_call applies that wrapper); otherwise, when the body needs a static rgctx invoke, pass
+	 * mini_method_get_rgctx(method) — identically to the llvm_only path. Without this, a generic-shared callee
+	 * (e.g. IKVM's ExceptionHelper.MapException<T>, called from essentially every Java catch block — and on MC's
+	 * HOT networking path, which throws/catches RunningOnDifferentThreadException as control flow) would be
+	 * inlined with a NULL rgctx and trap. Non-generic callees (the common case) need no static rgctx invoke, so
+	 * out_rgctx stays NULL and behaviour is unchanged. */
+	if (!mono_llvm_only && !*out_rgctx) {
+		if (mono_aot_get_method_flags ((guint8*)cinfo->addr) & MONO_AOT_METHOD_FLAG_GSHAREDVT_VARIABLE)
+			return FALSE;
+		if (mono_method_needs_static_rgctx_invoke (method, FALSE))
+			*out_rgctx = mini_method_get_rgctx (method);
+	}
 	return TRUE;
 }
 

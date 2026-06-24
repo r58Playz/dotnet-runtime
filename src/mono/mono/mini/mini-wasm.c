@@ -81,6 +81,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_no_lmf; const char *nl = g_getenv ("MONO_WASM_JIT_NO_LMF"); mono_wasm_jit_no_lmf = (nl && *nl && *nl != '0') ? 1 : 0; } /* PROOF: skip interp_push_lmf in do_jit_call for wasm-JIT residual AOT calls. Tests whether the LMF is needed (conservative GC + local wasm-EH suggest not). 1 = skip, default 0 = keep. */
 	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia && *ia != '0') ? 1 : 0; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). 1 = on, default 0 = off. */
 	{ extern int mono_wasm_jit_aotconst; const char *ac = g_getenv ("MONO_WASM_JIT_AOTCONST"); mono_wasm_jit_aotconst = (ac && *ac) ? (*ac != '0') : 1; } /* bake resolved OP_AOTCONST pointers; default ON */
+	{ extern int mono_wasm_jit_rgctx; const char *rg = g_getenv ("MONO_WASM_JIT_RGCTX"); mono_wasm_jit_rgctx = (rg && *rg) ? (*rg != '0') : 1; } /* JIT uses_rgctx_reg methods, routing the rgctx call through the interp residual; default ON, =0 reverts to the whole-method bail */
 	{ extern int mono_wasm_jit_eh_nocxa; const char *en = g_getenv ("MONO_WASM_JIT_EH_NOCXA"); mono_wasm_jit_eh_nocxa = (en && *en && *en != '0') ? 1 : 0; } /* bisection: skip begin/end_catch in the EH landing pad */
 	{ extern int mono_wasm_jit_cppeh; const char *ch = g_getenv ("MONO_WASM_JIT_CPPEH"); mono_wasm_jit_cppeh = (ch && *ch && *ch != '0') ? 1 : 0; } /* AOT-style EH: propagate via C++/wasm-EH native unwinding (throw helpers C++-throw; drop EMIT_PENDING_EXC_CHECK + inline-AOT try/catch; interp->JIT boundary catches C++). 0 = resume-state model (default until validated). */
 	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
@@ -179,6 +180,19 @@ int mono_wasm_jit_no_lmf = 0;         /* PROOF (MONO_WASM_JIT_NO_LMF=1): skip th
 int mono_wasm_jit_inline_aot = 0;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the inline direct same-ABI AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry/frame/LMF) instead of the residual, for AOT'd callees. Build 1 = no wasm-EH yet (test non-throwing callees). default off. */
 int mono_wasm_jit_eh_nocxa = 0;       /* MONO_WASM_JIT_EH_NOCXA=1 (bisection): skip the __cxa_begin_catch/end_catch in the in-method catch landing pad, to test whether the cxa lifecycle (on nested catch + try re-entry) is the world-load corruption. */
 int mono_wasm_jit_aotconst = 1;       /* MONO_WASM_JIT_AOTCONST: bake resolved OP_AOTCONST pointers (vtable/class/method/static/image) so newobj/token-constant methods JIT instead of bailing. Default ON (validated on MC jit108; the earlier suspected regression was the missing JSPI build flag, not this). MONO_WASM_JIT_AOTCONST=0 reverts to the bail. */
+/* MONO_WASM_JIT_RGCTX: 1 = JIT methods that call a generic-shared callee needing a runtime generic
+ * context (cfg->uses_rgctx_reg), routing each such call through the interp residual (which derives the
+ * context from the concrete inflated call->method — both interp_entry and do_jit_call-via-gsharedvt_out
+ * are rgctx-correct), instead of bailing the WHOLE method at the gate. This is the dominant EH-method
+ * blocker on IKVM: a Java try/catch lowers to a catch-block call to the generic ExceptionHelper.MapException<T>,
+ * which sets uses_rgctx_reg — so the rgctx bail was killing nearly every render-path EH method (e.g.
+ * tesselateBlock) right after the EH gate let it through. The rgctx call sits in the COLD catch block, so
+ * the (slower) residual re-entry there is free; the hot try-body JITs to wasm. The direct f-slot path needs
+ * no rgctx (our f-slots are dedicated/concrete compiles); INLINE_AOT is skipped for rgctx calls (it would
+ * bake a NULL rgctx — cinfo->extra_arg is only populated under mono_llvm_only, which this runtime is not);
+ * indirect/virtual rgctx calls still bail (untested shape). Default ON; MONO_WASM_JIT_RGCTX=0 reverts to the
+ * old whole-method bail. */
+int mono_wasm_jit_rgctx = 1;
 int mono_wasm_jit_cppeh = 0;          /* MONO_WASM_JIT_CPPEH=1: AOT-style EH — exceptions propagate via C++/wasm-EH native stack unwinding (mono_llvm_cpp_throw_exception) instead of cooperative resume-state. throw/raise helpers C++-throw; the emitter drops EMIT_PENDING_EXC_CHECK + the inline-AOT try/catch (calls become pure call_indirect = the per-call perf win); the interp->JIT boundary (MINT_CALL e-thunk) wraps the invoke in mono_llvm_catch_exception to convert an escaping C++ exception back to interp resume-state + restore the ref-shadow-stack SP. default 0 = resume-state model. */
 const char *mono_wasm_jit_dump_ir = NULL;  /* MONO_WASM_JIT_DUMP_IR=<substr>: dump clauses + bb regions + opcode stream for clause-bearing methods whose full name contains <substr> (EH-lowering ground truth, e.g. "indigo"). */
 
@@ -1135,8 +1149,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * that slot traps "null function". Bail the whole method to the interpreter, which forwards the
 	 * rgctx correctly. (Shared callees never get an f-slot anyway — they bail just above — so the call
 	 * would always take the rgctx-less residual; bailing the caller is the only safe option until we
-	 * marshal the rgctx through.) */
-	if (cfg->uses_rgctx_reg) { fail = "uses rgctx reg"; goto done; }
+	 * marshal the rgctx through.)
+	 *
+	 * MONO_WASM_JIT_RGCTX (default ON) lifts this: instead of bailing the whole method, each rgctx call
+	 * is routed per-site to the interp residual (mono_wasm_jit_call_interp), which derives the generic
+	 * context from the concrete inflated call->method and is rgctx-correct (interp_entry, and the AOT
+	 * fastpath's do_jit_call-via-gsharedvt_out wrapper, both handle it). The INLINE_AOT direct-body path is
+	 * skipped for rgctx calls (it would feed a NULL rgctx — cinfo->extra_arg is only set under mono_llvm_only);
+	 * indirect/virtual rgctx calls still bail. This unblocks IKVM EH methods whose catch block calls the
+	 * generic ExceptionHelper.MapException<T> (the #1 render-path blocker after the EH gate). */
+	{ extern int mono_wasm_jit_rgctx;
+	  if (!mono_wasm_jit_rgctx && cfg->uses_rgctx_reg) { fail = "uses rgctx reg"; goto done; } }
 
 	for (i = 0; i < nvreg; ++i) {
 		li [i] = -1;
@@ -2419,7 +2442,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						extern __thread MonoMethod *mono_wasm_jit_last_blocking_callee;
 						int rm = mono_wasm_jit_residual_mode;
 						/* record the blocking callee so the trigger can eagerly form the island (see the relay decl) */
-						if (rm == 0) {
+						/* rgctx calls (MONO_WASM_JIT_RGCTX): if INLINE_AOT couldn't take it (gsharedvt-variable, or
+						 * inline-aot off/byref), keep the method JITted by routing this one call through the residual
+						 * (mono_wasm_jit_call_interp derives the context from the concrete callee) rather than bailing
+						 * the whole method at the RESIDUAL=0 gate. The rgctx call is the cold catch-block edge; the hot
+						 * try-body still JITs. */
+						if (rm == 0 && !((MonoCallInst*)ins)->rgctx_reg) {
 							/* jit->AOT fastpath: an AOT-compiled callee with no f-slot is STILL directly callable
 							 * via its native AOT body — so don't bail the whole method. Fall through to the
 							 * residual emit, which routes through interp_entry->do_jit_call to the AOT body
@@ -2572,6 +2600,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				int type_idx = -1, k, ai, nmeth;
 				gboolean is_membase = ins->opcode == OP_CALL_MEMBASE || ins->opcode == OP_VOIDCALL_MEMBASE || ins->opcode == OP_FCALL_MEMBASE || ins->opcode == OP_LCALL_MEMBASE || ins->opcode == OP_RCALL_MEMBASE;
 				if (!csig) { fail = "callreg null sig"; goto done; }
+				/* rgctx on an indirect/virtual call: the rgctx is a separate outarg the wasm backend doesn't
+				 * forward, and neither the inline-IC virtual resolve nor the indirect dispatch carries it. Bail
+				 * the whole method (rare; the common static-generic case — IKVM MapException<T> — is a DIRECT
+				 * OP_CALL, handled above via INLINE_AOT rgctx passthrough / residual). */
+				if (call->rgctx_reg) { fail = "rgctx indirect/virtual call"; goto done; }
 				/* Virtual method call (interp-only runtime): the vtable slot holds a fixed-sig
 				 * trampoline stub, not a callable entry, so we can't call_indirect it directly. Lower
 				 * to a call of mono_wasm_jit_vcall_i4(this, base_method) — a C helper that resolves the
