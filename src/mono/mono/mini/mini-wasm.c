@@ -80,6 +80,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_aot_residual; const char *ar = g_getenv ("MONO_WASM_JIT_AOT_RESIDUAL"); mono_wasm_jit_aot_residual = (ar && *ar && *ar == '0') ? 0 : 1; } /* jit->AOT fastpath: residual/vcall-fallback to an AOT'd callee runs it natively via do_jit_call. 0 = old behaviour (interpret it). */
 	{ extern int mono_wasm_jit_no_lmf; const char *nl = g_getenv ("MONO_WASM_JIT_NO_LMF"); mono_wasm_jit_no_lmf = (nl && *nl && *nl != '0') ? 1 : 0; } /* PROOF: skip interp_push_lmf in do_jit_call for wasm-JIT residual AOT calls. Tests whether the LMF is needed (conservative GC + local wasm-EH suggest not). 1 = skip, default 0 = keep. */
 	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia && *ia != '0') ? 1 : 0; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). 1 = on, default 0 = off. */
+	{ extern int mono_wasm_jit_aotconst; const char *ac = g_getenv ("MONO_WASM_JIT_AOTCONST"); mono_wasm_jit_aotconst = (ac && *ac) ? (*ac != '0') : 1; } /* bake resolved OP_AOTCONST pointers; default ON */
+	{ extern int mono_wasm_jit_eh_nocxa; const char *en = g_getenv ("MONO_WASM_JIT_EH_NOCXA"); mono_wasm_jit_eh_nocxa = (en && *en && *en != '0') ? 1 : 0; } /* bisection: skip begin/end_catch in the EH landing pad */
+	{ extern int mono_wasm_jit_cppeh; const char *ch = g_getenv ("MONO_WASM_JIT_CPPEH"); mono_wasm_jit_cppeh = (ch && *ch && *ch != '0') ? 1 : 0; } /* AOT-style EH: propagate via C++/wasm-EH native unwinding (throw helpers C++-throw; drop EMIT_PENDING_EXC_CHECK + inline-AOT try/catch; interp->JIT boundary catches C++). 0 = resume-state model (default until validated). */
+	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
@@ -173,6 +177,10 @@ int mono_wasm_jit_cond_exc = 1;   /* JIT OP_COND_EXC_* (checked-op throws); MONO
 int mono_wasm_jit_aot_residual = 1;   /* jit->AOT fastpath: route a wasm-JITted method's residual/vcall-fallback to an AOT'd callee through do_jit_call (native) instead of interpreting it; MONO_WASM_JIT_AOT_RESIDUAL=0 reverts */
 int mono_wasm_jit_no_lmf = 0;         /* PROOF (MONO_WASM_JIT_NO_LMF=1): skip the per-call LMF push/pop in do_jit_call for wasm-JIT residual AOT calls — validates the inline-direct-AOT-call plan (which can't cheaply push an LMF). Conservative GC + local wasm-EH should make it unneeded. */
 int mono_wasm_jit_inline_aot = 0;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the inline direct same-ABI AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry/frame/LMF) instead of the residual, for AOT'd callees. Build 1 = no wasm-EH yet (test non-throwing callees). default off. */
+int mono_wasm_jit_eh_nocxa = 0;       /* MONO_WASM_JIT_EH_NOCXA=1 (bisection): skip the __cxa_begin_catch/end_catch in the in-method catch landing pad, to test whether the cxa lifecycle (on nested catch + try re-entry) is the world-load corruption. */
+int mono_wasm_jit_aotconst = 1;       /* MONO_WASM_JIT_AOTCONST: bake resolved OP_AOTCONST pointers (vtable/class/method/static/image) so newobj/token-constant methods JIT instead of bailing. Default ON (validated on MC jit108; the earlier suspected regression was the missing JSPI build flag, not this). MONO_WASM_JIT_AOTCONST=0 reverts to the bail. */
+int mono_wasm_jit_cppeh = 0;          /* MONO_WASM_JIT_CPPEH=1: AOT-style EH — exceptions propagate via C++/wasm-EH native stack unwinding (mono_llvm_cpp_throw_exception) instead of cooperative resume-state. throw/raise helpers C++-throw; the emitter drops EMIT_PENDING_EXC_CHECK + the inline-AOT try/catch (calls become pure call_indirect = the per-call perf win); the interp->JIT boundary (MINT_CALL e-thunk) wraps the invoke in mono_llvm_catch_exception to convert an escaping C++ exception back to interp resume-state + restore the ref-shadow-stack SP. default 0 = resume-state model. */
+const char *mono_wasm_jit_dump_ir = NULL;  /* MONO_WASM_JIT_DUMP_IR=<substr>: dump clauses + bb regions + opcode stream for clause-bearing methods whose full name contains <substr> (EH-lowering ground truth, e.g. "indigo"). */
 
 /* TRUE if `name` is in the comma-separated MONO_WASM_JIT_METHOD list (bring-up targeting). */
 gboolean
@@ -435,7 +443,7 @@ mono_wasm_jit_sync_thread (void)
 			/* A module that instantiated fine on the COMPILING thread failed here on another thread:
 			 * names the corruption (e.g. magic-word/type) + which slot, so we can tell a byte-corruption
 			 * (race) apart from a thread-local structural issue. Slot stays a placeholder -> interp. */
-			char b [256]; snprintf (b, sizeof b, "WASM_JIT_SYNC_FAIL e=%d f=%d len=%d : %s", wj_reg [synced].e, wj_reg [synced].f, wj_reg [synced].len, eb); mono_wasm_jit_log_main (b);
+			if (mono_wasm_jit_stats) { char b [256]; snprintf (b, sizeof b, "WASM_JIT_SYNC_FAIL e=%d f=%d len=%d : %s", wj_reg [synced].e, wj_reg [synced].f, wj_reg [synced].len, eb); mono_wasm_jit_log_main (b); }
 		}
 		synced++;
 	}
@@ -503,6 +511,16 @@ mono_wasm_jit_ref_leave (MonoObject **base)
 	while (p < wj_ref_sp)
 		*p++ = NULL;
 	wj_ref_sp = base;
+}
+
+/* Current ref-shadow-stack SP (for the AOT-style-EH boundary: save it before invoking a JITted method,
+ * and on a caught C++ unwind restore via mono_wasm_jit_ref_leave(saved) — the unwound JITted frames
+ * skipped their own ref_leave, so their slots must be zeroed + the SP rewound here). NULL before first
+ * use (no JITted frame has run on this thread yet -> nothing to restore). */
+MonoObject **
+mono_wasm_jit_ref_sp_save (void)
+{
+	return wj_ref_sp;
 }
 
 /*
@@ -829,7 +847,8 @@ static WasmValtype
 wasm_valtype_of_opcode (int opcode)
 {
 	switch (opcode) {
-	case OP_ICONST: case OP_MOVE:
+	case OP_ICONST: case OP_MOVE: case OP_AOTCONST:   /* AOTCONST bakes a resolved pointer -> i32 on wasm32 */
+	case OP_GET_EX_OBJ:   /* caught exception object -> i32 (ref) on wasm32 */
 	case OP_IADD: case OP_ISUB: case OP_IMUL:
 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
 	case OP_IAND: case OP_IOR: case OP_IXOR:
@@ -1001,7 +1020,7 @@ void
 mono_wasm_emit_method (MonoCompile *cfg)
 {
 #ifdef HOST_BROWSER
-	{ char b [160]; snprintf (b, sizeof b, "WASM_JIT_EMIT_ENTER %s opt=0x%x", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); mono_wasm_jit_log_main (b); }
+	if (mono_wasm_jit_stats) { char b [160]; snprintf (b, sizeof b, "WASM_JIT_EMIT_ENTER %s opt=0x%x", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); mono_wasm_jit_log_main (b); }
 #endif
 	MonoMethodSignature *sig = mono_method_signature_internal (cfg->method);
 	int nvreg = cfg->next_vreg;
@@ -1021,6 +1040,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int vc_fslot_idx = 0;              /* i32 local: inline virtual-IC fast-path resolved f-slot */
 	int vc_ic_idx = 0;                 /* i64 local: inline virtual-IC fast-path IC value (vtable|imethod<<32) */
+	int eh_exc_idx = 0, eh_h_idx = 0;  /* i32 locals: in-method EH catch landing pad — saved C++ exc ptr + dispatch result */
+	int finally_ind_idx = 0;           /* i32 local: in-method finally indicator (continuation bb idx, or -1 = rethrow) */
+	gboolean eh_has_finally = FALSE;   /* TRUE: method has >=1 FINALLY clause (milestone 2c) */
+	WasmEhTable *eh_table = NULL;      /* in-method EH clause table (built below, baked into the catch landing pad) */
+	gboolean eh_on = FALSE;            /* TRUE: emit the in-method try/catch wrapper for this method */
+	int eh_dispatch_ti = -1, eh_endcatch_ti = -1;  /* functype indices: (i32,i32)->i32 dispatch + ()->void end_catch */
 	int nrefslots = 0;                 /* number of reference vregs routed to the GC ref shadow stack */
 	int enter_ti = -1, leave_ti = -1;  /* functype indices for mono_wasm_jit_ref_enter/leave */
 	WjCtx lc;
@@ -1041,7 +1066,66 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * backend doesn't lower yet — exception-handling clauses (no try/catch emission) and
 	 * generic-shared methods (rgctx access the non-llvmonly path doesn't handle). Unknown opcodes
 	 * still bail individually via the lowering switch's default case. */
-	if (cfg->header && cfg->header->num_clauses > 0) { fail = "has EH clauses"; goto done; }
+#ifndef HOST_BROWSER
+	/* EH ground-truth dump (MONO_WASM_JIT_DUMP_IR=<substr>): print clauses + per-bb region + opcode stream
+	 * for clause-bearing methods. OFFLINE-CROSS ONLY: mono_inst_name returns a string in the cross but an
+	 * int under the runtime's DISABLE_LOGGING, and the dump is only ever driven by the offline MONO_WASM_JIT_DUMP_IR
+	 * env — so guard it out of the browser runtime build entirely (was breaking the runtime compile). */
+	{ char *_df = g_getenv ("MONO_WASM_JIT_DUMP_IR");   /* read directly: the env-init fn isn't run in the offline cross */
+	  if (_df && *_df && cfg->header && cfg->header->num_clauses > 0 && mname && strstr (mname, _df)) {
+		guint _ci; MonoBasicBlock *_db; MonoInst *_di;
+		g_printerr ("[eh-ir] === %s nclauses=%u ===\n", mname, cfg->header->num_clauses);
+		for (_ci = 0; _ci < cfg->header->num_clauses; ++_ci) {
+			MonoExceptionClause *_c = &cfg->header->clauses [_ci];
+			g_printerr ("[eh-ir] clause%u flags=%d(0=catch,2=finally,4=fault) try=[%u,%u) handler=[%u,%u)\n",
+				_ci, _c->flags, _c->try_offset, _c->try_offset + _c->try_len, _c->handler_offset, _c->handler_offset + _c->handler_len);
+		}
+		for (_db = cfg->bb_entry; _db; _db = _db->next_bb) {
+			g_printerr ("[eh-ir] bb%d region=0x%x:\n", _db->block_num, _db->region);
+			MONO_BB_FOR_EACH_INS (_db, _di) {
+				const char *_nm = mono_inst_name (_di->opcode);
+				if ((_di->opcode == OP_CALL_HANDLER || _di->opcode == OP_BR) && _di->inst_target_bb)
+					g_printerr ("[eh-ir]   %s -> bb%d\n", _nm, _di->inst_target_bb->block_num);
+				else if (_di->opcode == OP_AOTCONST)
+					g_printerr ("[eh-ir]   %s patch_type=%d p0=%p\n", _nm, (int) (gsize) _di->inst_p1, _di->inst_p0);
+				else
+					g_printerr ("[eh-ir]   %s\n", _nm);
+			}
+		}
+	  }
+	  g_free (_df);
+	}
+#endif /* !HOST_BROWSER (offline IR dump) */
+	if (cfg->header && cfg->header->num_clauses > 0) {
+		char *_eh = g_getenv ("MONO_WASM_JIT_EH"); gboolean _ehon = _eh && *_eh && *_eh != '0'; g_free (_eh);
+		if (!_ehon) { fail = "has EH clauses"; goto done; }   /* MONO_WASM_JIT_EH=1: attempt the in-method EH lowering */
+		/* bisection: MONO_WASM_JIT_EH_ONLY=<substr> emits the in-method wrapper only for methods whose full
+		 * name contains <substr> (others bail like EH=0) — to pin down which EH method corrupts world load. */
+		{ char *_o = g_getenv ("MONO_WASM_JIT_EH_ONLY"); gboolean _skip = _o && *_o && (!mname || !strstr (mname, _o)); if (_o) g_free (_o); if (_skip) { fail = "eh-only filter"; goto done; } }
+		{ extern int mono_wasm_jit_cppeh; guint _ci; gboolean _cppeh = mono_wasm_jit_cppeh;
+		  { char *_cv = g_getenv ("MONO_WASM_JIT_CPPEH"); if (_cv) { _cppeh = (*_cv && *_cv != '0'); g_free (_cv); } }   /* env fallback so the offline cross (env-init not run) can validate */
+		  if (!_cppeh) { fail = "EH needs cppeh"; goto done; }   /* in-method clauses propagate via C++/wasm-EH */
+		  /* increment 2a: catch (NONE). 2c: + finally (FINALLY, incl. Java try-with-resources / try{}finally{}).
+		   * filter (1) / fault (4) still bail — handled in a later increment. */
+		  for (_ci = 0; _ci < cfg->header->num_clauses; ++_ci) {
+			  int _f = cfg->header->clauses [_ci].flags;
+			  if (_f == MONO_EXCEPTION_CLAUSE_FINALLY) {
+				  /* MONO_WASM_JIT_FINALLY=0 bails finally methods (catch-only) — bisects catch-il_state-at-scale
+				   * vs the new try/finally codegen without a rebuild once this env check is compiled in. */
+				  char *_fv = g_getenv ("MONO_WASM_JIT_FINALLY"); gboolean _foff = _fv && *_fv == '0'; if (_fv) g_free (_fv);
+				  if (_foff) { fail = "finally (gated off)"; goto done; }
+				  eh_has_finally = TRUE;
+			  }
+			  else if (_f != MONO_EXCEPTION_CLAUSE_NONE) { fail = "EH clause kind (catch/finally only)"; goto done; }
+		  }
+		  /* the prologue il_state island has a fixed data[] (WJ_ISLAND_DATA=256 in interp.c) that the GC
+		   * scans for args+locals; bail EH methods that exceed it so the GC never reads past the buffer. */
+		  { MonoMethodSignature *_s = mono_method_signature_internal (cfg->method);
+		    int _nd = (_s && _s->hasthis ? 1 : 0) + (_s ? (int) _s->param_count : 0) + (int) cfg->header->num_locals;
+		    if (_nd > 256) { fail = "EH method exceeds il_state data cap (256 args+locals)"; goto done; } }
+		  eh_on = TRUE;   /* emit the outer-loop+try wrapper + catch landing pad (table built after bbidx) */
+		}
+	}
 	if (cfg->gshared) { fail = "gshared method"; goto done; }
 	/* A call here passes the generic-sharing context in MONO_ARCH_RGCTX_REG (an out-arg register set by
 	 * set_rgctx_arg) — e.g. this concrete method calls a gsharedvt/shared callee like
@@ -1112,6 +1196,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	/* one more i32 local for the inline virtual-IC fast path's resolved f-slot (dead in methods with no
 	 * virtual call — a harmless unused declared local) */
 	vc_fslot_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	/* two i32 locals for the in-method EH catch landing pad (dead in methods with no clauses) */
+	eh_exc_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	eh_h_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	/* one i32 local for the in-method finally indicator (dead in non-finally methods): OP_CALL_HANDLER sets
+	 * it to the continuation bb index; the catch landing pad sets it to -1; OP_ENDFINALLY branches on it. */
+	finally_ind_idx = nargs + cnt [0];
 	cnt [0] += 1;
 	base [0] = nargs;
 	base [1] = base [0] + cnt [0];
@@ -1294,6 +1387,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
 		wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ref_leave); \
 		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0); \
+	} \
+	if (eh_on) {   /* pop this EH method's il_state island (pushed by enter_island in the prologue) */ \
+		extern void mono_wasm_jit_leave_island (void); \
+		wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_leave_island); \
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0); \
 	} } while (0)
 #else
 #define EMIT_REF_LEAVE() do { } while (0)
@@ -1306,6 +1404,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * through every JITted frame, not just the one entered from the interp e-thunk. (No-op offline.) */
 #ifdef HOST_BROWSER
 #define EMIT_PENDING_EXC_CHECK() do { \
+		extern int mono_wasm_jit_cppeh; \
+		if (mono_wasm_jit_cppeh) break;   /* AOT-style: a thrown callee C++-unwinds straight through; no per-call check (the perf win) */ \
 		extern int mono_wasm_jit_pending_exception (void); \
 		WasmFuncType _pt; int _pti = -1, _pk; \
 		memset (&_pt, 0, sizeof (_pt)); _pt.ret = WASM_I32; _pt.nparams = 0; \
@@ -1337,6 +1437,39 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	N = 0;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
 		bbidx [bb->block_num] = N++;
+
+	/* In-method EH: build the per-method clause table the catch landing pad's dispatch helper walks.
+	 * Maps each dense bb -> its IL offset (for is-address-protected), and each clause -> {flags, try
+	 * IL-range, handler bbidx, catch_class}. g_malloc'd so it outlives this compile (the JITted module
+	 * bakes its address); a small per-EH-method leak. */
+	if (eh_on) {
+		guint _ci; int _d;
+		eh_table = (WasmEhTable *) g_malloc0 (sizeof (WasmEhTable));
+		eh_table->name = mname ? g_strdup (mname) : NULL;   /* diagnostics */
+		eh_table->nbbs = N;
+		eh_table->nclauses = (gint32) cfg->header->num_clauses;
+		eh_table->il_offsets = (gint32 *) g_malloc0 (sizeof (gint32) * (N > 0 ? N : 1));
+		eh_table->clauses = (WasmEhClause *) g_malloc0 (sizeof (WasmEhClause) * (eh_table->nclauses > 0 ? eh_table->nclauses : 1));
+		for (_d = 0; _d < N; ++_d) eh_table->il_offsets [_d] = -1;
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+			int _bd = bbidx [bb->block_num];
+			if (_bd >= 0 && _bd < N)
+				eh_table->il_offsets [_bd] = bb->cil_code ? (gint32) (bb->cil_code - cfg->header->code) : -1;
+		}
+		for (_ci = 0; _ci < cfg->header->num_clauses; ++_ci) {
+			MonoExceptionClause *_c = &cfg->header->clauses [_ci];
+			WasmEhClause *_wc = &eh_table->clauses [_ci];
+			MonoBasicBlock *_hb; int _hbb = -1;
+			_wc->flags = (gint16) _c->flags;
+			_wc->try_start = (gint32) _c->try_offset;
+			_wc->try_len = (gint32) _c->try_len;
+			_wc->catch_class = (_c->flags == MONO_EXCEPTION_CLAUSE_NONE) ? _c->data.catch_class : NULL;
+			for (_hb = cfg->bb_entry; _hb; _hb = _hb->next_bb)
+				if (_hb->cil_code && (gint32) (_hb->cil_code - cfg->header->code) == (gint32) _c->handler_offset) { _hbb = bbidx [_hb->block_num]; break; }
+			if (_hbb < 0) { fail = "eh handler bb not found"; goto done; }
+			_wc->handler_bbidx = _hbb;
+		}
+	}
 
 	/* prologue: dispatch index ($blk) starts at the entry block (dense index 0) */
 	wasm_i32_const (&body, 0);
@@ -1376,7 +1509,42 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 *   loop { block^N { local.get $blk; br_table 0..N-1 } bb0; bb1; ... } unreachable
 	 * br_table index i jumps just past block B_i, where bb_i's code lives. A branch
 	 * to bb T sets $blk=idx(T) and br's back to the loop to re-dispatch.
-	 */
+	 *
+	 * In-method EH (eh_on): wrap the whole dispatch in `loop $outer { try { <dispatch> } catch <x.e> {
+	 * <clause-walk landing pad>; br $outer } }`. A C++/wasm-EH unwind out of any bb is caught here; the
+	 * landing pad maps the throwing bb ($blk) -> a handler bb (set $blk + br $outer to re-dispatch) or
+	 * rethrows. The inner dispatch + all GOTO depths are UNCHANGED — outer-loop/try sit ABOVE the inner
+	 * loop, so a GOTO's depth to the inner loop is unaffected. */
+	if (eh_on) {
+		WasmFuncType _t; int _k;
+		/* (i32)->void: the x.e tag type AND mono_jiterp_begin_catch */
+		memset (&_t, 0, sizeof _t); _t.nparams = 1; _t.params [0] = WASM_I32; _t.ret = WASM_VOID;
+		eh_type_idx = -1;
+		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_type_idx = 2 + _k; break; }
+		if (eh_type_idx < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_type_idx = 2 + nextra++; }
+		/* (i32,i32)->i32: mono_wasm_jit_eh_dispatch (table, blk) -> handler bbidx or -1 */
+		memset (&_t, 0, sizeof _t); _t.nparams = 2; _t.params [0] = WASM_I32; _t.params [1] = WASM_I32; _t.ret = WASM_I32;
+		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_dispatch_ti = 2 + _k; break; }
+		if (eh_dispatch_ti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_dispatch_ti = 2 + nextra++; }
+		/* ()->void: mono_jiterp_end_catch */
+		memset (&_t, 0, sizeof _t); _t.nparams = 0; _t.ret = WASM_VOID;
+		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_endcatch_ti = 2 + _k; break; }
+		if (eh_endcatch_ti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_endcatch_ti = 2 + nextra++; }
+		uses_calls = TRUE;
+		uses_eh_tag = TRUE;
+		/* PROLOGUE: push this EH method's il_state island so mono's exception pass-1 sees it on ANY entry
+		 * (interp->JIT boundary OR direct JIT->JIT f-slot call). method ptr baked; (i32)->void = eh_type_idx.
+		 * Popped at every exit by EMIT_REF_LEAVE + the rethrow paths. */
+		wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+#ifdef HOST_BROWSER
+		{ extern void mono_wasm_jit_enter_island (MonoMethod *m); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_enter_island); }
+#else
+		wasm_i32_const (&body, 0x7ff6);
+#endif
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_type_idx); wasm_uleb (&body, 0);
+		wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);   /* $outer: catch re-dispatch loop */
+		wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);    /* in-method EH try region (catches x.e) */
+	}
 	wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);
 	for (i = 0; i < N; ++i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);
@@ -1388,6 +1556,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 
 #define GOTO(TBB, DEPTH) do { int _ti = bbidx [(TBB)->block_num]; if (_ti < 0) { fail = "bad branch target"; goto done; } wasm_i32_const (&body, _ti); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx); wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) (DEPTH)); } while (0)
 
+	/* MONO_WASM_JIT_BBTRACE=<substr>: per-bb runtime $blk trace for a matching EH method (debug only). */
+	gboolean eh_bbtrace = FALSE;
+	{ char *_bbt = g_getenv ("MONO_WASM_JIT_BBTRACE"); if (_bbt) { eh_bbtrace = *_bbt && eh_on && mname && strstr (mname, _bbt); g_free (_bbt); } }
 	i = 0;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
 		int loop_depth = N - 1 - i;
@@ -1401,11 +1572,100 @@ mono_wasm_emit_method (MonoCompile *cfg)
 
 		wasm_op (&body, WASM_OP_END); /* close block B_i; bb_i code follows */
 
+#ifdef HOST_BROWSER
+		/* bbtrace: log this bb's dense index at runtime (reuses the (i32,i32)->i32 dispatch functype + drop) */
+		if (eh_bbtrace) {
+			extern int mono_wasm_jit_bbtrace_log (WasmEhTable *t, int blk);
+			wasm_i32_const (&body, (gint32) (intptr_t) eh_table);
+			wasm_i32_const (&body, i);
+			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_bbtrace_log);
+			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_dispatch_ti); wasm_uleb (&body, 0);
+			wasm_op (&body, WASM_OP_DROP);
+		}
+		/* AOT-style in-method EH (milestone 2b): record this bb's IL offset into the active island il_state
+		 * (pushed at the interp->JIT boundary) so mono's exception pass-1 matches THIS method's enclosing
+		 * try and finds its catch as the NEAREST handler for a throwing AOT callee — stopping the walk here
+		 * and running no outer frames' finally clauses. (i32)->void via eh_type_idx. EH methods only. */
+		if (eh_on) {
+			extern void mono_wasm_jit_set_il_offset (int il_offset);
+			wasm_i32_const (&body, eh_table->il_offsets [i]);
+			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_set_il_offset);
+			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_type_idx); wasm_uleb (&body, 0);
+		}
+#endif
+
 		MONO_BB_FOR_EACH_INS (bb, ins) {
+			if (terminated) continue;   /* skip instrs after a bb terminator (e.g. the OP_BR following OP_CALL_HANDLER) */
 			switch (ins->opcode) {
 			case OP_NOP: case OP_IL_SEQ_POINT: case OP_SEQ_POINT:
 			case OP_DUMMY_USE: case OP_NOT_REACHED: case OP_START_HANDLER:
 				break;
+			case OP_CALL_HANDLER: {
+				/* milestone 2c: "call" a finally subroutine. We don't call — we record the continuation bb
+				 * index in finally_ind, then GOTO the finally bb; OP_ENDFINALLY reads finally_ind to branch
+				 * back. The leave's OP_BR (whose target IS the continuation) immediately follows and is
+				 * skipped via the `terminated` guard above. Bail on a non-OP_BR continuation (a nested-finally
+				 * leave emits multiple OP_CALL_HANDLERs in one bb — not supported yet). */
+				int _cont; MonoInst *_nx = ins->next;
+				while (_nx && (_nx->opcode == OP_NOP || _nx->opcode == OP_IL_SEQ_POINT || _nx->opcode == OP_SEQ_POINT)) _nx = _nx->next;
+				if (!_nx || _nx->opcode != OP_BR || !_nx->inst_target_bb) { fail = "finally: complex call_handler continuation"; goto done; }
+				_cont = bbidx [_nx->inst_target_bb->block_num];
+				if (_cont < 0) { fail = "finally: bad continuation"; goto done; }
+				wasm_i32_const (&body, _cont);
+				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) finally_ind_idx);
+				GOTO (ins->inst_target_bb, loop_depth);
+				terminated = TRUE;
+				break;
+			}
+			case OP_ENDFINALLY: {
+				/* milestone 2c: end of a finally handler. finally_ind == -1 => the finally ran on the
+				 * EXCEPTION path (the catch landing pad set it) -> re-raise the in-flight exception
+				 * (mono_wasm_jit_endfinally_rethrow, ()->void, never returns). Otherwise finally_ind holds the
+				 * continuation bb index of the OP_CALL_HANDLER that ran us (normal leave) -> GOTO it. */
+				wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) finally_ind_idx);
+				wasm_i32_const (&body, -1);
+				wasm_op (&body, WASM_OP_I32_EQ);
+				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);    /* exception path */
+				/* the method escapes via this re-raise -> pop its il_state island first */
+#ifdef HOST_BROWSER
+				{ extern void mono_wasm_jit_leave_island (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_leave_island); }
+#else
+				wasm_i32_const (&body, 0x7ff7);
+#endif
+				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0);   /* leave_island ()->void */
+#ifdef HOST_BROWSER
+				{ extern void mono_wasm_jit_endfinally_rethrow (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_endfinally_rethrow); }
+#else
+				wasm_i32_const (&body, 0x7ff5);
+#endif
+				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0);   /* ()->void */
+				wasm_op (&body, WASM_OP_UNREACHABLE);   /* the re-raise never returns */
+				wasm_op (&body, WASM_OP_END);           /* end if */
+				/* normal leave path: GOTO finally_ind (the continuation) */
+				wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) finally_ind_idx);
+				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
+				wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) loop_depth);
+				terminated = TRUE;
+				break;
+			}
+			case OP_GET_EX_OBJ: {
+				/* In a JITted catch handler: load the exception the catch landing pad stashed
+				 * (mono_wasm_jit_get_caught_exc, ()->i32). dreg is a ref -> wasm_st routes it to the
+				 * GC ref shadow stack. */
+				WasmFuncType _gt; int _gti = -1, _gk;
+				memset (&_gt, 0, sizeof _gt); _gt.nparams = 0; _gt.ret = WASM_I32;
+				for (_gk = 0; _gk < nextra; ++_gk) if (functype_eq (&extra_types [_gk], &_gt)) { _gti = 2 + _gk; break; }
+				if (_gti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _gt; _gti = 2 + nextra++; }
+				uses_calls = TRUE;
+#ifdef HOST_BROWSER
+				{ extern MonoObject *mono_wasm_jit_get_caught_exc (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_get_caught_exc); }
+#else
+				wasm_i32_const (&body, 0x7ff4);
+#endif
+				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) _gti); wasm_uleb (&body, 0);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "get_ex_obj dreg"; goto done; }
+				break;
+			}
 			case OP_MEMORY_BARRIER:
 #ifndef DISABLE_THREADS
 				/* Match the jiterpreter (MINT_MONO_MEMORY_BARRIER): emit a seq-cst atomic.fence
@@ -1425,9 +1685,27 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * resolve+bake token constants yet — and MONO_PATCH_INFO_LDSTR resolves to a movable GC
 				 * object that can't be a wasm immediate — so bail the method to the interpreter. The
 				 * GC_SAFE_POINT_FLAG form (shouldn't reach here on wasm) is dead, so tolerate it. */
-				if ((MonoJumpInfoType) (gsize) ins->inst_p1 == MONO_PATCH_INFO_GC_SAFE_POINT_FLAG)
+				switch ((MonoJumpInfoType) (gsize) ins->inst_p1) {
+				case MONO_PATCH_INFO_GC_SAFE_POINT_FLAG:
+					break;   /* dead on wasm; OP_GC_SAFE_POINT re-bakes the flag address */
+				/* !compile_aot: NEW_*CONST stored the RESOLVED runtime pointer in inst_p0 (ir-emit.h:
+				 * `compile_aot ? klass : vtable`). vtables/classes/methods/static-storage/images are
+				 * stable, un-movable, cross-thread -> bake the pointer like a resolved pconst. (Movable
+				 * LDSTR objects come via OP_(I|P)CONST + the interned slot, never here.) */
+				case MONO_PATCH_INFO_VTABLE: case MONO_PATCH_INFO_CLASS: case MONO_PATCH_INFO_METHOD:
+				case MONO_PATCH_INFO_METHODCONST: case MONO_PATCH_INFO_FIELD: case MONO_PATCH_INFO_SFLDA:
+				case MONO_PATCH_INFO_IMAGE: case MONO_PATCH_INFO_METHOD_RGCTX:
+					/* GATED (MONO_WASM_JIT_AOTCONST=1, default OFF): baking inst_p0 enables newobj/token-constant
+					 * methods to JIT, but is unvalidated and suspected of a regression — default to the
+					 * known-good bail until isolated. */
+					{ extern int mono_wasm_jit_aotconst; if (!mono_wasm_jit_aotconst) { fail = "aotconst (gated off)"; fail_op = ins->opcode; goto done; } }
+					wasm_i32_const (&body, (gint32) (intptr_t) ins->inst_p0);
+					if (!wasm_st (&body, &lc, ins->dreg)) { fail = "aotconst dreg"; goto done; }
 					break;
-				fail = "aotconst"; fail_op = ins->opcode; goto done;
+				default:
+					fail = "aotconst type"; fail_op = ins->opcode; goto done;
+				}
+				break;
 			}
 			case OP_GC_SAFE_POINT: {
 				/* Cooperative-GC safepoint poll: if (mono_polling_required) mono_threads_state_poll().
@@ -1791,16 +2069,22 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_i32_const (&body, 0x7ff8);
 #endif
 				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) rti); wasm_uleb (&body, 0);
-				switch (ret_vt) {
-				case WASM_I32: wasm_i32_const (&body, 0); break;
-				case WASM_I64: wasm_i64_const (&body, 0); break;
-				case WASM_F32: wasm_f32_const (&body, 0); break;
-				case WASM_F64: wasm_f64_const (&body, 0); break;
-				default: break;
-				}
-				EMIT_REF_LEAVE ();
-				wasm_op (&body, WASM_OP_RETURN);
-				wasm_op (&body, WASM_OP_END);
+				{ extern int mono_wasm_jit_cppeh;
+				if (mono_wasm_jit_cppeh) {
+					/* AOT-style: mono_wasm_jit_raise_corlib C++-throws and never returns; unwind natively. */
+					wasm_op (&body, WASM_OP_UNREACHABLE);
+				} else {
+					switch (ret_vt) {
+					case WASM_I32: wasm_i32_const (&body, 0); break;
+					case WASM_I64: wasm_i64_const (&body, 0); break;
+					case WASM_F32: wasm_f32_const (&body, 0); break;
+					case WASM_F64: wasm_f64_const (&body, 0); break;
+					default: break;
+					}
+					EMIT_REF_LEAVE ();
+					wasm_op (&body, WASM_OP_RETURN);
+				} }
+				wasm_op (&body, WASM_OP_END);   /* close the cond `if` (hot path continues after) */
 				break;
 			}
 			case OP_THROW: {
@@ -1821,15 +2105,24 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_i32_const (&body, 0x7ff7);
 #endif
 				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) tti); wasm_uleb (&body, 0);
-				switch (ret_vt) {
-				case WASM_I32: wasm_i32_const (&body, 0); break;
-				case WASM_I64: wasm_i64_const (&body, 0); break;
-				case WASM_F32: wasm_f32_const (&body, 0); break;
-				case WASM_F64: wasm_f64_const (&body, 0); break;
-				default: break;
-				}
-				EMIT_REF_LEAVE ();
-				wasm_op (&body, WASM_OP_RETURN);
+				{ extern int mono_wasm_jit_cppeh;
+				if (mono_wasm_jit_cppeh) {
+					/* AOT-style: mono_wasm_jit_throw C++-throws (mono_llvm_cpp_throw_exception) and never
+					 * returns — the wasm stack unwinds natively to the nearest landing pad (an in-method
+					 * catch or the interp e-thunk boundary). No dummy ret / ref_leave (the catch boundary
+					 * restores the ref shadow-stack SP). */
+					wasm_op (&body, WASM_OP_UNREACHABLE);
+				} else {
+					switch (ret_vt) {
+					case WASM_I32: wasm_i32_const (&body, 0); break;
+					case WASM_I64: wasm_i64_const (&body, 0); break;
+					case WASM_F32: wasm_f32_const (&body, 0); break;
+					case WASM_F64: wasm_f64_const (&body, 0); break;
+					default: break;
+					}
+					EMIT_REF_LEAVE ();
+					wasm_op (&body, WASM_OP_RETURN);
+				} }
 				terminated = TRUE;
 				break;
 			}
@@ -2074,33 +2367,40 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							nt.params [nt.nparams++] = WASM_I32;
 							for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &nt)) { nti = 2 + k; break; }
 							if (nti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = nt; nti = 2 + nextra++; }
-							memset (&eht, 0, sizeof (eht)); eht.nparams = 1; eht.params [0] = WASM_I32; eht.ret = WASM_VOID;
-							for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &eht)) { ehti = 2 + k; break; }
-							if (ehti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = eht; ehti = 2 + nextra++; }
 							uses_calls = TRUE;
-							uses_eh_tag = TRUE;
-							eh_type_idx = ehti;
 							if (!call->call_info) { fail = "no captured call args"; goto done; }
-							/* Wrap the direct AOT call in a wasm try/catch: a throwing AOT callee is caught via the
-							 * x.e (__cpp_exception) tag and converted to the interp resume-state by
-							 * mono_wasm_jit_aot_caught; the JITted method then bails via EMIT_PENDING_EXC_CHECK and
-							 * the exception resumes in the interp handler up the stack. No per-call LMF (jit102). */
-							wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);   /* try (void) */
-							{ int *wargs = (int *) call->call_info; for (ai = 0; ai < (int) ct.nparams; ++ai) if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "call arg ld"; goto done; } }
-							wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);   /* rgctx (ftndesc.arg) */
-							wasm_i32_const (&body, (gint32) (intptr_t) aot_addr);    /* AOT target table index (cinfo->addr) */
-							wasm_op (&body, WASM_OP_CALL_INDIRECT);
-							wasm_uleb (&body, (guint32) nti);
-							wasm_uleb (&body, 0);   /* table 0 (imported f.f) */
-							if (ct.ret != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "call dreg"; goto done; }   /* store ret inside the try */
-							wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0);   /* catch <tag 0>: pushes the C++ exc ptr (i32) */
-							{ extern void mono_wasm_jit_aot_caught (void *exc); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_aot_caught); }
-							wasm_op (&body, WASM_OP_CALL_INDIRECT);
-							wasm_uleb (&body, (guint32) ehti);
-							wasm_uleb (&body, 0);   /* table 0 */
-							wasm_op (&body, WASM_OP_END);   /* end try/catch */
-							EMIT_PENDING_EXC_CHECK ();
-							{ extern void mono_wasm_jit_log_main (const char *msg); static int n_il = 0; if (n_il++ < 64) { char *cn = mono_method_get_full_name (call->method); char *m2 = g_strdup_printf ("WASM_JIT_INLINE_AOT[%d] %s -> %s", n_il, mname, cn); mono_wasm_jit_log_main (m2); g_free (m2); g_free (cn); } }
+							{ extern int mono_wasm_jit_cppeh;
+							if (mono_wasm_jit_cppeh) {
+								/* AOT-style EH: bare direct AOT call. A throwing AOT callee C++-unwinds (wasm-EH)
+								 * straight through this JITted frame to the nearest landing pad — the interp e-thunk
+								 * boundary (mono_llvm_catch_exception) or an in-method catch. No try/catch + no
+								 * EMIT_PENDING_EXC_CHECK: the call is pure call_indirect (the per-call perf win). */
+								{ int *wargs = (int *) call->call_info; for (ai = 0; ai < (int) ct.nparams; ++ai) if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "call arg ld"; goto done; } }
+								wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);
+								wasm_i32_const (&body, (gint32) (intptr_t) aot_addr);
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) nti); wasm_uleb (&body, 0);
+								if (ct.ret != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "call dreg"; goto done; }
+							} else {
+								memset (&eht, 0, sizeof (eht)); eht.nparams = 1; eht.params [0] = WASM_I32; eht.ret = WASM_VOID;
+								for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &eht)) { ehti = 2 + k; break; }
+								if (ehti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = eht; ehti = 2 + nextra++; }
+								uses_eh_tag = TRUE;
+								eh_type_idx = ehti;
+								/* resume-state model: wrap the AOT call in wasm try/catch <x.e>; a throwing callee is caught
+								 * by mono_wasm_jit_aot_caught (-> interp resume-state) + the method bails via EMIT_PENDING_EXC_CHECK. */
+								wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);   /* try (void) */
+								{ int *wargs = (int *) call->call_info; for (ai = 0; ai < (int) ct.nparams; ++ai) if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "call arg ld"; goto done; } }
+								wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);   /* rgctx (ftndesc.arg) */
+								wasm_i32_const (&body, (gint32) (intptr_t) aot_addr);    /* AOT target table index (cinfo->addr) */
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) nti); wasm_uleb (&body, 0);
+								if (ct.ret != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "call dreg"; goto done; }   /* store ret inside the try */
+								wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0);   /* catch <tag 0>: pushes the C++ exc ptr (i32) */
+								{ extern void mono_wasm_jit_aot_caught (void *exc); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_aot_caught); }
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ehti); wasm_uleb (&body, 0);   /* table 0 */
+								wasm_op (&body, WASM_OP_END);   /* end try/catch */
+								EMIT_PENDING_EXC_CHECK ();
+							} }
+							{ extern void mono_wasm_jit_log_main (const char *msg); static int n_il = 0; if (mono_wasm_jit_stats && n_il++ < 64) { char *cn = mono_method_get_full_name (call->method); char *m2 = g_strdup_printf ("WASM_JIT_INLINE_AOT[%d] %s -> %s", n_il, mname, cn); mono_wasm_jit_log_main (m2); g_free (m2); g_free (cn); } }
 							break;
 						}
 					}
@@ -2167,7 +2467,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					  if (_ns && !strncmp (_ns, "System.Reflection", 17)) { fail = "residual reflection"; goto done; } }
 					/* Diagnostic: list the params+non-void residual sites. Only reached in modes 1/4 (mode 5
 					 * bails this shape above). Lets a =1/=4 run name a suspect caller->callee. */
-					if (csig->param_count > 0 && ct.ret != WASM_VOID) {
+					if (mono_wasm_jit_stats && csig->param_count > 0 && ct.ret != WASM_VOID) {
 						char *cn = mono_method_get_full_name (call->method);
 						char b [512]; snprintf (b, sizeof b, "WASM_JIT_RESIDUAL_PNV %s -> %s", mname, cn ? cn : "?");
 						mono_wasm_jit_log_main (b); g_free (cn);
@@ -2541,6 +2841,70 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	wasm_op (&body, WASM_OP_END);          /* close loop */
 	wasm_op (&body, WASM_OP_UNREACHABLE);  /* loop never falls through */
 
+	if (eh_on) {
+		/* In-method EH landing pad: `catch <x.e>` of the wrapping try. The C++ exc ptr (i32) is pushed.
+		 * h = eh_dispatch(table, $blk): the throwing bb's matching catch handler bbidx, or -1. h<0 ->
+		 * rethrow (propagate to an outer try / the interp boundary). h>=0 -> claim the C++ exc + set
+		 * $blk=h + br $outer to re-dispatch into the handler bb. */
+		wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0);   /* tag 0 = x.e */
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
+#ifdef HOST_BROWSER
+		wasm_i32_const (&body, (gint32) (intptr_t) eh_table);
+#else
+		wasm_i32_const (&body, 0x7ff0);   /* offline: placeholder EH-table addr */
+#endif
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);   /* $blk = the throwing bb */
+#ifdef HOST_BROWSER
+		{ extern int mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_eh_dispatch); }
+#else
+		wasm_i32_const (&body, 0x7ff1);
+#endif
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_dispatch_ti); wasm_uleb (&body, 0);
+		wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) eh_h_idx);
+		wasm_i32_const (&body, 0);
+		wasm_op (&body, WASM_OP_I32_LT_S);
+		wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);     /* h < 0: no local handler */
+		/* the method escapes via rethrow -> pop its il_state island first */
+#ifdef HOST_BROWSER
+		{ extern void mono_wasm_jit_leave_island (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_leave_island); }
+#else
+		wasm_i32_const (&body, 0x7ff7);
+#endif
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0);   /* leave_island ()->void */
+		wasm_op (&body, WASM_OP_RETHROW); wasm_uleb (&body, 1); /* depth 1 = the enclosing try -> re-propagate */
+		wasm_op (&body, WASM_OP_END);                          /* end if */
+		/* matched: claim+release the C++ exception (balance the cxa handler count), then dispatch. */
+		{ extern int mono_wasm_jit_eh_nocxa;
+		if (!mono_wasm_jit_eh_nocxa) {   /* MONO_WASM_JIT_EH_NOCXA=1 skips the cxa claim (bisection) */
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_exc_idx);
+#ifdef HOST_BROWSER
+		{ extern void mono_jiterp_begin_catch (void *e); wasm_i32_const (&body, (gint32) (intptr_t) mono_jiterp_begin_catch); }
+#else
+		wasm_i32_const (&body, 0x7ff2);
+#endif
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_type_idx); wasm_uleb (&body, 0);   /* (i32)->void */
+#ifdef HOST_BROWSER
+		{ extern void mono_jiterp_end_catch (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_jiterp_end_catch); }
+#else
+		wasm_i32_const (&body, 0x7ff3);
+#endif
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0);   /* ()->void */
+		} }
+		/* milestone 2c: mark the EXCEPTION path for any finally handler we dispatch to — finally_ind = -1 so
+		 * its OP_ENDFINALLY re-raises (vs a normal leave, where OP_CALL_HANDLER set finally_ind to a real
+		 * continuation bb). Harmless for catch handlers (they never read finally_ind). Finally methods only. */
+		if (eh_has_finally) {
+			wasm_i32_const (&body, -1);
+			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) finally_ind_idx);
+		}
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_h_idx);
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);   /* $blk = handler bbidx */
+		wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);     /* depth 1 = $outer loop -> re-dispatch */
+		wasm_op (&body, WASM_OP_END);          /* close try */
+		wasm_op (&body, WASM_OP_END);          /* close $outer loop */
+		wasm_op (&body, WASM_OP_UNREACHABLE);  /* $outer loop never falls through */
+	}
+
 #undef GOTO
 #undef BIN
 #undef BINI32
@@ -2613,14 +2977,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				mono_wasm_jit_last_bytes = cached;
 				mono_wasm_jit_last_len = (int) out.len;
 				mono_wasm_jit_last_slot = e_slot;
+				/* EH methods now push their il_state in the PROLOGUE (mono_wasm_jit_enter_island), so a direct
+				 * JIT->JIT f-slot call is visible to pass-1 too — re-expose the f-slot for direct dispatch. */
 				mono_wasm_jit_last_fslot = f_slot;
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_registered_count++;
 				{ extern void mono_wasm_jit_register (int e_slot, int f_slot, void *bytes, int len); mono_wasm_jit_register (e_slot, f_slot, cached, (int) out.len); }
-				{ char b [256]; snprintf (b, sizeof b, "WASM_JIT_REGISTERED %s e_slot=%d f_slot=%d len=%u", mname, e_slot, f_slot, (unsigned) out.len); mono_wasm_jit_log_main (b); }
+				if (mono_wasm_jit_stats) { char b [256]; snprintf (b, sizeof b, "WASM_JIT_REGISTERED %s e_slot=%d f_slot=%d len=%u", mname, e_slot, f_slot, (unsigned) out.len); mono_wasm_jit_log_main (b); }
 			} else {
 				g_free (cached);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_invalid_count++;
-				{ char b [320]; snprintf (b, sizeof b, "WASM_JIT_INVALID %s e_slot=%d len=%u : %s", mname, e_slot, (unsigned) out.len, ierr); mono_wasm_jit_log_main (b); }
+				if (mono_wasm_jit_stats) { char b [320]; snprintf (b, sizeof b, "WASM_JIT_INVALID %s e_slot=%d len=%u : %s", mname, e_slot, (unsigned) out.len, ierr); mono_wasm_jit_log_main (b); }
 			}
 		}
 	} else
@@ -2656,7 +3022,7 @@ done:
 	if (fail) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_bailed_count++;
 #ifdef HOST_BROWSER
-		{ char b [256]; snprintf (b, sizeof b, "WASM_JIT_BAIL %s : %s (op=%d %s)", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-"); mono_wasm_jit_log_main (b); }
+		if (mono_wasm_jit_stats) { char b [256]; snprintf (b, sizeof b, "WASM_JIT_BAIL %s : %s (op=%d %s)", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-"); mono_wasm_jit_log_main (b); }
 #else
 		printf ("WASM_JIT_BAIL %s : %s (op=%d %s)\n", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-");
 		fflush (stdout);
