@@ -786,6 +786,7 @@ mono_wasm_jit_dump_blockers (int topn)
 			case -8: why = "gshared/rgctx"; break;
 			case -9: why = "synchronized"; break;
 			case -10: why = "eh-other"; break;
+			case -11: why = "island-blocked(perm-leaf)"; break;
 			default: why = bail > 0 ? "opcode" : "?"; break;
 			}
 			printf ("  %8d  %-18s (slot=%d bail=%d) %s\n", bestc, why, slot, bail, wj_block_name [best] ? wj_block_name [best] : "?");
@@ -868,9 +869,15 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget)
 			 * interp<->JIT boundary cost (jit79: registered 1037->1483, fps regressed). */
 			extern int mono_wasm_jit_thresh, mono_wasm_jit_block_promote;
 			InterpMethod *cim = mono_interp_get_imethod (callee);
-			if (cim->wasm_jit_slot == -1) {   /* blocker is permanently un-JITtable: island can't close around it (residual=0) */
+			if (cim->wasm_jit_slot == -1) {
+				/* The blocking callee can NEVER wasm-jit (slot==-1: an emitter bail like ldaddr/filter, or
+				 * itself transitively blocked, bail==-11). Under residual=0 our island can never close around
+				 * it, so give up PERMANENTLY now — and propagate a transitive-permanent sentinel (bail=-11) so
+				 * OUR callers also stop retrying. (Was: return 0 = retriable, which made the whole hot path
+				 * retry-exhaust to -1 and never close — jit136's 40/40 island-exhausted callers.) */
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BLOCKED_PERM);
-				return 0;
+				im->wasm_jit_bail = -11;
+				return -1;
 			}
 			/* Lever C cold gate: pull the callee if it's hot by its own call count OR if it has BLOCKED
 			 * >= MONO_WASM_JIT_BLOCK_PROMOTE island attempts (block_n) — a callee that keeps stopping islands
@@ -883,8 +890,11 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget)
 				return 0;   /* callee too cold to be worth eager island compilation */
 			}
 		}
-		if (wasm_jit_force_island (callee, depth + 1, budget) <= 0)
-			return 0;                              /* couldn't JIT the blocking callee -> m stays retriable */
+		{
+			int _r = wasm_jit_force_island (callee, depth + 1, budget);
+			if (_r < 0) { im->wasm_jit_bail = -11; return -1; }   /* callee permanently un-closable -> so are we (propagate) */
+			if (_r == 0) return 0;                                /* callee still cold/warming -> m stays RETRIABLE */
+		}
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_PROMOTED_DOWN);   /* pulled a callee into the island */
 		/* callee JITted; loop to retry m (it may have further un-JITted direct callees) */
 	}
@@ -928,7 +938,7 @@ wasm_jit_drain_promotions (void)
 				 * + re-attempting its whole subtree every ENTRY_PROMOTE crossings (the jit127 compile churn:
 				 * 43k attempts for 506 registered). The push gate (slot 0/-2..) stops re-queuing once it's -1. */
 				int s = pim->wasm_jit_slot;
-				if (r == 0) { pim->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -1); pim->wasm_jit_hits = 0; }
+				if (r == 0) { pim->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -5); pim->wasm_jit_hits = 0; }
 				else pim->wasm_jit_slot = -1;
 			}
 		}
@@ -960,12 +970,17 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 		if (r > 0) {
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_COMPLETED);
 			return;   /* JITted + published */
-		} else if (r == 0) {   /* retriable: island incomplete (callee bailed / over budget) -> retry later */
+		} else if (r == 0) {
+			/* retriable: island incomplete because a callee is COLD/WARMING (not permanently un-jittable —
+			 * force_island returns -1 + sets bail=-11 for those). Cycle the slot -2..-5 and STAY at -5 (keep
+			 * retrying, spaced ~thresh calls) until the leaves warm up and the island closes — instead of
+			 * exhausting to -1 (jit136: that gave up on the whole interdependent hot path before it could
+			 * close bottom-up). hits reset so the next retry is ~thresh calls away (bounds churn). */
 			int s = cmethod->wasm_jit_slot;
-			cmethod->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -1);
+			cmethod->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -5);
 			cmethod->wasm_jit_hits = 0;
 		} else {
-			cmethod->wasm_jit_slot = -1;
+			cmethod->wasm_jit_slot = -1;   /* permanent: emitter bail, or force_island hit a permanent blocker (bail=-11) */
 		}
 	}
 }
@@ -3583,7 +3598,13 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 {
 	extern MonoObject **mono_wasm_jit_ref_sp_save (void);
 	extern void mono_wasm_jit_ref_leave (MonoObject **base);
+	/* The addressable-locals frame (OP_LDADDR) is unwound the same way as the ref shadow stack: snapshot its
+	 * SP before the invoke, and on a caught C++ unwind rewind it — the unwound JITted frames skipped their
+	 * own addr_leave (EMIT_REF_LEAVE). */
+	extern guint8 *mono_wasm_jit_addr_sp_save (void);
+	extern void mono_wasm_jit_addr_leave (void *base);
 	MonoObject **ref_sp_saved = mono_wasm_jit_ref_sp_save ();
+	guint8 *addr_sp_saved = mono_wasm_jit_addr_sp_save ();
 	gboolean saved_wj = wj_residual_active;   /* a residual inside the JITted method that C++-threw skipped its own restore */
 	gboolean thrown = FALSE;
 	WasmJitEThunkArgs a;
@@ -3609,14 +3630,15 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 	 * balance. ret!=saved => intValue's EMIT_REF_LEAVE didn't fully restore the GC ref shadow stack across
 	 * the catch (over/under-scan -> GC corruption). A sane ret with balance==0 => the bug is elsewhere
 	 * (premature pass-1 finally in outer frames). Bounded + STATS-gated. */
-	{ extern int mono_wasm_jit_stats; extern __thread int mono_wasm_jit_eh_caught_flag; extern void mono_wasm_jit_log_main (const char *msg);
-	  if (mono_wasm_jit_stats && mono_wasm_jit_eh_caught_flag) { static int _ivc = 0;
+	{ extern int mono_wasm_jit_verbose; extern __thread int mono_wasm_jit_eh_caught_flag; extern void mono_wasm_jit_log_main (const char *msg);
+	  if (mono_wasm_jit_verbose >= 2 && mono_wasm_jit_eh_caught_flag) { static int _ivc = 0;
 		MonoObject **now = mono_wasm_jit_ref_sp_save (); int bal = (int) (now - ref_sp_saved);
 		if (_ivc++ < 200) { char *_m = g_strdup_printf ("INVCAUGHT caught ret=%d thrown=%d refbal=%d", ret ? *(gint32 *) ret : -999999, thrown, bal); mono_wasm_jit_log_main (_m); g_free (_m); } }
 	  mono_wasm_jit_eh_caught_flag = 0; }
 	if (!thrown)
 		return;
 	mono_wasm_jit_ref_leave (ref_sp_saved);   /* the unwound JITted frames skipped EMIT_REF_LEAVE */
+	mono_wasm_jit_addr_leave (addr_sp_saved); /* ... and their addr-frame pop too */
 	ThreadContext *context = get_context ();
 	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
 	if (context->has_resume_state) {
@@ -3780,8 +3802,8 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 	if (!exc)
 		return -1;
 	il = (blk >= 0 && blk < t->nbbs) ? t->il_offsets [blk] : -1;
-	{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_stats; static int _ehd = 0;
-	  if (mono_wasm_jit_stats && _ehd++ < 200) {
+	{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_verbose; static int _ehd = 0;
+	  if (mono_wasm_jit_verbose >= 2 && _ehd++ < 200) {
 		/* DIAG: log the INCOMING resume-state pass-1 installed (if any) BEFORE we clear it. il_state!=0 or
 		 * has_resume_state=1 means the throw ran mono_handle_exception pass-1, which WALKED PAST this JITted
 		 * frame (it's unwinder-invisible) and found an OUTER handler — running any intervening finally
@@ -3812,15 +3834,17 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 				if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
 				jit_tls->resume_state.il_state = NULL;
 				wj_residual_active = FALSE;   /* a residual inside the try that C++-threw skipped its own restore; the handler runs in the method body where wj is FALSE */
-				{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_stats; static int _ehm = 0; if (mono_wasm_jit_stats && _ehm++ < 200) { char *_m = g_strdup_printf ("EHDISP   -> MATCH %s cl%d -> bb%d", t->name ? t->name : "?", i, c->handler_bbidx); mono_wasm_jit_log_main (_m); g_free (_m); } }
+				{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_verbose; static int _ehm = 0; if (mono_wasm_jit_verbose >= 2 && _ehm++ < 200) { char *_m = g_strdup_printf ("EHDISP   -> MATCH %s cl%d -> bb%d", t->name ? t->name : "?", i, c->handler_bbidx); mono_wasm_jit_log_main (_m); g_free (_m); } }
 				return c->handler_bbidx;
 			}
 			mono_error_cleanup (error);
 			error_init_reuse (error);
-		} else if (c->flags == MONO_EXCEPTION_CLAUSE_FINALLY) {
-			/* milestone 2c: a FINALLY clause covering the throwing bb. The finally runs in the JITted wasm
-			 * body (landing pad GOTOs handler_bbidx with finally_ind=-1), then OP_ENDFINALLY RE-RAISES the
-			 * exception (mono_wasm_jit_endfinally_rethrow) so it keeps propagating to an outer catch/finally.
+		} else if (c->flags == MONO_EXCEPTION_CLAUSE_FINALLY || c->flags == MONO_EXCEPTION_CLAUSE_FAULT) {
+			/* A FINALLY (or FAULT) clause covering the throwing bb. Both run on the exception path identically:
+			 * the handler runs in the JITted wasm body (landing pad GOTOs handler_bbidx with finally_ind=-1),
+			 * then OP_ENDFINALLY (== endfault) RE-RAISES the exception (mono_wasm_jit_endfinally_rethrow) so it
+			 * keeps propagating to an outer catch/finally. (FAULT differs from FINALLY only on the NORMAL path,
+			 * where it isn't run — handled in codegen: a fault handler has no OP_CALL_HANDLER.)
 			 * Unlike catch we do NOT clear thrown_exc (it's the GC-rooted source for that re-raise); we only
 			 * drop the resume-state pass-1 may have set for an OUTER handler (the finally runs nearer first;
 			 * after it re-raises, the advanced il_offset lets the re-dispatch find the next clause). */
@@ -3832,10 +3856,10 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 			if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
 			jit_tls->resume_state.il_state = NULL;
 			wj_residual_active = FALSE;
-			{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_stats; static int _ehf = 0; if (mono_wasm_jit_stats && _ehf++ < 200) { char *_m = g_strdup_printf ("EHDISP   -> FINALLY %s cl%d -> bb%d", t->name ? t->name : "?", i, c->handler_bbidx); mono_wasm_jit_log_main (_m); g_free (_m); } }
+			{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_verbose; static int _ehf = 0; if (mono_wasm_jit_verbose >= 2 && _ehf++ < 200) { char *_m = g_strdup_printf ("EHDISP   -> FINALLY %s cl%d -> bb%d", t->name ? t->name : "?", i, c->handler_bbidx); mono_wasm_jit_log_main (_m); g_free (_m); } }
 			return c->handler_bbidx;
 		}
-		/* FAULT/FILTER clauses come in a later increment; the gate bails methods that have them. */
+		/* FILTER clauses still bail at the emitter gate; FAULT is handled above (like FINALLY). */
 	}
 	return -1;   /* no matching handler in this method -> rethrow to propagate */
 }
@@ -3877,7 +3901,8 @@ int
 mono_wasm_jit_bbtrace_log (WasmEhTable *t, int blk)
 {
 	static int _n = 0;
-	if (mono_wasm_jit_stats && _n++ < 600) {
+	extern int mono_wasm_jit_verbose; extern void mono_wasm_jit_log_main (const char *msg);
+	if (mono_wasm_jit_verbose >= 2 && _n++ < 600) {
 		char *m = (blk == -1)
 			? g_strdup_printf ("BBTRACE %s RETURN", t && t->name ? t->name : "?")
 			: g_strdup_printf ("BBTRACE %s bb=%d", t && t->name ? t->name : "?", blk);
