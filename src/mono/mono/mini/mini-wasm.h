@@ -147,6 +147,8 @@ enum {
 	 * AOT = the override is NOT wasm-jitted because it already has native AOT code (slot==-1, bail==0): the
 	 * vcall falls back to the AOT residual, NOT an emitter bail — this is the bulk of the perm vcall cost. */
 	WJC_VPERM_SIG, WJC_VPERM_BYREF, WJC_VPERM_GSHARED, WJC_VPERM_SYNC, WJC_VPERM_EHOTHER, WJC_VPERM_AOT,
+	/* vcalls that took the fast AOT dispatch (MONO_WASM_JIT_VCALL_AOT) instead of the residual */
+	WJC_VCALL_AOT_FAST,
 	WJC_MAX
 };
 
