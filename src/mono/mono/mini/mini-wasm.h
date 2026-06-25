@@ -117,4 +117,43 @@ void mono_wasm_print_stack_trace (void);
 gboolean
 mini_wasm_is_scalar_vtype (MonoType *type, MonoType **etype);
 
+/*
+ * wasm full-method JIT statistics (gated by MONO_WASM_JIT_STATS=1).
+ *
+ * A single counter array replaces the old sprawl of ad-hoc int globals; both mini-wasm.c (the
+ * emitter) and interp/interp.c (the interp<->JIT transition glue) bump it via the helpers below.
+ * Counters hold RAW values: plain counts, except the WJC_ELAPSED_* timers which hold MICROSECONDS
+ * and WJC_BYTES_GENERATED which holds bytes. Storage is gint64 because on wasm32 `long` is 32-bit
+ * and the per-frame transition counts (hundreds of thousands/frame) overflow it over a 60s bench.
+ *
+ * The consumer harness (ikvmcraft frontend/src/dotnet.ts, enum WasmJitCounter) mirrors this enum BY
+ * INDEX and reads each counter via the mono_wasm_jit_get_counter export. KEEP THE ORDER STABLE:
+ * append new counters immediately before WJC_MAX only, and update the harness mirror in lockstep.
+ */
+enum {
+	WJC_REGISTERED, WJC_BAILED, WJC_INVALID,
+	WJC_INVOKE, WJC_RESIDUAL, WJC_FASTVCALL,
+	WJC_AOT_ROUTED, WJC_INTERP_ROUTED,
+	WJC_VIC_HIT, WJC_VIC_MISS, WJC_VFAST_HAD, WJC_VFAST_NEW, WJC_VFB_THRESH, WJC_VFB_PERM, WJC_VSYNC_WORK,
+	WJC_VPERM_EH, WJC_VPERM_LDADDR, WJC_VPERM_LCMP, WJC_VPERM_OTHEROP, WJC_VPERM_OTHER,
+	WJC_REF_HWM,
+	/* compile-time accounting (Part 2) */
+	WJC_BYTES_GENERATED, WJC_ELAPSED_GENERATION, WJC_ELAPSED_INSTANTIATION, WJC_COMPILE_ATTEMPTS,
+	/* island formation outcomes (Part 3b/5) */
+	WJC_ISLAND_ATTEMPT, WJC_ISLAND_COMPLETED, WJC_ISLAND_BUDGET_EXHAUSTED, WJC_ISLAND_DEPTH_EXCEEDED,
+	WJC_ISLAND_BLOCKED_PERM, WJC_ISLAND_BLOCKED_COLD, WJC_PROMOTED_UP, WJC_PROMOTED_DOWN,
+	/* finer split of the perm-unjittable vcall residual (was lumped into WJC_VPERM_OTHER): which override
+	 * shape dominates the steady-state virtual-dispatch boundary cost. SIG=arg/ret type; the rest as named.
+	 * AOT = the override is NOT wasm-jitted because it already has native AOT code (slot==-1, bail==0): the
+	 * vcall falls back to the AOT residual, NOT an emitter bail — this is the bulk of the perm vcall cost. */
+	WJC_VPERM_SIG, WJC_VPERM_BYREF, WJC_VPERM_GSHARED, WJC_VPERM_SYNC, WJC_VPERM_EHOTHER, WJC_VPERM_AOT,
+	WJC_MAX
+};
+
+extern int mono_wasm_jit_stats;                     /* master gate: MONO_WASM_JIT_STATS=1 */
+extern gint64 mono_wasm_jit_counters [WJC_MAX];     /* the counters (raw counts / microseconds) */
+void mono_wasm_jit_count (int idx);                 /* atomic += 1 */
+void mono_wasm_jit_add (int idx, gint64 v);         /* atomic += v (bytes / microseconds) */
+void mono_wasm_jit_max (int idx, gint64 v);         /* racy max (ref-stack high-water) */
+
 #endif /* __MONO_MINI_WASM_H__ */
