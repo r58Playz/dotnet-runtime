@@ -96,6 +96,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_island_depth; const char *id = g_getenv ("MONO_WASM_JIT_ISLAND_DEPTH"); mono_wasm_jit_island_depth = (id && *id && atoi (id) > 0) ? atoi (id) : 10; }   /* Lever C: default 10 */
 	{ extern int mono_wasm_jit_island_budget; const char *ib = g_getenv ("MONO_WASM_JIT_ISLAND_BUDGET"); mono_wasm_jit_island_budget = (ib && *ib && atoi (ib) > 0) ? atoi (ib) : 64; } /* Lever C: default 64 */
 	{ extern int mono_wasm_jit_block_promote; const char *bp = g_getenv ("MONO_WASM_JIT_BLOCK_PROMOTE"); mono_wasm_jit_block_promote = (bp && *bp) ? atoi (bp) : 16; } /* Lever C: default 16; 0 disables */
+	{ extern int mono_wasm_jit_vcall_aot; const char *va = g_getenv ("MONO_WASM_JIT_VCALL_AOT"); mono_wasm_jit_vcall_aot = (va && *va && *va != '0') ? 1 : 0; } /* fast AOT-vcall dispatch: 0=off (residual) */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
@@ -212,6 +213,13 @@ int mono_wasm_jit_residual_perm = 0;   /* Lever B: MONO_WASM_JIT_RESIDUAL_PERM=1
 int mono_wasm_jit_island_depth = 10;   /* Lever C: MONO_WASM_JIT_ISLAND_DEPTH — max island DFS depth (was a fixed 10). */
 int mono_wasm_jit_island_budget = 64;  /* Lever C: MONO_WASM_JIT_ISLAND_BUDGET — max force-compiles per island attempt (was a fixed 64). */
 int mono_wasm_jit_block_promote = 16;  /* Lever C: MONO_WASM_JIT_BLOCK_PROMOTE — pull a cold callee into an island once it has BLOCKED >= N island attempts (block_n), even if its own hit count is low (it's hot via JITted callers). 0 = disable (cold gate is hits-only). The bench showed top blockers ~100, so the old thresh/4 (=500) never fired — 16 catches the hot ctors. */
+/* MONO_WASM_JIT_VCALL_AOT=1: when a JITted method's virtual call resolves to an AOT-backed override (the
+ * vcall_resolve_fslot f-slot miss — the dominant steady-state residual, ~98% "aot-backed" in the bench),
+ * call_indirect the override's AOT body DIRECTLY (this+args+rgctx, same native ABI the inline-AOT direct
+ * call uses) instead of routing through the residual (mono_wasm_jit_call_interp -> wasm_jit_aot_call_lean
+ * -> do_jit_call: double arg-marshalling + an LMF frame). Default 0; mirrors INLINE_AOT's EH handling
+ * (resume-state try/catch, or bare under CPPEH). Off-by-default so the validated residual path is unchanged. */
+int mono_wasm_jit_vcall_aot = 0;
 
 /* TRUE if `name` is in the comma-separated MONO_WASM_JIT_METHOD list (bring-up targeting). */
 gboolean
@@ -377,8 +385,8 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_VPERM_AOT), WJC_(WJC_VPERM_EH), WJC_(WJC_VPERM_LDADDR), WJC_(WJC_VPERM_LCMP),
 		WJC_(WJC_VPERM_SIG), WJC_(WJC_VPERM_BYREF), WJC_(WJC_VPERM_GSHARED), WJC_(WJC_VPERM_SYNC), WJC_(WJC_VPERM_EHOTHER),
 		WJC_(WJC_VPERM_OTHEROP), WJC_(WJC_VPERM_OTHER));
-	printf ("[wasm-jit aotroute] aot_routed=%lld interp_routed=%lld\n",
-		WJC_(WJC_AOT_ROUTED), WJC_(WJC_INTERP_ROUTED));
+	printf ("[wasm-jit aotroute] aot_routed=%lld interp_routed=%lld vcall_aot_fast=%lld\n",
+		WJC_(WJC_AOT_ROUTED), WJC_(WJC_INTERP_ROUTED), WJC_(WJC_VCALL_AOT_FAST));
 	fflush (stdout);
 	/* the bail histogram (this file) + the island blockers / hot entry-edges (interp.c) */
 	{
@@ -2851,6 +2859,70 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
 							if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall fast dreg"; goto done; } }
 						wasm_op (&body, WASM_OP_ELSE);
+							/* Fast AOT-vcall (MONO_WASM_JIT_VCALL_AOT, gated, default off): if the resolved override
+							 * (target@200, stashed by resolve_fslot) is AOT-backed, call its AOT body DIRECTLY with the
+							 * native (this,args,rgctx) ABI — skipping the residual's double marshalling + do_jit_call
+							 * frame. Wrapped in a $no_aot block: if the helper says "not AOT" we br to $no_aot and fall
+							 * into the (shared, unchanged) residual below; if AOT we call + br past the residual. */
+							{
+								extern int mono_wasm_jit_vcall_aot, mono_wasm_jit_cppeh;
+								if (mono_wasm_jit_vcall_aot) {
+									extern int mono_wasm_jit_vcall_aot_target (guint8 *scratch);
+									extern void mono_wasm_jit_aot_caught (void *exc);
+									WasmFuncType at, aott, eht; int ati = -1, aotti = -1, ehti = -1;
+									if (n2 + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "vcall aot nparams"; goto done; }
+									/* aott (i32)->i32 = the resolve helper; at (this,params,i32 rgctx)->rv = the AOT body */
+									memset (&aott, 0, sizeof (aott)); aott.params [0] = WASM_I32; aott.nparams = 1; aott.ret = WASM_I32;
+									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &aott)) { aotti = 2 + vk; break; }
+									if (aotti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = aott; aotti = 2 + nextra++; }
+									memset (&at, 0, sizeof (at)); for (vk = 0; vk < n2; ++vk) at.params [vk] = pp [vk]; at.params [n2] = WASM_I32; at.nparams = (guint32) (n2 + 1); at.ret = rv;
+									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at)) { ati = 2 + vk; break; }
+									if (ati < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = at; ati = 2 + nextra++; }
+									uses_calls = TRUE;
+									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $no_aot */
+									/* aot = mono_wasm_jit_vcall_aot_target(scratch); if (!aot) br $no_aot (-> residual) */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+#ifdef HOST_BROWSER
+									wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_aot_target);
+#else
+									wasm_i32_const (&body, 0x7ff9);
+#endif
+									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) aotti); wasm_uleb (&body, 0);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* !aot -> $no_aot -> residual */
+									if (!mono_wasm_jit_cppeh) {
+										/* resume-state: wrap the AOT call in try/catch <x.e>; a throw is caught by
+										 * mono_wasm_jit_aot_caught (-> interp resume-state) + the method bails via the
+										 * EMIT_PENDING_EXC_CHECK after the if/else. (i32)->void = catch handler + the x.e tag. */
+										memset (&eht, 0, sizeof (eht)); eht.params [0] = WASM_I32; eht.nparams = 1; eht.ret = WASM_VOID;
+										for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &eht)) { ehti = 2 + vk; break; }
+										if (ehti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = eht; ehti = 2 + nextra++; }
+										uses_eh_tag = TRUE; eh_type_idx = ehti;
+										wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);
+									}
+									/* load this+args (fresh from vregs), then rgctx@216, then AOT addr@212 = call_indirect index */
+									for (ai = 0; ai < n2; ++ai)
+										if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall aot arg ld"; goto done; }
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216);   /* rgctx (ftndesc.arg) */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
+									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ati); wasm_uleb (&body, 0);
+									if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall aot dreg"; goto done; } }
+									if (!mono_wasm_jit_cppeh) {
+										wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0);
+#ifdef HOST_BROWSER
+										wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_aot_caught);
+#else
+										wasm_i32_const (&body, 0x7ff8);   /* offline cross build: placeholder (never executed) */
+#endif
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ehti); wasm_uleb (&body, 0);
+										wasm_op (&body, WASM_OP_END);   /* end try/catch */
+									}
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* AOT done -> exit fslot-IF, skip residual */
+									wasm_op (&body, WASM_OP_END);   /* end $no_aot */
+								}
+							}
 							/* FALLBACK: spill this + each arg into scratch[k*8] (this at 0, arg i at (1+i)*8), then re-enter
 							 * the interp via call_interp(target, scratch). */
 							for (ai = 0; ai < n2; ++ai) {

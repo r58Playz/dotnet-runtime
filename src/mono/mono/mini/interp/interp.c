@@ -3409,6 +3409,27 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	return 0;
 }
 
+/* Fast AOT-vcall dispatch (MONO_WASM_JIT_VCALL_AOT). Called by JITted code ONLY after a vcall_resolve_fslot
+ * f-slot miss, which left the resolved override MonoMethod* at scratch+200. If that override is AOT-backed,
+ * stash its AOT call-target table index at scratch+212 and its rgctx at scratch+216 and return 1 — the
+ * JITted caller then call_indirects the AOT body directly (this+args+rgctx native ABI), skipping the
+ * residual's double marshalling + do_jit_call frame. Returns 0 if not AOT-backed (caller takes the
+ * residual). Same eligibility (no_wrapper / gsharedvt-variable bail + static-rgctx recovery) as the
+ * INLINE_AOT direct path, via the shared mono_wasm_jit_aot_call_target. */
+int
+mono_wasm_jit_vcall_aot_target (guint8 *scratch)
+{
+	extern gboolean mono_wasm_jit_aot_call_target (MonoMethod *m, gpointer *out_addr, gpointer *out_rgctx);
+	MonoMethod *target = *(MonoMethod **) (scratch + 200);
+	gpointer addr = NULL, rgctx = NULL;
+	if (!target || !mono_wasm_jit_aot_call_target (target, &addr, &rgctx))
+		return 0;
+	*(gpointer *) (scratch + 212) = addr;
+	*(gpointer *) (scratch + 216) = rgctx;
+	if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VCALL_AOT_FAST);
+	return 1;
+}
+
 /* AOT-style EH (MONO_WASM_JIT_CPPEH=1): after the throw's FIRST PASS (mono_handle_exception has already
  * run finally clauses + installed the interp/il_state resume-state for the handler), skip the native
  * JITted frames between here and that handler in one shot via a C++/wasm-EH native unwind, instead of
