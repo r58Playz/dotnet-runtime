@@ -612,6 +612,189 @@ interp_pop_lmf (MonoLMFExt *ext)
  * "retriable" so the method is re-attempted later — never blocks, so coop-GC suspend can't deadlock. */
 static volatile gint32 wj_compiling = 0;
 
+/*
+ * Island/transition diagnostics (Part 3). Two bounded, open-addressed, lock-free tables (racy under
+ * threads — approximate, which the wasm-jit stats already accept). Gated by mono_wasm_jit_stats.
+ *
+ *  - wj_entry_edges: the interp->JIT boundary the transition storm crosses. Keyed (caller, callee) at
+ *    the MINT_CALL/CALLVIRT invoke sites. `window` is reset by mono_wasm_jit_snapshot so the harness can
+ *    report a per-"frame" (per-sampling-window) top-N; `count` is cumulative.
+ *  - wj_block_tab: a registry of methods that BLOCKED a caller's island from completing (residual=0 +
+ *    callee not jitted). The per-callee count lives on InterpMethod.wasm_jit_block_n; this table just
+ *    records which methods to scan for the top-N report (their bail reason is read from wasm_jit_bail).
+ *
+ * CRITICAL: the dump exports are called from JS on the MAIN thread. mono_method_get_full_name / the
+ * jit_mm + loader locks taken by mono_interp_get_imethod can deadlock there against a GC-suspended
+ * worker holding the lock (cooperative-GC) — a hard UI freeze. So everything the dump needs (method
+ * full names, the caller's InterpMethod*) is resolved + cached HERE at record time, on the coop interp/
+ * compile thread where taking those locks is safe. The dumps then only read plain memory: NO Mono API.
+ */
+#define WJ_EDGE_SLOTS 8192
+#define WJ_EDGE_PROBE 64
+typedef struct {
+	MonoMethod *caller, *callee;          /* hash key */
+	guint32 count, window;
+	InterpMethod *caller_im;              /* cached: dump reads slot/hits/bail via a plain deref (no lock) */
+	char *caller_name, *callee_name;      /* cached full names (g_malloc'd at insertion; never freed) */
+} WjEntryEdge;
+static WjEntryEdge wj_entry_edges [WJ_EDGE_SLOTS];
+
+static void
+wj_edge_bump (InterpMethod *caller_im, InterpMethod *callee_im)
+{
+	MonoMethod *caller = caller_im->method, *callee = callee_im->method;
+	gsize h = (((gsize) caller >> 4) ^ ((gsize) callee >> 4)) & (WJ_EDGE_SLOTS - 1);
+	int i;
+	for (i = 0; i < WJ_EDGE_PROBE; ++i) {
+		WjEntryEdge *e = &wj_entry_edges [(h + i) & (WJ_EDGE_SLOTS - 1)];
+		if (e->callee == callee && e->caller == caller) { e->count++; e->window++; return; }
+		if (!e->callee) {
+			/* first time we see this edge: cache names + caller imethod now (coop thread, safe to lock) */
+			e->caller = caller; e->caller_im = caller_im;
+			e->caller_name = mono_method_get_full_name (caller);
+			e->callee_name = mono_method_get_full_name (callee);
+			e->count = 1; e->window = 1;
+			mono_memory_barrier ();
+			e->callee = callee;   /* publish the occupied marker last */
+			return;
+		}
+	}
+	/* table full / long probe chain: drop the sample (approximate is fine for a bench histogram) */
+}
+
+#define WJ_BLOCK_SLOTS 4096
+static MonoMethod *wj_block_tab [WJ_BLOCK_SLOTS];
+static guint32 wj_block_cnt [WJ_BLOCK_SLOTS];        /* per-slot block count (dump scan reads this — no Mono API) */
+static InterpMethod *wj_block_im [WJ_BLOCK_SLOTS];   /* cached: dump reads slot/bail via deref (no jit_mm lock) */
+static char *wj_block_name [WJ_BLOCK_SLOTS];         /* cached full name (resolved at record time on a coop thread) */
+
+/* Note that `callee` blocked an island compile. The per-method block_n counter is bumped ALWAYS (it's a
+ * cheap compile-time event and doubles as a stats-independent "hot at the island boundary" signal for
+ * the Lever C cold gate); the top-N report table is only populated when stats are on. Called from
+ * wasm_jit_compile_publish on a retriable ("callee not jitted") bail. */
+static void
+wj_block_note (MonoMethod *callee)
+{
+	InterpMethod *cim = mono_interp_get_imethod (callee);
+	cim->wasm_jit_block_n++;
+	if (G_LIKELY (!mono_wasm_jit_stats))
+		return;
+	{
+		gsize h = ((gsize) callee >> 4) & (WJ_BLOCK_SLOTS - 1);
+		int i;
+		for (i = 0; i < WJ_EDGE_PROBE; ++i) {
+			int idx = (h + i) & (WJ_BLOCK_SLOTS - 1);
+			MonoMethod **s = &wj_block_tab [idx];
+			if (*s == callee) { wj_block_cnt [idx]++; return; }
+			if (!*s) {
+				/* first time: cache name + imethod now (coop compile thread, safe to lock) */
+				wj_block_im [idx] = cim;
+				wj_block_name [idx] = mono_method_get_full_name (callee);
+				wj_block_cnt [idx] = 1;
+				mono_memory_barrier ();
+				*s = callee;   /* publish last */
+				return;
+			}
+		}
+	}
+}
+
+/* Lever A — upward island growth: a bounded best-effort queue of hot interp CALLERS to force-JIT, so
+ * their call to an already-JITted callee lowers to a direct f-slot (no transition). Pushed from the
+ * invoke sites when a caller's wasm_jit_invoke_out crosses MONO_WASM_JIT_ENTRY_PROMOTE; drained at the
+ * wasm_jit_maybe_compile safe point. Racy across threads (duplicates/drops acceptable for a heuristic). */
+#define WJ_PROMOTE_Q 256
+static MonoMethod * volatile wj_promote_q [WJ_PROMOTE_Q];
+static volatile gint32 wj_promote_head, wj_promote_tail;
+
+static void
+wj_promote_push (MonoMethod *m)
+{
+	gint32 t = wj_promote_tail;
+	if (t - wj_promote_head >= WJ_PROMOTE_Q) return;   /* full: drop */
+	wj_promote_q [t & (WJ_PROMOTE_Q - 1)] = m;
+	wj_promote_tail = t + 1;
+}
+
+/* Reset the per-window edge counts (the harness calls this at the START of a bench window; at the END it
+ * calls mono_wasm_jit_dump_hot_edges, which prints by `window` = that window's accumulation). */
+EMSCRIPTEN_KEEPALIVE void
+mono_wasm_jit_snapshot (void)
+{
+	int i;
+	for (i = 0; i < WJ_EDGE_SLOTS; ++i)
+		wj_entry_edges [i].window = 0;
+}
+
+/* Top-N interp->JIT entry edges by current-window count, annotated with the CALLER's JIT state so it's
+ * obvious whether the caller is promotable-upward (slot 0/-2..-5, jittable) or perm-blocked (slot -1). */
+EMSCRIPTEN_KEEPALIVE void
+mono_wasm_jit_dump_hot_edges (int topn)
+{
+	guint32 lastw = 0xffffffffu; int lasti = WJ_EDGE_SLOTS, shown = 0;
+	if (topn <= 0) topn = 40;
+	printf ("[wasm-jit hot entry-edges] interp->JIT crossings this window (caller -> callee):\n");
+	while (shown < topn) {
+		int best = -1, k; guint32 bestw = 0;
+		for (k = 0; k < WJ_EDGE_SLOTS; ++k) {
+			guint32 w = wj_entry_edges [k].window;
+			if (!w || w > lastw || (w == lastw && k >= lasti)) continue;
+			if (best < 0 || w > bestw || (w == bestw && k > best)) { best = k; bestw = w; }
+		}
+		if (best < 0) break;
+		{
+			WjEntryEdge *e = &wj_entry_edges [best];
+			InterpMethod *cim = e->caller_im;   /* cached at record time — plain deref, NO Mono API on the main thread */
+			printf ("  %8u (cum %u)  %s -> %s  [caller slot=%d hits=%d bail=%d]\n",
+				e->window, e->count, e->caller_name ? e->caller_name : "?", e->callee_name ? e->callee_name : "?",
+				cim ? cim->wasm_jit_slot : 0, cim ? cim->wasm_jit_hits : 0, cim ? cim->wasm_jit_bail : 0);
+		}
+		lastw = bestw; lasti = best; shown++;
+	}
+	fflush (stdout);
+}
+
+/* Top-N island-blocking callees by block count, with WHY each can't JIT (wasm_jit_bail) — the most
+ * actionable island signal: "if callee X were jittable, N island attempts would complete." */
+EMSCRIPTEN_KEEPALIVE void
+mono_wasm_jit_dump_blockers (int topn)
+{
+	gint32 lastc = 0x7fffffff; int lasti = -1, shown = 0;
+	if (topn <= 0) topn = 40;
+	printf ("[wasm-jit island blockers] un-JITted callees that blocked a caller's island:\n");
+	while (shown < topn) {
+		int best = -1, k; gint32 bestc = 0;
+		for (k = 0; k < WJ_BLOCK_SLOTS; ++k) {
+			gint32 c = (gint32) wj_block_cnt [k];   /* pure array read — no Mono API / locks in the hot scan */
+			if (!c || c > lastc || (c == lastc && k <= lasti)) continue;
+			if (best < 0 || c > bestc || (c == bestc && k > best)) { best = k; bestc = c; }
+		}
+		if (best < 0) break;
+		{
+			InterpMethod *im = wj_block_im [best];   /* cached — plain deref, NO Mono API on the main thread */
+			gint16 bail = im ? im->wasm_jit_bail : 0;
+			gint32 slot = im ? im->wasm_jit_slot : 0;
+			const char *why;
+			switch (bail) {
+			case 0:  why = slot == -1 ? "aot-backed" : "not-yet-jitted"; break;
+			case -2: why = "EH-clauses"; break;
+			case -3: why = "arg/ret-type"; break;
+			case -4: why = "other-ir-shape"; break;
+			case -5: why = "ldaddr"; break;
+			case -6: why = "lcompare"; break;
+			case -7: why = "byref"; break;
+			case -8: why = "gshared/rgctx"; break;
+			case -9: why = "synchronized"; break;
+			case -10: why = "eh-other"; break;
+			default: why = bail > 0 ? "opcode" : "?"; break;
+			}
+			printf ("  %8d  %-18s (slot=%d bail=%d) %s\n", bestc, why, slot, bail, wj_block_name [best] ? wj_block_name [best] : "?");
+		}
+		lastc = bestc; lasti = best; shown++;
+	}
+	fflush (stdout);
+}
+
 /* Compile im->method to wasm and, on success, publish the result onto its InterpMethod (so callers
  * see its f-slot). Returns 1 = JITted+published; 0 = retriable bail ("callee not jitted" with the
  * blocking callee in mono_wasm_jit_last_blocking_callee, OR another thread was compiling); -1 =
@@ -642,8 +825,13 @@ wasm_jit_compile_publish (InterpMethod *im)
 		im->wasm_jit_slot = mono_wasm_jit_last_slot;
 		return 1;
 	}
-	if (mono_wasm_jit_last_retriable)
+	if (mono_wasm_jit_last_retriable) {
+		/* retriable = blocked by an un-JITted callee. Record the blocker (block_n is always counted as the
+		 * Lever C cold-gate signal; the top-N report table is populated only under stats — see wj_block_note). */
+		if (mono_wasm_jit_last_blocking_callee)
+			wj_block_note (mono_wasm_jit_last_blocking_callee);
 		return 0;
+	}
 	im->wasm_jit_bail = (gint16) mono_wasm_jit_last_bail;   /* permanent bail: record why, for the vcall-residual breakdown */
 	return -1;
 }
@@ -658,15 +846,16 @@ static int
 wasm_jit_force_island (MonoMethod *m, int depth, int *budget)
 {
 	extern __thread MonoMethod *mono_wasm_jit_last_blocking_callee;
+	extern int mono_wasm_jit_island_depth;   /* Lever C: env-tunable recursion depth (default 10) */
 	InterpMethod *im = mono_interp_get_imethod (m);
 	int tries;
 	if (im->wasm_jit_fslot > 0) return 1;          /* already JITted */
 	if (im->wasm_jit_slot == -1) return -1;        /* permanently bailed */
-	if (depth > WASM_JIT_ISLAND_MAX_DEPTH) return 0;
+	if (depth > mono_wasm_jit_island_depth) { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_DEPTH_EXCEEDED); return 0; }
 	for (tries = 0; tries <= WASM_JIT_ISLAND_MAX_DEPTH; tries++) {
 		MonoMethod *callee;
 		int r;
-		if (*budget <= 0) return 0;
+		if (*budget <= 0) { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BUDGET_EXHAUSTED); return 0; }
 		(*budget)--;
 		r = wasm_jit_compile_publish (im);
 		if (r != 0) return r;                      /* JITted (1) or permanent (-1) */
@@ -677,13 +866,26 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget)
 			 * e.g. the exception-constructor chains (new NullPointerException()) in rarely-taken error
 			 * branches — would otherwise be force-compiled for no benefit, bloating compilation + the
 			 * interp<->JIT boundary cost (jit79: registered 1037->1483, fps regressed). */
-			extern int mono_wasm_jit_thresh;
+			extern int mono_wasm_jit_thresh, mono_wasm_jit_block_promote;
 			InterpMethod *cim = mono_interp_get_imethod (callee);
-			if (cim->wasm_jit_fslot <= 0 && cim->wasm_jit_slot != -1 && cim->wasm_jit_hits < mono_wasm_jit_thresh / 4)
+			if (cim->wasm_jit_slot == -1) {   /* blocker is permanently un-JITtable: island can't close around it (residual=0) */
+				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BLOCKED_PERM);
+				return 0;
+			}
+			/* Lever C cold gate: pull the callee if it's hot by its own call count OR if it has BLOCKED
+			 * >= MONO_WASM_JIT_BLOCK_PROMOTE island attempts (block_n) — a callee that keeps stopping islands
+			 * from closing sits on a hot path even when reached mostly via JITted callers (which don't bump
+			 * its interp hit count: the hot-ctor blind spot). block_n is always counted (see wj_block_note),
+			 * so the relaxation works without MONO_WASM_JIT_STATS. block_promote==0 disables it (hits-only). */
+			if (cim->wasm_jit_fslot <= 0 && cim->wasm_jit_hits < mono_wasm_jit_thresh / 4
+			    && !(mono_wasm_jit_block_promote > 0 && cim->wasm_jit_block_n >= mono_wasm_jit_block_promote)) {
+				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BLOCKED_COLD);
 				return 0;   /* callee too cold to be worth eager island compilation */
+			}
 		}
 		if (wasm_jit_force_island (callee, depth + 1, budget) <= 0)
 			return 0;                              /* couldn't JIT the blocking callee -> m stays retriable */
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_PROMOTED_DOWN);   /* pulled a callee into the island */
 		/* callee JITted; loop to retry m (it may have further un-JITted direct callees) */
 	}
 	return 0;
@@ -693,10 +895,51 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget)
  * to wasm (eagerly forming its call-tree island unless MONO_WASM_JIT_ISLAND=0). Slot states: 0=untried
  * (counting); >0=JITted; -1=permanent bail; -2..-5=retry-pending. Shared by MINT_CALL (direct) and
  * MINT_CALLVIRT_FAST (virtual) dispatch so virtual targets — the bulk of hot IKVM methods — also JIT. */
+/* Lever A drain: force-JIT a couple of queued hot interp CALLERS (upward island growth) at this safe
+ * point (the same wj_compiling-serialized path the threshold trigger uses). No-op unless
+ * MONO_WASM_JIT_ENTRY_PROMOTE>0. Force-compiling a method that's currently being interpreted is safe —
+ * the live frame keeps interpreting; the f-slot is used on the next entry. */
+static void
+wasm_jit_drain_promotions (void)
+{
+	extern int mono_wasm_jit_entry_promote, mono_wasm_jit_auto, mono_wasm_jit_island_budget;
+	int n;
+	if (G_LIKELY (mono_wasm_jit_entry_promote <= 0) || mono_wasm_jit_auto <= 0)
+		return;
+	for (n = 0; n < 2; ++n) {
+		gint32 h = wj_promote_head;
+		MonoMethod *pm;
+		InterpMethod *pim;
+		int budget;
+		if (h == wj_promote_tail) break;
+		pm = wj_promote_q [h & (WJ_PROMOTE_Q - 1)];
+		wj_promote_head = h + 1;
+		if (!pm) continue;
+		pim = mono_interp_get_imethod (pm);
+		if (pim->wasm_jit_fslot > 0 || pim->wasm_jit_slot == -1) continue;   /* already done / hopeless */
+		budget = mono_wasm_jit_island_budget;
+		{
+			int r = wasm_jit_force_island (pm, 0, &budget);
+			if (r > 0) {
+				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_PROMOTED_UP);
+			} else {
+				/* Back off a FAILED promotion exactly like wasm_jit_maybe_compile, so a caller whose island
+				 * can't close (blocked by a perm/cold callee) drifts -2..-5 -> -1 instead of being re-promoted
+				 * + re-attempting its whole subtree every ENTRY_PROMOTE crossings (the jit127 compile churn:
+				 * 43k attempts for 506 registered). The push gate (slot 0/-2..) stops re-queuing once it's -1. */
+				int s = pim->wasm_jit_slot;
+				if (r == 0) { pim->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -1); pim->wasm_jit_hits = 0; }
+				else pim->wasm_jit_slot = -1;
+			}
+		}
+	}
+}
+
 static void
 wasm_jit_maybe_compile (InterpMethod *cmethod)
 {
-	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island;
+	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island, mono_wasm_jit_island_budget;
+	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
 	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && (cmethod->wasm_jit_slot == 0 || cmethod->wasm_jit_slot <= -2) && ++cmethod->wasm_jit_hits == mono_wasm_jit_thresh) {
 		int r;
 		/* Don't whole-method-JIT a method that already has AOT code — it runs faster as native AOT, reached
@@ -707,13 +950,15 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 			cmethod->wasm_jit_slot = -1;
 			return;
 		}
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_ATTEMPT);
 		if (mono_wasm_jit_island) {
-			int budget = 64;   /* max force-compiles per island attempt; retries continue across crosses */
+			int budget = mono_wasm_jit_island_budget;   /* Lever C: env-tunable; max force-compiles per island attempt */
 			r = wasm_jit_force_island (cmethod->method, 0, &budget);
 		} else {
 			r = wasm_jit_compile_publish (cmethod);
 		}
 		if (r > 0) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_COMPLETED);
 			return;   /* JITted + published */
 		} else if (r == 0) {   /* retriable: island incomplete (callee bailed / over budget) -> retry later */
 			int s = cmethod->wasm_jit_slot;
@@ -2807,7 +3052,6 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
 static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE];
 
 extern int mono_wasm_jit_stats;
-extern int mono_wasm_jit_residual_count;
 
 gpointer
 mono_wasm_jit_scratch (void)
@@ -2944,9 +3188,9 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 	/* INLINE AOT FASTPATH: if the callee has AOT code, run it natively via do_jit_call directly,
 	 * skipping interp_entry's InterpEntryData marshalling. Covers BOTH the direct-call residual and the
 	 * vcall-fallback (which funnels here after resolve). Cached on code_type like the interp MINT_JIT_CALL.
-	 * mono_wasm_jit_aot_routed / _interp_routed measure the split (how much the fastpath actually fires). */
+	 * WJC_AOT_ROUTED / WJC_INTERP_ROUTED measure the split (how much the fastpath actually fires). */
 	{
-		extern int mono_wasm_jit_aot_residual, mono_wasm_jit_aot_routed, mono_wasm_jit_interp_routed;
+		extern int mono_wasm_jit_aot_residual;
 		extern MonoMethod *mono_wasm_jit_ring [];
 		extern int mono_wasm_jit_ring_count, mono_wasm_jit_ring_frozen;
 		InterpMethodCodeType ct = imethod->code_type;
@@ -2956,13 +3200,13 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		}
 		if (mono_wasm_jit_aot_residual && ct == IMETHOD_CODE_COMPILED) {
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
-				mono_wasm_jit_residual_count++;
-				mono_wasm_jit_aot_routed++;
+				mono_wasm_jit_count (WJC_RESIDUAL);
+				mono_wasm_jit_count (WJC_AOT_ROUTED);
 				if (!mono_wasm_jit_ring_frozen) { mono_wasm_jit_ring [mono_wasm_jit_ring_count & 127] = method; mono_wasm_jit_ring_count++; }
 			}
 			return wasm_jit_aot_call_lean (imethod, sig, buf);
 		}
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_interp_routed++;
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_INTERP_ROUTED);
 	}
 	memset (&data, 0, sizeof (data));
 	data.rmethod = imethod;
@@ -2992,7 +3236,7 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 	if (G_UNLIKELY (mono_wasm_jit_stats)) {
 		extern MonoMethod *mono_wasm_jit_ring [];
 		extern int mono_wasm_jit_ring_count, mono_wasm_jit_ring_frozen;
-		mono_wasm_jit_residual_count++;
+		mono_wasm_jit_count (WJC_RESIDUAL);
 		/* trail of recent residual callees (ring buffer); frozen at a detected failure so a post-crash
 		 * dump shows the residuals up to the failure (not the crash-report flood that follows) */
 		if (!mono_wasm_jit_ring_frozen) {
@@ -3099,16 +3343,14 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	 * receiver type) -> dispatch to the wrong override (NullPointerException) or a wrong-signature f-slot
 	 * call_indirect (traps the worker -> GC can't suspend it). The i64 atomic makes the pair consistent. */
 	extern int mono_wasm_jit_vcall_ic, mono_wasm_jit_stats;
-	extern int mono_wasm_jit_vic_hit, mono_wasm_jit_vic_miss, mono_wasm_jit_vfast_had, mono_wasm_jit_vfast_new, mono_wasm_jit_vfb_thresh, mono_wasm_jit_vfb_perm;
-	extern int mono_wasm_jit_vperm_eh, mono_wasm_jit_vperm_ldaddr, mono_wasm_jit_vperm_lcmp, mono_wasm_jit_vperm_otherop, mono_wasm_jit_vperm_other;
 	gboolean use_ic = mono_wasm_jit_vcall_ic;
 	guint64 cached = use_ic ? (guint64) mono_atomic_load_i64 ((volatile gint64 *) icp) : 0;
 	if (use_ic && G_LIKELY ((guint32) cached == (guint32) (gsize) vt)) {
 		imethod = (InterpMethod *) (gsize) (guint32) (cached >> 32);   /* IC hit: skip the resolve + get_imethod */
 		target = imethod->method;
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_vic_hit++;
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_HIT);
 	} else {
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_vic_miss++;
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_MISS);
 		target = mono_object_get_virtual_method_internal (this_obj, base_method);
 		if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
 			target = mono_marshal_get_synchronized_wrapper (target);
@@ -3134,11 +3376,10 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_fslot > 0) {
 		extern void mono_wasm_jit_sync_thread (void);
-		extern int mono_wasm_jit_fastvcall_count;
 		mono_wasm_jit_sync_thread ();
 		if (G_UNLIKELY (mono_wasm_jit_stats)) {
-			mono_wasm_jit_fastvcall_count++;
-			if (had_fslot) mono_wasm_jit_vfast_had++; else mono_wasm_jit_vfast_new++;
+			mono_wasm_jit_count (WJC_FASTVCALL);
+			mono_wasm_jit_count (had_fslot ? WJC_VFAST_HAD : WJC_VFAST_NEW);
 		}
 		return imethod->wasm_jit_fslot;
 	}
@@ -3147,17 +3388,23 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	 * is still below the JIT threshold and SHOULD become fast once it crosses (threshold latency). */
 	if (G_UNLIKELY (mono_wasm_jit_stats)) {
 		if (imethod->wasm_jit_slot == -1) {
-			mono_wasm_jit_vfb_perm++;
+			mono_wasm_jit_count (WJC_VFB_PERM);
 			switch (imethod->wasm_jit_bail) {            /* weighted breakdown of WHY it can't JIT (see mono_wasm_jit_last_bail) */
-			case -2: mono_wasm_jit_vperm_eh++; break;
-			case -5: mono_wasm_jit_vperm_ldaddr++; break;
-			case -6: mono_wasm_jit_vperm_lcmp++; break;
+			case 0:  mono_wasm_jit_count (WJC_VPERM_AOT); break;   /* slot==-1 + bail==0: not wasm-jitted because it has native AOT code (not an emitter bail) */
+			case -2: mono_wasm_jit_count (WJC_VPERM_EH); break;
+			case -3: mono_wasm_jit_count (WJC_VPERM_SIG); break;
+			case -5: mono_wasm_jit_count (WJC_VPERM_LDADDR); break;
+			case -6: mono_wasm_jit_count (WJC_VPERM_LCMP); break;
+			case -7: mono_wasm_jit_count (WJC_VPERM_BYREF); break;
+			case -8: mono_wasm_jit_count (WJC_VPERM_GSHARED); break;
+			case -9: mono_wasm_jit_count (WJC_VPERM_SYNC); break;
+			case -10: mono_wasm_jit_count (WJC_VPERM_EHOTHER); break;
 			default:
-				if (imethod->wasm_jit_bail > 0) mono_wasm_jit_vperm_otherop++;
-				else mono_wasm_jit_vperm_other++;     /* sig / synchronized / byref / other */
+				if (imethod->wasm_jit_bail > 0) mono_wasm_jit_count (WJC_VPERM_OTHEROP);
+				else mono_wasm_jit_count (WJC_VPERM_OTHER);     /* genuinely other IR shape */
 				break;
 			}
-		} else mono_wasm_jit_vfb_thresh++;
+		} else mono_wasm_jit_count (WJC_VFB_THRESH);
 	}
 	return 0;
 }
@@ -5892,7 +6139,10 @@ main_loop:
 						interp_pop_lmf (&ext);
 					} }
 				}
-				{ extern int mono_wasm_jit_stats, mono_wasm_jit_invoke_count; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_invoke_count++; }
+				{ if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_INVOKE); cmethod->wasm_jit_invoke_in++; wj_edge_bump (frame->imethod, cmethod); }
+				  /* Lever A: this interp caller keeps entering jitted islands — queue it for upward JIT. */
+				  { extern int mono_wasm_jit_entry_promote; InterpMethod *wjc = frame->imethod;
+				    if (G_UNLIKELY (mono_wasm_jit_entry_promote > 0) && (wjc->wasm_jit_slot == 0 || wjc->wasm_jit_slot <= -2) && ++wjc->wasm_jit_invoke_out >= mono_wasm_jit_entry_promote) { wjc->wasm_jit_invoke_out = 0; wj_promote_push (wjc->method); } } }
 				CHECK_RESUME_STATE (context);
 				MINT_IN_BREAK;
 			}
@@ -5995,7 +6245,10 @@ jit_call:
 							interp_pop_lmf (&ext);
 						} }
 					}
-					{ extern int mono_wasm_jit_stats, mono_wasm_jit_invoke_count; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_invoke_count++; }
+					{ if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_INVOKE); cmethod->wasm_jit_invoke_in++; wj_edge_bump (frame->imethod, cmethod); }
+				  /* Lever A: this interp caller keeps entering jitted islands — queue it for upward JIT. */
+				  { extern int mono_wasm_jit_entry_promote; InterpMethod *wjc = frame->imethod;
+				    if (G_UNLIKELY (mono_wasm_jit_entry_promote > 0) && (wjc->wasm_jit_slot == 0 || wjc->wasm_jit_slot <= -2) && ++wjc->wasm_jit_invoke_out >= mono_wasm_jit_entry_promote) { wjc->wasm_jit_invoke_out = 0; wj_promote_push (wjc->method); } } }
 					/* If a residual interp call inside the JITted method threw, interp_entry set the
 					 * thread resume-state and the JITted method returned early (a dummy result). Propagate
 					 * the exception through the interp's EH, exactly like do_jit_call does after a thrown

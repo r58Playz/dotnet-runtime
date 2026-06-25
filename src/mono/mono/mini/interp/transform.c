@@ -10088,6 +10088,18 @@ mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 	InterpMethod *im = mono_interp_get_imethod (method);
 	return im ? im->wasm_jit_fslot : 0;
 }
+
+/* runtime wasm JIT (Lever B): 1 if the callee is PERMANENTLY un-JITtable (slot==-1: EH/unsupported
+ * opcode/sig). Under MONO_WASM_JIT_RESIDUAL_PERM the emitter routes just this edge through the interp
+ * residual instead of bailing the whole caller, so the caller's island completes around a blocker that
+ * will never get an f-slot. (A not-yet-jitted callee, slot 0/-2..-5, is NOT perm — the island should
+ * still pull it in, so this returns 0 for it.) */
+int
+mono_wasm_jit_callee_perm_unjittable (MonoMethod *method)
+{
+	InterpMethod *im = mono_interp_get_imethod (method);
+	return (im && im->wasm_jit_slot == -1) ? 1 : 0;
+}
 #endif
 
 void
