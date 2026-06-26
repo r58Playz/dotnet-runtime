@@ -30,11 +30,18 @@ wasm_buf_free (WasmBuf *b)
 static void
 wasm_buf_ensure (WasmBuf *b, guint32 extra)
 {
-	guint32 need = b->len + extra;
+	/* 64-bit arithmetic so neither b->len + extra nor the doubling can wrap a guint32 to a too-small
+	 * capacity (which would under-allocate -> heap overflow). JIT modules are bounded well under 4GB. */
+	guint64 need = (guint64) b->len + extra;
+	guint64 cap;
 	if (need <= b->cap)
 		return;
-	while (b->cap < need)
-		b->cap *= 2;
+	cap = b->cap ? b->cap : WASM_BUF_MIN_CAP;
+	while (cap < need)
+		cap *= 2;
+	if (cap > 0xffffffffu)
+		g_error ("wasm-encoder buffer exceeds 4GB");   /* unreachable for real JIT modules */
+	b->cap = (guint32) cap;
 	b->data = (guint8 *) g_realloc (b->data, b->cap);
 }
 

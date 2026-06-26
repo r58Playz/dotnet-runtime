@@ -938,7 +938,12 @@ wasm_jit_drain_promotions (void)
 				 * + re-attempting its whole subtree every ENTRY_PROMOTE crossings (the jit127 compile churn:
 				 * 43k attempts for 506 registered). The push gate (slot 0/-2..) stops re-queuing once it's -1. */
 				int s = pim->wasm_jit_slot;
-				if (r == 0) { pim->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -5); pim->wasm_jit_hits = 0; }
+				if (s > 0) {
+					/* Race: another thread published a real e-slot (>0) for this method between our gate
+					 * check and here. NEVER lower a live positive slot — a decremented (s-1) index points at a
+					 * different method's f-slot/placeholder and call_indirect-ing it traps the worker; even -1
+					 * would de-JIT a working method. Leave the published slot intact. */
+				} else if (r == 0) { pim->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -5); pim->wasm_jit_hits = 0; }
 				else pim->wasm_jit_slot = -1;
 			}
 		}
@@ -977,10 +982,17 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 			 * exhausting to -1 (jit136: that gave up on the whole interdependent hot path before it could
 			 * close bottom-up). hits reset so the next retry is ~thresh calls away (bounds churn). */
 			int s = cmethod->wasm_jit_slot;
-			cmethod->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -5);
-			cmethod->wasm_jit_hits = 0;
+			/* Race guard: another thread may have won the compile CAS and published a real e-slot (>0) for
+			 * this method AFTER we passed the threshold gate above (which only saw slot 0/<=-2). Never lower a
+			 * live positive slot to (s-1) — that index is a different method's f-slot/jiterpreter placeholder,
+			 * and the interp invoke path would call_indirect it and trap the worker (signature mismatch). */
+			if (s <= 0) {
+				cmethod->wasm_jit_slot = (s == 0) ? -2 : (s > -5 ? s - 1 : -5);
+				cmethod->wasm_jit_hits = 0;
+			}
 		} else {
-			cmethod->wasm_jit_slot = -1;   /* permanent: emitter bail, or force_island hit a permanent blocker (bail=-11) */
+			if (cmethod->wasm_jit_slot <= 0)   /* same race: don't de-JIT a method another thread just published */
+				cmethod->wasm_jit_slot = -1;   /* permanent: emitter bail, or force_island hit a permanent blocker (bail=-11) */
 		}
 	}
 }
@@ -2952,7 +2964,15 @@ mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
 		gint32 res = 0;
 		if (!imethod->transformed) {
 			mono_interp_transform_method (imethod, get_context (), error);
-			mono_error_assert_ok (error);
+			if (G_UNLIKELY (!is_ok (error))) {
+				/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
+				 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
+				 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
+				 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_i4) */
+				extern void mono_wasm_jit_throw (MonoObject *exc);
+				mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+				return 0;
+			}
 		}
 		memset (&data, 0, sizeof (data));
 		data.rmethod = imethod;
@@ -3042,7 +3062,15 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
 		gint32 res = 0;
 		if (!imethod->transformed) {
 			mono_interp_transform_method (imethod, get_context (), error);
-			mono_error_assert_ok (error);
+			if (G_UNLIKELY (!is_ok (error))) {
+				/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
+				 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
+				 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
+				 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_ic_miss) */
+				extern void mono_wasm_jit_throw (MonoObject *exc);
+				mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+				return 0;
+			}
 		}
 		memset (&data, 0, sizeof (data));
 		data.rmethod = imethod;
@@ -3199,7 +3227,15 @@ mono_wasm_jit_pretransform (MonoMethod *method)
 	if (G_UNLIKELY (!imethod->transformed)) {
 		ERROR_DECL (error);
 		mono_interp_transform_method (imethod, get_context (), error);
-		mono_error_assert_ok (error);
+		if (G_UNLIKELY (!is_ok (error))) {
+			/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
+			 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
+			 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
+			 * resume-state and the JITted caller's pending-exception check unwinds. (pretransform) */
+			extern void mono_wasm_jit_throw (MonoObject *exc);
+			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+			return;
+		}
 	}
 }
 
@@ -3236,7 +3272,15 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 
 	if (G_UNLIKELY (!imethod->transformed)) {
 		mono_interp_transform_method (imethod, get_context (), error);
-		mono_error_assert_ok (error);
+		if (G_UNLIKELY (!is_ok (error))) {
+			/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
+			 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
+			 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
+			 * resume-state and the JITted caller's pending-exception check unwinds. (call_interp (threw)) */
+			extern void mono_wasm_jit_throw (MonoObject *exc);
+			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+			return 1;
+		}
 	}
 	/* INLINE AOT FASTPATH: if the callee has AOT code, run it natively via do_jit_call directly,
 	 * skipping interp_entry's InterpEntryData marshalling. Covers BOTH the direct-call residual and the
@@ -3347,7 +3391,15 @@ mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
 	if (G_UNLIKELY (!imethod->transformed)) {
 		ERROR_DECL (error);
 		mono_interp_transform_method (imethod, get_context (), error);
-		mono_error_assert_ok (error);
+		if (G_UNLIKELY (!is_ok (error))) {
+			/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
+			 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
+			 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
+			 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_resolve) */
+			extern void mono_wasm_jit_throw (MonoObject *exc);
+			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+			return NULL;
+		}
 	}
 	return target;
 }
@@ -3411,7 +3463,15 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 		if (G_UNLIKELY (!imethod->transformed)) {
 			ERROR_DECL (error);
 			mono_interp_transform_method (imethod, get_context (), error);
-			mono_error_assert_ok (error);
+			if (G_UNLIKELY (!is_ok (error))) {
+				/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
+				 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
+				 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
+				 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_resolve_fslot) */
+				extern void mono_wasm_jit_throw (MonoObject *exc);
+				mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+				return 0;
+			}
 		}
 		if (use_ic)
 			mono_atomic_store_i64 ((volatile gint64 *) icp,
@@ -3429,12 +3489,19 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_fslot > 0) {
 		extern void mono_wasm_jit_sync_thread (void);
+		extern int mono_wasm_jit_slot_live (int slot);
 		mono_wasm_jit_sync_thread ();
-		if (G_UNLIKELY (mono_wasm_jit_stats)) {
-			mono_wasm_jit_count (WJC_FASTVCALL);
-			mono_wasm_jit_count (had_fslot ? WJC_VFAST_HAD : WJC_VFAST_NEW);
+		/* Only return the f-slot if THIS thread actually instantiated that module. sync_thread can fail to
+		 * instantiate on a worker (OOM/CompileError under pressure) while it succeeded on the compiling
+		 * thread; the slot then holds a jiterpreter placeholder and call_indirect-ing it traps the worker.
+		 * Fall through to the interp residual (call_interp) instead. */
+		if (mono_wasm_jit_slot_live (imethod->wasm_jit_fslot)) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) {
+				mono_wasm_jit_count (WJC_FASTVCALL);
+				mono_wasm_jit_count (had_fslot ? WJC_VFAST_HAD : WJC_VFAST_NEW);
+			}
+			return imethod->wasm_jit_fslot;
 		}
-		return imethod->wasm_jit_fslot;
 	}
 	/* Fallback to interp (call_interp). Split by reason: slot==-1 is permanently un-JITtable (EH/unsupported
 	 * opcode/eligibility bail — will NEVER take the fast path); anything else (0 counting, -2..-5 retriable)
@@ -3746,26 +3813,91 @@ __thread MonoMethodILState *mono_wasm_jit_cur_island_il_state = NULL;
  * fix for the catch-il_state-at-scale ClassCastException. The il_state data[] is zeroed: the GC scans it
  * (in bounds), finds NULL -> no roots from this frame, which is correct because the method's live refs
  * are in the separately-rooted GC ref shadow stack. */
-#define WJ_ISLAND_MAX_DEPTH 512
 #define WJ_ISLAND_DATA      256   /* max args+locals; the emitter bails EH methods exceeding this */
+#define WJ_ISLAND_CHUNK     256   /* island frames per chunk (chunks never move -> LMF pointers stay stable) */
 typedef struct {
 	MonoLMFExt ext;
 	MonoMethodILState *prev;
+	int finally_sp;   /* wj_finally_exc_sp at this island's entry; leave/restore trims back to it */
 	guint8 st [sizeof (MonoMethodILState) + WJ_ISLAND_DATA * sizeof (gpointer)];
 } WjIsland;
-static __thread WjIsland *wj_island_stack = NULL;
+/* Chunked, pointer-stable island stack: enter only ever reaches one past the current max, so chunks grow
+ * incrementally; existing WjIsland (and the LMFExt linked into the LMF chain) never move on growth. There
+ * is no fixed depth cap (the C/wasm stack overflows long before this would), so deep nested JITted-EH
+ * recursion can no longer abort() the worker. */
+static __thread WjIsland **wj_island_chunks = NULL;
+static __thread int wj_island_nchunks = 0;
 static __thread int wj_island_sp = 0;
+
+/*
+ * Per-thread stack of exceptions captured by an active in-method finally/fault running on the EXCEPTION
+ * path. jit_tls->thrown_exc is a SINGLE per-thread gchandle; a nested throw+catch inside a finally body
+ * (or a JITted callee the finally invokes) clears it (mono_wasm_jit_eh_dispatch's catch path frees it),
+ * which would destroy the exception the finally must re-raise at OP_ENDFINALLY -> a NULL load -> wasm
+ * trap -> worker death. So each FINALLY/FAULT dispatch MOVES thrown_exc into this stack (taking ownership
+ * of the gchandle) and clears thrown_exc; OP_ENDFINALLY pops it and re-raises. Entries left behind by a
+ * finally body that itself threw-and-escaped (never reaching its OP_ENDFINALLY) are reclaimed when the
+ * owning island frame is left (trim to the island's recorded finally_sp).
+ */
+static __thread MonoGCHandle *wj_finally_exc = NULL;   /* gchandles (NULL == empty), same type as jit_tls->thrown_exc */
+static __thread int wj_finally_exc_cap = 0;
+static __thread int wj_finally_exc_sp = 0;
+
+static WjIsland *
+wj_island_at (int i)
+{
+	int c = i / WJ_ISLAND_CHUNK;
+	if (G_UNLIKELY (c >= wj_island_nchunks)) {
+		int k, nc = wj_island_nchunks ? wj_island_nchunks * 2 : 4;
+		while (c >= nc)
+			nc *= 2;
+		wj_island_chunks = (WjIsland **) g_realloc (wj_island_chunks, nc * sizeof (WjIsland *));
+		for (k = wj_island_nchunks; k < nc; ++k)
+			wj_island_chunks [k] = (WjIsland *) g_malloc0 (sizeof (WjIsland) * WJ_ISLAND_CHUNK);
+		wj_island_nchunks = nc;
+	}
+	return &wj_island_chunks [c][i % WJ_ISLAND_CHUNK];
+}
+
+/* Move the in-flight exception (gchandle ownership) onto the finally save stack; caller then clears
+ * thrown_exc. */
+static void
+wj_finally_push (MonoGCHandle gchandle)
+{
+	if (G_UNLIKELY (wj_finally_exc_sp >= wj_finally_exc_cap)) {
+		wj_finally_exc_cap = wj_finally_exc_cap ? wj_finally_exc_cap * 2 : 32;
+		wj_finally_exc = (MonoGCHandle *) g_realloc (wj_finally_exc, wj_finally_exc_cap * sizeof (MonoGCHandle));
+	}
+	wj_finally_exc [wj_finally_exc_sp++] = gchandle;
+}
+
+/* Pop the exception a finally must re-raise (NULL if the stack is empty). Ownership transfers to the caller. */
+static MonoGCHandle
+wj_finally_pop (void)
+{
+	if (wj_finally_exc_sp <= 0)
+		return NULL;
+	return wj_finally_exc [--wj_finally_exc_sp];
+}
+
+/* Free any finally-save entries this island's frame pushed but never popped (a finally body that threw
+ * and escaped past its own OP_ENDFINALLY), restoring the save stack to the island's entry baseline. */
+static void
+wj_finally_trim (int baseline)
+{
+	while (wj_finally_exc_sp > baseline) {
+		MonoGCHandle h = wj_finally_exc [--wj_finally_exc_sp];
+		if (h)
+			mono_gchandle_free_internal (h);
+	}
+}
 
 void
 mono_wasm_jit_enter_island (MonoMethod *method)
 {
 	WjIsland *is;
 	MonoMethodILState *il;
-	if (G_UNLIKELY (!wj_island_stack))
-		wj_island_stack = (WjIsland *) g_malloc0 (sizeof (WjIsland) * WJ_ISLAND_MAX_DEPTH);
-	if (G_UNLIKELY (wj_island_sp >= WJ_ISLAND_MAX_DEPTH))
-		g_error ("wasm-jit EH island stack overflow (>%d nested JITted EH frames)", WJ_ISLAND_MAX_DEPTH);
-	is = &wj_island_stack [wj_island_sp++];
+	is = wj_island_at (wj_island_sp++);
 	il = (MonoMethodILState *) is->st;
 	memset (is->st, 0, sizeof (is->st));   /* zero method + il_offset + data[] (GC-scanned, kept NULL) */
 	il->method = method;
@@ -3773,6 +3905,7 @@ mono_wasm_jit_enter_island (MonoMethod *method)
 	memset (&is->ext, 0, sizeof (is->ext));
 	is->ext.kind = MONO_LMFEXT_IL_STATE;
 	is->ext.il_state = il;
+	is->finally_sp = wj_finally_exc_sp;
 	mono_push_lmf (&is->ext);
 	is->prev = mono_wasm_jit_cur_island_il_state;
 	mono_wasm_jit_cur_island_il_state = il;
@@ -3784,9 +3917,10 @@ mono_wasm_jit_leave_island (void)
 	WjIsland *is;
 	if (G_UNLIKELY (wj_island_sp <= 0))
 		return;
-	is = &wj_island_stack [--wj_island_sp];
+	is = wj_island_at (--wj_island_sp);
 	mono_pop_lmf (&is->ext.lmf);
 	mono_wasm_jit_cur_island_il_state = is->prev;
+	wj_finally_trim (is->finally_sp);
 }
 
 /* boundary safety net: a C++ unwind that escapes a JITted EH method WITHOUT going through its emitted
@@ -3801,9 +3935,10 @@ void
 mono_wasm_jit_island_sp_restore (int sp)
 {
 	while (wj_island_sp > sp) {
-		WjIsland *is = &wj_island_stack [--wj_island_sp];
+		WjIsland *is = wj_island_at (--wj_island_sp);
 		mono_pop_lmf (&is->ext.lmf);
 		mono_wasm_jit_cur_island_il_state = is->prev;
+		wj_finally_trim (is->finally_sp);
 	}
 }
 
@@ -3827,10 +3962,10 @@ int
 mono_wasm_jit_is_island (MonoMethodILState *il_state)
 {
 	int i;
-	if (!il_state || !wj_island_stack)
+	if (!il_state || !wj_island_chunks)
 		return 0;
 	for (i = 0; i < wj_island_sp; ++i)
-		if ((MonoMethodILState *) wj_island_stack [i].st == il_state)
+		if ((MonoMethodILState *) wj_island_at (i)->st == il_state)
 			return 1;
 	return 0;
 }
@@ -3900,9 +4035,13 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 			 * then OP_ENDFINALLY (== endfault) RE-RAISES the exception (mono_wasm_jit_endfinally_rethrow) so it
 			 * keeps propagating to an outer catch/finally. (FAULT differs from FINALLY only on the NORMAL path,
 			 * where it isn't run — handled in codegen: a fault handler has no OP_CALL_HANDLER.)
-			 * Unlike catch we do NOT clear thrown_exc (it's the GC-rooted source for that re-raise); we only
-			 * drop the resume-state pass-1 may have set for an OUTER handler (the finally runs nearer first;
-			 * after it re-raises, the advanced il_offset lets the re-dispatch find the next clause). */
+			 * We MOVE the in-flight exception onto the finally save stack (taking ownership of the gchandle)
+			 * and CLEAR jit_tls->thrown_exc, instead of leaving it in the single shared slot: a nested
+			 * throw+catch inside the finally body would otherwise free that shared slot (the catch dispatch
+			 * clears thrown_exc), and OP_ENDFINALLY's re-raise would then load NULL and trap the worker. With
+			 * the value saved, a nested throw starts from a clean thrown_exc and OP_ENDFINALLY re-raises from
+			 * the save stack. We also drop the resume-state pass-1 may have set for an OUTER handler (the
+			 * finally runs nearer first; after it re-raises, the advanced il_offset finds the next clause). */
 			ThreadContext *ctx = get_context ();
 			MonoJitTlsData *jit_tls = mono_get_jit_tls ();
 			if (ctx->exc_gchandle) { mono_gchandle_free_internal (ctx->exc_gchandle); ctx->exc_gchandle = 0; }
@@ -3911,6 +4050,8 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 			if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
 			jit_tls->resume_state.il_state = NULL;
 			wj_residual_active = FALSE;
+			wj_finally_push (jit_tls->thrown_exc);   /* take ownership of the gchandle for OP_ENDFINALLY's re-raise */
+			jit_tls->thrown_exc = 0;                 /* clear so a nested throw inside the finally body can't free it */
 			{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_verbose; static int _ehf = 0; if (mono_wasm_jit_verbose >= 2 && _ehf++ < 200) { char *_m = g_strdup_printf ("EHDISP   -> FINALLY %s cl%d -> bb%d", t->name ? t->name : "?", i, c->handler_bbidx); mono_wasm_jit_log_main (_m); g_free (_m); } }
 			return c->handler_bbidx;
 		}
@@ -3920,19 +4061,39 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 }
 
 /* OP_ENDFINALLY rethrow path (finally_ind == -1, i.e. the finally ran on the EXCEPTION path, not a normal
- * leave): re-raise the still-in-flight exception so it propagates past this finally to the next enclosing
- * catch/finally (or out of the method). thrown_exc was kept set by the FINALLY dispatch above; reading +
- * re-throwing here runs pass-1 again from the finally-handler il_offset (now OUTSIDE this finally's try),
- * so the re-dispatch advances to the outer clause. NEVER returns (mono_wasm_jit_rethrow C++-unwinds). */
+ * leave): re-raise the exception this finally was running for so it propagates past this finally to the
+ * next enclosing catch/finally (or out of the method). The exception was MOVED onto the finally save stack
+ * by the FINALLY dispatch (not left in the shared jit_tls->thrown_exc, which a nested throw+catch in the
+ * finally body may have cleared); we pop it here. Re-throwing runs pass-1 again from the finally-handler
+ * il_offset (now OUTSIDE this finally's try), so the re-dispatch advances to the outer clause. This MUST
+ * NEVER RETURN — the emitter places an unconditional WASM_OP_UNREACHABLE right after the call, so a return
+ * would trap the worker instead of unwinding a (catchable) managed exception. */
 void
 mono_wasm_jit_endfinally_rethrow (void)
 {
 	extern void mono_wasm_jit_rethrow (MonoObject *exc);
-	MonoObject *exc = mini_llvmonly_load_exception ();
-	mini_llvmonly_clear_exception ();   /* mono_wasm_jit_rethrow's pass-1 + native unwind re-installs it */
+	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
+	MonoGCHandle h = wj_finally_pop ();
+	MonoObject *exc = h ? mono_gchandle_get_target_internal (h) : NULL;
+	if (exc) {
+		/* Hand the saved handle back to thrown_exc so the object stays GC-rooted across the re-raise (whose
+		 * pass-1 may allocate); the eventual catch / invoke_caught frees it. mono_wasm_jit_rethrow's pass-1
+		 * sees thrown_exc already set and reuses it (no double-root). */
+		if (jit_tls->thrown_exc && jit_tls->thrown_exc != h)
+			mono_gchandle_free_internal (jit_tls->thrown_exc);
+		jit_tls->thrown_exc = h;
+		mono_wasm_jit_rethrow (exc);   /* CONTINUATION: preserve the original stack trace */
+		g_assert_not_reached ();
+	}
+	if (h)
+		mono_gchandle_free_internal (h);
+	/* Defensive: the saved exception was lost (an exotic finally-threw-and-escaped mis-attribution, or the
+	 * save stack overflowed). Re-raise whatever is still in flight, else synthesize a catchable exception, so
+	 * we ALWAYS C++-unwind and never fall into the emitted unreachable -> raw trap -> worker death. */
+	exc = mini_llvmonly_load_exception ();
+	mini_llvmonly_clear_exception ();
 	if (!exc)
-		return;   /* nothing in flight (shouldn't happen on the exception path) — fall through */
-	/* re-raise as a CONTINUATION (preserve the original stack trace), not a fresh throw */
+		exc = (MonoObject *) mono_get_exception_execution_engine ("wasm-jit: finally re-raise lost the in-flight exception");
 	mono_wasm_jit_rethrow (exc);
 	g_assert_not_reached ();
 }
@@ -6222,7 +6383,14 @@ main_loop:
 			wasm_jit_maybe_compile (cmethod);
 			if (G_UNLIKELY (cmethod->wasm_jit_slot > 0)) {
 				extern void mono_wasm_jit_sync_thread (void);
+				extern int mono_wasm_jit_slot_live (int slot);
 				mono_wasm_jit_sync_thread ();
+				/* Only call the JITted e-thunk if THIS thread actually instantiated it. sync_thread can fail to
+				 * instantiate a module on a worker (OOM/CompileError under pressure) while it succeeded on the
+				 * compiling thread; the slot then holds a jiterpreter placeholder of a different signature, and
+				 * call_indirect-ing it traps + kills the worker. Run in the interpreter (jit_call) instead. */
+				if (G_UNLIKELY (!mono_wasm_jit_slot_live (cmethod->wasm_jit_slot)))
+					goto jit_call;
 				{
 					MonoLMFExt ext;
 					/* Set the resume IP before the call (see the MINT_CALL path): mono_handle_exception reads
@@ -6321,6 +6489,14 @@ jit_call:
 					 * and any methods it calls via f-slot call_indirect are present in this thread's table. */
 					extern void mono_wasm_jit_sync_thread (void);
 					mono_wasm_jit_sync_thread ();
+					{ extern int mono_wasm_jit_slot_live (int slot);
+					/* Only call the JITted e-thunk if THIS thread actually instantiated it. sync_thread can fail to
+					 * instantiate a module on a worker (OOM/CompileError under pressure) while it succeeded on the
+					 * compiling thread; the slot then holds a jiterpreter placeholder of a different signature and
+					 * call_indirect-ing it traps + kills the worker. Interpret the method instead. */
+					if (G_UNLIKELY (!mono_wasm_jit_slot_live (cmethod->wasm_jit_slot)))
+						goto interp_call;
+					}
 					{
 						/* Push an LMF across the interp->JITted-wasm call, same as do_jit_call does for compiled
 						 * code: it marks the managed->native boundary so GC stack-walking and cooperative/JSPI
