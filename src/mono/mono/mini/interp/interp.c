@@ -3151,8 +3151,22 @@ wasm_jit_aot_call_lean (InterpMethod *imethod, MonoMethodSignature *sig, guint8 
 	if (imethod->needs_thread_attach)
 		mono_threads_detach_coop (orig_domain, &attach_cookie);
 
-	if (context->has_resume_state)
-		return 1;
+	if (context->has_resume_state) {
+		/* Under CPPEH the throw MUST be delivered by a native (C++/wasm-EH) unwind, not cooperatively: a
+		 * bare JIT->JIT f-slot caller has no per-call resume-state poll (EMIT_PENDING_EXC_CHECK is a no-op
+		 * under CPPEH), so returning threw=1 here would let that caller swallow the exception (run on with a
+		 * garbage dummy return + a stale thread resume-state) and SKIP any enclosing JITted-island catch/
+		 * finally that pass-1 parked with handler_frame==NULL. Mirror interp_entry's CPPEH tail exactly:
+		 * start the native unwind to the nearest landing pad (this method's wasm catch, an enclosing JITted
+		 * island, or the interp e-thunk boundary). pass-1 (mono_handle_exception) already ran above (in
+		 * do_jit_call's epilogue or the error branch), so this only performs the unwind. */
+		extern int mono_wasm_jit_cppeh;
+		if (mono_wasm_jit_cppeh) {
+			mono_llvm_start_native_unwind ();
+			g_assert_not_reached ();   /* the C++ throw above does not return */
+		}
+		return 1;   /* non-CPPEH cooperative resume-state model: the JITted caller bails on threw=1 */
+	}
 
 	/* Write the return value back into the scratch for the JITted caller (mirrors interp_entry exit). */
 	if (sig->ret->type != MONO_TYPE_VOID) {
@@ -3163,6 +3177,30 @@ wasm_jit_aot_call_lean (InterpMethod *imethod, MonoMethodSignature *sig, guint8 
 			stackval_to_data_sign_ext (sig->ret, sp, buf + WJ_SCRATCH_RET_OFF, FALSE);
 	}
 	return 0;
+}
+
+/*
+ * mono_wasm_jit_pretransform:
+ *
+ *   Transform a DIRECT-residual callee BEFORE the JITted caller spills the call's arguments into the
+ * GC-invisible per-thread scratch buffer. Transforming a cold method runs its class cctor — arbitrary
+ * managed code that can allocate (triggering a GC that moves the call's reference args) and can itself
+ * re-enter another residual/vcall on this thread (reusing the same scratch). Doing it HERE, while the ref
+ * args still live in the GC-scanned ref shadow stack and the scratch is still free, means a GC moves the
+ * args safely and a nested residual can't clobber args that haven't been spilled yet. mono_wasm_jit_call_interp
+ * then finds the imethod already transformed and only does the GC-free marshal + interp_entry/do_jit_call,
+ * so the (now-spilled) scratch values stay valid. Mirrors the vcall path's pre-transform in
+ * mono_wasm_jit_vcall_resolve(_fslot) — the discipline the direct residual previously lacked.
+ */
+void
+mono_wasm_jit_pretransform (MonoMethod *method)
+{
+	InterpMethod *imethod = mono_interp_get_imethod (method);
+	if (G_UNLIKELY (!imethod->transformed)) {
+		ERROR_DECL (error);
+		mono_interp_transform_method (imethod, get_context (), error);
+		mono_error_assert_ok (error);
+	}
 }
 
 /*
@@ -3520,15 +3558,18 @@ mono_wasm_jit_raise_corlib (int exc_id)
  * landing pad runs the catch. `throw` is the #1 leaf-method JIT blocker in IKVM (null/argument-validation
  * throws are everywhere), so supporting it lets throwing leaves JIT and the RESIDUAL=0 islands resolve.
  */
-void
-mono_wasm_jit_throw (MonoObject *exc)
+static void
+wasm_jit_throw_internal (MonoObject *exc, gboolean rethrow)
 {
 	ERROR_DECL (error);
 	MonoContext ctx;
 	if (G_UNLIKELY (!exc))
 		exc = (MonoObject *) mono_get_exception_null_reference ();
-	/* fresh throw (not rethrow): clear any captured trace so mono_handle_exception rebuilds it (mirrors interp_throw) */
-	if (mono_object_isinst_checked (exc, mono_defaults.exception_class, error)) {
+	/* fresh throw (`throw expr`): clear any captured trace so mono_handle_exception rebuilds it from the
+	 * current throw site (mirrors interp_throw). A RETHROW (`throw;`) or a finally re-raise is a CONTINUATION
+	 * of an already-in-flight exception, not a new throw site, so PRESERVE the trace pass-1 captured at the
+	 * original throw (mirrors interp_rethrow / mini_llvmonly_rethrow_exception, which skip the rebuild). */
+	if (!rethrow && mono_object_isinst_checked (exc, mono_defaults.exception_class, error)) {
 		MonoException *mex = (MonoException *) exc;
 		mex->stack_trace = NULL;
 		mex->trace_ips = NULL;
@@ -3549,6 +3590,20 @@ mono_wasm_jit_throw (MonoObject *exc)
 	{ extern int mono_wasm_jit_cppeh;
 	  if (mono_wasm_jit_cppeh) wasm_jit_cpp_unwind (exc);   /* C++-unwind to the landing pad; never returns */
 	  g_assert (get_context ()->has_resume_state); }
+}
+
+void
+mono_wasm_jit_throw (MonoObject *exc)
+{
+	wasm_jit_throw_internal (exc, FALSE);   /* fresh throw: rebuild the stack trace */
+}
+
+/* IL `rethrow` (OP_RETHROW) and the finally re-raise (mono_wasm_jit_endfinally_rethrow): re-raise the
+ * caught/in-flight exception while PRESERVING its original stack trace (a continuation, not a new throw). */
+void
+mono_wasm_jit_rethrow (MonoObject *exc)
+{
+	wasm_jit_throw_internal (exc, TRUE);    /* rethrow / re-raise: keep the captured trace */
 }
 
 /*
@@ -3868,16 +3923,17 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
  * leave): re-raise the still-in-flight exception so it propagates past this finally to the next enclosing
  * catch/finally (or out of the method). thrown_exc was kept set by the FINALLY dispatch above; reading +
  * re-throwing here runs pass-1 again from the finally-handler il_offset (now OUTSIDE this finally's try),
- * so the re-dispatch advances to the outer clause. NEVER returns (mono_wasm_jit_throw C++-unwinds). */
+ * so the re-dispatch advances to the outer clause. NEVER returns (mono_wasm_jit_rethrow C++-unwinds). */
 void
 mono_wasm_jit_endfinally_rethrow (void)
 {
-	extern void mono_wasm_jit_throw (MonoObject *exc);
+	extern void mono_wasm_jit_rethrow (MonoObject *exc);
 	MonoObject *exc = mini_llvmonly_load_exception ();
-	mini_llvmonly_clear_exception ();   /* mono_wasm_jit_throw's pass-1 + native unwind re-installs it */
+	mini_llvmonly_clear_exception ();   /* mono_wasm_jit_rethrow's pass-1 + native unwind re-installs it */
 	if (!exc)
 		return;   /* nothing in flight (shouldn't happen on the exception path) — fall through */
-	mono_wasm_jit_throw (exc);
+	/* re-raise as a CONTINUATION (preserve the original stack trace), not a fresh throw */
+	mono_wasm_jit_rethrow (exc);
 	g_assert_not_reached ();
 }
 
