@@ -2918,8 +2918,9 @@ interp_entry (InterpEntryData *data)
  * gsharedvt_in_sig native->interp entry wrapper which doesn't exist here, so instead the JIT
  * lowers a virtual call to a direct call_indirect of this helper (resolved by its raw C address).
  * The result is returned by value (res lives on the C stack), so this is reentrant — nested
- * virtual calls from the callee reuse the C stack frame, no scratch buffer needed.
- */
+	 * virtual calls from the callee reuse the C stack frame, no scratch buffer needed.
+	 */
+static gboolean wasm_jit_prepare_interp_callee (MonoMethod *method, InterpMethod *imethod, MonoError *error);
 gint32
 mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
 {
@@ -2962,17 +2963,15 @@ mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
 		ERROR_DECL (error);
 		InterpEntryData data;
 		gint32 res = 0;
-		if (!imethod->transformed) {
-			mono_interp_transform_method (imethod, get_context (), error);
-			if (G_UNLIKELY (!is_ok (error))) {
-				/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
-				 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
-				 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
-				 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_i4) */
-				extern void mono_wasm_jit_throw (MonoObject *exc);
-				mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
-				return 0;
-			}
+		if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (imethod->method, imethod, error))) {
+			/* A cold callee's first transform/signature/code-type warmup failed (cctor threw / unloadable type /
+			 * bad IL). Deliver it as a catchable managed exception via the wasm-JIT throw path instead of
+			 * mono_error_assert_ok's abort() (which kills the worker). Under CPPEH this C++-unwinds and never
+			 * returns; otherwise it installs resume-state and the JITted caller's pending-exception check unwinds.
+			 * (vcall_i4) */
+			extern void mono_wasm_jit_throw (MonoObject *exc);
+			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+			return 0;
 		}
 		memset (&data, 0, sizeof (data));
 		data.rmethod = imethod;
@@ -3060,17 +3059,15 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
 		ERROR_DECL (error);
 		InterpEntryData data;
 		gint32 res = 0;
-		if (!imethod->transformed) {
-			mono_interp_transform_method (imethod, get_context (), error);
-			if (G_UNLIKELY (!is_ok (error))) {
-				/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
-				 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
-				 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
-				 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_ic_miss) */
-				extern void mono_wasm_jit_throw (MonoObject *exc);
-				mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
-				return 0;
-			}
+		if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (target, imethod, error))) {
+			/* A cold callee's first transform/signature/code-type warmup failed (cctor threw / unloadable type /
+			 * bad IL). Deliver it as a catchable managed exception via the wasm-JIT throw path instead of
+			 * mono_error_assert_ok's abort() (which kills the worker). Under CPPEH this C++-unwinds and never
+			 * returns; otherwise it installs resume-state and the JITted caller's pending-exception check unwinds.
+			 * (vcall_ic_miss) */
+			extern void mono_wasm_jit_throw (MonoObject *exc);
+			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+			return 0;
 		}
 		memset (&data, 0, sizeof (data));
 		data.rmethod = imethod;
@@ -3207,6 +3204,25 @@ wasm_jit_aot_call_lean (InterpMethod *imethod, MonoMethodSignature *sig, guint8 
 	return 0;
 }
 
+/* Warm a residual/vcall callee completely BEFORE the JITted caller spills reference args into the
+ * GC-invisible scratch buffer: transform the body if needed, parse the signature, and decide code_type
+ * (which may run class init / AOT lookup). After this, call_interp can copy refs out of the scratch and
+ * enter the callee without a first-use GC window that would stale the spilled raw pointers. */
+static gboolean
+wasm_jit_prepare_interp_callee (MonoMethod *method, InterpMethod *imethod, MonoError *error)
+{
+	MonoMethodSignature *sig;
+	if (G_UNLIKELY (!imethod->transformed)) {
+		mono_interp_transform_method (imethod, get_context (), error);
+		if (G_UNLIKELY (!is_ok (error)))
+			return FALSE;
+	}
+	sig = mono_method_signature_internal (method);
+	if (imethod->code_type == IMETHOD_CODE_UNKNOWN)
+		imethod->code_type = mono_interp_jit_call_supported (method, sig) ? IMETHOD_CODE_COMPILED : IMETHOD_CODE_INTERP;
+	return TRUE;
+}
+
 /*
  * mono_wasm_jit_pretransform:
  *
@@ -3215,27 +3231,26 @@ wasm_jit_aot_call_lean (InterpMethod *imethod, MonoMethodSignature *sig, guint8 
  * managed code that can allocate (triggering a GC that moves the call's reference args) and can itself
  * re-enter another residual/vcall on this thread (reusing the same scratch). Doing it HERE, while the ref
  * args still live in the GC-scanned ref shadow stack and the scratch is still free, means a GC moves the
- * args safely and a nested residual can't clobber args that haven't been spilled yet. mono_wasm_jit_call_interp
- * then finds the imethod already transformed and only does the GC-free marshal + interp_entry/do_jit_call,
- * so the (now-spilled) scratch values stay valid. Mirrors the vcall path's pre-transform in
- * mono_wasm_jit_vcall_resolve(_fslot) — the discipline the direct residual previously lacked.
+	 * args safely and a nested residual can't clobber args that haven't been spilled yet. We also warm the
+	 * residual's code_type/signature here because deciding AOT-vs-interp can run class init / AOT lookup.
+	 * mono_wasm_jit_call_interp then finds the imethod already prepared and only does the GC-free marshal +
+	 * interp_entry/do_jit_call, so the (now-spilled) scratch values stay valid. Mirrors the vcall path's pre-transform in
+	 * mono_wasm_jit_vcall_resolve(_fslot) — the discipline the direct residual previously lacked.
  */
 void
 mono_wasm_jit_pretransform (MonoMethod *method)
 {
 	InterpMethod *imethod = mono_interp_get_imethod (method);
-	if (G_UNLIKELY (!imethod->transformed)) {
-		ERROR_DECL (error);
-		mono_interp_transform_method (imethod, get_context (), error);
-		if (G_UNLIKELY (!is_ok (error))) {
-			/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
-			 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
-			 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
-			 * resume-state and the JITted caller's pending-exception check unwinds. (pretransform) */
-			extern void mono_wasm_jit_throw (MonoObject *exc);
-			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
-			return;
-		}
+	ERROR_DECL (error);
+	if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (method, imethod, error))) {
+		/* A cold callee's first transform/signature/code-type warmup failed (cctor threw / unloadable type /
+		 * bad IL). Deliver it as a catchable managed exception via the wasm-JIT throw path instead of
+		 * mono_error_assert_ok's abort() (which kills the worker). Under CPPEH this C++-unwinds and never
+		 * returns; otherwise it installs resume-state and the JITted caller's pending-exception check unwinds.
+		 * (pretransform) */
+		extern void mono_wasm_jit_throw (MonoObject *exc);
+		mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+		return;
 	}
 }
 
@@ -3265,22 +3280,26 @@ int
 mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 {
 	ERROR_DECL (error);
+	if (G_UNLIKELY (!method)) {
+		/* A vcall resolve stored a NULL target after raising an exception (null/corrupt receiver): the
+		 * interp resume-state is already set, so just signal threw=1 and let the JITted caller bail. This
+		 * also guards the mono_interp_get_imethod(NULL) deref below. */
+		return 1;
+	}
 	InterpMethod *imethod = mono_interp_get_imethod (method);
 	MonoMethodSignature *sig = mono_method_signature_internal (method);
 	InterpEntryData data;
 	int idx = 0, i;
 
-	if (G_UNLIKELY (!imethod->transformed)) {
-		mono_interp_transform_method (imethod, get_context (), error);
-		if (G_UNLIKELY (!is_ok (error))) {
-			/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
-			 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
-			 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
-			 * resume-state and the JITted caller's pending-exception check unwinds. (call_interp (threw)) */
-			extern void mono_wasm_jit_throw (MonoObject *exc);
-			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
-			return 1;
-		}
+	if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (method, imethod, error))) {
+		/* A cold callee's first transform/signature/code-type warmup failed (cctor threw / unloadable type /
+		 * bad IL). Deliver it as a catchable managed exception via the wasm-JIT throw path instead of
+		 * mono_error_assert_ok's abort() (which kills the worker). Under CPPEH this C++-unwinds and never
+		 * returns; otherwise it installs resume-state and the JITted caller's pending-exception check unwinds.
+		 * (call_interp (threw)) */
+		extern void mono_wasm_jit_throw (MonoObject *exc);
+		mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
+		return 1;
 	}
 	/* INLINE AOT FASTPATH: if the callee has AOT code, run it natively via do_jit_call directly,
 	 * skipping interp_entry's InterpEntryData marshalling. Covers BOTH the direct-call residual and the
@@ -3372,6 +3391,14 @@ gpointer
 mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
 {
 	MonoMethod *target = mono_object_get_virtual_method_internal (this_obj, base_method);
+	if (G_UNLIKELY (!target)) {
+		/* See mono_wasm_jit_vcall_resolve_fslot: a NULL override means a null/corrupt receiver. Raise a
+		 * catchable NRE and return NULL; the emitter's mono_wasm_jit_call_interp(NULL) fallback signals
+		 * threw=1 so the caller bails, instead of dereferencing NULL below. */
+		extern void mono_wasm_jit_throw (MonoObject *exc);
+		mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
+		return NULL;
+	}
 	/* If the resolved override is synchronized, dispatch its SYNCHRONIZED wrapper (Monitor.Enter/Exit):
 	 * the raw body has no monitor ops, and mono_wasm_jit_call_interp's mono_interp_get_imethod does NOT
 	 * substitute the wrapper (unlike get_virtual_method) -> the body would run without the monitor and a
@@ -3381,21 +3408,22 @@ mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
 	if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
 		target = mono_marshal_get_synchronized_wrapper (target);
 	/* Pre-transform the override here too. The JITted code calls this BEFORE spilling the call's
-	 * reference args into the GC-invisible scratch buffer; BOTH the resolve above AND transforming a
-	 * cold method can allocate -> GC. Doing them now (while the ref args still live in the GC-scanned
-	 * ref shadow stack) lets a GC move them safely. mono_wasm_jit_call_interp then finds the imethod
-	 * already transformed and only does the GC-free marshal + interp_entry, so the (now-spilled)
-	 * scratch pointers stay valid. (Without this, a transform-triggered GC inside call_interp — after
-	 * the spill — would stale the scratch refs, the latent hazard the direct residual rarely hit.) */
+	 * reference args into the GC-invisible scratch buffer; BOTH the resolve above AND fully preparing a
+	 * cold method (transform + code_type/signature warmup) can allocate -> GC. Doing them now (while the
+	 * ref args still live in the GC-scanned ref shadow stack) lets a GC move them safely.
+	 * mono_wasm_jit_call_interp then finds the imethod already prepared and only does the GC-free marshal
+	 * + interp_entry, so the (now-spilled) scratch pointers stay valid. (Without this, a first-use GC
+	 * inside call_interp — after the spill — would stale the scratch refs, the latent hazard the direct
+	 * residual rarely hit.) */
 	InterpMethod *imethod = mono_interp_get_imethod (target);
-	if (G_UNLIKELY (!imethod->transformed)) {
+	{
 		ERROR_DECL (error);
-		mono_interp_transform_method (imethod, get_context (), error);
-		if (G_UNLIKELY (!is_ok (error))) {
-			/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
-			 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
-			 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
-			 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_resolve) */
+		if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (target, imethod, error))) {
+			/* A cold callee's first transform/signature/code-type warmup failed (cctor threw / unloadable type /
+			 * bad IL). Deliver it as a catchable managed exception via the wasm-JIT throw path instead of
+			 * mono_error_assert_ok's abort() (which kills the worker). Under CPPEH this C++-unwinds and never
+			 * returns; otherwise it installs resume-state and the JITted caller's pending-exception check unwinds.
+			 * (vcall_resolve) */
 			extern void mono_wasm_jit_throw (MonoObject *exc);
 			mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
 			return NULL;
@@ -3457,17 +3485,30 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	} else {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_MISS);
 		target = mono_object_get_virtual_method_internal (this_obj, base_method);
+		if (G_UNLIKELY (!target)) {
+			/* mono_object_get_virtual_method_internal returns NULL for an unresolvable receiver (object.c:
+			 * "res can be null if klass is abstract and doesn't implement method"). The JIT emitter now
+			 * null-checks the receiver before this call (matching MINT_CALLVIRT_FAST's NULL_CHECK), so a plain
+			 * null receiver raises a catchable NRE and never reaches here; a NULL target now means a corrupt
+			 * receiver. Raise a catchable NRE and store a NULL target so the residual's call_interp(NULL)
+			 * signals threw=1 and the JITted caller bails — instead of dereferencing the NULL override into
+			 * mono_marshal_get_synchronized_wrapper (g_assert(method) abort) or dispatching to garbage. */
+			*(MonoMethod **) (scratch + 200) = NULL;
+			extern void mono_wasm_jit_throw (MonoObject *exc);
+			mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
+			return 0;
+		}
 		if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
 			target = mono_marshal_get_synchronized_wrapper (target);
 		imethod = mono_interp_get_imethod (target);
-		if (G_UNLIKELY (!imethod->transformed)) {
+		{
 			ERROR_DECL (error);
-			mono_interp_transform_method (imethod, get_context (), error);
-			if (G_UNLIKELY (!is_ok (error))) {
-				/* A cold callee's first transform failed (cctor threw / unloadable type / bad IL). Deliver it as a
-				 * catchable managed exception via the wasm-JIT throw path instead of mono_error_assert_ok's abort()
-				 * (which kills the worker). Under CPPEH this C++-unwinds and never returns; otherwise it installs
-				 * resume-state and the JITted caller's pending-exception check unwinds. (vcall_resolve_fslot) */
+			if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (target, imethod, error))) {
+				/* A cold callee's first transform/signature/code-type warmup failed (cctor threw / unloadable type /
+				 * bad IL). Deliver it as a catchable managed exception via the wasm-JIT throw path instead of
+				 * mono_error_assert_ok's abort() (which kills the worker). Under CPPEH this C++-unwinds and never
+				 * returns; otherwise it installs resume-state and the JITted caller's pending-exception check unwinds.
+				 * (vcall_resolve_fslot) */
 				extern void mono_wasm_jit_throw (MonoObject *exc);
 				mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
 				return 0;
@@ -4090,8 +4131,10 @@ mono_wasm_jit_endfinally_rethrow (void)
 	/* Defensive: the saved exception was lost (an exotic finally-threw-and-escaped mis-attribution, or the
 	 * save stack overflowed). Re-raise whatever is still in flight, else synthesize a catchable exception, so
 	 * we ALWAYS C++-unwind and never fall into the emitted unreachable -> raw trap -> worker death. */
-	exc = mini_llvmonly_load_exception ();
-	mini_llvmonly_clear_exception ();
+	if (jit_tls->thrown_exc) {
+		exc = mini_llvmonly_load_exception ();
+		mini_llvmonly_clear_exception ();
+	}
 	if (!exc)
 		exc = (MonoObject *) mono_get_exception_execution_engine ("wasm-jit: finally re-raise lost the in-flight exception");
 	mono_wasm_jit_rethrow (exc);

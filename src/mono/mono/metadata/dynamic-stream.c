@@ -11,6 +11,7 @@
 
 #include "mono/metadata/dynamic-stream-internals.h"
 #include "mono/metadata/metadata-internals.h"
+#include "mono/metadata/class-internals.h"   /* mono_loader_lock/unlock */
 #include "mono/utils/checked-build.h"
 #include "mono/utils/mono-error-internals.h"
 #include "object-internals.h"
@@ -45,6 +46,17 @@ make_room_in_stream (MonoDynamicStream *stream, guint32 size)
 	stream->data = (char *)g_realloc (stream->data, stream->alloc_size);
 }
 
+/*
+ * THREAD SAFETY (concurrent Reflection.Emit): these stream mutators are NOT intrinsically safe —
+ * make_room_in_stream() g_realloc()s sh->data, and `sh->index += len` is a non-atomic read-modify-write.
+ * IKVM finishes types on multiple threads into ONE shared MonoDynamicImage (its parallel classloader),
+ * so two threads appending to the same blob/string/us stream concurrently would race: one thread's
+ * realloc frees the buffer the other is mid-memcpy into, corrupting the heap (the smash later surfaces
+ * in an unrelated allocation). We serialize every stream mutation under the LOADER LOCK — the same
+ * recursive, outermost lock the sre.c token functions already hold across their whole emit operation,
+ * so loader-locked callers just nest (no added contention) while any stray path is still serialized.
+ * Reusing the existing emit lock adds no new lock-ordering edge, so it cannot introduce a deadlock.
+ */
 guint32
 mono_dynstream_insert_string (MonoDynamicStream *sh, const char *str)
 {
@@ -54,8 +66,12 @@ mono_dynstream_insert_string (MonoDynamicStream *sh, const char *str)
 	size_t len;
 	gpointer oldkey, oldval;
 
-	if (g_hash_table_lookup_extended (sh->hash, str, &oldkey, &oldval))
+	mono_loader_lock ();
+
+	if (g_hash_table_lookup_extended (sh->hash, str, &oldkey, &oldval)) {
+		mono_loader_unlock ();
 		return GPOINTER_TO_UINT (oldval);
+	}
 
 	len = strlen (str) + 1;
 	idx = sh->index;
@@ -70,6 +86,7 @@ mono_dynstream_insert_string (MonoDynamicStream *sh, const char *str)
 	g_hash_table_insert (sh->hash, g_strdup (str), GUINT_TO_POINTER (idx));
 	memcpy (sh->data + idx, str, len);
 	sh->index += (guint32)len;
+	mono_loader_unlock ();
 	return idx;
 }
 
@@ -94,10 +111,12 @@ mono_dynstream_add_data (MonoDynamicStream *stream, gconstpointer data, guint32 
 
 	guint32 idx;
 
+	mono_loader_lock ();
 	make_room_in_stream (stream, stream->index + len);
 	memcpy (stream->data + stream->index, data, len);
 	idx = stream->index;
 	stream->index += len;
+	mono_loader_unlock ();
 	/*
 	 * align index? Not without adding an additional param that controls it since
 	 * we may store a blob value in pieces.
@@ -112,10 +131,12 @@ mono_dynstream_add_zero (MonoDynamicStream *stream, guint32 len)
 
 	guint32 idx;
 
+	mono_loader_lock ();
 	make_room_in_stream (stream, stream->index + len);
 	memset (stream->data + stream->index, 0, len);
 	idx = stream->index;
 	stream->index += len;
+	mono_loader_unlock ();
 	return idx;
 }
 

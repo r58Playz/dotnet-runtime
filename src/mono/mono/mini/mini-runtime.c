@@ -3046,9 +3046,6 @@ mono_jit_free_method (MonoMethod *method)
 
 	g_assert (method->dynamic);
 
-	if (mono_use_interpreter)
-		mini_get_interp_callbacks ()->free_method (method);
-
 	jit_mm = jit_mm_for_method (method);
 
 	jit_mm_lock (jit_mm);
@@ -3063,6 +3060,16 @@ mono_jit_free_method (MonoMethod *method)
 		g_hash_table_remove (jit_mm->dyn_delegate_info_hash, method);
 	}
 	jit_mm_unlock (jit_mm);
+
+	/* Free the interp method only AFTER the dyn_delegate_info_hash walk above. interp_free_method
+	 * (interp.c) destroys the dynamic method's mempool (dmethod->mp) — which is exactly where those dpairs
+	 * are allocated (mono_create_delegate_trampoline_info -> mono_dyn_method_alloc0). Freeing it first (the
+	 * previous order) made the walk read use-after-freed, mimalloc-poisoned (0xDF) dpairs, tripping the
+	 * `dpair->method == method` assert on every delegate created over a dynamic method (IKVM's
+	 * MethodHandle/LambdaForm machinery hits this constantly). Must stay BEFORE the `if (!ji) return`
+	 * early-out below so interp-only dynamic methods still get their interp resources + mempool freed. */
+	if (mono_use_interpreter)
+		mini_get_interp_callbacks ()->free_method (method);
 
 	ji = mono_dynamic_code_hash_lookup (method);
 	if (!ji)

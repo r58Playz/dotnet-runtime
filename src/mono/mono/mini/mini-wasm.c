@@ -100,7 +100,11 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_island_budget; const char *ib = g_getenv ("MONO_WASM_JIT_ISLAND_BUDGET"); mono_wasm_jit_island_budget = (ib && *ib && atoi (ib) > 0) ? atoi (ib) : 64; } /* Lever C: default 64 */
 	{ extern int mono_wasm_jit_block_promote; const char *bp = g_getenv ("MONO_WASM_JIT_BLOCK_PROMOTE"); mono_wasm_jit_block_promote = (bp && *bp) ? atoi (bp) : 16; } /* Lever C: default 16; 0 disables */
 	{ extern int mono_wasm_jit_vcall_aot; const char *va = g_getenv ("MONO_WASM_JIT_VCALL_AOT"); mono_wasm_jit_vcall_aot = (va && *va && *va != '0') ? 1 : 0; } /* fast AOT-vcall dispatch: 0=off (residual) */
-	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi && *vi != '0') ? 1 : 0; } /* inline vcall IC fast path: 0=off (UNSAFE on threaded builds — placeholder sig mismatch) */
+	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi && *vi != '0') ? 1 : 0;
+#ifndef DISABLE_THREADS
+	  mono_wasm_jit_vcall_inline_ic = 0;
+#endif
+	} /* inline vcall IC fast path: 0=off; force-off on threaded builds (placeholder sig mismatch) */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
@@ -601,8 +605,13 @@ mono_wasm_jit_sync_thread (void)
 		if (!mono_wasm_jit_instantiate_local (wj_reg [synced].e, wj_reg [synced].f, wj_reg [synced].bytes, wj_reg [synced].len, eb, (int) sizeof (eb), &ms)) {
 			/* A module that instantiated fine on the COMPILING thread failed here on another thread:
 			 * names the corruption (e.g. magic-word/type) + which slot, so we can tell a byte-corruption
-			 * (race) apart from a thread-local structural issue. Slot stays a placeholder -> interp. */
+			 * (race) apart from a thread-local structural issue. Slot stays a placeholder -> interp.
+			 * Do NOT advance past the failure: later JITted modules can directly call earlier f-slots, so
+			 * marking later slots live on this thread while an earlier dependency is still a placeholder
+			 * can turn a managed throw into an uncaught call_indirect signature trap. */
 			if (mono_wasm_jit_stats) { char b [256]; snprintf (b, sizeof b, "WASM_JIT_SYNC_FAIL e=%d f=%d len=%d : %s", wj_reg [synced].e, wj_reg [synced].f, wj_reg [synced].len, eb); mono_wasm_jit_log_main (b); }
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_add (WJC_ELAPSED_INSTANTIATION, (gint64) (ms * 1000.0));
+			break;
 		}
 		/* per-thread table-sync instantiation is real compile wall-cost too — fold it into the same timer */
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_add (WJC_ELAPSED_INSTANTIATION, (gint64) (ms * 1000.0));
@@ -740,6 +749,15 @@ mono_wasm_jit_addr_enter (int nbytes)
 void
 mono_wasm_jit_addr_leave (void *base)
 {
+	/* Mirror ref_leave's first-use unwind guard. mono_wasm_jit_invoke_caught snapshots the SP before the
+	 * first JITted invoke on a worker, so the saved base can be NULL. If that invoke allocates the
+	 * addressable-locals stack and then throws, restoring NULL here would leave wj_addr_sp below its real
+	 * base; the next addr_enter/addr load-store would operate near address 0 instead of rewinding to an empty
+	 * stack. Clamp to this thread's actual base. */
+	if (G_UNLIKELY (!base || (guint8 *) base < wj_addr_base))
+		base = wj_addr_base;
+	if (G_UNLIKELY (!base))
+		return;   /* addressable-locals stack was never allocated on this thread */
 	wj_addr_sp = (guint8 *) base;
 }
 
@@ -3301,6 +3319,47 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #else
 						vic = (gpointer) (intptr_t) 0x7ff0;
 #endif
+						/* RECEIVER NULL CHECK — materialize the implicit null check a callvirt relies on. On real
+						 * hardware the vtable load from a null `this` faults; wasm linear-memory address 0 is a
+						 * valid address, so the load silently reads garbage. The interp does this explicitly too
+						 * (MINT_CALLVIRT_FAST: NULL_CHECK(this_arg) before resolving). Without it a null receiver
+						 * flows into mono_wasm_jit_vcall_resolve_fslot, where mono_object_get_virtual_method_internal
+						 * returns NULL and the NULL override is dereferenced -> mono_marshal_get_synchronized_wrapper(NULL)
+						 * aborts (marshal.c g_assert(method)). On null, raise a catchable NullReferenceException
+						 * (exc_id 4) and bail, exactly like OP_COND_EXC. */
+						{
+							WasmFuncType nrt; int nrti = -1, nck;
+							memset (&nrt, 0, sizeof (nrt)); nrt.params [0] = WASM_I32; nrt.nparams = 1; nrt.ret = WASM_VOID;
+							for (nck = 0; nck < nextra; ++nck) if (functype_eq (&extra_types [nck], &nrt)) { nrti = 2 + nck; break; }
+							if (nrti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = nrt; nrti = 2 + nextra++; }
+							uses_calls = TRUE;
+							if (!wasm_ld (&body, &lc, this_vr)) { fail = "vcall nullchk this"; goto done; }
+							wasm_op (&body, WASM_OP_I32_EQZ);
+							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+							wasm_i32_const (&body, 4);   /* NullReferenceException */
+#ifdef HOST_BROWSER
+							{ extern void mono_wasm_jit_raise_corlib (int exc_id); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_raise_corlib); }
+#else
+							wasm_i32_const (&body, 0x7ff8);
+#endif
+							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) nrti); wasm_uleb (&body, 0);
+							{ extern int mono_wasm_jit_cppeh;
+							if (mono_wasm_jit_cppeh) {
+								/* AOT-style: raise_corlib C++-throws and never returns; unwind natively. */
+								wasm_op (&body, WASM_OP_UNREACHABLE);
+							} else {
+								switch (ret_vt) {
+								case WASM_I32: wasm_i32_const (&body, 0); break;
+								case WASM_I64: wasm_i64_const (&body, 0); break;
+								case WASM_F32: wasm_f32_const (&body, 0); break;
+								case WASM_F64: wasm_f64_const (&body, 0); break;
+								default: break;
+								}
+								EMIT_REF_LEAVE ();
+								wasm_op (&body, WASM_OP_RETURN);
+							} }
+							wasm_op (&body, WASM_OP_END);
+						}
 						/* --- INLINE MONOMORPHIC IC FAST PATH (skip the resolve_fslot C helper on a hit) ---
 						 * ~97.8% of MC vcalls hit the IC; each otherwise pays a C call (resolve_fslot: atomic load
 						 * + checks + sync_thread) before the real call_indirect. Do the hit inline in wasm:
