@@ -334,7 +334,22 @@ function cwrap (name: string, returnType: string | null, argTypes: string[] | un
                     "WebAssembly.promising is not available; rebuild with WasmEnableJSPI=false or run in a browser with JSPI support");
                 cached = (<any>WebAssembly).promising(raw);
             }
-            return cached!(...args);
+            const ret = cached!(...args);
+            // INSTRUMENTATION (jit140 silent-worker-death hunt): a wasm trap (RuntimeError) inside a
+            // JSPI-promising export surfaces as a REJECTED promise, not a thrown error. Several callers
+            // of these exports (sync-context pump, async post, finalizer/task fire-and-forget) never
+            // observe the result, so the rejection is swallowed: no console error, the wasm thread is
+            // dead, and the GC then hangs ~20s trying to suspend the now-unresponsive thread. Observe
+            // every rejection HERE (the single promising chokepoint for main thread + every worker) and
+            // log it loudly with the export name + stack so the trap is attributable. We only ATTACH a
+            // logging observer (a separate .then branch) and still return the original promise, so any
+            // caller that does handle the result is unaffected.
+            if (ret && typeof ret.then === "function") {
+                (ret as Promise<any>).then(undefined, (err: any) => {
+                    mono_log_error(`JSPI promising export '${name}' REJECTED — a wasm trap on a suspended stack silently kills this thread (the GC then stalls trying to suspend it): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`);
+                });
+            }
+            return ret;
         };
     }
     return fce;

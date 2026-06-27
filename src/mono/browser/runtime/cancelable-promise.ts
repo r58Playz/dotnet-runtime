@@ -9,7 +9,7 @@ import { createPromiseController, loaderHelpers, mono_assert } from "./globals";
 import { ControllablePromise, GCHandle, MarshalerToCs } from "./types/internal";
 import { ManagedObject } from "./marshal";
 import { compareExchangeI32, forceThreadMemoryViewRefresh } from "./memory";
-import { mono_log_debug } from "./logging";
+import { mono_log_debug, mono_log_error } from "./logging";
 import { complete_task } from "./managed-exports";
 import { marshal_cs_object_to_cs } from "./marshal-to-cs";
 import { invoke_later_when_on_ui_thread_async } from "./invoke-js";
@@ -179,7 +179,7 @@ export class PromiseHolder extends ManagedObject {
             if (WasmEnableJSPI) {
                 // Fire-and-forget under JSPI: the Promise resolves when the wasm side finishes.
                 // We're already inside a Promise resolve/reject callback (no caller to await us).
-                (complete_task(this.gc_handle, reason, data, this.res_converter || marshal_cs_object_to_cs) as Promise<void>).catch(() => { /* swallow */ });
+                (complete_task(this.gc_handle, reason, data, this.res_converter || marshal_cs_object_to_cs) as Promise<void>).catch((err) => mono_log_error(`JSPI complete_task rejected (wasm trap on a suspended stack silently kills this thread): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`));
             } else {
                 complete_task(this.gc_handle, reason, data, this.res_converter || marshal_cs_object_to_cs);
             }

@@ -2895,12 +2895,11 @@ function emit_branch (
                 if (builder.backBranchOffsets.indexOf(destination) >= 0) {
                     // We found a backward branch target we can branch to, so we branch out
                     //  to the top of the loop body
-                    // append_safepoint(builder, ip);
                     if (builder.backBranchTraceLevel > 1)
                         mono_log_info(`0x${(<any>ip).toString(16)} performing backward branch to 0x${destination.toString(16)}`);
                     if (isCallHandler)
                         append_call_handler_store_ret_ip(builder, ip, frame, opcode);
-                    builder.cfg.branch(destination, true, CfgBranchType.Unconditional);
+                    builder.cfg.branch(destination, true, CfgBranchType.SafepointUnconditional);
                     modifyCounter(JiterpCounter.BackBranchesEmitted, 1);
                     return true;
                 } else {

@@ -3284,13 +3284,17 @@ reflection_methodbuilder_to_mono_method (MonoClass *klass,
 					}
 					assembly = (MonoDynamicImage*)klass->image;
 					idx = mono_dynimage_encode_constant (assembly, pb->def_value, &def_type);
-					/* Copy the data from the blob since it might get realloc-ed */
+					/* Copy the data from the blob since it might get realloc-ed — including by ANOTHER
+					 * thread baking a type into the same dynamic image (IKVM parallel class finish). The
+					 * blob mutators take the loader lock, so hold it across the read+copy here too. */
+					mono_loader_lock ();
 					p = assembly->blob.data + idx;
 					len = mono_metadata_decode_blob_size (p, &p2);
 					len += GPTRDIFF_TO_UINT32 (p2 - p);
 					method_aux->param_defaults [i] = (uint8_t *)image_g_malloc (image, len);
 					method_aux->param_default_types [i] = def_type;
 					memcpy ((gpointer)method_aux->param_defaults [i], p, len);
+					mono_loader_unlock ();
 				}
 
 				if (pb->name) {
@@ -3680,10 +3684,14 @@ static gint32
 modulebuilder_get_next_table_index (MonoReflectionModuleBuilder *mb, gint32 table, gint32 num_fields, MonoError *error)
 {
 	error_init (error);
+	mono_monitor_enter_internal ((MonoObject *) mb);
 
 	if (mb->table_indexes == NULL) {
 		MonoArray *arr = mono_array_new_checked (mono_defaults.int_class, 64, error);
-		return_val_if_nok (error, 0);
+		if (!is_ok (error)) {
+			mono_monitor_exit_internal ((MonoObject *) mb);
+			return 0;
+		}
 		for (int i = 0; i < 64; i++) {
 			mono_array_set_internal (arr, int, i, 1);
 		}
@@ -3692,6 +3700,7 @@ modulebuilder_get_next_table_index (MonoReflectionModuleBuilder *mb, gint32 tabl
 	gint32 index = mono_array_get_internal (mb->table_indexes, gint32, table);
 	gint32 next_index = index + num_fields;
 	mono_array_set_internal (mb->table_indexes, gint32, table, next_index);
+	mono_monitor_exit_internal ((MonoObject *) mb);
 	return index;
 }
 
@@ -3770,12 +3779,15 @@ typebuilder_setup_one_field (MonoDynamicImage *dynamic_image, MonoClass *klass, 
 			MonoDynamicImage *assembly = (MonoDynamicImage*)klass->image;
 			field->type->attrs |= FIELD_ATTRIBUTE_HAS_DEFAULT;
 			idx = mono_dynimage_encode_constant (assembly, MONO_HANDLE_RAW (ref_def_value), &def_value_out->def_type);
-			/* Copy the data from the blob since it might get realloc-ed */
+			/* Copy the data from the blob since it might get realloc-ed — incl. by a concurrent emit
+			 * thread (see the blob mutators in dynamic-stream.c); hold the loader lock across read+copy. */
+			mono_loader_lock ();
 			p = assembly->blob.data + idx;
 			len = mono_metadata_decode_blob_size (p, &p2);
 			len += GPTRDIFF_TO_UINT32 (p2 - p);
 			def_value_out->data = (const char *)mono_image_alloc (image, len);
 			memcpy ((gpointer)def_value_out->data, p, len);
+			mono_loader_unlock ();
 		}
 
 		MonoObjectHandle field_builder_handle = MONO_HANDLE_CAST (MonoObject, ref_fb);
@@ -3884,12 +3896,15 @@ typebuilder_setup_properties (MonoClass *klass, MonoError *error)
 				info->def_values = image_g_new0 (image, MonoFieldDefaultValue, info->count);
 			properties [i].attrs |= PROPERTY_ATTRIBUTE_HAS_DEFAULT;
 			idx = mono_dynimage_encode_constant (assembly, pb->def_value, &info->def_values [i].def_type);
-			/* Copy the data from the blob since it might get realloc-ed */
+			/* Copy the data from the blob since it might get realloc-ed — incl. by a concurrent emit
+			 * thread (see the blob mutators in dynamic-stream.c); hold the loader lock across read+copy. */
+			mono_loader_lock ();
 			p = assembly->blob.data + idx;
 			len = mono_metadata_decode_blob_size (p, &p2);
 			len += GPTRDIFF_TO_UINT32 (p2 - p);
 			info->def_values [i].data = (const char *)mono_image_alloc (image, len);
 			memcpy ((gpointer)info->def_values [i].data, p, len);
+			mono_loader_unlock ();
 		}
 	}
 }

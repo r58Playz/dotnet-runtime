@@ -21,6 +21,7 @@
 #include "mono/metadata/dynamic-stream-internals.h"
 #include "mono/metadata/gc-internals.h"
 #include "mono/metadata/metadata-internals.h"
+#include "mono/metadata/class-internals.h"   /* mono_loader_lock/unlock */
 #include "mono/metadata/mono-hash-internals.h"
 #include "mono/metadata/profiler-private.h"
 #include "mono/metadata/reflection-internals.h"
@@ -444,6 +445,12 @@ mono_dynimage_alloc_table (MonoDynamicTable *table, guint nrows)
 {
 	MONO_REQ_GC_NEUTRAL_MODE;
 
+	/* Serialize under the loader lock like the stream mutators (see dynamic-stream.c): g_renew can MOVE
+	 * table->values, and the sre.c callers compute `values = table->values + row*cols` then write the row
+	 * through it — a concurrent emit thread reallocating this table would leave that pointer dangling.
+	 * The token functions already hold the loader lock across the whole alloc-row+write sequence, so this
+	 * recursive acquire is a no-op for them and serializes any other path that grows the same table. */
+	mono_loader_lock ();
 	table->rows = nrows;
 	g_assert (table->columns);
 	if (nrows + 1 >= table->alloc_rows) {
@@ -456,6 +463,7 @@ mono_dynimage_alloc_table (MonoDynamicTable *table, guint nrows)
 
 		table->values = (guint32 *)g_renew (guint32, table->values, (table->alloc_rows) * table->columns);
 	}
+	mono_loader_unlock ();
 }
 
 

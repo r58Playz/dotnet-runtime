@@ -40,6 +40,7 @@ using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace System.Reflection.Emit
 {
@@ -230,47 +231,56 @@ namespace System.Reflection.Emit
 
         private void AddType(RuntimeTypeBuilder tb)
         {
-            if (types != null)
+            lock (this)
             {
-                if (types.Length == num_types)
+                if (types != null)
                 {
-                    RuntimeTypeBuilder[] new_types = new RuntimeTypeBuilder[types.Length * 2];
-                    Array.Copy(types, new_types, num_types);
-                    types = new_types;
+                    if (types.Length == num_types)
+                    {
+                        RuntimeTypeBuilder[] new_types = new RuntimeTypeBuilder[types.Length * 2];
+                        Array.Copy(types, new_types, num_types);
+                        types = new_types;
+                    }
                 }
+                else
+                {
+                    types = new RuntimeTypeBuilder[1];
+                }
+
+                types[num_types] = tb;
+                num_types++;
             }
-            else
-            {
-                types = new RuntimeTypeBuilder[1];
-            }
-            types[num_types] = tb;
-            num_types++;
         }
 
         private RuntimeTypeBuilder DefineType(string name, TypeAttributes attr, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] Type? parent, Type[]? interfaces, PackingSize packingSize, int typesize)
         {
             Debug.Assert(name is not null);
             ITypeIdentifier ident = TypeIdentifiers.FromInternal(name);
-            if (name_cache.ContainsKey(ident))
-                throw new ArgumentException(SR.Argument_DuplicateTypeName);
-            RuntimeTypeBuilder res = new RuntimeTypeBuilder(this, name, attr, parent, interfaces, packingSize, typesize, null);
-            AddType(res);
-
-            name_cache.Add(ident, res);
-
-            return res;
+            lock (this)
+            {
+                if (name_cache.ContainsKey(ident))
+                    throw new ArgumentException(SR.Argument_DuplicateTypeName);
+                RuntimeTypeBuilder res = new RuntimeTypeBuilder(this, name, attr, parent, interfaces, packingSize, typesize, null);
+                AddType(res);
+                name_cache.Add(ident, res);
+                return res;
+            }
         }
 
         internal void RegisterTypeName(RuntimeTypeBuilder tb, ITypeName name)
         {
-            name_cache.Add(name, tb);
+            lock (this)
+                name_cache.Add(name, tb);
         }
 
         internal RuntimeTypeBuilder? GetRegisteredType(ITypeName name)
         {
-            RuntimeTypeBuilder? result;
-            name_cache.TryGetValue(name, out result);
-            return result;
+            lock (this)
+            {
+                RuntimeTypeBuilder? result;
+                name_cache.TryGetValue(name, out result);
+                return result;
+            }
         }
 
         protected override TypeBuilder DefineTypeCore(string name, TypeAttributes attr, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] Type? parent, Type[]? interfaces, PackingSize packingSize, int typesize)
@@ -286,14 +296,17 @@ namespace System.Reflection.Emit
         protected override EnumBuilder DefineEnumCore(string name, TypeAttributes visibility, Type underlyingType)
         {
             ITypeIdentifier ident = TypeIdentifiers.FromInternal(name);
-            if (name_cache.ContainsKey(ident))
-                throw new ArgumentException(SR.Argument_DuplicateTypeName);
+            lock (this)
+            {
+                if (name_cache.ContainsKey(ident))
+                    throw new ArgumentException(SR.Argument_DuplicateTypeName);
 
-            RuntimeEnumBuilder eb = new RuntimeEnumBuilder(this, name, visibility, underlyingType);
-            RuntimeTypeBuilder res = eb.GetTypeBuilder();
-            AddType(res);
-            name_cache.Add(ident, res);
-            return eb;
+                RuntimeEnumBuilder eb = new RuntimeEnumBuilder(this, name, visibility, underlyingType);
+                RuntimeTypeBuilder res = eb.GetTypeBuilder();
+                AddType(res);
+                name_cache.Add(ident, res);
+                return eb;
+            }
         }
 
         [RequiresUnreferencedCode("Types might be removed by trimming. If the type name is a string literal, consider using Type.GetType instead.")]
@@ -412,18 +425,21 @@ namespace System.Reflection.Emit
 
         internal int get_next_table_index(int table, int count)
         {
-            if (table_indexes == null)
+            lock (this)
             {
-                table_indexes = new int[64];
-                for (int i = 0; i < 64; ++i)
-                    table_indexes[i] = 1;
-                /* allow room for .<Module> in TypeDef table */
-                table_indexes[0x02] = 2;
+                if (table_indexes == null)
+                {
+                    table_indexes = new int[64];
+                    for (int i = 0; i < 64; ++i)
+                        table_indexes[i] = 1;
+                    /* allow room for .<Module> in TypeDef table */
+                    table_indexes[0x02] = 2;
+                }
+                // Console.WriteLine ("getindex for table "+table.ToString()+" got "+table_indexes [table].ToString());
+                int index = table_indexes[table];
+                table_indexes[table] += count;
+                return index;
             }
-            // Console.WriteLine ("getindex for table "+table.ToString()+" got "+table_indexes [table].ToString());
-            int index = table_indexes[table];
-            table_indexes[table] += count;
-            return index;
         }
 
         protected override void SetCustomAttributeCore(ConstructorInfo con, ReadOnlySpan<byte> binaryAttribute)
@@ -551,14 +567,17 @@ namespace System.Reflection.Emit
 
         internal int GetToken(string str)
         {
-            int result;
-            if (!us_string_cache.TryGetValue(str, out result))
+            lock (this)
             {
-                result = getUSIndex(this, str);
-                us_string_cache[str] = result;
-            }
+                int result;
+                if (!us_string_cache.TryGetValue(str, out result))
+                {
+                    result = getUSIndex(this, str);
+                    us_string_cache[str] = result;
+                }
 
-            return result;
+                return result;
+            }
         }
 
         private static int typeref_tokengen = 0x01ffffff;
@@ -577,73 +596,76 @@ namespace System.Reflection.Emit
         //
         private int GetPseudoToken(MemberInfo member, bool create_open_instance)
         {
-            int token;
-            Dictionary<MemberInfo, int>? dict = create_open_instance ? inst_tokens_open : inst_tokens;
-            if (dict == null)
+            lock (this)
             {
-                dict = new Dictionary<MemberInfo, int>(ReferenceEqualityComparer.Instance);
-                if (create_open_instance)
-                    inst_tokens_open = dict;
-                else
-                    inst_tokens = dict;
-            }
-            else if (dict.TryGetValue(member, out token))
-            {
-                return token;
-            }
+                int token;
+                Dictionary<MemberInfo, int>? dict = create_open_instance ? inst_tokens_open : inst_tokens;
+                if (dict == null)
+                {
+                    dict = new Dictionary<MemberInfo, int>(ReferenceEqualityComparer.Instance);
+                    if (create_open_instance)
+                        inst_tokens_open = dict;
+                    else
+                        inst_tokens = dict;
+                }
+                else if (dict.TryGetValue(member, out token))
+                {
+                    return token;
+                }
 
-            // Count backwards to avoid collisions with the tokens
-            // allocated by the runtime
-            if (member is TypeBuilderInstantiation || member is SymbolType)
-                token = typespec_tokengen--;
-            else if (member is FieldOnTypeBuilderInstantiation)
-                token = memberref_tokengen--;
-            else if (member is ConstructorOnTypeBuilderInstantiation)
-                token = memberref_tokengen--;
-            else if (member is MethodOnTypeBuilderInstantiation)
-                token = memberref_tokengen--;
-            else if (member is FieldBuilder)
-                token = memberref_tokengen--;
-            else if (member is TypeBuilder tb)
-            {
-                if (create_open_instance && tb.ContainsGenericParameters)
-                    token = typespec_tokengen--;
-                else if (member.Module == this)
-                    token = typedef_tokengen--;
+                // Count backwards to avoid collisions with the tokens
+                // allocated by the runtime
+                if (member is TypeBuilderInstantiation || member is SymbolType)
+                    token = Interlocked.Decrement(ref typespec_tokengen) + 1;
+                else if (member is FieldOnTypeBuilderInstantiation)
+                    token = Interlocked.Decrement(ref memberref_tokengen) + 1;
+                else if (member is ConstructorOnTypeBuilderInstantiation)
+                    token = Interlocked.Decrement(ref memberref_tokengen) + 1;
+                else if (member is MethodOnTypeBuilderInstantiation)
+                    token = Interlocked.Decrement(ref memberref_tokengen) + 1;
+                else if (member is FieldBuilder)
+                    token = Interlocked.Decrement(ref memberref_tokengen) + 1;
+                else if (member is TypeBuilder tb)
+                {
+                    if (create_open_instance && tb.ContainsGenericParameters)
+                        token = Interlocked.Decrement(ref typespec_tokengen) + 1;
+                    else if (member.Module == this)
+                        token = Interlocked.Decrement(ref typedef_tokengen) + 1;
+                    else
+                        token = Interlocked.Decrement(ref typeref_tokengen) + 1;
+                }
+                else if (member is RuntimeEnumBuilder eb)
+                {
+                    token = GetPseudoToken(eb.GetTypeBuilder(), create_open_instance);
+                    dict[member] = token;
+                    // n.b. don't register with the runtime, the TypeBuilder already did it.
+                    return token;
+                }
+                else if (member is RuntimeConstructorBuilder cb)
+                {
+                    if (member.Module == this && !cb.TypeBuilder.ContainsGenericParameters)
+                        token = Interlocked.Decrement(ref methoddef_tokengen) + 1;
+                    else
+                        token = Interlocked.Decrement(ref memberref_tokengen) + 1;
+                }
+                else if (member is RuntimeMethodBuilder mb)
+                {
+                    if (member.Module == this && !mb.TypeBuilder.ContainsGenericParameters && !mb.IsGenericMethodDefinition)
+                        token = Interlocked.Decrement(ref methoddef_tokengen) + 1;
+                    else
+                        token = Interlocked.Decrement(ref memberref_tokengen) + 1;
+                }
+                else if (member is GenericTypeParameterBuilder)
+                {
+                    token = Interlocked.Decrement(ref typespec_tokengen) + 1;
+                }
                 else
-                    token = typeref_tokengen--;
-            }
-            else if (member is RuntimeEnumBuilder eb)
-            {
-                token = GetPseudoToken(eb.GetTypeBuilder(), create_open_instance);
+                    throw new NotImplementedException();
+
                 dict[member] = token;
-                // n.b. don't register with the runtime, the TypeBuilder already did it.
+                RegisterToken(member, token);
                 return token;
             }
-            else if (member is RuntimeConstructorBuilder cb)
-            {
-                if (member.Module == this && !cb.TypeBuilder.ContainsGenericParameters)
-                    token = methoddef_tokengen--;
-                else
-                    token = memberref_tokengen--;
-            }
-            else if (member is RuntimeMethodBuilder mb)
-            {
-                if (member.Module == this && !mb.TypeBuilder.ContainsGenericParameters && !mb.IsGenericMethodDefinition)
-                    token = methoddef_tokengen--;
-                else
-                    token = memberref_tokengen--;
-            }
-            else if (member is GenericTypeParameterBuilder)
-            {
-                token = typespec_tokengen--;
-            }
-            else
-                throw new NotImplementedException();
-
-            dict[member] = token;
-            RegisterToken(member, token);
-            return token;
         }
 
         internal int GetToken(MemberInfo member)
@@ -746,7 +768,8 @@ namespace System.Reflection.Emit
 
         internal void CreateGlobalType()
         {
-            global_type ??= new RuntimeTypeBuilder(this, 0, 1, true);
+            lock (this)
+                global_type ??= new RuntimeTypeBuilder(this, 0, 1, true);
         }
 
         public override Assembly Assembly

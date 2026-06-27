@@ -167,7 +167,7 @@ export function teardown_managed_proxy (owner: any, gc_handle: GCHandle, skipMan
             if (WasmEnableJSPI) {
                 // Fire-and-forget under JSPI: finalization runs on the wasm-suspending stack but
                 // callers (FinalizationRegistry) are synchronous JS callbacks that can't await.
-                (release_js_owned_object_by_gc_handle(gc_handle) as Promise<void>).catch(() => { /* swallow */ });
+                (release_js_owned_object_by_gc_handle(gc_handle) as Promise<void>).catch((err) => mono_log_warn(`JSPI release_js_owned_object_by_gc_handle rejected (wasm trap on a suspended stack silently kills this thread): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`));
             } else {
                 release_js_owned_object_by_gc_handle(gc_handle);
             }
