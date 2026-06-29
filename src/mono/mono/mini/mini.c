@@ -3310,6 +3310,16 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 			cfg->compile_wasm = TRUE;
 			cfg->compile_llvm = FALSE;
 			try_llvm = FALSE;
+			/* CRITICAL: force EXPLICIT null checks. explicit_null_checks was decided above (from
+			 * backend->explicit_null_checks / JIT_FLAG_EXPLICIT_NULL_CHECKS) BEFORE this compile_wasm fork,
+			 * and may be FALSE — in which case MONO_EMIT_NULL_CHECK takes the implicit (fault-based) path and
+			 * the wasm backend emits a RAW load/store. On wasm, linear-memory address 0 is VALID, so a deref
+			 * of a null reference does NOT fault — it reads/writes low memory => silent random corruption
+			 * (the "later OOB / ClassCastException / dlmalloc-metadata" symptoms). Forcing explicit checks
+			 * routes every null check through OP_COMPARE_IMM + OP_COND_EXC(EQ, NullReferenceException), which
+			 * the wasm backend lowers to a real compare + catchable throw (or bails the method to interp). */
+			cfg->explicit_null_checks = TRUE;
+			cfg->disable_llvm_implicit_null_checks = TRUE;
 			/* Disable IR optimizations: the wasm backend reads call->args directly at codegen,
 			 * but copyprop/etc. (which assume a native/LLVM emit_call consumes them) mangle the
 			 * call-arg vregs. opt=0 keeps the explicit arg-setup moves so calls lower correctly. */

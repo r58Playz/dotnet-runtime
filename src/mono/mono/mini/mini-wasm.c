@@ -77,6 +77,7 @@ mono_wasm_jit_auto_init (void)
 	 * logging floods): 0=silent (default), 1=+registered/invalid, 2=+bail, 3=+emit-enter. The 23k-line log
 	 * came from these firing whenever stats was on; the aggregated bail histogram replaces them at level 0. */
 	{ extern int mono_wasm_jit_verbose; const char *vb = g_getenv ("MONO_WASM_JIT_VERBOSE"); mono_wasm_jit_verbose = (vb && *vb) ? atoi (vb) : 0; }
+	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm && *nm != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_virtual; const char *v = g_getenv ("MONO_WASM_JIT_VIRTUAL"); mono_wasm_jit_virtual = (v && *v && *v == '0') ? 0 : 1; } /* 0 = bail virtual calls (revert to whole-method interp); default on */
 	{ extern int mono_wasm_jit_vcall_ic; const char *c = g_getenv ("MONO_WASM_JIT_VCALL_IC"); mono_wasm_jit_vcall_ic = (c && *c && *c == '0') ? 0 : 1; } /* 0 = disable the virtual resolve cache (always resolve) */
@@ -99,7 +100,15 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_island_depth; const char *id = g_getenv ("MONO_WASM_JIT_ISLAND_DEPTH"); mono_wasm_jit_island_depth = (id && *id && atoi (id) > 0) ? atoi (id) : 10; }   /* Lever C: default 10 */
 	{ extern int mono_wasm_jit_island_budget; const char *ib = g_getenv ("MONO_WASM_JIT_ISLAND_BUDGET"); mono_wasm_jit_island_budget = (ib && *ib && atoi (ib) > 0) ? atoi (ib) : 64; } /* Lever C: default 64 */
 	{ extern int mono_wasm_jit_block_promote; const char *bp = g_getenv ("MONO_WASM_JIT_BLOCK_PROMOTE"); mono_wasm_jit_block_promote = (bp && *bp) ? atoi (bp) : 16; } /* Lever C: default 16; 0 disables */
+	{ extern int mono_wasm_jit_promotion_drain; const char *pd = g_getenv ("MONO_WASM_JIT_PROMOTION_DRAIN"); mono_wasm_jit_promotion_drain = (pd && *pd && atoi (pd) > 0) ? atoi (pd) : 8; }
+	{ extern int mono_wasm_jit_retry_retain_pct; const char *rr = g_getenv ("MONO_WASM_JIT_RETRY_RETAIN_PCT"); mono_wasm_jit_retry_retain_pct = (rr && *rr) ? atoi (rr) : 75; if (mono_wasm_jit_retry_retain_pct < 0) mono_wasm_jit_retry_retain_pct = 0; else if (mono_wasm_jit_retry_retain_pct > 99) mono_wasm_jit_retry_retain_pct = 99; }
+	{ extern int mono_wasm_jit_island_cold_div; const char *cd = g_getenv ("MONO_WASM_JIT_ISLAND_COLD_DIV"); mono_wasm_jit_island_cold_div = (cd && *cd && atoi (cd) > 0) ? atoi (cd) : 4; }
+	{ extern int mono_wasm_jit_promoted_cold_div; const char *pc = g_getenv ("MONO_WASM_JIT_PROMOTED_COLD_DIV"); mono_wasm_jit_promoted_cold_div = (pc && *pc && atoi (pc) > 0) ? atoi (pc) : 16; }
+	{ extern int mono_wasm_jit_promoted_root_uncold_depth; const char *pu = g_getenv ("MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH"); mono_wasm_jit_promoted_root_uncold_depth = (pu && *pu && atoi (pu) >= 0) ? atoi (pu) : 1; }
+	{ extern int mono_wasm_jit_block_force; const char *bf = g_getenv ("MONO_WASM_JIT_BLOCK_FORCE"); mono_wasm_jit_block_force = (bf && *bf) ? atoi (bf) : 4; }
 	{ extern int mono_wasm_jit_vcall_aot; const char *va = g_getenv ("MONO_WASM_JIT_VCALL_AOT"); mono_wasm_jit_vcall_aot = (va && *va && *va != '0') ? 1 : 0; } /* fast AOT-vcall dispatch: 0=off (residual) */
+	{ extern int mono_wasm_jit_storeguard; const char *sg = g_getenv ("MONO_WASM_JIT_STOREGUARD"); mono_wasm_jit_storeguard = (sg && *sg && *sg != '0') ? 1 : 0; } /* DEBUG: bounds-check every ref/addr-frame store to catch the wild store (traps at the culprit). default off */
+	{ extern int mono_wasm_jit_pinall; const char *pn = g_getenv ("MONO_WASM_JIT_PINALL"); mono_wasm_jit_pinall = (pn && *pn && *pn != '0') ? 1 : 0; } /* DEBUG TEST: route EVERY i32 vreg to the GC-pinning ref shadow stack. If the random corruption stops, a ref vreg was being missed by the isref inference. SLOW. default off */
 	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi && *vi != '0') ? 1 : 0;
 #ifndef DISABLE_THREADS
 	  mono_wasm_jit_vcall_inline_ic = 0;
@@ -153,6 +162,7 @@ mono_wasm_jit_max (int idx, gint64 v)
 /* Per-method emit LOG verbosity (MONO_WASM_JIT_VERBOSE), independent of the counters: 0 silent, 1
  * registered+invalid, 2 +bail, 3 +emit-enter. Default 0 so a stats run no longer floods stdout. */
 int mono_wasm_jit_verbose = 0;
+int mono_wasm_jit_names = 0;   /* MONO_WASM_JIT_NAMES=1 emits a wasm name section per JITted module so traps self-symbolicate */
 
 /* Aggregated bail-reason histogram (Part 4): the per-method WASM_JIT_BAIL lines (7028 of them in the
  * jit121 capture) buried the signal — 151 ldaddr, 47 EH. This rolls every bail into category buckets +
@@ -224,6 +234,12 @@ int mono_wasm_jit_residual_perm = 0;   /* Lever B: MONO_WASM_JIT_RESIDUAL_PERM=1
 int mono_wasm_jit_island_depth = 10;   /* Lever C: MONO_WASM_JIT_ISLAND_DEPTH — max island DFS depth (was a fixed 10). */
 int mono_wasm_jit_island_budget = 64;  /* Lever C: MONO_WASM_JIT_ISLAND_BUDGET — max force-compiles per island attempt (was a fixed 64). */
 int mono_wasm_jit_block_promote = 16;  /* Lever C: MONO_WASM_JIT_BLOCK_PROMOTE — pull a cold callee into an island once it has BLOCKED >= N island attempts (block_n), even if its own hit count is low (it's hot via JITted callers). 0 = disable (cold gate is hits-only). The bench showed top blockers ~100, so the old thresh/4 (=500) never fired — 16 catches the hot ctors. */
+int mono_wasm_jit_promotion_drain = 8; /* MONO_WASM_JIT_PROMOTION_DRAIN — max queued caller promotions drained per safe point. Higher values reduce backlog when ENTRY_PROMOTE is active. */
+int mono_wasm_jit_retry_retain_pct = 75; /* MONO_WASM_JIT_RETRY_RETAIN_PCT — on a retriable island failure, retain this percentage of the threshold worth of hits instead of restarting from zero. */
+int mono_wasm_jit_island_cold_div = 4; /* MONO_WASM_JIT_ISLAND_COLD_DIV — normal cold gate divisor for eager island callees; thresh/div is the minimum retained hit count. */
+int mono_wasm_jit_promoted_cold_div = 16; /* MONO_WASM_JIT_PROMOTED_COLD_DIV — looser cold gate divisor when force-JITing an upward-promoted caller. */
+int mono_wasm_jit_promoted_root_uncold_depth = 1; /* MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH — for promoted roots, skip the cold gate entirely through this DFS depth. */
+int mono_wasm_jit_block_force = 4; /* MONO_WASM_JIT_BLOCK_FORCE — queue a blocking callee for direct promotion once it has blocked this many island attempts. 0 disables. */
 /* MONO_WASM_JIT_VCALL_AOT=1: when a JITted method's virtual call resolves to an AOT-backed override (the
  * vcall_resolve_fslot f-slot miss — the dominant steady-state residual, ~98% "aot-backed" in the bench),
  * call_indirect the override's AOT body DIRECTLY (this+args+rgctx, same native ABI the inline-AOT direct
@@ -357,20 +373,6 @@ mono_wasm_jit_llvmonly_enabled (void)
 }
 
 #ifdef HOST_BROWSER
-/* Forward a bring-up diagnostic line to the UI-thread console. Worker stdout/stderr (printf,
- * g_printerr) is NOT surfaced to the page, and g_printerr is compiled out in release; managed
- * Console.WriteLine reaches main via a separate path. Mirror the consumer's log forwarder:
- * strdup + async proxy to the main thread, which frees the copy after logging. */
-void
-mono_wasm_jit_log_main (const char *msg)
-{
-	/* worker stdout (reaches the DevTools worker console). No main-thread proxy: on real workloads
-	 * the JIT emits thousands of lines and the cross-thread MAIN_THREAD_ASYNC_EM_ASM console.log
-	 * proxy floods the UI-thread task queue, dominating boot time. */
-	printf ("%s\n", msg);
-	fflush (stdout);
-}
-
 /* Single bench getter (analog of the jiterpreter's mono_jiterp_get_counter): the consumer's
  * heat-snapshot harness reads each counter by its WJC_* index via Module._mono_wasm_jit_get_counter().
  * Returns a double so the harness gets exact values past 2^53 isn't a concern at bench scale (and JS
@@ -609,7 +611,11 @@ mono_wasm_jit_sync_thread (void)
 			 * Do NOT advance past the failure: later JITted modules can directly call earlier f-slots, so
 			 * marking later slots live on this thread while an earlier dependency is still a placeholder
 			 * can turn a managed throw into an uncaught call_indirect signature trap. */
-			if (mono_wasm_jit_stats) { char b [256]; snprintf (b, sizeof b, "WASM_JIT_SYNC_FAIL e=%d f=%d len=%d : %s", wj_reg [synced].e, wj_reg [synced].f, wj_reg [synced].len, eb); mono_wasm_jit_log_main (b); }
+			/* UNCONDITIONAL (rate-limited): a sync break is rare but is THE cause of the per-thread placeholder
+			 * call_indirect traps (a self-compiled method whose slot is live runs while an earlier dependency,
+			 * held back past this break, is still a jiterpreter placeholder). It was previously stats-gated, so
+			 * the break was invisible without MONO_WASM_JIT_STATS. Always surface it + the JS error string. */
+			{ static int _sf = 0; if (_sf++ < 60) printf ("WASM_JIT_SYNC_FAIL idx=%d/%d e=%d f=%d len=%d : %s\n", synced, wj_reg_n, wj_reg [synced].e, wj_reg [synced].f, wj_reg [synced].len, eb); }
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_add (WJC_ELAPSED_INSTANTIATION, (gint64) (ms * 1000.0));
 			break;
 		}
@@ -723,6 +729,36 @@ mono_wasm_jit_ref_sp_save (void)
 static __thread guint8 *wj_addr_base = NULL;
 static __thread guint8 *wj_addr_sp   = NULL;
 static __thread guint8 *wj_addr_end  = NULL;
+
+/* MONO_WASM_JIT_STOREGUARD: 1 = emit a bounds-check call_indirect before every ref-shadow-stack / addr-frame
+ * store. DEBUG ONLY (a C call per such store); used to catch the wild store that scribbles random in-bounds
+ * C-heap (the arenas are g_malloc'd, so an overrun via a drifted base hits neighbours like the marshal cache
+ * / jiterp tlqueue). Default off. */
+int mono_wasm_jit_storeguard = 0;
+/* MONO_WASM_JIT_PINALL: 1 = mark EVERY i32 vreg as a reference so it is routed to the GC-scanned (pinning)
+ * ref shadow stack instead of a GC-invisible wasm local. Over-marking a non-ref i32 is harmless (it just
+ * conservatively pins whatever the value points at). DEBUG TEST to confirm/refute a missed-ref coverage gap
+ * as the corruption source. Very slow (every int op hits memory). Default off. */
+int mono_wasm_jit_pinall = 0;
+
+/* Called (when storeguard is on) right before a ref-shadow-stack (kind 0) or addr-frame (kind 1) store, with
+ * the computed target address. If the address is outside this thread's arena — the signature of an
+ * enter/leave imbalance on an EH unwind drifting the base past the region, or a corrupted base — trap HERE so
+ * the (MONO_WASM_JIT_NAMES-symbolicated) wasm stack trace names the JITted method doing the wild store,
+ * instead of the random downstream OOB. */
+void
+mono_wasm_jit_check_store (guint8 *addr, int kind)
+{
+	guint8 *lo, *hi;
+	if (kind == 0) { lo = (guint8 *) wj_ref_base; hi = (guint8 *) wj_ref_end; }
+	else           { lo = wj_addr_base;           hi = wj_addr_end; }
+	if (G_UNLIKELY (!lo || addr < lo || addr >= hi)) {
+		printf ("WASM_JIT_WILD_STORE kind=%d addr=%p arena=[%p,%p) ref_sp=%p addr_sp=%p — storing method in the trap below:\n",
+			kind, (void *) addr, (void *) lo, (void *) hi, (void *) wj_ref_sp, (void *) wj_addr_sp);
+		fflush (stdout);
+		__builtin_trap ();   /* deliberate: the symbolicated wasm trace names the culprit method */
+	}
+}
 
 /* Reserve nbytes of addressable-locals frame; returns the frame base. Lazily allocates this thread's
  * frame stack on first use. Zeroes the reserved bytes (locals are zero-init). */
@@ -1196,6 +1232,11 @@ typedef struct {
 	int addrbase;
 	WasmValtype *vt;
 	int addr_tmp [4];
+	/* MONO_WASM_JIT_STOREGUARD debug assert: when storeguard != 0, every ref-shadow-stack / addr-frame
+	 * store is preceded by a call_indirect to mono_wasm_jit_check_store(addr, kind) (functype index
+	 * check_ti = (i32,i32)->void) that traps if the target is outside this thread's arena. */
+	int storeguard;
+	int check_ti;
 } WjCtx;
 
 /* Emit a memory load/store of an addressable local (addrslot[vreg] >= 0), at addrbase + offset, using the
@@ -1242,6 +1283,18 @@ wasm_addr_st (WasmBuf *b, WjCtx *c, int vreg)
 	default: return FALSE;
 	}
 	wasm_op_local (b, WASM_OP_LOCAL_SET, (guint32) c->addr_tmp [g]);
+#ifdef HOST_BROWSER
+	if (G_UNLIKELY (c->storeguard)) {
+		/* check_store(addrbase + off, 1) before the store (STOREGUARD; arenas+helper are HOST_BROWSER) */
+		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->addrbase);
+		wasm_i32_const (b, (gint32) off);
+		wasm_op (b, WASM_OP_I32_ADD);
+		wasm_i32_const (b, 1);
+		wasm_i32_const (b, (gint32) (intptr_t) mono_wasm_jit_check_store);
+		wasm_op (b, WASM_OP_CALL_INDIRECT); wasm_uleb (b, (guint32) c->check_ti); wasm_uleb (b, 0);
+	}
+#endif
 	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->addrbase);
 	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->addr_tmp [g]);
 	wasm_op (b, sop); wasm_memarg (b, (guint32) al, off);
@@ -1294,6 +1347,18 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		/* reference vreg: store the value (already on the wasm stack) to the ref shadow stack.
 		 * i32.store wants [addr, val] but val is on top, so stash it via rtmp then push addr+val. */
 		wasm_op_local (b, WASM_OP_LOCAL_SET, (guint32) c->rtmp);
+#ifdef HOST_BROWSER
+		if (G_UNLIKELY (c->storeguard)) {
+			/* check_store(refbase + slot*4, 0) before the store (STOREGUARD; arenas+helper are HOST_BROWSER) */
+			extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+			wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
+			wasm_i32_const (b, (gint32) (c->refslot [vreg] * 4));
+			wasm_op (b, WASM_OP_I32_ADD);
+			wasm_i32_const (b, 0);
+			wasm_i32_const (b, (gint32) (intptr_t) mono_wasm_jit_check_store);
+			wasm_op (b, WASM_OP_CALL_INDIRECT); wasm_uleb (b, (guint32) c->check_ti); wasm_uleb (b, 0);
+		}
+#endif
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->rtmp);
 		wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, (guint32) (c->refslot [vreg] * 4));
@@ -1355,7 +1420,7 @@ void
 mono_wasm_emit_method (MonoCompile *cfg)
 {
 #ifdef HOST_BROWSER
-	if (mono_wasm_jit_verbose >= 3) { char b [160]; snprintf (b, sizeof b, "WASM_JIT_EMIT_ENTER %s opt=0x%x", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); mono_wasm_jit_log_main (b); }
+	if (mono_wasm_jit_verbose >= 3) { printf ("WASM_JIT_EMIT_ENTER %s opt=0x%x\n", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); }
 #endif
 	/* Compile-time accounting (Part 2): wj_gen_t0 = bytecode-GENERATION start (100ns ticks); wj_inst_ms =
 	 * the JS WebAssembly.Module/Instance time for THIS compile (written by mono_wasm_jit_instantiate_local).
@@ -1381,6 +1446,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int scratch_idx G_GNUC_UNUSED = 0; /* i32 local holding the per-thread interp-residual scratch ptr */
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int vc_fslot_idx = 0;              /* i32 local: inline virtual-IC fast-path resolved f-slot */
+	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
 	int vc_ic_idx = 0;                 /* i64 local: inline virtual-IC fast-path IC value (vtable|imethod<<32) */
 	int eh_exc_idx = 0, eh_h_idx = 0;  /* i32 locals: in-method EH catch landing pad — saved C++ exc ptr + dispatch result */
 	int finally_ind_idx = 0;           /* i32 local: in-method finally indicator (continuation bb idx, or -1 = rethrow) */
@@ -1628,6 +1694,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * virtual call — a harmless unused declared local) */
 	vc_fslot_idx = nargs + cnt [0];
 	cnt [0] += 1;
+	/* one i32 local for the VCALL_AOT dispatch kind (0/1/2 from mono_wasm_jit_vcall_aot_target); dead in
+	 * methods with no virtual call — a harmless unused declared local */
+	vc_aotkind_idx = nargs + cnt [0];
+	cnt [0] += 1;
 	/* two i32 locals for the in-method EH catch landing pad (dead in methods with no clauses) */
 	eh_exc_idx = nargs + cnt [0];
 	cnt [0] += 1;
@@ -1671,6 +1741,21 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	lc.addr_ldkind = (naddrbytes > 0) ? addr_ldkind : NULL;
 	lc.addr_tmp [0] = addr_tmp_idx [0]; lc.addr_tmp [1] = addr_tmp_idx [1];
 	lc.addr_tmp [2] = addr_tmp_idx [2]; lc.addr_tmp [3] = addr_tmp_idx [3];
+	/* MONO_WASM_JIT_STOREGUARD (debug): pre-register the (i32,i32)->void functype for the per-store
+	 * mono_wasm_jit_check_store call_indirect so wasm_st/wasm_addr_st can reference it by index. Done here
+	 * (before body emission, nextra==0) so check_ti is stable; force uses_calls so the table is imported. */
+	lc.storeguard = 0; lc.check_ti = -1;
+#ifdef HOST_BROWSER
+	{
+		extern int mono_wasm_jit_storeguard;
+		if (mono_wasm_jit_storeguard && nextra < 32) {
+			WasmFuncType cst; memset (&cst, 0, sizeof (cst));
+			cst.params [0] = WASM_I32; cst.params [1] = WASM_I32; cst.nparams = 2; cst.ret = WASM_VOID;
+			extra_types [nextra] = cst; lc.check_ti = 2 + nextra++;
+			lc.storeguard = 1; uses_calls = TRUE;
+		}
+	}
+#endif
 #ifdef HOST_BROWSER
 	/* Route managed-reference vregs to the GC-scanned ref shadow stack instead of (GC-invisible) wasm
 	 * locals: a reference held in a wasm local across a GC point (a residual interp call, which can
@@ -1756,6 +1841,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				}
 			}
 		}
+		{
+			/* DECISIVE TEST (MONO_WASM_JIT_PINALL): pin every i32 vreg by treating it as a reference, so it
+			 * lands on the GC-scanned (conservatively pinning) ref shadow stack instead of a GC-invisible wasm
+			 * local. Over-marking a non-ref i32 is harmless. If the random heap corruption STOPS with this on,
+			 * a reference vreg was being MISSED by the inference above (left unpinned -> moved by the copying
+			 * nursery -> stale -> wild store); if it persists, the corruptor is a wild *base*, not a stale ref. */
+			extern int mono_wasm_jit_pinall;
+			if (G_UNLIKELY (mono_wasm_jit_pinall)) {
+				for (i = 0; i < nvreg; ++i)
+					if (vt [i] == WASM_I32)
+						isref [i] = TRUE;
+			}
+		}
 		for (i = 0; i < nvreg; ++i)
 			if (li [i] >= 0 && isref [i])
 				refslot [i] = nrefslots++;
@@ -1772,7 +1870,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		if (G_UNLIKELY (cfg->method && mono_wasm_jit_refdiag_name (cfg->method->name))) {
 			MonoBasicBlock *bb2; MonoInst *ins2;
 #define WJ_RF(v) (((v) >= 0 && (v) < nvreg) ? (isref [v] ? 'R' : '-') : '.')
-			{ char b [160]; snprintf (b, sizeof b, "WASM_JIT_IR === %s nvreg=%d nrefslots=%d nargs=%d ===", cfg->method->name, nvreg, nrefslots, nargs); mono_wasm_jit_log_main (b); }
+			{ printf ("WASM_JIT_IR === %s nvreg=%d nrefslots=%d nargs=%d ===\n", cfg->method->name, nvreg, nrefslots, nargs); }
 			for (bb2 = cfg->bb_entry; bb2; bb2 = bb2->next_bb)
 				MONO_BB_FOR_EACH_INS (bb2, ins2) {
 					char b [256]; int n;
@@ -1804,7 +1902,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					}
 					default: break;
 					}
-					mono_wasm_jit_log_main (b);
+					printf ("%s\n", b);
 				}
 #undef WJ_RF
 		}
@@ -2473,17 +2571,44 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "r4const"; goto done; }
 				break;
 			case OP_AND_IMM: BINI32 (WASM_OP_I32_AND); break;
-			case OP_NOT_NULL: case OP_CHECK_THIS:
-				/* Null check. Trap (-> RuntimeError) if sreg1 is null rather than skipping it: a skipped
-				 * check would let a following null deref read low linear memory (address 0 is valid in a
-				 * wasm linear memory) = silent garbage, not a fault. Methods with EH clauses bail before
-				 * here, so we don't need to raise a *catchable* NRE. */
+			case OP_NOT_NULL: case OP_CHECK_THIS: {
+				/* Null check: if sreg1 is null, raise a CATCHABLE NullReferenceException, mirroring OP_COND_EXC
+				 * — NOT a raw wasm trap. address 0 is valid in wasm linear memory, so a skipped check silently
+				 * corrupts low memory; and EH methods now compile (MONO_WASM_JIT_EH), so a null this/deref inside
+				 * a try must reach managed EH/finally rather than `unreachable`. Hot path = ld + eqz + not-taken
+				 * branch; cold path raises NRE (exc_id 4) then C++-unwinds (cppeh) or bails to interp resume-state. */
+				WasmFuncType rt; int rti = -1, ck;
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "nullchk sreg"; goto done; }
 				wasm_op (&body, WASM_OP_I32_EQZ);
 				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-				wasm_op (&body, WASM_OP_UNREACHABLE);
+				memset (&rt, 0, sizeof (rt)); rt.params [0] = WASM_I32; rt.nparams = 1; rt.ret = WASM_VOID;
+				for (ck = 0; ck < nextra; ++ck) if (functype_eq (&extra_types [ck], &rt)) { rti = 2 + ck; break; }
+				if (rti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = rt; rti = 2 + nextra++; }
+				uses_calls = TRUE;
+				wasm_i32_const (&body, 4);   /* NullReferenceException (see OP_COND_EXC's exc_id map) */
+#ifdef HOST_BROWSER
+				{ extern void mono_wasm_jit_raise_corlib (int exc_id); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_raise_corlib); }
+#else
+				wasm_i32_const (&body, 0x7ff8);
+#endif
+				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) rti); wasm_uleb (&body, 0);
+				{ extern int mono_wasm_jit_cppeh;
+				if (mono_wasm_jit_cppeh) {
+					wasm_op (&body, WASM_OP_UNREACHABLE);   /* raise_corlib C++-throws; never returns */
+				} else {
+					switch (ret_vt) {
+					case WASM_I32: wasm_i32_const (&body, 0); break;
+					case WASM_I64: wasm_i64_const (&body, 0); break;
+					case WASM_F32: wasm_f32_const (&body, 0); break;
+					case WASM_F64: wasm_f64_const (&body, 0); break;
+					default: break;
+					}
+					EMIT_REF_LEAVE ();
+					wasm_op (&body, WASM_OP_RETURN);
+				} }
 				wasm_op (&body, WASM_OP_END);
 				break;
+			}
 #define LOADM(WOP, AL) do { if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; } } while (0)
 			case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE: LOADM (WASM_OP_I32_LOAD, 2); break;
 			case OP_LOADU1_MEMBASE: LOADM (WASM_OP_I32_LOAD8_U, 0); break;
@@ -2964,6 +3089,26 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* arg source vregs captured at method-to-ir time (calls.c), not call->args
 					 * (which gets corrupted by later vreg passes) */
 					if (!call->call_info) { fail = "no captured call args"; goto done; }
+#ifdef HOST_BROWSER
+					/* SYNC-ON-CALL: ensure the callee's module is instantiated in THIS thread's per-thread
+					 * function table BEFORE the direct call_indirect. The slot may still hold the jiterpreter
+					 * placeholder on a worker that ran this (self-compiled/island-run) caller without fully
+					 * syncing the callee -> call_indirect of a placeholder is a signature-mismatch trap. The
+					 * helper no-ops (one branch) once the slot is live; on a miss it lazily instantiates the
+					 * SPECIFIC callee module (robust vs the sync watermark) and returns, keeping the fast
+					 * direct path (no interp residual). emitted: ensure_fslot(call_method, call_fslot). */
+					{
+						extern void mono_wasm_jit_ensure_fslot (MonoMethod *callee, int fslot);
+						WasmFuncType et; int eti = -1;
+						memset (&et, 0, sizeof (et)); et.params [0] = WASM_I32; et.params [1] = WASM_I32; et.nparams = 2; et.ret = WASM_VOID;
+						for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &et)) { eti = 2 + k; break; }
+						if (eti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; eti = 2 + nextra++; }
+						wasm_i32_const (&body, (gint32) (intptr_t) call_method);
+						wasm_i32_const (&body, call_fslot);
+						wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ensure_fslot);
+						wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eti); wasm_uleb (&body, 0);
+					}
+#endif
 					{
 						int *wargs = (int *) call->call_info;
 						for (ai = 0; ai < (int) ct.nparams; ++ai)
@@ -2986,17 +3131,23 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					 * throwing AOT callee would escape uncaught until Build 2 adds wasm-EH — test non-throwing. */
 					{
 						extern int mono_wasm_jit_inline_aot;
-						extern gboolean mono_wasm_jit_aot_call_target (MonoMethod *m, gpointer *addr, gpointer *rgctx);
+						extern gboolean mono_wasm_jit_aot_call_target (MonoMethod *m, gpointer *addr, gpointer *rgctx, gboolean *has_extra_arg);
 						gpointer aot_addr = NULL, aot_rgctx = NULL;
+						gboolean aot_has_extra = TRUE;   /* does the raw AOT body carry the trailing rgctx/dummy arg? */
 						gboolean aot_ok = mono_wasm_jit_inline_aot && !m_type_is_byref (csig->ret);
 						for (k = 0; k < (int) csig->param_count && aot_ok; ++k)
 							if (m_type_is_byref (csig->params [k])) aot_ok = FALSE;
-						if (aot_ok && mono_wasm_jit_aot_call_target (call_method, &aot_addr, &aot_rgctx)) {
-							WasmFuncType nt = ct;   /* native functype = (this?, args by value) + i32 rgctx -> ct.ret */
+						if (aot_ok && mono_wasm_jit_aot_call_target (call_method, &aot_addr, &aot_rgctx, &aot_has_extra)) {
+							WasmFuncType nt = ct;   /* native functype = (this?, args by value) [+ i32 rgctx if aot_has_extra] -> ct.ret */
 							WasmFuncType eht;       /* (i32)->void: the catch handler (mono_wasm_jit_aot_caught) AND the x.e tag */
 							int nti = -1, ehti = -1;
-							if (nt.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "aot inline nparams"; goto done; }
-							nt.params [nt.nparams++] = WASM_I32;
+							/* Append the trailing extra (rgctx/dummy) arg ONLY when the body actually has it. Exempt
+							 * wrapper kinds (alloc/castclass/icall/etc.) have a bare (this,args)->ret body — appending
+							 * would declare one param too many -> call_indirect signature-mismatch trap. */
+							if (aot_has_extra) {
+								if (nt.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "aot inline nparams"; goto done; }
+								nt.params [nt.nparams++] = WASM_I32;
+							}
 							for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &nt)) { nti = 2 + k; break; }
 							if (nti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = nt; nti = 2 + nextra++; }
 							uses_calls = TRUE;
@@ -3008,7 +3159,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								 * boundary (mono_llvm_catch_exception) or an in-method catch. No try/catch + no
 								 * EMIT_PENDING_EXC_CHECK: the call is pure call_indirect (the per-call perf win). */
 								{ int *wargs = (int *) call->call_info; for (ai = 0; ai < (int) ct.nparams; ++ai) if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "call arg ld"; goto done; } }
-								wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);
+								if (aot_has_extra) wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);   /* trailing rgctx/dummy — only if the body has it */
 								wasm_i32_const (&body, (gint32) (intptr_t) aot_addr);
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) nti); wasm_uleb (&body, 0);
 								if (ct.ret != WASM_VOID) {
@@ -3025,7 +3176,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								 * by mono_wasm_jit_aot_caught (-> interp resume-state) + the method bails via EMIT_PENDING_EXC_CHECK. */
 								wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);   /* try (void) */
 								{ int *wargs = (int *) call->call_info; for (ai = 0; ai < (int) ct.nparams; ++ai) if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "call arg ld"; goto done; } }
-								wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);   /* rgctx (ftndesc.arg) */
+								if (aot_has_extra) wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);   /* rgctx (ftndesc.arg) — only if the body has it */
 								wasm_i32_const (&body, (gint32) (intptr_t) aot_addr);    /* AOT target table index (cinfo->addr) */
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) nti); wasm_uleb (&body, 0);
 								if (ct.ret != WASM_VOID) {   /* store ret inside the try */
@@ -3038,7 +3189,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								wasm_op (&body, WASM_OP_END);   /* end try/catch */
 								EMIT_PENDING_EXC_CHECK ();
 							} }
-							{ extern void mono_wasm_jit_log_main (const char *msg); extern int mono_wasm_jit_verbose; static int n_il = 0; if (mono_wasm_jit_verbose >= 3 && n_il++ < 64) { char *cn = mono_method_get_full_name (call->method); char *m2 = g_strdup_printf ("WASM_JIT_INLINE_AOT[%d] %s -> %s", n_il, mname, cn); mono_wasm_jit_log_main (m2); g_free (m2); g_free (cn); } }
+							{ extern int mono_wasm_jit_verbose; static int n_il = 0; if (mono_wasm_jit_verbose >= 3 && n_il++ < 64) { char *cn = mono_method_get_full_name (call->method); printf ("WASM_JIT_INLINE_AOT[%d] %s -> %s\n", n_il, mname, cn); g_free (cn); } }
 							break;
 						}
 					}
@@ -3122,8 +3273,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					 * bails this shape above). Lets a =1/=4 run name a suspect caller->callee. */
 					if (mono_wasm_jit_stats && csig->param_count > 0 && ct.ret != WASM_VOID) {
 						char *cn = mono_method_get_full_name (call->method);
-						char b [512]; snprintf (b, sizeof b, "WASM_JIT_RESIDUAL_PNV %s -> %s", mname, cn ? cn : "?");
-						mono_wasm_jit_log_main (b); g_free (cn);
+						printf ("WASM_JIT_RESIDUAL_PNV %s -> %s\n", mname, cn ? cn : "?");
+						g_free (cn);
 					}
 					memset (&ts, 0, sizeof (ts)); ts.ret = WASM_I32; ts.nparams = 0;
 					memset (&ti, 0, sizeof (ti)); ti.ret = WASM_I32; ti.nparams = 2; ti.params [0] = WASM_I32; ti.params [1] = WASM_I32;
@@ -3464,18 +3615,25 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								if (mono_wasm_jit_vcall_aot) {
 									extern int mono_wasm_jit_vcall_aot_target (guint8 *scratch);
 									extern void mono_wasm_jit_aot_caught (void *exc);
-									WasmFuncType at, aott, eht; int ati = -1, aotti = -1, ehti = -1;
+									WasmFuncType at, at_ne, aott, eht; int ati = -1, ati_ne = -1, aotti = -1, ehti = -1;
 									if (n2 + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "vcall aot nparams"; goto done; }
-									/* aott (i32)->i32 = the resolve helper; at (this,params,i32 rgctx)->rv = the AOT body */
+									/* aott (i32)->i32 = the resolve helper, now returning 0=residual / 1=AOT+rgctx / 2=AOT,no-extra-arg.
+									 * at (this,params,i32 rgctx)->rv = AOT body WITH the trailing extra (rgctx/dummy) arg; at_ne
+									 * (this,params)->rv = AOT body of an exempt wrapper kind WITHOUT it. The override is resolved at
+									 * RUNTIME but the call_indirect functype is baked here, so emit BOTH variants and pick by the
+									 * helper's return code (kind==2 -> at_ne). Keeps every AOT-backed vcall fast (no residual). */
 									memset (&aott, 0, sizeof (aott)); aott.params [0] = WASM_I32; aott.nparams = 1; aott.ret = WASM_I32;
 									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &aott)) { aotti = 2 + vk; break; }
 									if (aotti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = aott; aotti = 2 + nextra++; }
 									memset (&at, 0, sizeof (at)); for (vk = 0; vk < n2; ++vk) at.params [vk] = pp [vk]; at.params [n2] = WASM_I32; at.nparams = (guint32) (n2 + 1); at.ret = rv;
 									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at)) { ati = 2 + vk; break; }
 									if (ati < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = at; ati = 2 + nextra++; }
+									memset (&at_ne, 0, sizeof (at_ne)); for (vk = 0; vk < n2; ++vk) at_ne.params [vk] = pp [vk]; at_ne.nparams = (guint32) n2; at_ne.ret = rv;
+									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at_ne)) { ati_ne = 2 + vk; break; }
+									if (ati_ne < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = at_ne; ati_ne = 2 + nextra++; }
 									uses_calls = TRUE;
 									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $no_aot */
-									/* aot = mono_wasm_jit_vcall_aot_target(scratch); if (!aot) br $no_aot (-> residual) */
+									/* kind = mono_wasm_jit_vcall_aot_target(scratch); if (kind==0) br $no_aot (-> residual) */
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 #ifdef HOST_BROWSER
 									wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_aot_target);
@@ -3483,8 +3641,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									wasm_i32_const (&body, 0x7ff9);
 #endif
 									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) aotti); wasm_uleb (&body, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_aotkind_idx);   /* stash kind, keep on stack */
 									wasm_op (&body, WASM_OP_I32_EQZ);
-									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* !aot -> $no_aot -> residual */
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* kind==0 -> $no_aot -> residual */
 									if (!mono_wasm_jit_cppeh) {
 										/* resume-state: wrap the AOT call in try/catch <x.e>; a throw is caught by
 										 * mono_wasm_jit_aot_caught (-> interp resume-state) + the method bails via the
@@ -3495,14 +3654,28 @@ mono_wasm_emit_method (MonoCompile *cfg)
 										uses_eh_tag = TRUE; eh_type_idx = ehti;
 										wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);
 									}
-									/* load this+args (fresh from vregs), then rgctx@216, then AOT addr@212 = call_indirect index */
-									for (ai = 0; ai < n2; ++ai)
-										if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall aot arg ld"; goto done; }
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216);   /* rgctx (ftndesc.arg) */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
-									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ati); wasm_uleb (&body, 0);
+									/* pick variant: kind==2 (exempt wrapper, no trailing arg) -> at_ne; else (kind==1) -> at + rgctx@216.
+									 * Each branch leaves one rv (or nothing if void) on the stack; result stored after the if/else end. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+									wasm_i32_const (&body, 2);
+									wasm_op (&body, WASM_OP_I32_EQ);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) rv);   /* block type = rv (WASM_VOID=0x40 -> empty) */
+										/* no-extra-arg variant: this+args, then AOT addr@212; call_indirect (this,args)->rv */
+										for (ai = 0; ai < n2; ++ai)
+											if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall aot arg ld"; goto done; }
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ati_ne); wasm_uleb (&body, 0);
+									wasm_op (&body, WASM_OP_ELSE);
+										/* with-rgctx variant: this+args, rgctx@216, AOT addr@212; call_indirect (this,args,rgctx)->rv */
+										for (ai = 0; ai < n2; ++ai)
+											if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall aot arg ld"; goto done; }
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216);   /* rgctx (ftndesc.arg) */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ati); wasm_uleb (&body, 0);
+									wasm_op (&body, WASM_OP_END);   /* end variant if/else */
 									if (rv != WASM_VOID) {
 										if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret);   /* raw AOT body: dirty upper bits */
 										if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall aot dreg"; goto done; }
@@ -3788,6 +3961,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		}
 		wasm_buf_init (&out);
 		wasm_module_method_and_entry (param_types, nargs, ret_vt, groups, 4, &body, &ethunk, extra_types, (guint32) nextra, uses_calls, uses_eh_tag, (guint32) (eh_type_idx < 0 ? 0 : eh_type_idx), &out);
+		if (mono_wasm_jit_names)
+			wasm_module_append_name_section (&out, mname, mname);
 		wasm_buf_free (&ethunk);
 	}
 
@@ -3798,7 +3973,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		GString *hex = g_string_sized_new (out.len * 2 + 1);
 		for (i = 0; i < (int) out.len; ++i)
 			g_string_append_printf (hex, "%02x", out.data [i]);
-		{ char *hb = g_strdup_printf ("WASM_JIT_HEX %s : %u : %s", mname, out.len, hex->str); mono_wasm_jit_log_main (hb); g_free (hb); }
+		{ printf ("WASM_JIT_HEX %s : %u : %s\n", mname, out.len, hex->str); }
 		g_string_free (hex, TRUE);
 	} else if (g_getenv ("MONO_WASM_JIT_DUMP_EXIT") == NULL) {
 		/* live runtime: allocate the (global) table slots + cache the emitted module bytes. The wasm
@@ -3823,11 +3998,22 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				mono_wasm_jit_last_fslot = f_slot;
 				if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_REGISTERED); mono_wasm_jit_add (WJC_BYTES_GENERATED, (gint64) out.len); }
 				{ extern void mono_wasm_jit_register (int e_slot, int f_slot, void *bytes, int len); mono_wasm_jit_register (e_slot, f_slot, cached, (int) out.len); }
-				if (mono_wasm_jit_verbose >= 1) { char b [256]; snprintf (b, sizeof b, "WASM_JIT_REGISTERED %s e_slot=%d f_slot=%d len=%u", mname, e_slot, f_slot, (unsigned) out.len); mono_wasm_jit_log_main (b); }
+				if (mono_wasm_jit_verbose >= 1) { printf ("WASM_JIT_REGISTERED %s e_slot=%d f_slot=%d len=%u\n", mname, e_slot, f_slot, (unsigned) out.len); }
+				/* The self-instantiate above populated ONLY this method's slots on this thread. But an
+				 * island/eager compile can run this freshly-compiled method on THIS SAME thread without going
+				 * back through the interp invoke path (interp.c MINT_CALL), which is where a thread otherwise
+				 * picks up the per-thread function-table sync. This method's baked direct JIT->JIT f-slot calls
+				 * (which have no slot_live guard) then target callee slots this thread may never have
+				 * instantiated -> the slot still holds the jiterpreter placeholder (mono_jiterp_placeholder_jit_call,
+				 * (i32,i32,i32,i32)->void) -> a call_indirect signature-mismatch trap. Bring this thread fully
+				 * current now: every callee is registered before its caller, so syncing the whole prefix here
+				 * guarantees all of this method's direct f-slot callees are live before it can run. No-op fast
+				 * path when already current. */
+				mono_wasm_jit_sync_thread ();
 			} else {
 				g_free (cached);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_INVALID);
-				if (mono_wasm_jit_verbose >= 1) { char b [320]; snprintf (b, sizeof b, "WASM_JIT_INVALID %s e_slot=%d len=%u : %s", mname, e_slot, (unsigned) out.len, ierr); mono_wasm_jit_log_main (b); }
+				if (mono_wasm_jit_verbose >= 1) { printf ("WASM_JIT_INVALID %s e_slot=%d len=%u : %s\n", mname, e_slot, (unsigned) out.len, ierr); }
 			}
 		}
 	} else
@@ -3889,12 +4075,7 @@ done:
 			else cat = WJB_SYNC_OTHER;
 			wj_bail_hist [cat]++;
 		}
-#ifdef HOST_BROWSER
-		if (mono_wasm_jit_verbose >= 2) { char b [256]; snprintf (b, sizeof b, "WASM_JIT_BAIL %s : %s (op=%d %s)", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-"); mono_wasm_jit_log_main (b); }
-#else
-		printf ("WASM_JIT_BAIL %s : %s (op=%d %s)\n", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-");
-		fflush (stdout);
-#endif
+		if (mono_wasm_jit_verbose >= 2) { printf ("WASM_JIT_BAIL %s : %s (op=%d %s)\n", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-"); }
 	}
 	g_free (mname);
 	if (g_getenv ("MONO_WASM_JIT_DUMP_EXIT") != NULL)
