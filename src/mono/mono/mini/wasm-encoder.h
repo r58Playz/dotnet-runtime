@@ -287,4 +287,12 @@ void wasm_module_interp_thunk (
 	const WasmBuf *body,
 	WasmBuf *out);
 
+/*
+ * Append a custom "name" section (id 0) to an already-framed module so V8 prints real method
+ * names in wasm stack traces instead of anonymous wasm-function[N]. Names func0 = the method
+ * (`func0_name`) and func1 = "entry"; sets the module name to `module_name`. Cheap; only emit
+ * when symbolication is wanted (gated by MONO_WASM_JIT_NAMES in the emitter).
+ */
+void wasm_module_append_name_section (WasmBuf *out, const char *module_name, const char *func0_name);
+
 #endif /* __MONO_MINI_WASM_ENCODER_H__ */

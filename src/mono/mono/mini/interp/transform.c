@@ -10139,14 +10139,12 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 		extern __thread int mono_wasm_jit_last_slot;
 		extern __thread int mono_wasm_jit_last_fslot;
 		extern gboolean mono_wasm_jit_name_targeted (const char *name);
-		extern void mono_wasm_jit_log_main (const char *msg);
 		extern void mono_wasm_jit_auto_init (void);
 		static __thread gboolean wasm_jit_in;
 		mono_wasm_jit_auto_init (); /* one-time: read MONO_WASM_JIT_AUTO / _THRESHOLD into the globals the interp's auto-trigger reads */
 		if (method->name && strstr (method->name, "WasmJit")) {
 			const char *envv = g_getenv ("MONO_WASM_JIT_METHOD");
-			char dbg [256]; snprintf (dbg, sizeof dbg, "WASM_JIT_HOOK name=%s match=%d in=%d env=%s", method->name, mono_wasm_jit_name_targeted (method->name), wasm_jit_in, envv ? envv : "(null)");
-			mono_wasm_jit_log_main (dbg);
+			printf ("WASM_JIT_HOOK name=%s match=%d in=%d env=%s\n", method->name, mono_wasm_jit_name_targeted (method->name), wasm_jit_in, envv ? envv : "(null)");
 		}
 		if (!wasm_jit_in && method->name && mono_wasm_jit_name_targeted (method->name)) {
 			extern __thread void *mono_wasm_jit_last_bytes;

@@ -377,6 +377,45 @@ wasm_module_method_and_entry (
 }
 
 void
+wasm_module_append_name_section (WasmBuf *out, const char *module_name, const char *func0_name)
+{
+	/* Append a custom "name" section (id 0) so V8 prints real Mono method names in wasm stack
+	 * traces (devtools, Error.stack, CDP) instead of anonymous wasm-function[N]. Custom sections
+	 * may appear after the code section. Subsection 0 = module name; subsection 1 = function names.
+	 * This module defines func0 = the method `f`, func1 = the entry thunk `e`; there are no function
+	 * imports (only memory/table/tag), so function indices start at 0. */
+	WasmBuf sec, sub;
+	const char *m = module_name ? module_name : "wasmjit";
+	const char *f0 = func0_name ? func0_name : "method";
+
+	wasm_buf_init (&sec);
+	wasm_name (&sec, "name");
+
+	/* subsection 0: module name */
+	wasm_buf_init (&sub);
+	wasm_name (&sub, m);
+	wasm_u8 (&sec, 0x00);
+	wasm_uleb (&sec, sub.len);
+	wasm_bytes (&sec, sub.data, sub.len);
+	wasm_buf_free (&sub);
+
+	/* subsection 1: function names (func0 = method, func1 = entry thunk) */
+	wasm_buf_init (&sub);
+	wasm_uleb (&sub, 2);          /* two name-map entries */
+	wasm_uleb (&sub, 0);          /* func index 0 */
+	wasm_name (&sub, f0);
+	wasm_uleb (&sub, 1);          /* func index 1 */
+	wasm_name (&sub, "entry");
+	wasm_u8 (&sec, 0x01);
+	wasm_uleb (&sec, sub.len);
+	wasm_bytes (&sec, sub.data, sub.len);
+	wasm_buf_free (&sub);
+
+	emit_section (out, 0, &sec);
+	wasm_buf_free (&sec);
+}
+
+void
 wasm_module_interp_thunk (
 	const WasmValtype *param_types, guint32 nparams,
 	WasmValtype ret_type,

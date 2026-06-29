@@ -177,6 +177,15 @@ function wrapPromisingSerialized (rawFn: Function): Function {
     let tail: Promise<any> = Promise.resolve();
     return function serializedMailbox (this: any, ...args: any[]) {
         const next = tail.then(() => promising.apply(this, args));
+        // VISIBILITY (wasm-trap hunt): a wasm trap during a mailbox tick surfaces as a REJECTED
+        // promise. The caller (emscripten's worker mailbox check) never observes the result, and the
+        // queue's `.catch(()=>undefined)` below registers a handler on `next` — so the rejection is
+        // fully swallowed: silent thread death, no console error, then the GC stalls ~20s trying to
+        // suspend the dead thread. Attach a LOGGING-ONLY observer (separate branch, doesn't affect the
+        // queue) so the trap is attributable. With MONO_WASM_JIT_NAMES the wasm frames carry method names.
+        next.then(undefined, (err: any) => {
+            mono_log_error(`JSPI mailbox export REJECTED — a wasm trap on a suspended stack silently killed this thread (GC will then stall trying to suspend it): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`);
+        });
         tail = next.catch(() => undefined);
         return next;
     };
