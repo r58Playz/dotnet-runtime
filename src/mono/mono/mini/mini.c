@@ -3304,10 +3304,12 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 		extern gboolean mono_wasm_jit_name_targeted (const char *name);
 		extern gboolean mono_wasm_jit_name_denied (const char *name);
 		extern gboolean mono_wasm_jit_llvmonly_enabled (void);
-		extern __thread gboolean mono_wasm_jit_force;
-		if (cfg->method && cfg->method->name && (mono_wasm_jit_force || mono_wasm_jit_name_targeted (cfg->method->name))
+		if (cfg->method && cfg->method->name && ((flags & JIT_FLAG_WASM_FORCE) || mono_wasm_jit_name_targeted (cfg->method->name))
 			&& !mono_wasm_jit_name_denied (cfg->method->name)) {
 			cfg->compile_wasm = TRUE;
+			/* Forced (auto-JIT / virtual-miss) vs name-targeted bring-up: the in-emitter raw-indirect bail
+			 * (mini-wasm.c) only fires on the forced path. Per-compile, so a nested compile starts clean. */
+			cfg->wasm_jit_forced = (flags & JIT_FLAG_WASM_FORCE) ? 1 : 0;
 			cfg->compile_llvm = FALSE;
 			try_llvm = FALSE;
 			/* CRITICAL: force EXPLICIT null checks. explicit_null_checks was decided above (from
@@ -4285,16 +4287,17 @@ mono_update_jit_stats (MonoCompile *cfg)
  *   Force-compile METHOD through the wasm-JIT emitter (COMPILE_WASM fork) on demand, for the
  * automatic hotness trigger (interp.c MINT_CALL) and virtual-miss force-JIT. Calls mini_method_compile
  * directly — bypassing the compiled-code cache, which would short-circuit for an already-interp'd
- * method — with the thread-local mono_wasm_jit_force flag set so the trigger in mini_method_compile
- * routes it to COMPILE_WASM regardless of name targeting. The emitter publishes the table slots via
- * the mono_wasm_jit_last_slot/fslot thread-locals (the caller reads them). Uses JIT_FLAG_RUN_CCTORS
- * to match the working transform-hook compile path; the reentrancy guard covers any cctor/init code
- * that runs during the compile and calls back in (it just skips the nested force-compile).
+ * method — passing JIT_FLAG_WASM_FORCE so the trigger in mini_method_compile routes it to COMPILE_WASM
+ * regardless of name targeting. The emitter writes the result (slots / bytes / bail / blockers) onto
+ * cfg->wasm_jit_result; we copy it into *OUT before destroying cfg, so the caller reads it from its own
+ * stack — no thread-local relays, re-entrancy-safe (each nested compile has its own cfg). OUT may be NULL.
+ * Uses JIT_FLAG_RUN_CCTORS to match the working transform-hook compile path; the reentrancy guard covers
+ * any cctor/init code that runs during the compile and calls back in (it just skips the nested force-compile,
+ * leaving *OUT at the caller's zero-init = "no result" = permanent bail, as before).
  */
 void
-mono_wasm_force_compile (MonoMethod *method)
+mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 {
-	extern __thread gboolean mono_wasm_jit_force;
 	static __thread gboolean reent;
 	MonoCompile *cfg;
 	ERROR_DECL (error);
@@ -4302,11 +4305,12 @@ mono_wasm_force_compile (MonoMethod *method)
 	if (reent)
 		return;
 	reent = TRUE;
-	mono_wasm_jit_force = TRUE;
-	cfg = mini_method_compile (method, 0, (JitFlags) JIT_FLAG_RUN_CCTORS, 0, -1);
-	mono_wasm_jit_force = FALSE;
-	if (cfg)
+	cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+	if (cfg) {
+		if (out)
+			*out = cfg->wasm_jit_result;
 		mono_destroy_compile (cfg);
+	}
 	(void) error;
 	reent = FALSE;
 }
