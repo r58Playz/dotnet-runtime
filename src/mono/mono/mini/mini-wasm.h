@@ -149,6 +149,9 @@ enum {
 	WJC_VPERM_SIG, WJC_VPERM_BYREF, WJC_VPERM_GSHARED, WJC_VPERM_SYNC, WJC_VPERM_EHOTHER, WJC_VPERM_AOT,
 	/* vcalls that took the fast AOT dispatch (MONO_WASM_JIT_VCALL_AOT) instead of the residual */
 	WJC_VCALL_AOT_FAST,
+	/* event-driven blocker waiting (Part 3 revamp): WJC_PARKED = times a method parked on cold blocker(s)
+	 * instead of poll-retrying; WJC_WAITER_WOKEN = total waiters re-queued when a blocker JITted. */
+	WJC_PARKED, WJC_WAITER_WOKEN,
 	WJC_MAX
 };
 

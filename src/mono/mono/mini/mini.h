@@ -1299,6 +1299,10 @@ typedef enum {
 	JIT_FLAG_SELF_INIT = (1 << 11),
 	/* Assume code memory is exec only */
 	JIT_FLAG_CODE_EXEC_ONLY = (1 << 12),
+	/* Force the runtime wasm-JIT (COMPILE_WASM) regardless of name targeting. Per-compile (replaces
+	 * the old per-thread mono_wasm_jit_force flag), so a nested cctor/AOT-init compile of a DIFFERENT
+	 * method during a forced compile is no longer mis-routed to wasm. */
+	JIT_FLAG_WASM_FORCE = (1 << 13),
 } JitFlags;
 
 /* Bit-fields in the MonoBasicBlock.region */
@@ -1327,12 +1331,36 @@ typedef struct {
 } MonoCachedLocallocInfo;
 
 /*
+ * Result of a runtime wasm-JIT emit (mono_wasm_emit_method), carried on the per-compile MonoCompile
+ * (cfg->wasm_jit_result) instead of thread-local relays. Per-compile => re-entrancy-safe by
+ * construction: a nested cctor/AOT-init compile gets its own cfg and cannot clobber the outer result.
+ * Read back by mono_wasm_force_compile (which gets cfg from mini_method_compile), copied BY VALUE into a
+ * caller stack local before cfg is destroyed. The blockers array is therefore INLINE (not mempool/heap):
+ * a cfg->mempool pointer would dangle after mono_destroy_compile, and `bytes` is the only field whose
+ * ownership transfers out (g_malloc'd). Defined unconditionally (mono_wasm_force_compile compiles into
+ * the cross-compiler too).
+ */
+#define MONO_WASM_JIT_MAX_BLOCKERS 32
+typedef struct {
+	int          e_slot;             /* entry-thunk table slot; >0 = success gate */
+	int          f_slot;             /* scalar fn slot */
+	void        *bytes;              /* g_malloc'd module bytes; ownership passes to InterpMethod */
+	int          bytes_len;
+	int          bail;               /* bail category: 0=ok; -2..-10; >0 unsupported opcode */
+	int          retriable;          /* 1 iff bail was "callee not jitted" (un-JITted direct callee) */
+	int          nblockers;          /* # entries in blockers[] (residual=0 island pre-scan) */
+	guint8       blockers_truncated; /* 1 if more than MONO_WASM_JIT_MAX_BLOCKERS distinct blockers existed */
+	MonoMethod  *blockers [MONO_WASM_JIT_MAX_BLOCKERS]; /* un-JITted direct callees; inline so it survives the by-value copy out of cfg */
+} MonoWasmJitResult;
+
+/*
  * Control Flow Graph and compilation unit information
  */
 typedef struct {
 	MonoMethod      *method;
 	MonoMethodHeader *header;
 	MonoMemPool     *mempool;
+	MonoWasmJitResult wasm_jit_result; /* runtime wasm-JIT emit result (cfg-scoped, replaces relay TLs) */
 	MonoInst       **varinfo;
 	MonoMethodVar   *vars;
 	MonoInst        *ret;
@@ -1467,6 +1495,7 @@ typedef struct {
 	guint            full_aot : 1;
 	guint            compile_llvm : 1;
 	guint            compile_wasm : 1;
+	guint            wasm_jit_forced : 1; /* this COMPILE_WASM was force-triggered (JIT_FLAG_WASM_FORCE), not name-targeted */
 	guint            got_var_allocated : 1;
 	guint            ret_var_is_local : 1;
 	guint            ret_var_set : 1;

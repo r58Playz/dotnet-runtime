@@ -10135,9 +10135,7 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 		/* wasm-jit bring-up (v3): drive the runtime wasm JIT emitter for the targeted method so it
 		 * compiles + instantiates + registers its function in the table. Validate-only for now
 		 * (the method still executes via the interpreter); routes through the COMPILE_WASM fork. */
-		extern gpointer mono_jit_compile_method_jit_only (MonoMethod *m, MonoError *e);
-		extern __thread int mono_wasm_jit_last_slot;
-		extern __thread int mono_wasm_jit_last_fslot;
+		extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 		extern gboolean mono_wasm_jit_name_targeted (const char *name);
 		extern void mono_wasm_jit_auto_init (void);
 		static __thread gboolean wasm_jit_in;
@@ -10147,23 +10145,19 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 			printf ("WASM_JIT_HOOK name=%s match=%d in=%d env=%s\n", method->name, mono_wasm_jit_name_targeted (method->name), wasm_jit_in, envv ? envv : "(null)");
 		}
 		if (!wasm_jit_in && method->name && mono_wasm_jit_name_targeted (method->name)) {
-			extern __thread void *mono_wasm_jit_last_bytes;
-			extern __thread int mono_wasm_jit_last_len;
-			ERROR_DECL (wasm_jit_error);
+			MonoWasmJitResult r;
+			memset (&r, 0, sizeof (r));   /* force_compile leaves *out untouched if its reentrancy guard fires */
 			wasm_jit_in = TRUE;
-			mono_wasm_jit_last_slot = 0;
-			mono_wasm_jit_last_fslot = 0;
-			mono_wasm_jit_last_bytes = NULL;
-			mono_wasm_jit_last_len = 0;
-			mono_jit_compile_method_jit_only (method, wasm_jit_error);
-			mono_error_cleanup (wasm_jit_error);
-			if (mono_wasm_jit_last_slot > 0) {
+			/* Name-targeted bring-up: force-compile through the same path the auto-JIT trigger uses. The
+			 * result rides on cfg->wasm_jit_result and is copied into r (no thread-local relays). */
+			mono_wasm_force_compile (method, &r);
+			if (r.e_slot > 0) {
 				/* publish bytes/fslot first, then the slot last (the "ready" flag the invoke checks) */
-				imethod->wasm_jit_fslot = mono_wasm_jit_last_fslot;
-				imethod->wasm_jit_bytes = mono_wasm_jit_last_bytes;
-				imethod->wasm_jit_bytes_len = mono_wasm_jit_last_len;
+				imethod->wasm_jit_fslot = r.f_slot;
+				imethod->wasm_jit_bytes = r.bytes;
+				imethod->wasm_jit_bytes_len = r.bytes_len;
 				mono_memory_barrier ();
-				imethod->wasm_jit_slot = mono_wasm_jit_last_slot; /* survives the tmp_imethod round-trip */
+				imethod->wasm_jit_slot = r.e_slot; /* survives the tmp_imethod round-trip */
 			}
 			wasm_jit_in = FALSE;
 		}

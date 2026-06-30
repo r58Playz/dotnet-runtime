@@ -30,31 +30,12 @@ static int mono_wasm_debug_level = 0;
 #ifdef HOST_BROWSER
 #include <emscripten.h>
 int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
-/* Relay: the emitter sets this (thread-local) to the registered entry-thunk slot on a
- * successful compile; the transform hook (same thread) reads it and stores it on the
- * method's InterpMethod.wasm_jit_slot, so the interp can invoke any JITted method. */
-__thread int mono_wasm_jit_last_slot = 0;
-__thread int mono_wasm_jit_last_fslot = 0;
-/* Relay: set at `done:` to 1 if the compile bailed for a RETRIABLE reason ("callee not jitted" — the
- * callee may become JITted later, so the caller should re-attempt to form a JIT island), else 0. The
- * auto-JIT trigger uses this to choose a retry slot state vs a permanent bail. */
-__thread int mono_wasm_jit_last_retriable = 0;
-/* Relay: on a "callee not jitted (residual off)" bail under the islands policy, the emitter sets this
- * (thread-local) to the un-JITted DIRECT callee that blocked the compile. The auto-JIT trigger uses it
- * to eagerly force-compile that callee (and, recursively, ITS blocking callees) so a hot method's whole
- * call-tree island forms in one shot, instead of slowly bottom-up over many threshold-crosses + retries
- * (the chunk-mesh getBlockState->index->accessor chains the IL inspection showed). NULL if none. */
-__thread MonoMethod *mono_wasm_jit_last_blocking_callee = NULL;
+/* The runtime wasm-JIT emit result (slots / bytes / bail / retriable / blockers) is no longer relayed
+ * through thread-locals: the emitter writes it onto the per-compile cfg->wasm_jit_result (see
+ * MonoWasmJitResult in mini.h) and mono_wasm_force_compile copies it out after the compile returns.
+ * Per-compile => re-entrancy-safe by construction (a nested cctor/AOT-init compile has its own cfg),
+ * so the old "publish the success gate last behind a barrier" dance is gone. */
 int mono_wasm_jit_island = 1;   /* eager transitive island-JIT; MONO_WASM_JIT_ISLAND=0 = old bottom-up retry only */
-/* Relay for the cached module bytes (for per-thread instantiation): the emitter g_malloc-copies the
- * emitted module here on a successful compile; the caller stores it on InterpMethod.wasm_jit_bytes. */
-__thread void *mono_wasm_jit_last_bytes = NULL;
-__thread int mono_wasm_jit_last_len = 0;
-/* Relay: set at `done:` to categorize WHY a compile bailed, for the weighted vcall-residual breakdown
- * (which permanently-un-JITtable overrides dominate the steady-state residual). 0=success/n/a;
- * -2=EH clauses; -3=signature (arg/ret) type; -4=other (synchronized/byref/etc); >0=the unsupported
- * mini opcode number. compile_publish stores it on InterpMethod.wasm_jit_bail when the bail is permanent. */
-__thread int mono_wasm_jit_last_bail = 0;
 /* Automatic hotness trigger (Phase 5): when mono_wasm_jit_auto>0, the interp (MINT_CALL) counts
  * calls to each callee and force-compiles it to wasm once its hit count reaches mono_wasm_jit_thresh,
  * instead of requiring the method to be named in MONO_WASM_JIT_METHOD. -1 = uninitialized. */
@@ -99,7 +80,6 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_island_budget; const char *ib = g_getenv ("MONO_WASM_JIT_ISLAND_BUDGET"); mono_wasm_jit_island_budget = (ib && *ib && atoi (ib) > 0) ? atoi (ib) : 64; } /* Lever C: default 64 */
 	{ extern int mono_wasm_jit_block_promote; const char *bp = g_getenv ("MONO_WASM_JIT_BLOCK_PROMOTE"); mono_wasm_jit_block_promote = (bp && *bp) ? atoi (bp) : 16; } /* Lever C: default 16; 0 disables */
 	{ extern int mono_wasm_jit_promotion_drain; const char *pd = g_getenv ("MONO_WASM_JIT_PROMOTION_DRAIN"); mono_wasm_jit_promotion_drain = (pd && *pd && atoi (pd) > 0) ? atoi (pd) : 8; }
-	{ extern int mono_wasm_jit_retry_retain_pct; const char *rr = g_getenv ("MONO_WASM_JIT_RETRY_RETAIN_PCT"); mono_wasm_jit_retry_retain_pct = (rr && *rr) ? atoi (rr) : 75; if (mono_wasm_jit_retry_retain_pct < 0) mono_wasm_jit_retry_retain_pct = 0; else if (mono_wasm_jit_retry_retain_pct > 99) mono_wasm_jit_retry_retain_pct = 99; }
 	{ extern int mono_wasm_jit_island_cold_div; const char *cd = g_getenv ("MONO_WASM_JIT_ISLAND_COLD_DIV"); mono_wasm_jit_island_cold_div = (cd && *cd && atoi (cd) > 0) ? atoi (cd) : 4; }
 	{ extern int mono_wasm_jit_promoted_cold_div; const char *pc = g_getenv ("MONO_WASM_JIT_PROMOTED_COLD_DIV"); mono_wasm_jit_promoted_cold_div = (pc && *pc && atoi (pc) > 0) ? atoi (pc) : 16; }
 	{ extern int mono_wasm_jit_promoted_root_uncold_depth; const char *pu = g_getenv ("MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH"); mono_wasm_jit_promoted_root_uncold_depth = (pu && *pu && atoi (pu) >= 0) ? atoi (pu) : 1; }
@@ -119,11 +99,9 @@ mono_wasm_jit_auto_init (void)
 }
 #endif
 
-/* Defined unconditionally for TARGET_WASM (not just HOST_BROWSER): mono_wasm_force_compile + the
- * mini.c COMPILE_WASM trigger reference it, and those compile into the cross-compiler too (where
- * HOST_BROWSER is off). Set around a forced compile so the trigger routes the method to COMPILE_WASM
- * regardless of name targeting. */
-__thread gboolean mono_wasm_jit_force = FALSE;
+/* The forced-compile routing is now JIT_FLAG_WASM_FORCE (per-compile), copied to cfg->wasm_jit_forced
+ * in mini.c — the old __thread mono_wasm_jit_force flag is gone (it leaked across nested cctor-driven
+ * compiles of unrelated methods; the per-compile flag is scoped correctly). */
 
 #include <string.h>
 #include <stdio.h>
@@ -231,8 +209,7 @@ int mono_wasm_jit_residual_perm = 0;   /* Lever B: MONO_WASM_JIT_RESIDUAL_PERM=1
 int mono_wasm_jit_island_depth = 10;   /* Lever C: MONO_WASM_JIT_ISLAND_DEPTH — max island DFS depth (was a fixed 10). */
 int mono_wasm_jit_island_budget = 64;  /* Lever C: MONO_WASM_JIT_ISLAND_BUDGET — max force-compiles per island attempt (was a fixed 64). */
 int mono_wasm_jit_block_promote = 16;  /* Lever C: MONO_WASM_JIT_BLOCK_PROMOTE — pull a cold callee into an island once it has BLOCKED >= N island attempts (block_n), even if its own hit count is low (it's hot via JITted callers). 0 = disable (cold gate is hits-only). The bench showed top blockers ~100, so the old thresh/4 (=500) never fired — 16 catches the hot ctors. */
-int mono_wasm_jit_promotion_drain = 8; /* MONO_WASM_JIT_PROMOTION_DRAIN — max queued caller promotions drained per safe point. Higher values reduce backlog when ENTRY_PROMOTE is active. */
-int mono_wasm_jit_retry_retain_pct = 75; /* MONO_WASM_JIT_RETRY_RETAIN_PCT — on a retriable island failure, retain this percentage of the threshold worth of hits instead of restarting from zero. */
+int mono_wasm_jit_promotion_drain = 8; /* MONO_WASM_JIT_PROMOTION_DRAIN — max queued promotions (Lever A callers, block-promote callees, and woken waiters) drained per safe point. */
 int mono_wasm_jit_island_cold_div = 4; /* MONO_WASM_JIT_ISLAND_COLD_DIV — normal cold gate divisor for eager island callees; thresh/div is the minimum retained hit count. */
 int mono_wasm_jit_promoted_cold_div = 16; /* MONO_WASM_JIT_PROMOTED_COLD_DIV — looser cold gate divisor when force-JITing an upward-promoted caller. */
 int mono_wasm_jit_promoted_root_uncold_depth = 1; /* MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH — for promoted roots, skip the cold gate entirely through this DFS depth. */
@@ -1689,11 +1666,114 @@ wj_fcmp_op (gboolean is_f32, int kind)
 	}
 }
 
+#ifdef HOST_BROWSER
+/* The synchronized-INNER wrapper (the dummy a MONO_WRAPPER_SYNCHRONIZED wrapper calls to reach the real
+ * body — see method-to-ir.c) is created FRESH on every IR build (mono_marshal_get_synchronized_inner_wrapper
+ * is uncached), so its MonoMethod — and thus its InterpMethod and wasm f-slot — changes on every compile.
+ * Under the f-slot model a synchronized wrapper could then NEVER observe its inner as JITted: it re-bails
+ * "callee not jitted" and the island re-compiles a fresh inner each pass (a table-slot leak + render
+ * hitches). Canonicalize it: map the wrapped method -> the FIRST inner-wrapper instance we see and always
+ * use THAT one for the f-slot lookup / island blocker / compile, so the slot is stable. Every inner wrapper
+ * for a given method is the same stub (resolved to the same body), so substituting the canonical one is
+ * sound. Other callees pass through unchanged. */
+static GHashTable *wj_sync_inner_canon;   /* wrapped MonoMethod* -> canonical synchronized-inner-wrapper MonoMethod* */
+static MonoMethod *
+wj_canonical_callee (MonoMethod *m)
+{
+	WrapperInfo *info;
+	MonoMethod *wrapped, *canon;
+	if (!m || m->wrapper_type != MONO_WRAPPER_OTHER)
+		return m;
+	info = mono_marshal_get_wrapper_info (m);
+	if (!info || info->subtype != WRAPPER_SUBTYPE_SYNCHRONIZED_INNER)
+		return m;
+	wrapped = info->d.synchronized_inner.method;
+	if (!wrapped)
+		return m;
+	mono_loader_lock ();
+	if (!wj_sync_inner_canon)
+		wj_sync_inner_canon = g_hash_table_new (g_direct_hash, g_direct_equal);
+	canon = (MonoMethod *) g_hash_table_lookup (wj_sync_inner_canon, wrapped);
+	if (!canon) { canon = m; g_hash_table_insert (wj_sync_inner_canon, wrapped, m); }
+	mono_loader_unlock ();
+	return canon;
+}
+
+/* Append a blocking callee to the cfg result, deduped + capped. Shared by the residual=0 pre-scan
+ * (enumerates the full set) and the emit bail site (records the first blocker it hits) so the two can't
+ * disagree on the head of the list. */
+static void
+wj_result_add_blocker (MonoWasmJitResult *res, MonoMethod *m)
+{
+	int i;
+	for (i = 0; i < res->nblockers; ++i)
+		if (res->blockers [i] == m)
+			return;
+	if (res->nblockers < MONO_WASM_JIT_MAX_BLOCKERS)
+		res->blockers [res->nblockers++] = m;
+	else
+		res->blockers_truncated = 1;
+}
+
+/* Pre-scan (residual=0 / islands only): enumerate ALL direct un-JITted callees that would HARD-BLOCK this
+ * method's compile, into cfg->wasm_jit_result.blockers — so wasm_jit_force_island can pull them all in one
+ * emit cycle instead of re-emitting the method once per blocker (the emit itself still bails at the FIRST
+ * blocker; this just hands the island builder the full set up front). The predicate MUST mirror the bail
+ * site in the OP_CALL lowering below: a direct OP_CALL-family call, method!=NULL, callee has no f-slot, not
+ * an rgctx call, not AOT-residual-eligible, not (residual_perm && perm-unjittable). INLINE_AOT (default
+ * off) is not modelled — when on it can only REMOVE a blocker (inlines an AOT callee), so the worst case is
+ * force_island wasting a little budget on a callee that would actually inline; never a correctness issue. */
+static void
+wj_prescan_blockers (MonoCompile *cfg)
+{
+	extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+	extern gboolean mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig);
+	extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
+	extern int mono_wasm_jit_aot_residual, mono_wasm_jit_residual_perm, mono_wasm_jit_sync;
+	extern MonoMethod *mono_marshal_get_synchronized_wrapper (MonoMethod *enter_method);
+	MonoBasicBlock *bb;
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+		MonoInst *ins;
+		MONO_BB_FOR_EACH_INS (bb, ins) {
+			MonoCallInst *call;
+			MonoMethod *call_method;
+			MonoMethodSignature *csig;
+			switch (ins->opcode) {
+			case OP_CALL: case OP_VOIDCALL: case OP_FCALL: case OP_LCALL: case OP_RCALL:
+				break;
+			default:
+				continue;
+			}
+			call = (MonoCallInst *) ins;
+			call_method = call->method;
+			csig = call->signature;
+			if (!call_method || !csig)        /* method==NULL = JIT-icall (never a managed blocker); no sig handled by emit */
+				continue;
+			if (call->rgctx_reg)              /* rgctx call -> routed through residual, never a hard blocker */
+				continue;
+			if (call_method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED) {
+				if (!mono_wasm_jit_sync)      /* sync disabled -> emit bails permanently (not retriable); skip */
+					continue;
+				call_method = mono_marshal_get_synchronized_wrapper (call_method);
+			}
+			call_method = wj_canonical_callee (call_method);   /* stabilize the per-compile synchronized-inner wrapper */
+			if (mono_wasm_jit_get_callee_fslot (call_method) > 0)                                   /* already JITted */
+				continue;
+			if (mono_wasm_jit_aot_residual && mono_interp_jit_call_supported (call_method, csig))    /* AOT-routed residual */
+				continue;
+			if (mono_wasm_jit_residual_perm && mono_wasm_jit_callee_perm_unjittable (call_method))   /* perm-unjittable -> residual */
+				continue;
+			wj_result_add_blocker (&cfg->wasm_jit_result, call_method);
+		}
+	}
+}
+#endif
+
 void
 mono_wasm_emit_method (MonoCompile *cfg)
 {
 #ifdef HOST_BROWSER
-	if (mono_wasm_jit_verbose >= 3) { printf ("WASM_JIT_EMIT_ENTER %s opt=0x%x\n", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); }
+	if (mono_wasm_jit_verbose >= 2) { printf ("WASM_JIT_EMIT_ENTER %s opt=0x%x\n", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); }
 #endif
 	/* Compile-time accounting (Part 2): wj_gen_t0 = bytecode-GENERATION start (100ns ticks); wj_inst_ms =
 	 * the JS WebAssembly.Module/Instance time for THIS compile (written by mono_wasm_jit_instantiate_local).
@@ -2405,6 +2485,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	/* MONO_WASM_JIT_BBTRACE=<substr>: per-bb runtime $blk trace for a matching EH method (debug only). */
 	gboolean eh_bbtrace = FALSE;
 	{ char *_bbt = g_getenv ("MONO_WASM_JIT_BBTRACE"); if (_bbt) { eh_bbtrace = *_bbt && eh_on && mname && strstr (mname, _bbt); g_free (_bbt); } }
+#ifdef HOST_BROWSER
+	/* Islands (residual=0): enumerate the full un-JITted-callee blocker set up front so the auto-JIT trigger
+	 * forms the whole island in ONE emit cycle (see wj_prescan_blockers). No-op under residual!=0. */
+	{ extern int mono_wasm_jit_residual_mode; if (mono_wasm_jit_residual_mode == 0) wj_prescan_blockers (cfg); }
+#endif
 	i = 0;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
 		int loop_depth = N - 1 - i;
@@ -3222,6 +3307,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					if (!mono_wasm_jit_sync) { fail = "calls synchronized method (sync disabled)"; goto done; }   /* bisection: revert to bailing the whole caller */
 					call_method = mono_marshal_get_synchronized_wrapper (call_method);
 				}
+#ifdef HOST_BROWSER
+				/* Canonicalize the (uncached, per-compile-fresh) synchronized-inner wrapper to a stable
+				 * instance so its f-slot is found across re-emits — see wj_canonical_callee. MUST match the
+				 * pre-scan, which canonicalizes identically, so the recorded blocker == this f-slot key. */
+				call_method = wj_canonical_callee (call_method);
+#endif
 				if (!call->method) {
 					/* method==NULL: a runtime JIT-icall. On the cold path of an llvmonly
 					 * virtual/interp call this is mini_llvmonly_init_vtable_slot, which lazily
@@ -3410,9 +3501,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					int tsi = -1, tii = -1, bi;
 					{
 						extern int mono_wasm_jit_residual_mode;
-						extern __thread MonoMethod *mono_wasm_jit_last_blocking_callee;
 						int rm = mono_wasm_jit_residual_mode;
-						/* record the blocking callee so the trigger can eagerly form the island (see the relay decl) */
+						/* record the blocking callee on the cfg result so the trigger can eagerly form the island */
 						/* rgctx calls (MONO_WASM_JIT_RGCTX): if INLINE_AOT couldn't take it (gsharedvt-variable, or
 						 * inline-aot off/byref), keep the method JITted by routing this one call through the residual
 						 * (mono_wasm_jit_call_interp derives the context from the concrete callee) rather than bailing
@@ -3437,7 +3527,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								extern int mono_wasm_jit_residual_perm;
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
 								if (!(mono_wasm_jit_residual_perm && mono_wasm_jit_callee_perm_unjittable (call_method))) {
-									mono_wasm_jit_last_blocking_callee = call_method;
+									/* The residual=0 pre-scan (wj_prescan_blockers) already enumerated the full
+									 * blocker set; record this one too (deduped) so the list head is correct even
+									 * if the pre-scan predicate ever drifts from this site. */
+									wj_result_add_blocker (&cfg->wasm_jit_result, call_method);
 									fail = "callee not jitted (residual off)";
 									goto done;
 								}
@@ -3941,8 +4034,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * gated: it dispatches via the inline IC + interp-entry-thunk fallback, which always
 				 * resolves to a callable slot. */
 				{
-					extern __thread gboolean mono_wasm_jit_force;
-					if (mono_wasm_jit_force) { fail = "raw indirect call under auto-JIT"; goto done; }
+					if (cfg->wasm_jit_forced) { fail = "raw indirect call under auto-JIT"; goto done; }
 				}
 				/* rgctx (ftndesc.arg) is folded into csig as a trailing param + call->args, so it's
 				 * handled like any other arg — no separate rgctx_arg_reg (that field is LLVM-only). */
@@ -4165,10 +4257,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			 * If the module is invalid (a codegen bug for some opcode shape), bail to the interpreter
 			 * here rather than letting another thread trap on a placeholder slot at invoke time. */
 			if (mono_wasm_jit_instantiate_local (e_slot, f_slot, cached, (int) out.len, ierr, (int) sizeof (ierr), &wj_inst_ms)) {
-				/* Success relay (mono_wasm_jit_last_*) is published LAST, after register + sync_thread below; see
-				 * the comment there. This whole compile is re-entrant (cctors / AOT-target init drive nested
-				 * wasm-JIT compiles that reuse these per-thread relay fields), so writing them early would let a
-				 * nested compile clobber THIS method's result. */
+				/* The compile result is written onto cfg->wasm_jit_result (below). It's per-compile, so a
+				 * re-entrant nested compile (cctors / AOT-target init) has its OWN cfg and can't clobber it —
+				 * no per-thread-relay ordering dance needed. We still write the e_slot gate AFTER register +
+				 * sync_thread so it's only set once this method's callees are guaranteed live on this thread. */
 				if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_REGISTERED); mono_wasm_jit_add (WJC_BYTES_GENERATED, (gint64) out.len); }
 				{ extern void mono_wasm_jit_register (int e_slot, int f_slot, void *bytes, int len); mono_wasm_jit_register (e_slot, f_slot, cached, (int) out.len); }
 				if (mono_wasm_jit_verbose >= 1) { printf ("WASM_JIT_REGISTERED %s e_slot=%d f_slot=%d len=%u\n", mname, e_slot, f_slot, (unsigned) out.len); }
@@ -4183,17 +4275,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * guarantees all of this method's direct f-slot callees are live before it can run. No-op fast
 				 * path when already current. */
 				mono_wasm_jit_sync_thread ();
-				/* Publish the success relay NOW: after register + the re-entrant sync_thread (and the whole
-				 * compile above, which can run cctors / AOT-target init that drive a NESTED wasm-JIT compile
-				 * reusing these per-thread relay fields). Writing them here, past every re-entrant step,
-				 * guarantees compile_publish / the transform path read THIS method's result, not a nested
-				 * one. last_slot is set LAST behind a barrier (it is the >0 success gate the readers test).
-				 * (Same per-thread-relay re-entrancy class as the vcall scratch+200 clobber.) */
-				mono_wasm_jit_last_bytes = cached;
-				mono_wasm_jit_last_len = (int) out.len;
-				mono_wasm_jit_last_fslot = f_slot;
-				mono_memory_barrier ();
-				mono_wasm_jit_last_slot = e_slot;
+				/* Write the success result onto cfg (read back by mono_wasm_force_compile after the compile
+				 * returns, on this same thread). e_slot is the >0 success gate the readers test; no cross-thread
+				 * barrier needed here — the result is consumed on this thread via cfg, and the cross-thread
+				 * publish to InterpMethod.wasm_jit_slot keeps its own barrier in wasm_jit_compile_publish. */
+				cfg->wasm_jit_result.bytes = cached;
+				cfg->wasm_jit_result.bytes_len = (int) out.len;
+				cfg->wasm_jit_result.f_slot = f_slot;
+				cfg->wasm_jit_result.e_slot = e_slot;
 			} else {
 				g_free (cached);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_INVALID);
@@ -4227,28 +4316,26 @@ done:
 	/* Retriable iff the bail was "callee not jitted" (an ordering/island issue that may resolve once the
 	 * callee JITs); EH clauses / unsupported opcodes / synchronized / byref are permanent. NULL fail
 	 * (success) -> 0. The auto-JIT trigger reads this to pick a retry vs permanent slot state. */
-	mono_wasm_jit_last_retriable = (fail && strstr (fail, "callee not jitted")) ? 1 : 0;
+	cfg->wasm_jit_result.retriable = (fail && strstr (fail, "callee not jitted")) ? 1 : 0;
 	/* Categorize the bail reason for the weighted vcall-residual breakdown (stored on InterpMethod by
 	 * compile_publish only when the bail is permanent). Opcode bails carry the opcode number so the bench
 	 * can name the dominant blocker (e.g. ldaddr 331); EH/sig/other get sentinel negatives. */
-	if (!fail) mono_wasm_jit_last_bail = 0;
-	else if (fail_op == OP_LDADDR) mono_wasm_jit_last_bail = -5;         /* ldaddr (needs addressable locals) */
-	else if (fail_op == OP_LCOMPARE) mono_wasm_jit_last_bail = -6;       /* lcompare */
-	else if (fail_op >= 0) mono_wasm_jit_last_bail = fail_op;            /* some other unsupported opcode (>0) */
-	else if (strstr (fail, "EH clauses")) mono_wasm_jit_last_bail = -2;
-	else if (strstr (fail, "arg type") || strstr (fail, "ret type")) mono_wasm_jit_last_bail = -3;   /* arg/ret sig type */
+	if (!fail) cfg->wasm_jit_result.bail = 0;
+	else if (fail_op == OP_LDADDR) cfg->wasm_jit_result.bail = -5;         /* ldaddr (needs addressable locals) */
+	else if (fail_op == OP_LCOMPARE) cfg->wasm_jit_result.bail = -6;       /* lcompare */
+	else if (fail_op >= 0) cfg->wasm_jit_result.bail = fail_op;            /* some other unsupported opcode (>0) */
+	else if (strstr (fail, "EH clauses")) cfg->wasm_jit_result.bail = -2;
+	else if (strstr (fail, "arg type") || strstr (fail, "ret type")) cfg->wasm_jit_result.bail = -3;   /* arg/ret sig type */
 	/* Split what used to be the -4 "other" catch-all so the vcall-perm breakdown is actionable (the bench
 	 * showed -4 was 99% of the perm vcall residual). Order: most specific class first. */
-	else if (strstr (fail, "byref")) mono_wasm_jit_last_bail = -7;                                   /* byref arg/ret */
-	else if (strstr (fail, "rgctx") || strstr (fail, "gshared")) mono_wasm_jit_last_bail = -8;        /* generic-shared / rgctx */
-	else if (strstr (fail, "synchronized")) mono_wasm_jit_last_bail = -9;                             /* synchronized method/wrapper */
-	else if (strstr (fail, "EH") || strstr (fail, "finally") || strstr (fail, "eh ") || strstr (fail, "eh-")) mono_wasm_jit_last_bail = -10; /* other EH reasons (not the -2 clause gate) */
-	else mono_wasm_jit_last_bail = -4;                                   /* genuinely other (unsupported IR shape: reg/move/sig/indirect/...) */
-	/* On any bail, clear the success relay: a nested re-entrant compile (cctor / AOT-target init
-	 * during this emit) may have left a positive last_slot, which compile_publish / the transform
-	 * path would otherwise mistake for THIS method succeeding (publishing the nested method's
-	 * slot/bytes onto this InterpMethod). last_retriable/last_bail above are the bail payload. */
-	if (fail) { mono_wasm_jit_last_slot = 0; mono_wasm_jit_last_fslot = 0; mono_wasm_jit_last_bytes = NULL; mono_wasm_jit_last_len = 0; }
+	else if (strstr (fail, "byref")) cfg->wasm_jit_result.bail = -7;                                   /* byref arg/ret */
+	else if (strstr (fail, "rgctx") || strstr (fail, "gshared")) cfg->wasm_jit_result.bail = -8;        /* generic-shared / rgctx */
+	else if (strstr (fail, "synchronized")) cfg->wasm_jit_result.bail = -9;                             /* synchronized method/wrapper */
+	else if (strstr (fail, "EH") || strstr (fail, "finally") || strstr (fail, "eh ") || strstr (fail, "eh-")) cfg->wasm_jit_result.bail = -10; /* other EH reasons (not the -2 clause gate) */
+	else cfg->wasm_jit_result.bail = -4;                                   /* genuinely other (unsupported IR shape: reg/move/sig/indirect/...) */
+	/* No on-fail clear needed: the success fields (e_slot/f_slot/bytes) are only written on the
+	 * instantiate-success path above, and this cfg is private to this compile — a nested re-entrant
+	 * compile has its own cfg and cannot have set them here (the old per-thread-relay clobber is gone). */
 #endif
 	if (fail) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) {
