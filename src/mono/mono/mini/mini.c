@@ -3796,7 +3796,13 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 		/* Disable llvm for overly complex methods */
 		cfg->disable_ssa = TRUE;
 
-	if (cfg->opt & MONO_OPT_LOOP) {
+	/* The runtime wasm JIT resets cfg->opt to INTRINS|FLOAT32 (dropping MONO_OPT_LOOP) to keep call-arg
+	 * vregs intact, but it still runs insert_safepoints below. Without loop analysis, bb->loop_body_start is
+	 * never set and insert_safepoints places NO loop back-edge poll, so a hot call-free JITted loop never
+	 * polls mono_polling_required -> on the threaded build a GC on another thread stalls (coop-suspend hang).
+	 * Run the loop ANALYSIS (dominator info + natural loops) for the wasm path when safepoints are enabled —
+	 * NOT MONO_OPT_LOOP itself, so the loop OPTIMIZATION passes (LICM, gated on cfg->opt) stay off. */
+	if ((cfg->opt & MONO_OPT_LOOP) || (cfg->compile_wasm && mono_threads_are_safepoints_enabled ())) {
 		MONO_TIME_TRACK (mono_jit_stats.jit_compile_dominator_info, mono_compile_dominator_info (cfg, MONO_COMP_DOM | MONO_COMP_IDOM));
 		MONO_TIME_TRACK (mono_jit_stats.jit_compute_natural_loops, mono_compute_natural_loops (cfg));
 	}
