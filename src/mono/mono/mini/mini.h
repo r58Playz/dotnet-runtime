@@ -2486,7 +2486,14 @@ typedef struct {
 	WasmEhClause *clauses;  /* [nclauses], in table (innermost/first-checked) order */
 	const char *name;       /* method full name (diagnostics only) */
 } WasmEhTable;
-/* Returns the dense bbidx of the handler to dispatch to (>=0), or -1 to rethrow (no local handler). */
+/* Returns the dense bbidx of the handler to dispatch to (>=0), or -1 to rethrow (no local handler).
+ * A FINALLY/FAULT handler's bbidx is tagged with WJ_EH_DISPATCH_FINALLY_BIT so the wasm landing pad
+ * sets the exception-path marker (finally_ind = -1) ONLY for those dispatches: setting it for every
+ * dispatch clobbered the OP_CALL_HANDLER continuation when a CATCH matched inside a NORMAL-path
+ * finally body (e.g. `finally { try { close(); } catch { } }`) — its OP_ENDFINALLY then took the
+ * re-raise path and popped an unrelated (or no) saved exception. bbidx is a dense bb index, far
+ * below 2^30, so the tag never collides and a tagged value still passes the pad's `h < 0` check. */
+#define WJ_EH_DISPATCH_FINALLY_BIT (1 << 30)
 int       mono_wasm_jit_eh_dispatch             (WasmEhTable *table, int blk);
 #endif
 void mono_call_inst_add_outarg_reg (MonoCompile *cfg, MonoCallInst *call, int vreg, int hreg, int bank);
