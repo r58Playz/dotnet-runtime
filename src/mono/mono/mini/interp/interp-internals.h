@@ -151,7 +151,7 @@ struct InterpMethod {
 	int n_data_items;
 	int num_clauses; // clauses
 	int transformed; // boolean
-	gint32 wasm_jit_slot; // runtime wasm JIT: function-table slot of the entry thunk e (0 = untried, -1 = attempted+bailed, >0 = JITted)
+	gint32 wasm_jit_slot; // runtime wasm JIT: function-table slot of the entry thunk e (0 = untried, -2 = waiter-parked, -3 = transient retry, -1 = permanent bail, >0 = JITted)
 	gint32 wasm_jit_fslot; // runtime wasm JIT: slot of the scalar method fn f, for call_indirect from JITted callers (0 = none)
 	gint32 wasm_jit_hits;  // runtime wasm JIT: call-count toward the auto-JIT hotness threshold (MONO_WASM_JIT_AUTO)
 	gint32 wasm_jit_bytes_len; // runtime wasm JIT: length of the cached module bytes (for per-thread instantiation)

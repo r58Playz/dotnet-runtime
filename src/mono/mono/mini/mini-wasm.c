@@ -194,8 +194,9 @@ int mono_wasm_jit_aotconst = 1;       /* MONO_WASM_JIT_AOTCONST: bake resolved O
  * which sets uses_rgctx_reg — so the rgctx bail was killing nearly every render-path EH method (e.g.
  * tesselateBlock) right after the EH gate let it through. The rgctx call sits in the COLD catch block, so
  * the (slower) residual re-entry there is free; the hot try-body JITs to wasm. The direct f-slot path needs
- * no rgctx (our f-slots are dedicated/concrete compiles); INLINE_AOT is skipped for rgctx calls (it would
- * bake a NULL rgctx — cinfo->extra_arg is only populated under mono_llvm_only, which this runtime is not);
+ * no rgctx (our f-slots are dedicated/concrete compiles); INLINE_AOT is skipped for rgctx calls because the
+ * call needs the CALLSITE runtime generic context, while the AOT fast path only knows how to bake the CALLEE
+ * extra arg/rgctx (cinfo->extra_arg in llvm_only, or the matching fallback recovery below);
  * indirect/virtual rgctx calls still bail (untested shape). Default ON; MONO_WASM_JIT_RGCTX=0 reverts to the
  * old whole-method bail. */
 int mono_wasm_jit_rgctx = 1;
@@ -1932,7 +1933,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * is routed per-site to the interp residual (mono_wasm_jit_call_interp), which derives the generic
 	 * context from the concrete inflated call->method and is rgctx-correct (interp_entry, and the AOT
 	 * fastpath's do_jit_call-via-gsharedvt_out wrapper, both handle it). The INLINE_AOT direct-body path is
-	 * skipped for rgctx calls (it would feed a NULL rgctx — cinfo->extra_arg is only set under mono_llvm_only);
+	 * skipped for rgctx calls because it can only bake the callee's extra arg/rgctx, not the separate CALLSITE
+	 * runtime generic context carried in MONO_ARCH_RGCTX_REG;
 	 * indirect/virtual rgctx calls still bail. This unblocks IKVM EH methods whose catch block calls the
 	 * generic ExceptionHelper.MapException<T> (the #1 render-path blocker after the EH gate). */
 	{ extern int mono_wasm_jit_rgctx;
@@ -2448,7 +2450,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		eh_type_idx = -1;
 		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_type_idx = 2 + _k; break; }
 		if (eh_type_idx < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_type_idx = 2 + nextra++; }
-		/* (i32,i32)->i32: mono_wasm_jit_eh_dispatch (table, blk) -> handler bbidx or -1 */
+		/* (i32,i32)->i32: mono_wasm_jit_eh_dispatch (table, blk) -> handler bbidx (a finally/fault
+		 * handler's bbidx is tagged with WJ_EH_DISPATCH_FINALLY_BIT; the landing pad strips it) or -1 */
 		memset (&_t, 0, sizeof _t); _t.nparams = 2; _t.params [0] = WASM_I32; _t.params [1] = WASM_I32; _t.ret = WASM_I32;
 		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_dispatch_ti = 2 + _k; break; }
 		if (eh_dispatch_ti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_dispatch_ti = 2 + nextra++; }
@@ -3445,10 +3448,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						/* Gate: byref args/ret bail (interp_entry handles those). ALSO bail two cases this inline
 						 * path cannot marshal, to the residual (which is correct for both):
 						 *  - call->rgctx_reg: a generic-shared callee needs the CALLSITE runtime generic context, but
-						 *    aot_call_target bakes cinfo->extra_arg (NULL in this non-llvm_only runtime) -> the callee
-						 *    would get a null/wrong rgctx (bad GOT lookups / null-fn trap). The comment at the RGCTX
-						 *    flag promised this skip; enforce it here (the vcall path already bails rgctx at the membase
-						 *    site). - call->need_unbox_trampoline: a boxed-valuetype receiver (object/interface target)
+						 *    aot_call_target only returns the callee-side extra arg/rgctx used by the llvm_only direct
+						 *    call ABI. Reusing that value here would feed the callee the wrong context (bad GOT lookups /
+						 *    null-fn trap). The comment at the RGCTX flag promised this skip; enforce it here (the vcall
+						 *    path already bails rgctx at the membase site). - call->need_unbox_trampoline: a boxed-valuetype receiver (object/interface target)
 						 *    needs `this` unboxed (+sizeof(MonoObject)); aot_call_target hands back the RAW body with no
 						 *    unbox tagging, so the inline path would pass the boxed header pointer -> field reads off by
 						 *    the header. The residual/interp preserves unbox semantics. */
@@ -4171,12 +4174,27 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0);
 		}
 #endif
-		/* milestone 2c: mark the EXCEPTION path for any finally handler we dispatch to — finally_ind = -1 so
-		 * its OP_ENDFINALLY re-raises (vs a normal leave, where OP_CALL_HANDLER set finally_ind to a real
-		 * continuation bb). Harmless for catch handlers (they never read finally_ind). Finally methods only. */
+		/* milestone 2c: mark the EXCEPTION path (finally_ind = -1, so OP_ENDFINALLY re-raises) ONLY when
+		 * the matched handler IS a finally/fault — eh_dispatch tags those with WJ_EH_DISPATCH_FINALLY_BIT.
+		 * The old unconditional set clobbered the OP_CALL_HANDLER continuation whenever a CATCH matched
+		 * while a NORMAL-path finally body was executing (`finally { try { close(); } catch { } }`, the
+		 * common Java/IKVM cleanup shape): after the catch swallowed, that finally's OP_ENDFINALLY read
+		 * -1 and took the re-raise path — popping an UNRELATED outer finally's saved exception (cross-
+		 * frame exception theft + gchandle double-free) or synthesizing a spurious EEE on a normal leave.
+		 * After setting the marker, strip the tag so $blk receives the plain handler bbidx. Finally
+		 * methods only (a catch-only method's dispatch never tags, and its pad has no finally_ind use). */
 		if (eh_has_finally) {
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_h_idx);
+			wasm_i32_const (&body, WJ_EH_DISPATCH_FINALLY_BIT);
+			wasm_op (&body, WASM_OP_I32_AND);
+			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);    /* tagged: finally/fault handler */
 			wasm_i32_const (&body, -1);
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) finally_ind_idx);
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_h_idx);
+			wasm_i32_const (&body, ~WJ_EH_DISPATCH_FINALLY_BIT);
+			wasm_op (&body, WASM_OP_I32_AND);
+			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_h_idx);
+			wasm_op (&body, WASM_OP_END);                          /* end if (untagged catch: finally_ind untouched) */
 		}
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_h_idx);
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);   /* $blk = handler bbidx */
