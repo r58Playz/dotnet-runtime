@@ -10086,7 +10086,24 @@ int
 mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 {
 	InterpMethod *im = mono_interp_get_imethod (method);
-	return im ? im->wasm_jit_fslot : 0;
+	/* Prefer the published (live) f-slot; else the reserved-but-unpublished slot of an SCC member currently
+	 * being batch-compiled, so mutually-recursive cycle members bake each other's f-slot at emit time. */
+	return im ? (im->wasm_jit_fslot > 0 ? im->wasm_jit_fslot : im->wasm_jit_resv_fslot) : 0;
+}
+
+/* runtime wasm JIT (multi-method cycle batch): if `method` has a reserved slot pair (it is a member of an
+ * SCC currently being batch-compiled by wasm_jit_compile_scc), output it and return 1 — the emitter
+ * instantiates INTO these instead of allocating fresh. 0 = none. */
+int
+mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
+{
+	InterpMethod *im = mono_interp_get_imethod (method);
+	if (im && im->wasm_jit_resv_fslot > 0) {
+		*e_out = im->wasm_jit_resv_eslot;
+		*f_out = im->wasm_jit_resv_fslot;
+		return 1;
+	}
+	return 0;
 }
 
 /* runtime wasm JIT (Lever B): 1 if the callee is PERMANENTLY un-JITtable (slot==-1: EH/unsupported

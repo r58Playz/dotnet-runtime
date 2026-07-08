@@ -160,6 +160,8 @@ struct InterpMethod {
 	gint32 wasm_jit_invoke_in; // runtime wasm JIT diag (Part 3c): times entered interp->JIT (this method was the JITted callee at a MINT_CALL/CALLVIRT). stats only
 	gint32 wasm_jit_block_n;   // runtime wasm JIT (Part 3a / Lever C): times this (un-JITted) method BLOCKED a caller's island. Always counted (cheap, compile-time): also a stats-independent "hot at the island boundary" signal for the cold gate.
 	gint32 wasm_jit_invoke_out; // runtime wasm JIT (Lever A): times THIS (interp) method invoked a JITted callee. Drives MONO_WASM_JIT_ENTRY_PROMOTE upward island growth.
+	gint32 wasm_jit_resv_eslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished entry-thunk slot while this method's SCC is being batch-compiled (0 = none)
+	gint32 wasm_jit_resv_fslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished fn slot; get_callee_fslot returns it so cycle members bake each other's f-slot before any member is published/invocable
 	unsigned int param_count;
 	unsigned int hasthis; // boolean
 	MonoProfilerCallInstrumentationFlags prof_flags;

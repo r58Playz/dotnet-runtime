@@ -846,11 +846,11 @@ int mono_wasm_jit_pinall = 0;
  * shadow-stack/addr-frame stores). DEBUG ONLY (a C call per ref store). Default off. */
 int mono_wasm_jit_objguard = 0;
 
-/* Called (when storeguard is on) right before a ref-shadow-stack (kind 0) or addr-frame (kind 1) store, with
- * the computed target address. If the address is outside this thread's arena — the signature of an
- * enter/leave imbalance on an EH unwind drifting the base past the region, or a corrupted base — trap HERE so
- * the (MONO_WASM_JIT_NAMES-symbolicated) wasm stack trace names the JITted method doing the wild store,
- * instead of the random downstream OOB. */
+/* Called (when storeguard/objguard is on) right before a ref-shadow-stack (kind 0), addr-frame (kind 1),
+ * object/base store (kind 2/3), or generic membase access (kind 4), with the computed target address. If the
+ * address is outside the expected region — the signature of an enter/leave imbalance on an EH unwind drifting
+ * the base past the region, or a corrupted base — trap HERE so the (MONO_WASM_JIT_NAMES-symbolicated) wasm
+ * stack trace names the JITted method doing the bad access, instead of the random downstream OOB. */
 void
 mono_wasm_jit_check_store (guint8 *addr, int kind)
 {
@@ -862,7 +862,7 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 	 * These are __thread statics in this TU, so &x is this thread's own copy: a same-thread wild store matches.
 	 * Trap so the symbolicated wasm trace names the exact method + store doing it. Runs for the object-base
 	 * (kind 2) and byref-base (kind 3) guards. */
-	if (G_UNLIKELY ((kind == 2 || kind == 3) && addr != NULL)) {
+	if (G_UNLIKELY ((kind == 2 || kind == 3 || kind == 4) && addr != NULL)) {
 		gsize a = (gsize) addr;
 		struct { gsize lo, hi; } ctl [] = {
 			{ (gsize) &wj_ref_sp,   (gsize) &wj_ref_sp   + sizeof (wj_ref_sp) },
@@ -874,12 +874,27 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 		};
 		for (int _c = 0; _c < (int) (sizeof (ctl) / sizeof (ctl [0])); ++_c) {
 			if (G_UNLIKELY (a >= ctl [_c].lo && a < ctl [_c].hi)) {
-				printf ("WASM_JIT_CLOBBER_CTL store addr=%p hits shadow-stack control var #%d — this method's store is the wild write poisoning wj_ref_sp; trace below:\n",
+				printf ("WASM_JIT_CLOBBER_CTL access addr=%p hits shadow-stack control var #%d — this method's memory access is poisoning shadow-stack control; trace below:\n",
 					(void *) addr, _c);
 				fflush (stdout);
 				__builtin_trap ();
 			}
 		}
+	}
+	if (kind == 4) {
+		/* OBJGUARD generic membase load/store address: catch OOB loads and scalar-classified wild store bases
+		 * that the ref/byref-specific kind 2/3 checks do not see. */
+		if (G_UNLIKELY (addr != NULL)) {
+			gsize a = (gsize) addr;
+			gsize memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
+			if (G_UNLIKELY (a < 1024 || a >= memsz)) {
+				printf ("WASM_JIT_BAD_MEMADDR addr=%p — garbage JIT membase access address; method in the trap below:\n",
+					(void *) addr);
+				fflush (stdout);
+				__builtin_trap ();
+			}
+		}
+		return;
 	}
 	if (kind == 3) {
 		/* OBJGUARD byref base: addr is the base of a store THROUGH a ref/byref (e.g. `*outparam = scalar`).
@@ -1588,6 +1603,26 @@ wasm_ld (WasmBuf *b, WjCtx *c, int vreg)
 }
 
 static gboolean
+wasm_guard_memaddr (WasmBuf *b, WjCtx *c, int base_vreg, gint32 offset)
+{
+#ifdef HOST_BROWSER
+	if (G_UNLIKELY (c->objguard && c->check_ti >= 0)) {
+		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+		if (!wasm_ld (b, c, base_vreg))
+			return FALSE;
+		if (offset) {
+			wasm_i32_const (b, offset);
+			wasm_op (b, WASM_OP_I32_ADD);
+		}
+		wasm_i32_const (b, 4);   /* generic membase access address */
+		wasm_i32_const (b, (gint32) (intptr_t) mono_wasm_jit_check_store);
+		wasm_op (b, WASM_OP_CALL_INDIRECT); wasm_uleb (b, (guint32) c->check_ti); wasm_uleb (b, 0);
+	}
+#endif
+	return TRUE;
+}
+
+static gboolean
 wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 {
 	if (vreg < 0 || vreg >= c->nvreg)
@@ -1758,6 +1793,8 @@ wj_prescan_blockers (MonoCompile *cfg)
 				call_method = mono_marshal_get_synchronized_wrapper (call_method);
 			}
 			call_method = wj_canonical_callee (call_method);   /* stabilize the per-compile synchronized-inner wrapper */
+			if (call_method == cfg->method)                                                        /* self-recursion: baked via self-slot reservation, not a blocker */
+				continue;
 			if (mono_wasm_jit_get_callee_fslot (call_method) > 0)                                   /* already JITted */
 				continue;
 			if (mono_wasm_jit_aot_residual && mono_interp_jit_call_supported (call_method, csig))    /* AOT-routed residual */
@@ -1823,6 +1860,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	const char *fail = NULL;
 	int fail_op = -1;
 	char *mname = mono_method_get_full_name (cfg->method);
+#ifdef HOST_BROWSER
+	/* Self-recursive DIRECT calls under residual=0: a method calling itself can't bake its own f-slot
+	 * because the slot doesn't exist until this compile finishes. Reserve our OWN e/f-slot pair lazily on
+	 * the first self-call (reusing a pair recycled from a prior bailed self-emit if one is pending — the
+	 * jiterp table is append-only, so we can't free) and bake it; the success path instantiates INTO these.
+	 * 0 = none reserved. wj_recycle_* is a per-thread (__thread) static so it needs no lock and can never
+	 * alias a slot across threads even on the unserialized name-targeted compile path. */
+	static __thread int wj_recycle_e_slot = 0, wj_recycle_f_slot = 0;
+	int wj_self_e_slot = 0, wj_self_f_slot = 0;
+#endif
 
 	wasm_buf_init (&body);
 
@@ -2918,7 +2965,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_op (&body, WASM_OP_END);
 				break;
 			}
-#define LOADM(WOP, AL) do { if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; } } while (0)
+#define LOADM(WOP, AL) do { if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; } if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; } } while (0)
 			case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE: LOADM (WASM_OP_I32_LOAD, 2); break;
 			case OP_LOADU1_MEMBASE: LOADM (WASM_OP_I32_LOAD8_U, 0); break;
 			case OP_LOADI1_MEMBASE: LOADM (WASM_OP_I32_LOAD8_S, 0); break;
@@ -2947,6 +2994,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_check_store); \
 			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) lc.check_ti); wasm_uleb (&body, 0); \
 		} \
+		if (!wasm_guard_memaddr (&body, &lc, ins->dreg, (gint32) ins->inst_offset)) { fail = "store addr guard"; goto done; } \
 		if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store base"; goto done; } if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "store val"; goto done; } wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
 			case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: STOREM (WASM_OP_I32_STORE, 2); break;
 			case OP_STOREI1_MEMBASE_REG: STOREM (WASM_OP_I32_STORE8, 0); break;
@@ -2967,6 +3015,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_check_store); \
 			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) lc.check_ti); wasm_uleb (&body, 0); \
 		} \
+		if (!wasm_guard_memaddr (&body, &lc, ins->dreg, (gint32) ins->inst_offset)) { fail = "store-imm addr guard"; goto done; } \
 		if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store-imm base"; goto done; } wasm_i32_const (&body, (gint32) ins->inst_imm); wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
 			case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: STOREMI (WASM_OP_I32_STORE, 2); break;
 			case OP_STOREI1_MEMBASE_IMM: STOREMI (WASM_OP_I32_STORE8, 0); break;
@@ -3384,7 +3433,24 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					if (ct.ret == 0 || ct.ret == WASM_VOID) { fail = "call ret type"; goto done; }
 				}
 #ifdef HOST_BROWSER
-				{ extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m); call_fslot = mono_wasm_jit_get_callee_fslot (call_method); }
+				if (call_method == cfg->method) {
+					extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+					/* SCC batch: the orchestrator reserved our slot on the imethod -> get_callee_fslot returns
+					 * it. Otherwise this is standalone self-recursion: reserve our own e/f-slot pair here
+					 * (reusing a recycled pair from a prior bailed self-emit) and bake it; the success path
+					 * instantiates INTO these. Table exhausted (alloc -> 0) -> fall through to the not-jitted bail. */
+					call_fslot = mono_wasm_jit_get_callee_fslot (call_method);
+					if (call_fslot <= 0) {
+						if (!wj_self_f_slot) {
+							if (wj_recycle_f_slot) { wj_self_e_slot = wj_recycle_e_slot; wj_self_f_slot = wj_recycle_f_slot; wj_recycle_e_slot = 0; wj_recycle_f_slot = 0; }
+							else { wj_self_e_slot = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */); wj_self_f_slot = mono_jiterp_allocate_table_entry (1); }
+						}
+						call_fslot = wj_self_f_slot;
+					}
+				} else {
+					extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+					call_fslot = mono_wasm_jit_get_callee_fslot (call_method);
+				}
 #else
 				call_fslot = 0x7fff; /* offline dump: placeholder slot for encoder validation */
 #endif
@@ -4265,8 +4331,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * function table is PER-THREAD for dynamically-added entries, so instantiation is deferred to
 		 * the interp's first invoke on each thread (interp.c MINT_CALL → mono_wasm_jit_instantiate_local),
 		 * which instantiates its own WebAssembly.Instance into its own table[e_slot]/[f_slot]. */
-		int e_slot = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
-		int f_slot = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+		/* Slot selection: (1) an SCC batch reservation on our imethod (multi-method cycle — the orchestrator
+		 * reserved these and publishes us); (2) a standalone self-recursion reservation made in this emit;
+		 * (3) fresh allocation. Instantiate INTO the reserved pair so baked self/cross-cycle calls resolve. */
+		int e_slot = 0, f_slot = 0;
+		{ extern int mono_wasm_jit_self_reserved (MonoMethod *m, int *e_out, int *f_out);
+		  if (!mono_wasm_jit_self_reserved (cfg->method, &e_slot, &f_slot)) {
+			e_slot = wj_self_f_slot ? wj_self_e_slot : mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+			f_slot = wj_self_f_slot ? wj_self_f_slot : mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+		  } }
 		if (e_slot > 0 && f_slot > 0) {
 			void *cached = g_malloc ((gsize) out.len);
 			char ierr [192]; ierr [0] = 0;
@@ -4354,6 +4427,12 @@ done:
 	/* No on-fail clear needed: the success fields (e_slot/f_slot/bytes) are only written on the
 	 * instantiate-success path above, and this cfg is private to this compile — a nested re-entrant
 	 * compile has its own cfg and cannot have set them here (the old per-thread-relay clobber is gone). */
+	/* Reserved a self-slot pair but didn't instantiate into it (bail / invalid module) -> hand it to the
+	 * recycle so the next self-recursive emit reuses it instead of leaking the append-only table entry. */
+	if (wj_self_f_slot && cfg->wasm_jit_result.f_slot != wj_self_f_slot && !wj_recycle_f_slot) {
+		wj_recycle_e_slot = wj_self_e_slot;
+		wj_recycle_f_slot = wj_self_f_slot;
+	}
 #endif
 	if (fail) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) {
@@ -4369,7 +4448,17 @@ done:
 			else cat = WJB_SYNC_OTHER;
 			wj_bail_hist [cat]++;
 		}
-		if (mono_wasm_jit_verbose >= 2) { printf ("WASM_JIT_BAIL %s : %s (op=%d %s)\n", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-"); }
+		if (mono_wasm_jit_verbose >= 2) {
+			/* Name the FIRST recorded blocker + the blocker count. A retriable "callee not jitted" bail with
+			 * nblk=0 is the smoking gun for the retry storm: compile_publish can't block_note anything, so
+			 * force_island returns BUSY -> SLOT_RETRY -> re-attempt every threshold (never parks). */
+			int _nblk = cfg->wasm_jit_result.nblockers;
+			char *_cn = _nblk > 0 ? mono_method_get_full_name (cfg->wasm_jit_result.blockers [0]) : NULL;
+			printf ("WASM_JIT_BAIL %s : %s (op=%d %s) [nblk=%d%s%s]\n", mname, fail, fail_op,
+				fail_op >= 0 ? wj_opname (fail_op) : "-", _nblk,
+				_cn ? " blocker=" : "", _cn ? _cn : "");
+			g_free (_cn);
+		}
 	}
 	g_free (mname);
 	if (g_getenv ("MONO_WASM_JIT_DUMP_EXIT") != NULL)
