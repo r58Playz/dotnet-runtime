@@ -30,6 +30,7 @@ static int mono_wasm_debug_level = 0;
 #ifdef HOST_BROWSER
 #include <emscripten.h>
 int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
+#endif
 /* The runtime wasm-JIT emit result (slots / bytes / bail / retriable / blockers) is no longer relayed
  * through thread-locals: the emitter writes it onto the per-compile cfg->wasm_jit_result (see
  * MonoWasmJitResult in mini.h) and mono_wasm_force_compile copies it out after the compile returns.
@@ -43,6 +44,12 @@ int mono_wasm_jit_auto = -1;
 int mono_wasm_jit_thresh = 2000;
 int mono_wasm_jit_vcall_ic = 1;   /* virtual-dispatch resolve cache; MONO_WASM_JIT_VCALL_IC=0 disables (always resolve) */
 
+/* NB: compiled into BOTH the browser runtime and mono-aot-cross (no longer HOST_BROWSER-gated) so the
+ * OFFLINE cross-compiler dump path (mini.c COMPILE_WASM fork) reads MONO_WASM_JIT_VERBOSE/DUMP_IR/STATS +
+ * every lever from the env, exactly like the in-browser transform — that's what makes
+ * `mono-aot-cross --aot <dll>` with MONO_WASM_JIT_METHOD set a faithful offline emit/bail dumper.
+ * Idempotent (guarded on the auto<0 sentinel). The 4 trigger globals above are only USED by the browser
+ * interp hotness/island code; defining them for the cross build is harmless (unreferenced there). */
 void
 mono_wasm_jit_auto_init (void)
 {
@@ -55,7 +62,8 @@ mono_wasm_jit_auto_init (void)
 		mono_wasm_jit_thresh = 2000;
 	{ extern int mono_wasm_jit_stats; const char *s = g_getenv ("MONO_WASM_JIT_STATS"); mono_wasm_jit_stats = (s && *s && *s != '0') ? 1 : 0; }
 	/* MONO_WASM_JIT_VERBOSE controls the per-method emit LOG spam, DECOUPLED from stats (counting is cheap,
-	 * logging floods): 0=silent (default), 1=+registered/invalid, 2=+bail, 3=+emit-enter. The 23k-line log
+	 * logging floods): 0=silent (default), 1=+registered/invalid, 2=+bail, 3=+emit-enter AND per-call traces (vcall-aot
+	 * dispatch etc. — kept >=3 so a stats/bail run at verbose<=2 is never flooded by per-invocation logs). The 23k-line log
 	 * came from these firing whenever stats was on; the aggregated bail histogram replaces them at level 0. */
 	{ extern int mono_wasm_jit_verbose; const char *vb = g_getenv ("MONO_WASM_JIT_VERBOSE"); mono_wasm_jit_verbose = (vb && *vb) ? atoi (vb) : 0; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm && *nm != '0') ? 1 : 0; }
@@ -69,6 +77,9 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_aotconst; const char *ac = g_getenv ("MONO_WASM_JIT_AOTCONST"); mono_wasm_jit_aotconst = (ac && *ac) ? (*ac != '0') : 1; } /* bake resolved OP_AOTCONST pointers; default ON */
 	{ extern int mono_wasm_jit_rgctx; const char *rg = g_getenv ("MONO_WASM_JIT_RGCTX"); mono_wasm_jit_rgctx = (rg && *rg) ? (*rg != '0') : 1; } /* JIT uses_rgctx_reg methods, routing the rgctx call through the interp residual; default ON, =0 reverts to the whole-method bail */
 	{ extern int mono_wasm_jit_ldaddr; const char *ld = g_getenv ("MONO_WASM_JIT_LDADDR"); mono_wasm_jit_ldaddr = (ld && *ld) ? (*ld != '0') : 1; } /* OP_LDADDR: back address-taken scalar locals with a per-thread linear-memory frame (unblocks synchronized wrappers' Monitor.Enter bool& + ref/out-local calls); default ON, =0 reverts to the ldaddr bail */
+	{ extern int mono_wasm_jit_ldaddr_vtype; const char *lv = g_getenv ("MONO_WASM_JIT_LDADDR_VTYPE"); mono_wasm_jit_ldaddr_vtype = (lv && *lv && *lv != '0') ? 1 : 0; } /* OP_LDADDR of NON-SCALAR ref-free local via a full-size addr-frame slot. DEFAULT OFF (exonerated re: corruption but kept for repro parity). */
+	{ extern int mono_wasm_jit_vtype_scalar_ref; const char *vr = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR_REF"); mono_wasm_jit_vtype_scalar_ref = (vr && *vr && *vr != '0') ? 1 : 0; } /* ref-etype scalar-vtype arg via a GC-scanned ref-shadow slot; GC-critical, default OFF */
+	{ extern int mono_wasm_jit_vtype_scalar; const char *vs = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR"); mono_wasm_jit_vtype_scalar = (vs && *vs && *vs != '0') ? 1 : 0; } /* pass a BYVAL ref-free scalar-vtype call arg as its single-field etype scalar (LLVMArgWasmVtypeAsScalar ABI). Default OFF; needs LDADDR_VTYPE. */
 	{ extern int mono_wasm_jit_longdiv; const char *lv = g_getenv ("MONO_WASM_JIT_LONGDIV"); mono_wasm_jit_longdiv = (lv && *lv) ? (*lv != '0') : 1; } /* JIT i64 div/rem (OP_LDIV family) with inline div-by-zero/overflow checks; default ON, =0 reverts to the bail (bisection) */
 	{ extern int mono_wasm_jit_sync; const char *sv = g_getenv ("MONO_WASM_JIT_SYNC"); mono_wasm_jit_sync = (sv && *sv) ? (*sv != '0') : 1; } /* direct call to a synchronized method: substitute the SYNCHRONIZED wrapper (f-slot/residual); default ON, =0 reverts to bailing the whole caller (bisection) */
 	{ extern int mono_wasm_jit_eh_nocxa; const char *en = g_getenv ("MONO_WASM_JIT_EH_NOCXA"); mono_wasm_jit_eh_nocxa = (en && *en && *en != '0') ? 1 : 0; } /* bisection: skip begin/end_catch in the EH landing pad */
@@ -76,6 +87,8 @@ mono_wasm_jit_auto_init (void)
 	/* Island heuristic levers (Part 5), all default off. */
 	{ extern int mono_wasm_jit_entry_promote; const char *ep = g_getenv ("MONO_WASM_JIT_ENTRY_PROMOTE"); mono_wasm_jit_entry_promote = (ep && *ep) ? atoi (ep) : 0; }      /* Lever A: 0=off */
 	{ extern int mono_wasm_jit_residual_perm; const char *rp = g_getenv ("MONO_WASM_JIT_RESIDUAL_PERM"); mono_wasm_jit_residual_perm = (rp && *rp && *rp != '0') ? 1 : 0; } /* Lever B: 0=off */
+	{ extern int mono_wasm_jit_residual_cold; const char *rc = g_getenv ("MONO_WASM_JIT_RESIDUAL_COLD"); mono_wasm_jit_residual_cold = (rc && *rc && *rc != '0') ? 1 : 0; } /* Lever B': cold-leaf residual, 0=off */
+	{ extern int mono_wasm_jit_profile_fast; const char *pf = g_getenv ("MONO_WASM_JIT_PROFILE_FAST"); mono_wasm_jit_profile_fast = (pf && *pf && *pf != '0') ? 1 : 0; } /* emit fast-path volume counters, 0=off */
 	{ extern int mono_wasm_jit_island_depth; const char *id = g_getenv ("MONO_WASM_JIT_ISLAND_DEPTH"); mono_wasm_jit_island_depth = (id && *id && atoi (id) > 0) ? atoi (id) : 10; }   /* Lever C: default 10 */
 	{ extern int mono_wasm_jit_island_budget; const char *ib = g_getenv ("MONO_WASM_JIT_ISLAND_BUDGET"); mono_wasm_jit_island_budget = (ib && *ib && atoi (ib) > 0) ? atoi (ib) : 64; } /* Lever C: default 64 */
 	{ extern int mono_wasm_jit_block_promote; const char *bp = g_getenv ("MONO_WASM_JIT_BLOCK_PROMOTE"); mono_wasm_jit_block_promote = (bp && *bp) ? atoi (bp) : 16; } /* Lever C: default 16; 0 disables */
@@ -84,20 +97,27 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_promoted_cold_div; const char *pc = g_getenv ("MONO_WASM_JIT_PROMOTED_COLD_DIV"); mono_wasm_jit_promoted_cold_div = (pc && *pc && atoi (pc) > 0) ? atoi (pc) : 16; }
 	{ extern int mono_wasm_jit_promoted_root_uncold_depth; const char *pu = g_getenv ("MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH"); mono_wasm_jit_promoted_root_uncold_depth = (pu && *pu && atoi (pu) >= 0) ? atoi (pu) : 1; }
 	{ extern int mono_wasm_jit_block_force; const char *bf = g_getenv ("MONO_WASM_JIT_BLOCK_FORCE"); mono_wasm_jit_block_force = (bf && *bf) ? atoi (bf) : 4; }
+	{ extern int mono_wasm_jit_hot_root; const char *hr = g_getenv ("MONO_WASM_JIT_HOT_ROOT"); mono_wasm_jit_hot_root = (hr && *hr && *hr != '0') ? 1 : 0; } /* own-threshold island = promoted root, 0=off */
 	{ extern int mono_wasm_jit_vcall_aot; const char *va = g_getenv ("MONO_WASM_JIT_VCALL_AOT"); mono_wasm_jit_vcall_aot = (va && *va && *va != '0') ? 1 : 0; } /* fast AOT-vcall dispatch: 0=off (residual) */
+	{ extern int mono_wasm_jit_vcall_aot_ic; const char *vc = g_getenv ("MONO_WASM_JIT_VCALL_AOT_IC"); mono_wasm_jit_vcall_aot_ic = (vc && *vc && *vc != '0') ? 1 : 0; } /* per-call-site AOT-vcall IC; needs VCALL_INLINE_IC+VCALL_AOT; default off */
+#ifdef HOST_BROWSER
+	/* These three are DEBUG store/GC guards whose globals + runtime-check emission are HOST_BROWSER-only
+	 * (they insert per-store checks that only do anything when the JITted code actually RUNS). The offline
+	 * cross-compiler dump never executes JITted code, so skip their env here — otherwise auto_init would
+	 * reference browser-only globals and fail to link into mono-aot-cross. */
 	{ extern int mono_wasm_jit_storeguard; const char *sg = g_getenv ("MONO_WASM_JIT_STOREGUARD"); mono_wasm_jit_storeguard = (sg && *sg && *sg != '0') ? 1 : 0; } /* DEBUG: bounds-check every ref/addr-frame store to catch the wild store (traps at the culprit). default off */
 	{ extern int mono_wasm_jit_objguard; const char *og = g_getenv ("MONO_WASM_JIT_OBJGUARD"); mono_wasm_jit_objguard = (og && *og && *og != '0') ? 1 : 0; } /* DEBUG: before every ref-field store, validate the object BASE is a live heap object (catches missed-ref/stale-base wild stores). default off */
 	{ extern int mono_wasm_jit_pinall; const char *pn = g_getenv ("MONO_WASM_JIT_PINALL"); mono_wasm_jit_pinall = (pn && *pn && *pn != '0') ? 1 : 0; } /* DEBUG TEST: route EVERY i32 vreg to the GC-pinning ref shadow stack. If the random corruption stops, a ref vreg was being missed by the isref inference. SLOW. default off */
-	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi && *vi != '0') ? 1 : 0;
-#ifndef DISABLE_THREADS
-	  mono_wasm_jit_vcall_inline_ic = 0;
 #endif
-	} /* inline vcall IC fast path: 0=off; force-off on threaded builds (placeholder sig mismatch) */
+	{ extern int mono_wasm_jit_missedref; const char *mr = g_getenv ("MONO_WASM_JIT_MISSEDREF"); mono_wasm_jit_missedref = (mr && *mr && *mr != '0') ? 1 : 0; } /* DIAG: PINALL confirmed a missed ref; this names it. For every method, log any NONREF-classified i32 vreg used as a MEMBASE load/store base or virtual-call receiver (a stale one of these is the wild-deref corruptor), with its defining opcode -> pins which wj_opcode_is_nonref case is wrong. Bounded. default off */
+	{ extern int mono_wasm_jit_refbases; const char *rb = g_getenv ("MONO_WASM_JIT_REFBASES"); mono_wasm_jit_refbases = (rb && *rb) ? (*rb != '0') : 1; } /* FIX (default ON): pin every vreg used as a MEMBASE load/store base or virtual-call receiver on the ref shadow stack — a dereferenced pointer must stay valid across GC. Closes the missed-ref corruption the prove-non-ref pass leaves (object baked as non-STACK_OBJ iconst, interior-ptr add, ...) at far less cost than PINALL. =0 reverts (buggy) for A/B. */
+	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi && *vi != '0') ? 1 : 0;
+	} /* inline vcall IC fast path: 0=off (default), 1=on. Now MT-SAFE on threaded builds — the buggy
+	   * ref.is_null liveness (placeholder sig mismatch, jit138) is replaced by a per-thread slot_live gate. */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
 }
-#endif
 
 /* The forced-compile routing is now JIT_FLAG_WASM_FORCE (per-compile), copied to cfg->wasm_jit_forced
  * in mini.c — the old __thread mono_wasm_jit_force flag is gone (it leaked across nested cctor-driven
@@ -203,10 +223,17 @@ int mono_wasm_jit_rgctx = 1;
 int mono_wasm_jit_longdiv = 1;        /* MONO_WASM_JIT_LONGDIV: JIT i64 div/rem (OP_LDIV family). =0 bails those methods (bisection). */
 int mono_wasm_jit_sync = 1;           /* MONO_WASM_JIT_SYNC: substitute the SYNCHRONIZED wrapper for a direct call to a synchronized method. =0 reverts to bailing the whole caller (bisection). */
 int mono_wasm_jit_ldaddr = 1;         /* MONO_WASM_JIT_LDADDR: emit OP_LDADDR by backing address-taken SCALAR locals with a per-thread linear-memory frame (their address can't be a wasm local). Unblocks synchronized wrappers (Monitor.Enter's bool& lock_taken) and ref/out-local call sites (the #1 ldaddr bail). Default ON; =0 reverts to bailing the whole method on OP_LDADDR. */
+int mono_wasm_jit_ldaddr_vtype = 0;   /* MONO_WASM_JIT_LDADDR_VTYPE: extend OP_LDADDR to NON-SCALAR ref-free valuetype locals via a full-size addr-frame slot. DEFAULT OFF (exonerated: jit17 corrupted with it off; kept gated for binary/repro parity). */
+int mono_wasm_jit_vtype_scalar_ref = 0; /* MONO_WASM_JIT_VTYPE_SCALAR_REF: extend VTYPE_SCALAR to a scalar-vtype whose SINGLE field is a managed REFERENCE (e.g. RuntimeTypeHandle{RuntimeType}). Backed by a GC-SCANNED ref-shadow-stack slot (not the un-scanned addr frame): OP_LDADDR yields refbase+slot*4 so the field store/load track the ref as a conservative pinning root, and the store's inline card-barrier marks a HARMLESS card (wasm32 has no overlapping cards — the 8MB table covers the whole 32-bit space, so a non-heap mark is in-bounds and never scanned). GC-CRITICAL: validate in-browser with STOREGUARD/OBJGUARD. Default OFF. */
+int mono_wasm_jit_vtype_scalar = 0;   /* MONO_WASM_JIT_VTYPE_SCALAR: pass a BYVAL scalar-vtype call arg (mini_wasm_is_scalar_vtype: struct <=8 bytes, one field) as its single-field SCALAR — the ABI the AOT callee was compiled with (LLVMArgWasmVtypeAsScalar). The vtype value is addr-frame-backed (LDADDR_VTYPE), so we load its field (offset 0) from the addr-frame slot and pass that. REF-FREE etype only: a ref-etype scalar-vtype (e.g. RuntimeTypeHandle{RuntimeType}) can't live in the un-scanned addr frame — it bails at "ldaddr of vtype with refs" before here and needs the GC-scanned/ref-shadow-stack path (not yet implemented). Default OFF; requires LDADDR_VTYPE. */
+int mono_wasm_jit_missedref = 0;      /* MONO_WASM_JIT_MISSEDREF: diagnostic — log NONREF-classified vregs used as MEMBASE bases / call receivers + their defining opcode, to name the isref-inference gap PINALL papers over. Default off. */
+int mono_wasm_jit_refbases = 1;       /* MONO_WASM_JIT_REFBASES: pin every dereferenced pointer (MEMBASE base / call receiver) on the ref shadow stack, closing the missed-ref corruption the prove-non-ref pass leaves. Default ON; =0 reverts for A/B. */
 const char *mono_wasm_jit_dump_ir = NULL;  /* MONO_WASM_JIT_DUMP_IR=<substr>: dump clauses + bb regions + opcode stream for clause-bearing methods whose full name contains <substr> (EH-lowering ground truth, e.g. "indigo"). */
 /* Island heuristic levers (Part 5), all default-OFF so the baseline is unchanged and each can be A/B'd. */
 int mono_wasm_jit_entry_promote = 0;   /* Lever A: MONO_WASM_JIT_ENTRY_PROMOTE=N — after a hot interp caller invokes JITted callees N times, force-JIT the caller (grow the island UPWARD). 0 = off. */
 int mono_wasm_jit_residual_perm = 0;   /* Lever B: MONO_WASM_JIT_RESIDUAL_PERM=1 — under residual=0, residual-route ONLY a permanently-un-JITtable blocker instead of bailing the whole caller. 0 = off. */
+int mono_wasm_jit_residual_cold = 0;   /* Lever B': MONO_WASM_JIT_RESIDUAL_COLD=1 — under residual=0, residual-route a blocker the island cold-gate would refuse to pull in (still counting hits, below thresh/cold_div, not block-promoted): a cold branch (IKVM __<GetInstance> lambda factory, one-shot init, error path) reached rarely from a hot caller. Lets the hot method JIT while paying ~1 transition per cold call, NOT a per-iteration storm; hot/parked callees still bail so the island force-JITs them. 0 = off. NOTE: jit34 showed this misclassifies hot-via-JITted-caller callees as cold -> 2M residuals/frame -> 1.5fps. Keep OFF until residuals self-heal to the callee's f-slot. */
+int mono_wasm_jit_profile_fast = 0;    /* MONO_WASM_JIT_PROFILE_FAST=1 — emit inline volume counters into the fast dispatch paths (INLINE_AOT direct, inline f-slot IC hit, inline AOT-IC hit) which otherwise call no counting helper. Adds hot-path overhead, so OFF by default (only for a dedicated cost-attribution run). Feeds WJC_FAST_*. */
 int mono_wasm_jit_island_depth = 10;   /* Lever C: MONO_WASM_JIT_ISLAND_DEPTH — max island DFS depth (was a fixed 10). */
 int mono_wasm_jit_island_budget = 64;  /* Lever C: MONO_WASM_JIT_ISLAND_BUDGET — max force-compiles per island attempt (was a fixed 64). */
 int mono_wasm_jit_block_promote = 16;  /* Lever C: MONO_WASM_JIT_BLOCK_PROMOTE — pull a cold callee into an island once it has BLOCKED >= N island attempts (block_n), even if its own hit count is low (it's hot via JITted callers). 0 = disable (cold gate is hits-only). The bench showed top blockers ~100, so the old thresh/4 (=500) never fired — 16 catches the hot ctors. */
@@ -215,6 +242,7 @@ int mono_wasm_jit_island_cold_div = 4; /* MONO_WASM_JIT_ISLAND_COLD_DIV — norm
 int mono_wasm_jit_promoted_cold_div = 16; /* MONO_WASM_JIT_PROMOTED_COLD_DIV — looser cold gate divisor when force-JITing an upward-promoted caller. */
 int mono_wasm_jit_promoted_root_uncold_depth = 1; /* MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH — for promoted roots, skip the cold gate entirely through this DFS depth. */
 int mono_wasm_jit_block_force = 4; /* MONO_WASM_JIT_BLOCK_FORCE — queue a blocking callee for direct promotion once it has blocked this many island attempts. 0 disables. */
+int mono_wasm_jit_hot_root = 0; /* MONO_WASM_JIT_HOT_ROOT=1 — a method crossing its OWN auto-JIT threshold is proven hot (>=thresh calls), so build its island as a PROMOTED ROOT (relax the cold gate through PROMOTED_ROOT_UNCOLD_DEPTH) instead of the strict cold gate. Pulls the hot method's private callees (reached only via it -> ~0 interp hits -> the blind spot that makes it PARK forever) into the island so it actually JITs. Depth-limited + budget-bounded so it doesn't drag in the whole cold subtree. jit35: 94.6% of below-threshold vcall fallbacks were PARKED hot methods. Default OFF (A/B). */
 /* MONO_WASM_JIT_VCALL_AOT=1: when a JITted method's virtual call resolves to an AOT-backed override (the
  * vcall_resolve_fslot f-slot miss — the dominant steady-state residual, ~98% "aot-backed" in the bench),
  * call_indirect the override's AOT body DIRECTLY (this+args+rgctx, same native ABI the inline-AOT direct
@@ -222,15 +250,16 @@ int mono_wasm_jit_block_force = 4; /* MONO_WASM_JIT_BLOCK_FORCE — queue a bloc
  * -> do_jit_call: double arg-marshalling + an LMF frame). Default 0; mirrors INLINE_AOT's EH handling
  * (resume-state try/catch, or bare under CPPEH). Off-by-default so the validated residual path is unchanged. */
 int mono_wasm_jit_vcall_aot = 0;
+int mono_wasm_jit_vcall_aot_ic = 0;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-site inline cache for AOT-backed virtual targets — skip scratch()+resolve_fslot()+aot_target() (3 C calls/vcall) on a monomorphic hit, call_indirect the cached AOT body directly. Needs VCALL_INLINE_IC + VCALL_AOT. Default OFF; hottest-path + MT — validate in-browser. */
 /* MONO_WASM_JIT_VCALL_INLINE_IC: the inline monomorphic vcall IC fast-path (call_indirect the cached
- * f-slot in wasm, skipping the resolve_fslot C helper). DEFAULT OFF — it is UNSAFE on threaded builds:
- * its "table[fslot] != null => installed" liveness check is wrong because jiterpreter prefills every
- * JitCall table slot with a NON-null placeholder (mono_jiterp_placeholder_jit_call, sig (i32,i32,i32,i32)
- * ->void). On a worker that cached an f-slot via the shared IC but hasn't instantiated that module
- * locally, the slot is the placeholder, the check passes, and call_indirect with the vcall functype traps
- * "function signature mismatch" (jit138). The C-helper path (mono_wasm_jit_vcall_resolve_fslot) syncs the
- * thread before returning an f-slot, so it's safe; the inline path only shortcut the ~7% jitted-override
- * vcalls anyway. =1 re-enables it (only safe on single-threaded builds, where un-installed slots are null). */
+ * f-slot in wasm, skipping the scratch() + resolve_fslot C helpers on a hit — the profiled #1 game-thread
+ * cost, vcall_resolve_fslot ~17%). DEFAULT OFF; =1 enables. NOW MT-SAFE on threaded builds: the original
+ * "table[fslot] != null" liveness check was wrong (the per-thread table grows with a NON-null jiterpreter
+ * placeholder, mono_jiterp_placeholder_jit_call (i32,i32,i32,i32)->void, so it passed for un-instantiated
+ * slots -> call_indirect signature-mismatch trap, jit138). Fixed: the inline path now gates on the
+ * authoritative per-thread bitmap via one cheap mono_wasm_jit_slot_live() call (wasm exposes no funcref
+ * equality / funcref->i32 to compare the slot against the placeholder inline). Still one C boundary per hit
+ * vs two + resolve for the helper; a full pure-wasm gate would need __tls_base imported to read the bitmap. */
 int mono_wasm_jit_vcall_inline_ic = 0;
 
 /* TRUE if `name` is in the comma-separated MONO_WASM_JIT_METHOD list (bring-up targeting). */
@@ -490,6 +519,24 @@ mono_wasm_jit_slot_live (int slot)
 	if (slot <= 0 || slot >= wj_slot_live_cap)
 		return 0;
 	return (wj_slot_live [slot >> 3] >> (slot & 7)) & 1;
+}
+
+/* Addresses of the per-thread liveness bitmap pointer + capacity, for the emitter's INLINE liveness check on
+ * the vcall f-slot IC hot path (replaces the per-hit mono_wasm_jit_slot_live call_indirect — the profiled
+ * ~1.3M/frame boundary). The addresses of these __thread vars are STABLE per thread (fixed TLS offset), so a
+ * JITted method fetches them ONCE in its prologue and caches them in locals; each dispatch then re-loads the
+ * CURRENT bitmap pointer + cap THROUGH the cached address, so a realloc-on-grow (wj_mark_slot_live) is picked
+ * up transparently — the var's value moves, its address doesn't. Per-thread, so no cross-thread race, and no
+ * stale-pointer window (we never cache the bitmap pointer itself, only the address of the slot holding it). */
+guint8 **
+mono_wasm_jit_slot_live_ptr_addr (void)
+{
+	return &wj_slot_live;
+}
+int *
+mono_wasm_jit_slot_live_cap_addr (void)
+{
+	return &wj_slot_live_cap;
 }
 
 /* Instantiate a cached JITted module into the CURRENT thread's wasm function table. The table is
@@ -847,7 +894,7 @@ int mono_wasm_jit_pinall = 0;
 int mono_wasm_jit_objguard = 0;
 
 /* Called (when storeguard/objguard is on) right before a ref-shadow-stack (kind 0), addr-frame (kind 1),
- * object/base store (kind 2/3), or generic membase access (kind 4), with the computed target address. If the
+ * object/base store (kind 2/3), generic membase access (kind 4), or vcall receiver deref (kind 5), with the computed target address. If the
  * address is outside the expected region — the signature of an enter/leave imbalance on an EH unwind drifting
  * the base past the region, or a corrupted base — trap HERE so the (MONO_WASM_JIT_NAMES-symbolicated) wasm
  * stack trace names the JITted method doing the bad access, instead of the random downstream OOB. */
@@ -862,7 +909,7 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 	 * These are __thread statics in this TU, so &x is this thread's own copy: a same-thread wild store matches.
 	 * Trap so the symbolicated wasm trace names the exact method + store doing it. Runs for the object-base
 	 * (kind 2) and byref-base (kind 3) guards. */
-	if (G_UNLIKELY ((kind == 2 || kind == 3 || kind == 4) && addr != NULL)) {
+	if (G_UNLIKELY ((kind == 2 || kind == 3 || kind == 4 || kind == 5) && addr != NULL)) {
 		gsize a = (gsize) addr;
 		struct { gsize lo, hi; } ctl [] = {
 			{ (gsize) &wj_ref_sp,   (gsize) &wj_ref_sp   + sizeof (wj_ref_sp) },
@@ -914,7 +961,7 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 		}
 		return;
 	}
-	if (kind == 2) {
+	if (kind == 2 || kind == 5) {
 		/* OBJGUARD: addr is the OBJECT BASE of a reference-field store. A missed reference (a managed pointer
 		 * the isref pass left in a GC-invisible wasm local) goes stale/garbage when the GC moves or frees the
 		 * object; using it as the store base (or its write-barrier card mark, (base>>9)+cardtable) scribbles
@@ -927,7 +974,10 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 			gsize memsz = (gsize) __builtin_wasm_memory_size (0) << 16;   /* pages * 64KB */
 			/* The base ADDRESS must itself be a sane aligned in-memory pointer; if not, it is a wild base. */
 			if (G_UNLIKELY ((a & 3) || a < 1024 || a + 8 > memsz)) {
-				printf ("WASM_JIT_BAD_OBJBASE obj=%p — store base out of range / misaligned (wild base); method in the trap below:\n", (void *) addr);
+				if (kind == 5)
+					printf ("WASM_JIT_BAD_VCALL_THIS obj=%p — receiver out of range / misaligned before vtable load; method in the trap below:\n", (void *) addr);
+				else
+					printf ("WASM_JIT_BAD_OBJBASE obj=%p — store base out of range / misaligned (wild base); method in the trap below:\n", (void *) addr);
 				fflush (stdout);
 				__builtin_trap ();
 			}
@@ -940,6 +990,11 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 			 * zeroed-object pattern stays visible without killing the thread (a wasm trap on a JSPI-suspended
 			 * stack silently kills it and stalls the GC). */
 			if (vt == 0) {
+				if (kind == 5) {
+					printf ("WASM_JIT_BAD_VCALL_THIS obj=%p — receiver has null vtable before virtual dispatch; method in the trap below:\n", (void *) addr);
+					fflush (stdout);
+					__builtin_trap ();
+				}
 				static int z = 0;
 				if (z++ < 20) { printf ("WASM_JIT_OBJBASE_NULLVT obj=%p — null first word (byref into a null slot, or zeroed object); NOT trapping\n", (void *) addr); fflush (stdout); }
 				return;
@@ -950,8 +1005,12 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 			gsize klass = 0;
 			if (!bad) { klass = *(gsize *) vt; bad = !klass || (klass & 3) || klass < 1024 || klass + 8 > memsz; } /* vtable->klass */
 			if (G_UNLIKELY (bad)) {
-				printf ("WASM_JIT_BAD_OBJBASE obj=%p vtable=0x%x klass=0x%x — stale/garbage object base (non-null junk vtable); storing method in the trap below:\n",
-					(void *) addr, (unsigned) vt, (unsigned) klass);
+				if (kind == 5)
+					printf ("WASM_JIT_BAD_VCALL_THIS obj=%p vtable=0x%x klass=0x%x — stale/garbage receiver before virtual dispatch; method in the trap below:\n",
+						(void *) addr, (unsigned) vt, (unsigned) klass);
+				else
+					printf ("WASM_JIT_BAD_OBJBASE obj=%p vtable=0x%x klass=0x%x — stale/garbage object base (non-null junk vtable); storing method in the trap below:\n",
+						(void *) addr, (unsigned) vt, (unsigned) klass);
 				fflush (stdout);
 				__builtin_trap ();   /* deliberate: the symbolicated wasm trace names the culprit method */
 			}
@@ -1765,7 +1824,8 @@ wj_prescan_blockers (MonoCompile *cfg)
 	extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 	extern gboolean mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig);
 	extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
-	extern int mono_wasm_jit_aot_residual, mono_wasm_jit_residual_perm, mono_wasm_jit_sync;
+	extern int mono_wasm_jit_callee_too_cold (MonoMethod *m);
+	extern int mono_wasm_jit_aot_residual, mono_wasm_jit_residual_perm, mono_wasm_jit_residual_cold, mono_wasm_jit_sync;
 	extern MonoMethod *mono_marshal_get_synchronized_wrapper (MonoMethod *enter_method);
 	MonoBasicBlock *bb;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
@@ -1801,11 +1861,135 @@ wj_prescan_blockers (MonoCompile *cfg)
 				continue;
 			if (mono_wasm_jit_residual_perm && mono_wasm_jit_callee_perm_unjittable (call_method))   /* perm-unjittable -> residual */
 				continue;
+			if (mono_wasm_jit_residual_cold && mono_wasm_jit_callee_too_cold (call_method))          /* cold leaf -> residual, not a hard blocker */
+				continue;
 			wj_result_add_blocker (&cfg->wasm_jit_result, call_method);
 		}
 	}
 }
 #endif
+
+/* Scalar-vtype call ABI (MONO_WASM_JIT_VTYPE_SCALAR). A struct mini_wasm_is_scalar_vtype accepts (<=8
+ * bytes, exactly one field) is passed in the wasm ABI BY ITS SINGLE FIELD's scalar, not by address
+ * (get_storage -> ArgVtypeAsScalar -> LLVMArgWasmVtypeAsScalar). wj_scalar_vtype_valtype returns that
+ * scalar's wasm valtype for a REF-FREE such struct (sets *out, returns TRUE), else FALSE. A ref-etype
+ * scalar vtype (single object field, e.g. RuntimeTypeHandle{RuntimeType}) returns FALSE: its scalar is
+ * a managed ref that would have to be GC-tracked, which the un-scanned addr frame the ByVal value lives
+ * in cannot provide — those still bail earlier ("ldaddr of vtype with refs") and want the ref-shadow
+ * path (not yet implemented). Cross-available (used by the emit below in both builds). */
+static gboolean
+wj_scalar_vtype_valtype (MonoType *t, WasmValtype *out)
+{
+	MonoType *ut, *etype = NULL;
+	MonoClass *k;
+	WasmValtype ev;
+	if (!t || m_type_is_byref (t))
+		return FALSE;
+	ut = mini_get_underlying_type (t);
+	if (ut->type != MONO_TYPE_VALUETYPE && ut->type != MONO_TYPE_GENERICINST)
+		return FALSE;
+	if (mini_is_gsharedvt_variable_type (ut))
+		return FALSE;
+	if (!mini_wasm_is_scalar_vtype (ut, &etype) || !etype)
+		return FALSE;
+	k = mono_class_from_mono_type_internal (ut);
+	if (!k)
+		return FALSE;
+	{
+		extern int mono_wasm_jit_vtype_scalar, mono_wasm_jit_vtype_scalar_ref;
+		if (m_class_has_references (k) || m_class_has_ref_fields (k)) {
+			if (!(mono_wasm_jit_vtype_scalar_ref && mini_type_is_reference (etype)))
+				return FALSE;   /* ref-etype: only under VTYPE_SCALAR_REF (GC-scanned slot) */
+		} else if (!mono_wasm_jit_vtype_scalar) {
+			return FALSE;   /* ref-free scalar vtype gated on VTYPE_SCALAR */
+		}
+	}
+	ev = wasm_valtype_of_type (etype);
+	if (ev == 0 || ev == WASM_VOID)
+		return FALSE;
+	*out = ev;
+	return TRUE;
+}
+
+/* Emit a BYVAL ref-free scalar-vtype call arg onto the wasm stack. The ByVal value is addr-frame-backed
+ * (LDADDR_VTYPE gave the source vtype temp a slot, and LOWER-VTYPE-OPTS lowered its vzero/field-store/
+ * vmove to plain stores into that slot), so load the single field (offset 0) as the etype scalar — what
+ * the AOT callee's LLVMArgWasmVtypeAsScalar param expects. Returns FALSE (the caller then bails the whole
+ * method — safe) if the arg isn't a ref-free scalar vtype or the ByVal value has no addr-frame slot. */
+static gboolean
+wj_emit_scalar_vtype_arg (WasmBuf *body, WjCtx *c, MonoType *pt, int argvreg)
+{
+	WasmValtype ev;
+	guint32 off;
+	if (!wj_scalar_vtype_valtype (pt, &ev))
+		return FALSE;
+	if (!c->addrslot || argvreg < 0 || argvreg >= c->nvreg)
+		return FALSE;
+	if (c->addrslot [argvreg] == -2) {
+		/* ref-etype scalar vtype: the single ref lives in a GC-scanned ref-shadow slot; load it (i32). */
+		if (ev != WASM_I32 || !c->refslot || c->refslot [argvreg] < 0)
+			return FALSE;
+		wasm_op_local (body, WASM_OP_LOCAL_GET, (guint32) c->refbase);
+		if (c->refslot [argvreg] != 0) { wasm_i32_const (body, c->refslot [argvreg] * 4); wasm_op (body, WASM_OP_I32_ADD); }
+		wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, 0);
+		return TRUE;
+	}
+	if (c->addrslot [argvreg] < 0)
+		return FALSE;
+	off = (guint32) c->addrslot [argvreg];
+	wasm_op_local (body, WASM_OP_LOCAL_GET, (guint32) c->addrbase);
+	switch (ev) {
+	case WASM_I32: wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, off); return TRUE;
+	case WASM_I64: wasm_op (body, WASM_OP_I64_LOAD); wasm_memarg (body, 3, off); return TRUE;
+	case WASM_F32: wasm_op (body, WASM_OP_F32_LOAD); wasm_memarg (body, 2, off); return TRUE;
+	case WASM_F64: wasm_op (body, WASM_OP_F64_LOAD); wasm_memarg (body, 3, off); return TRUE;
+	default: return FALSE;
+	}
+}
+
+/* Emit one managed-call arg (index ai over the wasm functype params, incl. `this` at 0 when hasthis).
+ * A BYVAL ref-free scalar-vtype param (MONO_WASM_JIT_VTYPE_SCALAR) is loaded as its single-field etype
+ * scalar from the ByVal value's addr-frame slot; everything else is a normal wasm_ld of the arg vreg.
+ * Shared by the direct-JIT, inline-AOT and interp-residual arg loops so all three agree on the ABI
+ * (the residual then spills that scalar into the scratch slot, and interp_entry copies it back as the
+ * vtype value — the field IS the whole vtype, so the bytes match). */
+static gboolean
+wj_emit_one_call_arg (WasmBuf *body, WjCtx *c, MonoMethodSignature *csig, int *wargs, int ai)
+{
+	int pidx = ai - (csig->hasthis ? 1 : 0);
+	if (pidx >= 0 && pidx < (int) csig->param_count) {
+		WasmValtype sv;
+		if (wj_scalar_vtype_valtype (csig->params [pidx], &sv))
+			return wj_emit_scalar_vtype_arg (body, c, csig->params [pidx], wargs [ai]);
+	}
+	return wasm_ld (body, c, wargs [ai]);
+}
+
+/* Fast-path volume profiling (MONO_WASM_JIT_PROFILE_FAST): emit an inline atomic increment of
+ * mono_wasm_jit_counters[idx] into the JITted body. &counters[idx] is a link-time-constant address in the
+ * runtime's linear memory (the emitter runs in the same process, same memory — just like the embedded C
+ * function-pointer constants). i64.atomic.rmw.add (0xfe 0x26, align 3) keeps the count correct when worker
+ * threads share the site; the returned old value is dropped. No-op unless profile_fast is set at emit time,
+ * so normal STATS runs pay nothing. Only called from HOST_BROWSER fast-path sites; G_GNUC_UNUSED for the
+ * cross-compiler build (which never reaches those sites). */
+static G_GNUC_UNUSED void
+wj_emit_fast_count (WasmBuf *body, int idx)
+{
+	extern int mono_wasm_jit_profile_fast;
+	extern gint64 mono_wasm_jit_counters [];
+	if (!mono_wasm_jit_profile_fast)
+		return;
+	wasm_i32_const (body, (gint32) (intptr_t) &mono_wasm_jit_counters [idx]);
+	wasm_i64_const (body, 1);
+	wasm_op (body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (body, 0x1f); wasm_memarg (body, 3, 0);   /* i64.atomic.rmw.add (0xfe 0x1f; 0x26 is rmw.SUB!) */
+	wasm_op (body, WASM_OP_DROP);
+}
+
+/* Max distinct call_indirect callee functypes per JITted method (T0/T1 are the 2 base types; these are
+ * the extras). Raised 32->128: big hot methods (class_1309:method_6091 LivingEntity, class_922:method_4054
+ * entity render) have >32 distinct call signatures and were bailing "too many callee types". wasm allows
+ * arbitrarily many functypes, so this is just the on-stack array size (~128*sizeof(WasmFuncType)). */
+#define WJ_EXTRA_TYPES_MAX 128
 
 void
 mono_wasm_emit_method (MonoCompile *cfg)
@@ -1838,6 +2022,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int vc_fslot_idx = 0;              /* i32 local: inline virtual-IC fast-path resolved f-slot */
 	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
+	int aic_vtab_idx = 0, aic_ti_idx = 0, aic_rgctx_idx = 0; /* i32 locals: AOT-vcall IC — this->vtable, ti<<1|kind2, rgctx */
+	int slotlive_ptr_idx = 0, slotlive_cap_idx = 0; /* i32 locals: cached &wj_slot_live / &wj_slot_live_cap for the INLINE f-slot-IC liveness check (dead in methods with no vcall) */
+	gboolean has_vcall = FALSE;        /* TRUE: method has >=1 OP_*CALL_MEMBASE (a vcall-IC site) -> emit the prologue slotlive fetch */
 	int vc_ic_idx = 0;                 /* i64 local: inline virtual-IC fast-path IC value (vtable|imethod<<32) */
 	int eh_exc_idx = 0, eh_h_idx = 0;  /* i32 locals: in-method EH catch landing pad — saved C++ exc ptr + dispatch result */
 	int finally_ind_idx = 0;           /* i32 local: in-method finally indicator (continuation bb idx, or -1 = rethrow) */
@@ -1852,7 +2039,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int naddrbytes = 0;                /* total bytes of addressable-locals frame (8 per address-taken local) */
 	WjCtx lc;
 	int *bbidx;
-	WasmFuncType extra_types [32]; /* callee functypes for call_indirect, after T0/T1 */
+	WasmFuncType extra_types [WJ_EXTRA_TYPES_MAX]; /* callee functypes for call_indirect, after T0/T1 */
 	int nextra = 0;
 	gboolean uses_calls = FALSE;
 	gboolean uses_eh_tag = FALSE;   /* in-method EH landing pad -> import the C++ exception tag x.e */
@@ -2029,8 +2216,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * supported: a ref/byref slot would need GC tracking the frame doesn't provide, a vtype has no scalar
 	 * valtype, and an address-taken ARGUMENT (still in a wasm param) is bailed too. Anything unsupported
 	 * bails the whole method (the prior behaviour for any OP_LDADDR). MONO_WASM_JIT_LDADDR=0 disables the
-	 * pass so OP_LDADDR bails as before. */
-#ifdef HOST_BROWSER
+	 * pass so OP_LDADDR bails as before.
+	 * NB: NOT HOST_BROWSER-gated. This is a pure compile-time classification pass (it assigns addrslot
+	 * offsets / decides which ldaddr shapes are supported); the addr-frame runtime helpers it feeds
+	 * (mono_wasm_jit_addr_enter/leave, baked by the emit below) are already cross-compiled. Un-gating it
+	 * lets the offline cross-compiler dump reach the REAL ldaddr gate (e.g. "ldaddr of vtype with refs")
+	 * instead of the spurious "ldaddr unsupported var" the emit hits when no slot was ever assigned. */
 	{ extern int mono_wasm_jit_ldaddr;
 	if (mono_wasm_jit_ldaddr) {
 		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
@@ -2049,7 +2240,38 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (li [vv] >= 0) { fail = "ldaddr of arg local"; fail_op = OP_LDADDR; goto done; }   /* arg: in a wasm param, no address */
 				if (m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype)) { fail = "ldaddr of ref/byref local"; fail_op = OP_LDADDR; goto done; }
 				lvt = wasm_valtype_of_type (var->inst_vtype);
-				if (lvt == 0 || lvt == WASM_VOID || wasm_valtype_group (lvt) < 0) { fail = "ldaddr of non-scalar local"; fail_op = OP_LDADDR; goto done; }
+				if (lvt == 0 || lvt == WASM_VOID || wasm_valtype_group (lvt) < 0) {
+					/* Non-scalar (valuetype) address-taken local. DEFAULT: bail. MONO_WASM_JIT_LDADDR_VTYPE=1
+					 * backs it with a full-size addr-frame slot (field access via OP_LDADDR + MEMBASE). Gate:
+					 * bail if the vtype holds managed refs (addr frame is not GC-scanned); vt[vv] stays 0 so a
+					 * scalar/bulk value access bails. Exonerated re: the intermittent corruption (kept gated). */
+					extern int mono_wasm_jit_ldaddr_vtype;
+					MonoClass *vk;
+					int vsize;
+					if (!mono_wasm_jit_ldaddr_vtype) { fail = "ldaddr of non-scalar local"; fail_op = OP_LDADDR; goto done; }
+					vk = mono_class_from_mono_type_internal (var->inst_vtype);
+					if (!vk) { fail = "ldaddr vtype no class"; fail_op = OP_LDADDR; goto done; }
+					vsize = mono_class_value_size (vk, NULL);
+					if (m_class_has_references (vk) || m_class_has_ref_fields (vk)) {
+						/* Ref-bearing vtype: addr frame is not GC-scanned. EXCEPTION (VTYPE_SCALAR_REF): a SCALAR vtype
+						 * whose single field is a managed ref (e.g. RuntimeTypeHandle{RuntimeType}) is byte-for-byte one
+						 * ref -> back it with a GC-SCANNED ref-shadow slot (sentinel addrslot=-2; refslot assigned after
+						 * the isref pass). OP_LDADDR yields refbase+slot*4; the field store/load track it as a pinning
+						 * root and the store card-barrier marks a harmless card (wasm32: no overlapping cards). */
+						extern int mono_wasm_jit_vtype_scalar_ref;
+						MonoType *setype = NULL;
+						if (mono_wasm_jit_vtype_scalar_ref && vsize <= 8 && mini_wasm_is_scalar_vtype (var->inst_vtype, &setype) && setype && mini_type_is_reference (setype)) {
+							addrslot [vv] = -2;
+							continue;
+						}
+						fail = "ldaddr of vtype with refs (GC-unsafe frame)"; fail_op = OP_LDADDR; goto done;
+					}
+					if (vsize <= 0 || vsize > 4096) { fail = "ldaddr vtype size"; fail_op = OP_LDADDR; goto done; }
+					naddrbytes = (naddrbytes + 7) & ~7;
+					addrslot [vv] = naddrbytes;
+					naddrbytes += (vsize + 7) & ~7;
+					continue;
+				}
 				addrslot [vv] = naddrbytes;
 				naddrbytes += 8;   /* 8 bytes/slot: 8-aligned, covers i64/f64; zero-init by addr_enter */
 				vt [vv] = lvt;     /* the local is only written via the escaped pointer in some shapes -> set its valtype explicitly */
@@ -2065,7 +2287,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			}
 		}
 	} }
-#endif /* HOST_BROWSER (OP_LDADDR addressable-locals pass) */
 
 	/* assign locals for non-arg typed vregs, grouped by type (skip address-taken locals: they live in the
 	 * addr frame, not a wasm local) */
@@ -2097,6 +2318,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	/* one i32 local for the VCALL_AOT dispatch kind (0/1/2 from mono_wasm_jit_vcall_aot_target); dead in
 	 * methods with no virtual call — a harmless unused declared local */
 	vc_aotkind_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	/* i32 local: this->vtable, live across the AOT-vcall IC key+vtab_check compares (VCALL_AOT_IC) */
+	aic_vtab_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	aic_ti_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	aic_rgctx_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	/* two i32 locals caching &wj_slot_live / &wj_slot_live_cap for the inline f-slot-IC liveness check
+	 * (dead in methods with no vcall — harmless unused declared locals) */
+	slotlive_ptr_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	slotlive_cap_idx = nargs + cnt [0];
 	cnt [0] += 1;
 	/* two i32 locals for the in-method EH catch landing pad (dead in methods with no clauses) */
 	eh_exc_idx = nargs + cnt [0];
@@ -2137,7 +2371,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 
 	lc.li = li; lc.nvreg = nvreg; lc.refslot = NULL; lc.refbase = refbase_idx; lc.rtmp = rtmp_idx;
 	lc.vt = vt; lc.addrbase = addrbase_idx;
-	lc.addrslot = (naddrbytes > 0) ? addrslot : NULL;
+	{ /* addrslot must be visible to the OP_LDADDR emit when there are ONLY refvt locals (sentinel -2,
+	   * no addr-frame bytes) — otherwise naddrbytes==0 would NULL it and the refvt ldaddr misfires. */
+		gboolean _have_refvt = FALSE; int _i; for (_i = 0; _i < nvreg; ++_i) if (addrslot [_i] == -2) { _have_refvt = TRUE; break; }
+		lc.addrslot = (naddrbytes > 0 || _have_refvt) ? addrslot : NULL; }
 	lc.addr_ldkind = (naddrbytes > 0) ? addr_ldkind : NULL;
 	lc.addr_tmp [0] = addr_tmp_idx [0]; lc.addr_tmp [1] = addr_tmp_idx [1];
 	lc.addr_tmp [2] = addr_tmp_idx [2]; lc.addr_tmp [3] = addr_tmp_idx [3];
@@ -2148,7 +2385,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #ifdef HOST_BROWSER
 	{
 		extern int mono_wasm_jit_storeguard, mono_wasm_jit_objguard;
-		if ((mono_wasm_jit_storeguard || mono_wasm_jit_objguard) && nextra < 32) {
+		if ((mono_wasm_jit_storeguard || mono_wasm_jit_objguard) && nextra < WJ_EXTRA_TYPES_MAX) {
 			WasmFuncType cst; memset (&cst, 0, sizeof (cst));
 			cst.params [0] = WASM_I32; cst.params [1] = WASM_I32; cst.nparams = 2; cst.ret = WASM_VOID;
 			extra_types [nextra] = cst; lc.check_ti = 2 + nextra++;
@@ -2252,12 +2489,128 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					if (vt [i] == WASM_I32)
 						isref [i] = TRUE;
 			}
+			/* PRODUCTION FIX (MONO_WASM_JIT_REFBASES, default on): the prove-non-ref fixpoint trusts mono's
+			 * ins->type to spot refs, but that misses heap pointers in shapes it can't see (a movable object
+			 * baked as a non-STACK_OBJ iconst, an interior-pointer add mis-typed as scalar, ...), leaving a live
+			 * ref in a plain wasm local that dangles after a compacting GC — the intermittent corruption PINALL
+			 * confirmed. Close it WITHOUT PINALL's cost: any vreg used as a DEREFERENCE — a MEMBASE load/store
+			 * base or a virtual-call receiver — is a live pointer at that instruction, so pin it on the
+			 * (conservative) ref shadow stack. Over-marking an unmanaged/addr-frame base is harmless (it pins
+			 * nothing); a missed heap base is silent corruption. Only dereferenced pointers move to the shadow
+			 * stack — not every i32 temporary. */
+			{ extern int mono_wasm_jit_refbases;
+			  if (mono_wasm_jit_refbases) {
+				MonoBasicBlock *bbf; MonoInst *insf;
+				int *dop = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nvreg);
+				for (i = 0; i < nvreg; ++i) dop [i] = -1;
+				for (bbf = cfg->bb_entry; bbf; bbf = bbf->next_bb)
+					MONO_BB_FOR_EACH_INS (bbf, insf)
+						if (insf->dreg >= 0 && insf->dreg < nvreg) dop [insf->dreg] = insf->opcode;
+				for (bbf = cfg->bb_entry; bbf; bbf = bbf->next_bb) {
+					MONO_BB_FOR_EACH_INS (bbf, insf) {
+						int b = -1;
+						switch (insf->opcode) {
+						case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE:
+						case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE: case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE:
+						case OP_LOADI8_MEMBASE: case OP_LOADR4_MEMBASE: case OP_LOADR8_MEMBASE:
+							b = insf->sreg1; break;
+						case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
+						case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
+						case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
+							b = insf->dreg; break;
+						case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
+							b = insf->sreg1; break;
+						default: break;
+						}
+						/* Skip bases proven to be an addr-frame pointer (OP_LDADDR result = addrbase+slot, linear
+						 * memory, never a heap ref) — pinning those is pure waste. Everything else that gets
+						 * dereferenced could be a heap pointer -> pin it. */
+						if (b >= 0 && b < nvreg && vt [b] == WASM_I32 && dop [b] != OP_LDADDR)
+							isref [b] = TRUE;
+					}
+				}
+			  } }
 		}
 		for (i = 0; i < nvreg; ++i)
 			if (li [i] >= 0 && isref [i])
 				refslot [i] = nrefslots++;
+		/* ref-etype scalar-vtype locals (addrslot==-2 from the ldaddr pre-pass): each gets a GC-scanned
+		 * ref-shadow slot so its single ref field is a tracked/pinning root (VTYPE_SCALAR_REF). */
+		for (i = 0; i < nvreg; ++i)
+			if (addrslot [i] == -2) {
+				refslot [i] = nrefslots++;
+			}
 		if (nrefslots > 0)
 			lc.refslot = refslot;
+
+		/* MISSED-REF FINDER (MONO_WASM_JIT_MISSEDREF=1): PINALL proved the corruptor is a ref left in a plain
+		 * wasm local (isref=FALSE) that goes stale after a GC. The dangerous uses are dereferences: a MEMBASE
+		 * load/store base, or a virtual-call receiver. Log each such NONREF base + the opcode that DEFINED it,
+		 * so the wrong wj_opcode_is_nonref case is nameable. OP_LDADDR bases are addr-frame (non-heap) -> skip.
+		 * Bounded across the whole run. */
+		{ extern int mono_wasm_jit_missedref;
+		  if (G_UNLIKELY (mono_wasm_jit_missedref)) {
+			MonoInst **defins = (MonoInst **) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoInst *) * nvreg);
+			MonoBasicBlock *bbr; MonoInst *insr;
+			gsize memsz = 0;
+#ifdef HOST_BROWSER
+			memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
+#endif
+			for (bbr = cfg->bb_entry; bbr; bbr = bbr->next_bb)
+				MONO_BB_FOR_EACH_INS (bbr, insr)
+					if (insr->dreg >= 0 && insr->dreg < nvreg) defins [insr->dreg] = insr;
+			for (bbr = cfg->bb_entry; bbr; bbr = bbr->next_bb) {
+				MONO_BB_FOR_EACH_INS (bbr, insr) {
+					int base = -1; const char *knd = NULL;
+					MonoInst *d; int dop;
+					switch (insr->opcode) {
+					case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE:
+					case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE: case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE:
+					case OP_LOADI8_MEMBASE: case OP_LOADR4_MEMBASE: case OP_LOADR8_MEMBASE:
+						base = insr->sreg1; knd = "load"; break;
+					case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
+					case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
+					case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
+						base = insr->dreg; knd = "store"; break;
+					case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
+						base = insr->sreg1; knd = "callrecv"; break;
+					default: break;
+					}
+					if (base < 0 || base >= nvreg || vt [base] != WASM_I32 || isref [base])
+						continue;
+					d = defins [base];
+					dop = d ? d->opcode : -1;
+					if (dop == OP_LDADDR)
+						continue;   /* addr-frame pointer (non-heap) */
+					if (dop == OP_ICONST) {
+						/* A CONSTANT base is safe ONLY if it's a fixed address (vtable/class/static blob — never
+						 * GC-moved). If the constant is a MOVABLE heap object baked directly (should have gone
+						 * through the PCONST precise root), the GC moves it -> the baked constant goes stale ->
+						 * wild deref = the corruptor. Flag it by probing whether the constant looks like a live
+						 * object (val -> vtable -> klass are all plausible in-memory pointers). */
+#ifdef HOST_BROWSER
+						gsize v = (gsize) d->inst_c0;
+						if (v >= 1024 && (v & 3) == 0 && v + 8 <= memsz) {
+							gsize vtab = *(gsize *) v;
+							if (vtab >= 1024 && (vtab & 3) == 0 && vtab + 8 <= memsz) {
+								gsize kl = *(gsize *) vtab;
+								if (kl >= 1024 && (kl & 3) == 0 && kl + 8 <= memsz) {
+									static int _mo = 0;
+									if (_mo++ < 200)
+										printf ("WASM_JIT_MISSED_REF_ICONST_OBJ %s : %s base=%d val=0x%x vtable=0x%x (MOVABLE object baked as iconst -> stale after GC)\n",
+											mname, knd, base, (unsigned) v, (unsigned) vtab);
+								}
+							}
+						}
+#endif
+						continue;   /* fixed-address iconst -> not a missed ref */
+					}
+					{ static int _mn = 0;
+					  if (_mn++ < 400)
+						printf ("WASM_JIT_MISSED_REF_BASE %s : %s base=%d def=%s\n", mname, knd, base, dop >= 0 ? wj_opname (dop) : "(arg/undef)"); }
+				}
+			}
+		  } }
 
 		/* REF-SAFETY IR DUMP (MONO_WASM_JIT_REFDIAG=<name,...>): for a watch-listed method, dump the full
 		 * post-classification IR — each instruction's opcode name + dreg/sreg with their isref flag
@@ -2431,6 +2784,26 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		}
 	}
 
+	/* prescan: does this method have any OP_*CALL_MEMBASE (a virtual/interface call = an inline-IC site)?
+	 * If so we fetch &wj_slot_live / &wj_slot_live_cap once in the prologue (below) so each IC hit can do the
+	 * liveness check INLINE instead of a per-hit mono_wasm_jit_slot_live call_indirect. Leaf methods with no
+	 * vcall skip the fetch entirely (no wasted prologue C calls). */
+	{
+		MonoBasicBlock *_bb;
+		for (_bb = cfg->bb_entry; _bb && !has_vcall; _bb = _bb->next_bb) {
+			MonoInst *_ins;
+			MONO_BB_FOR_EACH_INS (_bb, _ins) {
+				switch (_ins->opcode) {
+				case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
+				case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
+					has_vcall = TRUE; break;
+				default: break;
+				}
+				if (has_vcall) break;
+			}
+		}
+	}
+
 	/* prologue: dispatch index ($blk) starts at the entry block (dense index 0) */
 	wasm_i32_const (&body, 0);
 	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
@@ -2452,8 +2825,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			if (enter_ti < 0 && functype_eq (&extra_types [k2], &et)) enter_ti = 2 + k2;
 			if (leave_ti < 0 && functype_eq (&extra_types [k2], &lt)) leave_ti = 2 + k2;
 		}
-		if (enter_ti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; enter_ti = 2 + nextra++; }
-		if (leave_ti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = lt; leave_ti = 2 + nextra++; }
+		if (enter_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; enter_ti = 2 + nextra++; }
+		if (leave_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = lt; leave_ti = 2 + nextra++; }
 		uses_calls = TRUE;
 		if (nrefslots > 0 || eh_on) {   /* eh_on with 0 slots: ref_enter(0) captures the entry SP into refbase without bumping */
 			wasm_i32_const (&body, nrefslots);
@@ -2477,6 +2850,32 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) addrbase_idx);
 		}
 	}
+	/* INLINE f-slot-IC liveness prologue: fetch the STABLE per-thread addresses of the wj_slot_live bitmap
+	 * pointer + capacity ONCE (2 tiny ()->i32 calls per invocation), caching them in locals. Each vcall IC hit
+	 * then does the liveness check inline (load the current bitmap ptr/cap through these addresses + a bit
+	 * test) instead of a per-hit mono_wasm_jit_slot_live call_indirect (the profiled ~1.3M/frame boundary).
+	 * Only when the method has a vcall site AND the inline IC is on. */
+	if (mono_wasm_jit_vcall_inline_ic && has_vcall) {
+		WasmFuncType pt; int pti = -1, k3;
+		memset (&pt, 0, sizeof pt); pt.nparams = 0; pt.ret = WASM_I32;   /* ()->i32 */
+		for (k3 = 0; k3 < nextra; ++k3) if (functype_eq (&extra_types [k3], &pt)) { pti = 2 + k3; break; }
+		if (pti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt; pti = 2 + nextra++; }
+		uses_calls = TRUE;
+#ifdef HOST_BROWSER
+		{ extern guint8 **mono_wasm_jit_slot_live_ptr_addr (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_slot_live_ptr_addr); }
+#else
+		wasm_i32_const (&body, 0x7ff4);
+#endif
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) pti); wasm_uleb (&body, 0);
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_ptr_idx);
+#ifdef HOST_BROWSER
+		{ extern int *mono_wasm_jit_slot_live_cap_addr (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_slot_live_cap_addr); }
+#else
+		wasm_i32_const (&body, 0x7ff5);
+#endif
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) pti); wasm_uleb (&body, 0);
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_cap_idx);
+	}
 #endif
 
 	/*
@@ -2496,16 +2895,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		memset (&_t, 0, sizeof _t); _t.nparams = 1; _t.params [0] = WASM_I32; _t.ret = WASM_VOID;
 		eh_type_idx = -1;
 		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_type_idx = 2 + _k; break; }
-		if (eh_type_idx < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_type_idx = 2 + nextra++; }
+		if (eh_type_idx < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_type_idx = 2 + nextra++; }
 		/* (i32,i32)->i32: mono_wasm_jit_eh_dispatch (table, blk) -> handler bbidx (a finally/fault
 		 * handler's bbidx is tagged with WJ_EH_DISPATCH_FINALLY_BIT; the landing pad strips it) or -1 */
 		memset (&_t, 0, sizeof _t); _t.nparams = 2; _t.params [0] = WASM_I32; _t.params [1] = WASM_I32; _t.ret = WASM_I32;
 		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_dispatch_ti = 2 + _k; break; }
-		if (eh_dispatch_ti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_dispatch_ti = 2 + nextra++; }
+		if (eh_dispatch_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_dispatch_ti = 2 + nextra++; }
 		/* ()->void: mono_jiterp_end_catch */
 		memset (&_t, 0, sizeof _t); _t.nparams = 0; _t.ret = WASM_VOID;
 		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_endcatch_ti = 2 + _k; break; }
-		if (eh_endcatch_ti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_endcatch_ti = 2 + nextra++; }
+		if (eh_endcatch_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_endcatch_ti = 2 + nextra++; }
 		uses_calls = TRUE;
 		uses_eh_tag = TRUE;
 		/* PROLOGUE: push this EH method's il_state island so mono's exception pass-1 sees it on ANY entry
@@ -2639,7 +3038,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				WasmFuncType _gt; int _gti = -1, _gk;
 				memset (&_gt, 0, sizeof _gt); _gt.nparams = 0; _gt.ret = WASM_I32;
 				for (_gk = 0; _gk < nextra; ++_gk) if (functype_eq (&extra_types [_gk], &_gt)) { _gti = 2 + _gk; break; }
-				if (_gti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = _gt; _gti = 2 + nextra++; }
+				if (_gti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _gt; _gti = 2 + nextra++; }
 				uses_calls = TRUE;
 #ifdef HOST_BROWSER
 				{ extern MonoObject *mono_wasm_jit_get_caught_exc (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_get_caught_exc); }
@@ -2706,7 +3105,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					WasmFuncType pt; int pti = -1, pk;
 					memset (&pt, 0, sizeof (pt)); pt.ret = WASM_VOID; pt.nparams = 0;
 					for (pk = 0; pk < nextra; ++pk) if (functype_eq (&extra_types [pk], &pt)) { pti = 2 + pk; break; }
-					if (pti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt; pti = 2 + nextra++; }
+					if (pti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt; pti = 2 + nextra++; }
 					uses_calls = TRUE;
 					wasm_i32_const (&body, (gint32) (intptr_t) &mono_polling_required);
 					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
@@ -2760,6 +3159,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * (ref/byref/vtype/arg, or LDADDR disabled), bail the whole method as before. */
 				MonoInst *var = (MonoInst *) ins->inst_p0;
 				int vv = (var && var->dreg >= 0 && var->dreg < nvreg) ? var->dreg : -1;
+				if (vv >= 0 && lc.addrslot && lc.addrslot [vv] == -2) {
+					/* ref-etype scalar vtype: address is its GC-scanned ref-shadow slot (refbase + slot*4). */
+					if (!lc.refslot || lc.refslot [vv] < 0) { fail = "ldaddr refvt no slot"; fail_op = OP_LDADDR; goto done; }
+					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+					if (lc.refslot [vv] != 0) { wasm_i32_const (&body, lc.refslot [vv] * 4); wasm_op (&body, WASM_OP_I32_ADD); }
+					if (!wasm_st (&body, &lc, ins->dreg)) { fail = "ldaddr dreg"; goto done; }
+					break;
+				}
 				if (vv < 0 || !lc.addrslot || lc.addrslot [vv] < 0) { fail = "ldaddr unsupported var"; fail_op = OP_LDADDR; goto done; }
 				wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) addrbase_idx);
 				if (lc.addrslot [vv] != 0) { wasm_i32_const (&body, lc.addrslot [vv]); wasm_op (&body, WASM_OP_I32_ADD); }
@@ -2841,7 +3248,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				/* (i32)->void functype for mono_wasm_jit_raise_corlib */
 				memset (&rt, 0, sizeof (rt)); rt.params [0] = WASM_I32; rt.nparams = 1; rt.ret = WASM_VOID;
 				for (rk = 0; rk < nextra; ++rk) if (functype_eq (&extra_types [rk], &rt)) { ldiv_rti = 2 + rk; break; }
-				if (ldiv_rti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = rt; ldiv_rti = 2 + nextra++; }
+				if (ldiv_rti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = rt; ldiv_rti = 2 + nextra++; }
 				uses_calls = TRUE;
 				/* divide-by-zero: if (sreg2 == 0) raise DivideByZeroException (exc_id 1) */
 				if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "ldiv b"; goto done; }
@@ -2952,7 +3359,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 				memset (&rt, 0, sizeof (rt)); rt.params [0] = WASM_I32; rt.nparams = 1; rt.ret = WASM_VOID;
 				for (ck = 0; ck < nextra; ++ck) if (functype_eq (&extra_types [ck], &rt)) { rti = 2 + ck; break; }
-				if (rti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = rt; rti = 2 + nextra++; }
+				if (rti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = rt; rti = 2 + nextra++; }
 				uses_calls = TRUE;
 				wasm_i32_const (&body, 4);   /* NullReferenceException (see OP_COND_EXC's exc_id map) */
 #ifdef HOST_BROWSER
@@ -3180,7 +3587,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				else { fail = "cond_exc exc name"; goto done; }
 				memset (&rt, 0, sizeof (rt)); rt.params [0] = WASM_I32; rt.nparams = 1; rt.ret = WASM_VOID;
 				for (ck = 0; ck < nextra; ++ck) if (functype_eq (&extra_types [ck], &rt)) { rti = 2 + ck; break; }
-				if (rti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = rt; rti = 2 + nextra++; }
+				if (rti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = rt; rti = 2 + nextra++; }
 				uses_calls = TRUE;
 				if (!wasm_ld (&body, &lc, cmp_a)) { fail = "cond_exc a"; goto done; }
 				if (cmp_imm_mode) { if (cmp_i64) wasm_i64_const (&body, cmp_imm64); else wasm_i32_const (&body, cmp_imm); }
@@ -3211,7 +3618,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "throw sreg"; goto done; }
 				memset (&tt, 0, sizeof (tt)); tt.params [0] = WASM_I32; tt.nparams = 1; tt.ret = WASM_VOID;
 				for (tk = 0; tk < nextra; ++tk) if (functype_eq (&extra_types [tk], &tt)) { tti = 2 + tk; break; }
-				if (tti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = tt; tti = 2 + nextra++; }
+				if (tti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = tt; tti = 2 + nextra++; }
 				uses_calls = TRUE;
 #ifdef HOST_BROWSER
 				/* OP_RETHROW preserves the original stack trace (mono_wasm_jit_rethrow); OP_THROW rebuilds it. */
@@ -3398,7 +3805,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					if (csig->ret->type == MONO_TYPE_VOID) ct.ret = WASM_VOID;
 					else { ct.ret = wasm_valtype_of_type (csig->ret); if (ct.ret == 0 || ct.ret == WASM_VOID) { fail = "icall ret type"; goto done; } }
 					for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &ct)) { type_idx = 2 + k; break; }
-					if (type_idx < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = ct; type_idx = 2 + nextra++; }
+					if (type_idx < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ct; type_idx = 2 + nextra++; }
 					uses_calls = TRUE;
 					if (!call->call_info) { fail = "no captured icall args"; goto done; }
 					{
@@ -3422,7 +3829,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				}
 				for (ai = 0; ai < (int) csig->param_count; ++ai) {
 					WasmValtype pv = wasm_valtype_of_type (csig->params [ai]);
-					if (pv == 0 || pv == WASM_VOID) { fail = "call arg type"; goto done; }
+					if (pv == 0 || pv == WASM_VOID) {
+						/* BYVAL scalar-vtype arg (MONO_WASM_JIT_VTYPE_SCALAR): declare the param as its single-field
+						 * etype scalar, matching the AOT callee's LLVMArgWasmVtypeAsScalar ABI; the arg-emit loops
+						 * below load that scalar from the ByVal value's addr-frame slot. Ref-free only
+						 * (wj_scalar_vtype_valtype); anything else keeps the original bail. */
+						WasmValtype sv;
+						if (!wj_scalar_vtype_valtype (csig->params [ai], &sv)) { fail = "call arg type"; goto done; }
+						pv = sv;
+					}
 					if (ct.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "call nargs"; goto done; }
 					ct.params [ct.nparams++] = pv;
 				}
@@ -3459,7 +3874,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					for (k = 0; k < nextra; ++k)
 						if (functype_eq (&extra_types [k], &ct)) { type_idx = 2 + k; break; }
 					if (type_idx < 0) {
-						if (nextra >= 32) { fail = "too many callee types"; goto done; }
+						if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
 						extra_types [nextra] = ct;
 						type_idx = 2 + nextra++;
 					}
@@ -3480,7 +3895,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						WasmFuncType et; int eti = -1;
 						memset (&et, 0, sizeof (et)); et.params [0] = WASM_I32; et.params [1] = WASM_I32; et.nparams = 2; et.ret = WASM_VOID;
 						for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &et)) { eti = 2 + k; break; }
-						if (eti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; eti = 2 + nextra++; }
+						if (eti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; eti = 2 + nextra++; }
 						wasm_i32_const (&body, (gint32) (intptr_t) call_method);
 						wasm_i32_const (&body, call_fslot);
 						wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ensure_fslot);
@@ -3490,7 +3905,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					{
 						int *wargs = (int *) call->call_info;
 						for (ai = 0; ai < (int) ct.nparams; ++ai)
-							if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "call arg ld"; goto done; }
+							if (!wj_emit_one_call_arg (&body, &lc, csig, wargs, ai)) { fail = "call arg ld"; goto done; }
 					}
 					wasm_i32_const (&body, call_fslot);
 					wasm_op (&body, WASM_OP_CALL_INDIRECT);
@@ -3536,7 +3951,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								nt.params [nt.nparams++] = WASM_I32;
 							}
 							for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &nt)) { nti = 2 + k; break; }
-							if (nti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = nt; nti = 2 + nextra++; }
+							if (nti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = nt; nti = 2 + nextra++; }
 							uses_calls = TRUE;
 							if (!call->call_info) { fail = "no captured call args"; goto done; }
 							{
@@ -3545,7 +3960,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								 * landing pad — the interp e-thunk boundary (mono_llvm_catch_exception) or an
 								 * in-method catch. The call is pure call_indirect (the per-call perf win); no
 								 * try/catch, no per-call pending-exception check. */
-								{ int *wargs = (int *) call->call_info; for (ai = 0; ai < (int) ct.nparams; ++ai) if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "call arg ld"; goto done; } }
+								wj_emit_fast_count (&body, WJC_FAST_INLINE_AOT);   /* profile: INLINE_AOT direct dispatch */
+								{ int *wargs = (int *) call->call_info; for (ai = 0; ai < (int) ct.nparams; ++ai) if (!wj_emit_one_call_arg (&body, &lc, csig, wargs, ai)) { fail = "call arg ld"; goto done; } }
 								if (aot_has_extra) wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);   /* trailing rgctx/dummy — only if the body has it */
 								wasm_i32_const (&body, (gint32) (intptr_t) aot_addr);
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) nti); wasm_uleb (&body, 0);
@@ -3554,7 +3970,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									if (!wasm_st (&body, &lc, ins->dreg)) { fail = "call dreg"; goto done; }
 								}
 							}
-							{ extern int mono_wasm_jit_verbose; static int n_il = 0; if (mono_wasm_jit_verbose >= 3 && n_il++ < 64) { char *cn = mono_method_get_full_name (call->method); printf ("WASM_JIT_INLINE_AOT[%d] %s -> %s\n", n_il, mname, cn); g_free (cn); } }
+							{ extern int mono_wasm_jit_verbose; static int n_il = 0; if (mono_wasm_jit_verbose >= 2 && n_il++ < 128) { char *cn = mono_method_get_full_name (call->method); printf ("WASM_JIT_INLINE_AOT[%d] %s -> %s\n", n_il, mname, cn); g_free (cn); } }
 							break;
 						}
 					}
@@ -3596,12 +4012,26 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								extern int mono_wasm_jit_residual_perm;
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
 								if (!(mono_wasm_jit_residual_perm && mono_wasm_jit_callee_perm_unjittable (call_method))) {
-									/* The residual=0 pre-scan (wj_prescan_blockers) already enumerated the full
-									 * blocker set; record this one too (deduped) so the list head is correct even
-									 * if the pre-scan predicate ever drifts from this site. */
-									wj_result_add_blocker (&cfg->wasm_jit_result, call_method);
-									fail = "callee not jitted (residual off)";
-									goto done;
+									/* Lever B' (MONO_WASM_JIT_RESIDUAL_COLD): the blocker is genuinely COLD — the
+									 * island cold-gate would refuse to pull it in (still counting hits, below
+									 * thresh/cold_div, not block-promoted). A cold branch (IKVM __<GetInstance>
+									 * lambda factory, one-shot init, error path) reached rarely from this hot caller.
+									 * Route just this edge through the interp residual so the hot method JITs, paying
+									 * ~1 transition per cold call rather than bailing the whole (hot) method. Hot/parked
+									 * callees are NOT cold -> they still bail here and the island force-JITs them, so no
+									 * per-iteration residual storm on the hot path (the user's transition-cost constraint). */
+									extern int mono_wasm_jit_residual_cold;
+									extern int mono_wasm_jit_callee_too_cold (MonoMethod *m);
+									if (!(mono_wasm_jit_residual_cold && mono_wasm_jit_callee_too_cold (call_method))) {
+										/* The residual=0 pre-scan (wj_prescan_blockers) already enumerated the full
+										 * blocker set; record this one too (deduped) so the list head is correct even
+										 * if the pre-scan predicate ever drifts from this site. */
+										wj_result_add_blocker (&cfg->wasm_jit_result, call_method);
+										fail = "callee not jitted (residual off)";
+										goto done;
+									}
+									{ extern int mono_wasm_jit_verbose; static int n_cl = 0; if (mono_wasm_jit_verbose >= 2 && n_cl++ < 128) { char *cn = mono_method_get_full_name (call_method); printf ("WASM_JIT_RESIDUAL_COLD[%d] %s -> %s\n", n_cl, mname, cn); g_free (cn); } }
+									/* else: cold-leaf blocker + RESIDUAL_COLD -> fall through, emit interp residual */
 								}
 								/* else: perm-unjittable blocker + RESIDUAL_PERM -> fall through, emit interp residual */
 							}
@@ -3649,8 +4079,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						if (tsi < 0 && functype_eq (&extra_types [k], &ts)) tsi = 2 + k;
 						if (tii < 0 && functype_eq (&extra_types [k], &ti)) tii = 2 + k;
 					}
-					if (tsi < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = ts; tsi = 2 + nextra++; }
-					if (tii < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = ti; tii = 2 + nextra++; }
+					if (tsi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ts; tsi = 2 + nextra++; }
+					if (tii < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ti; tii = 2 + nextra++; }
 					uses_calls = TRUE;
 					/* scratch-reentrancy: pre-transform the callee BEFORE spilling its args into the
 					 * GC-invisible scratch (mirrors the vcall path's mono_wasm_jit_vcall_resolve). The
@@ -3665,7 +4095,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						WasmFuncType tp; int tpi = -1, tpk;
 						memset (&tp, 0, sizeof (tp)); tp.params [0] = WASM_I32; tp.nparams = 1; tp.ret = WASM_VOID;
 						for (tpk = 0; tpk < nextra; ++tpk) if (functype_eq (&extra_types [tpk], &tp)) { tpi = 2 + tpk; break; }
-						if (tpi < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = tp; tpi = 2 + nextra++; }
+						if (tpi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = tp; tpi = 2 + nextra++; }
 						wasm_i32_const (&body, (gint32) (intptr_t) call_method);
 						wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_pretransform);
 						wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) tpi); wasm_uleb (&body, 0);
@@ -3679,7 +4109,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						for (ai = 0; ai < (int) ct.nparams; ++ai) {
 							WasmOpcode sop; int al;
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-							if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "residual arg ld"; goto done; }
+							if (!wj_emit_one_call_arg (&body, &lc, csig, wargs, ai)) { fail = "residual arg ld"; goto done; }
 							switch (ct.params [ai]) {
 							case WASM_I32: sop = WASM_OP_I32_STORE; al = 2; break;
 							case WASM_I64: sop = WASM_OP_I64_STORE; al = 3; break;
@@ -3793,7 +4223,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						extern gpointer mono_wasm_jit_scratch (void);
 						extern int mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic);
 						extern int mono_wasm_jit_call_interp (MonoMethod *m, guint8 *buf);
-						WasmFuncType vts, vtrf, vtd, ftd; int vtsi = -1, vtrfi = -1, vtdi = -1, ftdi = -1, vk, ai, n2, this_vr;
+						WasmFuncType vts, vtrf, vtd, ftd; int vtsi = -1, vtrfi = -1, vtdi = -1, ftdi = -1, vk, ai, n2, this_vr; int aic_ati = -1, aic_ati_ne = -1;
 						WasmValtype pp [WASM_FUNCTYPE_MAX_PARAMS], rv; int npp = 0; gpointer vic;
 						if (!csig->hasthis) { fail = "vcall not instance"; goto done; }
 						if (!call->call_info) { fail = "no captured vcall args"; goto done; }
@@ -3818,18 +4248,41 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * vtd (i32,i32)->i32 (call_interp fallback); ftd this+params->ret (the override's scalar `f`). */
 						memset (&vts, 0, sizeof (vts)); vts.nparams = 0; vts.ret = WASM_I32;
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &vts)) { vtsi = 2 + vk; break; }
-						if (vtsi < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = vts; vtsi = 2 + nextra++; }
+						if (vtsi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = vts; vtsi = 2 + nextra++; }
 						memset (&vtrf, 0, sizeof (vtrf)); vtrf.params [0] = WASM_I32; vtrf.params [1] = WASM_I32; vtrf.params [2] = WASM_I32; vtrf.params [3] = WASM_I32; vtrf.nparams = 4; vtrf.ret = WASM_I32;
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &vtrf)) { vtrfi = 2 + vk; break; }
-						if (vtrfi < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = vtrf; vtrfi = 2 + nextra++; }
+						if (vtrfi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = vtrf; vtrfi = 2 + nextra++; }
 						memset (&vtd, 0, sizeof (vtd)); vtd.params [0] = WASM_I32; vtd.params [1] = WASM_I32; vtd.nparams = 2; vtd.ret = WASM_I32;
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &vtd)) { vtdi = 2 + vk; break; }
-						if (vtdi < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = vtd; vtdi = 2 + nextra++; }
+						if (vtdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = vtd; vtdi = 2 + nextra++; }
 						memset (&ftd, 0, sizeof (ftd)); for (vk = 0; vk < npp; ++vk) ftd.params [vk] = pp [vk]; ftd.nparams = (guint32) npp; ftd.ret = rv;
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &ftd)) { ftdi = 2 + vk; break; }
-						if (ftdi < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = ftd; ftdi = 2 + nextra++; }
+						if (ftdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ftd; ftdi = 2 + nextra++; }
 						uses_calls = TRUE;
 						n2 = csig->param_count + 1; /* this + params */
+						/* per-call-site AOT-vcall IC cell (VCALL_AOT_IC): 20B, see mono_wasm_jit_alloc_aot_ic */
+						gpointer aic = NULL;
+						{ extern int mono_wasm_jit_vcall_aot_ic, mono_wasm_jit_vcall_inline_ic, mono_wasm_jit_vcall_aot;
+						  if (mono_wasm_jit_vcall_aot_ic && mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_aot) {
+#ifdef HOST_BROWSER
+							extern gpointer mono_wasm_jit_alloc_aot_ic (void); aic = mono_wasm_jit_alloc_aot_ic ();
+#else
+							aic = (gpointer) (intptr_t) 0x7fe0;
+#endif
+						  } }
+						if (aic) {
+							/* register AOT-body functypes up front for the inline AOT-IC: at (this,args,rgctx)->rv, at_ne (this,args)->rv */
+							WasmFuncType at, at_ne;
+							if (n2 + 1 <= WASM_FUNCTYPE_MAX_PARAMS) {
+								memset (&at, 0, sizeof (at)); for (vk = 0; vk < n2; ++vk) at.params [vk] = pp [vk]; at.params [n2] = WASM_I32; at.nparams = (guint32) (n2 + 1); at.ret = rv;
+								for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at)) { aic_ati = 2 + vk; break; }
+								if (aic_ati < 0 && nextra < WJ_EXTRA_TYPES_MAX) { extra_types [nextra] = at; aic_ati = 2 + nextra++; }
+								memset (&at_ne, 0, sizeof (at_ne)); for (vk = 0; vk < n2; ++vk) at_ne.params [vk] = pp [vk]; at_ne.nparams = (guint32) n2; at_ne.ret = rv;
+								for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at_ne)) { aic_ati_ne = 2 + vk; break; }
+								if (aic_ati_ne < 0 && nextra < WJ_EXTRA_TYPES_MAX) { extra_types [nextra] = at_ne; aic_ati_ne = 2 + nextra++; }
+							}
+							if (aic_ati < 0 || aic_ati_ne < 0) aic = NULL;   /* functype table full -> skip AOT-IC (safe) */
+						}
 						/* per-call-site inline cache (8 bytes: [i32 vtable, i32 InterpMethod*]) in shared memory;
 						 * resolve_fslot caches the virtual resolve here, skipping it on a monomorphic hit. */
 #ifdef HOST_BROWSER
@@ -3849,7 +4302,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							WasmFuncType nrt; int nrti = -1, nck;
 							memset (&nrt, 0, sizeof (nrt)); nrt.params [0] = WASM_I32; nrt.nparams = 1; nrt.ret = WASM_VOID;
 							for (nck = 0; nck < nextra; ++nck) if (functype_eq (&extra_types [nck], &nrt)) { nrti = 2 + nck; break; }
-							if (nrti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = nrt; nrti = 2 + nextra++; }
+							if (nrti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = nrt; nrti = 2 + nextra++; }
 							uses_calls = TRUE;
 							if (!wasm_ld (&body, &lc, this_vr)) { fail = "vcall nullchk this"; goto done; }
 							wasm_op (&body, WASM_OP_I32_EQZ);
@@ -3866,17 +4319,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							wasm_op (&body, WASM_OP_END);
 						}
 						/* --- INLINE MONOMORPHIC IC FAST PATH (skip the resolve_fslot C helper on a hit) ---
-						 * ~97.8% of MC vcalls hit the IC; each otherwise pays a C call (resolve_fslot: atomic load
-						 * + checks + sync_thread) before the real call_indirect. Do the hit inline in wasm:
+						 * ~97.8% of MC vcalls hit the IC; each otherwise pays TWO C calls (scratch() + resolve_fslot:
+						 * atomic load + resolve/checks + sync_thread) before the real call_indirect — the profiled
+						 * #1 game-thread cost (vcall_resolve_fslot ~17%). Do the hit inline in wasm:
 						 *   vtab = *this; ic = atomic_load(&vic);
 						 *   if (vtab == (i32)ic) { im = (i32)(ic>>32); fslot = im->wasm_jit_fslot;
-						 *     if (fslot != 0 && table[fslot] != null) { call_indirect(fslot); skip slow } }
-						 * The table[fslot] != null LIVENESS check is essential + is what makes inline dispatch
-						 * MT-safe: the IC is shared but the function table is PER-THREAD, so a slot another thread
-						 * cached may be absent on THIS thread. BUG: that liveness check is WRONG on threaded
-						 * builds — jiterpreter prefills JitCall slots with a NON-null placeholder, so the check
-						 * passes and call_indirect traps "function signature mismatch" (jit138). Gated OFF by
-						 * default (MONO_WASM_JIT_VCALL_INLINE_IC); the C-helper slow path below syncs the thread. */
+						 *     if (fslot != 0 && mono_wasm_jit_slot_live(fslot)) { call_indirect(fslot); skip slow } }
+						 * The liveness check is essential + is what makes inline dispatch MT-safe: the IC is shared
+						 * but the function table is PER-THREAD, so a slot another thread cached may be absent on THIS
+						 * thread. The ORIGINAL inline check (table[fslot] != null via ref.is_null) was WRONG — the
+						 * per-thread table grows with a NON-null jiterpreter placeholder, so it passed for un-instantiated
+						 * slots -> signature-mismatch trap (jit138). Fixed below: gate on the authoritative per-thread
+						 * bitmap via one cheap mono_wasm_jit_slot_live() call (wasm has no funcref equality to compare the
+						 * slot against the placeholder inline). Env-gated (MONO_WASM_JIT_VCALL_INLINE_IC=1) for A/B. */
 						if (mono_wasm_jit_vcall_inline_ic) {
 #ifdef HOST_BROWSER
 							extern int mono_wasm_jit_imethod_fslot_off (void);
@@ -3886,6 +4341,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #endif
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /*   $do_slow (void) */
+							/* OBJGUARD: validate the receiver before the inline IC's raw this->vtable load.
+							 * Otherwise a type-confused scalar/garbage receiver traps as a bare wasm OOB before
+							 * the C resolver can print anything. */
+#ifdef HOST_BROWSER
+							if (G_UNLIKELY (lc.objguard && lc.check_ti >= 0)) {
+								extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+								if (!wasm_ld (&body, &lc, this_vr)) { fail = "ic this guard ld"; goto done; }
+								wasm_i32_const (&body, 5);
+								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_check_store);
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) lc.check_ti); wasm_uleb (&body, 0);
+							}
+#endif
 							/* vtab = *(this + 0) */
 							if (!wasm_ld (&body, &lc, this_vr)) { fail = "ic this ld"; goto done; }
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
@@ -3903,11 +4370,42 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
 							wasm_op (&body, WASM_OP_I32_EQZ);
 							wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
-							/* liveness: if (table[fslot] is null on THIS thread) -> $do_slow */
-							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-							wasm_op (&body, WASM_OP_TABLE_GET); wasm_uleb (&body, 0);
-							wasm_op (&body, WASM_OP_REF_IS_NULL);
-							wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+							/* liveness: if (!slot_live(fslot)) -> $do_slow. The function table is PER-THREAD, so a slot
+							 * can hold the jiterpreter placeholder (NON-null, (i32,i32,i32,i32)->void) on a thread that
+							 * hasn't instantiated the callee -> call_indirect would signature-mismatch trap (jit138). The
+							 * authoritative per-thread signal is the wj_slot_live bitmap. INLINE it (no per-hit C call —
+							 * the profiled ~1.3M/frame boundary): read the CURRENT bitmap ptr + cap through the prologue-
+							 * cached &wj_slot_live / &wj_slot_live_cap (stable per-thread addresses; a realloc-on-grow moves
+							 * the values, not their addresses, so this stays correct with zero stale-pointer window):
+							 *   live = (fslot < cap) ? ((bitmap[fslot>>3] >> (fslot&7)) & 1) : 0;   if (!live) -> $do_slow
+							 * The cap gate short-circuits the bitmap load, so cap==0 / bitmap==NULL (never instantiated on
+							 * this thread) safely takes the slow path with no OOB/NULL read. fslot!=0 is already ensured by
+							 * the EQZ check above. Falls back to the C call only if the prologue fetch didn't run (should
+							 * not happen: has_vcall gates both), guarded by slotlive_ptr_idx being a valid local. */
+							{
+								/* fslot < cap ? */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);        /* cap = *(&wj_slot_live_cap) */
+								wasm_op (&body, WASM_OP_I32_LT_U);
+								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);    /* if (fslot<cap) { bit } else { 0 } */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);    /* bitmap = *(&wj_slot_live) */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+									wasm_op (&body, WASM_OP_I32_ADD);                                 /* &bitmap[fslot>>3] */
+									wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);  /* byte */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
+									wasm_op (&body, WASM_OP_I32_SHR_U);                               /* byte >> (fslot&7) */
+									wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);      /* bit */
+								wasm_op (&body, WASM_OP_ELSE);
+									wasm_i32_const (&body, 0);
+								wasm_op (&body, WASM_OP_END);
+								wasm_op (&body, WASM_OP_I32_EQZ);
+								wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* !live -> $do_slow */
+							}
+							wj_emit_fast_count (&body, WJC_FAST_VIC);   /* profile: inline f-slot IC hit (JIT->JIT) */
 							/* FAST: push this+args (fresh from vregs), fslot, call_indirect(ftd); store; skip slow */
 							for (ai = 0; ai < n2; ++ai)
 								if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "ic fast arg ld"; goto done; }
@@ -3916,6 +4414,36 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "ic fast dreg"; goto done; } }
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> $after (skip the C-helper slow path) */
 							wasm_op (&body, WASM_OP_END);                            /* end $do_slow */
+							/* --- INLINE AOT-VCALL IC (VCALL_AOT_IC), MT-safe: two atomic i64 words, each vtab-tagged. A hit needs
+							 * BOTH words' low32 == this->vtable; then ti/kind (ic1.hi) and rgctx (ic2.hi) are correct for this
+							 * vtable regardless of interleaved fills (a vtable maps to ONE target -> identical values). Only
+							 * atomic i64 loads (no plain-vs-atomic ordering, which wasm's memory model does not provide). */
+							if (aic) {
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_miss ($after now depth 1) */
+								if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic this ld"; goto done; }
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);   /* v = *this */
+								wasm_i32_const (&body, (gint32) (intptr_t) aic); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* a = ic1 (reuse vc_ic_idx i64) */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* a.vtab != v -> miss */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);   /* ti_kind = a>>32 */
+								wasm_i32_const (&body, (gint32) (intptr_t) aic); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 8); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* b = ic2 */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* b.vtab != v -> miss */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_rgctx_idx);   /* rgctx = b>>32 */
+								wj_emit_fast_count (&body, WJC_FAST_AOTIC);   /* profile: inline AOT-IC hit (JIT->AOT) */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);   /* kind2bit */
+								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) rv);
+									for (ai = 0; ai < n2; ++ai) if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "aot ic arg ld"; goto done; }
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);   /* ti */
+									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) aic_ati_ne); wasm_uleb (&body, 0);
+								wasm_op (&body, WASM_OP_ELSE);
+									for (ai = 0; ai < n2; ++ai) if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "aot ic arg ld"; goto done; }
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_rgctx_idx);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);
+									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) aic_ati); wasm_uleb (&body, 0);
+								wasm_op (&body, WASM_OP_END);   /* end kind if/else */
+								if (rv != WASM_VOID) { if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "aot ic dreg"; goto done; } }
+								wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* hit -> $after */
+								wasm_op (&body, WASM_OP_END);   /* end $aot_miss -> slow path */
+							}
 						}
 						/* $scratch = mono_wasm_jit_scratch() */
 #ifdef HOST_BROWSER
@@ -3977,13 +4505,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									 * helper's return code (kind==2 -> at_ne). Keeps every AOT-backed vcall fast (no residual). */
 									memset (&aott, 0, sizeof (aott)); aott.params [0] = WASM_I32; aott.nparams = 1; aott.ret = WASM_I32;
 									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &aott)) { aotti = 2 + vk; break; }
-									if (aotti < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = aott; aotti = 2 + nextra++; }
+									if (aotti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = aott; aotti = 2 + nextra++; }
 									memset (&at, 0, sizeof (at)); for (vk = 0; vk < n2; ++vk) at.params [vk] = pp [vk]; at.params [n2] = WASM_I32; at.nparams = (guint32) (n2 + 1); at.ret = rv;
 									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at)) { ati = 2 + vk; break; }
-									if (ati < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = at; ati = 2 + nextra++; }
+									if (ati < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = at; ati = 2 + nextra++; }
 									memset (&at_ne, 0, sizeof (at_ne)); for (vk = 0; vk < n2; ++vk) at_ne.params [vk] = pp [vk]; at_ne.nparams = (guint32) n2; at_ne.ret = rv;
 									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at_ne)) { ati_ne = 2 + vk; break; }
-									if (ati_ne < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = at_ne; ati_ne = 2 + nextra++; }
+									if (ati_ne < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = at_ne; ati_ne = 2 + nextra++; }
 									uses_calls = TRUE;
 									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $no_aot */
 									/* kind = mono_wasm_jit_vcall_aot_target(scratch); if (kind==0) br $no_aot (-> residual) */
@@ -3997,6 +4525,23 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_aotkind_idx);   /* stash kind, keep on stack */
 									wasm_op (&body, WASM_OP_I32_EQZ);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* kind==0 -> $no_aot -> residual */
+									if (aic) {   /* FILL the two-i64 AOT-IC cell: ic1 = vtab | ((ti<<1|kind2)<<32); ic2 = vtab | (rgctx<<32) */
+										/* fill only when the cell is EMPTY (first-vtab-wins): a polymorphic site would otherwise refill on
+										 * every miss — pure waste (never read back). Monomorphic sites fill once and hit thereafter. */
+										wasm_i32_const (&body, (gint32) (intptr_t) aic); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op (&body, WASM_OP_I32_EQZ);
+										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);   /* if (ic1.key == 0) */
+										wasm_i32_const (&body, (gint32) (intptr_t) aic);
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic fill v1"; goto done; } wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U);   /* vtab low32 */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHL);   /* ti<<1 */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx); wasm_i32_const (&body, 2); wasm_op (&body, WASM_OP_I32_EQ); wasm_op (&body, WASM_OP_I32_OR);   /* | kind2bit */
+										wasm_op (&body, WASM_OP_I64_EXTEND_I32_U); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHL); wasm_op (&body, WASM_OP_I64_OR);
+										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 0);   /* i64.atomic.store ic1 */
+										wasm_i32_const (&body, (gint32) (intptr_t) aic);
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic fill v2"; goto done; } wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHL); wasm_op (&body, WASM_OP_I64_OR);
+										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 8);   /* i64.atomic.store ic2 */
+										wasm_op (&body, WASM_OP_END);   /* end if-empty */
+									}
 									/* cppeh: bare AOT call — a throwing callee C++-unwinds natively to the nearest landing
 									 * pad (an in-method catch or the interp e-thunk boundary). No try/catch wrapper. */
 									/* pick variant: kind==2 (exempt wrapper, no trailing arg) -> at_ne; else (kind==1) -> at + rgctx@216.
@@ -4118,7 +4663,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (csig->ret->type == MONO_TYPE_VOID) ct.ret = WASM_VOID;
 				else { ct.ret = wasm_valtype_of_type (csig->ret); if (ct.ret == 0 || ct.ret == WASM_VOID) { fail = "creg ret type"; goto done; } }
 				for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &ct)) { type_idx = 2 + k; break; }
-				if (type_idx < 0) { if (nextra >= 32) { fail = "too many callee types"; goto done; } extra_types [nextra] = ct; type_idx = 2 + nextra++; }
+				if (type_idx < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ct; type_idx = 2 + nextra++; }
 				uses_calls = TRUE;
 				nmeth = csig->param_count + (csig->hasthis ? 1 : 0);
 				if (!call->call_info) { fail = "no captured callreg args"; goto done; }

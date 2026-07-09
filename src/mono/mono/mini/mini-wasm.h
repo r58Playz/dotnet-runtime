@@ -152,6 +152,17 @@ enum {
 	/* event-driven blocker waiting (Part 3 revamp): WJC_PARKED = times a method parked on cold blocker(s)
 	 * instead of poll-retrying; WJC_WAITER_WOKEN = total waiters re-queued when a blocker JITted. */
 	WJC_PARKED, WJC_WAITER_WOKEN,
+	/* below-threshold vcall fallback (WJC_VFB_THRESH) split by the target's wasm_jit_slot state, so we can
+	 * tell "cold callee, interp is fine" apart from "hot method whose island won't close" (the real interp-
+	 * residual driver): VFB_COLD = slot 0 (still counting), VFB_PARKED = slot -2 (crossed thresh, island
+	 * blocked on a cold callee), VFB_RETRY = slot -3 (transient compile-lock contention). Sum == VFB_THRESH. */
+	WJC_VFB_COLD, WJC_VFB_PARKED, WJC_VFB_RETRY,
+	/* fast-path VOLUME counters, emitted INTO the JITted wasm (gated by MONO_WASM_JIT_PROFILE_FAST, OFF by
+	 * default so normal STATS runs are unperturbed). The dispatch fast paths call NO counting helper, so
+	 * without these the counted totals (invoked/fastvcall/residual) exclude them and frame cost can't be
+	 * attributed. FAST_INLINE_AOT = INLINE_AOT direct AOT call_indirect; FAST_VIC = inline f-slot IC hit
+	 * (JIT->JIT); FAST_AOTIC = inline AOT-IC hit (JIT->AOT). */
+	WJC_FAST_INLINE_AOT, WJC_FAST_VIC, WJC_FAST_AOTIC,
 	WJC_MAX
 };
 

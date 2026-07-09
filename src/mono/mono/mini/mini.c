@@ -3145,6 +3145,95 @@ mini_get_rgctx_access_for_method (MonoMethod *method)
 		return MONO_RGCTX_ACCESS_THIS;
 }
 
+#ifdef TARGET_WASM
+/*
+ * wasm_jit_extra_opt:
+ *
+ *   MINI optimization flags to OR onto the wasm-JIT's required base (MONO_OPT_INTRINS | MONO_OPT_FLOAT32)
+ * at the compile_wasm fork below. Read once from MONO_WASM_JIT_OPT; default 0 = today's behaviour (-O0
+ * bodies: no inlining, so every accessor stays a real call — the call-bound profile).
+ *
+ *   ACCEPTS a comma-separated opt-name list ("inline", "inline,deadce"), "all", or a raw numeric mask.
+ * '-name' clears a flag. Unknown names warn and are ignored (never exit(), unlike the driver parser).
+ *
+ *   SAFETY IS PER-FLAG, not uniform:
+ *   - INLINE happens in method_to_ir (before codegen) and removes calls outright — the highest-value flag
+ *     and the intended first experiment. It does NOT depend on the vreg-mutating passes, so the emitter's
+ *     call-arg capture survives; but inlining feeds NEW ref-vreg shapes to the GC-ref passes (isref/
+ *     REFBASES), so validate with MONO_WASM_JIT_PINALL=1 A/B for missed-ref corruption, not just fps.
+ *   - COPYPROP/CONSPROP/DEADCE renumber/coalesce/eliminate vregs. The wasm emitter reads call->args by
+ *     vreg number at codegen (see the reset comment at the fork), so these can SILENTLY MISCOMPILE call
+ *     args (not a clean bail). Opt-in at your own risk until the emitter captures args robustly.
+ *   The emitter's main switch bails ("unsupported opcode") on any IR shape it can't lower, so an
+ * opcode it doesn't know only costs JIT coverage (method -> interp); with MONO_WASM_JIT_STATS=1,
+ * mono_wasm_jit_dump_bail_hist() then names the top newly-bailed opcodes for bisection.
+ */
+static guint32
+wasm_jit_extra_opt (void)
+{
+	static gboolean inited = FALSE;
+	static guint32 cached = 0;
+	const char *p;
+
+	if (inited)
+		return cached;
+	inited = TRUE;
+
+	p = g_getenv ("MONO_WASM_JIT_OPT");
+	if (!p || !*p)
+		return (cached = 0);
+
+	if (*p >= '0' && *p <= '9') {
+		/* raw mask: hex (0x..) or decimal. Hand-rolled — eglib here doesn't declare g_ascii_strtoull. */
+		guint32 v = 0; const char *q = p; int base = 10;
+		if (q [0] == '0' && (q [1] == 'x' || q [1] == 'X')) { base = 16; q += 2; }
+		for (; *q; ++q) {
+			int d;
+			if (*q >= '0' && *q <= '9') d = *q - '0';
+			else if (base == 16 && *q >= 'a' && *q <= 'f') d = *q - 'a' + 10;
+			else if (base == 16 && *q >= 'A' && *q <= 'F') d = *q - 'A' + 10;
+			else break;
+			v = v * (guint32) base + (guint32) d;
+		}
+		cached = v;
+	} else {
+		/* mini.h leaves OPTFLAG defined (enum builder); undef it so our name-table variant doesn't warn. */
+#undef OPTFLAG
+#define OPTFLAG(id,shift,nm,desc) { nm, shift },
+		static const struct { const char *name; int shift; } names [] = {
+#include "optflags-def.h"
+		};
+#undef OPTFLAG
+		char **parts = g_strsplit (p, ",", -1), **ptr;
+		guint32 opt = 0;
+		for (ptr = parts; ptr && *ptr; ++ptr) {
+			char *a = *ptr;
+			gboolean inv = (*a == '-');
+			guint i;
+			gboolean found = FALSE;
+			if (inv)
+				a++;
+			if (!strcmp (a, "all")) { opt = inv ? 0 : 0xffffffffu; continue; }
+			for (i = 0; i < G_N_ELEMENTS (names); ++i) {
+				if (!strcmp (a, names [i].name)) {
+					if (inv) opt &= ~(1u << names [i].shift);
+					else opt |= (1u << names [i].shift);
+					found = TRUE;
+					break;
+				}
+			}
+			if (!found && *a)
+				printf ("MONO_WASM_JIT_OPT: unknown opt '%s' (ignored)\n", a);
+		}
+		g_strfreev (parts);
+		cached = opt;
+	}
+	printf ("MONO_WASM_JIT_OPT = 0x%x (added to the INTRINS|FLOAT32 base)\n", cached);
+	fflush (stdout);
+	return cached;
+}
+#endif /* TARGET_WASM */
+
 /*
  * mini_method_compile:
  * @method: the method to compile
@@ -3297,6 +3386,13 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 	cfg->compile_llvm = try_llvm;
 #ifdef TARGET_WASM
 	{
+		/* Read the wasm-JIT config/levers from the env in THIS process. The browser reads them from the
+		 * interp transform (mono_interp_transform_method); the offline cross-compiler (mono-aot-cross) has
+		 * no interp, so do it here — that's what lets `mono-aot-cross --aot <dll>` with MONO_WASM_JIT_METHOD
+		 * set honour MONO_WASM_JIT_VERBOSE/DUMP_IR/STATS + every lever and dump the real emit/bail offline.
+		 * Idempotent (auto<0 sentinel), so the extra call on the in-browser path is a no-op. */
+		extern void mono_wasm_jit_auto_init (void);
+		mono_wasm_jit_auto_init ();
 		/* Phase 1 bring-up trigger: force the runtime wasm JIT for methods named
 		 * in MONO_WASM_JIT_METHOD (comma-separated simple-name match). Deciding it
 		 * here routes the method to the COMPILE_WASM fork, bypassing the mono_aot_only
@@ -3338,6 +3434,11 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 				 * method. With r4fp on, the backend's native-f32 load/store/const handling matches and
 				 * float arithmetic lowers to the OP_R* (f32) ops below. */
 				cfg->opt = MONO_OPT_INTRINS | MONO_OPT_FLOAT32;
+				/* Experiment knob: OR extra MINI opts (MONO_WASM_JIT_OPT) onto the required base. Default 0
+				 * (unchanged -O0 bodies). "inline" is the intended first try (removes calls before codegen);
+				 * the vreg-mutating passes (copyprop/consprop/deadce) can miscompile call args — see
+				 * wasm_jit_extra_opt(). Keeps INTRINS|FLOAT32 no matter what (they're correctness-required). */
+				cfg->opt |= wasm_jit_extra_opt ();
 			/* Opt-in: emit llvmonly indirect-dispatch IR (ftndesc) for virtual/interp calls.
 			 * Required for virtual dispatch on wasm (the normal vtable-slot dispatch calls a
 			 * fixed-signature trampoline → call_indirect mismatch). The codegen fork still routes

@@ -10117,6 +10117,34 @@ mono_wasm_jit_callee_perm_unjittable (MonoMethod *method)
 	InterpMethod *im = mono_interp_get_imethod (method);
 	return (im && im->wasm_jit_slot == -1) ? 1 : 0;
 }
+
+/* runtime wasm JIT (cold-leaf residual, MONO_WASM_JIT_RESIDUAL_COLD): 1 if this un-JITted DIRECT callee is
+ * genuinely COLD — i.e. the island cold-gate (wj_blocker_too_cold) would refuse to pull it in: it is still
+ * COUNTING hits (slot==0, never crossed the auto-JIT threshold), its hit count is below thresh/cold_div, and
+ * it has NOT block-promoted (blocked >= block_promote islands). Such a callee is a cold branch — an IKVM
+ * lambda factory (__<GetInstance>), a one-shot cctor/init, an error path — reached rarely from a hot caller.
+ * Under residual=0 the emitter routes JUST this edge through the interp residual instead of bailing the whole
+ * (hot) caller, so the hot method JITs while paying ~1 JIT->interp transition per cold call — NOT a per-
+ * iteration storm on the hot path. Deliberately returns 0 for: an already-f-slotted callee (fslot>0: not a
+ * blocker); a parked/retry callee (slot -2/-3: it CROSSED the hotness threshold = hot-but-blocked, so
+ * residual-routing it WOULD storm — the island must close it instead); and a permanent callee (slot -1: that
+ * is RESIDUAL_PERM's axis). Mirrors the slot==0 branch of wj_blocker_too_cold so the set we residual is
+ * exactly the set the island won't pull. */
+int
+mono_wasm_jit_callee_too_cold (MonoMethod *method)
+{
+	extern int mono_wasm_jit_thresh, mono_wasm_jit_block_promote, mono_wasm_jit_island_cold_div;
+	InterpMethod *im = mono_interp_get_imethod (method);
+	int cold_div, cold_thresh;
+	if (!im)
+		return 1;                          /* never executed -> definitively cold (one-shot residual) */
+	if (im->wasm_jit_fslot > 0 || im->wasm_jit_slot != 0)
+		return 0;                          /* JITted / parked / retry / perm -> not a cold-counting leaf */
+	cold_div = mono_wasm_jit_island_cold_div > 0 ? mono_wasm_jit_island_cold_div : 4;
+	cold_thresh = mono_wasm_jit_thresh / cold_div;
+	return im->wasm_jit_hits < cold_thresh
+		&& !(mono_wasm_jit_block_promote > 0 && im->wasm_jit_block_n >= mono_wasm_jit_block_promote);
+}
 #endif
 
 void
