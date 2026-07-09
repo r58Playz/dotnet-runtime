@@ -62,6 +62,46 @@ mono_arch_unwind_frame (MonoJitTlsData *jit_tls,
 		if (*lmf == jit_tls->first_lmf)
 			return FALSE;
 
+		/* DIAG (wasm-jit EH unwind): a NULL-method PLAIN LMF here means either a save_lmf method's LMF was
+		 * pushed without its method, or (more likely under aggressive island JIT) a wasm-JIT EH/finally
+		 * codegen wild-store corrupted an LMFExt's previous_lmf (clearing the bit-2 ext tag -> it's read as a
+		 * plain LMF with a garbage/NULL method). Dump the whole LMF chain so the NEXT crash names the frames
+		 * around the bad entry, instead of just aborting blind. Bounded walk; g_printerr leaks names but we
+		 * are aborting anyway. */
+		if (G_UNLIKELY (!(*lmf)->method)) {
+			MonoLMF *l = *lmf;
+			int n = 0;
+			g_printerr ("WASM_JIT_LMF_NULL_METHOD: LMF chain from %p (first_lmf=%p):\n", (void *) *lmf, (void *) jit_tls->first_lmf);
+			while (l && n < 64) {
+				gsize prev = (gsize) l->previous_lmf;
+				/* A wasm-JIT island ext whose previous_lmf was wild-stored to ~0 loses its bit-2 tag and reads
+				 * as a plain NULL-method LMF; recover the island's method (survives the offset-0 clobber) to
+				 * name the corrupting method's finally/EH codegen. Browser-only (the island machinery is
+				 * HOST_BROWSER; mono-aot-cross links this file but never runs islands). */
+				MonoMethod *island_m = NULL;
+#ifdef HOST_BROWSER
+				{ extern MonoMethod *mono_wasm_jit_island_lmf_method (gpointer lmf); island_m = mono_wasm_jit_island_lmf_method (l); }
+#endif
+				if (prev & 2) {
+					MonoLMFExt *ext = (MonoLMFExt *) l;
+					if (ext->kind == MONO_LMFEXT_IL_STATE)
+						g_printerr ("  [%d] %p EXT IL_STATE il_state.method=%s\n", n, (void *) l,
+							ext->il_state && ext->il_state->method ? mono_method_get_full_name (ext->il_state->method) : "NULL");
+					else
+						g_printerr ("  [%d] %p EXT kind=%d\n", n, (void *) l, ext->kind);
+				} else {
+					g_printerr ("  [%d] %p PLAIN method=%s%s%s\n", n, (void *) l,
+						l->method ? mono_method_get_full_name (l->method) : "NULL",
+						island_m ? " CORRUPTED-ISLAND island.method=" : "",
+						island_m ? mono_method_get_full_name (island_m) : "");
+				}
+				if (l == jit_tls->first_lmf)
+					break;
+				l = (MonoLMF *) (prev & ~3);
+				n++;
+			}
+			g_printerr ("WASM_JIT_LMF_NULL_METHOD: end (walked %d frames)\n", n);
+		}
 		/* This will compute the original method address */
 		g_assert ((*lmf)->method);
 		gpointer addr = mono_compile_method_checked ((*lmf)->method, error);

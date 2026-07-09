@@ -26,6 +26,7 @@ void jiterp_preserve_module (void);
 #include <emscripten.h>
 
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 
@@ -1672,11 +1673,201 @@ pthread_once_t queue_keys_initialized = PTHREAD_ONCE_INIT;
 static mono_mutex_t queue_mutex;
 static GPtrArray *shared_queues = NULL;
 
+#define TLQUEUE_MAX_ITEMS 16u
+#define TLQUEUE_MAX_SHARED_QUEUES 4096u
+#define TLQUEUE_EVENT_COUNT 256
+
+typedef struct {
+	guint64 seq;
+	const char *op;
+	int queue;
+	GPtrArray *items;
+	gpointer item;
+	guint len_before;
+	guint len_after;
+	gpointer pdata;
+	guint shared_len;
+	gsize tid;
+	gsize key;
+} TlqueueEvent;
+
+static TlqueueEvent tlqueue_events [TLQUEUE_EVENT_COUNT];
+static guint64 tlqueue_event_seq;
+static int tlqueue_trace_enabled = -1;
+
+static const char *
+tlqueue_name (int queue)
+{
+	switch (queue) {
+	case 0: return "JitCall";
+	case 1: return "InterpEntry";
+	default: return "?";
+	}
+}
+
+static gboolean
+tlqueue_trace (void)
+{
+	if (tlqueue_trace_enabled < 0) {
+		const char *v = g_getenv ("MONO_JITERP_TLQUEUE_TRACE");
+		tlqueue_trace_enabled = (v && *v && *v != '0') ? 1 : 0;
+	}
+	return tlqueue_trace_enabled != 0;
+}
+
+static gsize
+tlqueue_thread_id (void)
+{
+#ifdef DISABLE_THREADS
+	return 0;
+#else
+	return (gsize) pthread_self ();
+#endif
+}
+
+static gsize
+tlqueue_key_value (int queue)
+{
+	return ((queue >= 0) && (queue < NUM_QUEUES)) ? (gsize) queue_keys [queue] : 0;
+}
+
+static gsize
+tlqueue_mem_size (void)
+{
+	return (gsize) __builtin_wasm_memory_size (0) << 16;
+}
+
+static gboolean
+tlqueue_range_ok (gconstpointer ptr, gsize bytes, gboolean allow_null)
+{
+	gsize a = (gsize) ptr;
+	gsize memsz;
+	if (!a)
+		return allow_null;
+	memsz = tlqueue_mem_size ();
+	return a >= 1024 && bytes <= memsz && a <= memsz - bytes;
+}
+
+static void
+tlqueue_record_locked (const char *op, int queue, GPtrArray *items, gpointer item, guint len_before, guint len_after)
+{
+	guint64 seq = ++tlqueue_event_seq;
+	TlqueueEvent *e = &tlqueue_events [seq % TLQUEUE_EVENT_COUNT];
+	e->seq = seq;
+	e->op = op;
+	e->queue = queue;
+	e->items = items;
+	e->item = item;
+	e->len_before = len_before;
+	e->len_after = len_after;
+	e->pdata = (items && tlqueue_range_ok (items, sizeof (GPtrArray), FALSE)) ? items->pdata : NULL;
+	e->shared_len = (shared_queues && tlqueue_range_ok (shared_queues, sizeof (GPtrArray), FALSE)) ? shared_queues->len : 0;
+	e->tid = tlqueue_thread_id ();
+	e->key = tlqueue_key_value (queue);
+	if (G_UNLIKELY (tlqueue_trace ())) {
+		printf ("WASM_JITERP_TLQUEUE_%s tid=0x%x key=%u queue=%d/%s items=%p pdata=%p item=%p len=%u->%u shared_len=%u seq=%llu\n",
+			op, (unsigned) e->tid, (unsigned) e->key, queue, tlqueue_name (queue), (void *) items, e->pdata, item, len_before, len_after,
+			e->shared_len, (unsigned long long) seq);
+		fflush (stdout);
+	}
+}
+
+static void
+tlqueue_dump_events (void)
+{
+	guint64 start = tlqueue_event_seq > TLQUEUE_EVENT_COUNT ? tlqueue_event_seq - TLQUEUE_EVENT_COUNT + 1 : 1;
+	printf ("WASM_JITERP_TLQUEUE_EVENTS last=%u total_seq=%llu\n", TLQUEUE_EVENT_COUNT, (unsigned long long) tlqueue_event_seq);
+	for (guint64 s = start; s <= tlqueue_event_seq; ++s) {
+		TlqueueEvent *e = &tlqueue_events [s % TLQUEUE_EVENT_COUNT];
+		if (e->seq != s)
+			continue;
+		printf ("  seq=%llu tid=0x%x key=%u op=%s queue=%d/%s items=%p pdata=%p item=%p len=%u->%u shared_len=%u\n",
+			(unsigned long long) e->seq, (unsigned) e->tid, (unsigned) e->key, e->op ? e->op : "?", e->queue, tlqueue_name (e->queue),
+			(void *) e->items, e->pdata, e->item, e->len_before, e->len_after, e->shared_len);
+	}
+}
+
+static void
+tlqueue_bad (const char *where, int queue, GPtrArray *items, gpointer item, const char *why)
+{
+	guint len = 0, shared_len = 0;
+	gpointer pdata = NULL, shared_pdata = NULL;
+	if (items && tlqueue_range_ok (items, sizeof (GPtrArray), FALSE)) {
+		len = items->len;
+		pdata = items->pdata;
+	}
+	if (shared_queues && tlqueue_range_ok (shared_queues, sizeof (GPtrArray), FALSE)) {
+		shared_len = shared_queues->len;
+		shared_pdata = shared_queues->pdata;
+	}
+	printf ("WASM_JITERP_TLQUEUE_BAD tid=0x%x key=%u where=%s queue=%d/%s why=%s items=%p pdata=%p len=%u item=%p shared=%p shared_pdata=%p shared_len=%u mem=%u\n",
+		(unsigned) tlqueue_thread_id (), (unsigned) tlqueue_key_value (queue), where, queue, tlqueue_name (queue), why, (void *) items, pdata, len, item, (void *) shared_queues,
+		shared_pdata, shared_len, (unsigned) tlqueue_mem_size ());
+	tlqueue_dump_events ();
+	fflush (stdout);
+	__builtin_trap ();
+}
+
+static gboolean
+tlqueue_ptr_array_ok_locked (const char *where, int queue, GPtrArray *items, guint max_len, gboolean allow_null)
+{
+	guint len;
+	gpointer pdata;
+	gsize pdata_bytes;
+	gsize check_bytes;
+	if (!items) {
+		if (!allow_null)
+			tlqueue_bad (where, queue, items, NULL, "GPtrArray pointer is NULL");
+		return allow_null;
+	}
+	if (((gsize) items & 3) || !tlqueue_range_ok (items, sizeof (GPtrArray), FALSE))
+		tlqueue_bad (where, queue, items, NULL, "GPtrArray header pointer out of wasm memory or misaligned");
+	len = items->len;
+	pdata = items->pdata;
+	if (len > max_len)
+		tlqueue_bad (where, queue, items, NULL, "GPtrArray len is implausibly large");
+	pdata_bytes = (gsize) len * sizeof (gpointer);
+	check_bytes = pdata_bytes ? pdata_bytes : (gsize) sizeof (gpointer);
+	if (pdata && (((gsize) pdata & 3) || !tlqueue_range_ok (pdata, check_bytes, FALSE)))
+		tlqueue_bad (where, queue, items, NULL, "GPtrArray pdata pointer out of wasm memory or misaligned");
+	if (len && !pdata)
+		tlqueue_bad (where, queue, items, NULL, "GPtrArray len is nonzero but pdata is NULL");
+	return TRUE;
+}
+
+static gboolean
+tlqueue_shared_contains_locked (GPtrArray *items)
+{
+	if (!shared_queues)
+		return FALSE;
+	tlqueue_ptr_array_ok_locked ("shared_contains", -1, shared_queues, TLQUEUE_MAX_SHARED_QUEUES, FALSE);
+	for (guint i = 0; i < shared_queues->len; ++i) {
+		if ((GPtrArray *) shared_queues->pdata [i] == items)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void
+tlqueue_check_item (const char *where, int queue, GPtrArray *items, gpointer item)
+{
+	if (!item)
+		return;
+	if (((gsize) item & 3) || !tlqueue_range_ok (item, sizeof (gpointer), FALSE))
+		tlqueue_bad (where, queue, items, item, "queued item pointer is out of wasm memory or misaligned");
+}
+
 static void
 free_queue (void *ptr) {
 	mono_os_mutex_lock (&queue_mutex);
 	// WARNING: Ensure we do not call into the runtime or JS while holding this mutex!
-	g_assert (shared_queues);
+	if (!shared_queues)
+		tlqueue_bad ("free_queue", -1, (GPtrArray *) ptr, NULL, "shared queue list is NULL");
+	tlqueue_ptr_array_ok_locked ("free_queue.shared", -1, shared_queues, TLQUEUE_MAX_SHARED_QUEUES, FALSE);
+	tlqueue_ptr_array_ok_locked ("free_queue.items", -1, (GPtrArray *) ptr, TLQUEUE_MAX_ITEMS, FALSE);
+	if (!tlqueue_shared_contains_locked ((GPtrArray *) ptr))
+		tlqueue_bad ("free_queue", -1, (GPtrArray *) ptr, NULL, "TLS queue is not present in shared queue list");
+	tlqueue_record_locked ("FREE", -1, (GPtrArray *) ptr, NULL, ((GPtrArray *) ptr)->len, 0);
 	g_ptr_array_remove_fast (shared_queues, ptr);
 	g_ptr_array_free ((GPtrArray *)ptr, TRUE);
 	mono_os_mutex_unlock (&queue_mutex);
@@ -1700,7 +1891,8 @@ initialize_queue_keys () {
 
 static MonoNativeTlsKey
 get_queue_key (int queue) {
-	g_assert ((queue >= 0) && (queue < NUM_QUEUES));
+	if (G_UNLIKELY ((queue < 0) || (queue >= NUM_QUEUES)))
+		tlqueue_bad ("get_queue_key", queue, NULL, NULL, "queue index out of range");
 
 #ifdef DISABLE_THREADS
 	if (!queue_keys_initialized)
@@ -1717,11 +1909,28 @@ get_queue (int queue) {
 	MonoNativeTlsKey key = get_queue_key (queue);
 	GPtrArray *result = NULL;
 	if ((result = (GPtrArray *)mono_native_tls_get_value (key)) == NULL) {
+		gpointer readback;
 		g_assert (mono_native_tls_set_value (key, result = g_ptr_array_new ()));
+		readback = mono_native_tls_get_value (key);
+		if (readback != result) {
+			mono_os_mutex_lock (&queue_mutex);
+			tlqueue_bad ("get_queue.set_verify", queue, result, readback, "pthread TLS readback does not match newly stored queue");
+			mono_os_mutex_unlock (&queue_mutex);
+		}
 		// WARNING: Ensure we do not call into the runtime or JS while holding this mutex!
 		mono_os_mutex_lock (&queue_mutex);
-		g_assert (shared_queues);
+		if (!shared_queues)
+			tlqueue_bad ("get_queue", queue, result, NULL, "shared queue list is NULL");
+		tlqueue_ptr_array_ok_locked ("get_queue.shared", queue, shared_queues, TLQUEUE_MAX_SHARED_QUEUES, FALSE);
+		tlqueue_ptr_array_ok_locked ("get_queue.new", queue, result, TLQUEUE_MAX_ITEMS, FALSE);
 		g_ptr_array_add (shared_queues, result);
+		tlqueue_record_locked ("NEW", queue, result, NULL, 0, result->len);
+		mono_os_mutex_unlock (&queue_mutex);
+	} else {
+		mono_os_mutex_lock (&queue_mutex);
+		if (!tlqueue_shared_contains_locked (result))
+			tlqueue_bad ("get_queue", queue, result, NULL, "TLS queue is not present in shared queue list");
+		tlqueue_ptr_array_ok_locked ("get_queue.tls", queue, result, TLQUEUE_MAX_ITEMS, FALSE);
 		mono_os_mutex_unlock (&queue_mutex);
 	}
 	return result;
@@ -1735,10 +1944,18 @@ mono_jiterp_tlqueue_purge_all (gpointer item) {
 
 	// WARNING: Ensure we do not call into the runtime or JS while holding this mutex!
 	mono_os_mutex_lock (&queue_mutex);
-	for (int i = 0; i < shared_queues->len; i++) {
+	if (!shared_queues)
+		tlqueue_bad ("purge_all", -1, NULL, item, "shared queue list is NULL");
+	tlqueue_ptr_array_ok_locked ("purge_all.shared", -1, shared_queues, TLQUEUE_MAX_SHARED_QUEUES, FALSE);
+	tlqueue_check_item ("purge_all.item", -1, NULL, item);
+	for (guint i = 0; i < shared_queues->len; i++) {
 		GPtrArray *queue = (GPtrArray *)g_ptr_array_index (shared_queues, i);
+		guint old_len;
+		tlqueue_ptr_array_ok_locked ("purge_all.queue", -1, queue, TLQUEUE_MAX_ITEMS, FALSE);
+		old_len = queue->len;
 		gboolean ok = g_ptr_array_remove_fast (queue, item);
 		if (ok) {
+			tlqueue_record_locked ("PURGE", -1, queue, item, old_len, queue->len);
 			// g_printf ("Purged %x from queue %x\n", (unsigned int)item, (unsigned int)queue);
 		}
 	}
@@ -1755,9 +1972,17 @@ mono_jiterp_tlqueue_next (int queue) {
 	mono_os_mutex_lock (&queue_mutex);
 	// WARNING: Ensure we do not call into the runtime or JS while holding this mutex!
 	gpointer result = NULL;
+	tlqueue_ptr_array_ok_locked ("next.pre", queue, items, TLQUEUE_MAX_ITEMS, FALSE);
+	if (!tlqueue_shared_contains_locked (items))
+		tlqueue_bad ("next", queue, items, NULL, "TLS queue is not present in shared queue list");
 	if (items->len) {
+		guint old_len = items->len;
 		result = g_ptr_array_index (items, 0);
+		tlqueue_check_item ("next.item", queue, items, result);
 		g_ptr_array_remove_index_fast (items, 0);
+		tlqueue_record_locked ("NEXT", queue, items, result, old_len, items->len);
+	} else {
+		tlqueue_record_locked ("NEXT_EMPTY", queue, items, NULL, 0, 0);
 	}
 	mono_os_mutex_unlock (&queue_mutex);
 	return result;
@@ -1770,8 +1995,15 @@ mono_jiterp_tlqueue_add (int queue, gpointer item) {
 	GPtrArray *items = get_queue (queue);
 	mono_os_mutex_lock (&queue_mutex);
 	// WARNING: Ensure we do not call into the runtime or JS while holding this mutex!
+	tlqueue_ptr_array_ok_locked ("add.pre", queue, items, TLQUEUE_MAX_ITEMS, FALSE);
+	if (!tlqueue_shared_contains_locked (items))
+		tlqueue_bad ("add", queue, items, item, "TLS queue is not present in shared queue list");
+	tlqueue_check_item ("add.item", queue, items, item);
+	guint old_len = items->len;
 	g_ptr_array_add (items, item);
 	result = items->len;
+	tlqueue_ptr_array_ok_locked ("add.post", queue, items, TLQUEUE_MAX_ITEMS, FALSE);
+	tlqueue_record_locked ("ADD", queue, items, item, old_len, items->len);
 	mono_os_mutex_unlock (&queue_mutex);
 	return result;
 }
@@ -1781,7 +2013,12 @@ mono_jiterp_tlqueue_clear (int queue) {
 	GPtrArray *items = get_queue (queue);
 	mono_os_mutex_lock (&queue_mutex);
 	// WARNING: Ensure we do not call into the runtime or JS while holding this mutex!
+	tlqueue_ptr_array_ok_locked ("clear.pre", queue, items, TLQUEUE_MAX_ITEMS, FALSE);
+	if (!tlqueue_shared_contains_locked (items))
+		tlqueue_bad ("clear", queue, items, NULL, "TLS queue is not present in shared queue list");
+	guint old_len = items->len;
 	g_ptr_array_set_size (items, 0);
+	tlqueue_record_locked ("CLEAR", queue, items, NULL, old_len, items->len);
 	mono_os_mutex_unlock (&queue_mutex);
 }
 

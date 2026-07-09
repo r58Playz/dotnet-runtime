@@ -1,7 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-import { MonoMethod, MonoType } from "./types/internal";
+import { MonoMethod, MonoType, PThreadPtrNull } from "./types/internal";
 import { NativePointer } from "./types/emscripten";
 import { mono_assert } from "./globals";
 import {
@@ -20,6 +20,8 @@ import {
 import { WasmValtype } from "./jiterpreter-opcodes";
 import { mono_log_error, mono_log_info } from "./logging";
 import { utf8ToString } from "./strings";
+import WasmEnableThreads from "consts:wasmEnableThreads";
+import { mono_wasm_pthread_ptr } from "./pthreads/shared";
 import {
     JiterpreterTable, JiterpCounter, JitQueue
 } from "./jiterpreter-enums";
@@ -154,6 +156,10 @@ class TrampolineInfo {
 
 let mostRecentOptions: JiterpreterOptions | undefined = undefined;
 
+function has_live_pthread () {
+    return !WasmEnableThreads || mono_wasm_pthread_ptr() !== PThreadPtrNull;
+}
+
 // If a method is freed we need to remove its info (just in case another one gets
 //  allocated at that exact memory offset later) and more importantly, ensure it is
 //  not waiting in the jit queue
@@ -180,6 +186,9 @@ export function mono_interp_record_interp_entry (imethod: number) {
     if (info.hitCount === mostRecentOptions!.interpEntryFlushThreshold)
         flush_wasm_entry_trampoline_jit_queue();
     else if (info.hitCount !== mostRecentOptions!.interpEntryHitCount)
+        return;
+
+    if (!has_live_pthread())
         return;
 
     const jitQueueLength = cwraps.mono_jiterp_tlqueue_add(JitQueue.InterpEntry, <any>imethod);
@@ -247,11 +256,16 @@ function ensure_jit_is_scheduled () {
     //  there is no realistic way to efficiently maintain a hit counter for these trampolines
     jitQueueTimeout = globalThis.setTimeout(() => {
         jitQueueTimeout = 0;
+        if (!has_live_pthread())
+            return;
         flush_wasm_entry_trampoline_jit_queue();
     }, queueFlushDelayMs);
 }
 
 function flush_wasm_entry_trampoline_jit_queue () {
+    if (!has_live_pthread())
+        return;
+
     const jitQueue : TrampolineInfo[] = [];
     let methodPtr = <MonoMethod><any>0;
     // tlqueue_next returns an i32, so an imethod pointer >= 2GB comes back as a negative

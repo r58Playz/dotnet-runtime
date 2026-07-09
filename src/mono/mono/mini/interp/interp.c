@@ -1298,8 +1298,9 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 		}
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_ATTEMPT);
 		if (mono_wasm_jit_island) {
+			extern int mono_wasm_jit_hot_root;   /* MONO_WASM_JIT_HOT_ROOT: this method just crossed its own thresh (proven hot) -> build its island as a promoted root so the cold gate is relaxed and its private (blind-spot ~0-hit) callees get pulled in instead of parking it forever */
 			int budget = mono_wasm_jit_island_budget;   /* Lever C: env-tunable; max force-compiles per island attempt */
-			r = wasm_jit_force_island (cmethod->method, 0, &budget, FALSE);
+			r = wasm_jit_force_island (cmethod->method, 0, &budget, mono_wasm_jit_hot_root ? TRUE : FALSE);
 		} else {
 			r = wasm_jit_compile_publish (cmethod, NULL);
 		}
@@ -3348,6 +3349,20 @@ mono_wasm_jit_alloc_ic (void)
 	return g_malloc0 (8);
 }
 
+/* Per-call-site AOT-vcall inline cache cell (VCALL_AOT_IC): TWO atomic i64 words
+ *   +0  ic1 = vtab (low32) | ((table_index<<1 | kind2bit) << 32)
+ *   +8  ic2 = vtab (low32) | (rgctx << 32)
+ * A given vtable deterministically maps to ONE override -> one (table_index,kind,rgctx). So a hit only
+ * requires BOTH words low32 == this->vtable: the payload is then correct regardless of which thread/
+ * fill wrote each word (all fills for that vtab store identical values). Fully MT-safe with only atomic
+ * i64 loads/stores (no plain-vs-atomic ordering assumption, which the wasm memory model does NOT give).
+ * AOT bodies sit at fixed module-shared table indices (thread-invariant) -> no per-thread liveness gate. */
+gpointer
+mono_wasm_jit_alloc_aot_ic (void)
+{
+	return g_malloc0 (16);   /* two atomic i64: +0 = vtab | ((ti<<1|kind2)<<32), +8 = vtab | (rgctx<<32) */
+}
+
 /*
  * mono_wasm_jit_vcall_ic_resolve:
  *
@@ -3755,6 +3770,20 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 gpointer
 mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
 {
+	if (G_UNLIKELY (!this_obj)) {
+		/* Defensive backstop; the emitter normally materializes callvirt's null check before reaching here. */
+		extern void mono_wasm_jit_throw (MonoObject *exc);
+		mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
+		return NULL;
+	}
+#ifdef HOST_BROWSER
+	{
+		extern int mono_wasm_jit_objguard;
+		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+		if (G_UNLIKELY (mono_wasm_jit_objguard))
+			mono_wasm_jit_check_store ((guint8 *) this_obj, 5);
+	}
+#endif
 	MonoMethod *target = mono_object_get_virtual_method_internal (this_obj, base_method);
 	if (G_UNLIKELY (!target)) {
 		/* See mono_wasm_jit_vcall_resolve_fslot: a NULL override means a null/corrupt receiver. Raise a
@@ -3832,9 +3861,24 @@ int
 mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic)
 {
 	guint64 *icp = (guint64 *) ic;
-	MonoVTable *vt = this_obj->vtable;
+	MonoVTable *vt;
 	InterpMethod *imethod;
 	MonoMethod *target;
+	if (G_UNLIKELY (!this_obj)) {
+		*(MonoMethod **) (scratch + 200) = NULL;
+		extern void mono_wasm_jit_throw (MonoObject *exc);
+		mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
+		return 0;
+	}
+#ifdef HOST_BROWSER
+	{
+		extern int mono_wasm_jit_objguard;
+		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+		if (G_UNLIKELY (mono_wasm_jit_objguard))
+			mono_wasm_jit_check_store ((guint8 *) this_obj, 5);
+	}
+#endif
+	vt = this_obj->vtable;
 	/* Read the (vtable | imethod<<32) pair ATOMICALLY. MC builds chunks on worker threads concurrently
 	 * with the render thread, so the same vcall site's IC is written by multiple threads. A non-atomic
 	 * i32-pair read can tear (match an old vtable but read a freshly-written imethod for a DIFFERENT
@@ -3978,7 +4022,18 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 				else mono_wasm_jit_count (WJC_VPERM_OTHER);     /* genuinely other IR shape */
 				break;
 			}
-		} else mono_wasm_jit_count (WJC_VFB_THRESH);
+		} else {
+			mono_wasm_jit_count (WJC_VFB_THRESH);
+			/* split by slot state: distinguishes a genuinely-cold target (slot 0, interp is acceptable) from
+			 * a HOT method whose island won't close (slot -2 parked / -3 retry) — the latter interprets every
+			 * call and is the real interp-residual driver, fixable only by closing its island, not by residual. */
+			switch (imethod->wasm_jit_slot) {
+			case 0:                    mono_wasm_jit_count (WJC_VFB_COLD); break;
+			case WASM_JIT_SLOT_PARKED: mono_wasm_jit_count (WJC_VFB_PARKED); break;
+			case WASM_JIT_SLOT_RETRY:  mono_wasm_jit_count (WJC_VFB_RETRY); break;
+			default: break;
+			}
+		}
 	}
 	return 0;
 }
@@ -4026,11 +4081,18 @@ mono_wasm_jit_vcall_aot_target (guint8 *scratch)
 	 * (inflated/gshared, wrapper kind, etc.). Gated on verbose; the dedup keeps it bounded despite ~24M calls. */
 	{
 		extern int mono_wasm_jit_verbose;
+		/* PER-CALL diagnostic -> gated at verbose>=3 (per-call trace tier), NOT >=2: this fires on the
+		 * vcall-dispatch fast path (~24M calls), and each printf+fflush is a synchronous console write that
+		 * in-loop measurably taints the fps bench (jit30: ~66 lines/frame -> ~40ms/frame, dropped 6.9->5.4).
+		 * A verbose<=2 stats/bail run must stay clean. Even at >=3, bound it to ~one line per target with a
+		 * 2-WAY seen-set: the old direct-mapped 8192 set let two hash-colliding hot iterators ping-pong-evict
+		 * each other (the observed ~9748+~9745 twin counts) -> 10k+ reprints each. */
 		if (G_UNLIKELY (mono_wasm_jit_verbose >= 3)) {
-			static __thread MonoMethod *wj_vaot_seen [8192];   /* per-thread probabilistic seen-set (32KB) */
+			static __thread MonoMethod *wj_vaot_seen [8192][2];   /* per-thread 2-way seen-set (64KB) */
 			guint h = (guint) (((gsize) target >> 4) & 8191);
-			if (wj_vaot_seen [h] != target) {
-				wj_vaot_seen [h] = target;
+			if (wj_vaot_seen [h][0] != target && wj_vaot_seen [h][1] != target) {
+				wj_vaot_seen [h][1] = wj_vaot_seen [h][0];
+				wj_vaot_seen [h][0] = target;
 				char *fn = mono_method_get_full_name (target);
 				printf ("WASM_JIT_VCALL_AOT target=%s kind=%d extra_arg=%d inflated=%d wrapper=%d rgctx=%p\n",
 					fn, has_extra_arg ? 1 : 2, has_extra_arg, target->is_inflated, target->wrapper_type, rgctx);
@@ -4511,6 +4573,28 @@ mono_wasm_jit_is_island (MonoMethodILState *il_state)
 		}
 	}
 	return 0;
+}
+
+/* DIAG (wasm-jit EH unwind crash): if `lmf` is the address of one of THIS thread's wasm-JIT island LMFExts,
+ * return the island's method (read from il_state->method in `st`, at a nonzero struct offset that survives a
+ * previous_lmf-only / offset-0 clobber). Lets mono_arch_unwind_frame NAME the method whose island ext got
+ * corrupted (bit-2 tag cleared -> read as a plain NULL-method LMF) instead of aborting anonymously, pointing
+ * straight at the finally/EH codegen that wild-stored it. Returns NULL if `lmf` is not an island slot. */
+MonoMethod *
+mono_wasm_jit_island_lmf_method (gpointer lmf)
+{
+	int i, total;
+	if (!wj_island_chunks)
+		return NULL;
+	total = wj_island_nchunks * WJ_ISLAND_CHUNK;
+	for (i = 0; i < total; ++i) {
+		WjIsland *is = wj_island_at (i);
+		if ((gpointer) &is->ext == lmf) {
+			MonoMethodILState *il = (MonoMethodILState *) is->st;
+			return il ? il->method : NULL;
+		}
+	}
+	return NULL;
 }
 
 /* --- AOT-style EH milestone 2: in-method catch landing-pad dispatch -----------------------------------
