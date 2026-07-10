@@ -3192,7 +3192,41 @@ interp_entry (InterpEntryData *data)
 	 * the interp's MINT_JIT_CALL. */
 	extern int mono_wasm_jit_aot_residual;
 	gboolean wj_did_jit_call = FALSE;
-	if (G_UNLIKELY (wj_entry_is_residual (data)) && mono_wasm_jit_aot_residual) {
+	/* wasm-JIT e-slot redirect: if the target method has itself been wasm-JITted (a live entry thunk),
+	 * run its COMPILED wasm body via the e-thunk instead of interpreting it. This is what makes a JITted
+	 * method reached through a NON-MINT_CALL entry actually execute in wasm rather than as its interp copy:
+	 * a residual / vcall-fallback from another JITted method (mono_wasm_jit_call_interp,
+	 * mono_wasm_jit_vcall_*) and a native/AOT-driven virtual dispatch all funnel here with rmethod = the
+	 * resolved target. Before this, such a target ran its interp copy even though it was fully JITted — the
+	 * dominant steady-state boundary cost in the bench (the hot entry-edges: IKVM lambda applyAsLong/accept,
+	 * Vec3i.equals). interp_entry has already marshalled `this`+scalar args onto the GC-scanned interp stack
+	 * at sp (this at 0, each arg at +8 — arg_offsets[k]==k*8 for the scalar-only sigs the JIT emits), which
+	 * is EXACTLY the e-thunk's (args_ptr) layout; the e-thunk stores the result back at sp+0, and the shared
+	 * return tail below marshals it to data->res identically to the mono_interp_exec_method path. A thrown
+	 * callee sets the interp resume-state inside mono_wasm_jit_invoke_caught, which the has_resume_state /
+	 * need_native_unwind tail propagates — same model as the AOT residual branch. No extra interp_push_lmf:
+	 * the JITted caller that reached this entry already pushed its island LMF (prologue), and the e-thunk
+	 * callee pushes its own, so the managed->native boundary is marked without a callee-frame INTERP_EXIT LMF
+	 * (whose null ip could mis-match pass-1). Delegate-invoke (is_invoke) rewrites rmethod to the invoke
+	 * wrapper, which is not JITted and dispatches its target via its own MINT_CALL — skip it here. */
+	{
+		extern int mono_wasm_jit_entry_redirect;
+		gint32 wj_eslot = rmethod->wasm_jit_slot;
+		if (mono_wasm_jit_entry_redirect && G_UNLIKELY (wj_eslot > 0) && !rmethod->is_invoke) {
+			extern void mono_wasm_jit_sync_thread (void);
+			extern int mono_wasm_jit_slot_live (int slot);
+			/* Bring THIS thread's function table up to date, then confirm the slot actually instantiated
+			 * here (sync can fail on a worker under memory pressure while the compiling thread succeeded;
+			 * call_indirect-ing a mismatched placeholder would trap). If not live, fall through to interpret. */
+			mono_wasm_jit_sync_thread ();
+			if (G_LIKELY (mono_wasm_jit_slot_live (wj_eslot))) {
+				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
+				mono_wasm_jit_invoke_caught (method, wj_eslot, frame.stack, frame.stack);
+				wj_did_jit_call = TRUE;
+			}
+		}
+	}
+	if (!wj_did_jit_call && G_UNLIKELY (wj_entry_is_residual (data)) && mono_wasm_jit_aot_residual) {
 		InterpMethodCodeType ct = rmethod->code_type;
 		if (ct == IMETHOD_CODE_UNKNOWN) {
 			ct = mono_interp_jit_call_supported (method, sig) ? IMETHOD_CODE_COMPILED : IMETHOD_CODE_INTERP;
@@ -12095,7 +12129,39 @@ mono_jiterp_interp_entry (void *res)
 	g_assert (header.context->stack_pointer < header.context->stack_end);
 
 	MONO_ENTER_GC_UNSAFE;
+#if HOST_BROWSER
+	/* wasm-JIT e-slot redirect for the JITERPRETER's native->interp entry. This is the entry the
+	 * jiterpreter compiles for methods called from native/AOT/wasm-JITted code (the "interp_entries" in the
+	 * jiterp stats), and it is a SEPARATE path from interp_entry() — so a wasm-JITted target reached this way
+	 * ran its INTERP copy despite slot>0/live. That is how every IKVM lambda / functional-interface delegate
+	 * is invoked (Java lambda -> .NET delegate -> jiterp interp-entry): Consumer.accept, ToLongFunction.
+	 * applyAsLong — the dominant hot entry-edges, invisible to the interp_entry redirect AND every C call
+	 * opcode (confirmed: they surfaced only at the universal mono_interp_exec_method probe, as root frames,
+	 * live=1). The jiterp entry-prologue already marshalled this+scalar args onto the GC-scanned interp stack
+	 * at frame.stack (this at 0, each arg at +8 — get_arg_offset_fast), exactly the e-thunk's args_ptr layout;
+	 * the e-thunk writes the result back at frame.stack and the shared tail's mono_jiterp_stackval_to_data
+	 * marshals it to `res`, and a thrown callee's resume-state is handled by the has_resume_state tail below —
+	 * identical to the mono_interp_exec_method path. Gated by MONO_WASM_JIT_ENTRY_REDIRECT (=0 reverts). */
+	{
+		extern int mono_wasm_jit_entry_redirect;
+		InterpMethod *wj_rm = header.rmethod;
+		gboolean wj_dispatched = FALSE;
+		if (mono_wasm_jit_entry_redirect && G_UNLIKELY (wj_rm->wasm_jit_slot > 0) && !wj_rm->is_invoke) {
+			extern void mono_wasm_jit_sync_thread (void);
+			extern int mono_wasm_jit_slot_live (int slot);
+			mono_wasm_jit_sync_thread ();
+			if (G_LIKELY (mono_wasm_jit_slot_live (wj_rm->wasm_jit_slot))) {
+				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
+				mono_wasm_jit_invoke_caught (wj_rm->method, (gint32) wj_rm->wasm_jit_slot, frame.stack, frame.stack);
+				wj_dispatched = TRUE;
+			}
+		}
+		if (!wj_dispatched)
+			mono_interp_exec_method (&frame, header.context, NULL);
+	}
+#else
 	mono_interp_exec_method (&frame, header.context, NULL);
+#endif
 	MONO_EXIT_GC_UNSAFE;
 
 	header.context->stack_pointer = (guchar*)sp;
