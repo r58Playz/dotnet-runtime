@@ -599,6 +599,12 @@ mono_decompose_long_opts (MonoCompile *cfg)
 #if SIZEOF_REGISTER == 4
 	MonoBasicBlock *bb, *first_bb;
 
+	/* The wasm JIT backend consumes native i64 IR (like LLVM); pair-decomposing longs into
+	 * LS/MS component vregs here would feed it IR it mislowers (and this pass asserts on ops
+	 * it expects arch-decomposed, e.g. OP_LNEG). mini.c skips this pass for COMPILE_WASM —
+	 * this guards any other caller (mono_local_emulate_ops was one). */
+	g_assert (!COMPILE_WASM (cfg));
+
 	/*
 	 * Some opcodes, like lcall can't be decomposed so the rest of the JIT
 	 * needs to be able to handle long vregs.
@@ -2038,7 +2044,9 @@ mono_local_emulate_ops (MonoCompile *cfg)
 	 * at IR level, instead of inlining the icall wrapper. FIXME
 	 */
 	if (inlined_wrapper) {
-		if (!COMPILE_LLVM (cfg))
+		/* Backends that consume method-to-ir IR directly (LLVM, wasm JIT) keep longs native;
+		 * re-running the pair decomposition here would mislower i64 for them. */
+		if (!COMPILE_METHODIR (cfg))
 			mono_decompose_long_opts (cfg);
 		if (cfg->opt & (MONO_OPT_CONSPROP | MONO_OPT_COPYPROP))
 			mono_local_cprop (cfg);

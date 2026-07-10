@@ -370,7 +370,10 @@ mono_strength_reduction_ins (MonoCompile *cfg, MonoInst *ins, const char **spec)
 	}
 	case OP_IDIV_UN_IMM:
 	case OP_IDIV_IMM: {
-		if (!COMPILE_LLVM (cfg))
+		/* METHODIR: the magic-number expansion emits OP_BIGMUL (32x32->64), which IR-consuming
+		 * backends don't lower (the wasm JIT has native i32.div_s/u and the browser's optimizing
+		 * wasm tier strength-reduces constant divisors itself; LLVM likewise does its own). */
+		if (!COMPILE_METHODIR (cfg))
 			allocated_vregs = mono_strength_reduction_division (cfg, ins);
 		break;
 	}
@@ -413,7 +416,9 @@ mono_strength_reduction_ins (MonoCompile *cfg, MonoInst *ins, const char **spec)
 	}
 #if SIZEOF_REGISTER == 4
 	case OP_LSHR_IMM: {
-		if (COMPILE_LLVM (cfg))
+		/* METHODIR: the expansion below emits MONO_LVREG_LS/MS pair ops — only valid for
+		 * backends that pair-decompose i64; LLVM and the wasm JIT have native i64. */
+		if (COMPILE_METHODIR (cfg))
 			break;
 		if (ins->inst_c1 == 32) {
 			MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, MONO_LVREG_LS (ins->dreg), MONO_LVREG_MS (ins->sreg1));
@@ -435,7 +440,7 @@ mono_strength_reduction_ins (MonoCompile *cfg, MonoInst *ins, const char **spec)
 		break;
 	}
 	case OP_LSHR_UN_IMM: {
-		if (COMPILE_LLVM (cfg))
+		if (COMPILE_METHODIR (cfg))
 			break;
 		if (ins->inst_c1 == 32) {
 			MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, MONO_LVREG_LS (ins->dreg), MONO_LVREG_MS (ins->sreg1));
@@ -457,7 +462,7 @@ mono_strength_reduction_ins (MonoCompile *cfg, MonoInst *ins, const char **spec)
 		break;
 	}
 	case OP_LSHL_IMM: {
-		if (COMPILE_LLVM (cfg))
+		if (COMPILE_METHODIR (cfg))
 			break;
 		if (ins->inst_c1 == 32) {
 			/* just move the lower half to the upper and zero the lower word */
@@ -662,7 +667,12 @@ mono_local_cprop (MonoCompile *cfg)
 						mono_constant_fold_ins (cfg, ins, defs [ins->sreg1], NULL, TRUE);
 					}
 
-					opcode2 = mono_op_to_op_imm (ins->opcode);
+					/* COMPILE_WASM: never fold a MANAGED OBJECT constant (a STACK_OBJ pconst — a
+					 * movable GC pointer the wasm JIT routes through its literal table) into an
+					 * instruction IMMEDIATE: the baked pointer dangles after a compacting GC.
+					 * Only the wasm JIT sees runtime object pconsts at opt time (LLVM/AOT use
+					 * AOTCONST), so gate narrowly. It stays a register use of the interned load. */
+					opcode2 = (COMPILE_WASM (cfg) && def->type == STACK_OBJ && def->inst_p0) ? -1 : mono_op_to_op_imm (ins->opcode);
 					if ((opcode2 != -1) && mono_arch_is_inst_imm (ins->opcode, opcode2, def->inst_c0) && ((srcindex == 1) || (ins->sreg2 == -1))) {
 						ins->opcode = GUINT32_TO_OPCODE (opcode2);
 						if ((def->opcode == OP_I8CONST) && TARGET_SIZEOF_VOID_P == 4)
@@ -696,7 +706,9 @@ mono_local_cprop (MonoCompile *cfg)
 							ins->sreg2 = -1;
 						}
 #endif
-						opcode2 = mono_load_membase_to_load_mem (ins->opcode);
+						/* same movable-object-constant guard as the op_imm fold above: don't bake
+						 * a managed pointer as a load_mem address immediate */
+						opcode2 = (COMPILE_WASM (cfg) && def->type == STACK_OBJ && def->inst_p0) ? -1 : mono_load_membase_to_load_mem (ins->opcode);
 						if ((srcindex == 0) && (opcode2 != -1) && mono_arch_is_inst_imm (ins->opcode, opcode2, def->inst_c0)) {
 							ins->opcode = GUINT32_TO_OPCODE (opcode2);
 							ins->inst_imm = def->inst_c0 + ins->inst_offset;

@@ -107,6 +107,12 @@ typedef struct SeqPointInfo SeqPointInfo;
 #define COMPILE_WASM(cfg) (0)
 #endif
 
+/* Backend consumes method-to-ir/pre-regalloc IR directly (LLVM or the wasm JIT): no regalloc,
+ * no flags-based ops, native i64 (no LS/MS pair decomposition), call args captured at
+ * method-to-ir time. Use for gates that distinguish "IR-consuming backend" from mono_codegen
+ * backends, instead of writing COMPILE_LLVM || COMPILE_WASM by hand. */
+#define COMPILE_METHODIR(cfg) (COMPILE_LLVM (cfg) || COMPILE_WASM (cfg))
+
 #ifdef MONO_ARCH_SIMD_INTRINSICS
 #define ARCH_SIMD_ENABLED TRUE
 #else
@@ -2497,6 +2503,10 @@ typedef struct {
 int       mono_wasm_jit_eh_dispatch             (WasmEhTable *table, int blk);
 #endif
 void mono_call_inst_add_outarg_reg (MonoCompile *cfg, MonoCallInst *call, int vreg, int hreg, int bank);
+#ifdef TARGET_WASM
+/* COMPILE_WASM analog of mono_llvm_emit_call (defined in mini-wasm.c) */
+void mono_wasm_emit_call (MonoCompile *cfg, MonoCallInst *call);
+#endif
 void      mono_call_inst_add_outarg_vt          (MonoCompile *cfg, MonoCallInst *call, MonoInst *outarg_vt);
 
 /* methods that must be provided by the arch-specific port */

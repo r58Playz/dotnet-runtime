@@ -163,6 +163,12 @@ enum {
 	 * attributed. FAST_INLINE_AOT = INLINE_AOT direct AOT call_indirect; FAST_VIC = inline f-slot IC hit
 	 * (JIT->JIT); FAST_AOTIC = inline AOT-IC hit (JIT->AOT). */
 	WJC_FAST_INLINE_AOT, WJC_FAST_VIC, WJC_FAST_AOTIC,
+	/* GC-classification alignment (GCMAPS/taint work): REFBASES_EXTRA counts vregs the REFBASES
+	 * dereference-pinning pass flipped to ref that the structural-seed fixpoint had NOT already
+	 * classified ref. A long soak at 0 proves REFBASES is formally subsumed by the structural
+	 * marking (compute_gc_maps seeds + add/sub taint) and can stay off. Each nonzero hit is a
+	 * named counterexample (logged under MONO_WASM_JIT_REFVERIFY). */
+	WJC_REFBASES_EXTRA,
 	WJC_MAX
 };
 

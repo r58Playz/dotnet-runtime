@@ -60,10 +60,6 @@ alloc_ireg_ref (MonoCompile *cfg)
 	if (cfg->compute_gc_maps)
 		mono_mark_vreg_as_ref (cfg, vreg);
 
-#ifdef TARGET_WASM
-		mono_mark_vreg_as_ref (cfg, vreg);
-#endif
-
 	return vreg;
 }
 

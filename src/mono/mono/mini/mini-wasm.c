@@ -111,6 +111,9 @@ mono_wasm_jit_auto_init (void)
 #endif
 	{ extern int mono_wasm_jit_missedref; const char *mr = g_getenv ("MONO_WASM_JIT_MISSEDREF"); mono_wasm_jit_missedref = (mr && *mr && *mr != '0') ? 1 : 0; } /* DIAG: PINALL confirmed a missed ref; this names it. For every method, log any NONREF-classified i32 vreg used as a MEMBASE load/store base or virtual-call receiver (a stale one of these is the wild-deref corruptor), with its defining opcode -> pins which wj_opcode_is_nonref case is wrong. Bounded. default off */
 	{ extern int mono_wasm_jit_refbases; const char *rb = g_getenv ("MONO_WASM_JIT_REFBASES"); mono_wasm_jit_refbases = (rb && *rb) ? (*rb != '0') : 1; } /* FIX (default ON): pin every vreg used as a MEMBASE load/store base or virtual-call receiver on the ref shadow stack — a dereferenced pointer must stay valid across GC. Closes the missed-ref corruption the prove-non-ref pass leaves (object baked as non-STACK_OBJ iconst, interior-ptr add, ...) at far less cost than PINALL. =0 reverts (buggy) for A/B. */
+	{ extern int mono_wasm_jit_gcmaps; const char *gm = g_getenv ("MONO_WASM_JIT_GCMAPS"); mono_wasm_jit_gcmaps = (gm && *gm) ? (*gm != '0') : 1; } /* structural ref/mp seeds from MINI's compute_gc_maps marking; default ON, =0 for A/B against opcode-inference-only */
+	{ extern int mono_wasm_jit_refverify; const char *rv = g_getenv ("MONO_WASM_JIT_REFVERIFY"); mono_wasm_jit_refverify = (rv && *rv) ? atoi (rv) : 0; } /* 1=log, 2=assert classification-vs-structural-marking violations; default off */
+	{ extern int mono_wasm_jit_outarg; const char *oa = g_getenv ("MONO_WASM_JIT_OUTARG"); mono_wasm_jit_outarg = (oa && *oa && *oa != '0') ? 1 : 0; } /* LLVM-style call-arg capture (moves + out_ireg_args); prerequisite for enabling mini local opts. default off (legacy snapshot) */
 	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi && *vi != '0') ? 1 : 0;
 	} /* inline vcall IC fast path: 0=off (default), 1=on. Now MT-SAFE on threaded builds — the buggy
 	   * ref.is_null liveness (placeholder sig mismatch, jit138) is replaced by a per-thread slot_live gate. */
@@ -228,6 +231,9 @@ int mono_wasm_jit_vtype_scalar_ref = 0; /* MONO_WASM_JIT_VTYPE_SCALAR_REF: exten
 int mono_wasm_jit_vtype_scalar = 0;   /* MONO_WASM_JIT_VTYPE_SCALAR: pass a BYVAL scalar-vtype call arg (mini_wasm_is_scalar_vtype: struct <=8 bytes, one field) as its single-field SCALAR — the ABI the AOT callee was compiled with (LLVMArgWasmVtypeAsScalar). The vtype value is addr-frame-backed (LDADDR_VTYPE), so we load its field (offset 0) from the addr-frame slot and pass that. REF-FREE etype only: a ref-etype scalar-vtype (e.g. RuntimeTypeHandle{RuntimeType}) can't live in the un-scanned addr frame — it bails at "ldaddr of vtype with refs" before here and needs the GC-scanned/ref-shadow-stack path (not yet implemented). Default OFF; requires LDADDR_VTYPE. */
 int mono_wasm_jit_missedref = 0;      /* MONO_WASM_JIT_MISSEDREF: diagnostic — log NONREF-classified vregs used as MEMBASE bases / call receivers + their defining opcode, to name the isref-inference gap PINALL papers over. Default off. */
 int mono_wasm_jit_refbases = 1;       /* MONO_WASM_JIT_REFBASES: pin every dereferenced pointer (MEMBASE base / call receiver) on the ref shadow stack, closing the missed-ref corruption the prove-non-ref pass leaves. Default ON; =0 reverts for A/B. */
+int mono_wasm_jit_gcmaps = 1;         /* MONO_WASM_JIT_GCMAPS: set cfg->compute_gc_maps for COMPILE_WASM so MINI's own ref/managed-pointer marking (mini.c create_var_for_vreg, ir-emit.h alloc_ireg_ref/_mp) seeds the isref classification structurally — the same type facts LLVM/native GC maps use, replacing the old wasm-only ad-hoc marking. Default ON; =0 reverts to opcode-inference-only seeds for A/B. */
+int mono_wasm_jit_refverify = 0;      /* MONO_WASM_JIT_REFVERIFY (0/1/2): after the isref fixpoint, cross-check classification against the structural vreg_is_ref/vreg_is_mp marking — 1 logs violations (a marked vreg classified nonref = lost seed = would-be silent corruption), 2 asserts. Debug only, default off. */
+int mono_wasm_jit_outarg = 0;         /* MONO_WASM_JIT_OUTARG: capture call args LLVM-style in mono_wasm_emit_call — a real per-arg OP_*MOVE into a fresh vreg registered in call->out_ireg_args (so DEADCE/alias treat it as used), the mechanism that lets mini opt passes run without corrupting the captured arg vregs. 0 (default) = legacy raw-dreg snapshot, byte-identical modules; MUST stay 0 while cfg->opt is hard-reset, and the opt whitelist must not enable CONSPROP/COPYPROP/DEADCE until this is 1. */
 const char *mono_wasm_jit_dump_ir = NULL;  /* MONO_WASM_JIT_DUMP_IR=<substr>: dump clauses + bb regions + opcode stream for clause-bearing methods whose full name contains <substr> (EH-lowering ground truth, e.g. "indigo"). */
 /* Island heuristic levers (Part 5), all default-OFF so the baseline is unchanged and each can be A/B'd. */
 int mono_wasm_jit_entry_promote = 0;   /* Lever A: MONO_WASM_JIT_ENTRY_PROMOTE=N — after a hot interp caller invokes JITted callees N times, force-JIT the caller (grow the island UPWARD). 0 = off. */
@@ -414,6 +420,8 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_VPERM_OTHEROP), WJC_(WJC_VPERM_OTHER));
 	printf ("[wasm-jit aotroute] aot_routed=%lld interp_routed=%lld vcall_aot_fast=%lld\n",
 		WJC_(WJC_AOT_ROUTED), WJC_(WJC_INTERP_ROUTED), WJC_(WJC_VCALL_AOT_FAST));
+	printf ("[wasm-jit gcref] refbases_extra=%lld (0 across a soak with REFBASES=1 => REFBASES subsumed by structural seeds)\n",
+		WJC_(WJC_REFBASES_EXTRA));
 	fflush (stdout);
 	/* the bail histogram (this file) + the island blockers / hot entry-edges (interp.c) */
 	{
@@ -730,131 +738,34 @@ mono_wasm_jit_instantiate_fslot (int fslot)
 
 
 /*
- * GC-safe object references for JITted methods.
+ * GC-safe object references for JITted methods — C-STACK FRAMES.
  *
- * The JIT keeps vregs in wasm locals (registers) for speed, but wasm locals are NOT GC-scanned (the
- * GC scans the interp stack precisely via interp_mark_stack, never the native/wasm-locals state). So
- * an object reference held in a wasm local across a GC point (an allocation in a residual callee, a
- * loop safepoint, ...) would be collected or moved out from under the JITted method -> dangling ptr.
+ * The JIT keeps vregs in wasm locals (registers) for speed, but wasm locals are NOT GC-scanned. So an
+ * object reference held in a wasm local across a GC point (an allocation in a residual callee, a loop
+ * safepoint, ...) would be collected or moved out from under the JITted method -> dangling ptr.
  *
- * Fix: each JITted method's REFERENCE vregs (cfg->vreg_is_ref) live in a per-thread shadow stack in
- * linear memory that IS a GC root, instead of in wasm locals. Non-ref vregs (ints/floats/unmanaged
- * pointers) stay in fast wasm locals. The region is registered once per thread as a CONSERVATIVE
- * pinning root (MONO_GC_DESCRIPTOR_NULL): the GC pins whatever object each live slot points at (so it
- * stays valid and isn't moved); leave() zeroes freed slots so popped frames pin nothing.
+ * Fix: each JITted method's reference (and address-taken) vregs live in a real stack frame on the
+ * emscripten C stack (__stack_pointer), which sgen already scans CONSERVATIVELY for every thread —
+ * the exact mechanism AOT'd LLVM code relies on for refs in C locals. This replaced a custom
+ * per-thread "ref shadow stack" arena (mono_gc_register_root + enter/leave + zero-on-pop + balance
+ * guards): with real frames, a popped/unwound frame falls below the SP and is simply no longer
+ * scanned, C++/wasm-EH landing pads restore the SP like every LLVM-compiled catch does, and
+ * JSPI-suspended computations keep their frames inside the scanned [SP, stack-top] region — whatever
+ * guarantee AOT frames have, JIT frames inherit by construction.
  *
- * A method does: base = ref_enter(N) at entry (reserve N ref slots), accesses ref vreg i at base[i],
- * ref_leave(base) at every exit. The slot addresses are base-relative (base is per-thread, fetched at
- * runtime — a __thread region address can't be baked into the shared module).
+ * Frame layout (stack grows DOWN; entry_sp is the SP at method entry):
+ *   entry_sp                                  <- restored at every exit (stackRestore)
+ *     ref slots   [refbase + slot*4)          <- refbase = frame base; zeroed in the prologue
+ *     addr slots  [addrbase + offset)         <- addrbase = refbase + align8(nrefslots*4)
+ *   frame = align16(entry_sp - framebytes)    <- the new __stack_pointer after the prologue
+ * SP access from JITted code uses the same baked-C-function call_indirect mechanism as every other
+ * runtime helper: emscripten_stack_get_current () -> i32 and stackRestore (i32) -> void (the
+ * compiler-rt primitives the main module already exports as stackSave/stackRestore).
  */
-#define WJ_REFSTACK_SLOTS (64 * 1024)   /* 256KB/thread on wasm32; ~13k frames deep — the C stack dies first */
-static __thread MonoObject **wj_ref_base = NULL;
-static __thread MonoObject **wj_ref_sp   = NULL;
-static __thread MonoObject **wj_ref_end  = NULL;
-
-/* One-shot warning for a ref shadow-stack invariant violation (pathological depth, or a drifted/underflowed
- * base). Always on and free on the hot path — only reached from the G_UNLIKELY guards below. Warns once (a
- * racy flag is fine for a diagnostic) instead of aborting, so the worker survives to be diagnosed. This is
- * the per-enter/leave boundary replacement for MONO_WASM_JIT_STOREGUARD's per-store bounds check. */
-static void
-wj_shadow_stack_warn (const char *what)
-{
-	static int warned = 0;
-	if (warned)
-		return;
-	warned = 1;
-	g_warning ("wasm-jit: ref shadow stack %s — enter/leave imbalance (was caught by MONO_WASM_JIT_STOREGUARD)", what);
-}
-
-/* Reserve n reference slots for a JITted method's frame; returns the frame base (slot 0). Lazily
- * allocates + GC-registers this thread's shadow stack on first use. */
-MonoObject **
-mono_wasm_jit_ref_enter (int n)
-{
-	MonoObject **base;
-	if (G_UNLIKELY (!wj_ref_base)) {
-		wj_ref_base = (MonoObject **) g_malloc0 (WJ_REFSTACK_SLOTS * sizeof (MonoObject *));
-		wj_ref_sp = wj_ref_base;
-		wj_ref_end = wj_ref_base + WJ_REFSTACK_SLOTS;
-		mono_gc_register_root ((char *) wj_ref_base, WJ_REFSTACK_SLOTS * sizeof (MonoObject *),
-			MONO_GC_DESCRIPTOR_NULL, MONO_ROOT_SOURCE_THREAD_STATIC, NULL, "wasm-jit ref shadow stack");
-	}
-	/* Sanity the SP before reading it as the new frame base: if a wild store clobbered the &wj_ref_sp
-	 * thread-static, the value is junk and would propagate into refbase (then into EMIT_REF_LEAVE). Catch it
-	 * at the next push and reset to empty; the boundary resync re-establishes the real SP. */
-	if (G_UNLIKELY (wj_ref_sp < wj_ref_base || wj_ref_sp > wj_ref_end)) {
-		wj_shadow_stack_warn ("wj_ref_sp out of arena on enter (wild write to the SP itself) — resetting to empty");
-		wj_ref_sp = wj_ref_base;
-	}
-	base = wj_ref_sp;
-	if (G_UNLIKELY (base + n > wj_ref_end)) {
-		wj_shadow_stack_warn ("overflow (pathological frame depth)");
-		return base; /* don't bump, accept overlap (the C stack would overflow first) */
-	}
-	wj_ref_sp = base + n;
-	{
-		/* High-water mark of the ref shadow-stack depth (slots), for leak diagnosis: if this climbs
-		 * unboundedly toward WJ_REFSTACK_SLOTS over a run, frames are leaking (a wasm-EH unwind skipped
-		 * EMIT_REF_LEAVE); if it stays small/bounded, enter/leave is balanced. Racy global max — fine. */
-		int d = (int) (wj_ref_sp - wj_ref_base);
-		mono_wasm_jit_max (WJC_REF_HWM, d);
-	}
-	return base;
-}
-
-/* Pop a JITted method's ref frame: zero its slots (so the conservative scan pins nothing stale) and
- * restore the stack pointer. */
-void
-mono_wasm_jit_ref_leave (MonoObject **base)
-{
-	MonoObject **p;
-	/* Guard the NULL/underflow case. mono_wasm_jit_invoke_caught snapshots the SP (mono_wasm_jit_ref_sp_save)
-	 * BEFORE the first JITted invocation on a worker — when this thread's lazily-allocated shadow stack is
-	 * still NULL — so the saved base is NULL. If that invocation (or an f-slot/residual callee) then allocates
-	 * the stack and throws through to the boundary, ref_leave(NULL) would iterate `*p++ = NULL` from address 0
-	 * up to wj_ref_sp, zeroing megabytes of live linear memory. Clamp a NULL/below-base pointer to the real
-	 * frame base so we only zero this thread's live slots and reset the SP to empty. */
-	if (G_UNLIKELY (base && base < wj_ref_base))
-		wj_shadow_stack_warn ("base below arena (drift/underflow)");   /* NULL base is the legit first-use case; below-base is the bug */
-	if (G_UNLIKELY (!base || base < wj_ref_base))
-		base = wj_ref_base;
-	if (G_UNLIKELY (!base))
-		return;   /* shadow stack never allocated on this thread -> nothing to restore */
-	/* Sanity the SP ITSELF before using it as the zero-loop upper bound. If a wild store landed on the
-	 * &wj_ref_sp thread-static (the garbage-SP corruption mechanism), wj_ref_sp is now junk; `while (p<sp)`
-	 * below would zero from base up to a garbage address, scribbling megabytes of live linear memory. A valid
-	 * SP is in [base, end]. If it is out of range, it has been clobbered: warn and treat the stack as empty
-	 * (we cannot trust the depth) so we zero nothing wild; the boundary resync restores the precise SP. */
-	if (G_UNLIKELY (wj_ref_sp < wj_ref_base || wj_ref_sp > wj_ref_end)) {
-		wj_shadow_stack_warn ("wj_ref_sp out of arena on leave (wild write to the SP itself) — resetting to empty");
-		wj_ref_sp = wj_ref_base;
-		return;
-	}
-	/* Guard a garbage-HIGH base. A legitimate leave pops DOWN to a frame at or below the current top, so
-	 * base <= wj_ref_sp always. A base above the SP means the saved refbase local was clobbered or fed a
-	 * wild value (observed: a leaf method's EMIT_REF_LEAVE invoked with base = saved + hundreds of MB,
-	 * which would slam wj_ref_sp to garbage and cascade-corrupt the heap on the next pin/scan). Refuse to
-	 * write a garbage SP: warn and leave wj_ref_sp untouched so the boundary resync (invoke_caught) can
-	 * restore it precisely from its own snapshot. Do NOT zero the [base, sp) range either — base is junk. */
-	if (G_UNLIKELY (base > wj_ref_sp)) {
-		wj_shadow_stack_warn ("ref_leave base above SP (clobbered/wild refbase) — SP left for boundary resync");
-		return;
-	}
-	p = base;
-	while (p < wj_ref_sp)
-		*p++ = NULL;
-	wj_ref_sp = base;
-}
-
-/* Current ref-shadow-stack SP (for the AOT-style-EH boundary: save it before invoking a JITted method,
- * and on a caught C++ unwind restore via mono_wasm_jit_ref_leave(saved) — the unwound JITted frames
- * skipped their own ref_leave, so their slots must be zeroed + the SP rewound here). NULL before first
- * use (no JITted frame has run on this thread yet -> nothing to restore). */
-MonoObject **
-mono_wasm_jit_ref_sp_save (void)
-{
-	return wj_ref_sp;
-}
+#ifdef HOST_BROWSER
+#include <emscripten/stack.h>
+extern void stackRestore (uintptr_t sp);   /* compiler-rt (stack_ops.S): sets __stack_pointer */
+#endif
 
 /*
  * Per-thread "addressable locals" frame stack (linear memory) for OP_LDADDR.
@@ -868,16 +779,13 @@ mono_wasm_jit_ref_sp_save (void)
  * is touched via OP_MOVE (ldloc/stloc) or written through the escaped pointer by a callee, so they stay
  * consistent.
  *
- * The region is NOT GC-scanned: the emitter only routes NON-REFERENCE scalar locals here (ref/byref
- * address-taken locals bail), so a slot never holds a managed pointer the GC would need to keep alive or
- * update. addr_enter zeroes the frame (.NET locals are zero-init). Mirrors the ref shadow stack's
- * enter/leave + the EH-unwind SP restore at the interp->JIT boundary (mono_wasm_jit_invoke_caught). */
-#define WJ_ADDRSTACK_BYTES (256 * 1024)   /* per thread; ~32k 8-byte slots — the C stack dies first */
-static __thread guint8 *wj_addr_base = NULL;
-static __thread guint8 *wj_addr_sp   = NULL;
-static __thread guint8 *wj_addr_end  = NULL;
+ * The addr slots live in the same C-stack frame as the ref slots (addrbase = refbase + align8(refbytes)).
+ * Being on the C stack they ARE now conservatively scanned — same as any C local in AOT'd code; that is
+ * harmless for scalars (a value that happens to look like a heap pointer just over-pins) and it is what
+ * allows address-taken REF locals to use frame slots too. The frame is zeroed in the prologue (.NET
+ * locals are zero-init). */
 
-/* MONO_WASM_JIT_STOREGUARD: 1 = emit a bounds-check call_indirect before every ref-shadow-stack / addr-frame
+/* MONO_WASM_JIT_STOREGUARD: 1 = emit a bounds-check call_indirect before every ref-slot / addr-slot
  * store. DEBUG ONLY (a C call per such store); used to catch the wild store that scribbles random in-bounds
  * C-heap (the arenas are g_malloc'd, so an overrun via a drifted base hits neighbours like the marshal cache
  * / jiterp tlqueue). Default off. */
@@ -893,6 +801,26 @@ int mono_wasm_jit_pinall = 0;
  * shadow-stack/addr-frame stores). DEBUG ONLY (a C call per ref store). Default off. */
 int mono_wasm_jit_objguard = 0;
 
+/* Current linear-memory size in bytes, clamped so it is usable in 32-bit arithmetic: at 65536 pages
+ * (a fully-grown 4GB memory) `pages << 16` overflows 32-bit gsize to 0. */
+static inline gsize
+wj_memsz (void)
+{
+	gsize s = (gsize) __builtin_wasm_memory_size (0) << 16;
+	return s ? s : (gsize) -1;
+}
+
+/* Overflow-safe "is `a` a plausible aligned pointer we may speculatively READ 8 bytes at?" for the
+ * OBJGUARD/MISSEDREF diagnostic probes. The naive form `a + 8 > memsz` WRAPS for a near 2^32 —
+ * e.g. probing a heap word that holds a small negative int like -8 (0xFFFFFFF8): a+8 == 0 passes,
+ * and the diagnostic's own deref becomes the OOB trap that silently kills a JSPI-suspended thread
+ * and stalls the GC (seen live: MISSEDREF ICONST probe trapping inside mono_wasm_emit_method). */
+static inline gboolean
+wj_probe_ok (gsize a, gsize memsz)
+{
+	return !(a & 3) && a >= 1024 && a <= memsz - 8;
+}
+
 /* Called (when storeguard/objguard is on) right before a ref-shadow-stack (kind 0), addr-frame (kind 1),
  * object/base store (kind 2/3), generic membase access (kind 4), or vcall receiver deref (kind 5), with the computed target address. If the
  * address is outside the expected region — the signature of an enter/leave imbalance on an EH unwind drifting
@@ -902,38 +830,12 @@ void
 mono_wasm_jit_check_store (guint8 *addr, int kind)
 {
 	guint8 *lo, *hi;
-	/* SMOKING-GUN check for the long-standing garbage-SP corruption: a store whose target address lands on
-	 * THIS thread's shadow-stack control variables (wj_ref_sp / wj_ref_base / wj_ref_end / wj_addr_*). The
-	 * +66M-slot boundary delta with a constant HWM can only come from wj_ref_sp being clobbered by a wild
-	 * store that bypasses ref_enter/leave — i.e. a stale/garbage byref store base that happens to point here.
-	 * These are __thread statics in this TU, so &x is this thread's own copy: a same-thread wild store matches.
-	 * Trap so the symbolicated wasm trace names the exact method + store doing it. Runs for the object-base
-	 * (kind 2) and byref-base (kind 3) guards. */
-	if (G_UNLIKELY ((kind == 2 || kind == 3 || kind == 4 || kind == 5) && addr != NULL)) {
-		gsize a = (gsize) addr;
-		struct { gsize lo, hi; } ctl [] = {
-			{ (gsize) &wj_ref_sp,   (gsize) &wj_ref_sp   + sizeof (wj_ref_sp) },
-			{ (gsize) &wj_ref_base, (gsize) &wj_ref_base + sizeof (wj_ref_base) },
-			{ (gsize) &wj_ref_end,  (gsize) &wj_ref_end  + sizeof (wj_ref_end) },
-			{ (gsize) &wj_addr_sp,   (gsize) &wj_addr_sp   + sizeof (wj_addr_sp) },
-			{ (gsize) &wj_addr_base, (gsize) &wj_addr_base + sizeof (wj_addr_base) },
-			{ (gsize) &wj_addr_end,  (gsize) &wj_addr_end  + sizeof (wj_addr_end) },
-		};
-		for (int _c = 0; _c < (int) (sizeof (ctl) / sizeof (ctl [0])); ++_c) {
-			if (G_UNLIKELY (a >= ctl [_c].lo && a < ctl [_c].hi)) {
-				printf ("WASM_JIT_CLOBBER_CTL access addr=%p hits shadow-stack control var #%d — this method's memory access is poisoning shadow-stack control; trace below:\n",
-					(void *) addr, _c);
-				fflush (stdout);
-				__builtin_trap ();
-			}
-		}
-	}
 	if (kind == 4) {
 		/* OBJGUARD generic membase load/store address: catch OOB loads and scalar-classified wild store bases
 		 * that the ref/byref-specific kind 2/3 checks do not see. */
 		if (G_UNLIKELY (addr != NULL)) {
 			gsize a = (gsize) addr;
-			gsize memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
+			gsize memsz = wj_memsz ();
 			if (G_UNLIKELY (a < 1024 || a >= memsz)) {
 				printf ("WASM_JIT_BAD_MEMADDR addr=%p — garbage JIT membase access address; method in the trap below:\n",
 					(void *) addr);
@@ -951,7 +853,7 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 		 * where the byref points at wj_ref_sp — that is the real garbage-SP catch.) NULL is a NRE elsewhere. */
 		if (G_UNLIKELY (addr != NULL)) {
 			gsize a = (gsize) addr;
-			gsize memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
+			gsize memsz = wj_memsz ();
 			if (G_UNLIKELY (a < 1024 || a >= memsz)) {
 				printf ("WASM_JIT_BAD_BYREF base=%p — garbage byref store base (stale out-param / drift?); storing method in the trap below:\n",
 					(void *) addr);
@@ -971,9 +873,9 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 		 * JITted method with the bad base. */
 		if (G_UNLIKELY (addr != NULL)) {
 			gsize a = (gsize) addr;
-			gsize memsz = (gsize) __builtin_wasm_memory_size (0) << 16;   /* pages * 64KB */
+			gsize memsz = wj_memsz ();
 			/* The base ADDRESS must itself be a sane aligned in-memory pointer; if not, it is a wild base. */
-			if (G_UNLIKELY ((a & 3) || a < 1024 || a + 8 > memsz)) {
+			if (G_UNLIKELY (!wj_probe_ok (a, memsz))) {
 				if (kind == 5)
 					printf ("WASM_JIT_BAD_VCALL_THIS obj=%p — receiver out of range / misaligned before vtable load; method in the trap below:\n", (void *) addr);
 				else
@@ -1001,9 +903,9 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 			}
 			/* Non-null vtable: it MUST look like a real vtable (aligned, in range) pointing at a real klass. A
 			 * non-null-but-garbage vtable is the unambiguous stale/freed-object signature -> hard trap. */
-			gboolean bad = (vt & 3) || vt < 1024 || vt + 8 > memsz;
+			gboolean bad = !wj_probe_ok (vt, memsz);
 			gsize klass = 0;
-			if (!bad) { klass = *(gsize *) vt; bad = !klass || (klass & 3) || klass < 1024 || klass + 8 > memsz; } /* vtable->klass */
+			if (!bad) { klass = *(gsize *) vt; bad = !klass || !wj_probe_ok (klass, memsz); } /* vtable->klass */
 			if (G_UNLIKELY (bad)) {
 				if (kind == 5)
 					printf ("WASM_JIT_BAD_VCALL_THIS obj=%p vtable=0x%x klass=0x%x — stale/garbage receiver before virtual dispatch; method in the trap below:\n",
@@ -1017,73 +919,18 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 		}
 		return;
 	}
-	if (kind == 0) { lo = (guint8 *) wj_ref_base; hi = (guint8 *) wj_ref_end; }
-	else           { lo = wj_addr_base;           hi = wj_addr_end; }
+	/* kind 0/1: a JIT frame (ref or addr) slot store. The frame lives on the emscripten C stack, so a
+	 * valid target must be within this thread's live stack region: at or above the deepest live SP
+	 * (we are called FROM the JITted method, so our own C frame is below its frame) and below the
+	 * stack base. Anything else is a wild/clobbered frame base. */
+	lo = (guint8 *) emscripten_stack_get_current ();
+	hi = (guint8 *) emscripten_stack_get_base ();
 	if (G_UNLIKELY (!lo || addr < lo || addr >= hi)) {
-		printf ("WASM_JIT_WILD_STORE kind=%d addr=%p arena=[%p,%p) ref_sp=%p addr_sp=%p — storing method in the trap below:\n",
-			kind, (void *) addr, (void *) lo, (void *) hi, (void *) wj_ref_sp, (void *) wj_addr_sp);
+		printf ("WASM_JIT_WILD_STORE kind=%d addr=%p stack=[%p,%p) — storing method in the trap below:\n",
+			kind, (void *) addr, (void *) lo, (void *) hi);
 		fflush (stdout);
 		__builtin_trap ();   /* deliberate: the symbolicated wasm trace names the culprit method */
 	}
-}
-
-/* Reserve nbytes of addressable-locals frame; returns the frame base. Lazily allocates this thread's
- * frame stack on first use. Zeroes the reserved bytes (locals are zero-init). */
-void *
-mono_wasm_jit_addr_enter (int nbytes)
-{
-	guint8 *base;
-	if (G_UNLIKELY (!wj_addr_base)) {
-		wj_addr_base = (guint8 *) g_malloc0 (WJ_ADDRSTACK_BYTES);
-		wj_addr_sp = wj_addr_base;
-		wj_addr_end = wj_addr_base + WJ_ADDRSTACK_BYTES;
-	}
-	/* Mirror ref_enter: if a wild store clobbered the &wj_addr_sp thread-static, handing out base=junk would
-	 * route this method's address-taken-local stores to garbage memory. Reset to empty if out of range. */
-	if (G_UNLIKELY (wj_addr_sp < wj_addr_base || wj_addr_sp > wj_addr_end)) {
-		wj_shadow_stack_warn ("wj_addr_sp out of arena on enter (wild write to the SP itself) — resetting to empty");
-		wj_addr_sp = wj_addr_base;
-	}
-	base = wj_addr_sp;
-	if (G_UNLIKELY (base + nbytes > wj_addr_end))
-		return base; /* pathological depth (C stack overflows first); don't bump, accept overlap */
-	wj_addr_sp = base + nbytes;
-	if (nbytes > 0)
-		memset (base, 0, (size_t) nbytes);
-	return base;
-}
-
-/* Pop a JITted method's addressable-locals frame: restore the SP. (No zeroing needed — the region is not
- * GC-scanned, and addr_enter re-zeroes on the next reservation.) */
-void
-mono_wasm_jit_addr_leave (void *base)
-{
-	/* Mirror ref_leave's first-use unwind guard. mono_wasm_jit_invoke_caught snapshots the SP before the
-	 * first JITted invoke on a worker, so the saved base can be NULL. If that invoke allocates the
-	 * addressable-locals stack and then throws, restoring NULL here would leave wj_addr_sp below its real
-	 * base; the next addr_enter/addr load-store would operate near address 0 instead of rewinding to an empty
-	 * stack. Clamp to this thread's actual base. */
-	if (G_UNLIKELY (!base || (guint8 *) base < wj_addr_base))
-		base = wj_addr_base;
-	if (G_UNLIKELY (!base))
-		return;   /* addressable-locals stack was never allocated on this thread */
-	/* Same garbage-high guard as ref_leave: a valid leave restores to base <= wj_addr_sp. A base above the
-	 * SP is a clobbered/wild saved-base; writing it would slam wj_addr_sp to garbage. Leave the SP for the
-	 * boundary resync instead of corrupting it. */
-	if (G_UNLIKELY ((guint8 *) base > wj_addr_sp)) {
-		wj_shadow_stack_warn ("addr_leave base above SP (clobbered/wild base) — SP left for boundary resync");
-		return;
-	}
-	wj_addr_sp = (guint8 *) base;
-}
-
-/* Current addr-frame SP, for the AOT-style-EH boundary (save before invoking a JITted method, restore via
- * mono_wasm_jit_addr_leave(saved) on a caught C++ unwind — the unwound frames skipped their addr_leave).
- * NULL before first use. */
-guint8 *
-mono_wasm_jit_addr_sp_save (void)
-{
-	return wj_addr_sp;
 }
 
 /*
@@ -1430,6 +1277,7 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_SHL_IMM: case OP_SHR_IMM: case OP_SHR_UN_IMM:
 	case OP_INEG: case OP_INOT:
 	case OP_LCONV_TO_I4: case OP_LCONV_TO_U4:   /* i64 -> i32 (i32.wrap_i64) */
+	case OP_LCONV_TO_I: case OP_LCONV_TO_U:     /* i64 -> native int/uint = i32 on wasm32 (wrap) */
 	case OP_ICEQ: case OP_ICNEQ: case OP_ICLT: case OP_ICLT_UN: case OP_ICGT: case OP_ICGT_UN:
 	case OP_ICLE: case OP_ICLE_UN: case OP_ICGE: case OP_ICGE_UN:
 	case OP_LCEQ: case OP_LCGT: case OP_LCGT_UN: case OP_LCLT: case OP_LCLT_UN:  /* i64 setcc -> i32 0/1 */
@@ -1454,7 +1302,7 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_LDIV_IMM: case OP_LDIV_UN_IMM: case OP_LREM_IMM: case OP_LREM_UN_IMM:
 	case OP_LAND_IMM: case OP_LOR_IMM: case OP_LXOR_IMM:
 	case OP_LSHL_IMM: case OP_LSHR_IMM: case OP_LSHR_UN_IMM:
-	case OP_LNOT:
+	case OP_LNOT: case OP_LNEG:
 	case OP_MOVE_F_TO_I8:  /* f64 bits -> i64 (reinterpret) */
 		return WASM_I64;
 	case OP_R8CONST: case OP_FMOVE:
@@ -1502,18 +1350,23 @@ wj_opcode_is_nonref (MonoInst *ins)
 	if (ins->type == STACK_OBJ || ins->type == STACK_MP)
 		return FALSE;
 	switch (ins->opcode) {
+	/* NOTE: integer add/sub and and-mask (incl. their _IMM forms) are deliberately NOT here:
+	 * on wasm32 OP_PADD/OP_PSUB/OP_PAND_IMM alias OP_IADD/OP_ISUB/OP_IAND_IMM, so "add" is how
+	 * every interior pointer (ldelema/ldflda/Unsafe.Add) is formed — and the front end doesn't
+	 * always type those STACK_MP (EMIT_NEW_BIALU_IMM leaves type 0; Unsafe.* uses STACK_PTR).
+	 * The fixpoint loop taint-propagates them instead: add/sub/mask of a proven-scalar source
+	 * stays scalar, of a possible-ref source is a possible ref. */
 	case OP_ICONST: case OP_I8CONST:
-	case OP_IADD: case OP_ISUB: case OP_IMUL:
+	case OP_IMUL:
 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
 	case OP_IAND: case OP_IOR: case OP_IXOR:
 	case OP_ISHL: case OP_ISHR: case OP_ISHR_UN:
 	case OP_INEG: case OP_INOT:
-	case OP_IADD_IMM: case OP_ISUB_IMM: case OP_IMUL_IMM:
-	case OP_IAND_IMM: case OP_IOR_IMM: case OP_IXOR_IMM:
+	case OP_IMUL_IMM:
+	case OP_IOR_IMM: case OP_IXOR_IMM:
 	case OP_ISHL_IMM: case OP_ISHR_IMM: case OP_ISHR_UN_IMM:
 	case OP_IDIV_IMM: case OP_IDIV_UN_IMM: case OP_IREM_IMM: case OP_IREM_UN_IMM:
-	case OP_AND_IMM:
-	case OP_ADD_IMM: case OP_SUB_IMM: case OP_MUL_IMM: case OP_OR_IMM: case OP_XOR_IMM:
+	case OP_MUL_IMM: case OP_OR_IMM: case OP_XOR_IMM:
 	case OP_SHL_IMM: case OP_SHR_IMM: case OP_SHR_UN_IMM:
 	case OP_ICONV_TO_U1: case OP_ICONV_TO_I1: case OP_ICONV_TO_U2: case OP_ICONV_TO_I2:
 	case OP_LCONV_TO_I4: case OP_LCONV_TO_U4:
@@ -2020,6 +1873,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int dispatch_idx = 0, N = 0;
 	int scratch_idx G_GNUC_UNUSED = 0; /* i32 local holding the per-thread interp-residual scratch ptr */
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
+	int spentry_idx = 0;               /* i32 local: C-stack SP at entry (exit/landing-pad restore target) */
+	int framebytes = 0, refbytes_al = 0; /* C-stack frame size (16-aligned) / 8-aligned ref-slot bytes */
 	int vc_fslot_idx = 0;              /* i32 local: inline virtual-IC fast-path resolved f-slot */
 	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
 	int aic_vtab_idx = 0, aic_ti_idx = 0, aic_rgctx_idx = 0; /* i32 locals: AOT-vcall IC — this->vtable, ti<<1|kind2, rgctx */
@@ -2033,7 +1888,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean eh_on = FALSE;            /* TRUE: emit the in-method try/catch wrapper for this method */
 	int eh_dispatch_ti = -1, eh_endcatch_ti = -1;  /* functype indices: (i32,i32)->i32 dispatch + ()->void end_catch */
 	int nrefslots = 0;                 /* number of reference vregs routed to the GC ref shadow stack */
-	int enter_ti = -1, leave_ti = -1;  /* functype indices for mono_wasm_jit_ref_enter/leave (shared with addr_enter/leave) */
+	int enter_ti = -1, leave_ti = -1;  /* functype indices: emscripten_stack_get_current ()->i32 / stackRestore (i32)->void */
 	int addrbase_idx = 0;              /* i32 local: addressable-locals frame base address (OP_LDADDR) */
 	int addr_tmp_idx [4] = { 0, 0, 0, 0 }; /* per-type scratch locals for addr-frame stores (i32/i64/f32/f64) */
 	int naddrbytes = 0;                /* total bytes of addressable-locals frame (8 per address-taken local) */
@@ -2203,8 +2058,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (c->signature && c->signature->ret->type != MONO_TYPE_VOID)
 					rt = wasm_valtype_of_type (c->signature->ret);
 			}
-			if (rt && ins->dreg >= 0 && ins->dreg < nvreg && li [ins->dreg] < 0)
+			if (rt && ins->dreg >= 0 && ins->dreg < nvreg && li [ins->dreg] < 0) {
+				/* Two defs with different wasm valtypes (possible once opt passes coalesce
+				 * vregs): last-writer-wins would emit a type-invalid module that only fails
+				 * at instantiate (WJC_INVALID, whole-module loss). Bail cleanly instead. */
+				if (vt [ins->dreg] && vt [ins->dreg] != rt) { fail = "vreg valtype conflict"; fail_op = ins->opcode; goto done; }
 				vt [ins->dreg] = rt;
+			}
 		}
 	}
 
@@ -2219,7 +2079,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * pass so OP_LDADDR bails as before.
 	 * NB: NOT HOST_BROWSER-gated. This is a pure compile-time classification pass (it assigns addrslot
 	 * offsets / decides which ldaddr shapes are supported); the addr-frame runtime helpers it feeds
-	 * (mono_wasm_jit_addr_enter/leave, baked by the emit below) are already cross-compiled. Un-gating it
+	 * (the C-stack frame prologue, baked by the emit below) is HOST_BROWSER-gated separately. Un-gating it
 	 * lets the offline cross-compiler dump reach the REAL ldaddr gate (e.g. "ldaddr of vtype with refs")
 	 * instead of the spurious "ldaddr unsupported var" the emit hits when no slot was ever assigned. */
 	{ extern int mono_wasm_jit_ldaddr;
@@ -2273,7 +2133,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					continue;
 				}
 				addrslot [vv] = naddrbytes;
-				naddrbytes += 8;   /* 8 bytes/slot: 8-aligned, covers i64/f64; zero-init by addr_enter */
+				naddrbytes += 8;   /* 8 bytes/slot: 8-aligned, covers i64/f64; zero-init by the prologue frame fill */
 				vt [vv] = lvt;     /* the local is only written via the escaped pointer in some shapes -> set its valtype explicitly */
 				/* record sub-word width+signedness so wasm_addr_ld reads it back with a width-correct narrow
 				 * load (a narrow callee write through &local leaves the upper bytes stale). */
@@ -2306,10 +2166,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * with no such call, which is a harmless unused declared local) */
 	scratch_idx = nargs + cnt [0];
 	cnt [0] += 1;
-	/* reserve two more i32 locals: the GC ref shadow-stack frame base, and a scratch for ref stores */
+	/* reserve two more i32 locals: the GC ref-slot frame base, and a scratch for ref stores */
 	refbase_idx = nargs + cnt [0];
 	cnt [0] += 1;
 	rtmp_idx = nargs + cnt [0];
+	cnt [0] += 1;
+	/* one more i32 local: the C-stack SP captured at entry (every exit stackRestores to it) */
+	spentry_idx = nargs + cnt [0];
 	cnt [0] += 1;
 	/* one more i32 local for the inline virtual-IC fast path's resolved f-slot (dead in methods with no
 	 * virtual call — a harmless unused declared local) */
@@ -2424,9 +2287,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		/* candidates: pointer-sized vregs (i64/f32/f64 can never hold a ref -> never shadow-stacked) */
 		for (i = 0; i < nvreg; ++i)
 			nonref [i] = (vt [i] == WASM_I32);
-		/* vregs mono already knows are object refs are definitely refs */
+		/* vregs mono already knows are object refs OR managed pointers are definitely refs.
+		 * With MONO_WASM_JIT_GCMAPS (default on) setting cfg->compute_gc_maps, MINI's own
+		 * marking populates both arrays structurally from the type system: create_var_for_vreg
+		 * marks ref/byref vars, alloc_ireg_ref/_mp mark ref and interior-pointer TEMPS
+		 * (ldelema, ldflda, the stfld write-barrier address, Unsafe.Add/AddByteOffset).
+		 * These are the same facts the LLVM/native GC paths consume — the fixpoint below is
+		 * just the closure of them over MOVE chains, pointer arithmetic and call returns. */
 		for (i = 0; i < nvreg; ++i)
-			if (vreg_is_ref (cfg, i))
+			if (vreg_is_ref (cfg, i) || vreg_is_mp (cfg, i))
 				nonref [i] = FALSE;
 		/* Explicitly mark reference-typed AND byref ARGUMENTS. mono_compile_create_var marks object-ref
 		 * vregs via vreg_is_ref, but it never covers managed POINTERS: (a) a reference-type class's `this`
@@ -2462,6 +2331,24 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					if (d < 0 || d >= nvreg || !nonref [d])
 						continue;   /* not a candidate, or already proven a ref */
 					if (ins->opcode == OP_MOVE)
+						def_nonref = (ins->sreg1 >= 0 && ins->sreg1 < nvreg && nonref [ins->sreg1]);
+					else if ((ins->opcode == OP_IADD || ins->opcode == OP_ISUB)
+							&& ins->type != STACK_OBJ && ins->type != STACK_MP)
+						/* pointer arithmetic (OP_PADD/OP_PSUB alias these on wasm32): the result of
+						 * add/sub is an interior pointer whenever either source might be a ref/mp —
+						 * taint-propagate like OP_MOVE instead of trusting a scalar allow-list.
+						 * Backstop for interior pointers that carry neither a STACK_MP type nor a
+						 * structural mark. Scalar+scalar stays scalar, so ordinary integer math
+						 * (and the write-barrier card-mark address computation) costs nothing.
+						 * An explicitly OBJ/MP-typed add falls through to wj_opcode_is_nonref,
+						 * whose type front-check classifies it ref unconditionally. */
+						def_nonref = (ins->sreg1 >= 0 && ins->sreg1 < nvreg && nonref [ins->sreg1])
+							&& (ins->sreg2 >= 0 && ins->sreg2 < nvreg && nonref [ins->sreg2]);
+					else if ((ins->opcode == OP_IADD_IMM || ins->opcode == OP_ISUB_IMM
+							|| ins->opcode == OP_ADD_IMM || ins->opcode == OP_SUB_IMM
+							|| ins->opcode == OP_IAND_IMM || ins->opcode == OP_AND_IMM)
+							&& ins->type != STACK_OBJ && ins->type != STACK_MP)
+						/* ptr+imm (field offset) / ptr&~mask (alignment): pointer-preserving unary shapes */
 						def_nonref = (ins->sreg1 >= 0 && ins->sreg1 < nvreg && nonref [ins->sreg1]);
 					else if (ins->opcode == OP_CALL || ins->opcode == OP_CALL_REG || ins->opcode == OP_CALL_MEMBASE) {
 						/* a call result is a ref unless its return type is a scalar (int/float/native-int/ptr);
@@ -2525,8 +2412,52 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						/* Skip bases proven to be an addr-frame pointer (OP_LDADDR result = addrbase+slot, linear
 						 * memory, never a heap ref) — pinning those is pure waste. Everything else that gets
 						 * dereferenced could be a heap pointer -> pin it. */
-						if (b >= 0 && b < nvreg && vt [b] == WASM_I32 && dop [b] != OP_LDADDR)
-							isref [b] = TRUE;
+						if (b >= 0 && b < nvreg && vt [b] == WASM_I32 && dop [b] != OP_LDADDR) {
+							/* Subsumption audit: with the structural seeds (GCMAPS) + add/sub taint, the
+							 * fixpoint should already classify every dereferenced heap pointer — a flip
+							 * here is a counterexample. Counted always (cheap), named under REFVERIFY.
+							 * A long soak with REFBASES=1 and refbases_extra==0 proves REFBASES is
+							 * subsumed and can stay off in production. */
+							if (!isref [b]) {
+								extern int mono_wasm_jit_refverify;
+								if (mono_wasm_jit_stats)
+									mono_wasm_jit_count (WJC_REFBASES_EXTRA);
+								if (G_UNLIKELY (mono_wasm_jit_refverify)) {
+									char *mn = mono_method_get_full_name (cfg->method);
+									/* wj_opname, NOT mono_inst_name: under DISABLE_LOGGING (browser Release)
+									 * mono_inst_name returns the opcode as an int — %s would wild-read it. */
+									printf ("WASM_JIT_REFBASES_EXTRA: %s vreg R%d (def op %s, deref op %s) classified nonref by fixpoint\n",
+										mn ? mn : "?", b, dop [b] >= 0 ? wj_opname (dop [b]) : "?", wj_opname (insf->opcode));
+									g_free (mn);
+								}
+								isref [b] = TRUE;
+							}
+						}
+					}
+				}
+			  } }
+			/* REFVERIFY cross-check (debug): the classification must be a superset of the structural
+			 * marking — a vreg mono marked ref/mp that the fixpoint left as a plain wasm local is a
+			 * lost seed, i.e. exactly the missed-ref shape that corrupts silently. Also flag marked
+			 * vregs whose inferred wasm valtype is not pointer-sized (a type-confusion anomaly). */
+			{ extern int mono_wasm_jit_refverify;
+			  if (G_UNLIKELY (mono_wasm_jit_refverify)) {
+				for (i = 0; i < nvreg; ++i) {
+					gboolean marked = vreg_is_ref (cfg, i) || vreg_is_mp (cfg, i);
+					if (!marked)
+						continue;
+					if (vt [i] == WASM_I32 && !isref [i]) {
+						char *mn = mono_method_get_full_name (cfg->method);
+						printf ("WASM_JIT_REFVERIFY: %s vreg R%d marked %s but classified NONREF (lost seed)\n",
+							mn ? mn : "?", i, vreg_is_ref (cfg, i) ? "ref" : "mp");
+						g_free (mn);
+						if (mono_wasm_jit_refverify >= 2)
+							g_assert_not_reached ();
+					} else if (vt [i] != 0 && vt [i] != WASM_I32) {
+						char *mn = mono_method_get_full_name (cfg->method);
+						printf ("WASM_JIT_REFVERIFY: %s vreg R%d marked %s but valtype %d (not pointer-sized)\n",
+							mn ? mn : "?", i, vreg_is_ref (cfg, i) ? "ref" : "mp", (int) vt [i]);
+						g_free (mn);
 					}
 				}
 			  } }
@@ -2542,6 +2473,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			}
 		if (nrefslots > 0)
 			lc.refslot = refslot;
+		/* C-stack frame size: ref slots first (4-byte), then the 8-aligned addr slots; whole frame
+		 * 16-aligned per the emscripten SP ABI. */
+		refbytes_al = (nrefslots * 4 + 7) & ~7;
+		framebytes = (refbytes_al + naddrbytes + 15) & ~15;
 
 		/* MISSED-REF FINDER (MONO_WASM_JIT_MISSEDREF=1): PINALL proved the corruptor is a ref left in a plain
 		 * wasm local (isref=FALSE) that goes stale after a GC. The dangerous uses are dereferences: a MEMBASE
@@ -2554,7 +2489,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			MonoBasicBlock *bbr; MonoInst *insr;
 			gsize memsz = 0;
 #ifdef HOST_BROWSER
-			memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
+			memsz = wj_memsz ();
 #endif
 			for (bbr = cfg->bb_entry; bbr; bbr = bbr->next_bb)
 				MONO_BB_FOR_EACH_INS (bbr, insr)
@@ -2589,12 +2524,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * wild deref = the corruptor. Flag it by probing whether the constant looks like a live
 						 * object (val -> vtable -> klass are all plausible in-memory pointers). */
 #ifdef HOST_BROWSER
+						/* wj_probe_ok, NOT open-coded bounds math: `v + 8 <= memsz` wraps for v near 2^32
+						 * (a probed word holding e.g. int -8) and the probe's own deref becomes an OOB trap. */
 						gsize v = (gsize) d->inst_c0;
-						if (v >= 1024 && (v & 3) == 0 && v + 8 <= memsz) {
+						if (wj_probe_ok (v, memsz)) {
 							gsize vtab = *(gsize *) v;
-							if (vtab >= 1024 && (vtab & 3) == 0 && vtab + 8 <= memsz) {
+							if (wj_probe_ok (vtab, memsz)) {
 								gsize kl = *(gsize *) vtab;
-								if (kl >= 1024 && (kl & 3) == 0 && kl + 8 <= memsz) {
+								if (wj_probe_ok (kl, memsz)) {
 									static int _mo = 0;
 									if (_mo++ < 200)
 										printf ("WASM_JIT_MISSED_REF_ICONST_OBJ %s : %s base=%d val=0x%x vtable=0x%x (MOVABLE object baked as iconst -> stale after GC)\n",
@@ -2700,19 +2637,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		wasm_op (&body, wj_fcmp_op ((IS_F32), (KIND))); \
 		if (NEG) wasm_op (&body, WASM_OP_I32_EQZ); \
 	} while (0)
-/* Pop the GC ref shadow-stack frame (zero its slots + restore SP). Emit before EVERY return so a
- * popped JITted frame leaves nothing for the GC to scan. No-op for methods with no ref vregs. The
- * leave call consumes only refbase + returns void, so it leaves any return value on the stack. */
+/* Pop this method's C-stack frame (restore __stack_pointer to the entry SP). Emit before EVERY
+ * return: a popped frame falls below the SP and stops being GC-scanned — no zeroing needed. The
+ * stackRestore call consumes only entry_sp + returns void, so it leaves any return value on the
+ * stack. No-op for frame-less methods. */
 #ifdef HOST_BROWSER
-#define EMIT_REF_LEAVE() do { if (nrefslots > 0) { \
-		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
-		wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ref_leave); \
-		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0); \
-	} \
-	if (naddrbytes > 0) {   /* pop this method's addressable-locals frame (mirrors the ref-frame leave) */ \
-		extern void mono_wasm_jit_addr_leave (void *base); \
-		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) addrbase_idx); \
-		wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_addr_leave); \
+#define EMIT_REF_LEAVE() do { if (framebytes > 0) { \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+		wasm_i32_const (&body, (gint32) (intptr_t) stackRestore); \
 		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0); \
 	} \
 	if (eh_on) {   /* pop this EH method's il_state island (pushed by enter_island in the prologue) */ \
@@ -2809,30 +2741,46 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
 
 #ifdef HOST_BROWSER
-	/* GC ref-frame + addressable-locals-frame prologue. The enter/leave helpers share functypes — enter is
-	 * (i32)->i32, leave is (i32)->void — so register them once for EITHER frame. ref_enter reserves
-	 * nrefslots GC-scanned slots and copies reference args in; addr_enter reserves naddrbytes of (zeroed,
-	 * non-GC) addressable-locals frame for OP_LDADDR. Both are popped at every exit by EMIT_REF_LEAVE.
-	 * An EH method ALWAYS captures its entry SPs (even with 0 ref slots / 0 addr bytes): its catch landing
-	 * pad must rewind frames leaked by callees the C++ unwind tore through, and that needs refbase/addrbase
-	 * to point at this method's frame top. Without this, a zero-ref EH catcher silently leaks every unwound
-	 * callee frame -> wj_ref_sp drifts upward and trips the boundary balance check. */
-	if (nrefslots > 0 || naddrbytes > 0 || eh_on) {
-		WasmFuncType et, lt; int k2;
-		memset (&et, 0, sizeof et); et.nparams = 1; et.params [0] = WASM_I32; et.ret = WASM_I32;   /* enter: (i32)->i32 */
-		memset (&lt, 0, sizeof lt); lt.nparams = 1; lt.params [0] = WASM_I32; lt.ret = WASM_VOID;   /* leave: (i32)->void */
+	/* C-STACK FRAME PROLOGUE. Reserve this method's ref+addr slots as a real frame on the emscripten
+	 * C stack (see the layout doc at the top of this file): capture entry_sp, drop the SP by the
+	 * 16-aligned frame size, zero the frame (GC must not scan garbage; .NET locals are zero-init),
+	 * copy reference args into their slots, and derive addrbase. Every exit stackRestores entry_sp
+	 * (EMIT_REF_LEAVE); the EH landing pad stackRestores refbase (this frame stays live, unwound
+	 * callee frames fall below the SP and stop being scanned — no zeroing, no balance bookkeeping).
+	 * An EH method with an EMPTY frame still captures entry_sp (refbase = entry_sp) so its landing
+	 * pad can pop the frames of callees the C++ unwind tore through. */
+	if (framebytes > 0 || eh_on) {
+		WasmFuncType gt, lt; int k2;
+		memset (&gt, 0, sizeof gt); gt.nparams = 0; gt.ret = WASM_I32;                              /* emscripten_stack_get_current: ()->i32 */
+		memset (&lt, 0, sizeof lt); lt.nparams = 1; lt.params [0] = WASM_I32; lt.ret = WASM_VOID;   /* stackRestore: (i32)->void */
 		for (k2 = 0; k2 < nextra; ++k2) {
-			if (enter_ti < 0 && functype_eq (&extra_types [k2], &et)) enter_ti = 2 + k2;
+			if (enter_ti < 0 && functype_eq (&extra_types [k2], &gt)) enter_ti = 2 + k2;
 			if (leave_ti < 0 && functype_eq (&extra_types [k2], &lt)) leave_ti = 2 + k2;
 		}
-		if (enter_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; enter_ti = 2 + nextra++; }
+		if (enter_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = gt; enter_ti = 2 + nextra++; }
 		if (leave_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = lt; leave_ti = 2 + nextra++; }
 		uses_calls = TRUE;
-		if (nrefslots > 0 || eh_on) {   /* eh_on with 0 slots: ref_enter(0) captures the entry SP into refbase without bumping */
-			wasm_i32_const (&body, nrefslots);
-			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ref_enter);
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) enter_ti); wasm_uleb (&body, 0);
+		/* entry_sp = emscripten_stack_get_current () */
+		wasm_i32_const (&body, (gint32) (intptr_t) emscripten_stack_get_current);
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) enter_ti); wasm_uleb (&body, 0);
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx);
+		if (framebytes > 0) {
+			/* refbase (frame base) = (entry_sp - framebytes) & ~15; __stack_pointer = refbase */
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx);
+			wasm_i32_const (&body, framebytes);
+			wasm_op (&body, WASM_OP_I32_SUB);
+			wasm_i32_const (&body, -16);
+			wasm_op (&body, WASM_OP_I32_AND);
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx);
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+			wasm_i32_const (&body, (gint32) (intptr_t) stackRestore);
+			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0);
+			/* memory.fill (refbase, 0, framebytes): the frame is above the SP now, so the GC scans it —
+			 * it must hold no garbage/stale pointers; .NET local zero-init falls out of the same fill */
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+			wasm_i32_const (&body, 0);
+			wasm_i32_const (&body, framebytes);
+			wasm_u8 (&body, 0xFC); wasm_uleb (&body, 11); wasm_u8 (&body, 0);   /* memory.fill mem 0 (bulk memory) */
 			for (i = 0; i < nargs; ++i) {
 				int av = cfg->args [i]->dreg;
 				if (av >= 0 && av < nvreg && refslot [av] >= 0) {
@@ -2841,13 +2789,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [av] * 4));
 				}
 			}
-		}
-		if (naddrbytes > 0 || eh_on) {   /* eh_on with 0 bytes: addr_enter(0) captures the entry addr-SP into addrbase */
-			extern void *mono_wasm_jit_addr_enter (int nbytes);
-			wasm_i32_const (&body, naddrbytes);
-			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_addr_enter);
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) enter_ti); wasm_uleb (&body, 0);
-			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) addrbase_idx);
+			if (naddrbytes > 0) {
+				wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+				wasm_i32_const (&body, refbytes_al);
+				wasm_op (&body, WASM_OP_I32_ADD);
+				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) addrbase_idx);
+			}
+		} else {
+			/* eh_on with an empty frame: refbase = entry_sp is the landing pad's restore target */
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx);
+			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx);
 		}
 	}
 	/* INLINE f-slot-IC liveness prologue: fetch the STABLE per-thread addresses of the wj_slot_live bitmap
@@ -2980,6 +2931,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			switch (ins->opcode) {
 			case OP_NOP: case OP_IL_SEQ_POINT: case OP_SEQ_POINT:
 			case OP_DUMMY_USE: case OP_NOT_REACHED: case OP_START_HANDLER:
+			/* GC liveness annotations emitted under cfg->compute_gc_maps (set for COMPILE_WASM to get
+			 * MINI's structural ref/mp vreg marking). They only feed the precise-GC-map builder, which
+			 * is compiled out (mini-gc.c #if 0) — the wasm backend's ref classification reads the
+			 * vreg_is_ref/vreg_is_mp arrays directly, so these are pure no-ops here. */
+			case OP_GC_LIVENESS_DEF: case OP_GC_LIVENESS_USE:
+			case OP_GC_PARAM_SLOT_LIVENESS_DEF: case OP_GC_SPILL_SLOT_LIVENESS_DEF:
 				break;
 			case OP_CALL_HANDLER: {
 				/* milestone 2c: "call" a finally subroutine. We don't call — we record the continuation bb
@@ -3227,6 +3184,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_op (&body, WASM_OP_I64_XOR);
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "lnot dreg"; goto done; }
 				break;
+			case OP_LNEG: /* no i64.neg in wasm: 0 - x */
+				wasm_i64_const (&body, (gint64) 0);
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "lneg sreg"; goto done; }
+				wasm_op (&body, WASM_OP_I64_SUB);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "lneg dreg"; goto done; }
+				break;
 			case OP_LADD: BIN (WASM_OP_I64_ADD); break;
 			case OP_LSUB: BIN (WASM_OP_I64_SUB); break;
 			case OP_LMUL: BIN (WASM_OP_I64_MUL); break;
@@ -3333,7 +3296,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			case OP_ICONV_TO_I2: UN (WASM_OP_I32_EXTEND16_S); break;      /* (short) */
 			case OP_ICONV_TO_U1: MASK (0xFF); break;                     /* (byte) */
 			case OP_ICONV_TO_U2: MASK (0xFFFF); break;                   /* (ushort) */
-			case OP_LCONV_TO_I4: case OP_LCONV_TO_U4: UN (WASM_OP_I32_WRAP_I64); break;  /* i64 -> i32 (truncate) */
+			case OP_LCONV_TO_I4: case OP_LCONV_TO_U4:
+			case OP_LCONV_TO_I: case OP_LCONV_TO_U: UN (WASM_OP_I32_WRAP_I64); break;  /* i64 -> i32/native-int (truncate) */
 			case OP_LCONV_TO_R8: UN (WASM_OP_F64_CONVERT_I64_S); break;  /* i64 -> f64 */
 			case OP_LCONV_TO_R4: UN (WASM_OP_F32_CONVERT_I64_S); break;  /* i64 -> f32 */
 			/* bit-reinterpret (Unsafe.BitCast intrinsic, what IKVM's Float/Double intBitsToFloat etc. lower
@@ -4755,33 +4719,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #endif
 		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0);   /* ()->void */
 		} }
-		/* REF-SP-1: rewind THIS method's GC ref + addressable-locals shadow stacks to their OWN frame top
-		 * before re-dispatching into the handler. A C++/wasm-EH unwind into this catch skipped the
-		 * EMIT_REF_LEAVE of every JITted frame it tore through (nested non-EH callees, and EH callees that
-		 * escaped via their own h<0 rethrow), so wj_ref_sp/wj_addr_sp are still elevated by those leaked
-		 * frames. ref_leave(refbase + nrefslots) zeroes [frame-top, sp) — killing the conservative GC
-		 * over-pin of dead callee objects — and resets the SP to this method's frame top; addr_leave does the
-		 * same for the addressable-locals frame. We rewind to the POST-prologue SP (frame top), NOT the base,
-		 * so this method's OWN live slots survive for the handler. Idempotent across repeated catches (e.g. a
-		 * finally that re-raises and is re-caught). The h<0 escape and normal-return paths don't need this —
-		 * the interp->JIT boundary (mono_wasm_jit_invoke_caught) reclaims the whole call tree's frames there.
-		 * NOTE: unconditional (not gated on nrefslots/naddrbytes>0) because an eh_on method ALWAYS captured its
-		 * entry SP into refbase/addrbase in the prologue — even a 0-slot/0-byte catcher must reclaim the frames
-		 * its unwound callees leaked. With 0 slots, refbase + 0 == this method's frame top, so the rewind
-		 * zeroes exactly the leaked [frame-top, sp) range and resets the SP. leave_ti is registered for eh_on. */
+		/* REF-SP-1: restore __stack_pointer to THIS method's frame base before re-dispatching into the
+		 * handler. A C++/wasm-EH unwind into this catch skipped the EMIT_REF_LEAVE of every JITted frame
+		 * it tore through (nested non-EH callees, and EH callees that escaped via their own h<0 rethrow),
+		 * potentially leaving the SP below this frame. stackRestore(refbase) pops exactly those callee
+		 * frames — they fall below the SP and stop being GC-scanned (no zeroing needed) — while this
+		 * method's OWN frame [refbase, entry_sp) stays live for the handler. Idempotent across repeated
+		 * catches (e.g. a finally that re-raises and is re-caught). Unconditional: an eh_on method always
+		 * captures refbase in the prologue (== entry_sp for an empty frame). leave_ti is registered for
+		 * eh_on. */
 #ifdef HOST_BROWSER
 		{
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
-			wasm_i32_const (&body, (gint32) (nrefslots * 4));   /* sizeof (MonoObject*) == 4 on wasm32; 0 when ref-less */
-			wasm_op (&body, WASM_OP_I32_ADD);
-			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ref_leave);
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0);
-		}
-		{
-			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) addrbase_idx);
-			wasm_i32_const (&body, (gint32) naddrbytes);   /* 0 when no address-taken locals */
-			wasm_op (&body, WASM_OP_I32_ADD);
-			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_addr_leave);
+			wasm_i32_const (&body, (gint32) (intptr_t) stackRestore);
 			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0);
 		}
 #endif
@@ -5089,6 +5039,75 @@ void
 mono_arch_emit_call (MonoCompile *cfg, MonoCallInst *call)
 {
 	g_error ("mono_arch_emit_call");
+}
+
+/*
+ * mono_wasm_emit_call:
+ *
+ *   COMPILE_WASM analog of mono_llvm_emit_call, invoked from mono_emit_call_args in place of
+ * mono_arch_emit_call. The emitter reads call args positionally from a plain int array stored on
+ * the (otherwise unused for wasm) call->call_info.
+ *
+ * Legacy mode (MONO_WASM_JIT_OUTARG=0, default): snapshot call->args[i]->dreg raw. Nothing in the
+ * IR uses those vregs, so any opt pass that runs later (copyprop/deadce/...) corrupts them — this
+ * is why mini_method_compile hard-resets cfg->opt for wasm.
+ *
+ * Structural mode (OUTARG=1): clone LLVM's mechanism — emit a real OP_*MOVE per scalar/ref/byref
+ * arg into a fresh vreg, add it to cfg->cbb, and register the dreg in call->out_ireg_args via
+ * mono_call_inst_add_outarg_reg. The moves are ordinary instructions (copyprop/deadce/SSA see the
+ * dependency), mono_local_deadce explicitly marks out_ireg_args vregs used, and alias analysis
+ * special-cases them (kill_call_arg_alias) — so the captured vregs survive the opt pipeline.
+ * The side array then holds the MOVE dregs, and the emitter is unchanged. A ref arg's move dreg is
+ * classified ref by the fixpoint's OP_MOVE taint (extra shadow slot per ref arg per call site —
+ * the cost of rooting the arg at the call).
+ *
+ * Vtype args (the VTYPE_SCALAR machinery) get NO move (OP_VMOVE would need vtype plumbing and
+ * OP_LLVM_OUTARG_VT has no non-LLVM decompose case): the original dreg is recorded in the side
+ * array AND registered in out_ireg_args so DEADCE keeps its def alive. Worst case under opts is a
+ * clean "call arg ld" bail, never corruption.
+ */
+void
+mono_wasm_emit_call (MonoCompile *cfg, MonoCallInst *call)
+{
+	extern int mono_wasm_jit_outarg;
+	MonoMethodSignature *sig = call->signature;
+	int n = sig->param_count + sig->hasthis, i;
+	int *wargs = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (n > 0 ? n : 1));
+
+	if (!mono_wasm_jit_outarg) {
+		for (i = 0; i < n; ++i)
+			wargs [i] = call->args [i]->dreg;
+		call->call_info = (CallInfo *) wargs;
+		return;
+	}
+
+	for (i = 0; i < n; ++i) {
+		MonoInst *in = call->args [i];
+		MonoInst *ins;
+		MonoType *t = (sig->hasthis && i == 0) ? mono_get_int_type () : sig->params [i - sig->hasthis];
+		guint32 opcode = mono_type_to_regmove (cfg, t);
+
+		if (opcode == OP_VMOVE || opcode == OP_XMOVE) {
+			/* vtype: no move — record + register the original dreg (keeps the def live) */
+			wargs [i] = in->dreg;
+			mono_call_inst_add_outarg_reg (cfg, call, in->dreg, 0, FALSE);
+			continue;
+		}
+		MONO_INST_NEW (cfg, ins, opcode);
+		if (opcode == OP_FMOVE || opcode == OP_RMOVE)
+			ins->dreg = mono_alloc_freg (cfg);
+		else if (opcode == OP_LMOVE)
+			ins->dreg = mono_alloc_lreg (cfg);
+		else
+			ins->dreg = mono_alloc_ireg (cfg);
+		ins->sreg1 = in->dreg;
+		MONO_ADD_INS (cfg->cbb, ins);
+		/* always the ireg list (hreg 0), even for f/l moves — positional decode, exactly like
+		 * mono_llvm_emit_call; deadce walks both lists anyway */
+		mono_call_inst_add_outarg_reg (cfg, call, ins->dreg, 0, FALSE);
+		wargs [i] = ins->dreg;
+	}
+	call->call_info = (CallInfo *) wargs;
 }
 
 void

@@ -93,6 +93,25 @@
 #ifdef HOST_BROWSER
 #include "jiterpreter.h"
 #include <emscripten.h>
+#include <emscripten/stack.h>
+extern void stackRestore (uintptr_t sp);   /* compiler-rt (stack_ops.S): sets __stack_pointer; JIT frames live on the C stack */
+
+/* Overflow-safe probe bounds for the JIT-boundary diagnostics (mirrors mini-wasm.c wj_probe_ok):
+ * the naive `a + 8 > memsz` WRAPS for a near 2^32 (e.g. an object whose first word is int -8), so the
+ * probe's own speculative deref becomes the OOB trap that silently kills a JSPI-suspended thread. Also
+ * clamps the 65536-page (4GB) case where `pages << 16` overflows 32-bit gsize to 0. */
+static inline gsize
+wj_memsz (void)
+{
+	gsize s = (gsize) __builtin_wasm_memory_size (0) << 16;
+	return s ? s : (gsize) -1;
+}
+
+static inline gboolean
+wj_probe_ok (gsize a, gsize memsz)
+{
+	return !(a & 3) && a >= 1024 && a <= memsz - 8;
+}
 #endif
 
 /* Arguments that are passed when invoking only a finally/filter clause from the frame */
@@ -3642,6 +3661,25 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		 * also guards the mono_interp_get_imethod(NULL) deref below. */
 		return 1;
 	}
+	/* SYNCHRONIZED_INNER wrappers are dummy "Shouldn't be called." throw stubs — the interpreter never
+	 * executes them (interp inlines monitor ops during transform and never uses the wrapper pair), so
+	 * interp-running one raw throws EEE. Substitute the wrapped method: its transform re-adds the
+	 * monitor enter/exit, and Monitor is reentrant so the outer (JITted) wrapper already holding the
+	 * lock is fine. Reached when a JITted outer synchronized wrapper residual-calls its not-yet-JITted
+	 * inner (runtime-loaded classes: no AOT body to dispatch to). */
+	if (G_UNLIKELY (method->wrapper_type == MONO_WRAPPER_OTHER)) {
+		WrapperInfo *winfo = mono_marshal_get_wrapper_info (method);
+		if (winfo && winfo->subtype == WRAPPER_SUBTYPE_SYNCHRONIZED_INNER) {
+			MonoMethod *wrapped = winfo->d.synchronized_inner.method;
+			if (wrapped && method->is_inflated) {
+				ERROR_DECL (inflate_error);
+				wrapped = mono_class_inflate_generic_method_checked (wrapped, mono_method_get_context (method), inflate_error);
+				if (!is_ok (inflate_error)) { mono_error_cleanup (inflate_error); wrapped = NULL; }
+			}
+			if (wrapped)
+				method = wrapped;
+		}
+	}
 	InterpMethod *imethod = mono_interp_get_imethod (method);
 	MonoMethodSignature *sig = mono_method_signature_internal (method);
 	InterpEntryData data;
@@ -3654,7 +3692,7 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 	 * -10 (0xfffffff6) that reached a (Biome[]) cast in Villager pathfinding — means the JIT put an int into a
 	 * reference slot. Log (rate-limited) the callee + arg index so the SOURCE method is named; non-fatal. */
 	{
-		gsize _memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
+		gsize _memsz = wj_memsz ();
 		int _vidx = sig->hasthis ? 1 : 0;
 		if (sig->hasthis) {
 			gsize _t = (gsize) *(gpointer *) (buf + 0);
@@ -4237,13 +4275,13 @@ wasm_jit_ethunk_cb (gpointer arg)
  * EXACTLY. It must NOT THROW_EX a fresh exception: pass 1 of the throw
  * (mono_handle_exception, run before the native unwind) already installed the resume-state / il_state,
  * and a second handling would double-process it (the resume_state.ex_gchandle assertion). Also restores
- * the GC ref shadow-stack SP — the unwound JITted frames skipped their own ref_leave. */
-/* Cheap always-on shadow-stack balance invariant — the production replacement for the per-store
- * MONO_WASM_JIT_STOREGUARD. An enter/leave imbalance drifts the ref/addr SP: on a CLEAN (non-thrown) return
- * from the boundary the SP must be exactly restored to the pre-invoke snapshot, and on a thrown unwind it
- * must not have dropped BELOW it (the boundary rewind only trims frames the unwound JIT skipped). A
- * violation is a real corruption source; warn ONCE (racy global flag is fine for a diagnostic) rather than
- * abort, so the worker survives to be diagnosed. O(1) per interp->JIT boundary, not per store. */
+ * the C-stack SP — the unwound JITted frames' native EH cleanup is not guaranteed. */
+/* Cheap always-on C-stack balance invariant. JITted frames live on the emscripten C stack now: on a
+ * CLEAN (non-thrown) return every JIT frame ran its stackRestore, so the SP must be exactly back at
+ * the pre-invoke snapshot; a drift means a JIT return path is missing EMIT_REF_LEAVE. On a thrown
+ * unwind the native EH landing pads restore the SP, but we resync from the snapshot regardless —
+ * belt-and-suspenders that also covers codegen bugs. Warn ONCE (racy global flag is fine for a
+ * diagnostic) rather than abort. O(1) per interp->JIT boundary, not per store. */
 static void
 wj_shadow_balance_warn (const char *what)
 {
@@ -4251,34 +4289,29 @@ wj_shadow_balance_warn (const char *what)
 	if (warned)
 		return;
 	warned = TRUE;
-	g_warning ("wasm-jit: ref/addr shadow-stack %s at interp->JIT boundary — enter/leave imbalance (was caught by MONO_WASM_JIT_STOREGUARD)", what);
+	g_warning ("wasm-jit: C-stack %s at interp->JIT boundary — a JIT frame push/pop imbalance (was caught by MONO_WASM_JIT_STOREGUARD)", what);
 }
 
 /* Names the leaking method on a clean-return imbalance. A CALLEE's leak is corrected by the caller's own
- * ref_leave(caller_base), so for the drift to reach the interp->JIT boundary the boundary-invoked `method`
+ * stackRestore(entry_sp), so for the drift to reach the interp->JIT boundary the boundary-invoked `method`
  * ITSELF must have a return path missing EMIT_REF_LEAVE — i.e. THIS is the culprit. Rate-limited. */
 static void
-wj_shadow_balance_warn_m (const char *method, int ref_leak, int addr_leak)
+wj_shadow_balance_warn_m (const char *method, int leak)
 {
 	static int n = 0;
 	if (n >= 40)
 		return;
 	n++;
-	g_warning ("wasm-jit: shadow-stack imbalance on CLEAN return from %s (ref leak=%d slots, addr leak=%d bytes) — a return path is missing EMIT_REF_LEAVE; resynced at boundary", method, ref_leak, addr_leak);
+	g_warning ("wasm-jit: C-stack imbalance on CLEAN return from %s (leak=%d bytes) — a return path is missing EMIT_REF_LEAVE; resynced at boundary", method, leak);
 }
 
 void
 mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret)
 {
-	extern MonoObject **mono_wasm_jit_ref_sp_save (void);
-	extern void mono_wasm_jit_ref_leave (MonoObject **base);
-	/* The addressable-locals frame (OP_LDADDR) is unwound the same way as the ref shadow stack: snapshot its
-	 * SP before the invoke, and on a caught C++ unwind rewind it — the unwound JITted frames skipped their
-	 * own addr_leave (EMIT_REF_LEAVE). */
-	extern guint8 *mono_wasm_jit_addr_sp_save (void);
-	extern void mono_wasm_jit_addr_leave (void *base);
-	MonoObject **ref_sp_saved = mono_wasm_jit_ref_sp_save ();
-	guint8 *addr_sp_saved = mono_wasm_jit_addr_sp_save ();
+	/* JIT frames live on the emscripten C stack: snapshot the SP so a caught C++ unwind (whose
+	 * native landing pads may or may not have run for the torn-through JIT frames) can be resynced
+	 * precisely, and a clean return can be balance-checked. */
+	uintptr_t c_sp_saved = emscripten_stack_get_current ();
 	gboolean thrown = FALSE;
 	WasmJitEThunkArgs a;
 	a.thunk = (gpointer) (intptr_t) slot;
@@ -4298,49 +4331,33 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 	mono_llvm_catch_exception (wasm_jit_ethunk_cb, &a, &thrown);
 
 	mono_wasm_jit_island_sp_restore (island_sp_saved);
-	/* DIAG (loot-NPE bisection): on a catch-taken, non-thrown return, log the return value + the ref-stack
-	 * balance. ret!=saved => intValue's EMIT_REF_LEAVE didn't fully restore the GC ref shadow stack across
-	 * the catch (over/under-scan -> GC corruption). A sane ret with balance==0 => the bug is elsewhere
-	 * (premature pass-1 finally in outer frames). Bounded + STATS-gated. */
+	/* DIAG (loot-NPE bisection): on a catch-taken, non-thrown return, log the return value + the C-stack
+	 * balance. bal!=0 => a JIT frame's EMIT_REF_LEAVE didn't restore the SP across the catch. Bounded. */
 	{ extern int mono_wasm_jit_verbose; extern __thread int mono_wasm_jit_eh_caught_flag;
 	  if (mono_wasm_jit_verbose >= 2 && mono_wasm_jit_eh_caught_flag) { static int _ivc = 0;
-		MonoObject **now = mono_wasm_jit_ref_sp_save (); int bal = (int) (now - ref_sp_saved);
-		if (_ivc++ < 200) { printf ("INVCAUGHT caught ret=%d thrown=%d refbal=%d\n", ret ? *(gint32 *) ret : -999999, thrown, bal); } }
+		int bal = (int) ((intptr_t) emscripten_stack_get_current () - (intptr_t) c_sp_saved);
+		if (_ivc++ < 200) { printf ("INVCAUGHT caught ret=%d thrown=%d spbal=%d\n", ret ? *(gint32 *) ret : -999999, thrown, bal); } }
 	  mono_wasm_jit_eh_caught_flag = 0; }
 	if (!thrown) {
-		/* clean return: every entered JIT frame ran its EMIT_REF_LEAVE, so the SP must be exactly restored. If
-		 * not, `method`'s codegen has a return path missing EMIT_REF_LEAVE (a callee leak is corrected by this
-		 * method's own ref_leave, so the boundary only sees the boundary method's own leak). Name it, then
-		 * RESYNC the SP to the pre-invoke snapshot so the drift can't shift the NEXT invocation's ref slots
-		 * into a stale-base store — neutralising the corruption while we fix the codegen. */
-		MonoObject **now_ref = mono_wasm_jit_ref_sp_save ();
-		guint8 *now_addr = mono_wasm_jit_addr_sp_save ();
-		/* FIRST-USE GUARD: on a thread's first JITted invocation the shadow stack(s) are still NULL when we
-		 * snapshot above, then lazily g_malloc0'd by this call's ref_enter/addr_enter. A clean return leaves
-		 * the SP at the (newly allocated) arena base = balanced — but (now - NULL) computes the malloc'd base
-		 * ADDRESS as a bogus multi-hundred-MB "leak" (this is the long-reported 66560028-slot phantom: that is
-		 * 0x0FDE8070/4, the arena address, not drift). Only a NON-NULL snapshot that moved is a real imbalance.
-		 * The resync still runs in both cases: ref_leave(NULL) clamps to the arena base, normalising the SP. */
-		gboolean ref_drift  = ref_sp_saved  != NULL && now_ref  != ref_sp_saved;
-		gboolean addr_drift = addr_sp_saved != NULL && now_addr != addr_sp_saved;
-		if (G_UNLIKELY (ref_drift || addr_drift)) {
+		/* clean return: every JIT frame ran its stackRestore (and every C callee restored its own frame),
+		 * so the SP must be exactly back at the snapshot. If not, `method`'s codegen has a return path
+		 * missing EMIT_REF_LEAVE (a callee leak is corrected by the caller's own restore, so the boundary
+		 * only sees the boundary method's own leak). Name it, then RESYNC so the drift can't accumulate. */
+		uintptr_t now_sp = emscripten_stack_get_current ();
+		if (G_UNLIKELY (now_sp != c_sp_saved)) {
 			char *fn = mono_method_get_full_name (method);
-			wj_shadow_balance_warn_m (fn, ref_drift ? (int) (now_ref - ref_sp_saved) : 0,
-			                              addr_drift ? (int) (now_addr - addr_sp_saved) : 0);
+			wj_shadow_balance_warn_m (fn, (int) ((intptr_t) c_sp_saved - (intptr_t) now_sp));
 			g_free (fn);
+			stackRestore (c_sp_saved);
 		}
-		if (G_UNLIKELY (now_ref != ref_sp_saved))
-			mono_wasm_jit_ref_leave (ref_sp_saved);
-		if (G_UNLIKELY (now_addr != addr_sp_saved))
-			mono_wasm_jit_addr_leave (addr_sp_saved);
 		return;
 	}
-	/* thrown: the unwound JITted frames skipped their EMIT_REF_LEAVE, so rewind to the snapshot here. The SP
-	 * must be AT or ABOVE the snapshot — below it means an underflow (a leave ran past the frame base). */
-	if (G_UNLIKELY (mono_wasm_jit_ref_sp_save () < ref_sp_saved || mono_wasm_jit_addr_sp_save () < addr_sp_saved))
+	/* thrown: the native EH landing pads restore the SP as the C++ unwind ran, but the torn-through JIT
+	 * frames had no cleanup of their own — resync from the snapshot regardless (idempotent when already
+	 * balanced). Above-snapshot means an underflow (a restore ran past its frame). */
+	if (G_UNLIKELY (emscripten_stack_get_current () > c_sp_saved))
 		wj_shadow_balance_warn ("underflowed on unwind");
-	mono_wasm_jit_ref_leave (ref_sp_saved);   /* the unwound JITted frames skipped EMIT_REF_LEAVE */
-	mono_wasm_jit_addr_leave (addr_sp_saved); /* ... and their addr-frame pop too */
+	stackRestore (c_sp_saved);
 	ThreadContext *context = get_context ();
 	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
 	if (context->has_resume_state) {
@@ -6394,11 +6411,11 @@ mono_interp_isinst (MonoObject* object, MonoClass* klass)
 	 * of dereferencing — the run continues so we can see how often / with what target type it happens. */
 	if (G_UNLIKELY (object != NULL)) {
 		gsize o = (gsize) object;
-		gsize memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
-		gboolean bad = (o & 3) || o < 1024 || o + 8 > memsz;
+		gsize memsz = wj_memsz ();
+		gboolean bad = !wj_probe_ok (o, memsz);
 		gsize vt = 0, kl = 0;
-		if (!bad) { vt = *(gsize *) o;  bad = !vt || (vt & 3) || vt < 1024 || vt + 8 > memsz; }     /* object->vtable */
-		if (!bad) { kl = *(gsize *) vt; bad = !kl || (kl & 3) || kl < 1024 || kl + 8 > memsz; }     /* vtable->klass */
+		if (!bad) { vt = *(gsize *) o;  bad = !vt || !wj_probe_ok (vt, memsz); }     /* object->vtable */
+		if (!bad) { kl = *(gsize *) vt; bad = !kl || !wj_probe_ok (kl, memsz); }     /* vtable->klass */
 		if (G_UNLIKELY (bad)) {
 			static int z = 0;
 			if (z++ < 40) {
