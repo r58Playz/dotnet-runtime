@@ -667,6 +667,11 @@ mono_compile_create_var_for_vreg (MonoCompile *cfg, MonoType *type, int opcode, 
 	if (!cfg->compile_aot && mono_class_has_failure (inst->klass))
 		mono_cfg_set_exception (cfg, MONO_EXCEPTION_TYPE_LOAD);
 
+	/* The wasm JIT (COMPILE_WASM) sets compute_gc_maps so this marking fires for it too:
+	 * vreg_is_ref/vreg_is_mp seed its GC ref classification (which vregs must live in the
+	 * GC-scanned frame instead of raw wasm locals). Byref/managed-pointer marking matters
+	 * as much as refs there — an interior pointer in an unscanned wasm local goes stale
+	 * across a moving collection exactly like an object ref. */
 	if (cfg->compute_gc_maps) {
 		if (m_type_is_byref (type)) {
 			mono_mark_vreg_as_mp (cfg, vreg);
@@ -677,11 +682,6 @@ mono_compile_create_var_for_vreg (MonoCompile *cfg, MonoType *type, int opcode, 
 			}
 		}
 	}
-
-#ifdef TARGET_WASM
-	if (mini_type_is_reference (type))
-		mono_mark_vreg_as_ref (cfg, vreg);
-#endif
 
 	cfg->varinfo [num] = inst;
 
@@ -3147,6 +3147,24 @@ mini_get_rgctx_access_for_method (MonoMethod *method)
 
 #ifdef TARGET_WASM
 /*
+ * wasm_jit_opt_whitelist:
+ *
+ *   MINI opts from the STANDARD pipeline's cfg->opt that the wasm JIT is allowed to inherit
+ * (everything else is masked at the compile_wasm fork; the correctness-required base
+ * INTRINS|FLOAT32 is always forced back on). Grown one flag at a time per the WS2 rollout
+ * (CONSPROP -> COPYPROP -> DEADCE -> BRANCH -> ALIAS -> LOOP -> SSA/ABCREM), each after an
+ * offline corpus diff + in-browser GC-guard soak. The vreg-mutating entries additionally
+ * require MONO_WASM_JIT_OUTARG=1 (see the interlock at the fork). NEVER whitelist: CMOV
+ * (no OP_CMOV lowering), TAILCALL, SIMD (no v128 lowering), SHARED/GSHARED, LINEARS,
+ * EXCEPTION.
+ */
+static guint32
+wasm_jit_opt_whitelist (void)
+{
+	return 0;
+}
+
+/*
  * wasm_jit_extra_opt:
  *
  *   MINI optimization flags to OR onto the wasm-JIT's required base (MONO_OPT_INTRINS | MONO_OPT_FLOAT32)
@@ -3228,6 +3246,10 @@ wasm_jit_extra_opt (void)
 		g_strfreev (parts);
 		cached = opt;
 	}
+	/* Never allow SIMD: the wasm JIT has no v128 lowering, and simd-intrinsics.c only
+	 * expands vector IR for LLVM — vector methods must stay as calls into AOT'd bodies.
+	 * (Also guards "all".) */
+	cached &= ~ (guint32) MONO_OPT_SIMD;
 	printf ("MONO_WASM_JIT_OPT = 0x%x (added to the INTRINS|FLOAT32 base)\n", cached);
 	fflush (stdout);
 	return cached;
@@ -3418,6 +3440,15 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 			 * the wasm backend lowers to a real compare + catchable throw (or bails the method to interp). */
 			cfg->explicit_null_checks = TRUE;
 			cfg->disable_llvm_implicit_null_checks = TRUE;
+			/* Turn on MINI's own ref/managed-pointer vreg marking (create_var_for_vreg,
+			 * alloc_ireg_ref/_mp) so the backend's GC classification is seeded from the type
+			 * system instead of opcode inference alone. The other compute_gc_maps consumers are
+			 * inert here: the precise-map builder is compiled out (mini-gc.c #if 0) and the
+			 * regalloc/spill passes that read it never run for COMPILE_WASM; the OP_GC_LIVENESS_*
+			 * annotations decompose emits under it are NOPs in the wasm emitter. */
+			{ extern int mono_wasm_jit_gcmaps;
+			  if (mono_wasm_jit_gcmaps)
+				cfg->compute_gc_maps = TRUE; }
 			/* Disable IR optimizations: the wasm backend reads call->args directly at codegen,
 			 * but copyprop/etc. (which assume a native/LLVM emit_call consumes them) mangle the
 			 * call-arg vregs. opt=0 keeps the explicit arg-setup moves so calls lower correctly. */
@@ -3433,12 +3464,22 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 				 * feeds f64 ops -> "expected f64, found f32" module CompileErrors on every float-math
 				 * method. With r4fp on, the backend's native-f32 load/store/const handling matches and
 				 * float arithmetic lowers to the OP_R* (f32) ops below. */
-				cfg->opt = MONO_OPT_INTRINS | MONO_OPT_FLOAT32;
-				/* Experiment knob: OR extra MINI opts (MONO_WASM_JIT_OPT) onto the required base. Default 0
-				 * (unchanged -O0 bodies). "inline" is the intended first try (removes calls before codegen);
-				 * the vreg-mutating passes (copyprop/consprop/deadce) can miscompile call args — see
-				 * wasm_jit_extra_opt(). Keeps INTRINS|FLOAT32 no matter what (they're correctness-required). */
+				/* Whitelist instead of the old hard reset: keep the opts from the standard pipeline
+				 * that are known-safe for the wasm emitter (wasm_jit_opt_whitelist — currently empty,
+				 * grown per WS2 soak step), always force the correctness-required base, and OR the
+				 * MONO_WASM_JIT_OPT experiment knob. "inline" is the intended first try (removes calls
+				 * before codegen). */
+				cfg->opt = (cfg->opt & wasm_jit_opt_whitelist ()) | MONO_OPT_INTRINS | MONO_OPT_FLOAT32;
 				cfg->opt |= wasm_jit_extra_opt ();
+				/* INTERLOCK: the vreg-mutating local/SSA passes are only safe once the call-arg
+				 * capture is structural (MONO_WASM_JIT_OUTARG=1: real moves registered in
+				 * call->out_ireg_args, which deadce/alias treat as used — mono_wasm_emit_call).
+				 * With the legacy raw-dreg snapshot they SILENTLY MISCOMPILE call args, so mask
+				 * them no matter how they were requested. */
+				{ extern int mono_wasm_jit_outarg;
+				  if (!mono_wasm_jit_outarg)
+					cfg->opt &= ~ (guint32) (MONO_OPT_CONSPROP | MONO_OPT_COPYPROP | MONO_OPT_DEADCE
+						| MONO_OPT_SSA | MONO_OPT_ABCREM | MONO_OPT_ALIAS_ANALYSIS); }
 			/* Opt-in: emit llvmonly indirect-dispatch IR (ftndesc) for virtual/interp calls.
 			 * Required for virtual dispatch on wasm (the normal vtable-slot dispatch calls a
 			 * fixed-signature trampoline → call_indirect mismatch). The codegen fork still routes
@@ -3546,7 +3587,17 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 		return cfg;
 	}
 
-	if (cfg->llvm_only && cfg->interp && !cfg->interp_entry_only && header->num_clauses) {
+	/* COMPILE_WASM: never build the llvmonly il_state deopt frame — the wasm JIT's island EH pushes
+	 * its il_state LMFExt from the interp glue (mono_wasm_jit_enter_island), not from IR, and with
+	 * compile_llvm off mono_llvm_create_vars never runs so cfg->lmf_var would be NULL here (crash in
+	 * the deopt IR emission). Hit offline (aot-cross passes llvmonly) and under MONO_WASM_JIT_LLVMONLY.
+	 * BUT keep deopt's disable_inline side effect for clause methods: inlining must not paste a
+	 * SYNCHRONIZED_INNER wrapper's dummy IL ("Shouldn't be called." throw stub — the runtime
+	 * substitutes the real body only at method-pointer resolution) into the outer synchronized
+	 * wrapper's try/finally, which is exactly what happened when this flag was dropped. */
+	if (COMPILE_WASM (cfg) && cfg->llvm_only && cfg->interp && !cfg->interp_entry_only && header->num_clauses)
+		cfg->disable_inline = TRUE;
+	if (cfg->llvm_only && cfg->interp && !cfg->interp_entry_only && header->num_clauses && !COMPILE_WASM (cfg)) {
 		gboolean can_deopt = TRUE;
 		/*
 		 * Can't handle catch clauses inside finally clauses right now.
@@ -3812,7 +3863,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 
 	/*g_print ("numblocks = %d\n", cfg->num_bblocks);*/
 
-	if (!COMPILE_LLVM (cfg) && !COMPILE_WASM (cfg)) {
+	if (!COMPILE_METHODIR (cfg)) {
 		/* wasm has native i64, so (like LLVM) don't decompose longs into i32 carry-pairs — that
 		 * pass asserts on ops the wasm backend keeps native (decompose.c:905). The emitter lowers
 		 * the native long ops it supports to wasm i64 ops and bails to the interpreter otherwise. */
@@ -4120,7 +4171,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
     //print_dfn (cfg);
 
 	/* variables are allocated after decompose, since decompose could create temps */
-	if (!COMPILE_LLVM (cfg) && !COMPILE_WASM (cfg)) {
+	if (!COMPILE_METHODIR (cfg)) {
 		MONO_TIME_TRACK (mono_jit_stats.jit_arch_allocate_vars, mono_arch_allocate_vars (cfg));
 		mono_cfg_dump_ir (cfg, "arch_allocate_vars");
 		if (cfg->exception_type)
@@ -4130,7 +4181,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 	if (cfg->gsharedvt)
 		mono_allocate_gsharedvt_vars (cfg);
 
-	if (!COMPILE_LLVM (cfg) && !COMPILE_WASM (cfg)) {
+	if (!COMPILE_METHODIR (cfg)) {
 		gboolean need_local_opts;
 		MONO_TIME_TRACK (mono_jit_stats.jit_spill_global_vars, mono_spill_global_vars (cfg, &need_local_opts));
 		mono_cfg_dump_ir (cfg, "spill_global_vars");
@@ -4405,6 +4456,27 @@ mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 
 	if (reent)
 		return;
+	/* SYNCHRONIZED_INNER wrappers are dummy stubs whose IL just throws ExecutionEngineException
+	 * ("Shouldn't be called."); the runtime substitutes the wrapped method's real body at
+	 * method-pointer resolution (mono_jit_compile_method_inner). Mirror that here: compile the
+	 * REAL body — the caller publishes the result under its own (inner-wrapper) imethod/slots,
+	 * and the outer synchronized wrapper already holds the lock when it calls the inner, so the
+	 * unsynchronized body is exactly right. Without this, the first time an outer synchronized
+	 * wrapper gets wasm-jitted its island compiles + publishes the raw stub and every call to
+	 * the synchronized method throws EEE (runtime-loaded classes only — AOT'd inners resolve to
+	 * the substituted AOT body instead of a fresh compile). */
+	if (method->wrapper_type == MONO_WRAPPER_OTHER) {
+		WrapperInfo *winfo = mono_marshal_get_wrapper_info (method);
+		if (winfo && winfo->subtype == WRAPPER_SUBTYPE_SYNCHRONIZED_INNER) {
+			MonoMethod *wrapped = winfo->d.synchronized_inner.method;
+			if (wrapped && method->is_inflated) {
+				wrapped = mono_class_inflate_generic_method_checked (wrapped, mono_method_get_context (method), error);
+				if (!is_ok (error)) { mono_error_cleanup (error); wrapped = NULL; }
+			}
+			if (wrapped)
+				method = wrapped;
+		}
+	}
 	reent = TRUE;
 	cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
 	if (cfg) {

@@ -536,7 +536,10 @@ MONO_RESTORE_WARNING
 		EMIT_NEW_BIALU (cfg, ins, OP_PMUL, mul_reg, args [1]->dreg, esize_ins->dreg);
 		ins->type = STACK_PTR;
 
-		int dreg = alloc_preg (cfg);
+		/* the result is a managed (interior) pointer — alloc_ireg_mp so backends that track
+		 * ref/mp vregs (compute_gc_maps consumers, e.g. the wasm JIT's GC classification) see it;
+		 * a no-op elsewhere since alloc_ireg_mp == alloc_ireg without compute_gc_maps */
+		int dreg = alloc_ireg_mp (cfg);
 		EMIT_NEW_BIALU (cfg, ins, op, dreg, args [0]->dreg, mul_reg);
 		ins->type = STACK_PTR;
 		return ins;
@@ -549,7 +552,8 @@ MONO_RESTORE_WARNING
 		int op = (!strcmp (cmethod->name, "AddByteOffset")) ? OP_PADD : OP_PSUB;
 
 		if (fsig->params [1]->type == MONO_TYPE_I || fsig->params [1]->type == MONO_TYPE_U) {
-			int dreg = alloc_preg (cfg);
+			/* managed (interior) pointer result — see the Add/Subtract comment above */
+			int dreg = alloc_ireg_mp (cfg);
 			EMIT_NEW_BIALU (cfg, ins, op, dreg, args [0]->dreg, args [1]->dreg);
 			ins->type = STACK_PTR;
 			return ins;
@@ -561,7 +565,8 @@ MONO_DISABLE_WARNING(4127) /* conditional expression is constant */
 				EMIT_NEW_UNALU (cfg, ins, OP_LCONV_TO_U4, sreg, args [1]->dreg);
 			}
 MONO_RESTORE_WARNING
-			int dreg = alloc_preg (cfg);
+			/* managed (interior) pointer result — see the Add/Subtract comment above */
+			int dreg = alloc_ireg_mp (cfg);
 			EMIT_NEW_BIALU (cfg, ins, op, dreg, args [0]->dreg, sreg);
 			ins->type = STACK_PTR;
 			return ins;

@@ -274,6 +274,10 @@ mono_constant_fold_ins (MonoCompile *cfg, MonoInst *ins, MonoInst *arg1, MonoIns
 			dest->opcode = arg1->opcode;
 			MONO_INST_NULLIFY_SREGS (dest);
 			dest->inst_c0 = arg1->inst_c0;
+			/* A managed-object constant (STACK_OBJ pconst; the wasm JIT's case) carries its
+			 * GC literal-table slot in inst_p1 — the clone must keep it or the backend sees a
+			 * movable pointer with no trackable slot. Unused (never read) for scalar consts. */
+			dest->inst_p1 = arg1->inst_p1;
 		}
 		break;
 	case OP_FMOVE:

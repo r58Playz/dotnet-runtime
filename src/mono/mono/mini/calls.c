@@ -260,15 +260,9 @@ mini_emit_call_args (MonoCompile *cfg, MonoMethodSignature *sig,
 	if (COMPILE_WASM (cfg)) {
 		/* The runtime wasm JIT backend reads call args directly in mono_wasm_emit_method and
 		 * lowers calls to call_indirect; skip native/LLVM call-arg lowering (mono_arch_emit_call
-		 * is an unimplemented wasm stub). But call->args[i]->dreg gets corrupted by later vreg
-		 * passes before codegen (it ends up pointing at result/sum vregs), so — like LLVM, which
-		 * reads args here at method-to-ir time — capture the arg source vregs NOW into a side array
-		 * (stored on the unused-for-wasm call->call_info) for the backend to read. */
-		int n = sig->param_count + sig->hasthis, i;
-		int *wargs = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (n > 0 ? n : 1));
-		for (i = 0; i < n; ++i)
-			wargs [i] = call->args [i]->dreg;
-		call->call_info = (CallInfo *) wargs;
+		 * is an unimplemented wasm stub). Like LLVM, capture the arg source vregs NOW at
+		 * method-to-ir time — see mono_wasm_emit_call (mini-wasm.c) for the two capture modes. */
+		mono_wasm_emit_call (cfg, call);
 	} else
 #endif
 	{

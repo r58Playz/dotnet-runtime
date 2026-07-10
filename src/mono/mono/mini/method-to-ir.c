@@ -11330,14 +11330,21 @@ field_access_end:
 
 					/* Throw exception if exvar is set */
 					/* FIXME Do we need this for calls from catch/filter ? */
-					NEW_BBLOCK (cfg, dont_throw);
-					MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, abort_exc->dreg, 0);
-					MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, dont_throw);
-					mono_emit_jit_icall (cfg, ves_icall_thread_finish_async_abort, NULL);
-					cfg->cbb->clause_holes = tmp;
+					if (!COMPILE_WASM (cfg)) {
+						NEW_BBLOCK (cfg, dont_throw);
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, abort_exc->dreg, 0);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, dont_throw);
+						mono_emit_jit_icall (cfg, ves_icall_thread_finish_async_abort, NULL);
+						cfg->cbb->clause_holes = tmp;
 
-					MONO_START_BB (cfg, dont_throw);
-					cfg->cbb->clause_holes = tmp;
+						MONO_START_BB (cfg, dont_throw);
+						cfg->cbb->clause_holes = tmp;
+					}
+					/* COMPILE_WASM: skip the async-abort propagation check — thread abort does not
+					 * exist on wasm (no async suspension of managed code; Thread.Abort is PNSE), and
+					 * the check breaks the leave into a shape the wasm emitter's OP_CALL_HANDLER
+					 * continuation (finally_ind = the following OP_BR's target bb) cannot express —
+					 * it was THE dominant "finally: complex call_handler continuation" bail. */
 
 					if (COMPILE_LLVM (cfg)) {
 						MonoBasicBlock *target_bb;

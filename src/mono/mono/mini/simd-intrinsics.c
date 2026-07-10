@@ -2035,7 +2035,11 @@ emit_sri_vector (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsi
 #endif
 
 #ifdef TARGET_WASM
-	g_assert (COMPILE_LLVM (cfg));
+	/* Only the LLVM AOT backend lowers SIMD IR on wasm. The runtime wasm JIT
+	 * (COMPILE_WASM) has no v128 support — return NULL so vector methods stay
+	 * as calls into their AOT'd bodies instead of aborting the runtime. */
+	if (!COMPILE_LLVM (cfg))
+		return NULL;
 	if (vector_size != 128)
 		return NULL;
 #endif
