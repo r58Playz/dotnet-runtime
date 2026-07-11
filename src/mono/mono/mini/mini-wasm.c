@@ -4415,13 +4415,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* b.vtab != v -> $aot_way (next) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_rgctx_idx);   /* rgctx = b>>32 */
 								wj_emit_fast_count (&body, WJC_FAST_AOTIC);   /* profile: inline AOT-IC hit (JIT->AOT) */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);   /* kind2bit */
-								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) rv);
-									for (ai = 0; ai < n2; ++ai) if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "aot ic arg ld"; goto done; }
+								/* Collapsed kind branch: the args are identical in both arms — only the trailing rgctx push
+								 * and the call_indirect functype differ — so load args ONCE here and let a TYPED if-block
+								 * (params = aic_ati_ne = (this,args)->rv, guaranteed valid: aic==NULL otherwise) carry them into
+								 * whichever arm runs. Halves the emitted arg-load sequence per way — the aic-only code bloat
+								 * that made widening the AOT-IC a net loss (vs the lean f-slot vic). Needs multi-value blocks. */
+								for (ai = 0; ai < n2; ++ai) if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "aot ic arg ld"; goto done; }
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);   /* kind2bit selector */
+								wasm_op (&body, WASM_OP_IF); wasm_sleb (&body, (gint64) aic_ati_ne);   /* typed block in: (this,args) out: rv */
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);   /* ti */
 									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) aic_ati_ne); wasm_uleb (&body, 0);
 								wasm_op (&body, WASM_OP_ELSE);
-									for (ai = 0; ai < n2; ++ai) if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "aot ic arg ld"; goto done; }
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_rgctx_idx);
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);
 									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) aic_ati); wasm_uleb (&body, 0);
@@ -4539,22 +4543,21 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									}
 									/* cppeh: bare AOT call — a throwing callee C++-unwinds natively to the nearest landing
 									 * pad (an in-method catch or the interp e-thunk boundary). No try/catch wrapper. */
-									/* pick variant: kind==2 (exempt wrapper, no trailing arg) -> at_ne; else (kind==1) -> at + rgctx@216.
-									 * Each branch leaves one rv (or nothing if void) on the stack; result stored after the if/else end. */
+									/* Collapsed kind branch (mirror of the inline AOT-IC): args identical in both arms, so load
+									 * them ONCE and pick the variant with a TYPED if-block (params = ati_ne = (this,args)->rv,
+									 * guaranteed valid — bailed above otherwise). Only the rgctx push + functype differ. */
+									for (ai = 0; ai < n2; ++ai)
+										if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall aot arg ld"; goto done; }
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
 									wasm_i32_const (&body, 2);
 									wasm_op (&body, WASM_OP_I32_EQ);
-									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) rv);   /* block type = rv (WASM_VOID=0x40 -> empty) */
-										/* no-extra-arg variant: this+args, then AOT addr@212; call_indirect (this,args)->rv */
-										for (ai = 0; ai < n2; ++ai)
-											if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall aot arg ld"; goto done; }
+									wasm_op (&body, WASM_OP_IF); wasm_sleb (&body, (gint64) ati_ne);   /* typed block in: (this,args) out: rv */
+										/* no-extra-arg variant: AOT addr@212; call_indirect (this,args)->rv */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
 										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ati_ne); wasm_uleb (&body, 0);
 									wasm_op (&body, WASM_OP_ELSE);
-										/* with-rgctx variant: this+args, rgctx@216, AOT addr@212; call_indirect (this,args,rgctx)->rv */
-										for (ai = 0; ai < n2; ++ai)
-											if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall aot arg ld"; goto done; }
+										/* with-rgctx variant: rgctx@216, AOT addr@212; call_indirect (this,args,rgctx)->rv */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216);   /* rgctx (ftndesc.arg) */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);

@@ -1360,7 +1360,19 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 {
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island, mono_wasm_jit_island_budget;
 	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
-	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) && ++cmethod->wasm_jit_hits == mono_wasm_jit_thresh) {
+	/* Hotness gate. The bump MUST be atomic: wasm_jit_hits lives on the SHARED InterpMethod and is bumped
+	 * from every worker (render/server/pool) in the auto-walk. A plain `++` loses updates AND lets one
+	 * thread's write skip the exact threshold value — which under the old (non-atomic) `== thresh` test
+	 * stranded a genuinely-hot method below the island trigger PERMANENTLY (kept running interpreted and
+	 * re-counting: the dominant "below-threshold retry" tail; the bench proved the race live — ISLAND prints
+	 * showed hits=501/96/66 at trigger time). The atomic inc is the actual fix: every value is now produced
+	 * exactly once, so exactly ONE thread ever observes `== thresh` — no skip (no stranding) AND no herd. A
+	 * `>=` test here is wrong: it fires on EVERY eligible caller at/above the threshold, so all concurrent
+	 * callers of a freshly-hot method pile into force_island (one compiles, the rest early-out) and a RETRY
+	 * method re-attempts every call — jit75 showed that as 82k island attempts/window for ~500 real compiles.
+	 * `== thresh` (atomic) keeps the exactly-once trigger; the BUSY back-off re-runs the counter up to thresh
+	 * again, so it still re-fires exactly once per cycle. */
+	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) && mono_atomic_inc_i32 (&cmethod->wasm_jit_hits) == mono_wasm_jit_thresh) {
 		int r;
 		/* Don't whole-method-JIT a method that already has AOT code — it runs faster as native AOT, reached
 		 * via do_jit_call (the residual / vcall-fallback now routes AOT'd callees there). Mark permanent so
@@ -1398,15 +1410,21 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 			 * so the coarse fallback re-attempt (only if no wake ever fires) is a full ~thresh calls away. */
 			if (wj_slot_retriable (cmethod->wasm_jit_slot)) {   /* race guard: never overwrite a slot another thread published >0 / -1 */
 				cmethod->wasm_jit_slot = WASM_JIT_SLOT_PARKED;
-				cmethod->wasm_jit_hits = 0;
+				mono_atomic_store_i32 (&cmethod->wasm_jit_hits, 0);   /* atomic: paired with the atomic inc above (PARKED is woken via wj_promote_q, not the counter) */
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_PARKED);
 			}
 		} else if (r == WASM_JIT_COMPILE_BUSY) {
 			/* Another thread held the compile lock. Keep this distinct from a waiter-parked blocker state so
-			 * event-driven sleepers don't re-enter threshold/promotion retries. */
+			 * event-driven sleepers don't re-enter threshold/promotion retries. Do NOT zero the counter: a
+			 * BUSY is transient (the lock holder is compiling this or a sibling right now), so discarding a
+			 * full threshold's worth of accrued hotness would force the method back through the interpreter
+			 * for another ~thresh calls for no reason — the "erases progress under contention" half of the
+			 * below-threshold-retry tail. Back off by a small fixed stride instead: the method re-attempts a
+			 * handful of calls later (bounded — the `>=` gate + this stride mean no per-call storm) while
+			 * keeping nearly all its progress. */
 			if (wj_slot_retriable (cmethod->wasm_jit_slot)) {
 				cmethod->wasm_jit_slot = WASM_JIT_SLOT_RETRY;
-				cmethod->wasm_jit_hits = 0;
+				mono_atomic_store_i32 (&cmethod->wasm_jit_hits, mono_wasm_jit_thresh > 64 ? mono_wasm_jit_thresh - 64 : 0);
 			}
 		} else {
 			if (wj_slot_retriable (cmethod->wasm_jit_slot)) {   /* same race: don't de-JIT a method another thread just published */
