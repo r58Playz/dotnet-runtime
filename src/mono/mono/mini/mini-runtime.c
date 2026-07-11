@@ -4443,6 +4443,7 @@ init_jit_mem_manager (MonoMemoryManager *mem_manager)
 	info->delegate_info_hash = g_hash_table_new (delegate_class_method_pair_hash, delegate_class_method_pair_equal);
 	info->seq_points = dn_simdhash_ght_new_full (mono_aligned_addr_hash, NULL, NULL, mono_seq_point_info_free, 0, NULL);
 	info->runtime_invoke_hash = mono_conc_hashtable_new_full (mono_aligned_addr_hash, NULL, NULL, runtime_invoke_info_free);
+	info->ftndesc_hash = mono_conc_hashtable_new_full (mono_aligned_addr_hash, NULL, NULL, NULL);   /* values are mempool-allocated ftndescs; no value destructor */
 	info->arch_seq_points = g_hash_table_new (mono_aligned_addr_hash, NULL);
 	mono_jit_code_hash_init (&info->jit_code_hash);
 	mono_jit_code_hash_init (&info->interp_code_hash);
@@ -4514,6 +4515,7 @@ free_jit_mem_manager (MonoMemoryManager *mem_manager)
 	g_hash_table_destroy (info->static_rgctx_trampoline_hash);
 	g_hash_table_destroy (info->mrgctx_hash);
 	mono_conc_hashtable_destroy (info->runtime_invoke_hash);
+	mono_conc_hashtable_destroy (info->ftndesc_hash);
 	dn_simdhash_free (info->seq_points);
 	g_hash_table_destroy (info->arch_seq_points);
 	if (info->agent_info)
