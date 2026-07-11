@@ -43,6 +43,9 @@ int mono_wasm_jit_island = 1;   /* eager transitive island-JIT; MONO_WASM_JIT_IS
 int mono_wasm_jit_auto = -1;
 int mono_wasm_jit_thresh = 2000;
 int mono_wasm_jit_vcall_ic = 1;   /* virtual-dispatch resolve cache; MONO_WASM_JIT_VCALL_IC=0 disables (always resolve) */
+int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiver-arity histogram for the vcall miss population (N-way IC capture curve). Diagnostic — perturbs timing (like PROFILE_FAST); default off */
+int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC (1 = monomorphic/legacy). Clamped [1,8]. 2 captures the ~63% of the miss population that are 2-type sites (arity depth-1) which a 1-way IC gets 0% of. */
+int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inline AOT-vcall IC (1 = monomorphic first-wins/legacy). Clamped [1,8]. 2 captures the AOT-backed 2-type sites (arity depth-0 once VCALL_WAYS>=2): the loser vtable of a 2-way AOT site is stuck reaching the resolve helper behind the 1-entry cache. */
 
 /* NB: compiled into BOTH the browser runtime and mono-aot-cross (no longer HOST_BROWSER-gated) so the
  * OFFLINE cross-compiler dump path (mini.c COMPILE_WASM fork) reads MONO_WASM_JIT_VERBOSE/DUMP_IR/STATS +
@@ -70,6 +73,9 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_virtual; const char *v = g_getenv ("MONO_WASM_JIT_VIRTUAL"); mono_wasm_jit_virtual = (v && *v && *v == '0') ? 0 : 1; } /* 0 = bail virtual calls (revert to whole-method interp); default on */
 	{ extern int mono_wasm_jit_vcall_ic; const char *c = g_getenv ("MONO_WASM_JIT_VCALL_IC"); mono_wasm_jit_vcall_ic = (c && *c && *c == '0') ? 0 : 1; } /* 0 = disable the virtual resolve cache (always resolve) */
+	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
+	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
+	{ extern int mono_wasm_jit_vcall_aot_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_AOT_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_aot_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline AOT-vcall IC; clamp [1,8]; 1 = legacy first-wins */
 	{ extern int mono_wasm_jit_cond_exc; const char *ce = g_getenv ("MONO_WASM_JIT_COND_EXC"); mono_wasm_jit_cond_exc = (ce && *ce && *ce == '0') ? 0 : 1; } /* 0 = bail OP_COND_EXC_* methods to interp */
 	{ extern int mono_wasm_jit_island; const char *il = g_getenv ("MONO_WASM_JIT_ISLAND"); mono_wasm_jit_island = (il && *il && *il == '0') ? 0 : 1; } /* 0 = no eager island formation (bottom-up retry only) */
 	{ extern int mono_wasm_jit_aot_residual; const char *ar = g_getenv ("MONO_WASM_JIT_AOT_RESIDUAL"); mono_wasm_jit_aot_residual = (ar && *ar && *ar == '0') ? 0 : 1; } /* jit->AOT fastpath: residual/vcall-fallback to an AOT'd callee runs it natively via do_jit_call. 0 = old behaviour (interpret it). */
@@ -4305,11 +4311,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #else
 							int fslot_off = 0x40; /* placeholder for offline encoder validation (real offset only matters at runtime) */
 #endif
+							int way;
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
-							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /*   $do_slow (void) */
-							/* OBJGUARD: validate the receiver before the inline IC's raw this->vtable load.
-							 * Otherwise a type-confused scalar/garbage receiver traps as a bare wasm OOB before
-							 * the C resolver can print anything. */
+							/* OBJGUARD (once, hoisted above the N ways): validate the receiver before any raw
+							 * this->vtable load. Otherwise a type-confused scalar/garbage receiver traps as a bare
+							 * wasm OOB before the C resolver can print anything. */
 #ifdef HOST_BROWSER
 							if (G_UNLIKELY (lc.objguard && lc.check_ti >= 0)) {
 								extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
@@ -4319,11 +4325,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) lc.check_ti); wasm_uleb (&body, 0);
 							}
 #endif
+							/* N-WAY inline IC (MONO_WASM_JIT_VCALL_WAYS, default 1 = monomorphic). One BLOCK per cached
+							 * (vtable -> f-slot) entry: a guard failure br 0's to the next way, a hit br 1's to $after.
+							 * A 2-way IC captures the ~63% of miss traffic that are 2-type sites (arity depth-1) which a
+							 * 1-way IC gets 0% of (it thrashes). After all ways: the AOT-IC + resolve_fslot slow path. */
+							for (way = 0; way < mono_wasm_jit_vcall_ways; ++way) {
+							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /*   $way_fail (void) */
 							/* vtab = *(this + 0) */
 							if (!wasm_ld (&body, &lc, this_vr)) { fail = "ic this ld"; goto done; }
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-							/* ic = i64.atomic.load(&vic); $ic = ic; if ((i32)ic != vtab) -> $do_slow */
-							wasm_i32_const (&body, (gint32) (intptr_t) vic);
+							/* ic = i64.atomic.load(&vic[way]); $ic = ic; if ((i32)ic != vtab) -> $way_fail */
+							wasm_i32_const (&body, (gint32) (intptr_t) vic + 8 * way);
 							wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0);   /* i64.atomic.load = 0xfe 0x11 (align 3) */
 							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
 							wasm_op (&body, WASM_OP_I32_WRAP_I64);
@@ -4379,20 +4391,28 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
 							if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "ic fast dreg"; goto done; } }
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> $after (skip the C-helper slow path) */
-							wasm_op (&body, WASM_OP_END);                            /* end $do_slow */
+							wasm_op (&body, WASM_OP_END);                            /* end $way_fail */
+							}   /* for each way -> fall through to the AOT-IC / resolve_fslot slow path */
 							/* --- INLINE AOT-VCALL IC (VCALL_AOT_IC), MT-safe: two atomic i64 words, each vtab-tagged. A hit needs
 							 * BOTH words' low32 == this->vtable; then ti/kind (ic1.hi) and rgctx (ic2.hi) are correct for this
 							 * vtable regardless of interleaved fills (a vtable maps to ONE target -> identical values). Only
 							 * atomic i64 loads (no plain-vs-atomic ordering, which wasm's memory model does not provide). */
 							if (aic) {
-								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_miss ($after now depth 1) */
+								/* N-WAY AOT-IC (MONO_WASM_JIT_VCALL_AOT_WAYS): one BLOCK per cached AOT entry (two vtab-tagged
+								 * i64 at aic+16*way). A hit needs BOTH words' low32 == vtab (already tear-safe: a torn 2-word
+								 * entry fails the both-match check -> miss, never a wrong dispatch, so N-way LRU/fill is MT-safe
+								 * for free). 2 ways capture the AOT 2-type sites whose loser vtable was stuck reaching the helper
+								 * behind the 1-entry first-wins cache. */
+								int aic_way;
+								for (aic_way = 0; aic_way < mono_wasm_jit_vcall_aot_ways; ++aic_way) {
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_way ($after now depth 1) */
 								if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic this ld"; goto done; }
 								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);   /* v = *this */
-								wasm_i32_const (&body, (gint32) (intptr_t) aic); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* a = ic1 (reuse vc_ic_idx i64) */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* a.vtab != v -> miss */
+								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* a = ic1[way] (reuse vc_ic_idx i64) */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* a.vtab != v -> $aot_way (next) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);   /* ti_kind = a>>32 */
-								wasm_i32_const (&body, (gint32) (intptr_t) aic); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 8); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* b = ic2 */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* b.vtab != v -> miss */
+								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 8); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* b = ic2[way] */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* b.vtab != v -> $aot_way (next) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_rgctx_idx);   /* rgctx = b>>32 */
 								wj_emit_fast_count (&body, WJC_FAST_AOTIC);   /* profile: inline AOT-IC hit (JIT->AOT) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);   /* kind2bit */
@@ -4408,7 +4428,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								wasm_op (&body, WASM_OP_END);   /* end kind if/else */
 								if (rv != WASM_VOID) { if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "aot ic dreg"; goto done; } }
 								wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* hit -> $after */
-								wasm_op (&body, WASM_OP_END);   /* end $aot_miss -> slow path */
+								wasm_op (&body, WASM_OP_END);   /* end $aot_way */
+								}   /* for each AOT way -> fall through to resolve_fslot slow path */
 							}
 						}
 						/* $scratch = mono_wasm_jit_scratch() */
@@ -4491,22 +4512,30 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_aotkind_idx);   /* stash kind, keep on stack */
 									wasm_op (&body, WASM_OP_I32_EQZ);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* kind==0 -> $no_aot -> residual */
-									if (aic) {   /* FILL the two-i64 AOT-IC cell: ic1 = vtab | ((ti<<1|kind2)<<32); ic2 = vtab | (rgctx<<32) */
-										/* fill only when the cell is EMPTY (first-vtab-wins): a polymorphic site would otherwise refill on
-										 * every miss — pure waste (never read back). Monomorphic sites fill once and hit thereafter. */
-										wasm_i32_const (&body, (gint32) (intptr_t) aic); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op (&body, WASM_OP_I32_EQZ);
-										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);   /* if (ic1.key == 0) */
-										wasm_i32_const (&body, (gint32) (intptr_t) aic);
+									if (aic) {   /* FILL the FIRST EMPTY of the N AOT-IC entries (each two i64: ic1=vtab|((ti<<1|kind2)<<32), ic2=vtab|(rgctx<<32)) */
+										/* first-empty-win, no eviction: on a MISS the receiver vtab is (was) in no entry, so filling any
+										 * empty slot with it can't dup. A 2-type AOT site fills slot0 with the winner, then slot1 with the
+										 * loser -> both hit thereafter (fixes the 1-entry first-wins thrash). br out after the first fill so
+										 * one miss fills exactly one slot (else the winner would fill every empty slot -> no room for the loser). */
+										int aic_way;
+										wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_filled */
+										for (aic_way = 0; aic_way < mono_wasm_jit_vcall_aot_ways; ++aic_way) {
+										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op (&body, WASM_OP_I32_EQZ);
+										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);   /* if (ic1[way].key == 0) */
+										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way);
 										if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic fill v1"; goto done; } wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U);   /* vtab low32 */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHL);   /* ti<<1 */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx); wasm_i32_const (&body, 2); wasm_op (&body, WASM_OP_I32_EQ); wasm_op (&body, WASM_OP_I32_OR);   /* | kind2bit */
 										wasm_op (&body, WASM_OP_I64_EXTEND_I32_U); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHL); wasm_op (&body, WASM_OP_I64_OR);
-										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 0);   /* i64.atomic.store ic1 */
-										wasm_i32_const (&body, (gint32) (intptr_t) aic);
+										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 0);   /* i64.atomic.store ic1[way] */
+										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way);
 										if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic fill v2"; goto done; } wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U);
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHL); wasm_op (&body, WASM_OP_I64_OR);
-										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 8);   /* i64.atomic.store ic2 */
-										wasm_op (&body, WASM_OP_END);   /* end if-empty */
+										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 8);   /* i64.atomic.store ic2[way] */
+										wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* filled one slot -> exit $aot_filled (skip remaining ways) */
+										wasm_op (&body, WASM_OP_END);   /* end if-empty(way) */
+										}   /* for each AOT way */
+										wasm_op (&body, WASM_OP_END);   /* end $aot_filled */
 									}
 									/* cppeh: bare AOT call — a throwing callee C++-unwinds natively to the nearest landing
 									 * pad (an in-method catch or the interp e-thunk boundary). No try/catch wrapper. */

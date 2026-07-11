@@ -59,6 +59,7 @@
 #include <mono/metadata/environment.h>
 #include <mono/metadata/mono-debug.h>
 #include <mono/metadata/gc-internals.h>
+#include <mono/metadata/object-internals.h>   /* MONO_IMT_SIZE + mono_method_get_imt_slot for the vcall fast-miss slot (mono_wasm_jit_vcall_resolve_fslot) */
 #include <mono/utils/atomic.h>
 
 #include "interp.h"
@@ -859,6 +860,59 @@ mono_wasm_jit_snapshot (void)
 		wj_entry_edges [i].window = 0;
 }
 
+/* Vtable/IMT slot for a virtual/interface base method — mirrors transform.c:get_virt_method_slot
+ * (static there). Stable per call site; the get_virtual_method_fast cache key used by the vcall
+ * fast-miss path (mono_wasm_jit_vcall_resolve[_fslot]). */
+static int
+wj_virt_method_slot (MonoMethod *m)
+{
+	return mono_class_is_interface (m->klass)
+		? (-2 * MONO_IMT_SIZE + mono_method_get_imt_slot (m))
+		: mono_method_get_vtable_slot (m);
+}
+
+/* --- vcall receiver-arity diagnostic (MONO_WASM_JIT_ARITY=1) -------------------------------------
+ * Answers the polymorphic-IC question directly: of the calls that reach the vcall resolve helper (i.e.
+ * MISS the site's monomorphic inline IC), what fraction would an N-way IC capture? Per call site we keep
+ * a shadow LRU of the last WJ_ARITY_WAYS receiver vtables (in the IC cell at +16, allocated only when the
+ * flag is on) and, on each helper call, record the LRU depth at which the receiver is found (depth d =>
+ * an (d+1)-way LRU IC would hit) or "miss" (beyond N distinct => megamorphic). Cumulative depth<=k gives
+ * the k-way capture rate. Counters are plain (not atomic) and the per-site shadow races across MC worker
+ * threads — fine for a distributional diagnostic (like MONO_WASM_JIT_PROFILE_FAST, it perturbs timing, so
+ * run it in a dedicated arity run, not a perf run). */
+#define WJ_ARITY_WAYS 8
+extern int mono_wasm_jit_arity;
+static long long wj_arity_hit [WJ_ARITY_WAYS];   /* receiver found at LRU depth d (0=MRU) */
+static long long wj_arity_miss;                   /* receiver not among the last WJ_ARITY_WAYS distinct vtables */
+
+static void
+wj_arity_record (gpointer ic, MonoVTable *vt)
+{
+	extern int mono_wasm_jit_vcall_ways;
+	guint32 *sh = (guint32 *) ((guint8 *) ic + 8 * (mono_wasm_jit_vcall_ways + 1));   /* after N IC entries + fast-miss meta; sh[0]=most-recent; g_malloc0 => 0 = empty */
+	guint32 v = (guint32) (gsize) vt;                 /* a real vtable pointer is never 0, so 0 slots never false-match */
+	int d = -1, i;
+	for (i = 0; i < WJ_ARITY_WAYS; ++i) if (sh [i] == v) { d = i; break; }
+	if (d < 0) { wj_arity_miss++; for (i = WJ_ARITY_WAYS - 1; i > 0; --i) sh [i] = sh [i - 1]; sh [0] = v; }
+	else       { wj_arity_hit [d]++; for (i = d; i > 0; --i) sh [i] = sh [i - 1]; sh [0] = v; }
+}
+
+static void
+wj_dump_arity (void)
+{
+	long long tot = wj_arity_miss, cum = 0; int i;
+	for (i = 0; i < WJ_ARITY_WAYS; ++i) tot += wj_arity_hit [i];
+	if (!tot) return;
+	printf ("[wasm-jit vcall arity] of calls reaching the resolve helper (miss population), N-way LRU IC capture:\n");
+	for (i = 0; i < WJ_ARITY_WAYS; ++i) {
+		cum += wj_arity_hit [i];
+		printf ("  <=%d-way: %5.1f%%  (depth %d: %lld)\n", i + 1, 100.0 * (double) cum / (double) tot, i, wj_arity_hit [i]);
+	}
+	printf ("  megamorphic (>%d-way): %5.1f%%  (%lld);  sampled %lld helper calls\n",
+		WJ_ARITY_WAYS, 100.0 * (double) wj_arity_miss / (double) tot, wj_arity_miss, tot);
+	fflush (stdout);
+}
+
 /* Top-N interp->JIT entry edges by current-window count, annotated with the CALLER's JIT state so it's
  * obvious whether the caller is promotable-upward (slot 0/parked, jittable) or perm-blocked (slot -1). */
 EMSCRIPTEN_KEEPALIVE void
@@ -884,6 +938,7 @@ mono_wasm_jit_dump_hot_edges (int topn)
 		}
 		lastw = bestw; lasti = best; shown++;
 	}
+	if (mono_wasm_jit_arity) wj_dump_arity ();   /* receiver-arity capture curve (MONO_WASM_JIT_ARITY=1); prints at each benchMeasure window-end */
 	fflush (stdout);
 }
 
@@ -3390,16 +3445,30 @@ mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
 /*
  * mono_wasm_jit_alloc_ic:
  *
- *   Allocate one inline-cache slot (8 bytes in the wasm heap = linear memory: [i32 vtable, i32
- * f-slot], zeroed) for a virtual call site in a wasm-JITted method. The address is baked into the
- * emitted wasm as an i32.const, so the JITted code reads/updates it inline (see mini-wasm.c). One
- * per virtual call site, allocated once at JIT-emit time. Never freed (bounded: one per JITted
+ *   Allocate one inline-cache cell (16 bytes in the wasm heap = linear memory, zeroed; g_malloc0 is
+ * >=8-byte aligned, which the i64 atomics below require) for a virtual call site in a wasm-JITted
+ * method. Two i64 words:
+ *     +0  monomorphic resolve IC: [i32 vtable | i32 InterpMethod* override]. Read inline by the
+ *         emitted wasm (i64.atomic.load) AND by mono_wasm_jit_vcall_resolve_fslot; the +0 address is
+ *         baked into the emitted wasm as an i32.const so the JITted code reads/updates it inline.
+ *     +8  fast-miss metadata: [(guint32) vtable/imt slot | (u32)(InterpMethod* base) << 32], lazily
+ *         filled by resolve_fslot on the FIRST miss (both are a pure function of base_method, so a racy
+ *         concurrent first-miss publish stores identical values) and used to drive get_virtual_method_fast
+ *         (the interp's cached per-(vtable,slot) resolve) on every subsequent miss. Only the C helper
+ *         touches +8; the emitted wasm never reads it.
+ * One per virtual call site, allocated once at JIT-emit time. Never freed (bounded: one per JITted
  * virtual call site).
  */
 gpointer
 mono_wasm_jit_alloc_ic (void)
 {
-	return g_malloc0 (8);
+	/* Layout: [ways x i64 IC entries][i64 fast-miss meta][optional arity shadow]. `ways` and the arity
+	 * flag are fixed at startup, so alloc-time and run-time (resolve_fslot / wj_arity_record) agree on the
+	 * offsets. The arity shadow (+8*(ways+1)) is allocated only when MONO_WASM_JIT_ARITY=1. */
+	extern int mono_wasm_jit_arity, mono_wasm_jit_vcall_ways;
+	int sz = 8 * (mono_wasm_jit_vcall_ways + 1);   /* N IC entries + one fast-miss meta i64 */
+	if (mono_wasm_jit_arity) sz += WJ_ARITY_WAYS * (int) sizeof (guint32);
+	return g_malloc0 (sz);
 }
 
 /* Per-call-site AOT-vcall inline cache cell (VCALL_AOT_IC): TWO atomic i64 words
@@ -3413,7 +3482,8 @@ mono_wasm_jit_alloc_ic (void)
 gpointer
 mono_wasm_jit_alloc_aot_ic (void)
 {
-	return g_malloc0 (16);   /* two atomic i64: +0 = vtab | ((ti<<1|kind2)<<32), +8 = vtab | (rgctx<<32) */
+	extern int mono_wasm_jit_vcall_aot_ways;
+	return g_malloc0 (16 * mono_wasm_jit_vcall_aot_ways);   /* N entries, each two atomic i64: +16k = vtab|((ti<<1|kind2)<<32), +16k+8 = vtab|(rgctx<<32) */
 }
 
 /*
@@ -3856,32 +3926,37 @@ mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
 			mono_wasm_jit_check_store ((guint8 *) this_obj, 5);
 	}
 #endif
-	MonoMethod *target = mono_object_get_virtual_method_internal (this_obj, base_method);
-	if (G_UNLIKELY (!target)) {
-		/* See mono_wasm_jit_vcall_resolve_fslot: a NULL override means a null/corrupt receiver. Raise a
-		 * catchable NRE and return NULL; the emitter's mono_wasm_jit_call_interp(NULL) fallback signals
-		 * threw=1 so the caller bails, instead of dereferencing NULL below. */
-		extern void mono_wasm_jit_throw (MonoObject *exc);
-		mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
-		return NULL;
-	}
-	/* If the resolved override is synchronized, dispatch its SYNCHRONIZED wrapper (Monitor.Enter/Exit):
-	 * the raw body has no monitor ops, and mono_wasm_jit_call_interp's mono_interp_get_imethod does NOT
-	 * substitute the wrapper (unlike get_virtual_method) -> the body would run without the monitor and a
-	 * notify/wait inside throws IllegalMonitorStateException. Do it HERE (before the JITted code spills
-	 * the call's ref args into the GC-invisible scratch), so the wrapper-creation + transform below can
-	 * allocate/GC while the ref args are still on the GC-scanned shadow stack. */
-	if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
+	/* FAST MISS PATH (mirror of mono_wasm_jit_vcall_resolve_fslot): resolve via the interp's cached
+	 * get_virtual_method_fast instead of the uncached mono_object_get_virtual_method_internal (the profiled
+	 * #1 game-thread cost). This is the lower-volume residual sibling with NO per-call-site IC cell, so the
+	 * base imethod + vtable/imt slot are computed fresh: the base-method mono_interp_get_imethod is the SAME
+	 * kind of locked lookup this path already did for the target below, and get_virtual_method_fast itself is
+	 * O(1) after the first (vtable,slot) touch (the table is shared with MINT_CALLVIRT_FAST). It applies
+	 * generic inflation + the synchronized/native wrappers (so the SYNCHRONIZED branch below is a no-op on
+	 * its result) but — like the original of this path — does NOT apply the boxed-valuetype unbox wrapper.
+	 * It asserts a non-NULL override: the emitter materializes callvirt's null check before reaching here, so
+	 * a NULL override means a corrupt receiver (same contract MINT_CALLVIRT_FAST relies on). The resolve can
+	 * still allocate/GC, and — as before — it runs HERE, before the JITted caller spills the call's ref args
+	 * into the GC-invisible scratch, so the ref args are still on the GC-scanned shadow stack. */
+	InterpMethod *base_im = mono_interp_get_imethod (base_method);
+	InterpMethod *imethod = get_virtual_method_fast (base_im, this_obj->vtable, wj_virt_method_slot (base_method));
+	MonoMethod *target = imethod->method;
+	/* Synchronized override -> its SYNCHRONIZED wrapper (Monitor.Enter/Exit): the raw body has no monitor
+	 * ops and mono_wasm_jit_call_interp's mono_interp_get_imethod does NOT substitute the wrapper -> the body
+	 * would run without the monitor and a notify/wait throws IllegalMonitorStateException. get_virtual_method
+	 * already applied it (so this is normally a no-op; kept as belt-and-braces). Re-derive imethod only when
+	 * it fires — get_virtual_method_fast already returned the override's imethod on the common path, so we
+	 * skip an extra locked mono_interp_get_imethod. */
+	if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)) {
 		target = mono_marshal_get_synchronized_wrapper (target);
-	/* Pre-transform the override here too. The JITted code calls this BEFORE spilling the call's
-	 * reference args into the GC-invisible scratch buffer; BOTH the resolve above AND fully preparing a
-	 * cold method (transform + code_type/signature warmup) can allocate -> GC. Doing them now (while the
-	 * ref args still live in the GC-scanned ref shadow stack) lets a GC move them safely.
-	 * mono_wasm_jit_call_interp then finds the imethod already prepared and only does the GC-free marshal
-	 * + interp_entry, so the (now-spilled) scratch pointers stay valid. (Without this, a first-use GC
-	 * inside call_interp — after the spill — would stale the scratch refs, the latent hazard the direct
-	 * residual rarely hit.) */
-	InterpMethod *imethod = mono_interp_get_imethod (target);
+		imethod = mono_interp_get_imethod (target);
+	}
+	/* Pre-transform the override here too. The JITted code calls this BEFORE spilling the call's reference
+	 * args into the GC-invisible scratch buffer; fully preparing a cold method (transform + code_type/
+	 * signature warmup) can allocate -> GC. Doing it now (while the ref args still live in the GC-scanned ref
+	 * shadow stack) lets a GC move them safely. mono_wasm_jit_call_interp then finds the imethod already
+	 * prepared and only does the GC-free marshal + interp_entry, so the (now-spilled) scratch pointers stay
+	 * valid. */
 	{
 		ERROR_DECL (error);
 		if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (target, imethod, error))) {
@@ -3951,33 +4026,68 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	}
 #endif
 	vt = this_obj->vtable;
+	if (G_UNLIKELY (mono_wasm_jit_arity)) wj_arity_record (ic, vt);   /* receiver-diversity histogram (MONO_WASM_JIT_ARITY=1) */
 	/* Read the (vtable | imethod<<32) pair ATOMICALLY. MC builds chunks on worker threads concurrently
 	 * with the render thread, so the same vcall site's IC is written by multiple threads. A non-atomic
 	 * i32-pair read can tear (match an old vtable but read a freshly-written imethod for a DIFFERENT
 	 * receiver type) -> dispatch to the wrong override (NullPointerException) or a wrong-signature f-slot
 	 * call_indirect (traps the worker -> GC can't suspend it). The i64 atomic makes the pair consistent. */
-	extern int mono_wasm_jit_vcall_ic, mono_wasm_jit_stats;
+	extern int mono_wasm_jit_vcall_ic, mono_wasm_jit_stats, mono_wasm_jit_vcall_ways;
 	gboolean use_ic = mono_wasm_jit_vcall_ic;
-	guint64 cached = use_ic ? (guint64) mono_atomic_load_i64 ((volatile gint64 *) icp) : 0;
-	if (use_ic && G_LIKELY ((guint32) cached == (guint32) (gsize) vt)) {
-		imethod = (InterpMethod *) (gsize) (guint32) (cached >> 32);   /* IC hit: skip the resolve + get_imethod */
-		target = imethod->method;
+	int ic_ways = mono_wasm_jit_vcall_ways;
+	gboolean ic_hit = FALSE;
+	if (use_ic) {
+		/* N-way scan: first vtable match wins, in the SAME order the emitted inline IC checks the ways, so
+		 * the C helper and the inline fast path stay in agreement. */
+		int k;
+		for (k = 0; k < ic_ways; ++k) {
+			guint64 c = (guint64) mono_atomic_load_i64 ((volatile gint64 *) (icp + k));
+			if (G_LIKELY ((guint32) c == (guint32) (gsize) vt)) {
+				imethod = (InterpMethod *) (gsize) (guint32) (c >> 32);   /* IC hit: skip the resolve + get_imethod */
+				target = imethod->method;
+				ic_hit = TRUE;
+				break;
+			}
+		}
+	}
+	if (ic_hit) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_HIT);
 	} else {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_MISS);
-		target = mono_object_get_virtual_method_internal (this_obj, base_method);
-		if (G_UNLIKELY (!target)) {
-			/* mono_object_get_virtual_method_internal returns NULL for an unresolvable receiver (object.c:
-			 * "res can be null if klass is abstract and doesn't implement method"). The JIT emitter now
-			 * null-checks the receiver before this call (matching MINT_CALLVIRT_FAST's NULL_CHECK), so a plain
-			 * null receiver raises a catchable NRE and never reaches here; a NULL target now means a corrupt
-			 * receiver. Raise a catchable NRE and store a NULL target so the residual's call_interp(NULL)
-			 * signals threw=1 and the JITted caller bails — instead of dereferencing the NULL override into
-			 * mono_marshal_get_synchronized_wrapper (g_assert(method) abort) or dispatching to garbage. */
-			*(MonoMethod **) (scratch + 200) = NULL;
-			extern void mono_wasm_jit_throw (MonoObject *exc);
-			mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
-			return 0;
+		/* FAST MISS PATH: resolve the override via the interp's per-(vtable,slot) cache
+		 * (get_virtual_method_fast) instead of the uncached mono_object_get_virtual_method_internal — the
+		 * profiled #1 game-thread cost (~150ns/call: a GC HANDLE_FUNCTION frame + mono_class_setup_vtable +
+		 * mono_class_interface_offset_with_variance, run on EVERY call). get_virtual_method_fast indexes
+		 * vtable->ee_data->interp_vtable[slot] — O(1) after the first (vtable,slot) touch — and fills it via
+		 * get_virtual_method on a genuine miss. Crucially it is the SAME table MINT_CALLVIRT_FAST populates,
+		 * so a POLYMORPHIC site whose receiver vtable keeps missing THIS site's monomorphic JIT IC (icp[0])
+		 * still resolves in O(1) here — that is the whole point of the fast miss path.
+		 *
+		 * base_imethod + the vtable/imt slot are a pure function of base_method (fixed per call site), so we
+		 * compute them ONCE on the first miss and cache them in the IC's 2nd i64 (icp[1] = base_imethod<<32 |
+		 * (guint32)slot); a concurrent first-miss writer stores identical values, so the racy publish is
+		 * benign. The slot formula mirrors transform.c:get_virt_method_slot (static there).
+		 *
+		 * get_virtual_method(_fast) already applies generic inflation + the synchronized/native wrappers (so
+		 * the SYNCHRONIZED branch below is a no-op on its result), but NOT the boxed-valuetype unbox wrapper —
+		 * the valuetype branch below still handles that. It asserts a non-NULL override, the same contract
+		 * MINT_CALLVIRT_FAST relies on: the emitter's inline receiver null-check already converted a null
+		 * `this` into a catchable NRE upstream (see the null-`this` guard at the top of this function), so
+		 * only a corrupt receiver could reach a NULL override here, exactly as in the interpreter. */
+		{
+			guint64 meta = (guint64) mono_atomic_load_i64 ((volatile gint64 *) (icp + ic_ways));   /* fast-miss meta sits after the N IC entries */
+			InterpMethod *base_im = (InterpMethod *) (gsize) (guint32) (meta >> 32);
+			int gvm_slot;
+			if (G_UNLIKELY (!base_im)) {
+				base_im = mono_interp_get_imethod (base_method);
+				gvm_slot = wj_virt_method_slot (base_method);
+				mono_atomic_store_i64 ((volatile gint64 *) (icp + ic_ways),
+					(gint64) (((guint64) (guint32) (gsize) base_im << 32) | (guint32) (gint32) gvm_slot));
+			} else {
+				gvm_slot = (gint32) (guint32) meta;
+			}
+			imethod = get_virtual_method_fast (base_im, vt, gvm_slot);
+			target = imethod->method;
 		}
 		/* SIGNATURE-COMPATIBILITY GUARD. The wasm-JIT bakes the call_indirect functype from the CALL SITE's
 		 * signature; the override resolved here must be compatible (same param count, this-ness, void-ness of
@@ -4006,9 +4116,15 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 				return 0;
 			}
 		}
-		if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED))
+		/* `imethod` already holds get_virtual_method_fast's resolved override (the common no-wrapper case),
+		 * so re-derive it ONLY when a wrapper below changes `target` — this skips a redundant, LOCKED
+		 * mono_interp_get_imethod hash lookup (jit_mm_lock) on the hot miss path (~110k/frame). The
+		 * SYNCHRONIZED branch is a no-op on a get_virtual_method result (which already applied the sync
+		 * wrapper — the wrapper is not itself flagged SYNCHRONIZED); it stays as belt-and-braces. */
+		if (G_UNLIKELY (target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)) {
 			target = mono_marshal_get_synchronized_wrapper (target);
-		else if (G_UNLIKELY (m_class_is_valuetype (target->klass) && target->wrapper_type == MONO_WRAPPER_NONE)) {
+			imethod = mono_interp_get_imethod (target);
+		} else if (G_UNLIKELY (m_class_is_valuetype (target->klass) && target->wrapper_type == MONO_WRAPPER_NONE)) {
 			/* Boxed-valuetype virtual/interface receiver: the resolved override's body expects an UNBOXED `this`
 			 * (&data = boxed + sizeof(MonoObject)), but every wasm-JIT vcall path (f-slot fast, vcall_aot, and the
 			 * call_interp residual) forwards the RAW boxed receiver loaded from the callsite vreg. The interp's own
@@ -4018,8 +4134,8 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			 * (and the IC caches the wrapper's imethod, so hits stay correct too). Without this, a valuetype
 			 * override reads/writes fields against the object header -> garbage / type confusion. */
 			target = mono_marshal_get_unbox_wrapper (target);
+			imethod = mono_interp_get_imethod (target);
 		}
-		imethod = mono_interp_get_imethod (target);
 		{
 			ERROR_DECL (error);
 			if (G_UNLIKELY (!wasm_jit_prepare_interp_callee (target, imethod, error))) {
@@ -4033,9 +4149,20 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 				return 0;
 			}
 		}
-		if (use_ic)
+		if (use_ic) {
+			/* LRU-insert (vt -> imethod) as the MRU way, shifting the rest down (evict the oldest). Every
+			 * entry is written as ONE atomic i64, so a concurrent inline reader always sees a whole, valid
+			 * (vtable,imethod) pair in each way — reordering affects only hit rate, never correctness (the
+			 * per-way vtable check + fslot/slot_live gate still guard every dispatch). This is what turns a
+			 * 2-type site's misses into inline hits: both vtables end up cached in the 2 ways and neither
+			 * evicts the other. */
+			int k;
+			for (k = ic_ways - 1; k > 0; --k)
+				mono_atomic_store_i64 ((volatile gint64 *) (icp + k),
+					mono_atomic_load_i64 ((volatile gint64 *) (icp + k - 1)));
 			mono_atomic_store_i64 ((volatile gint64 *) icp,
 				(gint64) (((guint64) (guint32) (gsize) imethod << 32) | (guint32) (gsize) vt));
+		}
 	}
 	*(MonoMethod **) (scratch + 200) = target;   /* for the call_interp fallback (past RET_OFF(192)+8) */
 	/* Force-JIT the hot override so the NEXT vcall to it takes the fast f-slot path instead of falling

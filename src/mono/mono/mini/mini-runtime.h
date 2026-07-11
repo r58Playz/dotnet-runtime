@@ -35,6 +35,10 @@ typedef struct {
 	GHashTable *dynamic_code_hash;
 	/* Maps methods to a RuntimeInvokeInfo structure, protected by the associated MonoDomain lock */
 	MonoConcurrentHashTable *runtime_invoke_hash;
+	/* Maps MonoMethod -> MonoFtnDesc* : caches the llvm_only ldftn/ldvirtftn function descriptor so it is
+	 * not re-allocated from the (never-freed) mem-manager mempool on every ldftn/ldvirtftn — see
+	 * mini_llvmonly_load_method_ftndesc. Lock-free lookup; values live in the mempool (no value destructor). */
+	MonoConcurrentHashTable *ftndesc_hash;
 	/* Maps MonoMethod to a GPtrArray containing sequence point locations */
 	/* Protected by the domain lock */
 	dn_simdhash_ght_t *seq_points;

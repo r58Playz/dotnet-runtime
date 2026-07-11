@@ -8,6 +8,7 @@
 #include <mono/metadata/tokentype.h>
 #include "llvmonly-runtime.h"
 #include "aot-runtime.h"
+#include <mono/utils/mono-conc-hashtable.h>
 
 /*
  * SYNCHRONIZED_INNER wrappers are dummy stubs whose IL just throws
@@ -89,14 +90,39 @@ mini_llvmonly_load_method (MonoMethod *method, gboolean caller_gsharedvt, gboole
 MonoFtnDesc*
 mini_llvmonly_load_method_ftndesc (MonoMethod *method, gboolean caller_gsharedvt, gboolean need_unbox, MonoError *error)
 {
+	/* Cache the ftndesc for the common ldftn/ldvirtftn path (caller_gsharedvt=FALSE, need_unbox=FALSE — what
+	 * mono_ldftn / ldvirtfn_internal use). Without this, every ldftn/ldvirtftn of an AOT-backed method minted
+	 * a fresh MonoFtnDesc from the never-freed mem-manager mempool -> unbounded native leak. It only bites with
+	 * the wasm-JIT on: the JIT dispatches virtual calls straight into AOT bodies, whose ldvirtftn lowers to
+	 * mono_ldvirtfn -> mono_ldftn -> here — a route the interpreter never takes (MINT_JIT_CALL is gated on
+	 * !is_virtual; virtual calls interpret their target, and MINT_LDVIRTFTN already caches on imethod->ftndesc).
+	 * This brings the AOT path to parity. The ftndesc is a pure function of the method (addr = compiled body +
+	 * wrappers, arg = rgctx, both stable per method), so caching is correct and gives stable function-pointer
+	 * identity. Lock-free lookup (hot path = hits); the lock is taken only on the first miss per method. */
+	MonoJitMemoryManager *jit_mm = NULL;
+	gboolean cacheable = !caller_gsharedvt && !need_unbox;
+	if (cacheable) {
+		jit_mm = jit_mm_for_method (method);
+		MonoFtnDesc *cached = (MonoFtnDesc*) mono_conc_hashtable_lookup (jit_mm->ftndesc_hash, method);
+		if (cached)
+			return cached;
+	}
+
 	gpointer addr = mono_compile_method_checked (method, error);
 	return_val_if_nok (error, NULL);
 
 	if (addr) {
 		gpointer arg = NULL;
 		addr = mini_llvmonly_add_method_wrappers (method, (gpointer)addr, caller_gsharedvt, need_unbox, &arg);
-		// FIXME: Cache this
-		return mini_llvmonly_create_ftndesc (method, addr, arg);
+		MonoFtnDesc *ftndesc = mini_llvmonly_create_ftndesc (method, addr, arg);
+		if (cacheable) {
+			jit_mm_lock (jit_mm);
+			MonoFtnDesc *other = (MonoFtnDesc*) mono_conc_hashtable_insert (jit_mm->ftndesc_hash, method, ftndesc);
+			jit_mm_unlock (jit_mm);
+			if (other)   /* lost the publish race: reuse the winner (our extra desc stays in the mempool, one-time & bounded) */
+				ftndesc = other;
+		}
+		return ftndesc;
 	} else {
 		method = unwrap_synchronized_inner (method, error);
 		return_val_if_nok (error, NULL);
