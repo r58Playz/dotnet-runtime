@@ -124,6 +124,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi && *vi != '0') ? 1 : 0;
 	} /* inline vcall IC fast path: 0=off (default), 1=on. Now MT-SAFE on threaded builds — the buggy
 	   * ref.is_null liveness (placeholder sig mismatch, jit138) is replaced by a per-thread slot_live gate. */
+	{ extern int mono_wasm_jit_sp_global; const char *sp = g_getenv ("MONO_WASM_JIT_SP_GLOBAL"); mono_wasm_jit_sp_global = (sp && *sp && *sp != '0') ? 1 : 0; } /* import __stack_pointer as global s.p + use global.get/set for the C-stack frame; requires -Wl,--export=__stack_pointer. default off */
+	{ extern int mono_wasm_jit_ensure_inline; const char *ei = g_getenv ("MONO_WASM_JIT_ENSURE_INLINE"); mono_wasm_jit_ensure_inline = (ei && *ei && *ei != '0') ? 1 : 0; } /* inline the direct-call slot_live fast path; default off == jit77 unconditional ensure_fslot call (bisection kill-switch) */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
@@ -275,6 +277,19 @@ int mono_wasm_jit_vcall_aot_ic = 0;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-
  * equality / funcref->i32 to compare the slot against the placeholder inline). Still one C boundary per hit
  * vs two + resolve for the helper; a full pure-wasm gate would need __tls_base imported to read the bitmap. */
 int mono_wasm_jit_vcall_inline_ic = 0;
+int mono_wasm_jit_ensure_inline = 0;   /* MONO_WASM_JIT_ENSURE_INLINE=1: inline the slot_live fast path before a
+                                        * direct f-slot call (call the ensure_fslot C helper only on a miss) instead
+                                        * of the unconditional per-call helper. Default OFF == jit77 behaviour
+                                        * (unconditional call) — a bisection kill-switch for the startup corruption. */
+int mono_wasm_jit_sp_global = 0;   /* MONO_WASM_JIT_SP_GLOBAL=1: import __stack_pointer as wasm global s.p and use
+                                    * global.get/set 0 for the C-stack frame save/restore instead of the
+                                    * emscripten_stack_get_current()/stackRestore() call_indirects (profiled ~4% of
+                                    * both hot threads). Requires the main module to export __stack_pointer
+                                    * (loader EmccExtraLDFlags: -Wl,--export=__stack_pointer) — the EM_ASM import
+                                    * passes wasmExports["__stack_pointer"] (per-thread). Default OFF: flag-off
+                                    * modules don't import s.p (byte-identical) so the build never depends on the
+                                    * export until enabled. global.set/get and stackRestore()/get_current() touch
+                                    * the SAME __stack_pointer, so the EH-pad/other sites interoperate. */
 
 /* TRUE if `name` is in the comma-separated MONO_WASM_JIT_METHOD list (bring-up targeting). */
 gboolean
@@ -576,7 +591,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 		var t0 = performance.now ();
 		try {
 			var b = HEAPU8.slice (p, p + $3);
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] } });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"] } });
 			if (op) HEAPF64[op >> 3] = performance.now () - t0;
 			if ($0 < 0) {
 				wasmTable.set ($1, inst.exports.t); /* interp-entry thunk: scalar -> interpreter */
@@ -2652,8 +2667,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #ifdef HOST_BROWSER
 #define EMIT_REF_LEAVE() do { if (framebytes > 0) { \
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
-		wasm_i32_const (&body, (gint32) (intptr_t) stackRestore); \
-		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0); \
+		if (mono_wasm_jit_sp_global) { wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); } \
+		else { wasm_i32_const (&body, (gint32) (intptr_t) stackRestore); \
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0); } \
 	} \
 	if (eh_on) {   /* pop this EH method's il_state island (pushed by enter_island in the prologue) */ \
 		extern void mono_wasm_jit_leave_island (void); \
@@ -2769,8 +2785,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		if (leave_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = lt; leave_ti = 2 + nextra++; }
 		uses_calls = TRUE;
 		/* entry_sp = emscripten_stack_get_current () */
-		wasm_i32_const (&body, (gint32) (intptr_t) emscripten_stack_get_current);
-		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) enter_ti); wasm_uleb (&body, 0);
+		if (mono_wasm_jit_sp_global) { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0); }
+		else { wasm_i32_const (&body, (gint32) (intptr_t) emscripten_stack_get_current);
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) enter_ti); wasm_uleb (&body, 0); }
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx);
 		if (framebytes > 0) {
 			/* refbase (frame base) = (entry_sp - framebytes) & ~15; __stack_pointer = refbase */
@@ -2781,8 +2798,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_op (&body, WASM_OP_I32_AND);
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx);
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
-			wasm_i32_const (&body, (gint32) (intptr_t) stackRestore);
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0);
+			if (mono_wasm_jit_sp_global) { wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); }
+			else { wasm_i32_const (&body, (gint32) (intptr_t) stackRestore);
+			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0); }
 			/* memory.fill (refbase, 0, framebytes): the frame is above the SP now, so the GC scans it —
 			 * it must hold no garbage/stale pointers; .NET local zero-init falls out of the same fill */
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
@@ -3864,14 +3882,50 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					 * direct path (no interp residual). emitted: ensure_fslot(call_method, call_fslot). */
 					{
 						extern void mono_wasm_jit_ensure_fslot (MonoMethod *callee, int fslot);
+						extern int mono_wasm_jit_vcall_inline_ic;
 						WasmFuncType et; int eti = -1;
 						memset (&et, 0, sizeof (et)); et.params [0] = WASM_I32; et.params [1] = WASM_I32; et.nparams = 2; et.ret = WASM_VOID;
 						for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &et)) { eti = 2 + k; break; }
 						if (eti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; eti = 2 + nextra++; }
-						wasm_i32_const (&body, (gint32) (intptr_t) call_method);
-						wasm_i32_const (&body, call_fslot);
-						wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ensure_fslot);
-						wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eti); wasm_uleb (&body, 0);
+						/* ensure_fslot's hot path is just slot_live(fslot) — so calling the C helper before EVERY
+						 * direct call was a per-call wasm->C boundary (profiled ~2-3% of both hot threads via
+						 * mono_wasm_jit_ensure_fslot). Inline the bitmap test (mirror of the vcall membase IC at
+						 * the slotlive prologue) and call the helper ONLY on a miss (cold: slot not yet live on
+						 * THIS thread -> lazy registry instantiate). call_fslot is a compile-time constant, so the
+						 * byte/bit indices bake to consts. Needs the prologue-cached &wj_slot_live/_cap, which the
+						 * prologue fetches under (vcall_inline_ic && has_vcall); no-vcall methods keep the plain call.
+						 * Gated by MONO_WASM_JIT_ENSURE_INLINE (default off == unconditional call, jit77 behaviour). */
+						if (mono_wasm_jit_ensure_inline && mono_wasm_jit_vcall_inline_ic && has_vcall) {
+							/* live = (call_fslot < cap) && ((bitmap[call_fslot>>3] >> (call_fslot&7)) & 1) */
+							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
+							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);          /* cap = *(&wj_slot_live_cap) */
+							wasm_i32_const (&body, call_fslot);
+							wasm_op (&body, WASM_OP_I32_GT_U);                                     /* cap > fslot  ==  fslot < cap */
+							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);       /* if (fslot<cap) { bit } else { 0 } */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);      /* bitmap = *(&wj_slot_live) */
+								wasm_i32_const (&body, call_fslot >> 3);
+								wasm_op (&body, WASM_OP_I32_ADD);                                  /* &bitmap[fslot>>3] */
+								wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
+								wasm_i32_const (&body, call_fslot & 7);
+								wasm_op (&body, WASM_OP_I32_SHR_U);
+								wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);       /* bit */
+							wasm_op (&body, WASM_OP_ELSE);
+								wasm_i32_const (&body, 0);
+							wasm_op (&body, WASM_OP_END);
+							wasm_op (&body, WASM_OP_I32_EQZ);                                      /* !live */
+							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);                    /* if (!live) ensure_fslot(callee, fslot) */
+								wasm_i32_const (&body, (gint32) (intptr_t) call_method);
+								wasm_i32_const (&body, call_fslot);
+								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ensure_fslot);
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eti); wasm_uleb (&body, 0);
+							wasm_op (&body, WASM_OP_END);
+						} else {
+							wasm_i32_const (&body, (gint32) (intptr_t) call_method);
+							wasm_i32_const (&body, call_fslot);
+							wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ensure_fslot);
+							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eti); wasm_uleb (&body, 0);
+						}
 					}
 #endif
 					{
@@ -4765,8 +4819,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #ifdef HOST_BROWSER
 		{
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
-			wasm_i32_const (&body, (gint32) (intptr_t) stackRestore);
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0);
+			if (mono_wasm_jit_sp_global) { wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); }
+			else { wasm_i32_const (&body, (gint32) (intptr_t) stackRestore);
+			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) leave_ti); wasm_uleb (&body, 0); }
 		}
 #endif
 		/* milestone 2c: mark the EXCEPTION path (finally_ind = -1, so OP_ENDFINALLY re-raises) ONLY when
@@ -4840,7 +4895,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_memarg (&ethunk, al, 0); /* *ret_ptr = result */
 		}
 		wasm_buf_init (&out);
-		wasm_module_method_and_entry (param_types, nargs, ret_vt, groups, 4, &body, &ethunk, extra_types, (guint32) nextra, uses_calls, uses_eh_tag, (guint32) (eh_type_idx < 0 ? 0 : eh_type_idx), &out);
+		wasm_module_method_and_entry (param_types, nargs, ret_vt, groups, 4, &body, &ethunk, extra_types, (guint32) nextra, uses_calls, uses_eh_tag, (guint32) (eh_type_idx < 0 ? 0 : eh_type_idx), mono_wasm_jit_sp_global, &out);
 		if (mono_wasm_jit_names)
 			wasm_module_append_name_section (&out, mname, mname);
 		wasm_buf_free (&ethunk);

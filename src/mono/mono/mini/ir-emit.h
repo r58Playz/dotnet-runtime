@@ -60,6 +60,16 @@ alloc_ireg_ref (MonoCompile *cfg)
 	if (cfg->compute_gc_maps)
 		mono_mark_vreg_as_ref (cfg, vreg);
 
+#ifdef TARGET_WASM
+	/* See mono_compile_create_var_for_vreg: LLVM-AOT/interp on wasm never set compute_gc_maps, so
+	 * without this the object-reference temporaries allocated here (STACK_OBJ dregs — the vcall
+	 * receiver, load results, newobj, etc.) go unmarked, are never stored into mini-llvm.c's
+	 * conservative gc_pin_area, and their objects move/free under a nursery GC leaving stale refs.
+	 * COMPILE_WASM already seeds refs via compute_gc_maps (gated by MONO_WASM_JIT_GCMAPS). */
+	if (!COMPILE_WASM (cfg))
+		mono_mark_vreg_as_ref (cfg, vreg);
+#endif
+
 	return vreg;
 }
 
