@@ -683,6 +683,20 @@ mono_compile_create_var_for_vreg (MonoCompile *cfg, MonoType *type, int opcode, 
 		}
 	}
 
+#ifdef TARGET_WASM
+	/* LLVM-AOT and interp on wasm never set cfg->compute_gc_maps: the precise GC-map machinery is
+	 * #if 0'd out in mini-gc.c (MONO_ARCH_GC_MAPS_SUPPORTED is undefined for wasm) and the active
+	 * mini_gc_init_gc_map is an empty stub, so the compute_gc_maps block above marks nothing for them.
+	 * They rely on mini-llvm.c's conservative gc_pin_area, which pins exactly the ref vregs marked here.
+	 * Without this marking a ref can live only in a wasm local — invisible to the conservative stack
+	 * scan — so a moving nursery collection relocates (or frees) its object and leaves a stale
+	 * forwarding-pointer reference (observed: a moved java.net.URL crashing the AOT vcall path).
+	 * COMPILE_WASM already seeds refs via compute_gc_maps above (gated by MONO_WASM_JIT_GCMAPS), so
+	 * exclude it here to keep its A/B toggle intact. */
+	if (!COMPILE_WASM (cfg) && mini_type_is_reference (type))
+		mono_mark_vreg_as_ref (cfg, vreg);
+#endif
+
 	cfg->varinfo [num] = inst;
 
 	cfg->vars [num].idx = num;
