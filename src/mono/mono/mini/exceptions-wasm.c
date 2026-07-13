@@ -62,6 +62,19 @@ mono_arch_unwind_frame (MonoJitTlsData *jit_tls,
 		if (*lmf == jit_tls->first_lmf)
 			return FALSE;
 
+		/* The wasm top-LMF marker is an all-zero MonoLMF (MONO_ARCH_INIT_TOP_LMF_ENTRY is empty).
+		 * Normally it is recognized by pointer identity with jit_tls->first_lmf above. A cooperative
+		 * attach/detach or JSPI TLS handoff can, however, leave an older root allocation at the end of
+		 * the active LMF chain while jit_tls->first_lmf names the replacement. It is still a terminal
+		 * marker, not a managed frame: it has no predecessor, address, or method. Recognize that exact
+		 * structural sentinel so StackTrace stops cleanly instead of trying to compile method == NULL.
+		 * Keep the assertion below for every nonterminal NULL-method LMF; linkage or lmf_addr state means
+		 * it is a genuinely malformed/corrupted managed frame and must not be hidden. */
+		if (G_UNLIKELY (!(*lmf)->previous_lmf && !(*lmf)->lmf_addr && !(*lmf)->method)) {
+			*lmf = NULL;
+			return FALSE;
+		}
+
 		/* DIAG (wasm-jit EH unwind): a NULL-method PLAIN LMF here means either a save_lmf method's LMF was
 		 * pushed without its method, or (more likely under aggressive island JIT) a wasm-JIT EH/finally
 		 * codegen wild-store corrupted an LMFExt's previous_lmf (clearing the bit-2 ext tag -> it's read as a

@@ -3283,6 +3283,27 @@ interp_entry (InterpEntryData *data)
 	 * the interp's MINT_JIT_CALL. */
 	extern int mono_wasm_jit_aot_residual;
 	gboolean wj_did_jit_call = FALSE;
+	gboolean wj_external_entry = !wj_entry_is_residual (data) && !rmethod->is_invoke;
+	MonoLMFExt wj_entry_ext;
+	/* Native/AOT callers enter an interpreted target here without executing a MINT_CALL or
+	 * MINT_CALLVIRT_FAST in an interpreter caller. Advance the same full-method wasm-JIT hotness
+	 * counter used by those opcodes, otherwise an override reached only from AOT (for example an
+	 * Object.equals implementation called by an AOT collection helper) can tier to optimized interp
+	 * code and accumulate arbitrarily-hot jiterpreter traces without ever attempting the full-method
+	 * JIT. Do not count the immediate wasm-JIT residual entry: its JITted caller already resolved and
+	 * counted the callee, and counting it again would make residual-heavy call sites promote at twice
+	 * the configured rate. Delegate Invoke is replaced with a generated wrapper above; that wrapper
+	 * dispatches its actual target through MINT_CALL, so leave it to the normal call-site trigger. */
+	if (G_UNLIKELY (wj_external_entry)) {
+		/* Unlike a wasm-JIT residual caller, a native/AOT caller has no wasm island LMF protecting
+		 * this transition. Compilation can safepoint, and a successfully compiled non-EH method has
+		 * no IL_STATE island of its own, so keep the marshalled interp frame visible across both the
+		 * compile and the possible immediate redirect. This is the same boundary MINT_CALL uses before
+		 * mono_wasm_jit_invoke_caught; without it the unwinder reaches the AOT entry's incomplete plain
+		 * save-LMF (method == NULL) and exceptions-wasm aborts. */
+		interp_push_lmf (&wj_entry_ext, &frame);
+		wasm_jit_maybe_compile (frame.imethod);
+	}
 	/* wasm-JIT e-slot redirect: if the target method has itself been wasm-JITted (a live entry thunk),
 	 * run its COMPILED wasm body via the e-thunk instead of interpreting it. This is what makes a JITted
 	 * method reached through a NON-MINT_CALL entry actually execute in wasm rather than as its interp copy:
@@ -3295,11 +3316,9 @@ interp_entry (InterpEntryData *data)
 	 * is EXACTLY the e-thunk's (args_ptr) layout; the e-thunk stores the result back at sp+0, and the shared
 	 * return tail below marshals it to data->res identically to the mono_interp_exec_method path. A thrown
 	 * callee sets the interp resume-state inside mono_wasm_jit_invoke_caught, which the has_resume_state /
-	 * need_native_unwind tail propagates — same model as the AOT residual branch. No extra interp_push_lmf:
-	 * the JITted caller that reached this entry already pushed its island LMF (prologue), and the e-thunk
-	 * callee pushes its own, so the managed->native boundary is marked without a callee-frame INTERP_EXIT LMF
-	 * (whose null ip could mis-match pass-1). Delegate-invoke (is_invoke) rewrites rmethod to the invoke
-	 * wrapper, which is not JITted and dispatches its target via its own MINT_CALL — skip it here. */
+	 * need_native_unwind tail propagates — same model as the AOT residual branch. A wasm-JIT residual caller
+	 * already has an island LMF; a native/AOT entry uses wj_entry_ext above. Delegate-invoke (is_invoke)
+	 * rewrites rmethod to the invoke wrapper, which dispatches its target via MINT_CALL — skip it here. */
 	{
 		extern int mono_wasm_jit_entry_redirect;
 		gint32 wj_eslot = rmethod->wasm_jit_slot;
@@ -3315,6 +3334,8 @@ interp_entry (InterpEntryData *data)
 			}
 		}
 	}
+	if (G_UNLIKELY (wj_external_entry))
+		interp_pop_lmf (&wj_entry_ext);
 	if (!wj_did_jit_call && G_UNLIKELY (wj_entry_is_residual (data)) && mono_wasm_jit_aot_residual) {
 		InterpMethodCodeType ct = rmethod->code_type;
 		if (ct == IMETHOD_CODE_UNKNOWN) {
@@ -12301,6 +12322,19 @@ mono_jiterp_interp_entry (void *res)
 		extern int mono_wasm_jit_entry_redirect;
 		InterpMethod *wj_rm = header.rmethod;
 		gboolean wj_dispatched = FALSE;
+		MonoLMFExt wj_entry_ext;
+		/* This entry is the jiterpreter thunk used by native/AOT callers. Like interp_entry above, it
+		 * bypasses every interpreter call opcode, so it must feed the full-method wasm-JIT hotness gate
+		 * itself. Compile before testing the slot so the threshold-crossing invocation can immediately
+		 * redirect to the newly-published e-thunk. Delegate Invoke wrappers dispatch their real target
+		 * through MINT_CALL and are intentionally left to that trigger. */
+		if (!wj_rm->is_invoke) {
+			/* This is an external managed-to-interp entry, not an interp MINT_CALL and not the explicit
+			 * wasm-JIT residual helper. Keep the prepared interp frame on the LMF chain while compilation
+			 * safepoints and while a compiled non-EH body runs. */
+			interp_push_lmf (&wj_entry_ext, &frame);
+			wasm_jit_maybe_compile (wj_rm);
+		}
 		if (mono_wasm_jit_entry_redirect && G_UNLIKELY (wj_rm->wasm_jit_slot > 0) && !wj_rm->is_invoke) {
 			extern int mono_wasm_jit_admit (int desc_id);
 			if (G_LIKELY (mono_wasm_jit_admit (wj_rm->wasm_jit_desc))) {
@@ -12309,6 +12343,8 @@ mono_jiterp_interp_entry (void *res)
 				wj_dispatched = TRUE;
 			}
 		}
+		if (!wj_rm->is_invoke)
+			interp_pop_lmf (&wj_entry_ext);
 		if (!wj_dispatched)
 			mono_interp_exec_method (&frame, header.context, NULL);
 	}
