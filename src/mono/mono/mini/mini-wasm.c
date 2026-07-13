@@ -215,6 +215,16 @@ int mono_wasm_jit_virtual = 1;
 /* Defined here (not in the HOST_BROWSER block) because mono_wasm_emit_method references it in BOTH the
  * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (HOST_BROWSER). */
 int mono_wasm_jit_cond_exc = 1;   /* JIT OP_COND_EXC_* (checked-op throws); MONO_WASM_JIT_COND_EXC=0 bails those methods */
+#ifndef HOST_BROWSER
+/* Cross-compiler (host != wasm) stub. mono_wasm_emit_method bakes &mono_wasm_jit_check_store into the
+ * OBJGUARD/STOREGUARD store paths (the STOREM/STOREMI macros), and that code is compiled in BOTH the
+ * runtime and the AOT cross build — but the real body (below, in the HOST_BROWSER block) uses wasm-only
+ * builtins (__builtin_wasm_memory_size), so it cannot compile for the x64 host. The cross-compiler never
+ * calls mono_wasm_emit_method (that runs only when cfg->compile_wasm, the runtime browser JIT), so a
+ * never-executed stub here just satisfies the link without perturbing the browser build. */
+void mono_wasm_jit_check_store (guint8 *addr, int kind);
+void mono_wasm_jit_check_store (guint8 *addr, int kind) { (void) addr; (void) kind; }
+#endif
 int mono_wasm_jit_aot_residual = 1;   /* jit->AOT fastpath: route a wasm-JITted method's residual/vcall-fallback to an AOT'd callee through do_jit_call (native) instead of interpreting it; MONO_WASM_JIT_AOT_RESIDUAL=0 reverts */
 int mono_wasm_jit_inline_aot = 0;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the inline direct same-ABI AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry/frame/LMF) instead of the residual, for AOT'd callees. Build 1 = no wasm-EH yet (test non-throwing callees). default off. */
 int mono_wasm_jit_eh_nocxa = 0;       /* MONO_WASM_JIT_EH_NOCXA=1 (bisection): skip the __cxa_begin_catch/end_catch in the in-method catch landing pad, to test whether the cxa lifecycle (on nested catch + try re-entry) is the world-load corruption. */
