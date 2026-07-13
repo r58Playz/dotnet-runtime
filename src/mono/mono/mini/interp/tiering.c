@@ -43,6 +43,20 @@ get_tier_up_imethod (InterpMethod *imethod)
 	if (old_imethod->optimized) {
 		new_imethod = old_imethod; /* leak the newly allocated InterpMethod to the mempool */
 	} else {
+		/* Runtime wasm-JIT identity belongs to the logical method, not to one interpreter tier. Preserve
+		 * the atomically-published descriptor and all policy/diagnostic state when replacing its imethod. */
+		new_imethod->wasm_jit_slot = old_imethod->wasm_jit_slot;
+		new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;
+		new_imethod->wasm_jit_fslot = old_imethod->wasm_jit_fslot;
+		new_imethod->wasm_jit_hits = old_imethod->wasm_jit_hits;
+		new_imethod->wasm_jit_bytes_len = old_imethod->wasm_jit_bytes_len;
+		new_imethod->wasm_jit_bytes = old_imethod->wasm_jit_bytes;
+		new_imethod->wasm_jit_bail = old_imethod->wasm_jit_bail;
+		new_imethod->wasm_jit_invoke_in = old_imethod->wasm_jit_invoke_in;
+		new_imethod->wasm_jit_block_n = old_imethod->wasm_jit_block_n;
+		new_imethod->wasm_jit_invoke_out = old_imethod->wasm_jit_invoke_out;
+		new_imethod->wasm_jit_resv_eslot = old_imethod->wasm_jit_resv_eslot;
+		new_imethod->wasm_jit_resv_fslot = old_imethod->wasm_jit_resv_fslot;
 		mono_internal_hash_table_remove (&jit_mm->interp_code_hash, method);
 		mono_internal_hash_table_insert (&jit_mm->interp_code_hash, method, new_imethod);
 	}

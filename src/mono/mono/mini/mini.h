@@ -1347,7 +1347,10 @@ typedef struct {
  * the cross-compiler too).
  */
 #define MONO_WASM_JIT_MAX_BLOCKERS 32
+#define MONO_WASM_JIT_MAX_DIRECT_DEPS 128
 typedef struct {
+	int          desc_id;            /* immutable centralized descriptor; published atomically on InterpMethod */
+	guint32      f_sig_id;           /* stable hash of the emitted scalar wasm ABI */
 	int          e_slot;             /* entry-thunk table slot; >0 = success gate */
 	int          f_slot;             /* scalar fn slot */
 	void        *bytes;              /* g_malloc'd module bytes; ownership passes to InterpMethod */
@@ -1357,6 +1360,10 @@ typedef struct {
 	int          nblockers;          /* # entries in blockers[] (residual=0 island pre-scan) */
 	guint8       blockers_truncated; /* 1 if more than MONO_WASM_JIT_MAX_BLOCKERS distinct blockers existed */
 	MonoMethod  *blockers [MONO_WASM_JIT_MAX_BLOCKERS]; /* un-JITted direct callees; inline so it survives the by-value copy out of cfg */
+	int          ndirect_deps;       /* exact f-slots reached by unchecked direct calls in this module */
+	guint8       direct_deps_truncated;
+	int          direct_deps [MONO_WASM_JIT_MAX_DIRECT_DEPS];
+	guint32      direct_dep_sig [MONO_WASM_JIT_MAX_DIRECT_DEPS];
 } MonoWasmJitResult;
 
 /*
