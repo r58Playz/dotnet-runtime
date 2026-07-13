@@ -69,6 +69,7 @@ mono_wasm_jit_auto_init (void)
 	 * dispatch etc. — kept >=3 so a stats/bail run at verbose<=2 is never flooded by per-invocation logs). The 23k-line log
 	 * came from these firing whenever stats was on; the aggregated bail histogram replaces them at level 0. */
 	{ extern int mono_wasm_jit_verbose; const char *vb = g_getenv ("MONO_WASM_JIT_VERBOSE"); mono_wasm_jit_verbose = (vb && *vb) ? atoi (vb) : 0; }
+	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm && *nm != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_virtual; const char *v = g_getenv ("MONO_WASM_JIT_VIRTUAL"); mono_wasm_jit_virtual = (v && *v && *v == '0') ? 0 : 1; } /* 0 = bail virtual calls (revert to whole-method interp); default on */
@@ -125,7 +126,6 @@ mono_wasm_jit_auto_init (void)
 	} /* inline vcall IC fast path: 0=off (default), 1=on. Now MT-SAFE on threaded builds — the buggy
 	   * ref.is_null liveness (placeholder sig mismatch, jit138) is replaced by a per-thread slot_live gate. */
 	{ extern int mono_wasm_jit_sp_global; const char *sp = g_getenv ("MONO_WASM_JIT_SP_GLOBAL"); mono_wasm_jit_sp_global = (sp && *sp && *sp != '0') ? 1 : 0; } /* import __stack_pointer as global s.p + use global.get/set for the C-stack frame; requires -Wl,--export=__stack_pointer. default off */
-	{ extern int mono_wasm_jit_ensure_inline; const char *ei = g_getenv ("MONO_WASM_JIT_ENSURE_INLINE"); mono_wasm_jit_ensure_inline = (ei && *ei && *ei != '0') ? 1 : 0; } /* inline the direct-call slot_live fast path; default off == jit77 unconditional ensure_fslot call (bisection kill-switch) */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
@@ -171,6 +171,7 @@ mono_wasm_jit_max (int idx, gint64 v)
 /* Per-method emit LOG verbosity (MONO_WASM_JIT_VERBOSE), independent of the counters: 0 silent, 1
  * registered+invalid, 2 +bail, 3 +emit-enter. Default 0 so a stats run no longer floods stdout. */
 int mono_wasm_jit_verbose = 0;
+const char *mono_wasm_jit_watch = NULL;
 int mono_wasm_jit_names = 0;   /* MONO_WASM_JIT_NAMES=1 emits a wasm name section per JITted module so traps self-symbolicate */
 
 /* Aggregated bail-reason histogram (Part 4): the per-method WASM_JIT_BAIL lines (7028 of them in the
@@ -277,10 +278,6 @@ int mono_wasm_jit_vcall_aot_ic = 0;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-
  * equality / funcref->i32 to compare the slot against the placeholder inline). Still one C boundary per hit
  * vs two + resolve for the helper; a full pure-wasm gate would need __tls_base imported to read the bitmap. */
 int mono_wasm_jit_vcall_inline_ic = 0;
-int mono_wasm_jit_ensure_inline = 0;   /* MONO_WASM_JIT_ENSURE_INLINE=1: inline the slot_live fast path before a
-                                        * direct f-slot call (call the ensure_fslot C helper only on a miss) instead
-                                        * of the unconditional per-call helper. Default OFF == jit77 behaviour
-                                        * (unconditional call) — a bisection kill-switch for the startup corruption. */
 int mono_wasm_jit_sp_global = 0;   /* MONO_WASM_JIT_SP_GLOBAL=1: import __stack_pointer as wasm global s.p and use
                                     * global.get/set 0 for the C-stack frame save/restore instead of the
                                     * emscripten_stack_get_current()/stackRestore() call_indirects (profiled ~4% of
@@ -522,6 +519,8 @@ mono_wasm_jit_dump_bail_hist (void)
  * the slot isn't live on this thread, instead of trapping. */
 static __thread guint8 *wj_slot_live = NULL;
 static __thread int wj_slot_live_cap = 0;   /* capacity, in slots */
+static __thread guint8 *wj_slot_installed = NULL;
+static __thread int wj_slot_installed_cap = 0;
 
 static void
 wj_mark_slot_live (int slot)
@@ -540,6 +539,31 @@ wj_mark_slot_live (int slot)
 		wj_slot_live_cap = ncap;
 	}
 	wj_slot_live [slot >> 3] |= (guint8) (1u << (slot & 7));
+}
+
+static void
+wj_mark_slot_installed (int slot)
+{
+	if (slot <= 0)
+		return;
+	if (G_UNLIKELY (slot >= wj_slot_installed_cap)) {
+		int oldbytes = (wj_slot_installed_cap + 7) / 8;
+		int ncap = wj_slot_installed_cap ? wj_slot_installed_cap : 1024;
+		int nbytes;
+		while (slot >= ncap) ncap *= 2;
+		nbytes = (ncap + 7) / 8;
+		wj_slot_installed = (guint8 *)g_realloc (wj_slot_installed, nbytes);
+		memset (wj_slot_installed + oldbytes, 0, nbytes - oldbytes);
+		wj_slot_installed_cap = ncap;
+	}
+	wj_slot_installed [slot >> 3] |= (guint8)(1u << (slot & 7));
+}
+
+static int
+wj_slot_is_installed (int slot)
+{
+	return slot > 0 && slot < wj_slot_installed_cap &&
+		((wj_slot_installed [slot >> 3] >> (slot & 7)) & 1);
 }
 
 /* TRUE iff THIS thread successfully instantiated the module owning `slot` (so call_indirect-ing it is
@@ -607,10 +631,11 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 		}
 	}, e_slot, f_slot, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms);
 	if (_ok) {
-		/* record which slots this thread now has the REAL export in, so the invoke paths can tell a live
-		 * slot from a jiterpreter placeholder and fall back to interp instead of trapping (see wj_slot_live). */
-		wj_mark_slot_live (e_slot);
-		wj_mark_slot_live (f_slot);
+		/* Physical installation is not dispatch admission. A freshly compiled module can have unchecked
+		 * direct dependencies that are still placeholders on this thread; only mono_wasm_jit_admit marks
+		 * e/f live after recursively admitting the complete closure. */
+		wj_mark_slot_installed (e_slot);
+		wj_mark_slot_installed (f_slot);
 	}
 	return _ok;
 }
@@ -631,11 +656,23 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
  * and the entry (barrier) BEFORE bumping wj_reg_n; readers acquire wj_reg_n (sync_thread under the loader
  * lock; mono_wasm_jit_instantiate_fslot via a barrier after snapshotting wj_reg_n). Appends serialized
  * under the loader lock. */
-typedef struct { int e, f, len; void *bytes; } WjRegEntry;
+typedef struct {
+	int e, f, len;
+	void *bytes;
+	MonoMethod *body_method;    /* method whose IR was emitted */
+	MonoMethod *logical_method; /* wrapper/method whose InterpMethod publishes this descriptor */
+	guint32 f_sig_id;
+	int ndeps;
+	int *deps; /* immutable f-slot dependency list */
+	guint32 *dep_sig;
+} WjRegEntry;
 #define WJ_REG_CHUNK   8192
 #define WJ_REG_NCHUNKS 1024      /* up to 8M JITted methods; the 4KB top-level pointer array never moves */
 static WjRegEntry *wj_reg_chunks [WJ_REG_NCHUNKS];
 static volatile int wj_reg_n = 0;
+#define WJ_SLOT_CHUNK 8192
+#define WJ_SLOT_NCHUNKS 1024
+static gint32 *wj_fslot_desc_chunks [WJ_SLOT_NCHUNKS]; /* f-slot -> descriptor id (registry index + 1) */
 /* serialize registry appends + per-thread sync; the loader lock is global + always inited at startup */
 extern void mono_loader_lock (void);
 extern void mono_loader_unlock (void);
@@ -649,13 +686,22 @@ wj_reg_at (int i)
 	return chunk ? &chunk [i % WJ_REG_CHUNK] : NULL;
 }
 
-void
-mono_wasm_jit_register (int e_slot, int f_slot, void *bytes, int len)
+int
+mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, const int *deps, const guint32 *dep_sig, int ndeps)
 {
+	int desc_id = 0;
 	mono_loader_lock ();
 	{
 		int n = wj_reg_n;
 		int ci = n / WJ_REG_CHUNK;
+		int fci = f_slot > 0 ? f_slot / WJ_SLOT_CHUNK : -1;
+		if (fci >= 0 && fci < WJ_SLOT_NCHUNKS && wj_fslot_desc_chunks [fci] &&
+			wj_fslot_desc_chunks [fci][f_slot % WJ_SLOT_CHUNK] != 0) {
+			printf ("WASM_JIT_FSLOT_COLLISION f=%d old_desc=%d new_method=%s — refusing slot reuse\n",
+				f_slot, wj_fslot_desc_chunks [fci][f_slot % WJ_SLOT_CHUNK], method->name ? method->name : "?");
+			mono_loader_unlock ();
+			return 0;
+		}
 		if (ci < WJ_REG_NCHUNKS) {
 			WjRegEntry *chunk = wj_reg_chunks [ci];
 			if (!chunk) {
@@ -667,8 +713,25 @@ mono_wasm_jit_register (int e_slot, int f_slot, void *bytes, int len)
 			chunk [n % WJ_REG_CHUNK].f = f_slot;
 			chunk [n % WJ_REG_CHUNK].bytes = bytes;
 			chunk [n % WJ_REG_CHUNK].len = len;
+			chunk [n % WJ_REG_CHUNK].body_method = method;
+			chunk [n % WJ_REG_CHUNK].logical_method = method;
+			chunk [n % WJ_REG_CHUNK].f_sig_id = f_sig_id;
+			chunk [n % WJ_REG_CHUNK].ndeps = ndeps;
+			if (ndeps > 0) {
+				chunk [n % WJ_REG_CHUNK].deps = g_new (int, ndeps);
+				memcpy (chunk [n % WJ_REG_CHUNK].deps, deps, sizeof (int) * ndeps);
+				chunk [n % WJ_REG_CHUNK].dep_sig = g_new (guint32, ndeps);
+				memcpy (chunk [n % WJ_REG_CHUNK].dep_sig, dep_sig, sizeof (guint32) * ndeps);
+			}
+			if (f_slot > 0 && f_slot / WJ_SLOT_CHUNK < WJ_SLOT_NCHUNKS) {
+				int ci2 = f_slot / WJ_SLOT_CHUNK;
+				if (!wj_fslot_desc_chunks [ci2])
+					wj_fslot_desc_chunks [ci2] = g_new0 (gint32, WJ_SLOT_CHUNK);
+				wj_fslot_desc_chunks [ci2][f_slot % WJ_SLOT_CHUNK] = n + 1;
+			}
 			mono_memory_barrier ();            /* publish the entry before the count */
 			wj_reg_n = n + 1;
+			desc_id = n + 1;
 		} else {
 			/* >8M JITted methods (absurd) — the chunk-pointer array is full. The method is JITted
 			 * (im->wasm_jit_* set) but NOT in wj_reg, so sync_thread can't pre-populate it;
@@ -678,6 +741,122 @@ mono_wasm_jit_register (int e_slot, int f_slot, void *bytes, int len)
 		}
 	}
 	mono_loader_unlock ();
+	return desc_id;
+}
+
+void
+mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method)
+{
+	WjRegEntry *re;
+	if (desc_id <= 0 || !logical_method)
+		return;
+	mono_loader_lock ();
+	re = desc_id <= wj_reg_n ? wj_reg_at (desc_id - 1) : NULL;
+	if (re) {
+		/* Rebinding is valid only for the synchronized-inner body substitution or the same method. */
+		if (re->logical_method != re->body_method && re->logical_method != logical_method) {
+			char *oldn = mono_method_get_full_name (re->logical_method);
+			char *newn = mono_method_get_full_name (logical_method);
+			printf ("WASM_JIT_LOGICAL_REBIND desc=%d old=%s new=%s\n", desc_id, oldn, newn);
+			g_free (oldn); g_free (newn);
+		} else {
+			re->logical_method = logical_method;
+		}
+	}
+	mono_loader_unlock ();
+}
+
+static int
+wj_desc_for_fslot (int fslot)
+{
+	int ci = fslot / WJ_SLOT_CHUNK;
+	if (fslot <= 0 || ci < 0 || ci >= WJ_SLOT_NCHUNKS || !wj_fslot_desc_chunks [ci])
+		return 0;
+	mono_memory_barrier ();
+	return wj_fslot_desc_chunks [ci][fslot % WJ_SLOT_CHUNK];
+}
+
+/* Per-worker admission state. Generated direct calls contain no liveness checks: a root may enter only
+ * after this DFS has installed its complete immutable direct-call closure in the worker's table. */
+static __thread guint8 *wj_desc_state;
+static __thread int wj_desc_state_cap;
+
+static void
+wj_desc_state_ensure (int id)
+{
+	if (id < wj_desc_state_cap)
+		return;
+	{
+		int old = wj_desc_state_cap, cap = old ? old : 1024;
+		while (id >= cap) cap *= 2;
+		wj_desc_state = (guint8 *) g_realloc (wj_desc_state, cap);
+		memset (wj_desc_state + old, 0, cap - old);
+		wj_desc_state_cap = cap;
+	}
+}
+
+int
+mono_wasm_jit_admit (int desc_id)
+{
+	WjRegEntry *re;
+	int i;
+	gboolean watch;
+	char eb [192]; double ms = 0;
+	if (desc_id <= 0 || desc_id > wj_reg_n)
+		return 0;
+	wj_desc_state_ensure (desc_id + 1);
+	mono_memory_barrier ();
+	re = wj_reg_at (desc_id - 1);
+	if (!re)
+		return 0;
+	watch = mono_wasm_jit_watch && re->logical_method && re->logical_method->name &&
+		strstr (re->logical_method->name, mono_wasm_jit_watch);
+	if (watch)
+		printf ("WASM_JIT_ADMIT_BEGIN desc=%d method=%s state=%d e=%d/live%d f=%d/live%d deps=%d\n",
+			desc_id, re->logical_method->name, wj_desc_state [desc_id], re->e,
+			mono_wasm_jit_slot_live (re->e), re->f, mono_wasm_jit_slot_live (re->f), re->ndeps);
+	if (wj_desc_state [desc_id] == 2) {
+		if (watch) printf ("WASM_JIT_ADMIT_CACHED desc=%d\n", desc_id);
+		return 1;
+	}
+	if (wj_desc_state [desc_id] == 1)
+		return 1; /* dependency cycle within this admission DFS */
+	if (wj_desc_state [desc_id] == 3)
+		return 0;
+	wj_desc_state [desc_id] = 1;
+	for (i = 0; i < re->ndeps; ++i) {
+		int dep_id = wj_desc_for_fslot (re->deps [i]);
+		WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
+		if (watch)
+			printf ("WASM_JIT_ADMIT_DEP parent=%d i=%d f=%d dep=%d state=%d e_live=%d f_live=%d\n",
+				desc_id, i, re->deps [i], dep_id,
+				dep_id > 0 && dep_id < wj_desc_state_cap ? wj_desc_state [dep_id] : -1,
+				dep ? mono_wasm_jit_slot_live (dep->e) : 0, dep ? mono_wasm_jit_slot_live (dep->f) : 0);
+		if (!dep_id || !dep || dep->f_sig_id != re->dep_sig [i]) {
+			printf ("WASM_JIT_ABI_MISMATCH desc=%d dep_fslot=%d expected=0x%x actual=0x%x\n",
+				desc_id, re->deps [i], re->dep_sig [i], dep ? dep->f_sig_id : 0);
+			goto fail;
+		}
+		if (!mono_wasm_jit_admit (dep_id))
+			goto fail;
+	}
+	/* The compiling worker already installed this descriptor; other workers instantiate it once here. */
+	if (!wj_slot_is_installed (re->e) || !wj_slot_is_installed (re->f)) {
+		eb [0] = 0;
+		if (!mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len, eb, (int) sizeof (eb), &ms)) {
+			printf ("WASM_JIT_ADMIT_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
+			goto fail;
+		}
+	}
+	/* Publish dispatchability only after every unchecked direct dependency is admitted. */
+	wj_mark_slot_live (re->e);
+	wj_mark_slot_live (re->f);
+	wj_desc_state [desc_id] = 2;
+	if (watch) printf ("WASM_JIT_ADMIT_OK desc=%d e_live=%d f_live=%d\n", desc_id, mono_wasm_jit_slot_live (re->e), mono_wasm_jit_slot_live (re->f));
+	return 1;
+fail:
+	wj_desc_state [desc_id] = 3;
+	return 0;
 }
 
 void
@@ -1603,6 +1782,16 @@ functype_eq (const WasmFuncType *a, const WasmFuncType *b)
 	return TRUE;
 }
 
+static guint32
+wj_functype_hash (const WasmFuncType *t)
+{
+	guint32 h = 2166136261u, i;
+	h = (h ^ t->nparams) * 16777619u;
+	for (i = 0; i < t->nparams; ++i)
+		h = (h ^ (guint32)t->params [i]) * 16777619u;
+	return (h ^ (guint32)t->ret) * 16777619u;
+}
+
 /* Opcode -> name, for the ref-safety IR dump (MONO_WASM_JIT_REFDIAG) and the bail message. mono_inst_name
  * is compiled out under DISABLE_LOGGING, so re-include mini-ops.h with our own MINI_OP to build a private
  * name table. (Defined unconditionally — also used by the WASM_JIT_BAIL print, incl. the offline dump.) */
@@ -1684,6 +1873,26 @@ wj_result_add_blocker (MonoWasmJitResult *res, MonoMethod *m)
 		res->blockers [res->nblockers++] = m;
 	else
 		res->blockers_truncated = 1;
+}
+
+static void
+wj_result_add_direct_dep (MonoWasmJitResult *res, int fslot, guint32 sig_id)
+{
+	int i;
+	if (fslot <= 0)
+		return;
+	for (i = 0; i < res->ndirect_deps; ++i)
+		if (res->direct_deps [i] == fslot) {
+			if (res->direct_dep_sig [i] != sig_id)
+				res->direct_deps_truncated = 1; /* same slot observed with two ABIs: reject emission */
+			return;
+		}
+	if (res->ndirect_deps < MONO_WASM_JIT_MAX_DIRECT_DEPS) {
+		res->direct_deps [res->ndirect_deps] = fslot;
+		res->direct_dep_sig [res->ndirect_deps++] = sig_id;
+	}
+	else
+		res->direct_deps_truncated = 1;
 }
 
 /* Pre-scan (residual=0 / islands only): enumerate ALL direct un-JITted callees that would HARD-BLOCK this
@@ -1926,13 +2135,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int fail_op = -1;
 	char *mname = mono_method_get_full_name (cfg->method);
 #ifdef HOST_BROWSER
-	/* Self-recursive DIRECT calls under residual=0: a method calling itself can't bake its own f-slot
-	 * because the slot doesn't exist until this compile finishes. Reserve our OWN e/f-slot pair lazily on
-	 * the first self-call (reusing a pair recycled from a prior bailed self-emit if one is pending — the
-	 * jiterp table is append-only, so we can't free) and bake it; the success path instantiates INTO these.
-	 * 0 = none reserved. wj_recycle_* is a per-thread (__thread) static so it needs no lock and can never
-	 * alias a slot across threads even on the unserialized name-targeted compile path. */
-	static __thread int wj_recycle_e_slot = 0, wj_recycle_f_slot = 0;
+	/* Self-recursive calls reserve a fresh immutable slot pair. Failed reservations are intentionally
+	 * orphaned: recycling is incompatible with baked f-slot identities and append-only descriptors. */
 	int wj_self_e_slot = 0, wj_self_f_slot = 0;
 #endif
 
@@ -3841,14 +4045,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (call_method == cfg->method) {
 					extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 					/* SCC batch: the orchestrator reserved our slot on the imethod -> get_callee_fslot returns
-					 * it. Otherwise this is standalone self-recursion: reserve our own e/f-slot pair here
-					 * (reusing a recycled pair from a prior bailed self-emit) and bake it; the success path
-					 * instantiates INTO these. Table exhausted (alloc -> 0) -> fall through to the not-jitted bail. */
+					 * it. Otherwise standalone self-recursion reserves a fresh immutable e/f pair and bakes it;
+					 * a failed reservation is orphaned rather than recycled. */
 					call_fslot = mono_wasm_jit_get_callee_fslot (call_method);
 					if (call_fslot <= 0) {
 						if (!wj_self_f_slot) {
-							if (wj_recycle_f_slot) { wj_self_e_slot = wj_recycle_e_slot; wj_self_f_slot = wj_recycle_f_slot; wj_recycle_e_slot = 0; wj_recycle_f_slot = 0; }
-							else { wj_self_e_slot = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */); wj_self_f_slot = mono_jiterp_allocate_table_entry (1); }
+							wj_self_e_slot = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+							wj_self_f_slot = mono_jiterp_allocate_table_entry (1);
 						}
 						call_fslot = wj_self_f_slot;
 					}
@@ -3861,6 +4064,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #endif
 				if (call_fslot > 0) {
 					/* Callee is wasm-JITted: direct call_indirect through its f-slot (Phase 2). */
+#ifdef HOST_BROWSER
+					wj_result_add_direct_dep (&cfg->wasm_jit_result, call_fslot, wj_functype_hash (&ct));
+					if (cfg->wasm_jit_result.direct_deps_truncated) { fail = "too many direct dependencies"; goto done; }
+#endif
 					for (k = 0; k < nextra; ++k)
 						if (functype_eq (&extra_types [k], &ct)) { type_idx = 2 + k; break; }
 					if (type_idx < 0) {
@@ -3872,62 +4079,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* arg source vregs captured at method-to-ir time (calls.c), not call->args
 					 * (which gets corrupted by later vreg passes) */
 					if (!call->call_info) { fail = "no captured call args"; goto done; }
-#ifdef HOST_BROWSER
-					/* SYNC-ON-CALL: ensure the callee's module is instantiated in THIS thread's per-thread
-					 * function table BEFORE the direct call_indirect. The slot may still hold the jiterpreter
-					 * placeholder on a worker that ran this (self-compiled/island-run) caller without fully
-					 * syncing the callee -> call_indirect of a placeholder is a signature-mismatch trap. The
-					 * helper no-ops (one branch) once the slot is live; on a miss it lazily instantiates the
-					 * SPECIFIC callee module (robust vs the sync watermark) and returns, keeping the fast
-					 * direct path (no interp residual). emitted: ensure_fslot(call_method, call_fslot). */
-					{
-						extern void mono_wasm_jit_ensure_fslot (MonoMethod *callee, int fslot);
-						extern int mono_wasm_jit_vcall_inline_ic;
-						WasmFuncType et; int eti = -1;
-						memset (&et, 0, sizeof (et)); et.params [0] = WASM_I32; et.params [1] = WASM_I32; et.nparams = 2; et.ret = WASM_VOID;
-						for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &et)) { eti = 2 + k; break; }
-						if (eti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = et; eti = 2 + nextra++; }
-						/* ensure_fslot's hot path is just slot_live(fslot) — so calling the C helper before EVERY
-						 * direct call was a per-call wasm->C boundary (profiled ~2-3% of both hot threads via
-						 * mono_wasm_jit_ensure_fslot). Inline the bitmap test (mirror of the vcall membase IC at
-						 * the slotlive prologue) and call the helper ONLY on a miss (cold: slot not yet live on
-						 * THIS thread -> lazy registry instantiate). call_fslot is a compile-time constant, so the
-						 * byte/bit indices bake to consts. Needs the prologue-cached &wj_slot_live/_cap, which the
-						 * prologue fetches under (vcall_inline_ic && has_vcall); no-vcall methods keep the plain call.
-						 * Gated by MONO_WASM_JIT_ENSURE_INLINE (default off == unconditional call, jit77 behaviour). */
-						if (mono_wasm_jit_ensure_inline && mono_wasm_jit_vcall_inline_ic && has_vcall) {
-							/* live = (call_fslot < cap) && ((bitmap[call_fslot>>3] >> (call_fslot&7)) & 1) */
-							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
-							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);          /* cap = *(&wj_slot_live_cap) */
-							wasm_i32_const (&body, call_fslot);
-							wasm_op (&body, WASM_OP_I32_GT_U);                                     /* cap > fslot  ==  fslot < cap */
-							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);       /* if (fslot<cap) { bit } else { 0 } */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
-								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);      /* bitmap = *(&wj_slot_live) */
-								wasm_i32_const (&body, call_fslot >> 3);
-								wasm_op (&body, WASM_OP_I32_ADD);                                  /* &bitmap[fslot>>3] */
-								wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
-								wasm_i32_const (&body, call_fslot & 7);
-								wasm_op (&body, WASM_OP_I32_SHR_U);
-								wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);       /* bit */
-							wasm_op (&body, WASM_OP_ELSE);
-								wasm_i32_const (&body, 0);
-							wasm_op (&body, WASM_OP_END);
-							wasm_op (&body, WASM_OP_I32_EQZ);                                      /* !live */
-							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);                    /* if (!live) ensure_fslot(callee, fslot) */
-								wasm_i32_const (&body, (gint32) (intptr_t) call_method);
-								wasm_i32_const (&body, call_fslot);
-								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ensure_fslot);
-								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eti); wasm_uleb (&body, 0);
-							wasm_op (&body, WASM_OP_END);
-						} else {
-							wasm_i32_const (&body, (gint32) (intptr_t) call_method);
-							wasm_i32_const (&body, call_fslot);
-							wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_ensure_fslot);
-							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eti); wasm_uleb (&body, 0);
-						}
-					}
-#endif
 					{
 						int *wargs = (int *) call->call_info;
 						for (ai = 0; ai < (int) ct.nparams; ++ai)
@@ -4937,27 +5088,36 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * no per-thread-relay ordering dance needed. We still write the e_slot gate AFTER register +
 				 * sync_thread so it's only set once this method's callees are guaranteed live on this thread. */
 				if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_REGISTERED); mono_wasm_jit_add (WJC_BYTES_GENERATED, (gint64) out.len); }
-				{ extern void mono_wasm_jit_register (int e_slot, int f_slot, void *bytes, int len); mono_wasm_jit_register (e_slot, f_slot, cached, (int) out.len); }
-				if (mono_wasm_jit_verbose >= 1) { printf ("WASM_JIT_REGISTERED %s e_slot=%d f_slot=%d len=%u\n", mname, e_slot, f_slot, (unsigned) out.len); }
-				/* The self-instantiate above populated ONLY this method's slots on this thread. But an
-				 * island/eager compile can run this freshly-compiled method on THIS SAME thread without going
-				 * back through the interp invoke path (interp.c MINT_CALL), which is where a thread otherwise
-				 * picks up the per-thread function-table sync. This method's baked direct JIT->JIT f-slot calls
-				 * (which have no slot_live guard) then target callee slots this thread may never have
-				 * instantiated -> the slot still holds the jiterpreter placeholder (mono_jiterp_placeholder_jit_call,
-				 * (i32,i32,i32,i32)->void) -> a call_indirect signature-mismatch trap. Bring this thread fully
-				 * current now: every callee is registered before its caller, so syncing the whole prefix here
-				 * guarantees all of this method's direct f-slot callees are live before it can run. No-op fast
-				 * path when already current. */
-				mono_wasm_jit_sync_thread ();
+				{ WasmFuncType self_ft;
+				  extern int mono_wasm_jit_register (MonoMethod *, int, int, void *, int, guint32, const int *, const guint32 *, int);
+				  memset (&self_ft, 0, sizeof (self_ft));
+				  for (i = 0; i < nargs; ++i) self_ft.params [i] = param_types [i];
+				  self_ft.nparams = (guint32)nargs; self_ft.ret = ret_vt;
+				  cfg->wasm_jit_result.f_sig_id = wj_functype_hash (&self_ft);
+				  cfg->wasm_jit_result.desc_id = mono_wasm_jit_register (cfg->method, e_slot, f_slot, cached, (int) out.len,
+					cfg->wasm_jit_result.f_sig_id, cfg->wasm_jit_result.direct_deps,
+					cfg->wasm_jit_result.direct_dep_sig, cfg->wasm_jit_result.ndirect_deps); }
+				if (cfg->wasm_jit_result.desc_id <= 0) {
+					g_free (cached);
+					cached = NULL;
+				} else {
+					if (mono_wasm_jit_verbose >= 1) {
+						printf ("WASM_JIT_REGISTERED %s desc=%d e_slot=%d f_slot=%d len=%u deps=%d [", mname, cfg->wasm_jit_result.desc_id, e_slot, f_slot, (unsigned) out.len, cfg->wasm_jit_result.ndirect_deps);
+						for (i = 0; i < cfg->wasm_jit_result.ndirect_deps; ++i)
+							printf ("%s%d/0x%x", i ? "," : "", cfg->wasm_jit_result.direct_deps [i], cfg->wasm_jit_result.direct_dep_sig [i]);
+						printf ("]\n");
+					}
+				}
 				/* Write the success result onto cfg (read back by mono_wasm_force_compile after the compile
 				 * returns, on this same thread). e_slot is the >0 success gate the readers test; no cross-thread
 				 * barrier needed here — the result is consumed on this thread via cfg, and the cross-thread
 				 * publish to InterpMethod.wasm_jit_slot keeps its own barrier in wasm_jit_compile_publish. */
-				cfg->wasm_jit_result.bytes = cached;
-				cfg->wasm_jit_result.bytes_len = (int) out.len;
-				cfg->wasm_jit_result.f_slot = f_slot;
-				cfg->wasm_jit_result.e_slot = e_slot;
+				if (cached) {
+					cfg->wasm_jit_result.bytes = cached;
+					cfg->wasm_jit_result.bytes_len = (int) out.len;
+					cfg->wasm_jit_result.f_slot = f_slot;
+					cfg->wasm_jit_result.e_slot = e_slot;
+				}
 			} else {
 				g_free (cached);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_INVALID);
@@ -5011,12 +5171,6 @@ done:
 	/* No on-fail clear needed: the success fields (e_slot/f_slot/bytes) are only written on the
 	 * instantiate-success path above, and this cfg is private to this compile — a nested re-entrant
 	 * compile has its own cfg and cannot have set them here (the old per-thread-relay clobber is gone). */
-	/* Reserved a self-slot pair but didn't instantiate into it (bail / invalid module) -> hand it to the
-	 * recycle so the next self-recursive emit reuses it instead of leaking the append-only table entry. */
-	if (wj_self_f_slot && cfg->wasm_jit_result.f_slot != wj_self_f_slot && !wj_recycle_f_slot) {
-		wj_recycle_e_slot = wj_self_e_slot;
-		wj_recycle_f_slot = wj_self_f_slot;
-	}
 #endif
 	if (fail) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) {

@@ -10197,10 +10197,13 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 			 * result rides on cfg->wasm_jit_result and is copied into r (no thread-local relays). */
 			mono_wasm_force_compile (method, &r);
 			if (r.e_slot > 0) {
+				extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
+				mono_wasm_jit_bind_logical (r.desc_id, imethod->method);
 				/* publish bytes/fslot first, then the slot last (the "ready" flag the invoke checks) */
 				imethod->wasm_jit_fslot = r.f_slot;
 				imethod->wasm_jit_bytes = r.bytes;
 				imethod->wasm_jit_bytes_len = r.bytes_len;
+				imethod->wasm_jit_desc = r.desc_id;
 				mono_memory_barrier ();
 				imethod->wasm_jit_slot = r.e_slot; /* survives the tmp_imethod round-trip */
 			}

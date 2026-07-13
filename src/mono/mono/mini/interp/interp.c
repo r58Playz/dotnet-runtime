@@ -1020,6 +1020,7 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 	if (im->wasm_jit_fslot > 0) {
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		if (out) {
+			out->desc_id = im->wasm_jit_desc;
 			out->e_slot = im->wasm_jit_slot;
 			out->f_slot = im->wasm_jit_fslot;
 			out->bytes = im->wasm_jit_bytes;
@@ -1032,12 +1033,22 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 	if (out)
 		*out = r;
 	if (r.e_slot > 0) {
+		extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
+		MonoMethod *logical_method = im->method;
+		MonoJitMemoryManager *jit_mm = jit_mm_for_method (logical_method);
+		mono_wasm_jit_bind_logical (r.desc_id, logical_method);
+		/* Serialize against tiering.c replacing the InterpMethod. Whichever operation wins the jit-mm lock,
+		 * the descriptor is either published to the replacement or copied by tier-up before replacement. */
+		jit_mm_lock (jit_mm);
+		im = (InterpMethod *)mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, logical_method);
 		im->wasm_jit_fslot = r.f_slot;
 		im->wasm_jit_bytes = r.bytes;
 		im->wasm_jit_bytes_len = r.bytes_len;
-		mono_memory_barrier ();   /* cross-thread: publish bytes/fslot before the >0 slot gate other threads test */
+		im->wasm_jit_desc = r.desc_id;
+		mono_memory_barrier ();   /* publish the immutable descriptor and compatibility fields before the slot gate */
 		im->wasm_jit_slot = r.e_slot;
-		wj_waiter_drain (im->method);   /* event-driven wake: re-queue any methods parked waiting on this callee */
+		jit_mm_unlock (jit_mm);
+		wj_waiter_drain (logical_method);   /* event-driven wake: re-queue any methods parked waiting on this callee */
 		return WASM_JIT_COMPILE_JITTED;
 	}
 	if (r.retriable) {
@@ -1181,15 +1192,22 @@ out:
 		/* Publish all. Every member is registered now, so once invocable a baked cross-cycle call_indirect
 		 * resolves via ensure_fslot. Set fslot before the wasm_jit_slot gate (cross-thread visibility). */
 		for (i = 0; i < n; i++) {
-			InterpMethod *im = mono_interp_get_imethod (members [i]);
-			if (im->wasm_jit_fslot > 0) { im->wasm_jit_resv_eslot = 0; im->wasm_jit_resv_fslot = 0; continue; }
+			InterpMethod *im;
+			MonoJitMemoryManager *jit_mm = jit_mm_for_method (members [i]);
+			extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
+			mono_wasm_jit_bind_logical (results [i].desc_id, members [i]);
+			jit_mm_lock (jit_mm);
+			im = (InterpMethod *)mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, members [i]);
+			if (im->wasm_jit_fslot > 0) { im->wasm_jit_resv_eslot = 0; im->wasm_jit_resv_fslot = 0; jit_mm_unlock (jit_mm); continue; }
 			im->wasm_jit_bytes = results [i].bytes;
 			im->wasm_jit_bytes_len = results [i].bytes_len;
 			mono_memory_barrier ();
 			im->wasm_jit_fslot = results [i].f_slot;
+			im->wasm_jit_desc = results [i].desc_id;
 			mono_memory_barrier ();
 			im->wasm_jit_slot = results [i].e_slot;
 			im->wasm_jit_resv_eslot = 0; im->wasm_jit_resv_fslot = 0;
+			jit_mm_unlock (jit_mm);
 		}
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		for (i = 0; i < n; i++)
@@ -3286,13 +3304,11 @@ interp_entry (InterpEntryData *data)
 		extern int mono_wasm_jit_entry_redirect;
 		gint32 wj_eslot = rmethod->wasm_jit_slot;
 		if (mono_wasm_jit_entry_redirect && G_UNLIKELY (wj_eslot > 0) && !rmethod->is_invoke) {
-			extern void mono_wasm_jit_sync_thread (void);
-			extern int mono_wasm_jit_slot_live (int slot);
+			extern int mono_wasm_jit_admit (int desc_id);
 			/* Bring THIS thread's function table up to date, then confirm the slot actually instantiated
 			 * here (sync can fail on a worker under memory pressure while the compiling thread succeeded;
 			 * call_indirect-ing a mismatched placeholder would trap). If not live, fall through to interpret. */
-			mono_wasm_jit_sync_thread ();
-			if (G_LIKELY (mono_wasm_jit_slot_live (wj_eslot))) {
+			if (G_LIKELY (mono_wasm_jit_admit (rmethod->wasm_jit_desc))) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 				mono_wasm_jit_invoke_caught (method, wj_eslot, frame.stack, frame.stack);
 				wj_did_jit_call = TRUE;
@@ -4193,14 +4209,12 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	if (imethod->wasm_jit_fslot <= 0)
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_fslot > 0) {
-		extern void mono_wasm_jit_sync_thread (void);
-		extern int mono_wasm_jit_slot_live (int slot);
-		mono_wasm_jit_sync_thread ();
+		extern int mono_wasm_jit_admit (int desc_id);
 		/* Only return the f-slot if THIS thread actually instantiated that module. sync_thread can fail to
 		 * instantiate on a worker (OOM/CompileError under pressure) while it succeeded on the compiling
 		 * thread; the slot then holds a jiterpreter placeholder and call_indirect-ing it traps the worker.
 		 * Fall through to the interp residual (call_interp) instead. */
-		if (mono_wasm_jit_slot_live (imethod->wasm_jit_fslot)) {
+		if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
 				mono_wasm_jit_count (WJC_FASTVCALL);
 				mono_wasm_jit_count (had_fslot ? WJC_VFAST_HAD : WJC_VFAST_NEW);
@@ -7354,14 +7368,12 @@ main_loop:
 			 * jit_call (AOT do_jit_call / interp), preserving existing behaviour. */
 			wasm_jit_maybe_compile (cmethod);
 			if (G_UNLIKELY (cmethod->wasm_jit_slot > 0)) {
-				extern void mono_wasm_jit_sync_thread (void);
-				extern int mono_wasm_jit_slot_live (int slot);
-				mono_wasm_jit_sync_thread ();
+				extern int mono_wasm_jit_admit (int desc_id);
 				/* Only call the JITted e-thunk if THIS thread actually instantiated it. sync_thread can fail to
 				 * instantiate a module on a worker (OOM/CompileError under pressure) while it succeeded on the
 				 * compiling thread; the slot then holds a jiterpreter placeholder of a different signature, and
 				 * call_indirect-ing it traps + kills the worker. Run in the interpreter (jit_call) instead. */
-				if (G_UNLIKELY (!mono_wasm_jit_slot_live (cmethod->wasm_jit_slot)))
+				if (G_UNLIKELY (!mono_wasm_jit_admit (cmethod->wasm_jit_desc)))
 					goto jit_call;
 				{
 					MonoLMFExt ext;
@@ -7454,14 +7466,12 @@ jit_call:
 					/* Bring THIS thread's per-thread function table up to date (instantiate any JITted
 					 * methods registered since this thread last synced) before invoking, so both this method
 					 * and any methods it calls via f-slot call_indirect are present in this thread's table. */
-					extern void mono_wasm_jit_sync_thread (void);
-					mono_wasm_jit_sync_thread ();
-					{ extern int mono_wasm_jit_slot_live (int slot);
+					{ extern int mono_wasm_jit_admit (int desc_id);
 					/* Only call the JITted e-thunk if THIS thread actually instantiated it. sync_thread can fail to
 					 * instantiate a module on a worker (OOM/CompileError under pressure) while it succeeded on the
 					 * compiling thread; the slot then holds a jiterpreter placeholder of a different signature and
 					 * call_indirect-ing it traps + kills the worker. Interpret the method instead. */
-					if (G_UNLIKELY (!mono_wasm_jit_slot_live (cmethod->wasm_jit_slot)))
+					if (G_UNLIKELY (!mono_wasm_jit_admit (cmethod->wasm_jit_desc)))
 						goto interp_call;
 					}
 					{
@@ -12292,10 +12302,8 @@ mono_jiterp_interp_entry (void *res)
 		InterpMethod *wj_rm = header.rmethod;
 		gboolean wj_dispatched = FALSE;
 		if (mono_wasm_jit_entry_redirect && G_UNLIKELY (wj_rm->wasm_jit_slot > 0) && !wj_rm->is_invoke) {
-			extern void mono_wasm_jit_sync_thread (void);
-			extern int mono_wasm_jit_slot_live (int slot);
-			mono_wasm_jit_sync_thread ();
-			if (G_LIKELY (mono_wasm_jit_slot_live (wj_rm->wasm_jit_slot))) {
+			extern int mono_wasm_jit_admit (int desc_id);
+			if (G_LIKELY (mono_wasm_jit_admit (wj_rm->wasm_jit_desc))) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 				mono_wasm_jit_invoke_caught (wj_rm->method, (gint32) wj_rm->wasm_jit_slot, frame.stack, frame.stack);
 				wj_dispatched = TRUE;
