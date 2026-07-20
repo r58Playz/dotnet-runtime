@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.IO;
 using System.Threading.Tasks;
 using System.Linq;
@@ -94,6 +95,116 @@ namespace Wasm.Build.Tests
             => await TestMain("bug49588_native_relinking", s_bug49588_ProgramCS, config, aot,
                         extraArgs: "-p:WasmBuildNative=true",
                         isNativeBuild: true);
+
+        [Theory]
+        [BuildAndRun(config: Configuration.Release, aot: false)]
+        public async Task WasmJitExceptionHandling(Configuration config, bool aot)
+        {
+            const string targetedMethods =
+                "WasmJitEhCatch,WasmJitEhConditionalThrow,WasmJitEhTypedCatch," +
+                "WasmJitEhThrowLeaf,WasmJitEhCatchJitCallee,WasmJitEhCatchInterpCallee," +
+                "WasmJitEhCatchAcrossGc,WasmJitEhRethrow,WasmJitEhCatchThrowsReplacement," +
+                "WasmJitEhFinallyNormal,WasmJitEhFinallyThrow,WasmJitEhFinallyReplacesException," +
+                "WasmJitEhCatchInsideNormalFinally," +
+                "WasmJitEhCatchInsideExceptionalFinally,WasmJitEhInnerFinallyThrow," +
+                "WasmJitEhOuterCatchInnerFinally,WasmJitEhMismatchedCatch,WasmJitEhNullThrow," +
+                "WasmJitEhFault,WasmJitEhFilterFallback,WasmJitEhNestedFinallyFallback," +
+                "WasmJitEhComplexFinallyFallback";
+
+            ProjectInfo info = CopyTestAsset(config, aot, TestAsset.WasmBasicTestApp, "wasm_jit_eh");
+            ReplaceFile(
+                Path.Combine("Common", "Program.cs"),
+                Path.Combine(BuildEnvironment.TestAssetsPath, "EntryPoints", "WasmJitEh.cs"));
+            PublishProject(
+                info,
+                config,
+                new PublishOptions(AOT: false, ExtraMSBuildArgs: "-p:WasmBuildNative=true"),
+                isNativeBuild: true);
+
+            NameValueCollection query = new()
+            {
+                ["MONO_WASM_JIT_METHOD"] = targetedMethods,
+                ["MONO_WASM_JIT_EH"] = "1",
+                ["MONO_WASM_JIT_VERBOSE"] = "2",
+                ["MONO_WASM_JIT_STATS"] = "1",
+            };
+            RunResult result = await RunForPublishWithWebServer(new BrowserRunOptions(
+                config,
+                TestScenario: "WasmJitEhTest",
+                BrowserQueryString: query,
+                ExpectedExitCode: 42));
+
+            Assert.Contains(result.ConsoleOutput, line => line.Contains("WASM_JIT_EH_TEST_PASS"));
+
+            string[] nativeEhMethods =
+            {
+                "WasmJitEhCatch", "WasmJitEhTypedCatch",
+                "WasmJitEhThrowLeaf", "WasmJitEhCatchJitCallee", "WasmJitEhCatchInterpCallee",
+                "WasmJitEhCatchAcrossGc", "WasmJitEhRethrow", "WasmJitEhCatchThrowsReplacement",
+                "WasmJitEhFinallyNormal", "WasmJitEhFinallyThrow", "WasmJitEhFinallyReplacesException",
+                "WasmJitEhCatchInsideNormalFinally",
+                "WasmJitEhCatchInsideExceptionalFinally", "WasmJitEhInnerFinallyThrow",
+                "WasmJitEhOuterCatchInnerFinally", "WasmJitEhMismatchedCatch", "WasmJitEhNullThrow",
+                "WasmJitEhFault",
+            };
+            foreach (string method in nativeEhMethods)
+                Assert.Contains(result.ConsoleOutput, line =>
+                    line.Contains("WASM_JIT_REGISTERED") && line.Contains($"WasmJitEhTests:{method}"));
+
+            // checked addition currently lowers to int_addcc, which the wasm-JIT does not support. Keep
+            // this as a non-EH-opcode fallback guard: its catch still has to execute correctly in interp.
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("WASM_JIT_BAIL") && line.Contains("WasmJitEhTests:WasmJitEhConditionalThrow") &&
+                line.Contains("int_addcc"));
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("WASM_JIT_BAIL") && line.Contains("WasmJitEhTests:WasmJitEhFilterFallback") &&
+                line.Contains("filter not supported"));
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("WASM_JIT_BAIL") && line.Contains("WasmJitEhTests:WasmJitEhNestedFinallyFallback") &&
+                line.Contains("nested finally inside finally handler"));
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("WASM_JIT_BAIL") && line.Contains("WasmJitEhTests:WasmJitEhComplexFinallyFallback") &&
+                line.Contains("complex call_handler continuation"));
+        }
+
+        [Theory]
+        [BuildAndRun(config: Configuration.Release, aot: true)]
+        public async Task WasmJitAotExceptionBoundary(Configuration config, bool aot)
+        {
+            const string targetedMethods =
+                "WasmJitEhAotThrowToJitCatch,WasmJitEhJitThrowToAotCatch," +
+                "WasmJitEhAotThrowToJitRethrow,WasmJitEhJitFinallyToAotCatch";
+
+            ProjectInfo info = CopyTestAsset(config, aot, TestAsset.WasmBasicTestApp, "wasm_jit_aot_eh_boundary");
+            ReplaceFile(
+                Path.Combine("Common", "Program.cs"),
+                Path.Combine(BuildEnvironment.TestAssetsPath, "EntryPoints", "WasmJitEhAotBoundary.cs"));
+            PublishProject(info, config, new PublishOptions(AOT: true), isNativeBuild: true);
+
+            NameValueCollection query = new()
+            {
+                ["MONO_WASM_JIT_METHOD"] = targetedMethods,
+                ["MONO_WASM_JIT_EH"] = "1",
+                ["MONO_WASM_JIT_VERBOSE"] = "2",
+                ["MONO_WASM_JIT_STATS"] = "1",
+                ["MONO_LOG_LEVEL"] = "debug",
+                ["MONO_LOG_MASK"] = "aot",
+            };
+            RunResult result = await RunForPublishWithWebServer(new BrowserRunOptions(
+                config,
+                AOT: true,
+                TestScenario: "WasmJitEhTest",
+                BrowserQueryString: query,
+                ExpectedExitCode: 42));
+
+            Assert.Contains(result.ConsoleOutput, line => line.Contains("WASM_JIT_AOT_EH_BOUNDARY_PASS"));
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("Found statically linked AOT module 'WasmBasicTestApp'"));
+
+            foreach (string method in targetedMethods.Split(','))
+                Assert.Contains(result.ConsoleOutput, line =>
+                    line.Contains("WASM_JIT_REGISTERED") && line.Contains($"WasmJitEhAotBoundaryTests:{method}"));
+        }
 
         [Theory]
         [BuildAndRun]

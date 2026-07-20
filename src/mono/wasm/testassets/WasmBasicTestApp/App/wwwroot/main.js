@@ -166,6 +166,20 @@ switch (testCase) {
     case "EnvVariablesTest":
         dotnet.withEnvironmentVariable("foo", "bar");
         break;
+    case "WasmJitEhTest":
+        // Runtime wasm-JIT controls are process environment variables. Keep this scenario explicit so
+        // arbitrary query parameters are not promoted into the environment for unrelated tests.
+        for (const name of [
+            "MONO_WASM_JIT_METHOD",
+            "MONO_WASM_JIT_EH",
+            "MONO_WASM_JIT_VERBOSE",
+            "MONO_WASM_JIT_STATS",
+        ]) {
+            const value = params.get(name);
+            if (value !== null)
+                dotnet.withEnvironmentVariable(name, value);
+        }
+        break;
     case "HttpNoStreamingTest":
         break;
     case "BrowserProfilerTest":
@@ -237,6 +251,7 @@ try {
         case "OutErrOverrideWorks":
         case "DotnetRun":
         case "MainWithArgs":
+        case "WasmJitEhTest":
             dotnet.run();
             break;
         case "DebugLevelTest":

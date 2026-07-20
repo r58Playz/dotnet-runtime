@@ -4729,7 +4729,12 @@ mono_wasm_jit_leave_island (void)
 	if (G_UNLIKELY (wj_island_sp <= 0))
 		return;
 	is = wj_island_at (--wj_island_sp);
-	mono_pop_lmf (&is->ext.lmf);
+	/* Exception pass 1 can already have rewound the TLS LMF past this island to
+	 * an outer AOT/interpreter handler.  In that case restoring the predecessor
+	 * captured on island entry resurrects frames which the unwinder deliberately
+	 * retired.  Only unlink the island when it is still the current TLS top. */
+	if (mono_get_lmf () == &is->ext.lmf)
+		mono_pop_lmf (&is->ext.lmf);
 	mono_wasm_jit_cur_island_il_state = is->prev;
 	wj_finally_trim (is->finally_sp);
 }
@@ -4747,7 +4752,8 @@ mono_wasm_jit_island_sp_restore (int sp)
 {
 	while (wj_island_sp > sp) {
 		WjIsland *is = wj_island_at (--wj_island_sp);
-		mono_pop_lmf (&is->ext.lmf);
+		if (mono_get_lmf () == &is->ext.lmf)
+			mono_pop_lmf (&is->ext.lmf);
 		mono_wasm_jit_cur_island_il_state = is->prev;
 		wj_finally_trim (is->finally_sp);
 	}
@@ -4829,9 +4835,20 @@ mono_wasm_jit_island_lmf_method (gpointer lmf)
 }
 
 /* --- AOT-style EH milestone 2: in-method catch landing-pad dispatch -----------------------------------
- * Set by mono_wasm_jit_eh_dispatch on a catch match; read by the JITted handler's OP_GET_EX_OBJ (the
- * emitter bakes this address + i32.loads it). Per-thread: the in-flight caught exception. */
-__thread MonoObject *mono_wasm_jit_caught_exc;
+ * Set by mono_wasm_jit_eh_dispatch on a catch match; read by the JITted handler's OP_GET_EX_OBJ.
+ * Keep a strong handle, not a raw MonoObject*: dispatch consumes jit_tls->thrown_exc before it returns
+ * to wasm, and the landing pad calls C++ catch helpers + set_il_offset before OP_GET_EX_OBJ runs. Those
+ * calls are not intended to be GC points, but correctness must not depend on that implementation detail.
+ * The handle remains live until the wasm handler has stored the object into its GC-scanned ref slot. */
+static __thread MonoGCHandle mono_wasm_jit_caught_exc;
+
+static void
+wj_caught_clear (void)
+{
+	if (mono_wasm_jit_caught_exc)
+		mono_gchandle_free_internal (mono_wasm_jit_caught_exc);
+	mono_wasm_jit_caught_exc = 0;
+}
 /* DIAG: set to 1 by the dispatch on a catch match; read+cleared by mono_wasm_jit_invoke_caught to
  * correlate a catch-taken invocation with its return value + ref-stack balance (loot-NPE bisection). */
 __thread int mono_wasm_jit_eh_caught_flag = 0;
@@ -4845,8 +4862,14 @@ int
 mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 {
 	ERROR_DECL (error);
-	MonoObject *exc = mini_llvmonly_load_exception ();
+	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
+	MonoObject *exc;
 	int il, i;
+	/* mini_llvmonly_load_exception dereferences thrown_exc while updating trace_ips. A wasm/C++
+	 * exception without Mono's managed payload is not ours to dispatch; let the pad rethrow it. */
+	if (!jit_tls || !jit_tls->thrown_exc)
+		return -1;
+	exc = mini_llvmonly_load_exception ();
 	if (!exc)
 		return -1;
 	il = (blk >= 0 && blk < t->nbbs) ? t->il_offsets [blk] : -1;
@@ -4869,10 +4892,17 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 		if (c->flags == MONO_EXCEPTION_CLAUSE_NONE) {   /* a catch clause */
 			if (c->catch_class && mono_object_isinst_checked (exc, (MonoClass *) c->catch_class, error)) {
 				ThreadContext *ctx = get_context ();
-				MonoJitTlsData *jit_tls = mono_get_jit_tls ();
-				mono_wasm_jit_caught_exc = exc;          /* for OP_GET_EX_OBJ in the handler */
+				/* Move ownership of the strong in-flight handle to the caught slot. This avoids both a
+				 * raw-object GC hole and a second handle allocation on every caught exception. */
+				wj_caught_clear ();
+				mono_wasm_jit_caught_exc = jit_tls->thrown_exc;
+				jit_tls->thrown_exc = 0;
+				if (jit_tls->thrown_non_exc) {
+					mono_gchandle_free_internal (jit_tls->thrown_non_exc);
+					jit_tls->thrown_non_exc = 0;
+				}
+				mono_memory_barrier ();
 				mono_wasm_jit_eh_caught_flag = 1;        /* DIAG: this invocation took the catch path */
-				mini_llvmonly_clear_exception ();        /* consumed: drop the in-flight native exception (thrown_exc) */
 				/* discard any resume-state pass-1 chose for an OUTER handler — we handle nearer. Cover both
 				 * the interp resume-state (interp outer handler) and the il_state resume-state (AOTed outer
 				 * handler), so a later mono_handle_exception's `!resume_state.ex_gchandle` assert holds. */
@@ -4959,16 +4989,19 @@ mono_wasm_jit_endfinally_rethrow (void)
 	g_assert_not_reached ();
 }
 
-/* OP_GET_EX_OBJ in a JITted catch handler: return (+ consume) the exception the landing pad's dispatch
- * stashed. mono_wasm_jit_caught_exc is __thread (per-thread address), so the emitter can't bake a fixed
- * address — it call_indirects this getter instead. No GC point between the dispatch stash and this read,
- * and the handler immediately stores the result into the GC-scanned ref shadow stack. */
+/* OP_GET_EX_OBJ in a JITted catch handler: return the exception the landing pad's dispatch stashed.
+ * The emitter stores it into the GC-scanned ref shadow stack and only then calls the release helper, so
+ * the object stays rooted across the complete raw-pointer handoff. */
 MonoObject *
 mono_wasm_jit_get_caught_exc (void)
 {
-	MonoObject *e = mono_wasm_jit_caught_exc;
-	mono_wasm_jit_caught_exc = NULL;
-	return e;
+	return mono_wasm_jit_caught_exc ? mono_gchandle_get_target_internal (mono_wasm_jit_caught_exc) : NULL;
+}
+
+void
+mono_wasm_jit_release_caught_exc (void)
+{
+	wj_caught_clear ();
 }
 
 /* MONO_WASM_JIT_BBTRACE=<substr>: the emitter inserts a call to this at the start of every bb of a

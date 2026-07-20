@@ -2508,6 +2508,10 @@ typedef struct {
  * below 2^30, so the tag never collides and a tagged value still passes the pad's `h < 0` check. */
 #define WJ_EH_DISPATCH_FINALLY_BIT (1 << 30)
 int       mono_wasm_jit_eh_dispatch             (WasmEhTable *table, int blk);
+/* A matched catch transfers the in-flight exception handle to this pair. The getter borrows the
+ * target; release must run only after the JIT has stored it into a GC-scanned reference slot. */
+MonoObject *mono_wasm_jit_get_caught_exc         (void);
+void        mono_wasm_jit_release_caught_exc     (void);
 #endif
 void mono_call_inst_add_outarg_reg (MonoCompile *cfg, MonoCallInst *call, int vreg, int hreg, int bank);
 #ifdef TARGET_WASM
