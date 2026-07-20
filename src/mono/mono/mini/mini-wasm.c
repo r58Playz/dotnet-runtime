@@ -89,6 +89,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_vtype_scalar; const char *vs = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR"); mono_wasm_jit_vtype_scalar = (vs && *vs && *vs != '0') ? 1 : 0; } /* pass a BYVAL ref-free scalar-vtype call arg as its single-field etype scalar (LLVMArgWasmVtypeAsScalar ABI). Default OFF; needs LDADDR_VTYPE. */
 	{ extern int mono_wasm_jit_longdiv; const char *lv = g_getenv ("MONO_WASM_JIT_LONGDIV"); mono_wasm_jit_longdiv = (lv && *lv) ? (*lv != '0') : 1; } /* JIT i64 div/rem (OP_LDIV family) with inline div-by-zero/overflow checks; default ON, =0 reverts to the bail (bisection) */
 	{ extern int mono_wasm_jit_sync; const char *sv = g_getenv ("MONO_WASM_JIT_SYNC"); mono_wasm_jit_sync = (sv && *sv) ? (*sv != '0') : 1; } /* direct call to a synchronized method: substitute the SYNCHRONIZED wrapper (f-slot/residual); default ON, =0 reverts to bailing the whole caller (bisection) */
+	{ extern int mono_wasm_jit_marshal_wrappers; const char *mw = g_getenv ("MONO_WASM_JIT_MARSHAL_WRAPPERS"); mono_wasm_jit_marshal_wrappers = (mw && *mw && *mw != '0') ? 1 : 0; } /* JIT managed<->native marshalling wrappers; default 0 = bail them to the interp (fix for the get_method_attributes wild store), =1 reverts (buggy) for A/B */
 	{ extern int mono_wasm_jit_eh_nocxa; const char *en = g_getenv ("MONO_WASM_JIT_EH_NOCXA"); mono_wasm_jit_eh_nocxa = (en && *en && *en != '0') ? 1 : 0; } /* bisection: skip begin/end_catch in the EH landing pad */
 	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
 	/* Island heuristic levers (Part 5), all default off. */
@@ -245,6 +246,7 @@ int mono_wasm_jit_aotconst = 1;       /* MONO_WASM_JIT_AOTCONST: bake resolved O
 int mono_wasm_jit_rgctx = 1;
 int mono_wasm_jit_longdiv = 1;        /* MONO_WASM_JIT_LONGDIV: JIT i64 div/rem (OP_LDIV family). =0 bails those methods (bisection). */
 int mono_wasm_jit_sync = 1;           /* MONO_WASM_JIT_SYNC: substitute the SYNCHRONIZED wrapper for a direct call to a synchronized method. =0 reverts to bailing the whole caller (bisection). */
+int mono_wasm_jit_marshal_wrappers = 0; /* MONO_WASM_JIT_MARSHAL_WRAPPERS: JIT the managed<->native marshalling wrappers (managed-to-native icall/pinvoke, native-to-managed, runtime-invoke). Default 0 = bail them to the interpreter. Their marshalling IR (LMF save/restore, the native fptr baked as an iconst, handle/byref marshal stores, coop-GC transitions) produces a ref store through a garbage/stale object base that the isref classifier + raw membase-store lowering mishandle -> wild store -> intermittent heap/metadata corruption (confirmed live: System.Reflection.MonoMethodInfo:get_method_attributes -> OBJGUARD kind 2 -> AIOOBE / mono_metadata_token_table assert). =1 reverts (buggy) for A/B. The synchronized (SYNCHRONIZED/OTHER) wrapper path is unaffected. */
 int mono_wasm_jit_ldaddr = 1;         /* MONO_WASM_JIT_LDADDR: emit OP_LDADDR by backing address-taken SCALAR locals with a per-thread linear-memory frame (their address can't be a wasm local). Unblocks synchronized wrappers (Monitor.Enter's bool& lock_taken) and ref/out-local call sites (the #1 ldaddr bail). Default ON; =0 reverts to bailing the whole method on OP_LDADDR. */
 int mono_wasm_jit_ldaddr_vtype = 0;   /* MONO_WASM_JIT_LDADDR_VTYPE: extend OP_LDADDR to NON-SCALAR ref-free valuetype locals via a full-size addr-frame slot. DEFAULT OFF (exonerated: jit17 corrupted with it off; kept gated for binary/repro parity). */
 int mono_wasm_jit_vtype_scalar_ref = 0; /* MONO_WASM_JIT_VTYPE_SCALAR_REF: extend VTYPE_SCALAR to a scalar-vtype whose SINGLE field is a managed REFERENCE (e.g. RuntimeTypeHandle{RuntimeType}). Backed by a GC-SCANNED ref-shadow-stack slot (not the un-scanned addr frame): OP_LDADDR yields refbase+slot*4 so the field store/load track the ref as a conservative pinning root, and the store's inline card-barrier marks a HARMLESS card (wasm32 has no overlapping cards — the 8MB table covers the whole 32-bit space, so a non-heap mark is in-bounds and never scanned). GC-CRITICAL: validate in-browser with STOREGUARD/OBJGUARD. Default OFF. */
@@ -2154,9 +2156,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 
 	/* Eligibility gates (critical for auto-JIT robustness on real code like Minecraft, where the
 	 * emitter is fed thousands of method shapes): bail to the interpreter for features the wasm
-	 * backend doesn't lower yet — exception-handling clauses (no try/catch emission) and
-	 * generic-shared methods (rgctx access the non-llvmonly path doesn't handle). Unknown opcodes
-	 * still bail individually via the lowering switch's default case. */
+	 * backend doesn't lower yet — unsupported EH/control-flow shapes and generic-shared methods
+	 * (rgctx access the non-llvmonly path doesn't handle). Unknown opcodes still bail individually
+	 * via the lowering switch's default case. */
 #ifndef HOST_BROWSER
 	/* EH ground-truth dump (MONO_WASM_JIT_DUMP_IR=<substr>): print clauses + per-bb region + opcode stream
 	 * for clause-bearing methods. OFFLINE-CROSS ONLY: mono_inst_name returns a string in the cross but an
@@ -2194,8 +2196,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * name contains <substr> (others bail like EH=0) — to pin down which EH method corrupts world load. */
 		{ char *_o = g_getenv ("MONO_WASM_JIT_EH_ONLY"); gboolean _skip = _o && *_o && (!mname || !strstr (mname, _o)); if (_o) g_free (_o); if (_skip) { fail = "eh-only filter"; goto done; } }
 		{ guint _ci;   /* in-method EH clauses always propagate via C++/wasm-EH (cppeh is the only model) */
-		  /* increment 2a: catch (NONE). 2c: + finally (FINALLY, incl. Java try-with-resources / try{}finally{}).
-		   * filter (1) / fault (4) still bail — handled in a later increment. */
+		  /* Supported native wasm-EH clauses: catch (NONE), finally (FINALLY, including Java
+		   * try-with-resources), and fault (FAULT). Filters still bail to the interpreter. */
 		  for (_ci = 0; _ci < cfg->header->num_clauses; ++_ci) {
 			  int _f = cfg->header->clauses [_ci].flags;
 			  if (_f == MONO_EXCEPTION_CLAUSE_FINALLY) {
@@ -2245,6 +2247,27 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		}
 	}
 	if (cfg->gshared) { fail = "gshared method"; goto done; }
+	/* Marshalling wrappers (managed-to-native icall/pinvoke, native-to-managed, runtime-invoke) carry LMF
+	 * save/restore, the native fptr baked as an iconst, handle/byref marshal stores and coop-GC transition
+	 * IR — shapes the isref classifier + raw membase-store lowering mishandle, producing a ref store through
+	 * a garbage/stale object base that scribbles the heap/metadata (confirmed live:
+	 * System.Reflection.MonoMethodInfo:get_method_attributes, a hot IKVM-reflection icall wrapper -> OBJGUARD
+	 * kind 2 wild store -> intermittent ArrayIndexOutOfBounds / mono_metadata_token_table assert). These
+	 * wrappers are ~a native call, so the JIT upside is near zero; bail them to the interpreter until their
+	 * codegen is verified. The synchronized wrapper (MONO_WRAPPER_SYNCHRONIZED) and its inner
+	 * (MONO_WRAPPER_OTHER) are a separate, supported path and are NOT bailed here.
+	 * MONO_WASM_JIT_MARSHAL_WRAPPERS=1 reverts (buggy) for A/B. */
+	{ extern int mono_wasm_jit_marshal_wrappers;
+	  if (!mono_wasm_jit_marshal_wrappers) {
+		  switch (cfg->method->wrapper_type) {
+		  case MONO_WRAPPER_MANAGED_TO_NATIVE:
+		  case MONO_WRAPPER_NATIVE_TO_MANAGED:
+		  case MONO_WRAPPER_RUNTIME_INVOKE:
+			  fail = "marshalling wrapper (unsupported IR shape)"; goto done;
+		  default:
+			  break;
+		  }
+	  } }
 	/* A call here passes the generic-sharing context in MONO_ARCH_RGCTX_REG (an out-arg register set by
 	 * set_rgctx_arg) — e.g. this concrete method calls a gsharedvt/shared callee like
 	 * Array.GetGenericValueImpl<T>. The wasm backend does NOT forward that register (neither the direct
@@ -3231,19 +3254,26 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			case OP_GET_EX_OBJ: {
 				/* In a JITted catch handler: load the exception the catch landing pad stashed
 				 * (mono_wasm_jit_get_caught_exc, ()->i32). dreg is a ref -> wasm_st routes it to the
-				 * GC ref shadow stack. */
+				 * GC ref shadow stack. Release the dispatch-owned strong handle only AFTER that store,
+				 * closing the raw-pointer GC window between native dispatch and handler entry. */
 				WasmFuncType _gt; int _gti = -1, _gk;
 				memset (&_gt, 0, sizeof _gt); _gt.nparams = 0; _gt.ret = WASM_I32;
 				for (_gk = 0; _gk < nextra; ++_gk) if (functype_eq (&extra_types [_gk], &_gt)) { _gti = 2 + _gk; break; }
 				if (_gti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _gt; _gti = 2 + nextra++; }
 				uses_calls = TRUE;
 #ifdef HOST_BROWSER
-				{ extern MonoObject *mono_wasm_jit_get_caught_exc (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_get_caught_exc); }
+				wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_get_caught_exc);
 #else
 				wasm_i32_const (&body, 0x7ff4);
 #endif
 				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) _gti); wasm_uleb (&body, 0);
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "get_ex_obj dreg"; goto done; }
+#ifdef HOST_BROWSER
+				wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_release_caught_exc);
+#else
+				wasm_i32_const (&body, 0x7ff6);
+#endif
+				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0);   /* ()->void */
 				break;
 			}
 			case OP_MEMORY_BARRIER:
