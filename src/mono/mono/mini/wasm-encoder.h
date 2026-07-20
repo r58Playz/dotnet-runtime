@@ -269,7 +269,6 @@ void wasm_module_method_and_entry (
 	const WasmFuncType *extra_types, guint32 nextra,
 	gboolean import_table,
 	gboolean import_eh_tag, guint32 eh_type_idx,
-	gboolean import_sp_global,
 	WasmBuf *out);
 
 /*

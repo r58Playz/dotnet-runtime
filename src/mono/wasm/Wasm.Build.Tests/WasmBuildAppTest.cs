@@ -163,7 +163,6 @@ namespace Wasm.Build.Tests
             NameValueCollection query = new()
             {
                 ["MONO_WASM_JIT_METHOD"] = targetedMethods,
-                ["MONO_WASM_JIT_EH"] = "1",
                 ["MONO_WASM_JIT_VERBOSE"] = "2",
                 ["MONO_WASM_JIT_STATS"] = "1",
             };
@@ -223,7 +222,6 @@ namespace Wasm.Build.Tests
             NameValueCollection query = new()
             {
                 ["MONO_WASM_JIT_METHOD"] = targetedMethods,
-                ["MONO_WASM_JIT_EH"] = "1",
                 ["MONO_WASM_JIT_VERBOSE"] = "2",
                 ["MONO_WASM_JIT_STATS"] = "1",
                 ["MONO_LOG_LEVEL"] = "debug",

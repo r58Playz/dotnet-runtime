@@ -691,8 +691,7 @@ mono_compile_create_var_for_vreg (MonoCompile *cfg, MonoType *type, int opcode, 
 	 * Without this marking a ref can live only in a wasm local — invisible to the conservative stack
 	 * scan — so a moving nursery collection relocates (or frees) its object and leaves a stale
 	 * forwarding-pointer reference (observed: a moved java.net.URL crashing the AOT vcall path).
-	 * COMPILE_WASM already seeds refs via compute_gc_maps above (gated by MONO_WASM_JIT_GCMAPS), so
-	 * exclude it here to keep its A/B toggle intact. */
+	 * COMPILE_WASM already seeds refs via compute_gc_maps above, so exclude it here. */
 	if (!COMPILE_WASM (cfg) && mini_type_is_reference (type))
 		mono_mark_vreg_as_ref (cfg, vreg);
 #endif
@@ -3167,8 +3166,9 @@ mini_get_rgctx_access_for_method (MonoMethod *method)
  * (everything else is masked at the compile_wasm fork; the correctness-required base
  * INTRINS|FLOAT32 is always forced back on). Grown one flag at a time per the WS2 rollout
  * (CONSPROP -> COPYPROP -> DEADCE -> BRANCH -> ALIAS -> LOOP -> SSA/ABCREM), each after an
- * offline corpus diff + in-browser GC-guard soak. The vreg-mutating entries additionally
- * require MONO_WASM_JIT_OUTARG=1 (see the interlock at the fork). NEVER whitelist: CMOV
+ * offline corpus diff + in-browser GC-guard soak. The vreg-mutating entries are safe to
+ * whitelist now that call-arg capture is always structural (mono_wasm_emit_call registers
+ * real moves in call->out_ireg_args). NEVER whitelist: CMOV
  * (no OP_CMOV lowering), TAILCALL, SIMD (no v128 lowering), SHARED/GSHARED, LINEARS,
  * EXCEPTION.
  */
@@ -3460,9 +3460,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 			 * inert here: the precise-map builder is compiled out (mini-gc.c #if 0) and the
 			 * regalloc/spill passes that read it never run for COMPILE_WASM; the OP_GC_LIVENESS_*
 			 * annotations decompose emits under it are NOPs in the wasm emitter. */
-			{ extern int mono_wasm_jit_gcmaps;
-			  if (mono_wasm_jit_gcmaps)
-				cfg->compute_gc_maps = TRUE; }
+			cfg->compute_gc_maps = TRUE;
 			/* Disable IR optimizations: the wasm backend reads call->args directly at codegen,
 			 * but copyprop/etc. (which assume a native/LLVM emit_call consumes them) mangle the
 			 * call-arg vregs. opt=0 keeps the explicit arg-setup moves so calls lower correctly. */
@@ -3485,15 +3483,6 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 				 * before codegen). */
 				cfg->opt = (cfg->opt & wasm_jit_opt_whitelist ()) | MONO_OPT_INTRINS | MONO_OPT_FLOAT32;
 				cfg->opt |= wasm_jit_extra_opt ();
-				/* INTERLOCK: the vreg-mutating local/SSA passes are only safe once the call-arg
-				 * capture is structural (MONO_WASM_JIT_OUTARG=1: real moves registered in
-				 * call->out_ireg_args, which deadce/alias treat as used — mono_wasm_emit_call).
-				 * With the legacy raw-dreg snapshot they SILENTLY MISCOMPILE call args, so mask
-				 * them no matter how they were requested. */
-				{ extern int mono_wasm_jit_outarg;
-				  if (!mono_wasm_jit_outarg)
-					cfg->opt &= ~ (guint32) (MONO_OPT_CONSPROP | MONO_OPT_COPYPROP | MONO_OPT_DEADCE
-						| MONO_OPT_SSA | MONO_OPT_ABCREM | MONO_OPT_ALIAS_ANALYSIS); }
 			/* Opt-in: emit llvmonly indirect-dispatch IR (ftndesc) for virtual/interp calls.
 			 * Required for virtual dispatch on wasm (the normal vtable-slot dispatch calls a
 			 * fixed-signature trampoline → call_indirect mismatch). The codegen fork still routes
