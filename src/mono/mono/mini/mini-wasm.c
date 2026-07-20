@@ -4449,16 +4449,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						if (m_type_is_byref (csig->ret)) { fail = "vcall byref ret"; goto done; }
 						for (ai = 0; ai < (int) csig->param_count; ++ai)
 							if (m_type_is_byref (csig->params [ai])) { fail = "vcall byref arg"; goto done; }
-						/* arg valtypes: this + params (scalars only; vtype/unsupported -> bail) */
-						pp [npp++] = WASM_I32; /* this */
-						for (ai = 0; ai < (int) csig->param_count; ++ai) {
-							WasmValtype pv = wasm_valtype_of_type (csig->params [ai]);
-							if (pv == 0 || pv == WASM_VOID) { fail = "vcall arg type"; goto done; }
-							if (npp >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "vcall nargs"; goto done; }
-							pp [npp++] = pv;
+						/* arg/ret valtypes from the shared ABI descriptor (this + params -> ret). vcall dispatch
+						 * (interp_entry marshalling) takes scalars only, so a scalar-vtype arg still bails here. */
+						{
+							WasmCallInfo _vci; mono_wasm_get_call_info (csig, &_vci);
+							if (!_vci.valid) { fail = _vci.vret_byaddr ? "vcall ret type" : "vcall nargs"; goto done; }
+							for (ai = 0; ai < _vci.nargs; ++ai)
+								if (_vci.args [ai].kind != WJ_ARG_SCALAR) { fail = "vcall arg type"; goto done; }
+							for (ai = 0; ai < (int) _vci.ftype.nparams; ++ai) pp [ai] = _vci.ftype.params [ai];
+							npp = (int) _vci.ftype.nparams;
+							rv = _vci.ftype.ret;
 						}
-						if (csig->ret->type == MONO_TYPE_VOID) rv = WASM_VOID;
-						else { rv = wasm_valtype_of_type (csig->ret); if (rv == 0 || rv == WASM_VOID) { fail = "vcall ret type"; goto done; } }
 						/* functypes: vts ()->i32 (scratch); vtrf (i32,i32,i32,i32)->i32 (resolve_fslot: this,base,scratch,ic);
 						 * vtd (i32,i32)->i32 (call_interp fallback); ftd this+params->ret (the override's scalar `f`). */
 						memset (&vts, 0, sizeof (vts)); vts.nparams = 0; vts.ret = WASM_I32;
