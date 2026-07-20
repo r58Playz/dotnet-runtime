@@ -1395,8 +1395,7 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 		/* Don't whole-method-JIT a method that already has AOT code — it runs faster as native AOT, reached
 		 * via do_jit_call (the residual / vcall-fallback now routes AOT'd callees there). Mark permanent so
 		 * we stop counting + stop wasting compile attempts (+ ldaddr bails) on already-compiled code. */
-		extern int mono_wasm_jit_aot_residual;
-		if (mono_wasm_jit_aot_residual && mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
+		if (mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
 			cmethod->wasm_jit_slot = -1;
 			return;
 		}
@@ -3281,7 +3280,6 @@ interp_entry (InterpEntryData *data)
 	 * wasm-JITted method's residual / vcall-fallback to AOT'd library code (fastutil/java/corlib) was
 	 * dropped to the interpreter, never touching the AOT body. Eligibility is cached on code_type, like
 	 * the interp's MINT_JIT_CALL. */
-	extern int mono_wasm_jit_aot_residual;
 	gboolean wj_did_jit_call = FALSE;
 	gboolean wj_external_entry = !wj_entry_is_residual (data) && !rmethod->is_invoke;
 	MonoLMFExt wj_entry_ext;
@@ -3320,9 +3318,8 @@ interp_entry (InterpEntryData *data)
 	 * already has an island LMF; a native/AOT entry uses wj_entry_ext above. Delegate-invoke (is_invoke)
 	 * rewrites rmethod to the invoke wrapper, which dispatches its target via MINT_CALL — skip it here. */
 	{
-		extern int mono_wasm_jit_entry_redirect;
 		gint32 wj_eslot = rmethod->wasm_jit_slot;
-		if (mono_wasm_jit_entry_redirect && G_UNLIKELY (wj_eslot > 0) && !rmethod->is_invoke) {
+		if (G_UNLIKELY (wj_eslot > 0) && !rmethod->is_invoke) {
 			extern int mono_wasm_jit_admit (int desc_id);
 			/* Bring THIS thread's function table up to date, then confirm the slot actually instantiated
 			 * here (sync can fail on a worker under memory pressure while the compiling thread succeeded;
@@ -3336,7 +3333,7 @@ interp_entry (InterpEntryData *data)
 	}
 	if (G_UNLIKELY (wj_external_entry))
 		interp_pop_lmf (&wj_entry_ext);
-	if (!wj_did_jit_call && G_UNLIKELY (wj_entry_is_residual (data)) && mono_wasm_jit_aot_residual) {
+	if (!wj_did_jit_call && G_UNLIKELY (wj_entry_is_residual (data))) {
 		InterpMethodCodeType ct = rmethod->code_type;
 		if (ct == IMETHOD_CODE_UNKNOWN) {
 			ct = mono_interp_jit_call_supported (method, sig) ? IMETHOD_CODE_COMPILED : IMETHOD_CODE_INTERP;
@@ -3887,7 +3884,6 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 	 * vcall-fallback (which funnels here after resolve). Cached on code_type like the interp MINT_JIT_CALL.
 	 * WJC_AOT_ROUTED / WJC_INTERP_ROUTED measure the split (how much the fastpath actually fires). */
 	{
-		extern int mono_wasm_jit_aot_residual;
 		extern MonoMethod *mono_wasm_jit_ring [];
 		extern int mono_wasm_jit_ring_count, mono_wasm_jit_ring_frozen;
 		InterpMethodCodeType ct = imethod->code_type;
@@ -3895,7 +3891,7 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 			ct = mono_interp_jit_call_supported (method, sig) ? IMETHOD_CODE_COMPILED : IMETHOD_CODE_INTERP;
 			imethod->code_type = ct;
 		}
-		if (mono_wasm_jit_aot_residual && ct == IMETHOD_CODE_COMPILED) {
+		if (ct == IMETHOD_CODE_COMPILED) {
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
 				mono_wasm_jit_count (WJC_RESIDUAL);
 				mono_wasm_jit_count (WJC_AOT_ROUTED);
@@ -4087,8 +4083,8 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	 * i32-pair read can tear (match an old vtable but read a freshly-written imethod for a DIFFERENT
 	 * receiver type) -> dispatch to the wrong override (NullPointerException) or a wrong-signature f-slot
 	 * call_indirect (traps the worker -> GC can't suspend it). The i64 atomic makes the pair consistent. */
-	extern int mono_wasm_jit_vcall_ic, mono_wasm_jit_stats, mono_wasm_jit_vcall_ways;
-	gboolean use_ic = mono_wasm_jit_vcall_ic;
+	extern int mono_wasm_jit_stats, mono_wasm_jit_vcall_ways;
+	gboolean use_ic = TRUE;   /* virtual-dispatch resolve cache (always on) */
 	int ic_ways = mono_wasm_jit_vcall_ways;
 	gboolean ic_hit = FALSE;
 	if (use_ic) {
@@ -12350,9 +12346,8 @@ mono_jiterp_interp_entry (void *res)
 	 * at frame.stack (this at 0, each arg at +8 — get_arg_offset_fast), exactly the e-thunk's args_ptr layout;
 	 * the e-thunk writes the result back at frame.stack and the shared tail's mono_jiterp_stackval_to_data
 	 * marshals it to `res`, and a thrown callee's resume-state is handled by the has_resume_state tail below —
-	 * identical to the mono_interp_exec_method path. Gated by MONO_WASM_JIT_ENTRY_REDIRECT (=0 reverts). */
+	 * identical to the mono_interp_exec_method path. */
 	{
-		extern int mono_wasm_jit_entry_redirect;
 		InterpMethod *wj_rm = header.rmethod;
 		gboolean wj_dispatched = FALSE;
 		MonoLMFExt wj_entry_ext;
@@ -12368,7 +12363,7 @@ mono_jiterp_interp_entry (void *res)
 			interp_push_lmf (&wj_entry_ext, &frame);
 			wasm_jit_maybe_compile (wj_rm);
 		}
-		if (mono_wasm_jit_entry_redirect && G_UNLIKELY (wj_rm->wasm_jit_slot > 0) && !wj_rm->is_invoke) {
+		if (G_UNLIKELY (wj_rm->wasm_jit_slot > 0) && !wj_rm->is_invoke) {
 			extern int mono_wasm_jit_admit (int desc_id);
 			if (G_LIKELY (mono_wasm_jit_admit (wj_rm->wasm_jit_desc))) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);

@@ -345,6 +345,10 @@
       <_EmccLDFlags Include="@(_EmccCommonFlags)" />
       <!-- -lexports.js to MINIFY_WASM_EXPORT_NAMES=0 -->
       <_EmccLDFlags Include="-s EXPORT_ES6=1 -lexports.js" />
+      <!-- Export the __stack_pointer wasm global so JIT-emitted modules can import it (s.p) for their
+           C-stack frame save/restore. A wasm global, not a function, so it needs the raw wasm-ld
+           --export flag rather than EXPORTED_FUNCTIONS. -->
+      <_EmccLDFlags Include="-Wl,--export=__stack_pointer" />
       <EmccExportedFunction Condition="'$(WasmEnableExceptionHandling)' == 'true'" Include="___cpp_exception" />
 
       <!-- on-demand MT EventPipe CPU-trace bridge (src/mono/browser/runtime/runtime.c); driven by

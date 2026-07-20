@@ -274,7 +274,6 @@ wasm_module_method_and_entry (
 	const WasmFuncType *extra_types, guint32 nextra,
 	gboolean import_table,
 	gboolean import_eh_tag, guint32 eh_type_idx,
-	gboolean import_sp_global,
 	WasmBuf *out)
 {
 	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
@@ -322,7 +321,7 @@ wasm_module_method_and_entry (
 	 * uses call_indirect — the indirect function table f.f as table 0; and — when it uses try/catch — the
 	 * C++ exception tag x.e (matches the runtime's __cpp_exception export, like the jiterpreter). */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + (import_sp_global ? 1 : 0)));
+	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 1 /* s.p global (always) */));
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);   /* memory */
@@ -344,11 +343,11 @@ wasm_module_method_and_entry (
 		wasm_u8 (&sec, 0x00);            /* tag attribute: exception */
 		wasm_uleb (&sec, eh_type_idx);   /* function type index ((i32)->void) */
 	}
-	if (import_sp_global) {
+	{
 		/* __stack_pointer as global s.p (kind 0x03), i32 mutable. Only global in the module -> global index 0.
-		 * Lets the C-stack frame prologue/epilogue use global.get/set 0 instead of the
-		 * emscripten_stack_get_current()/stackRestore() call_indirects. Requires the main module to export
-		 * __stack_pointer (loader: -Wl,--export=__stack_pointer) and the instantiation to pass it as s.p. */
+		 * The C-stack frame prologue/epilogue use global.get/set 0 for the SP save/restore. Requires the main
+		 * module to export __stack_pointer (-Wl,--export=__stack_pointer, set in browser.proj +
+		 * BrowserWasmApp.targets) and the instantiation to pass it as s.p. */
 		wasm_name (&sec, "s");
 		wasm_name (&sec, "p");
 		wasm_u8 (&sec, 0x03);            /* import kind: global */

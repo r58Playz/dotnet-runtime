@@ -171,7 +171,6 @@ switch (testCase) {
         // arbitrary query parameters are not promoted into the environment for unrelated tests.
         for (const name of [
             "MONO_WASM_JIT_METHOD",
-            "MONO_WASM_JIT_EH",
             "MONO_WASM_JIT_VERBOSE",
             "MONO_WASM_JIT_STATS",
         ]) {
