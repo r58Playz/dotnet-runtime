@@ -1964,6 +1964,100 @@ wj_scalar_vtype_valtype (MonoType *t, WasmValtype *out)
 	return TRUE;
 }
 
+/*
+ * WasmCallInfo: the single declarative wasm ABI descriptor for a MonoMethodSignature, shared by every
+ * call-emit path (method self-sig, JIT->JIT, inline-AOT, interp residual, vcall ICs). It replaces the
+ * ~8 sites that each re-derived a WasmFuncType from the signature by hand (the reviewer's "several bugs
+ * come from paths independently reconstructing the same ABI"). mono_wasm_get_call_info builds the
+ * CANONICAL callee functype -- [this i32] + params -> ret, with NO trailing rgctx/extra arg (that is a
+ * per-call-site concern, layered on top where needed) -- using exactly the rules the direct-call path
+ * used: this -> i32, each param via wasm_valtype_of_type with a ref-free/ref scalar-vtype fallback
+ * (LLVMArgWasmVtypeAsScalar), ret via wasm_valtype_of_type. Unrepresentable shapes leave valid=FALSE
+ * with a fail_reason the consumer bails on (preserving today's bail accounting). Hidden vret
+ * (ArgValuetypeAddrInIReg) sets vret_byaddr and, until the vret lowering lands, still bails.
+ */
+typedef enum {
+	WJ_ARG_SCALAR,          /* one wasm scalar (incl. managed byref/ptr/obj as i32, i8 as i64, ...) */
+	WJ_ARG_VTYPE_SCALAR,    /* ArgVtypeAsScalar: struct passed as its single-field etype scalar */
+	WJ_ARG_VTYPE_BYADDR,    /* ArgValuetypeAddrOnStack: i32 pointer to a caller copy (not yet emitted) */
+	WJ_ARG_GSHAREDVT,       /* ArgGsharedVTOnStack: unsupported here */
+	WJ_ARG_INVALID,
+} WjArgKind;
+
+typedef struct {
+	WjArgKind kind;
+	WasmValtype wtype;      /* wasm valtype (this -> WASM_I32; WASM_VOID only for a void ret) */
+	MonoType *type;         /* the managed arg/ret type (NULL for the synthetic this) */
+	MonoType *etype;        /* scalar-vtype single-field etype, else NULL */
+} WjArgInfo;
+
+typedef struct {
+	guint8 valid;           /* FALSE -> the consumer bails with fail_reason */
+	const char *fail_reason;
+	guint8 hasthis;
+	guint8 vret_byaddr;     /* ret is a by-address vtype (hidden vret); currently implies !valid */
+	int nargs;              /* hasthis + param_count */
+	WjArgInfo ret;
+	WjArgInfo args [WASM_FUNCTYPE_MAX_PARAMS];
+	WasmFuncType ftype;     /* canonical callee functype: [this i32] + params -> ret */
+	guint32 f_sig_id;       /* wj_functype_hash (&ftype); the persisted per-method ABI fingerprint */
+} WasmCallInfo;
+
+static void
+mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
+{
+	int i;
+	memset (ci, 0, sizeof (*ci));
+	ci->valid = TRUE;
+	ci->hasthis = sig->hasthis ? 1 : 0;
+	ci->nargs = sig->hasthis + sig->param_count;
+	if (ci->nargs > WASM_FUNCTYPE_MAX_PARAMS) { ci->valid = FALSE; ci->fail_reason = "call nargs"; return; }
+
+	if (sig->hasthis) {
+		ci->args [0].kind = WJ_ARG_SCALAR;
+		ci->args [0].wtype = WASM_I32;
+		ci->ftype.params [ci->ftype.nparams++] = WASM_I32;
+	}
+	for (i = 0; i < (int) sig->param_count; ++i) {
+		WjArgInfo *a = &ci->args [i + sig->hasthis];
+		WasmValtype pv = wasm_valtype_of_type (sig->params [i]);
+		a->type = sig->params [i];
+		if (pv == 0 || pv == WASM_VOID) {
+			/* BYVAL scalar-vtype arg: declare the param as its single-field etype scalar (the AOT
+			 * callee's LLVMArgWasmVtypeAsScalar ABI). Anything else is unrepresentable -> bail. */
+			WasmValtype sv;
+			if (!wj_scalar_vtype_valtype (sig->params [i], &sv)) { ci->valid = FALSE; ci->fail_reason = "call arg type"; return; }
+			a->kind = WJ_ARG_VTYPE_SCALAR;
+			a->etype = sig->params [i];
+			pv = sv;
+		} else {
+			a->kind = WJ_ARG_SCALAR;
+		}
+		a->wtype = pv;
+		ci->ftype.params [ci->ftype.nparams++] = pv;
+	}
+
+	ci->ret.type = sig->ret;
+	if (sig->ret->type == MONO_TYPE_VOID) {
+		ci->ret.kind = WJ_ARG_SCALAR;
+		ci->ret.wtype = WASM_VOID;
+		ci->ftype.ret = WASM_VOID;
+	} else {
+		WasmValtype rv = wasm_valtype_of_type (sig->ret);
+		if (rv == 0 || rv == WASM_VOID) {
+			/* vtype/gsharedvt return via a hidden by-address pointer -- not lowered yet; bail as before. */
+			ci->vret_byaddr = 1;
+			ci->valid = FALSE;
+			ci->fail_reason = "call ret type";
+			return;
+		}
+		ci->ret.kind = WJ_ARG_SCALAR;
+		ci->ret.wtype = rv;
+		ci->ftype.ret = rv;
+	}
+	ci->f_sig_id = wj_functype_hash (&ci->ftype);
+}
+
 /* Emit a BYVAL ref-free scalar-vtype call arg onto the wasm stack. The ByVal value is addr-frame-backed
  * (LDADDR_VTYPE gave the source vtype temp a slot, and LOWER-VTYPE-OPTS lowered its vzero/field-store/
  * vmove to plain stores into that slot), so load the single field (offset 0) as the etype scalar — what
@@ -3982,31 +4076,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					break;
 				}
 				if (!csig) { fail = "null sig call"; goto done; }
-				memset (&ct, 0, sizeof (ct));
-				if (csig->hasthis) {
-					if (ct.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "call nargs"; goto done; }
-					ct.params [ct.nparams++] = WASM_I32;
-				}
-				for (ai = 0; ai < (int) csig->param_count; ++ai) {
-					WasmValtype pv = wasm_valtype_of_type (csig->params [ai]);
-					if (pv == 0 || pv == WASM_VOID) {
-						/* BYVAL scalar-vtype arg (MONO_WASM_JIT_VTYPE_SCALAR): declare the param as its single-field
-						 * etype scalar, matching the AOT callee's LLVMArgWasmVtypeAsScalar ABI; the arg-emit loops
-						 * below load that scalar from the ByVal value's addr-frame slot. Ref-free only
-						 * (wj_scalar_vtype_valtype); anything else keeps the original bail. */
-						WasmValtype sv;
-						if (!wj_scalar_vtype_valtype (csig->params [ai], &sv)) { fail = "call arg type"; goto done; }
-						pv = sv;
-					}
-					if (ct.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "call nargs"; goto done; }
-					ct.params [ct.nparams++] = pv;
-				}
-				if (csig->ret->type == MONO_TYPE_VOID) {
-					ct.ret = WASM_VOID;
-				} else {
-					ct.ret = wasm_valtype_of_type (csig->ret);
-					if (ct.ret == 0 || ct.ret == WASM_VOID) { fail = "call ret type"; goto done; }
-				}
+				/* Canonical callee functype from the one shared ABI descriptor (this + args -> ret).
+				 * The scalar-vtype arg loads below still read wj_scalar_vtype_valtype per-arg. */
+				{ WasmCallInfo _ci; mono_wasm_get_call_info (csig, &_ci);
+				  if (!_ci.valid) { fail = _ci.fail_reason; goto done; }
+				  ct = _ci.ftype; }
 #ifdef HOST_BROWSER
 				if (call_method == cfg->method) {
 					extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
