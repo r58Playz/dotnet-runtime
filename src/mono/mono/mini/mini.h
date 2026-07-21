@@ -1364,6 +1364,7 @@ typedef struct {
 	guint8       direct_deps_truncated;
 	int          direct_deps [MONO_WASM_JIT_MAX_DIRECT_DEPS];
 	guint32      direct_dep_sig [MONO_WASM_JIT_MAX_DIRECT_DEPS];
+	MonoMethod  *direct_dep_method [MONO_WASM_JIT_MAX_DIRECT_DEPS]; /* callee behind each dep f-slot (diagnostics: names the method when an ABI/registration mismatch is caught at admit) */
 } MonoWasmJitResult;
 
 /*

@@ -10091,9 +10091,27 @@ mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 	return im ? (im->wasm_jit_fslot > 0 ? im->wasm_jit_fslot : im->wasm_jit_resv_fslot) : 0;
 }
 
+/* runtime wasm JIT: the synchronized-inner substitution in mono_wasm_force_compile compiles the WRAPPED
+ * body under its own MonoMethod, while the SCC batch reserved the slot pair on the INNER wrapper's
+ * imethod (the batch member — and the f-slot key fellow members bake via get_callee_fslot). Carry the
+ * original (pre-substitution) method across that compile so the registration's reservation lookup below
+ * still finds it. Without this the inner registered into a FRESH pair and the outer synchronized
+ * wrapper's baked dep f-slot never registered -> admit ABI_MISMATCH (fslot-unregistered) -> both
+ * wrappers permanently interp-pinned per thread (live: the recursive synchronized
+ * Field/Executable:declaredAnnotations pair). Thread-local + reentrancy-guarded force_compile => at
+ * most one owner per thread, no cross-compile bleed. */
+static __thread MonoMethod *wj_resv_owner;
+
+void
+mono_wasm_jit_set_resv_owner (MonoMethod *method)
+{
+	wj_resv_owner = method;
+}
+
 /* runtime wasm JIT (multi-method cycle batch): if `method` has a reserved slot pair (it is a member of an
  * SCC currently being batch-compiled by wasm_jit_compile_scc), output it and return 1 — the emitter
- * instantiates INTO these instead of allocating fresh. 0 = none. */
+ * instantiates INTO these instead of allocating fresh. 0 = none. Falls back to the reservation OWNER
+ * (the synchronized-inner wrapper this compile was substituted from — see above). */
 int
 mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
 {
@@ -10102,6 +10120,14 @@ mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
 		*e_out = im->wasm_jit_resv_eslot;
 		*f_out = im->wasm_jit_resv_fslot;
 		return 1;
+	}
+	if (wj_resv_owner && wj_resv_owner != method) {
+		im = mono_interp_get_imethod (wj_resv_owner);
+		if (im && im->wasm_jit_resv_fslot > 0) {
+			*e_out = im->wasm_jit_resv_eslot;
+			*f_out = im->wasm_jit_resv_fslot;
+			return 1;
+		}
 	}
 	return 0;
 }

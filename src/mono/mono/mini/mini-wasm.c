@@ -637,6 +637,7 @@ typedef struct {
 	int ndeps;
 	int *deps; /* immutable f-slot dependency list */
 	guint32 *dep_sig;
+	MonoMethod **dep_method; /* callee behind each dep f-slot (diagnostics only) */
 } WjRegEntry;
 #define WJ_REG_CHUNK   8192
 #define WJ_REG_NCHUNKS 1024      /* up to 8M JITted methods; the 4KB top-level pointer array never moves */
@@ -659,7 +660,7 @@ wj_reg_at (int i)
 }
 
 int
-mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, const int *deps, const guint32 *dep_sig, int ndeps)
+mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps)
 {
 	int desc_id = 0;
 	mono_loader_lock ();
@@ -694,6 +695,9 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				memcpy (chunk [n % WJ_REG_CHUNK].deps, deps, sizeof (int) * ndeps);
 				chunk [n % WJ_REG_CHUNK].dep_sig = g_new (guint32, ndeps);
 				memcpy (chunk [n % WJ_REG_CHUNK].dep_sig, dep_sig, sizeof (guint32) * ndeps);
+				chunk [n % WJ_REG_CHUNK].dep_method = g_new0 (MonoMethod *, ndeps);
+				if (dep_methods)
+					memcpy (chunk [n % WJ_REG_CHUNK].dep_method, dep_methods, sizeof (MonoMethod *) * ndeps);
 			}
 			if (f_slot > 0 && f_slot / WJ_SLOT_CHUNK < WJ_SLOT_NCHUNKS) {
 				int ci2 = f_slot / WJ_SLOT_CHUNK;
@@ -805,8 +809,24 @@ mono_wasm_jit_admit (int desc_id)
 				dep_id > 0 && dep_id < wj_desc_state_cap ? wj_desc_state [dep_id] : -1,
 				dep ? mono_wasm_jit_slot_live (dep->e) : 0, dep ? mono_wasm_jit_slot_live (dep->f) : 0);
 		if (!dep_id || !dep || dep->f_sig_id != re->dep_sig [i]) {
-			printf ("WASM_JIT_ABI_MISMATCH desc=%d dep_fslot=%d expected=0x%x actual=0x%x\n",
-				desc_id, re->deps [i], re->dep_sig [i], dep ? dep->f_sig_id : 0);
+			/* Disambiguate what the old print collapsed into "actual=0x0":
+			 *  cause=fslot-unregistered  — the baked dep f-slot has NO registry entry at all (a slot that
+			 *    was readable at emit time but whose registration never happened / was refused);
+			 *  cause=sig-hash-mismatch   — the dep IS registered but its emitted ABI hash differs from what
+			 *    the caller derived from the call-site signature (a real WasmCallInfo/self-sig divergence).
+			 * dep_now_fslot = the callee's CURRENT published/reserved f-slot (from its imethod): if it is
+			 * >0 and != dep_fslot the callee re-registered under a fresh slot after the caller baked the
+			 * old one; 0/-1 means it never (re)registered. */
+			extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+			MonoMethod *dm = re->dep_method ? re->dep_method [i] : NULL;
+			char *cn = re->logical_method ? mono_method_get_full_name (re->logical_method) : NULL;
+			char *dn = dm ? mono_method_get_full_name (dm) : NULL;
+			printf ("WASM_JIT_ABI_MISMATCH desc=%d dep_fslot=%d expected=0x%x actual=0x%x cause=%s dep_desc=%d dep_now_fslot=%d caller=%s dep=%s\n",
+				desc_id, re->deps [i], re->dep_sig [i], dep ? dep->f_sig_id : 0,
+				!dep_id ? "fslot-unregistered" : (!dep ? "desc-chunk-missing" : "sig-hash-mismatch"),
+				dep_id, dm ? mono_wasm_jit_get_callee_fslot (dm) : -1,
+				cn ? cn : "?", dn ? dn : "?");
+			g_free (cn); g_free (dn);
 			goto fail;
 		}
 		if (!mono_wasm_jit_admit (dep_id))
@@ -1847,7 +1867,7 @@ wj_result_add_blocker (MonoWasmJitResult *res, MonoMethod *m)
 }
 
 static void
-wj_result_add_direct_dep (MonoWasmJitResult *res, int fslot, guint32 sig_id)
+wj_result_add_direct_dep (MonoWasmJitResult *res, int fslot, guint32 sig_id, MonoMethod *callee)
 {
 	int i;
 	if (fslot <= 0)
@@ -1860,6 +1880,7 @@ wj_result_add_direct_dep (MonoWasmJitResult *res, int fslot, guint32 sig_id)
 		}
 	if (res->ndirect_deps < MONO_WASM_JIT_MAX_DIRECT_DEPS) {
 		res->direct_deps [res->ndirect_deps] = fslot;
+		res->direct_dep_method [res->ndirect_deps] = callee;
 		res->direct_dep_sig [res->ndirect_deps++] = sig_id;
 	}
 	else
@@ -4105,7 +4126,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (call_fslot > 0) {
 					/* Callee is wasm-JITted: direct call_indirect through its f-slot (Phase 2). */
 #ifdef HOST_BROWSER
-					wj_result_add_direct_dep (&cfg->wasm_jit_result, call_fslot, wj_functype_hash (&ct));
+					wj_result_add_direct_dep (&cfg->wasm_jit_result, call_fslot, wj_functype_hash (&ct), call_method);
 					if (cfg->wasm_jit_result.direct_deps_truncated) { fail = "too many direct dependencies"; goto done; }
 #endif
 					for (k = 0; k < nextra; ++k)
@@ -4336,6 +4357,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							wasm_op (&body, sop); wasm_memarg (&body, (guint32) al, (guint32) (ai * 8));
 						}
 					}
+					/* DIAG (WASM_JIT_BADREF_ARG caller attribution): bake THIS (calling) method at scratch+224 so
+					 * call_interp's bad-ref check can name the type-confusion SOURCE, not just the callee. Written
+					 * immediately before the call (after the spills) so a nested residual can't leave a stale value. */
+					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+					wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+					wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224 /* WJ_SCRATCH_CALLER_OFF */);
 					/* mono_wasm_jit_call_interp(method, $scratch): bake call_method (the synchronized wrapper for a
 					 * synchronized callee) so the interp runs it WITH the monitor; plain callees pass through. */
 					wasm_i32_const (&body, (gint32) (intptr_t) call_method);
@@ -4830,6 +4857,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "vcall arg ld"; goto done; }
 								wasm_op (&body, sop); wasm_memarg (&body, al2, (guint32) (ai * 8));
 							}
+							/* DIAG (WASM_JIT_BADREF_ARG caller attribution): bake THIS (calling) method at scratch+224
+							 * (mirrors the direct residual site; 224 is past ret(192)/target(200)/fslot(208)/aot(212,216)). */
+							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+#ifdef HOST_BROWSER
+							wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+#else
+							wasm_i32_const (&body, 0x7ff8);
+#endif
+							wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224 /* WJ_SCRATCH_CALLER_OFF */);
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 200);            /* target MonoMethod* */
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);            /* scratch buffer */
@@ -5126,14 +5162,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * sync_thread so it's only set once this method's callees are guaranteed live on this thread. */
 				if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_REGISTERED); mono_wasm_jit_add (WJC_BYTES_GENERATED, (gint64) out.len); }
 				{ WasmFuncType self_ft;
-				  extern int mono_wasm_jit_register (MonoMethod *, int, int, void *, int, guint32, const int *, const guint32 *, int);
+				  extern int mono_wasm_jit_register (MonoMethod *, int, int, void *, int, guint32, const int *, const guint32 *, MonoMethod *const *, int);
 				  memset (&self_ft, 0, sizeof (self_ft));
 				  for (i = 0; i < nargs; ++i) self_ft.params [i] = param_types [i];
 				  self_ft.nparams = (guint32)nargs; self_ft.ret = ret_vt;
 				  cfg->wasm_jit_result.f_sig_id = wj_functype_hash (&self_ft);
 				  cfg->wasm_jit_result.desc_id = mono_wasm_jit_register (cfg->method, e_slot, f_slot, cached, (int) out.len,
 					cfg->wasm_jit_result.f_sig_id, cfg->wasm_jit_result.direct_deps,
-					cfg->wasm_jit_result.direct_dep_sig, cfg->wasm_jit_result.ndirect_deps); }
+					cfg->wasm_jit_result.direct_dep_sig, cfg->wasm_jit_result.direct_dep_method, cfg->wasm_jit_result.ndirect_deps); }
 				if (cfg->wasm_jit_result.desc_id <= 0) {
 					g_free (cached);
 					cached = NULL;

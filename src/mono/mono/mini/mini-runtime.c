@@ -4168,6 +4168,16 @@ mono_get_delegate_virtual_invoke_impl_name (gboolean load_imt_reg, int offset)
 gpointer
 mono_get_delegate_virtual_invoke_impl (MonoMethodSignature *sig, MonoMethod *method)
 {
+#ifdef HOST_WASM
+	/* No delegate-virtual-invoke thunks exist on wasm: the arch fn is a g_error stub and the AOT images
+	 * carry no delegate_virtual_invoke* trampolines (mini-trampolines.c already compiles its call to this
+	 * out under HOST_WASM). The remaining runtime caller is handle_delegate_ctor's "can we inline this
+	 * virtual-target delegate ctor?" probe (method-to-ir.c), which treats NULL as "no" and falls back to
+	 * the generic mono_delegate_ctor path. Reached at runtime since the wasm JIT runs method_to_ir
+	 * on-device (IKVM MethodHandle/DynamicBinder code creates delegates over virtual methods); without
+	 * this it g_error-aborts the compiling worker mid-app. */
+	return NULL;
+#else
 	gboolean is_virtual_generic, is_interface, load_imt_reg;
 	int offset, idx;
 
@@ -4222,6 +4232,7 @@ mono_get_delegate_virtual_invoke_impl (MonoMethodSignature *sig, MonoMethod *met
 		cache [idx] = (guint8 *)mono_arch_get_delegate_virtual_invoke_impl (sig, method, offset, load_imt_reg);
 	}
 	return cache [idx];
+#endif /* HOST_WASM */
 }
 
 /**
