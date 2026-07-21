@@ -432,18 +432,23 @@ mono_g_hash_table_destroy (MonoGHashTable *hash)
 	g_free (hash);
 }
 
-static void
-mono_g_hash_table_insert_replace (MonoGHashTable *hash, gpointer key, gpointer value, gboolean replace)
+static gboolean
+mono_g_hash_table_insert_replace (MonoGHashTable *hash, gpointer key, gpointer value, gboolean replace, gpointer *previous_value)
 {
 	MONO_REQ_GC_UNSAFE_MODE;
-	g_return_if_fail (hash != NULL);
+	g_return_val_if_fail (hash != NULL, FALSE);
+	g_assert (!previous_value || !hash->value_destroy_func);
 
 	if (hash->in_use > (hash->table_size * HASH_TABLE_MAX_LOAD_FACTOR))
 		rehash (hash);
 
 	guint slot = mono_g_hash_table_find_slot (hash, (MonoObject*)key);
+	gboolean found = hash->keys [slot] != NULL;
 
-	if (hash->keys [slot]) {
+	if (previous_value)
+		*previous_value = found ? hash->values [slot] : NULL;
+
+	if (found) {
 		if (replace) {
 			if (hash->key_destroy_func)
 				(*hash->key_destroy_func)(hash->keys [slot]);
@@ -457,6 +462,8 @@ mono_g_hash_table_insert_replace (MonoGHashTable *hash, gpointer key, gpointer v
 		mono_g_hash_table_value_store (hash, slot, (MonoObject*)value);
 		hash->in_use++;
 	}
+
+	return found;
 }
 
 /**
@@ -474,7 +481,14 @@ void
 mono_g_hash_table_insert_internal (MonoGHashTable *h, gpointer k, gpointer v)
 {
 	MONO_REQ_GC_UNSAFE_MODE;
-	mono_g_hash_table_insert_replace (h, k, v, FALSE);
+	mono_g_hash_table_insert_replace (h, k, v, FALSE, NULL);
+}
+
+gboolean
+mono_g_hash_table_insert_internal_with_previous (MonoGHashTable *h, gpointer k, gpointer v, gpointer *previous_value)
+{
+	MONO_REQ_GC_UNSAFE_MODE;
+	return mono_g_hash_table_insert_replace (h, k, v, FALSE, previous_value);
 }
 
 /**
@@ -483,7 +497,7 @@ mono_g_hash_table_insert_internal (MonoGHashTable *h, gpointer k, gpointer v)
 void
 mono_g_hash_table_replace(MonoGHashTable *h, gpointer k, gpointer v)
 {
-	mono_g_hash_table_insert_replace (h, k, v, TRUE);
+	mono_g_hash_table_insert_replace (h, k, v, TRUE, NULL);
 }
 
 void

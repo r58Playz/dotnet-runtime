@@ -15,4 +15,7 @@ mono_g_hash_table_new_type_internal (GHashFunc hash_func, GEqualFunc key_equal_f
 MONO_COMPONENT_API void
 mono_g_hash_table_insert_internal (MonoGHashTable *h, gpointer k, gpointer v);
 
+MONO_COMPONENT_API gboolean
+mono_g_hash_table_insert_internal_with_previous (MonoGHashTable *h, gpointer k, gpointer v, gpointer *previous_value);
+
 #endif /* __MONO_G_HASH_INTERNALS_H__ */
