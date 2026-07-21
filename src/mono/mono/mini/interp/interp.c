@@ -1165,7 +1165,18 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 			(*budget)--;
 			memset (&results [i], 0, sizeof (results [i]));
 			mono_wasm_force_compile (members [i], &results [i]);
-			if (results [i].e_slot > 0) { done [i] = TRUE; progress = TRUE; continue; }
+			if (results [i].e_slot > 0) {
+				/* Identity check: a member with a reservation MUST have registered into it — fellow members
+				 * have already baked that reserved f-slot into their modules. A bypass here (a compile that
+				 * registered under a fresh pair, e.g. a method-substitution losing the reservation key) is
+				 * the admit "fslot-unregistered" failure in the making; surface it at the source. */
+				if (im->wasm_jit_resv_fslot > 0 && results [i].f_slot != im->wasm_jit_resv_fslot) {
+					char *mn = mono_method_get_full_name (members [i]);
+					printf ("WASM_JIT_RESV_BYPASS %s reserved f=%d registered f=%d\n", mn, im->wasm_jit_resv_fslot, results [i].f_slot);
+					g_free (mn);
+				}
+				done [i] = TRUE; progress = TRUE; continue;
+			}
 			for (b = 0; b < results [i].nblockers; b++) {
 				MonoMethod *bm = results [i].blockers [b];
 				InterpMethod *bim = mono_interp_get_imethod (bm);
@@ -3162,6 +3173,10 @@ typedef struct {
 #if HOST_BROWSER
 #define WJ_SCRATCH_RET_OFF 192   /* result slot; past the max args (WASM_FUNCTYPE_MAX_PARAMS*8 = 128) */
 #define WJ_SCRATCH_SIZE    256
+/* scratch layout past the ret slot (offsets baked into JITted modules in mini-wasm.c — keep in sync):
+ *   200 resolved vcall target MonoMethod* (vcall_resolve_fslot -> call_interp fallback)
+ *   208 vcall resolved f-slot temp;  212 AOT call-target table index;  216 AOT rgctx
+ *   224 CALLING JITted method MonoMethod* (WASM_JIT_BADREF_ARG caller attribution) */
 
 /* TRUE iff this interp_entry invocation is the IMMEDIATE entry made by the wasm-JIT outbound residual
  * (mono_wasm_jit_call_interp): only that caller passes data->res == this thread's scratch result slot,
@@ -3850,11 +3865,17 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 	{
 		gsize _memsz = wj_memsz ();
 		int _vidx = sig->hasthis ? 1 : 0;
+		/* Caller attribution: every JITted residual/vcall-fallback site bakes ITS OWN MonoMethod* at
+		 * scratch+224 immediately before calling here (mini-wasm.c), so on a bad ref we can name the
+		 * type-confusion SOURCE. Plausibility-checked like the args (a stale/garbage word prints "?"). */
+		MonoMethod *_caller = NULL;
+		{ gsize _cp = (gsize) *(gpointer *) (buf + 224);
+		  if (_cp >= 1024 && _cp < _memsz && !(_cp & 3)) _caller = (MonoMethod *) _cp; }
 		if (sig->hasthis) {
 			gsize _t = (gsize) *(gpointer *) (buf + 0);
 			if (G_UNLIKELY (_t != 0 && (_t < 1024 || _t >= _memsz || (_t & 3)))) {
 				static int _zt = 0;
-				if (_zt++ < 40) { char *fn = mono_method_get_full_name (method); printf ("WASM_JIT_BADREF_ARG callee=%s this=0x%x — JIT passed a non-pointer as `this` (type-confusion source)\n", fn, (unsigned) _t); fflush (stdout); g_free (fn); }
+				if (_zt++ < 40) { char *fn = mono_method_get_full_name (method); char *cn = _caller ? mono_method_get_full_name (_caller) : NULL; printf ("WASM_JIT_BADREF_ARG callee=%s this=0x%x caller=%s — JIT passed a non-pointer as `this` (type-confusion source)\n", fn, (unsigned) _t, cn ? cn : "?"); fflush (stdout); g_free (fn); g_free (cn); }
 			}
 		}
 		for (int _p = 0; _p < (int) sig->param_count; ++_p) {
@@ -3863,7 +3884,7 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 			gsize _v = (gsize) *(gpointer *) (buf + (_vidx + _p) * 8);
 			if (G_UNLIKELY (_v != 0 && (_v < 1024 || _v >= _memsz || (_v & 3)))) {
 				static int _z = 0;
-				if (_z++ < 40) { char *fn = mono_method_get_full_name (method); printf ("WASM_JIT_BADREF_ARG callee=%s arg#%d value=0x%x — JIT passed a non-pointer as a reference arg (type-confusion source)\n", fn, _p, (unsigned) _v); fflush (stdout); g_free (fn); }
+				if (_z++ < 40) { char *fn = mono_method_get_full_name (method); char *cn = _caller ? mono_method_get_full_name (_caller) : NULL; printf ("WASM_JIT_BADREF_ARG callee=%s arg#%d value=0x%x caller=%s — JIT passed a non-pointer as a reference arg (type-confusion source)\n", fn, _p, (unsigned) _v, cn ? cn : "?"); fflush (stdout); g_free (fn); g_free (cn); }
 			}
 		}
 	}

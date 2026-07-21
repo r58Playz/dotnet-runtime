@@ -4476,12 +4476,25 @@ mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 				wrapped = mono_class_inflate_generic_method_checked (wrapped, mono_method_get_context (method), error);
 				if (!is_ok (error)) { mono_error_cleanup (error); wrapped = NULL; }
 			}
-			if (wrapped)
+			if (wrapped) {
+#ifdef HOST_BROWSER
+				/* The SCC batch keys its slot reservation on THIS inner-wrapper method (and fellow
+				 * members bake that reserved f-slot), but the compile below runs under `wrapped`.
+				 * Hand the reservation owner to mono_wasm_jit_self_reserved so the registration
+				 * instantiates INTO the reserved pair instead of a fresh one — else the outer
+				 * wrapper's baked dep f-slot never registers and admit refuses it forever. */
+				extern void mono_wasm_jit_set_resv_owner (MonoMethod *m);
+				mono_wasm_jit_set_resv_owner (method);
+#endif
 				method = wrapped;
+			}
 		}
 	}
 	reent = TRUE;
 	cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+#ifdef HOST_BROWSER
+	{ extern void mono_wasm_jit_set_resv_owner (MonoMethod *m); mono_wasm_jit_set_resv_owner (NULL); }
+#endif
 	if (cfg) {
 		if (out)
 			*out = cfg->wasm_jit_result;
