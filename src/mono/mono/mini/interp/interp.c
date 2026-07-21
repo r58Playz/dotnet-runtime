@@ -1118,6 +1118,7 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 	extern int mono_jiterp_allocate_table_entry (int type);
 	extern int mono_wasm_jit_verbose;
+	extern int mono_wasm_jit_residual_perm;
 	MonoMethod *members [WJ_SCC_MAX];
 	MonoWasmJitResult results [WJ_SCC_MAX];
 	gboolean done [WJ_SCC_MAX];
@@ -1182,7 +1183,12 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 				InterpMethod *bim = mono_interp_get_imethod (bm);
 				int j, seen = 0;
 				if (bim->wasm_jit_fslot > 0 || bim->wasm_jit_resv_fslot > 0) continue;   /* live or already a member */
-				if (bim->wasm_jit_slot == -1) { ok = FALSE; give_up = TRUE; goto out; }  /* permanent dependency -> can't close */
+				if (bim->wasm_jit_slot == -1) {
+					/* The next emit can residual-route this permanent leaf.  Count that as
+					 * progress so the member is retried instead of poisoning the SCC. */
+					if (mono_wasm_jit_residual_perm) { progress = TRUE; continue; }
+					ok = FALSE; give_up = TRUE; goto out;
+				}
 				for (j = 0; j < n; j++) if (members [j] == bm) { seen = 1; break; }
 				if (seen) continue;
 				if (n >= WJ_SCC_MAX) { ok = FALSE; give_up = TRUE; goto out; }           /* closure too large -> abort (perm) */
@@ -1259,6 +1265,7 @@ static int
 wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_root)
 {
 	extern int mono_wasm_jit_island_depth;   /* Lever C: env-tunable recursion depth (default 10) */
+	extern int mono_wasm_jit_residual_perm;
 	InterpMethod *im = mono_interp_get_imethod (m);
 	int tries, spos, pushed = 0, ret = 0;
 	if (im->wasm_jit_fslot > 0) return 1;          /* already JITted */
@@ -1286,6 +1293,10 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 			cim = mono_interp_get_imethod (callee);
 			if (cim->wasm_jit_fslot > 0) continue;     /* already JITted (e.g. pulled via an earlier blocker's recursion) */
 			if (cim->wasm_jit_slot == -1) {
+				/* The emitter supports a residual call to a permanent leaf.  Re-emit m
+				 * now that the callee's terminal state is visible instead of making the
+				 * caller permanently un-JITtable as well. */
+				if (mono_wasm_jit_residual_perm) { pulled++; continue; }
 				/* Callee can NEVER wasm-jit (slot==-1). Under residual=0 our island can't close around it: give up
 				 * PERMANENTLY and propagate a transitive-permanent sentinel (bail=-11) so OUR callers stop too. */
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BLOCKED_PERM);
@@ -1303,7 +1314,19 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 				continue;
 			}
 			_r = wasm_jit_force_island (callee, depth + 1, budget, promoted_root);
-			if (_r < 0) { im->wasm_jit_bail = -11; ret = -1; goto pop; }   /* callee permanently un-closable -> so are we */
+			if (_r < 0) {
+				/* compile_publish records the bail reason but the outer hotness driver
+				 * normally publishes slot=-1.  This is a recursive island attempt, so
+				 * publish the terminal state here before asking the parent emitter to
+				 * recognize the callee as residual-eligible. */
+				if (wj_slot_retriable (cim->wasm_jit_slot)) {
+					cim->wasm_jit_slot = -1;
+					wj_waiter_drain (callee);
+				}
+				/* Retry this method so RESIDUAL_PERM can route only that edge through interp. */
+				if (mono_wasm_jit_residual_perm) { pulled++; continue; }
+				im->wasm_jit_bail = -11; ret = -1; goto pop;
+			}
 			if (_r == WASM_JIT_COMPILE_BUSY) { ret = _r; goto pop; }
 			if (_r > 0) { pulled++; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_PROMOTED_DOWN); }
 			else wj_waiter_register (callee, m);   /* callee still warming (its own blockers cold) -> wake m when it JITs */

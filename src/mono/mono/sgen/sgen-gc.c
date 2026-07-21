@@ -413,7 +413,18 @@ static mword roots_size = 0; /* amount of memory in the root set */
  * FIXME: Tune this.
  * FIXME: Make this self-tuning for each thread.
  */
+/* A 4 KiB TLAB is cheap to abandon on native hosts, but it makes allocation-heavy
+ * browser workloads contend on the shared nursery fragment list far too often.
+ * WebAssembly applications commonly fan resource loading out across a sizeable
+ * pthread pool; give each mutator enough local space to amortize the lock-free
+ * range search.  At 32 KiB the worst-case slack is still small compared with the
+ * browser nursery (one TLAB per mutator), while refill traffic is reduced by up
+ * to 8x.  Preserve the long-standing native default. */
+#ifdef HOST_BROWSER
+guint32 sgen_tlab_size = (1024 * 32);
+#else
 guint32 sgen_tlab_size = (1024 * 4);
+#endif
 
 #define MAX_SMALL_OBJ_SIZE	SGEN_MAX_SMALL_OBJ_SIZE
 

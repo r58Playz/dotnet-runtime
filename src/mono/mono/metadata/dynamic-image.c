@@ -52,6 +52,25 @@ mono_dynamic_images_init (void)
 	mono_os_mutex_init (&dynamic_images_mutex);
 }
 
+/* Metadata tokens contain a table identifier in the high byte and a sequential row
+ * number in the low 24 bits.  g_direct_hash leaves those sequences intact, so the
+ * ranges for several metadata tables overlap after the modulo in MonoGHashTable and
+ * form long linear-probing clusters.  Mix all token bits before reducing to the table
+ * size.  Keep this local: generic_def_objects uses pointer keys and still wants the
+ * normal direct hash. */
+static guint
+dynamic_token_hash (gconstpointer data)
+{
+	guint32 value = (guint32)(gsize)data;
+
+	value ^= value >> 16;
+	value *= 0x7feb352dU;
+	value ^= value >> 15;
+	value *= 0x846ca68bU;
+	value ^= value >> 16;
+	return value;
+}
+
 #ifndef DISABLE_REFLECTION_EMIT
 static void
 string_heap_init (MonoDynamicStream *sh)
@@ -147,12 +166,16 @@ void
 mono_dynamic_image_register_token (MonoDynamicImage *assembly, guint32 token, MonoObjectHandle obj, int how_collide)
 {
 	MONO_REQ_GC_UNSAFE_MODE;
+	gpointer previous = NULL;
+	MonoObject *prev;
+	gboolean found;
 
 	g_assert (!MONO_HANDLE_IS_NULL (obj));
 	g_assert (strcmp (m_class_get_name (mono_handle_class (obj)), "RuntimeEnumBuilder"));
 	dynamic_image_lock (assembly);
-	MonoObject *prev = (MonoObject *)mono_g_hash_table_lookup (assembly->tokens, GUINT_TO_POINTER (token));
-	if (prev) {
+	found = mono_g_hash_table_insert_internal_with_previous (assembly->tokens, GUINT_TO_POINTER (token), MONO_HANDLE_RAW (obj), &previous);
+	prev = (MonoObject *)previous;
+	if (found) {
 		switch (how_collide) {
 		case MONO_DYN_IMAGE_TOK_NEW:
 			g_warning ("%s: Unexpected previous object when called with MONO_DYN_IMAGE_TOK_NEW", __func__);
@@ -168,7 +191,6 @@ mono_dynamic_image_register_token (MonoDynamicImage *assembly, guint32 token, Mo
 			g_assert_not_reached ();
 		}
 	}
-	mono_g_hash_table_insert_internal (assembly->tokens, GUINT_TO_POINTER (token), MONO_HANDLE_RAW (obj));
 	dynamic_image_unlock (assembly);
 }
 #else
@@ -364,7 +386,7 @@ mono_dynamic_image_create (MonoDynamicAssembly *assembly, char *assembly_name, c
 	image->method_aux_hash = g_hash_table_new (NULL, NULL);
 	image->vararg_aux_hash = g_hash_table_new (NULL, NULL);
 	image->handleref = g_hash_table_new (NULL, NULL);
-	image->tokens = mono_g_hash_table_new_type_internal (NULL, NULL, MONO_HASH_VALUE_GC, MONO_ROOT_SOURCE_REFLECTION, NULL, "Reflection Dynamic Image Token Table");
+	image->tokens = mono_g_hash_table_new_type_internal (dynamic_token_hash, NULL, MONO_HASH_VALUE_GC, MONO_ROOT_SOURCE_REFLECTION, NULL, "Reflection Dynamic Image Token Table");
 	image->generic_def_objects = mono_g_hash_table_new_type_internal (NULL, NULL, MONO_HASH_VALUE_GC, MONO_ROOT_SOURCE_REFLECTION, NULL, "Reflection Dynamic Image Generic Definition Table");
 	image->typespec = g_hash_table_new ((GHashFunc)mono_metadata_type_hash, (GCompareFunc)mono_metadata_type_equal);
 	image->typeref = g_hash_table_new ((GHashFunc)mono_metadata_type_hash, (GCompareFunc)mono_metadata_type_equal);
