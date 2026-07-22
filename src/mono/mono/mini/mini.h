@@ -1355,7 +1355,8 @@ typedef struct {
 	int          f_slot;             /* scalar fn slot */
 	void        *bytes;              /* g_malloc'd module bytes; ownership passes to InterpMethod */
 	int          bytes_len;
-	int          bail;               /* bail category: 0=ok; -2..-10; >0 unsupported opcode */
+	int          bail;               /* bail category: 0=ok; -2..-12; >0 unsupported opcode */
+	const char  *fail_reason;        /* the emitter's fail string (a static literal, or NULL on success) — carried to InterpMethod.wasm_jit_fail so the weighted vperm dump can name the exact gate, not just the category */
 	int          retriable;          /* 1 iff bail was "callee not jitted" (un-JITted direct callee) */
 	int          nblockers;          /* # entries in blockers[] (residual=0 island pre-scan) */
 	guint8       blockers_truncated; /* 1 if more than MONO_WASM_JIT_MAX_BLOCKERS distinct blockers existed */

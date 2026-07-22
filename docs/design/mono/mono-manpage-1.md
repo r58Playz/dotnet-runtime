@@ -1287,6 +1287,14 @@ kilo-, mega- and gigabytes, respectively. The nursery is the first
 generation (of two). A larger nursery will usually speed up the program
 but will obviously use more memory. The default nursery size 4 MB.
 
+**tlab-size=***size*
+Sets the size of each thread-local allocation buffer. The size is
+specified in bytes and must be a power of two. The suffixes \`k', \`m'
+and \`g' can be used to specify kilo-, mega- and gigabytes, respectively.
+A larger TLAB reduces contention and shared nursery allocator work for
+allocation-heavy multithreaded programs, at the cost of more unused
+nursery space when threads abandon partially filled TLABs.
+
 **major=***collector*
 Specifies which major collector to use. Options are \`marksweep' for the
 Mark&Sweep collector, \`marksweep-conc' for concurrent Mark&Sweep and

@@ -169,6 +169,13 @@ enum {
 	 * marking (compute_gc_maps seeds + add/sub taint) and can stay off. Each nonzero hit is a
 	 * named counterexample (logged under MONO_WASM_JIT_REFVERIFY). */
 	WJC_REFBASES_EXTRA,
+	/* rgctx CALLSITE bails (bail -12, split out of WJC_VPERM_GSHARED): the perm callee is a concrete
+	 * method whose body makes an indirect/virtual call carrying MONO_ARCH_RGCTX_REG — fixable per-site
+	 * (route that one call through the residual), unlike the whole-method gshared gate (-8). */
+	WJC_VPERM_RGCTX,
+	/* vtype ABI coverage (WS-B B3): methods REGISTERED with >=1 by-addr vtype arg / with a hidden vret —
+	 * direct visibility that the new ABI paths are actually being exercised, not silently bailed. */
+	WJC_VT_BYADDR_METHODS, WJC_VRET_METHODS,
 	WJC_MAX
 };
 
