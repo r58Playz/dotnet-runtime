@@ -167,6 +167,83 @@ namespace Wasm.Build.Tests
         }
 
         [Theory]
+        [BuildAndRun(config: Configuration.Release, aot: false)]
+        public async Task WasmJitValueTypeAbi(Configuration config, bool aot)
+        {
+            // Every probe in the asset, so name-targeting compiles them on first call. VtFilteredTake /
+            // VtFilteredMake carry EH filters -> perm-bail; with RESIDUAL_PERM=1 their JITted callers
+            // route those edges through the interp residual (the by-addr / vret scratch marshal path).
+            const string targetedMethods =
+                "VtTakeMHA,VtMutateMHA,VtCallMHA,VtMakeMHA,VtUseMakeMHA," +
+                "VtFilteredTake,VtFilteredMake,VtResidualTake,VtResidualMake," +
+                "VtAcrossGc,VtSumTags,VtGcInside,VtTakeScalar,VtTakeScalarRef,VtMakeScalar,VtMakeScalarRef," +
+                "VtUseScalarReturn,VtUseScalarRefReturn,VtFilteredScalarReturn,VtResidualScalarReturn,VtVirtualScalarArg,VtVirtualTake,VtVirtualByaddrArg,VtVirtualTakeMha,VtMixedOffsets," +
+                "VtTakeNested,VtCallNested,VtRefLocal,VtConsumeRef," +
+                "VtInvokeMhaDelegate,VtInvokeIntDelegate,VtDelegateAdd,VtDelegateDouble," +
+                "VtTakeScalarLong,VtMakeScalarLong,VtUseScalarLongReturn," +
+                "VtTakeScalarDouble,VtMakeScalarDouble,VtUseScalarDoubleReturn," +
+                "VtBoundRefBias,VtBoundIntBias";
+
+            ProjectInfo info = CopyTestAsset(config, aot, TestAsset.WasmBasicTestApp, "wasm_jit_vtype");
+            ReplaceFile(
+                Path.Combine("Common", "Program.cs"),
+                Path.Combine(BuildEnvironment.TestAssetsPath, "EntryPoints", "WasmJitVtype.cs"));
+            PublishProject(
+                info,
+                config,
+                new PublishOptions(AOT: false, ExtraMSBuildArgs: "-p:WasmBuildNative=true"),
+                isNativeBuild: true);
+
+            NameValueCollection query = new()
+            {
+                ["MONO_WASM_JIT_METHOD"] = targetedMethods,
+                ["MONO_WASM_JIT_VERBOSE"] = "2",
+                ["MONO_WASM_JIT_STATS"] = "1",
+                ["MONO_WASM_JIT_RESIDUAL_PERM"] = "1",
+            };
+            RunResult result = await RunForPublishWithWebServer(new BrowserRunOptions(
+                config,
+                TestScenario: "WasmJitEhTest",
+                BrowserQueryString: query,
+                ExpectedExitCode: 42));
+
+            Assert.Contains(result.ConsoleOutput, line => line.Contains("WASM_JIT_VTYPE_TEST_PASS"));
+
+            // by-addr arg + hidden-vret shapes must actually JIT (not silently bail to the interp)
+            string[] vtypeAbiMethods =
+            {
+                "VtTakeMHA", "VtMutateMHA", "VtCallMHA", "VtMakeMHA", "VtUseMakeMHA",
+                "VtResidualTake", "VtResidualMake", "VtAcrossGc", "VtSumTags",
+                "VtGcInside", "VtTakeScalar", "VtTakeScalarRef", "VtMakeScalar", "VtMakeScalarRef",
+                "VtUseScalarReturn", "VtUseScalarRefReturn", "VtResidualScalarReturn", "VtVirtualScalarArg", "VtVirtualTake", "VtVirtualByaddrArg", "VtVirtualTakeMha", "VtMixedOffsets",
+                "VtTakeNested", "VtCallNested", "VtRefLocal", "VtConsumeRef",
+                "VtInvokeMhaDelegate", "VtInvokeIntDelegate", "VtDelegateDouble",
+                // wide-etype (i64/f64) scalar-vtype shapes
+                "VtTakeScalarLong", "VtMakeScalarLong", "VtUseScalarLongReturn",
+                "VtTakeScalarDouble", "VtMakeScalarDouble", "VtUseScalarDoubleReturn",
+                // bound-static ref-arg delegate target: compiled by the direct-target recipe's
+                // maybe_compile in wasm_jit_prepare_delegate_call (VtBoundIntBias is intentionally
+                // NOT asserted: its value-type bound arg stays on the wrapper path)
+                "VtBoundRefBias",
+            };
+            foreach (string method in vtypeAbiMethods)
+                Assert.Contains(result.ConsoleOutput, line =>
+                    line.Contains("WASM_JIT_REGISTERED") && line.Contains($"WasmJitVtypeTests:{method}"));
+
+            // the EH-filter probes stay interp-resident (perm bail) — that is what forces the
+            // residual by-addr / vret marshal in their JITted callers
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("WASM_JIT_BAIL") && line.Contains("WasmJitVtypeTests:VtFilteredTake") &&
+                line.Contains("filter not supported"));
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("WASM_JIT_BAIL") && line.Contains("WasmJitVtypeTests:VtFilteredMake") &&
+                line.Contains("filter not supported"));
+            Assert.Contains(result.ConsoleOutput, line =>
+                line.Contains("WASM_JIT_BAIL") && line.Contains("WasmJitVtypeTests:VtFilteredScalarReturn") &&
+                line.Contains("filter not supported"));
+        }
+
+        [Theory]
         [BuildAndRun(config: Configuration.Release, aot: true)]
         public async Task WasmJitAotExceptionBoundary(Configuration config, bool aot)
         {

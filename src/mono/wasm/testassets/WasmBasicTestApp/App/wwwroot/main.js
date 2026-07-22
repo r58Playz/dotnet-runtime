@@ -173,6 +173,7 @@ switch (testCase) {
             "MONO_WASM_JIT_METHOD",
             "MONO_WASM_JIT_VERBOSE",
             "MONO_WASM_JIT_STATS",
+            "MONO_WASM_JIT_RESIDUAL_PERM",
         ]) {
             const value = params.get(name);
             if (value !== null)

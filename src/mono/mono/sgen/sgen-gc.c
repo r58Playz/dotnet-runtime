@@ -3614,6 +3614,33 @@ sgen_gc_init (void)
 				}
 				continue;
 			}
+			if (g_str_has_prefix (opt, "tlab-size=")) {
+				size_t val;
+				opt = strchr (opt, '=') + 1;
+				if (*opt && mono_gc_parse_environment_string_extract_number (opt, &val)) {
+					if ((val & (val - 1))) {
+						sgen_env_var_error (MONO_GC_PARAMS_NAME, "Using default value.", "`tlab-size` must be a power of two.");
+						continue;
+					}
+
+					if (val < SGEN_MAX_NURSERY_WASTE) {
+						sgen_env_var_error (MONO_GC_PARAMS_NAME, "Using default value.",
+								"`tlab-size` must be at least %d bytes.", SGEN_MAX_NURSERY_WASTE);
+						continue;
+					}
+
+					if (val > G_MAXUINT32) {
+						sgen_env_var_error (MONO_GC_PARAMS_NAME, "Using default value.",
+								"`tlab-size` must be at most %u bytes.", G_MAXUINT32);
+						continue;
+					}
+
+					sgen_tlab_size = (guint32)val;
+				} else {
+					sgen_env_var_error (MONO_GC_PARAMS_NAME, "Using default value.", "`tlab-size` must be an integer.");
+				}
+				continue;
+			}
 			if (g_str_has_prefix (opt, "save-target-ratio=")) {
 				double val;
 				opt = strchr (opt, '=') + 1;
@@ -3692,6 +3719,7 @@ sgen_gc_init (void)
 			fprintf (stderr, "  soft-heap-limit=n (where N is an integer, possibly with a k, m or a g suffix)\n");
 			fprintf (stderr, "  mode=MODE (where MODE is 'balanced', 'throughput' or 'pause[:N]' and N is maximum pause in milliseconds)\n");
 			fprintf (stderr, "  nursery-size=N (where N is an integer, possibly with a k, m or a g suffix)\n");
+			fprintf (stderr, "  tlab-size=N (where N is a power-of-two integer, possibly with a k, m or a g suffix)\n");
 			fprintf (stderr, "  major=COLLECTOR (where COLLECTOR is `marksweep', `marksweep-conc', `marksweep-par')\n");
 			fprintf (stderr, "  minor=COLLECTOR (where COLLECTOR is `simple' or `split')\n");
 			fprintf (stderr, "  wbarrier=WBARRIER (where WBARRIER is `remset' or `cardtable')\n");

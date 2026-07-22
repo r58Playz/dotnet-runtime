@@ -157,7 +157,9 @@ struct InterpMethod {
 	gint32 wasm_jit_hits;  // runtime wasm JIT: call-count toward the auto-JIT hotness threshold (MONO_WASM_JIT_AUTO)
 	gint32 wasm_jit_bytes_len; // runtime wasm JIT: length of the cached module bytes (for per-thread instantiation)
 	gpointer wasm_jit_bytes;   // runtime wasm JIT: cached emitted module bytes; each thread instantiates its own WebAssembly.Instance from these into its own function table on first invoke (the table is per-thread for dynamically-added entries)
-	gint16 wasm_jit_bail;  // runtime wasm JIT: why this method permanently failed to JIT (set when slot==-1), for the weighted vcall-residual breakdown. 0=n/a; -2=EH clauses; -3=sig(arg/ret) type; -4=other; >0=the unsupported mini opcode number
+	gint16 wasm_jit_bail;  // runtime wasm JIT: why this method permanently failed to JIT (set when slot==-1), for the weighted vcall-residual breakdown. 0=n/a; -2=EH clauses; -3=sig(arg/ret) type; -4=other; -8=gshared method; -11=island perm-leaf poison; -12=rgctx callsite; >0=the unsupported mini opcode number
+	guint8 wasm_jit_blocked_noted; // runtime wasm JIT stats: this method was already counted (once) into the callee-not-jitted bail-histogram bucket — the island driver re-emits blocked methods every iteration, so publish-time distinct-method counting keeps the histogram terminal, not per-attempt
+	const char *wasm_jit_fail; // runtime wasm JIT: the emitter's exact fail string (static literal) behind wasm_jit_bail, for the weighted vperm top-N dump (names the specific gate, e.g. "ldaddr of vtype with refs" vs just "ldaddr")
 	gint32 wasm_jit_invoke_in; // runtime wasm JIT diag (Part 3c): times entered interp->JIT (this method was the JITted callee at a MINT_CALL/CALLVIRT). stats only
 	gint32 wasm_jit_block_n;   // runtime wasm JIT (Part 3a / Lever C): times this (un-JITted) method BLOCKED a caller's island. Always counted (cheap, compile-time): also a stats-independent "hot at the island boundary" signal for the cold gate.
 	gint32 wasm_jit_invoke_out; // runtime wasm JIT (Lever A): times THIS (interp) method invoked a JITted callee. Drives MONO_WASM_JIT_ENTRY_PROMOTE upward island growth.
