@@ -126,6 +126,8 @@ typedef struct {
 	/* interp virtual method table */
 	gpointer *interp_vtable;
 	MonoFtnDesc **gsharedvt_vtable;
+	/* Lazily allocated, vtable-owned ldvirtftn cache (private layout in jit-icalls.c). */
+	gpointer ldvirtfn_cache;
 } MonoVTableEEData;
 
 /*
