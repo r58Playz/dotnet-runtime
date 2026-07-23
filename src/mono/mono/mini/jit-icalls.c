@@ -35,6 +35,105 @@
 #include "mini-llvm-cpp.h"
 #endif
 
+/* ldvirtftn is commonly executed immediately before delegate construction. Cache the final callable
+ * address, not just the resolved override: a hit then avoids virtual resolution, generic inflation, and
+ * ftndesc/unbox-trampoline lookup. The cache hangs off the receiver vtable and its storage comes from the
+ * receiver class's memory manager, so collectible classes cannot leave process-global stale entries. */
+#define LDVIRTFTN_CACHE_WAYS 4
+
+typedef struct {
+	volatile gint32 seq;
+	MonoMethod * volatile method;
+	volatile gint32 gshared;
+	gpointer volatile addr;
+} LdvirtfnCacheEntry;
+
+static LdvirtfnCacheEntry*
+get_ldvirtfn_cache (MonoVTable *vtable)
+{
+	MonoVTableEEData *ee_data = (MonoVTableEEData*)mono_atomic_load_ptr ((volatile gpointer*)&vtable->ee_data);
+	MonoMemoryManager *memory_manager = NULL;
+
+	if (G_UNLIKELY (!ee_data)) {
+		memory_manager = m_class_get_mem_manager (vtable->klass);
+		mono_mem_manager_lock (memory_manager);
+		ee_data = (MonoVTableEEData*)mono_atomic_load_ptr ((volatile gpointer*)&vtable->ee_data);
+		if (!ee_data) {
+			ee_data = m_class_alloc0 (vtable->klass, sizeof (MonoVTableEEData));
+			mono_memory_barrier ();
+			mono_atomic_xchg_ptr ((volatile gpointer*)&vtable->ee_data, ee_data);
+		}
+		mono_mem_manager_unlock (memory_manager);
+	}
+	LdvirtfnCacheEntry *cache = (LdvirtfnCacheEntry*)mono_atomic_load_ptr (
+		(volatile gpointer*)&ee_data->ldvirtfn_cache);
+	if (G_UNLIKELY (!cache)) {
+		if (!memory_manager)
+			memory_manager = m_class_get_mem_manager (vtable->klass);
+		mono_mem_manager_lock (memory_manager);
+		cache = (LdvirtfnCacheEntry*)mono_atomic_load_ptr (
+			(volatile gpointer*)&ee_data->ldvirtfn_cache);
+		if (!cache) {
+			cache = m_class_alloc0 (
+				vtable->klass, LDVIRTFTN_CACHE_WAYS * sizeof (LdvirtfnCacheEntry));
+			mono_memory_barrier ();
+			mono_atomic_xchg_ptr ((volatile gpointer*)&ee_data->ldvirtfn_cache, cache);
+		}
+		mono_mem_manager_unlock (memory_manager);
+	}
+	return cache;
+}
+
+static gboolean
+ldvirtfn_cache_read (LdvirtfnCacheEntry *cache, MonoMethod *method, gboolean gshared, gpointer *addr)
+{
+	for (int i = 0; i < LDVIRTFTN_CACHE_WAYS; ++i) {
+		LdvirtfnCacheEntry *entry = &cache [i];
+		gint32 before = mono_atomic_load_i32 (&entry->seq);
+		if (!before || (before & 1))
+			continue;
+		mono_memory_barrier ();
+		MonoMethod *cached_method = entry->method;
+		gint32 cached_gshared = entry->gshared;
+		gpointer cached_addr = entry->addr;
+		mono_memory_barrier ();
+		if (before == mono_atomic_load_i32 (&entry->seq) && cached_method == method &&
+		    cached_gshared == (gshared ? 1 : 0) && cached_addr) {
+			*addr = cached_addr;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static void
+ldvirtfn_cache_write (LdvirtfnCacheEntry *cache, MonoMethod *method, gboolean gshared, gpointer addr)
+{
+	int victim = -1;
+	for (int i = 0; i < LDVIRTFTN_CACHE_WAYS; ++i) {
+		gint32 seq = mono_atomic_load_i32 (&cache [i].seq);
+		if (!(seq & 1) && seq && cache [i].method == method &&
+		    cache [i].gshared == (gshared ? 1 : 0)) {
+			victim = i;
+			break;
+		}
+		if (victim < 0 && !seq)
+			victim = i;
+	}
+	if (victim < 0)
+		victim = (int) ((((gsize) method >> 4) ^ (gshared ? 1 : 0)) % LDVIRTFTN_CACHE_WAYS);
+
+	LdvirtfnCacheEntry *entry = &cache [victim];
+	gint32 before = mono_atomic_load_i32 (&entry->seq);
+	if (before & 1 || mono_atomic_cas_i32 (&entry->seq, before + 1, before) != before)
+		return;
+	entry->method = method;
+	entry->gshared = gshared ? 1 : 0;
+	entry->addr = addr;
+	mono_memory_barrier ();
+	mono_atomic_xchg_i32 (&entry->seq, before + 2);
+}
+
 void*
 mono_ldftn (MonoMethod *method)
 {
@@ -80,12 +179,17 @@ ldvirtfn_internal (MonoObject *obj, MonoMethod *method, gboolean gshared)
 	ERROR_DECL (error);
 	MonoMethod *res;
 	gpointer addr;
+	LdvirtfnCacheEntry *cache;
 
 	if (obj == NULL) {
 		mono_error_set_null_reference (error);
 		mono_error_set_pending_exception (error);
 		return NULL;
 	}
+
+	cache = get_ldvirtfn_cache (obj->vtable);
+	if (ldvirtfn_cache_read (cache, method, gshared, &addr))
+		return addr;
 
 	res = mono_object_get_virtual_method_internal (obj, method);
 
@@ -127,6 +231,8 @@ ldvirtfn_internal (MonoObject *obj, MonoMethod *method, gboolean gshared)
 	} else {
 		addr = mono_ldftn (res);
 	}
+	if (addr)
+		ldvirtfn_cache_write (cache, method, gshared, addr);
 	return addr;
 }
 

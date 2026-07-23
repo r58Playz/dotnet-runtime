@@ -928,11 +928,11 @@ extern int mono_wasm_jit_arity;
 static long long wj_arity_hit [WJ_ARITY_WAYS];   /* receiver found at LRU depth d (0=MRU) */
 static long long wj_arity_miss;                   /* receiver not among the last WJ_ARITY_WAYS distinct vtables */
 
-/* Optional per-call-site single-cast delegate recipe, allocated only for Delegate.Invoke sites.
- * `seq` is a seqlock: even = stable, odd = writer active, zero = empty. The cache is shared by wasm
- * worker threads, so readers validate the sequence around the plain payload loads and can never combine
- * fields from two delegate targets. InterpMethod is cached rather than a raw e-slot so a target which
- * JITs later is observed and admitted into each thread's function table before use. */
+/* Optional per-call-site single-cast delegate recipes, allocated only for Delegate.Invoke sites.
+ * Each way has its own seqlock: even = stable, odd = writer active, zero = empty. The cache is shared
+ * by wasm worker threads, so readers validate the sequence around the plain payload loads and can never
+ * combine fields from two delegate targets. InterpMethod is cached rather than a raw e-slot so a target
+ * which JITs later is observed and admitted into each thread's function table before use. */
 typedef struct {
 	volatile gint32 seq;
 	MonoMethod * volatile source;
@@ -951,13 +951,20 @@ wj_delegate_ic (gpointer ic)
 	return (WjDelegateIC *) ((guint8 *) ic + 8 * (mono_wasm_jit_vcall_ways + 1));
 }
 
+static int
+wj_delegate_ic_size (void)
+{
+	extern int mono_wasm_jit_vcall_ways;
+	return mono_wasm_jit_vcall_ways * (int) sizeof (WjDelegateIC);
+}
+
 static void
 wj_arity_record (gpointer ic, MonoVTable *vt, gboolean delegate_site)
 {
 	extern int mono_wasm_jit_vcall_ways;
 	guint8 *p = (guint8 *) ic + 8 * (mono_wasm_jit_vcall_ways + 1);
 	if (delegate_site)
-		p += sizeof (WjDelegateIC);
+		p += wj_delegate_ic_size ();
 	guint32 *sh = (guint32 *) p;   /* after N IC entries + fast-miss meta + optional delegate recipe */
 	guint32 v = (guint32) (gsize) vt;                 /* a real vtable pointer is never 0, so 0 slots never false-match */
 	int d = -1, i;
@@ -3732,7 +3739,7 @@ mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
  *         concurrent first-miss publish stores identical values) and used to drive get_virtual_method_fast
  *         (the interp's cached per-(vtable,slot) resolve) on every subsequent miss. Only the C helper
  *         reads it.
- *     optional single-cast delegate dispatch recipe, present only at Delegate.Invoke sites.
+ *     optional N-way single-cast delegate dispatch recipes, present only at Delegate.Invoke sites.
  *     optional receiver-arity diagnostic shadow, present only when that diagnostic is enabled.
  * One per virtual call site, allocated once at JIT-emit time. Never freed (bounded: one per JITted
  * virtual call site).
@@ -3745,7 +3752,7 @@ mono_wasm_jit_alloc_ic (int delegate_site)
 	 * offsets. The arity shadow is allocated only when MONO_WASM_JIT_ARITY=1. */
 	extern int mono_wasm_jit_arity, mono_wasm_jit_vcall_ways;
 	int sz = 8 * (mono_wasm_jit_vcall_ways + 1);   /* N IC entries + one fast-miss meta i64 */
-	if (delegate_site) sz += sizeof (WjDelegateIC);
+	if (delegate_site) sz += wj_delegate_ic_size ();
 	if (mono_wasm_jit_arity) sz += WJ_ARITY_WAYS * (int) sizeof (guint32);
 	return g_malloc0 (sz);
 }
@@ -4346,7 +4353,7 @@ enum {
 };
 
 static gboolean
-wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
+wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
 	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
@@ -4378,7 +4385,7 @@ wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *rec
 }
 
 static void
-wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
+wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
 	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
@@ -4395,6 +4402,45 @@ wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *re
 	cache->scalar = scalar ? 1 : 0;
 	mono_memory_barrier ();
 	mono_atomic_xchg_i32 (&cache->seq, before + 2);
+}
+
+static gboolean
+wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
+	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar)
+{
+	extern int mono_wasm_jit_vcall_ways;
+	for (int i = 0; i < mono_wasm_jit_vcall_ways; ++i) {
+		if (wj_delegate_cache_read_way (&cache [i], source, receiver_vt,
+			target, imethod, shape, slots, scalar))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void
+wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
+	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar)
+{
+	extern int mono_wasm_jit_vcall_ways;
+	int victim = -1;
+
+	/* Preserve an existing way for this key, otherwise fill an empty way before evicting. Concurrent
+	 * duplicate fills are harmless: both recipes are pure functions of the same immutable key. */
+	for (int i = 0; i < mono_wasm_jit_vcall_ways; ++i) {
+		gint32 seq = mono_atomic_load_i32 (&cache [i].seq);
+		if (!(seq & 1) && seq && cache [i].source == source && cache [i].receiver_vt == receiver_vt) {
+			victim = i;
+			break;
+		}
+		if (victim < 0 && !seq)
+			victim = i;
+	}
+	if (victim < 0) {
+		gsize hash = ((gsize) source >> 4) ^ ((gsize) receiver_vt >> 5);
+		victim = (int) (hash % (guint) mono_wasm_jit_vcall_ways);
+	}
+	wj_delegate_cache_write_way (&cache [victim], source, receiver_vt,
+		target, imethod, shape, slots, scalar);
 }
 
 /* Resolve a single-cast Delegate.Invoke to the delegate's real target while all call arguments are
@@ -4431,6 +4477,10 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	if (!m_method_is_static (source) && m_method_is_virtual (source) && del->target)
 		receiver_vt = del->target->vtable;
 	if (wj_delegate_cache_read (cache, source, receiver_vt, &target, &imethod, &shape, &slots, &scalar)) {
+		/* Tiering replaces, rather than mutates, an InterpMethod. Follow the forwarding link so a recipe
+		 * populated before tier-up does not permanently retain the unoptimized method. */
+		while (imethod->optimized_imethod)
+			imethod = imethod->optimized_imethod;
 		/* A recipe can be cached on the target's first invocation, before it crosses the auto-JIT threshold.
 		 * Keep accumulating the same hotness/retry state as the uncached path; otherwise that first recipe
 		 * permanently strands the target in the interpreter (profile13: registered -6%, interp-routed +40%).
