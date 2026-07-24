@@ -176,6 +176,12 @@ enum {
 	/* vtype ABI coverage (WS-B B3): methods REGISTERED with >=1 by-addr vtype arg / with a hidden vret —
 	 * direct visibility that the new ABI paths are actually being exercised, not silently bailed. */
 	WJC_VT_BYADDR_METHODS, WJC_VRET_METHODS,
+	/* transition-elision paths added after profile18. RESIDUAL_HEALED counts successful late-fslot
+	 * discoveries (and therefore direct JIT->JIT calls from immutable residual sites). FAST_DELEGATE is
+	 * emitted only with PROFILE_FAST and counts scalar Delegate.Invoke recipes entered through the target
+	 * f-thunk directly, bypassing call_delegate/invoke_caught/e-thunk. DELEGATE_IC_HIT is the subset which
+	 * also bypassed vcall_resolve_fslot by consuming the recipe directly in generated wasm. */
+	WJC_RESIDUAL_HEALED, WJC_FAST_DELEGATE, WJC_DELEGATE_IC_HIT,
 	WJC_MAX
 };
 

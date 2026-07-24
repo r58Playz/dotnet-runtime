@@ -958,6 +958,45 @@ wj_delegate_ic_size (void)
 	return mono_wasm_jit_vcall_ways * (int) sizeof (WjDelegateIC);
 }
 
+/* Emitter-time layout queries for the generated-wasm recipe fast path. WjDelegateIC stays private
+ * to the interpreter and mini-wasm.c does not duplicate its C layout. None of these are hot calls. */
+gpointer
+mono_wasm_jit_delegate_ic_base (gpointer ic)
+{
+	return wj_delegate_ic (ic);
+}
+
+int
+mono_wasm_jit_delegate_ic_stride (void)
+{
+	return (int) sizeof (WjDelegateIC);
+}
+
+int
+mono_wasm_jit_delegate_ic_field_off (int field)
+{
+	switch (field) {
+	case 0: return (int) G_STRUCT_OFFSET (WjDelegateIC, seq);
+	case 1: return (int) G_STRUCT_OFFSET (WjDelegateIC, source);
+	case 2: return (int) G_STRUCT_OFFSET (WjDelegateIC, receiver_vt);
+	case 3: return (int) G_STRUCT_OFFSET (WjDelegateIC, imethod);
+	case 4: return (int) G_STRUCT_OFFSET (WjDelegateIC, shape);
+	case 5: return (int) G_STRUCT_OFFSET (WjDelegateIC, scalar);
+	default: g_assert_not_reached (); return 0;
+	}
+}
+
+int
+mono_wasm_jit_delegate_field_off (int field)
+{
+	switch (field) {
+	case 0: return (int) G_STRUCT_OFFSET (MonoDelegate, target);
+	case 1: return (int) G_STRUCT_OFFSET (MonoDelegate, method);
+	case 2: return (int) G_STRUCT_OFFSET (MonoMulticastDelegate, delegates);
+	default: g_assert_not_reached (); return 0;
+	}
+}
+
 static void
 wj_arity_record (gpointer ic, MonoVTable *vt, gboolean delegate_site)
 {
@@ -3372,7 +3411,8 @@ typedef struct {
  *   224 CALLING JITted method MonoMethod* (WASM_JIT_BADREF_ARG caller attribution)
  *   228 direct-delegate target e-slot (0 when residual marshalling is required)
  *   232 hidden-vret destination pointer (WJ_SCRATCH_VRET_OFF)
- *   236 direct-delegate target logical slot count;  240 target uses the scalar e-thunk ABI */
+ *   236 direct-delegate target logical slot count;  240 target uses the scalar e-thunk ABI
+ *   244 direct-delegate target f-slot; 248 closed/bound delegate target object */
 
 /* TRUE iff this interp_entry invocation is the IMMEDIATE entry made by the wasm-JIT outbound residual
  * (mono_wasm_jit_call_interp): only that caller passes data->res == this thread's scratch result slot,
@@ -4011,6 +4051,37 @@ wasm_jit_prepare_interp_callee (MonoMethod *method, InterpMethod *imethod, MonoE
 	return TRUE;
 }
 
+/* An immutable caller can outlive the point where its residual callee acquires an f-slot. Re-read the
+ * baked imethod, follow interpreter tiering, and admit the module into this thread's function table.
+ * The generated caller uses a nonzero result for a direct JIT->JIT call before any scratch spill. */
+int
+mono_wasm_jit_late_fslot (InterpMethod *imethod)
+{
+	if (!imethod)
+		return 0;
+	while (imethod->optimized_imethod)
+		imethod = imethod->optimized_imethod;
+	/* Direct residual edges used to be invisible to auto tiering: unlike an interpreter MINT_CALL,
+	 * mono_wasm_jit_call_interp does not run wasm_jit_maybe_compile because its caller already resolved
+	 * the callee. Consequently a method reached only through an immutable residual edge could never
+	 * acquire the f-slot this helper was waiting for (profile19: residual_healed=0). Count this execution
+	 * as the missing interpreter call edge. This runs before the generated caller spills arguments into
+	 * GC-invisible scratch, so island compilation and any resulting GC remain safe. */
+	if (wj_slot_hot_retry_eligible (imethod->wasm_jit_slot))
+		wasm_jit_maybe_compile (imethod);
+	while (imethod->optimized_imethod)
+		imethod = imethod->optimized_imethod;
+	if (imethod->wasm_jit_fslot > 0) {
+		extern int mono_wasm_jit_admit (int desc_id);
+		if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
+			if (G_UNLIKELY (mono_wasm_jit_stats))
+				mono_wasm_jit_count (WJC_RESIDUAL_HEALED);
+			return imethod->wasm_jit_fslot;
+		}
+	}
+	return 0;
+}
+
 /*
  * mono_wasm_jit_pretransform:
  *
@@ -4463,7 +4534,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	WjDelegateIC *cache = wj_delegate_ic (ic);
 	int shape = WJ_DELEGATE_NONE;
 	int slots = 0;
-	int eslot = 0;
+	int eslot = 0, fslot = 0;
 	gboolean scalar = FALSE;
 	ERROR_DECL (error);
 
@@ -4479,8 +4550,11 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	if (wj_delegate_cache_read (cache, source, receiver_vt, &target, &imethod, &shape, &slots, &scalar)) {
 		/* Tiering replaces, rather than mutates, an InterpMethod. Follow the forwarding link so a recipe
 		 * populated before tier-up does not permanently retain the unoptimized method. */
+		InterpMethod *cached_imethod = imethod;
 		while (imethod->optimized_imethod)
 			imethod = imethod->optimized_imethod;
+		if (imethod != cached_imethod)
+			wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar);
 		/* A recipe can be cached on the target's first invocation, before it crosses the auto-JIT threshold.
 		 * Keep accumulating the same hotness/retry state as the uncached path; otherwise that first recipe
 		 * permanently strands the target in the interpreter (profile13: registered -6%, interp-routed +40%).
@@ -4491,14 +4565,18 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		 * must still be admitted on this worker before call_delegate can enter it. */
 		if (imethod->wasm_jit_slot > 0) {
 			extern int mono_wasm_jit_admit (int desc_id);
-			if (mono_wasm_jit_admit (imethod->wasm_jit_desc))
+			if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
 				eslot = imethod->wasm_jit_slot;
+				fslot = imethod->wasm_jit_fslot;
+			}
 		}
 		*(MonoMethod **) (scratch + 200) = invoke;
 		*(MonoMethod **) (scratch + 204) = target;
 		*(gint32 *) (scratch + 228) = eslot;
 		*(gint32 *) (scratch + 236) = slots;
 		*(gint32 *) (scratch + 240) = scalar ? 1 : 0;
+		*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
+		*(MonoObject **) (scratch + 248) = del->target;
 		*(gint32 *) (scratch + 220) = shape; /* publish scratch recipe last */
 		return TRUE;
 	}
@@ -4558,8 +4636,10 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_slot > 0) {
 		extern int mono_wasm_jit_admit (int desc_id);
-		if (mono_wasm_jit_admit (imethod->wasm_jit_desc))
+		if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
 			eslot = imethod->wasm_jit_slot;
+			fslot = imethod->wasm_jit_fslot;
+		}
 	}
 	tsig = mono_method_signature_internal (target);
 	slots = tsig->param_count + (tsig->hasthis ? 1 : 0);
@@ -4575,6 +4655,8 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	*(gint32 *) (scratch + 228) = eslot;
 	*(gint32 *) (scratch + 236) = slots;
 	*(gint32 *) (scratch + 240) = scalar ? 1 : 0;
+	*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
+	*(MonoObject **) (scratch + 248) = del->target;
 	*(gint32 *) (scratch + 220) = shape;
 	return TRUE;
 }
@@ -4645,6 +4727,8 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	*(gint32 *) (scratch + 228) = 0;
 	*(gint32 *) (scratch + 236) = 0;
 	*(gint32 *) (scratch + 240) = 0;
+	*(gint32 *) (scratch + 244) = 0;
+	*(MonoObject **) (scratch + 248) = NULL;
 	if (G_UNLIKELY (!this_obj)) {
 		*(MonoMethod **) (scratch + 200) = NULL;
 		extern void mono_wasm_jit_throw (MonoObject *exc);

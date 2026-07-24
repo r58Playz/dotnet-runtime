@@ -422,6 +422,8 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_REFBASES_EXTRA));
 	printf ("[wasm-jit vtabi] vt_byaddr_methods=%lld vret_methods=%lld\n",
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
+	printf ("[wasm-jit transition] residual_healed=%lld fast_delegate=%lld delegate_ic_hit=%lld (fast counters require PROFILE_FAST=1)\n",
+		WJC_(WJC_RESIDUAL_HEALED), WJC_(WJC_FAST_DELEGATE), WJC_(WJC_DELEGATE_IC_HIT));
 	fflush (stdout);
 	/* the bail histogram (this file) + the island blockers / hot entry-edges (interp.c) */
 	{
@@ -4420,6 +4422,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				WasmFuncType ct;
 				WasmCallInfo cci;
 				int call_fslot, type_idx = -1, k, ai;
+#ifdef HOST_BROWSER
+				gboolean late_fslot_block = FALSE;
+#endif
 				/* A synchronized callee keeps its Monitor.Enter/Exit in a separate SYNCHRONIZED wrapper; the raw
 				 * method body (what mono_interp_get_imethod returns) has no monitor ops, so dispatching it
 				 * directly would run unlocked -> a notify/wait throws IllegalMonitorStateException + leaves the
@@ -4733,6 +4738,61 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						printf ("WASM_JIT_RESIDUAL_PNV %s -> %s\n", mname, cn ? cn : "?");
 						g_free (cn);
 					}
+					/* SELF-HEALING DIRECT RESIDUAL. This caller was emitted before call_method acquired
+					 * an f-slot. Bake its stable InterpMethod identity and, on each residual execution,
+					 * ask the tiny late-fslot helper to follow tiering + admit the module on this thread.
+					 * A live result calls the ordinary f-thunk directly, before pretransform/scratch/
+					 * interp_entry. A zero result falls through to the unchanged residual below.
+					 *
+					 * Exclude native-AOT callees (their slot can never heal and the inline-AOT/residual
+					 * AOT routes above are authoritative) and permanent wasm-JIT bails. */
+					{
+						extern gpointer mono_wasm_jit_get_callee_imethod (MonoMethod *method);
+						extern int mono_wasm_jit_late_fslot (gpointer imethod);
+						extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
+						extern gboolean mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig);
+						gpointer late_im = mono_wasm_jit_get_callee_imethod (call_method);
+						gboolean can_heal = late_im && !mono_wasm_jit_callee_perm_unjittable (call_method)
+							&& !mono_interp_jit_call_supported (call_method, csig);
+						if (can_heal) {
+							WasmFuncType ht; int hti = -1;
+							for (k = 0; k < nextra; ++k)
+								if (functype_eq (&extra_types [k], &ct)) { type_idx = 2 + k; break; }
+							if (type_idx < 0) {
+								if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
+								extra_types [nextra] = ct; type_idx = 2 + nextra++;
+							}
+							memset (&ht, 0, sizeof (ht)); ht.params [0] = WASM_I32; ht.nparams = 1; ht.ret = WASM_I32;
+							for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &ht)) { hti = 2 + k; break; }
+							if (hti < 0) {
+								if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
+								extra_types [nextra] = ht; hti = 2 + nextra++;
+							}
+							uses_calls = TRUE;
+							late_fslot_block = TRUE;
+							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $after_residual */
+							wasm_i32_const (&body, (gint32) (intptr_t) late_im);
+							wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_late_fslot);
+							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) hti); wasm_uleb (&body, 0);
+							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+							{
+								int *wargs = (int *) call->call_info;
+								for (ai = 0; ai < cci.nargs; ++ai)
+									if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, wargs, ai)) { fail = "late call arg ld"; goto done; }
+								if (cci.vret_byaddr && !wasm_ld (&body, &lc, wargs [cci.nargs])) { fail = "late call vret ld"; goto done; }
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) type_idx); wasm_uleb (&body, 0);
+								if (ct.ret != WASM_VOID) {
+									if (cci.ret.kind == WJ_ARG_VTYPE_SCALAR) {
+										if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wargs [cci.nargs])) { fail = "late scalar-vtype ret"; goto done; }
+									} else if (!wasm_st (&body, &lc, ins->dreg)) { fail = "late call dreg"; goto done; }
+								}
+							}
+							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> $after_residual */
+							wasm_op (&body, WASM_OP_END);
+						}
+					}
 					memset (&ts, 0, sizeof (ts)); ts.ret = WASM_I32; ts.nparams = 0;
 					memset (&ti, 0, sizeof (ti)); ti.ret = WASM_I32; ti.nparams = 2; ti.params [0] = WASM_I32; ti.params [1] = WASM_I32;
 					for (k = 0; k < nextra; ++k) {
@@ -4853,6 +4913,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wargs [cci.nargs])) { fail = "residual scalar-vtype ret"; goto done; }
 						} else if (!wasm_st (&body, &lc, ins->dreg)) { fail = "residual dreg"; goto done; }
 					}
+					if (late_fslot_block)
+						wasm_op (&body, WASM_OP_END); /* $after_residual */
 				}
 #else
 				else { fail = "callee not jitted"; goto done; }
@@ -4907,7 +4969,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						extern int mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic);
 							extern int mono_wasm_jit_call_interp (MonoMethod *m, guint8 *buf);
 							extern int mono_wasm_jit_call_delegate (MonoMethod *m, guint8 *buf);
-						WasmFuncType vts, vtrf, vtd, ftd; WasmCallInfo vci; int vtsi = -1, vtrfi = -1, vtdi = -1, ftdi = -1, vk, ai, n2, this_vr; int aic_ati = -1, aic_ati_ne = -1;
+						WasmFuncType vts, vtrf, vtd, ftd, dftd; WasmCallInfo vci; int vtsi = -1, vtrfi = -1, vtdi = -1, ftdi = -1, dftdi = -1, vk, ai, n2, this_vr; int aic_ati = -1, aic_ati_ne = -1;
 						WasmValtype pp [WASM_FUNCTYPE_MAX_PARAMS], rv; int npp = 0; gpointer vic;
 						gboolean is_delegate_invoke = !strcmp (call->method->name, "Invoke") &&
 							m_class_get_parent (call->method->klass) == mono_defaults.multicastdelegate_class;
@@ -4965,6 +5027,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						memset (&ftd, 0, sizeof (ftd)); for (vk = 0; vk < npp; ++vk) ftd.params [vk] = pp [vk]; ftd.nparams = (guint32) npp; ftd.ret = rv;
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &ftd)) { ftdi = 2 + vk; break; }
 						if (ftdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ftd; ftdi = 2 + nextra++; }
+						/* Open-static/open-instance delegate targets consume the Invoke arguments after
+						 * dropping the delegate receiver. Their canonical f-thunk type is therefore ftd
+						 * without parameter zero. Closed-instance/bound-static retain the full ftd. */
+						if (is_delegate_invoke) {
+							if (npp < 1) { fail = "delegate no receiver"; goto done; }
+							memset (&dftd, 0, sizeof (dftd));
+							for (vk = 1; vk < npp; ++vk) dftd.params [vk - 1] = pp [vk];
+							dftd.nparams = (guint32) (npp - 1); dftd.ret = rv;
+							for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &dftd)) { dftdi = 2 + vk; break; }
+							if (dftdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = dftd; dftdi = 2 + nextra++; }
+						}
 						uses_calls = TRUE;
 						n2 = csig->param_count + 1; /* this + params */
 						/* per-call-site AOT-vcall IC cell (VCALL_AOT_IC): 20B, see mono_wasm_jit_alloc_aot_ic */
@@ -5046,8 +5119,27 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #ifdef HOST_BROWSER
 							extern int mono_wasm_jit_imethod_fslot_off (void);
 							int fslot_off = mono_wasm_jit_imethod_fslot_off ();
+							extern gpointer mono_wasm_jit_delegate_ic_base (gpointer ic);
+							extern int mono_wasm_jit_delegate_ic_stride (void);
+							extern int mono_wasm_jit_delegate_ic_field_off (int field);
+							extern int mono_wasm_jit_delegate_field_off (int field);
+							gpointer delegate_ic = is_delegate_invoke ? mono_wasm_jit_delegate_ic_base (vic) : NULL;
+							int delegate_ic_stride = mono_wasm_jit_delegate_ic_stride ();
+							int dic_seq_off = mono_wasm_jit_delegate_ic_field_off (0);
+							int dic_source_off = mono_wasm_jit_delegate_ic_field_off (1);
+							int dic_receiver_off = mono_wasm_jit_delegate_ic_field_off (2);
+							int dic_imethod_off = mono_wasm_jit_delegate_ic_field_off (3);
+							int dic_shape_off = mono_wasm_jit_delegate_ic_field_off (4);
+							int dic_scalar_off = mono_wasm_jit_delegate_ic_field_off (5);
+							int delegate_target_off = mono_wasm_jit_delegate_field_off (0);
+							int delegate_method_off = mono_wasm_jit_delegate_field_off (1);
+							int delegate_list_off = mono_wasm_jit_delegate_field_off (2);
 #else
 							int fslot_off = 0x40; /* placeholder for offline encoder validation (real offset only matters at runtime) */
+							gpointer delegate_ic = (gpointer) (intptr_t) 0x7000;
+							int delegate_ic_stride = 32, dic_seq_off = 0, dic_source_off = 4;
+							int dic_receiver_off = 8, dic_imethod_off = 16, dic_shape_off = 20, dic_scalar_off = 28;
+							int delegate_target_off = 16, delegate_method_off = 20, delegate_list_off = 64;
 #endif
 							int way;
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
@@ -5063,6 +5155,126 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) lc.check_ti); wasm_uleb (&body, 0);
 							}
 #endif
+							/* Delegate.Invoke has a second IC beside the ordinary receiver-vtable IC. Its miss path
+							 * (resolve_fslot -> prepare_delegate_call) publishes a seqlock-protected recipe keyed by
+							 * delegate.method and, for virtual targets, target->vtable. Consume that recipe here before
+							 * entering either C resolver. On a hit the current closed target is read from the delegate
+							 * instance (never cached), and the per-thread f-slot bitmap provides the same admission gate
+							 * as the ordinary inline vcall IC. Multicast delegates explicitly miss: a recipe learned from
+							 * a single-cast instance at this polymorphic callsite must never bypass their invocation list. */
+							if (is_delegate_invoke) {
+								for (way = 0; way < mono_wasm_jit_vcall_ways; ++way) {
+									gint32 dic_addr = (gint32) (intptr_t) delegate_ic + way * delegate_ic_stride;
+									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $delegate_way_fail */
+									/* seq must be stable, nonzero, and even. */
+									wasm_i32_const (&body, dic_addr);
+									wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x10); wasm_memarg (&body, 2, (guint32) dic_seq_off);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_ti_idx);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+									wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* Multicast list must be null. */
+									if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate ic this ld"; goto done; }
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_list_off);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* delegate.method == recipe.source */
+									if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate ic source ld"; goto done; }
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_method_off);
+									wasm_i32_const (&body, dic_addr);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) dic_source_off);
+									wasm_op (&body, WASM_OP_I32_NE);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* A zero receiver key denotes nonvirtual/static recipes. Otherwise validate the
+									 * current closed target's vtable without introducing another control depth. */
+									wasm_i32_const (&body, dic_addr);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) dic_receiver_off);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_rgctx_idx);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate ic target ld"; goto done; }
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_target_off);
+										wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_vtab_idx);
+										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+											wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_rgctx_idx);
+											wasm_op (&body, WASM_OP_I32_EQ);
+										wasm_op (&body, WASM_OP_ELSE);
+											wasm_i32_const (&body, 0);
+										wasm_op (&body, WASM_OP_END);
+									wasm_op (&body, WASM_OP_ELSE);
+										wasm_i32_const (&body, 1);
+									wasm_op (&body, WASM_OP_END);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* Only scalar recipes have a canonical direct f-thunk ABI. */
+									wasm_i32_const (&body, dic_addr);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) dic_scalar_off);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									wasm_i32_const (&body, dic_addr);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) dic_shape_off);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
+									wasm_i32_const (&body, dic_addr);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) dic_imethod_off);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) fslot_off);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* Re-read seq after all payload fields. */
+									wasm_i32_const (&body, dic_addr);
+									wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x10); wasm_memarg (&body, 2, (guint32) dic_seq_off);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+									wasm_op (&body, WASM_OP_I32_NE);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* Per-thread f-slot liveness/admission gate. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_op (&body, WASM_OP_I32_LT_U);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_op (&body, WASM_OP_I32_ADD);
+										wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
+										wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);
+									wasm_op (&body, WASM_OP_ELSE);
+										wasm_i32_const (&body, 0);
+									wasm_op (&body, WASM_OP_END);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									wj_emit_fast_count (&body, WJC_DELEGATE_IC_HIT);
+									wj_emit_fast_count (&body, WJC_FAST_DELEGATE);
+									/* Closed-instance/bound-static replace Delegate this with the current target;
+									 * open-static/open-instance simply drop Delegate this. Both arms return the same
+									 * scalar value, so a typed if carries it to the common destination store. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+									wasm_i32_const (&body, 2 /* WJ_DELEGATE_BOUND_STATIC */);
+									wasm_op (&body, WASM_OP_I32_LE_U);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, rv == WASM_VOID ? 0x40 : (guint8) rv);
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate ic closed this ld"; goto done; }
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_target_off);
+										for (ai = 1; ai < n2; ++ai)
+											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "delegate ic closed arg ld"; goto done; }
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
+									wasm_op (&body, WASM_OP_ELSE);
+										for (ai = 1; ai < n2; ++ai)
+											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "delegate ic open arg ld"; goto done; }
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) dftdi); wasm_uleb (&body, 0);
+									wasm_op (&body, WASM_OP_END);
+									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "delegate ic dreg"; goto done; }
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
+									wasm_op (&body, WASM_OP_END); /* $delegate_way_fail */
+								}
+							}
 							/* N-WAY inline IC (MONO_WASM_JIT_VCALL_WAYS, default 1 = monomorphic). One BLOCK per cached
 							 * (vtable -> f-slot) entry: a guard failure br 0's to the next way, a hit br 1's to $after.
 							 * A 2-way IC captures the ~63% of miss traffic that are 2-type sites (arity depth-1) which a
@@ -5326,6 +5538,105 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "vcall arg ld"; goto done; }
 								wasm_op (&body, sop); wasm_memarg (&body, al2, (guint32) (ai * 8));
 							}
+							/* INLINE DELEGATE RECIPE HIT. resolve_fslot/prepare_delegate_call published a
+							 * thread-admitted target f-slot at +244 only for scalar-compatible recipes.
+							 * Rewrite the Invoke ABI in linear memory, load the rewritten arguments, and
+							 * enter the target f-thunk directly. This stays inside the caller's wasm/EH
+							 * island and skips call_delegate -> invoke_caught -> e-thunk. A zero f-slot
+							 * (cache miss, multicast, complex ABI, admission failure) takes the proven C
+							 * helper below unchanged. */
+							if (is_delegate_invoke) {
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $delegate_done */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 244);
+								wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+									/* Capture shape, then consume-clear the recipe before entering managed
+									 * code: a nested delegate call reuses this TLS scratch. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 220);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+									wasm_i32_const (&body, 0);
+									wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 220);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+									wasm_i32_const (&body, 0);
+									wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 244);
+									wj_emit_fast_count (&body, WJC_FAST_DELEGATE);
+
+									/* shape <= BOUND_STATIC: replace delegate `this` with the closed/bound
+									 * target and retain the full signature. Otherwise drop delegate `this`
+									 * with overlap-safe memory.copy and use ftd-with-param0-removed. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+									wasm_i32_const (&body, 2 /* WJ_DELEGATE_BOUND_STATIC */);
+									wasm_op (&body, WASM_OP_I32_LE_U);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 248);
+										wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0);
+										if (rv != WASM_VOID)
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										for (ai = 0; ai < n2; ++ai) {
+											WasmOpcode lop; guint32 al2;
+											switch (pp [ai]) {
+											case WASM_I64: lop = WASM_OP_I64_LOAD; al2 = 3; break;
+											case WASM_F32: lop = WASM_OP_F32_LOAD; al2 = 2; break;
+											case WASM_F64: lop = WASM_OP_F64_LOAD; al2 = 3; break;
+											default:       lop = WASM_OP_I32_LOAD; al2 = 2; break;
+											}
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+											wasm_op (&body, lop); wasm_memarg (&body, al2, (guint32) (ai * 8));
+										}
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
+										if (rv != WASM_VOID) {
+											WasmOpcode sop; guint32 al2;
+											switch (rv) {
+											case WASM_I64: sop = WASM_OP_I64_STORE; al2 = 3; break;
+											case WASM_F32: sop = WASM_OP_F32_STORE; al2 = 2; break;
+											case WASM_F64: sop = WASM_OP_F64_STORE; al2 = 3; break;
+											default:       sop = WASM_OP_I32_STORE; al2 = 2; break;
+											}
+											wasm_op (&body, sop); wasm_memarg (&body, al2, 192);
+										}
+									wasm_op (&body, WASM_OP_ELSE);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_i32_const (&body, 8); wasm_op (&body, WASM_OP_I32_ADD);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 236);
+										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHL);
+										wasm_u8 (&body, 0xFC); wasm_uleb (&body, 10); wasm_u8 (&body, 0); wasm_u8 (&body, 0); /* memory.copy 0 0 */
+										if (rv != WASM_VOID)
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										for (ai = 0; ai < n2 - 1; ++ai) {
+											WasmOpcode lop; guint32 al2;
+											switch (pp [ai + 1]) {
+											case WASM_I64: lop = WASM_OP_I64_LOAD; al2 = 3; break;
+											case WASM_F32: lop = WASM_OP_F32_LOAD; al2 = 2; break;
+											case WASM_F64: lop = WASM_OP_F64_LOAD; al2 = 3; break;
+											default:       lop = WASM_OP_I32_LOAD; al2 = 2; break;
+											}
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+											wasm_op (&body, lop); wasm_memarg (&body, al2, (guint32) (ai * 8));
+										}
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) dftdi); wasm_uleb (&body, 0);
+										if (rv != WASM_VOID) {
+											WasmOpcode sop; guint32 al2;
+											switch (rv) {
+											case WASM_I64: sop = WASM_OP_I64_STORE; al2 = 3; break;
+											case WASM_F32: sop = WASM_OP_F32_STORE; al2 = 2; break;
+											case WASM_F64: sop = WASM_OP_F64_STORE; al2 = 3; break;
+											default:       sop = WASM_OP_I32_STORE; al2 = 2; break;
+											}
+											wasm_op (&body, sop); wasm_memarg (&body, al2, 192);
+										}
+									wasm_op (&body, WASM_OP_END);
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> $delegate_done */
+								wasm_op (&body, WASM_OP_END);
+							}
 							/* DIAG (WASM_JIT_BADREF_ARG caller attribution): bake THIS (calling) method at scratch+224
 							 * (mirrors the direct residual site; 224 is past ret(192)/target(200)/fslot(208)/aot(212,216)). */
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
@@ -5367,6 +5678,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								EMIT_REF_LEAVE ();
 								wasm_op (&body, WASM_OP_RETURN);
 							wasm_op (&body, WASM_OP_END);
+							if (is_delegate_invoke)
+								wasm_op (&body, WASM_OP_END); /* $delegate_done */
 							if (rv != WASM_VOID) {
 								WasmOpcode lop; guint32 al2;
 								switch (rv) {
