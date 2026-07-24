@@ -548,7 +548,7 @@ JS_ENGINES = [NODE_JS]
       <_MonoMinimal Condition="'$(TargetsWasi)' == 'true'">$(_MonoMinimal),jit</_MonoMinimal>
     </PropertyGroup>
     <ItemGroup Condition="'$(TargetsBrowser)' == 'true' or '$(TargetsWasi)' == 'true'">
-      <_MonoCMakeArgs Include="-DENABLE_MINIMAL=sgen_major_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,sgen_debug_helpers,sgen_binary_protocol,logging,interpreter,qcalls$(_MonoMinimal)"/>
+      <_MonoCMakeArgs Include="-DENABLE_MINIMAL=sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,sgen_binary_protocol,logging,interpreter,qcalls$(_MonoMinimal)"/>
       <_MonoCMakeArgs Include="-DENABLE_INTERP_LIB=1"/>
       <_MonoCMakeArgs Include="-DDISABLE_ICALL_TABLES=1"/>
       <_MonoCMakeArgs Include="-DENABLE_ICALL_EXPORT=1"/>

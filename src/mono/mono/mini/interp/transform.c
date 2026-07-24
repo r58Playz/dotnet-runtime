@@ -10091,6 +10091,15 @@ mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 	return im ? (im->wasm_jit_fslot > 0 ? im->wasm_jit_fslot : im->wasm_jit_resv_fslot) : 0;
 }
 
+/* Stable identity baked into a direct residual callsite. The runtime late-fslot helper follows
+ * optimized_imethod before reading the slot, so tiering after the caller was emitted is observed
+ * without putting mono_interp_get_imethod and its jit-mm lock on the hot path. */
+gpointer
+mono_wasm_jit_get_callee_imethod (MonoMethod *method)
+{
+	return mono_interp_get_imethod (method);
+}
+
 /* runtime wasm JIT: the synchronized-inner substitution in mono_wasm_force_compile compiles the WRAPPED
  * body under its own MonoMethod, while the SCC batch reserved the slot pair on the INNER wrapper's
  * imethod (the batch member — and the f-slot key fellow members bake via get_callee_fslot). Carry the
