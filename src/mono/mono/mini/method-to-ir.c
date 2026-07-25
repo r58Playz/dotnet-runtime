@@ -1701,9 +1701,16 @@ mono_create_fast_tls_getter (MonoCompile *cfg, MonoTlsKey key)
 	if (cfg->compile_aot)
 		return NULL;
 
+	/* Check for fast-TLS support BEFORE looking up the offset: on targets without fast TLS
+	 * (wasm) the offsets are never registered and mono_tls_get_tls_offset () asserts — hit by
+	 * the runtime wasm JIT compiling a save_lmf method (emit_push_lmf -> TLS_KEY_LMF_ADDR).
+	 * Returning NULL routes the caller to the icall getter fallback instead. */
+	if (!mono_arch_have_fast_tls ())
+		return NULL;
+
 	int tls_offset = mono_tls_get_tls_offset (key);
 
-	if (tls_offset != -1 && mono_arch_have_fast_tls ()) {
+	if (tls_offset != -1) {
 		MonoInst *ins;
 		MONO_INST_NEW (cfg, ins, OP_TLS_GET);
 		ins->dreg = mono_alloc_preg (cfg);

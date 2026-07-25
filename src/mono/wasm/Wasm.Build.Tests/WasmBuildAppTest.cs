@@ -244,6 +244,74 @@ namespace Wasm.Build.Tests
         }
 
         [Theory]
+        [BuildAndRun(config: Configuration.Release, aot: false)]
+        public async Task WasmJitGcRefPinning(Configuration config, bool aot)
+        {
+            // GC-reference model soak (see WasmJitGcRef.cs): refs held across allocating residuals +
+            // full collections, deref-base temporaries, loop-carried refs, ref/byref args, dead refs.
+            // Runs the same publish under every pin-pressure flag combination — write-through locals
+            // (REF_WT), GC-point slot elision (SLOTLIVE), dead-slot zeroing (SLOTZERO) — plus
+            // REFVERIFY=1 so a lost classification seed logs instead of corrupting silently.
+            const string targetedMethods =
+                "GcRefHoldAcrossCalls,GcRefDerefBases,GcRefLoopCarried,GcRefArgsPinned," +
+                "GcRefByref,GcRefDeadSlots,GcRefStrings,MakeNode,TryGetValue";
+
+            ProjectInfo info = CopyTestAsset(config, aot, TestAsset.WasmBasicTestApp, "wasm_jit_gcref");
+            ReplaceFile(
+                Path.Combine("Common", "Program.cs"),
+                Path.Combine(BuildEnvironment.TestAssetsPath, "EntryPoints", "WasmJitGcRef.cs"));
+            PublishProject(
+                info,
+                config,
+                new PublishOptions(AOT: false, ExtraMSBuildArgs: "-p:WasmBuildNative=true"),
+                isNativeBuild: true);
+
+            var flagCombos = new (string RefWt, string SlotLive, string SlotZero)[]
+            {
+                ("0", "0", "0"),   // baseline (slot-homed, all slots)
+                ("1", "0", "0"),   // write-through only
+                ("1", "1", "0"),   // + slot elision
+                ("1", "1", "1"),   // + dead-slot zeroing
+            };
+
+            foreach (var combo in flagCombos)
+            {
+                NameValueCollection query = new()
+                {
+                    ["MONO_WASM_JIT_METHOD"] = targetedMethods,
+                    ["MONO_WASM_JIT_VERBOSE"] = "2",
+                    ["MONO_WASM_JIT_STATS"] = "1",
+                    ["MONO_WASM_JIT_REFVERIFY"] = "1",
+                    ["MONO_WASM_JIT_REF_WT"] = combo.RefWt,
+                    ["MONO_WASM_JIT_SLOTLIVE"] = combo.SlotLive,
+                    ["MONO_WASM_JIT_SLOTZERO"] = combo.SlotZero,
+                };
+                RunResult result = await RunForPublishWithWebServer(new BrowserRunOptions(
+                    config,
+                    TestScenario: "WasmJitEhTest",
+                    BrowserQueryString: query,
+                    ExpectedExitCode: 42));
+
+                Assert.Contains(result.ConsoleOutput, line => line.Contains("WASM_JIT_GCREF_TEST_PASS"));
+
+                // The GcRef* probes must actually JIT (not silently bail to the interp) for the run to
+                // prove anything. MakeNode/TryGetNode stay targeted but unasserted — whether their
+                // allocation shapes JIT or bail, the callers' ref handling is what's under test.
+                string[] mustRegister =
+                {
+                    "GcRefHoldAcrossCalls", "GcRefDerefBases", "GcRefLoopCarried", "GcRefArgsPinned",
+                    "GcRefByref", "GcRefDeadSlots", "GcRefStrings",
+                };
+                foreach (string method in mustRegister)
+                    Assert.Contains(result.ConsoleOutput, line =>
+                        line.Contains("WASM_JIT_REGISTERED") && line.Contains($"WasmJitGcRefTests:{method}"));
+
+                // a lost classification seed (would-be silent corruption) must not appear
+                Assert.DoesNotContain(result.ConsoleOutput, line => line.Contains("WASM_JIT_REFVERIFY:"));
+            }
+        }
+
+        [Theory]
         [BuildAndRun(config: Configuration.Release, aot: true)]
         public async Task WasmJitAotExceptionBoundary(Configuration config, bool aot)
         {

@@ -325,7 +325,14 @@ wasm_module_method_and_entry (
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);   /* memory */
+	/* limits flag must match the runtime heap's SHARED-ness exactly: a threads build has a shared
+	 * memory (0x03 = shared+max), a single-threaded build an unshared one (0x01 = max only) — a
+	 * mismatch fails instantiation ("mismatch in shared state of memory"). */
+#ifdef DISABLE_THREADS
+	wasm_u8 (&sec, 0x01);   /* limits: max, unshared */
+#else
 	wasm_u8 (&sec, 0x03);   /* limits: shared + max */
+#endif
 	wasm_uleb (&sec, 256);
 	wasm_uleb (&sec, 65535); /* must be >= the runtime heap's max (65535 pages); 32768 fails to match */
 	if (import_table) {
@@ -466,7 +473,12 @@ wasm_module_interp_thunk (
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);   /* memory */
+	/* SHARED-ness must match the runtime heap (see the method-module import section above) */
+#ifdef DISABLE_THREADS
+	wasm_u8 (&sec, 0x01);   /* limits: max, unshared */
+#else
 	wasm_u8 (&sec, 0x03);   /* limits: shared + max */
+#endif
 	wasm_uleb (&sec, 256);
 	wasm_uleb (&sec, 65535);
 	wasm_name (&sec, "f");
