@@ -3192,7 +3192,7 @@ wasm_jit_opt_whitelist (void)
  *   - INLINE happens in method_to_ir (before codegen) and removes calls outright — the highest-value flag
  *     and the intended first experiment. It does NOT depend on the vreg-mutating passes, so the emitter's
  *     call-arg capture survives; but inlining feeds NEW ref-vreg shapes to the GC-ref passes (isref/
- *     REFBASES), so validate with MONO_WASM_JIT_PINALL=1 A/B for missed-ref corruption, not just fps.
+ *     REFBASES), so validate with MONO_WASM_JIT_REFVERIFY=2 + OBJGUARD=1 for missed-ref corruption, not just fps.
  *   - COPYPROP/CONSPROP/DEADCE renumber/coalesce/eliminate vregs. The wasm emitter reads call->args by
  *     vreg number at codegen (see the reset comment at the fork), so these can SILENTLY MISCOMPILE call
  *     args (not a clean bail). Opt-in at your own risk until the emitter captures args robustly.

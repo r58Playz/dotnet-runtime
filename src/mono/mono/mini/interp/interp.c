@@ -7611,7 +7611,18 @@ interp_ldvirtftn_delegate (gpointer arg, MonoDelegate *del)
 	if (m_type_is_byref (invoke_sig->params [0])) {
 		arg_class = mono_class_from_mono_type_internal (invoke_sig->params [0]);
 	} else {
-		MonoObject *object = (MonoObject*)arg;
+		/* `arg` is the ADDRESS of the first invocation argument, not its value: the open-delegate invoke
+		 * wrapper pushes it with mono_mb_emit_ldarg_addr (marshal-lightweight.c), which is why the native
+		 * twin of this helper (mono_ldvirtftn_delegate in marshal.c) also derefs. Reading `arg` itself as
+		 * the object instead walked one level short — the receiver was decoded as a vtable and its vtable
+		 * as a MonoClass, so the resolve below entered mono_class_setup_vtable on a non-class and died in
+		 * mono_class_get_flags / mono_class_check_vtable_constraints.
+		 *
+		 * Unreachable in a pure interpreter run (open delegates dispatch via MINT_CALL_DELEGATE and never
+		 * execute this wrapper's IL) and unreachable under AOT (which runs the native twin), so only the
+		 * wasm-JIT residual — the one path that drives the generated invoke wrapper THROUGH the interp —
+		 * ever reaches MINT_LDVIRTFTN_DELEGATE. */
+		MonoObject *object = *(MonoObject**)arg;
 		arg_class = object->vtable->klass;
 	}
 

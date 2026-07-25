@@ -182,6 +182,13 @@ enum {
 	 * f-thunk directly, bypassing call_delegate/invoke_caught/e-thunk. DELEGATE_IC_HIT is the subset which
 	 * also bypassed vcall_resolve_fslot by consuming the recipe directly in generated wasm. */
 	WJC_RESIDUAL_HEALED, WJC_FAST_DELEGATE, WJC_DELEGATE_IC_HIT,
+	/* GC pin-pressure accounting (ref write-through / slot elision / dead-slot zeroing work).
+	 * Compile-time counts, summed over all compiles: REF_SLOTS = frame ref slots allocated;
+	 * REF_WT_VREGS = write-through ref vregs (local is home, slot is the pin mirror);
+	 * SLOTS_ELIDED = isref vregs that needed NO slot (no GC point inside their def->use range);
+	 * SLOT_ZERO_STORES = dead-slot zero stores emitted at a vreg's last use;
+	 * FRAME_BYTES = total C-stack frame bytes across compiled methods (ref + addr slots). */
+	WJC_REF_SLOTS, WJC_REF_WT_VREGS, WJC_SLOTS_ELIDED, WJC_SLOT_ZERO_STORES, WJC_FRAME_BYTES,
 	WJC_MAX
 };
 
