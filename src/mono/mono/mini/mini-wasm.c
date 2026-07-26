@@ -118,6 +118,9 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_slotlive; const char *sl = g_getenv ("MONO_WASM_JIT_SLOTLIVE"); mono_wasm_jit_slotlive = (sl && *sl) ? (*sl != '0') : 0; } /* GC-point liveness slot elision: an isref vreg whose whole def->use range crosses no GC point keeps NO frame slot (stays a fast wasm local the GC never needs to see). Cuts pin pressure + frame size. Default OFF until soak. */
 	{ extern int mono_wasm_jit_slotzero; const char *sz = g_getenv ("MONO_WASM_JIT_SLOTZERO"); mono_wasm_jit_slotzero = (sz && *sz) ? (*sz != '0') : 0; } /* dead-slot zeroing: null a single-bb ref slot at its last use so dead objects stop pinning (long-lived JSPI frames otherwise pin them until frame pop). Requires REF_WT+SLOTLIVE. Default OFF until soak. */
 	{ extern int mono_wasm_jit_nce; const char *nc = g_getenv ("MONO_WASM_JIT_NCE"); mono_wasm_jit_nce = (nc && *nc) ? (*nc != '0') : 1; } /* bb-local null-check elimination; 0 disables (A/B + kill switch). */
+	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF: correct, but reach is only 2.1% of heap loads and it measured neutral. */
+	{ extern int mono_wasm_jit_coalesce; const char *cs = g_getenv ("MONO_WASM_JIT_COALESCE"); mono_wasm_jit_coalesce = (cs && *cs && *cs != '0') ? 1 : 0; } /* share one wasm local between vregs with disjoint live ranges. Default OFF until A/B'd. */
+	{ extern int mono_wasm_jit_nodispatch; const char *nd = g_getenv ("MONO_WASM_JIT_NODISPATCH"); mono_wasm_jit_nodispatch = (nd && *nd && *nd != '0') ? 1 : 0; } /* elide dispatch scaffolding for single-bb methods. Default OFF, unvalidated. */
 	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); mono_wasm_jit_raise_nogc = (rn && *rn && *rn != '0') ? 1 : 0; } /* raises are not GC points in clause-free methods (frame-slot elision). Default OFF until soak. */
 	{ extern int mono_wasm_jit_marshal_wrappers; const char *mw = g_getenv ("MONO_WASM_JIT_MARSHAL_WRAPPERS"); mono_wasm_jit_marshal_wrappers = (mw && *mw && *mw != '0') ? 1 : 0; } /* JIT managed<->native marshalling wrappers; default 0 = bail them to the interp (fix for the get_method_attributes wild store), =1 reverts (buggy) for A/B */
 	{ extern int mono_wasm_jit_eh_nocxa; const char *en = g_getenv ("MONO_WASM_JIT_EH_NOCXA"); mono_wasm_jit_eh_nocxa = (en && *en && *en != '0') ? 1 : 0; } /* bisection: skip begin/end_catch in the EH landing pad */
@@ -268,6 +271,19 @@ int mono_wasm_jit_vret = 1;           /* MONO_WASM_JIT_VRET: value-type returns 
 int mono_wasm_jit_ldaddr_vtype_ref = 1; /* MONO_WASM_JIT_LDADDR_VTYPE_REF: allow REF-BEARING non-scalar vtype locals in the addr frame (full-size slot). The addr slots moved into the conservatively-scanned C-stack frame (see the frame doc above wasm_ld) — embedded refs over-pin, same guarantee AOT structs-in-C-locals rely on; the old "GC-unsafe frame" bail predates that move. */
 int mono_wasm_jit_missedref = 0;      /* MONO_WASM_JIT_MISSEDREF: diagnostic — log NONREF-classified vregs used as MEMBASE bases / call receivers + their defining opcode, to name an isref-inference gap. Default off. */
 int mono_wasm_jit_ref_wt = 0;         /* MONO_WASM_JIT_REF_WT: write-through ref vregs — the wasm LOCAL is the value home (fast reads), and every def ALSO stores to the frame slot so the conservative scan pins the referent (exactly LLVM AOT's gc_pin volatile-store model, mini-llvm.c emit_gc_pin). Sound because a pinned object never moves, so the cached local can't go stale — the same invariant AOT locals and JSPI-frozen locals rely on. Slot-HOMED exceptions: addrslot==-2 sentinels (their slot address escapes via OP_LDADDR, callees write through it). Default OFF until soak; flip to 1 after the test matrix passes. */
+int mono_wasm_jit_coalesce = 0;       /* MONO_WASM_JIT_COALESCE: share one wasm local between vregs whose live ranges are disjoint,
+                                       * computed from a real backward liveness dataflow (mention ranges are unsound across a back edge).
+                                       * li[] is otherwise one local per vreg with NO reuse: AABB:combine declares 58 where teavm needs 5.
+                                       * Caveat worth keeping in mind before attributing any win to this: TurboFan converts wasm locals to
+                                       * SSA, so its register pressure follows live-range OVERLAP, which renaming does not change. Default OFF. */
+int mono_wasm_jit_lcse = 0;           /* MONO_WASM_JIT_LCSE: extended-basic-block redundant heap-load elimination.
+                                       * mono has NO general CSE/GVN (optflags-def.h: SSAPRE is marked obsolete, ALIAS_ANALYSIS
+                                       * is locals-only), so every reload javac emitted survives into the wasm. Measured on
+                                       * AABB:combine, identical Java source: we emit 39 heap loads where teavm emits 14, and
+                                       * TurboFan does NOT clean them up -- its compiled output has 67 memory loads, so all 39
+                                       * are real. The dominant shape is javac's `a < b ? a : b` (jbox2d's MathUtils.min/max),
+                                       * which reloads BOTH operands in BOTH arms after the compare already loaded them.
+                                       * Default OFF until A/B'd. */
 int mono_wasm_jit_slotlive = 0;       /* MONO_WASM_JIT_SLOTLIVE: GC-point liveness slot elision — an isref vreg gets a frame slot ONLY if a GC can actually observe it there: it is live across a GC-capable instruction (wj_ins_is_gcpoint) or spans basic blocks. A ref defined and fully consumed between two GC points is invisible to the collector (cooperative suspend: this thread only scans at safepoints/calls), so it can stay in an unscanned wasm local. Main pin-pressure lever: most deref-backstop bases and immediately-consumed call results lose their slots. Disabled when STOREGUARD/OBJGUARD are on (they key ref-ness off refslot, so elision would change guard semantics). Default OFF until soak. */
 int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroing — zero a SINGLE-BB slotted ref vreg's frame slot at its last use (only when a GC point follows in the bb), so the dead object stops pinning. Critical for long-lived frames (a JSPI-suspended main loop otherwise pins its stale refs for the app lifetime). Single-bb scope makes death provable without dataflow (a vreg live into any EH handler is multi-bb by definition). Requires REF_WT (reads come from the local, so the slot can be zeroed BEFORE the killing instruction — stack-neutral, no terminator special cases) and SLOTLIVE (which computes the last-use walk). Default OFF until soak. */
 /* MONO_WASM_JIT_NCE: bb-local null-check elimination. cfg->explicit_null_checks is forced on for this
@@ -293,6 +309,12 @@ int mono_wasm_jit_nce = 1;
  * SLOTLIVE stops forcing every live ref into the GC frame just because a null check sits between its
  * def and its use. See the argument in wj_ins_is_gcpoint. Default OFF (silent-corruption risk class). */
 int mono_wasm_jit_raise_nogc = 0;
+/* MONO_WASM_JIT_NODISPATCH: skip the loop/block/br_table scaffolding for a single-bb, edge-free,
+ * clause-free method (see skip_dispatch). Shape-wise it is strictly less code, but the first two
+ * measurements both came out 9-15% SLOWER than the 1.905 control -- taken on a machine with a 3-5
+ * loadavg from a concurrent build, so unattributable rather than disproven. Default OFF until it can be
+ * A/B'd on a quiet machine; it is a flag precisely so that does not require another build. */
+int mono_wasm_jit_nodispatch = 0;
 int mono_wasm_jit_refverify = 0;      /* MONO_WASM_JIT_REFVERIFY (0/1/2): after the isref fixpoint, cross-check classification against the structural vreg_is_ref/vreg_is_mp marking — 1 logs violations (a marked vreg classified nonref = lost seed = would-be silent corruption), 2 asserts. Debug only, default off. */
 const char *mono_wasm_jit_dump_ir = NULL;  /* MONO_WASM_JIT_DUMP_IR=<substr>: dump clauses + bb regions + opcode stream for clause-bearing methods whose full name contains <substr> (EH-lowering ground truth, e.g. "indigo"). */
 /* Island heuristic levers (Part 5), all default-OFF so the baseline is unchanged and each can be A/B'd. */
@@ -1956,6 +1978,122 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean clause_free)
 	}
 }
 
+/*
+ * MONO_WASM_JIT_LCSE — redundant heap-load elimination, scoped to an extended basic block.
+ *
+ * Two entry kinds share one small table:
+ *   LOAD  : the value of *(base + off), read with mono opcode `op`, currently lives in vreg `vreg`.
+ *   ALIAS : `base` holds the same value as `vreg`, so every read of `base` can read `vreg` instead.
+ *
+ * ALIAS is what makes CHAINED reloads work, and it is the whole reason this is not just a bb-local
+ * peephole. For `a.lowerBound.x` reloaded in a ternary arm, eliding the outer load leaves the arm's
+ * `.x` load keyed on the elided load's dreg rather than on the cached vreg; without canonicalising
+ * through ALIAS the second load misses and only half the redundancy goes away. wasm_ld resolves through
+ * this table, so every existing read site in the emitter picks the elision up untouched.
+ *
+ * Deliberately small and linearly scanned: the win is a handful of hot locations per extended block,
+ * not a big table, and a fixed array costs no allocation per bb.
+ */
+#define WJ_LCSE_MAX 16
+#define WJ_LCSE_FREE  0
+#define WJ_LCSE_LOAD  1
+#define WJ_LCSE_ALIAS 2
+typedef struct {
+	guint8 kind;
+	int op;        /* LOAD: mono load opcode — distinguishes width/signedness at the same offset */
+	int base;      /* LOAD: base vreg (already canonical)   ALIAS: the aliasing vreg */
+	gint32 off;    /* LOAD: byte offset */
+	int vreg;      /* the vreg that holds the value */
+} WjLcseEnt;
+typedef struct {
+	WjLcseEnt e [WJ_LCSE_MAX];
+	int n;
+} WjLcse;
+
+static int
+wj_lcse_canon (WjLcse *t, int v)
+{
+	int guard;
+	if (!t || v < 0)
+		return v;
+	/* Chains are built by appending and are short; the bound is a hard stop against a cycle, not an
+	 * expected depth. */
+	for (guard = 0; guard < WJ_LCSE_MAX; ++guard) {
+		int i, next = -1;
+		for (i = 0; i < t->n; ++i)
+			if (t->e [i].kind == WJ_LCSE_ALIAS && t->e [i].base == v) { next = t->e [i].vreg; break; }
+		if (next < 0 || next == v)
+			break;
+		v = next;
+	}
+	return v;
+}
+
+/* Drop every entry mentioning `v` — as a LOAD's base (the address it names may now differ), as the vreg
+ * holding a cached value, or as either side of an ALIAS. Called on every def BEFORE the defining
+ * instruction is lowered, so the instruction's own sources still resolve against the old state. */
+static void
+wj_lcse_kill (WjLcse *t, int v)
+{
+	int i, k = 0;
+	if (!t || v < 0)
+		return;
+	for (i = 0; i < t->n; ++i) {
+		if (t->e [i].base == v || t->e [i].vreg == v)
+			continue;
+		t->e [k++] = t->e [i];
+	}
+	t->n = k;
+}
+
+static void
+wj_lcse_add (WjLcse *t, guint8 kind, int op, int base, gint32 off, int vreg)
+{
+	/* base == vreg would be self-referential: `t = load(t, off)` redefines its own base, and caching
+	 * (t,off) -> t would then hand out the loaded value as if it were the address. */
+	if (!t || base < 0 || vreg < 0 || base == vreg || t->n >= WJ_LCSE_MAX)
+		return;
+	t->e [t->n].kind = kind;
+	t->e [t->n].op = op;
+	t->e [t->n].base = base;
+	t->e [t->n].off = off;
+	t->e [t->n].vreg = vreg;
+	t->n++;
+}
+
+static int
+wj_lcse_find (WjLcse *t, int op, int base, gint32 off)
+{
+	int i;
+	if (!t)
+		return -1;
+	for (i = 0; i < t->n; ++i)
+		if (t->e [i].kind == WJ_LCSE_LOAD && t->e [i].op == op && t->e [i].base == base && t->e [i].off == off)
+			return t->e [i].vreg;
+	return -1;
+}
+
+/* Could this instruction change memory that a cached load already read? */
+static gboolean
+wj_ins_clobbers_mem (MonoInst *ins)
+{
+	/* Stores write it; OP_LDADDR hands its address to code we cannot see. */
+	if (MONO_IS_STORE_MEMBASE (ins) || ins->opcode == OP_LDADDR)
+		return TRUE;
+	/* A raise never returns, so nothing later in this method observes anything it did. Decided here
+	 * rather than by asking wj_ins_is_gcpoint with clause_free=TRUE, because that answer is gated on
+	 * MONO_WASM_JIT_RAISE_NOGC — which is about GC visibility, not memory effects — and LCSE's
+	 * effectiveness should not depend on an unrelated flag. Null checks are the commonest instruction
+	 * between a load and its reload, so getting this wrong costs the entire optimisation. */
+	if (MONO_IS_COND_EXC (ins) || ins->opcode == OP_THROW || ins->opcode == OP_RETHROW)
+		return FALSE;
+	/* Otherwise reuse the GC-point classifier's inverted whitelist: its FALSE set is exactly the
+	 * constants/moves/arithmetic/conversion/compare/branch/load family. Anything it does not recognise —
+	 * every call included — clears the table, i.e. an unknown opcode costs optimisation, never
+	 * correctness. */
+	return wj_ins_is_gcpoint (ins, FALSE);
+}
+
 /* Per-compile vreg access context: non-reference vregs live in wasm locals (li[]); reference vregs
  * (refslot[vreg] >= 0) live in the GC-scanned ref shadow stack at refbase + slot*4. refbase/rtmp are
  * wasm i32 locals (the frame base address + a scratch for ref stores). refslot is NULL when the ref
@@ -3507,6 +3645,218 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		}
 	}
 
+	/*
+	 * MONO_WASM_JIT_COALESCE — let several vregs share one wasm local when their live ranges are disjoint.
+	 *
+	 * li[] is otherwise strictly one local per vreg with no reuse at all: AABB:combine declares 58 where
+	 * teavm's optimiser needs 5 for the identical Java source.
+	 *
+	 * Liveness here is a real backward dataflow, NOT first-mention/last-mention. The cheap version is
+	 * unsound across a back edge:
+	 *
+	 *     bb0: t1 = 5
+	 *     bb1: use t1 ; t2 = 7 ; use t2 ; br bb1      <- loop header
+	 *
+	 * t1's mentions all precede t2's, so a mention-range allocator shares their local -- and on the
+	 * second iteration `use t1` reads t2's value. Propagating live_in/live_out keeps t1 live across the
+	 * whole loop, which is what makes the overlap visible.
+	 *
+	 * Uses are enumerated exactly as the SLOTLIVE walk does, and for the same reason: a missed use
+	 * shortens a range and silently shares a still-live local. That means the generic source registers,
+	 * plus a store-membase `dreg` (which is an ADDRESS, not a result), plus the positional call-arg vregs
+	 * hanging off call_info. cfg->ret->dreg is additionally pinned live to the end of the method because
+	 * the epilogue loads it OUTSIDE the instruction stream, where no walk of the IR can see it.
+	 *
+	 * Each valtype group holds exactly one wasm type (wasm_valtype_group), so sharing a slot within a
+	 * group can never produce a type mismatch.
+	 */
+	int *lslot = NULL;
+	/*
+	 * Clause-free methods only. The liveness below walks bb->out_bb, and mono does NOT thread exception
+	 * edges through it -- a throw reaches its handler via the EH machinery, not a CFG successor. So a vreg
+	 * whose only live path into a handler is that implicit edge looks dead here, and coalescing it would
+	 * miscompile the handler. jbox2d has no EH at all, so the bench cannot expose this; Minecraft is full
+	 * of it. Widening this needs the intervals of everything live in a try region extended across the
+	 * whole region plus its handlers.
+	 */
+	if (mono_wasm_jit_coalesce && nvreg > 0 && cfg->header->num_clauses == 0) {
+		int words = (nvreg + 31) / 32;
+		int nbb2 = 0, ordn = 0, bbn;
+		MonoBasicBlock *bbl; MonoInst *insl;
+
+		for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb)
+			nbb2++;
+		/* Bound the dataflow: 4 bitsets of nbb2*words words. Past this a method keeps the old
+		 * one-local-per-vreg assignment rather than paying unbounded compile time/memory. */
+		if (nbb2 > 0 && (gsize) nbb2 * words <= 65536) {
+			int *bb_lo = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nbb2);
+			int *bb_hi = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nbb2);
+			int *vlo = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+			int *vhi = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+			guint32 *bs_use = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
+			guint32 *bs_def = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
+			guint32 *bs_in  = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
+			guint32 *bs_out = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
+			int iter, changed = 1;
+
+#define WJ_BS(BASE, BB) ((BASE) + (gsize) (BB) * words)
+#define WJ_BS_GET(BASE, BB, V) ((WJ_BS (BASE, BB) [(V) >> 5] >> ((V) & 31)) & 1u)
+#define WJ_BS_SET(BASE, BB, V) do { WJ_BS (BASE, BB) [(V) >> 5] |= 1u << ((V) & 31); } while (0)
+
+			for (i = 0; i < nvreg; ++i) { vlo [i] = -1; vhi [i] = -1; }
+
+			/* per-bb upward-exposed uses + defs, and the ordinal range of each bb */
+			bbn = 0;
+			for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
+				bb_lo [bbn] = ordn;
+				MONO_BB_FOR_EACH_INS (bbl, insl) {
+					int srcs [MONO_MAX_SRC_REGS];
+					int nsrc = mono_inst_get_src_registers (insl, srcs);
+					gboolean dreg_is_base = FALSE;
+					int u, d;
+					switch (insl->opcode) {
+					case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
+					case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG:
+					case OP_STORER8_MEMBASE_REG:
+					case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM:
+					case OP_STOREI2_MEMBASE_IMM:
+						dreg_is_base = TRUE; break;
+					default: break;
+					}
+#define WJ_CO_USE(V) do { int _v = (V); \
+	if (_v >= 0 && _v < nvreg) { \
+		if (!WJ_BS_GET (bs_def, bbn, _v)) WJ_BS_SET (bs_use, bbn, _v); \
+		if (vlo [_v] < 0 || ordn < vlo [_v]) vlo [_v] = ordn; \
+		if (ordn > vhi [_v]) vhi [_v] = ordn; \
+	} } while (0)
+					for (u = 0; u < nsrc; ++u)
+						WJ_CO_USE (srcs [u]);
+					if (dreg_is_base)
+						WJ_CO_USE (insl->dreg);
+					if (MONO_IS_CALL (insl)) {
+						MonoCallInst *cl = (MonoCallInst *) insl;
+						if (cl->call_info && cl->signature) {
+							int *wa = (int *) cl->call_info;
+							int wn = (int) cl->signature->param_count + (cl->signature->hasthis ? 1 : 0);
+							for (u = 0; u <= wn; ++u)
+								WJ_CO_USE (wa [u]);
+						}
+					}
+#undef WJ_CO_USE
+					d = dreg_is_base ? -1 : insl->dreg;
+					if (d >= 0 && d < nvreg) {
+						WJ_BS_SET (bs_def, bbn, d);
+						if (vlo [d] < 0 || ordn < vlo [d]) vlo [d] = ordn;
+						if (ordn > vhi [d]) vhi [d] = ordn;
+					}
+					ordn++;
+				}
+				bb_hi [bbn] = ordn - 1;   /* < bb_lo for an empty bb; handled below */
+			}
+
+			/* live_out[b] = U live_in[succ];  live_in[b] = use[b] U (live_out[b] - def[b])
+			 *
+			 * Block index lookups are precomputed. Walking cfg->bb_entry to find a successor's index
+			 * inside the fixpoint would make this O(nbb^2) per iteration, which is real money on the
+			 * 7000-instruction methods here. */
+			MonoBasicBlock **bbarr = (MonoBasicBlock **) mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock *) * nbb2);
+			int *bbnum2idx = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * ((int) cfg->max_block_num + 1));
+			for (i = 0; i <= (int) cfg->max_block_num; ++i)
+				bbnum2idx [i] = -1;
+			bbn = 0;
+			for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
+				bbarr [bbn] = bbl;
+				if (bbl->block_num >= 0 && bbl->block_num <= (int) cfg->max_block_num)
+					bbnum2idx [bbl->block_num] = bbn;
+			}
+			for (iter = 0; changed && iter < nbb2 + 4; ++iter) {
+				changed = 0;
+				/* reverse layout order converges fast for a mostly-forward CFG */
+				for (bbn = nbb2 - 1; bbn >= 0; --bbn) {
+					MonoBasicBlock *b = bbarr [bbn];
+					int k, w;
+					for (k = 0; k < b->out_count; ++k) {
+						MonoBasicBlock *o = b->out_bb [k];
+						int oi = (o && o->block_num >= 0 && o->block_num <= (int) cfg->max_block_num)
+							? bbnum2idx [o->block_num] : -1;
+						if (oi < 0) continue;
+						for (w = 0; w < words; ++w) {
+							guint32 nv = WJ_BS (bs_out, bbn) [w] | WJ_BS (bs_in, oi) [w];
+							if (nv != WJ_BS (bs_out, bbn) [w]) { WJ_BS (bs_out, bbn) [w] = nv; changed = 1; }
+						}
+					}
+					for (w = 0; w < words; ++w) {
+						guint32 nv = WJ_BS (bs_use, bbn) [w] | (WJ_BS (bs_out, bbn) [w] & ~WJ_BS (bs_def, bbn) [w]);
+						if (nv != WJ_BS (bs_in, bbn) [w]) { WJ_BS (bs_in, bbn) [w] = nv; changed = 1; }
+					}
+				}
+			}
+
+			/* A vreg live at a block boundary is live across that whole block, back edges included. */
+			for (bbn = 0; bbn < nbb2; ++bbn) {
+				int hi = bb_hi [bbn] < bb_lo [bbn] ? bb_lo [bbn] : bb_hi [bbn];
+				for (i = 0; i < nvreg; ++i) {
+					if (!WJ_BS_GET (bs_in, bbn, i) && !WJ_BS_GET (bs_out, bbn, i))
+						continue;
+					if (vlo [i] < 0 || bb_lo [bbn] < vlo [i]) vlo [i] = bb_lo [bbn];
+					if (hi > vhi [i]) vhi [i] = hi;
+				}
+			}
+
+			/* The epilogue reads cfg->ret->dreg after the last instruction; no IR walk can see that. */
+			if (cfg->ret && cfg->ret->dreg >= 0 && cfg->ret->dreg < nvreg) {
+				int rv = cfg->ret->dreg;
+				if (vlo [rv] < 0) vlo [rv] = 0;
+				vhi [rv] = ordn;
+			}
+			/* Never-mentioned vregs collapse onto [0,0]: nothing can read them, since every emitter read
+			 * goes through a source reg, a call_info slot, or cfg->ret, all enumerated above. */
+			for (i = 0; i < nvreg; ++i)
+				if (vlo [i] < 0) { vlo [i] = 0; vhi [i] = 0; }
+
+			/* Greedy allocation in increasing start order (counting sort on vlo keeps it deterministic).
+			 * A slot is reusable once its current occupant's range has ENDED strictly before this one
+			 * starts. */
+			{
+				int nord = ordn + 2;
+				int *cntb = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nord);
+				int *order = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+				int *slot_end [4] = { NULL, NULL, NULL, NULL };
+				int nslot [4] = { 0, 0, 0, 0 };
+				int pos = 0, gi;
+
+				lslot = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+				for (i = 0; i < nvreg; ++i) lslot [i] = -1;
+				for (gi = 0; gi < 4; ++gi)
+					slot_end [gi] = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+
+				for (i = 0; i < nvreg; ++i) cntb [vlo [i] < nord ? vlo [i] : nord - 1]++;
+				for (i = 1; i < nord; ++i) cntb [i] += cntb [i - 1];
+				for (i = nvreg - 1; i >= 0; --i) {
+					int key = vlo [i] < nord ? vlo [i] : nord - 1;
+					order [--cntb [key]] = i;
+				}
+
+				for (pos = 0; pos < nvreg; ++pos) {
+					int v = order [pos], g, s, chosen = -1;
+					if (li [v] >= 0 || vt [v] == 0 || addrslot [v] >= 0)
+						continue;
+					g = wasm_valtype_group (vt [v]);
+					if (g < 0) continue;
+					/* Scanning is capped: past 256 slots the search cost stops being worth the reuse. */
+					for (s = 0; s < nslot [g] && s < 256; ++s)
+						if (slot_end [g] [s] < vlo [v]) { chosen = s; break; }
+					if (chosen < 0) chosen = nslot [g]++;
+					slot_end [g] [chosen] = vhi [v];
+					lslot [v] = chosen;
+				}
+			}
+#undef WJ_BS
+#undef WJ_BS_GET
+#undef WJ_BS_SET
+		}
+	}
+
 	/* assign locals for non-arg typed vregs, grouped by type (skip address-taken locals: they live in the
 	 * addr frame, not a wasm local) */
 	for (i = 0; i < nvreg; ++i) {
@@ -3515,7 +3865,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			continue;
 		g = wasm_valtype_group (vt [i]);
 		if (g < 0) continue;
-		cnt [g]++;
+		/* Coalesced: the group needs as many locals as its highest slot index, not one per vreg. Both
+		 * this counting pass and the assignment pass below key off the same lslot[], so they cannot
+		 * disagree about the group size. */
+		if (lslot && lslot [i] >= 0) {
+			if (lslot [i] + 1 > cnt [g]) cnt [g] = lslot [i] + 1;
+		} else {
+			cnt [g]++;
+		}
 	}
 	/* reserve one extra i32 local at the end of the i32 group for the dispatch index ($blk) */
 	dispatch_idx = nwparams + cnt [0];
@@ -3584,7 +3941,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			continue;
 		g = wasm_valtype_group (vt [i]);
 		if (g < 0) continue;
-		li [i] = base [g] + run [g]++;
+		li [i] = base [g] + ((lslot && lslot [i] >= 0) ? lslot [i] : run [g]++);
 	}
 	groups [0].type = WASM_I32; groups [0].count = cnt [0];
 	groups [1].type = WASM_I64; groups [1].count = cnt [1];
@@ -4087,7 +4444,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		if (G_UNLIKELY (cfg->method && mono_wasm_jit_refdiag_name (cfg->method->name))) {
 			MonoBasicBlock *bb2; MonoInst *ins2;
 #define WJ_RF(v) (((v) >= 0 && (v) < nvreg) ? (isref [v] ? ((sl_elide && sl_elide [v]) ? 'r' : 'R') : '-') : '.')
-			{ printf ("WASM_JIT_IR === %s nvreg=%d nrefslots=%d nargs=%d ===\n", cfg->method->name, nvreg, nrefslots, nargs); }
+			{ printf ("WASM_JIT_IR === %s nvreg=%d nrefslots=%d nargs=%d lcseflag=%d ===\n", cfg->method->name, nvreg, nrefslots, nargs, mono_wasm_jit_lcse); }
 			for (bb2 = cfg->bb_entry; bb2; bb2 = bb2->next_bb)
 				MONO_BB_FOR_EACH_INS (bb2, ins2) {
 					char b [256]; int n;
@@ -4205,6 +4562,62 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	N = 0;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
 		bbidx [bb->block_num] = N++;
+
+	/* MONO_WASM_JIT_LCSE state.
+	 *
+	 * The table flows from a bb to a successor only when that successor has EXACTLY ONE predecessor —
+	 * i.e. along the single edge of an extended basic block. That is what makes it sound with no path
+	 * analysis at all: with one predecessor there is no other way in, so nothing unaccounted-for can run
+	 * between the two blocks. Dominance alone would NOT be enough (idom(bb) can reach bb through
+	 * intervening blocks that store), which is why this does not reuse the NCE level-2 walk.
+	 *
+	 * That single-predecessor shape is exactly the ternary arm this targets, so the restriction costs
+	 * nothing on the measured case.
+	 *
+	 * Disabled under STOREGUARD/OBJGUARD: those wrap each access in a check_store call, and eliding a
+	 * load would elide its guard, changing what the guard run verifies. */
+	WjLcse *lcse = NULL;
+	WjLcse **lcse_exit = NULL;
+	int lcse_adds = 0, lcse_hits = 0, lcse_inherits = 0;
+	{
+		extern gboolean mono_wasm_jit_refdiag_name (const char *);
+		if (G_UNLIKELY (cfg->method && mono_wasm_jit_refdiag_name (cfg->method->name)))
+			printf ("WASM_JIT_LCSE %s: flag=%d nvreg=%d sg=%d og=%d\n",
+				cfg->method->name, mono_wasm_jit_lcse, nvreg, lc.storeguard, lc.objguard);
+	}
+	if (mono_wasm_jit_lcse && nvreg > 0 && !lc.storeguard && !lc.objguard) {
+		guint8 *needed = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) (N > 0 ? N : 1));
+		MonoBasicBlock *b3;
+		int nneed = 0;
+
+		lcse = (WjLcse *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjLcse));
+		/* Only blocks that some LATER block inherits from need their exit state kept; for the diamond
+		 * that is just the compare block. Saving one table per bb unconditionally would cost ~340 bytes
+		 * times the block count, which is real for the 7000-instruction methods here. */
+		for (b3 = cfg->bb_entry; b3; b3 = b3->next_bb) {
+			int ci = bbidx [b3->block_num], pi;
+			if (ci < 0 || b3->in_count != 1 || !b3->in_bb [0])
+				continue;
+			if (b3->flags & BB_EXCEPTION_HANDLER)
+				continue;   /* reached by an EH edge, not by falling out of in_bb[0] */
+			pi = (b3->in_bb [0]->block_num <= (int) cfg->max_block_num) ? bbidx [b3->in_bb [0]->block_num] : -1;
+			if (pi < 0 || pi >= ci)
+				continue;   /* back edge: the predecessor has not been emitted yet */
+			if (!needed [pi]) { needed [pi] = 1; nneed++; }
+		}
+		if (nneed > 0) {
+			lcse_exit = (WjLcse **) mono_mempool_alloc0 (cfg->mempool, sizeof (WjLcse *) * (gsize) (N > 0 ? N : 1));
+			for (i = 0; i < N; ++i)
+				if (needed [i])
+					lcse_exit [i] = (WjLcse *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjLcse));
+		}
+		{
+			extern gboolean mono_wasm_jit_refdiag_name (const char *);
+			if (G_UNLIKELY (cfg->method && mono_wasm_jit_refdiag_name (cfg->method->name)))
+				printf ("WASM_JIT_LCSE %s: on, N=%d nvreg=%d single-pred-sources=%d\n",
+					cfg->method->name, N, nvreg, nneed);
+		}
+	}
 
 	/* NCE level 2: cross-bb facts, propagated down the DOMINATOR tree.
 	 *
@@ -4347,9 +4760,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		}
 	}
 
-	/* prologue: dispatch index ($blk) starts at the entry block (dense index 0) */
-	wasm_i32_const (&body, 0);
-	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
+	/* prologue: dispatch index ($blk) starts at the entry block (dense index 0). Unneeded when the
+	 * dispatch scaffolding is skipped (see skip_dispatch) -- nothing ever reads it. */
+	if (!(mono_wasm_jit_nodispatch && N == 1 && !eh_on && cfg->bb_entry && cfg->bb_entry->out_count == 0)) {
+		wasm_i32_const (&body, 0);
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
+	}
 
 #ifdef HOST_BROWSER
 	/* C-STACK FRAME PROLOGUE. Reserve this method's ref+addr slots as a real frame on the emscripten
@@ -4499,6 +4915,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * inside bb_i the labels are B_{i+1}..B_{N-1} (N-1-i of them), the dispatch loop, then throw[0..K-1],
 	 * so throw[t] sits at depth N - i + t regardless of whether the EH scaffolding is present.
 	 */
+	/*
+	 * A single-basic-block method has nowhere to dispatch to, yet it still paid the full
+	 * `loop { block { local.get $blk; br_table } }` scaffolding: a $blk init in the prologue, an
+	 * indirect jump at entry, and a trailing `unreachable`. That is most of why
+	 * TreeNodeStack:getCount() -- literally `return count;` -- compiled to 103 instructions and 523
+	 * bytes. Skip the scaffolding entirely when there is exactly one bb, it has no outgoing edges (so
+	 * no branch can target it and no back edge exists), and there is no EH wrapper whose landing pad
+	 * would re-dispatch through $blk.
+	 */
+	gboolean skip_dispatch = mono_wasm_jit_nodispatch && (N == 1 && !eh_on && cfg->bb_entry && cfg->bb_entry->out_count == 0);
+
 	int wj_throw_slot [WJ_EXC_IDS];
 	int nthrow = 0;
 	for (i = 0; i < WJ_EXC_IDS; ++i) wj_throw_slot [i] = -1;
@@ -4530,14 +4957,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	/* Outermost first, so the last one emitted (throw[0]) is innermost and depth N-i+t holds. */
 	for (i = nthrow - 1; i >= 0; --i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
 
-	wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);
-	for (i = 0; i < N; ++i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);
-	wasm_op (&body, WASM_OP_BR_TABLE);
-	wasm_uleb (&body, (guint32) N);
-	for (i = 0; i < N; ++i)
-		wasm_uleb (&body, (guint32) i);
-	wasm_uleb (&body, 0); /* default -> block 0 */
+	if (!skip_dispatch) {
+		wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);
+		for (i = 0; i < N; ++i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);
+		wasm_op (&body, WASM_OP_BR_TABLE);
+		wasm_uleb (&body, (guint32) N);
+		for (i = 0; i < N; ++i)
+			wasm_uleb (&body, (guint32) i);
+		wasm_uleb (&body, 0); /* default -> block 0 */
+	}
 
 /*
  * Edge lowering. EXTRA is the number of wasm blocks opened INSIDE this bb's code at the branch point
@@ -4563,6 +4992,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define GOTO(TBB, EXTRA) do { \
 		int _ti = bbidx [(TBB)->block_num]; \
 		if (_ti < 0) { fail = "bad branch target"; goto done; } \
+		/* skip_dispatch removed every branch label; if an edge shows up anyway the depths would be
+		 * garbage, so bail the method instead of emitting a wrong branch. */ \
+		if (skip_dispatch) { fail = "branch in a single-bb method"; goto done; } \
 		if (_ti > i) { \
 			int _d = _ti - i - 1 + (EXTRA); \
 			/* depth 0 at bb top level is the fallthrough edge: emitting nothing gets there. */ \
@@ -4579,8 +5011,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * the prescan did not reserve a block for this id, so the caller can fall back to the inline form. */
 #define WJ_HAS_THROW(EXC_ID) ((EXC_ID) >= 0 && (EXC_ID) < WJ_EXC_IDS && wj_throw_slot [(EXC_ID)] >= 0)
 #define WJ_THROW_BR(EXC_ID, EXTRA) do { \
+		/* labels from inside bb_i: B_{i+1}..B_{N-1} (N-1-i), then the dispatch loop IF PRESENT, then
+		 * throw[0..K-1]. Without the scaffolding N==1 and there are no B blocks, so it collapses to t. */ \
 		wasm_op (&body, WASM_OP_BR_IF); \
-		wasm_uleb (&body, (guint32) (N - i + wj_throw_slot [(EXC_ID)] + (EXTRA))); \
+		wasm_uleb (&body, (guint32) ((N - 1 - i) + (skip_dispatch ? 0 : 1) + wj_throw_slot [(EXC_ID)] + (EXTRA))); \
 	} while (0)
 
 /* TRUE when GOTO(TBB, EXTRA) would lower to a plain forward `br`, i.e. the target needs no $blk write.
@@ -4638,7 +5072,21 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			else memset (nn, 0, (gsize) nvreg);
 		}
 
-		wasm_op (&body, WASM_OP_END); /* close block B_i; bb_i code follows */
+		/* LCSE: inherit the load table only across a single-predecessor edge from an already-emitted
+		 * block (see the allocation comment). Anything else starts empty. */
+		if (lcse) {
+			lcse->n = 0;
+			if (lcse_exit && bb->in_count == 1 && bb->in_bb [0] && !(bb->flags & BB_EXCEPTION_HANDLER)) {
+				int pi = (bb->in_bb [0]->block_num <= (int) cfg->max_block_num) ? bbidx [bb->in_bb [0]->block_num] : -1;
+				if (pi >= 0 && pi < i && lcse_exit [pi]) {
+					*lcse = *lcse_exit [pi];
+					if (lcse->n) lcse_inherits++;
+				}
+			}
+		}
+
+		if (!skip_dispatch)
+			wasm_op (&body, WASM_OP_END); /* close block B_i; bb_i code follows */
 
 #ifdef HOST_BROWSER
 		/* bbtrace: log this bb's dense index at runtime (reuses the (i32,i32)->i32 dispatch functype + drop) */
@@ -4682,6 +5130,25 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				gboolean nn_move = (ins->opcode == OP_MOVE) && NN_GET (ins->sreg1);
 				NN_KILL (ins->dreg);
 				if (nn_move) NN_SET (ins->dreg);
+			}
+			/* LCSE kill point, same placement and for the same reason as NCE's: the instruction's own
+			 * sources must still resolve against the pre-def state. A copy additionally carries the
+			 * equivalence forward, which is what lets a load keyed on the copy hit the original's entry. */
+			if (G_UNLIKELY (lcse != NULL)) {
+				/* SCALAR moves only. OP_VMOVE/OP_XMOVE copy a value type through memory rather than
+				 * moving a wasm local, so treating one as a value equivalence would key later lookups
+				 * off the wrong storage. */
+				gboolean scalar_move = ins->opcode == OP_MOVE || ins->opcode == OP_LMOVE ||
+					ins->opcode == OP_FMOVE || ins->opcode == OP_RMOVE;
+				int mv_src = scalar_move ? wj_lcse_canon (lcse, ins->sreg1) : -1;
+				if (wj_ins_clobbers_mem (ins))
+					lcse->n = 0;
+				else
+					wj_lcse_kill (lcse, ins->dreg);
+				if (mv_src >= 0 && mv_src < nvreg && ins->dreg >= 0 && ins->dreg < nvreg &&
+				    mv_src != ins->dreg && lc.vt && lc.vt [mv_src] == lc.vt [ins->dreg] &&
+				    !(lc.addrslot && (lc.addrslot [ins->dreg] != -1 || lc.addrslot [mv_src] != -1)))
+					wj_lcse_add (lcse, WJ_LCSE_ALIAS, 0, ins->dreg, 0, mv_src);
 			}
 			/* SLOTZERO kill point: the vregs chained at this ordinal had their last use at the PREVIOUS
 			 * instruction — zero their (now dead) frame slots so the objects stop pinning. Emitted before
@@ -5105,7 +5572,50 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				WJ_THROW_BR (4, 0);   /* one shared raise site per method, not a call per check */
 				break;
 			}
-#define LOADM(WOP, AL) do { if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; } if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; } } while (0)
+/* membase load: dreg = *(sreg1 + inst_offset).
+ *
+ * Under LCSE, if this exact (base, offset, opcode) was already loaded earlier in the extended block and
+ * nothing has clobbered memory since, replace the memory load with a LOCAL COPY of the vreg that already
+ * holds the value. The i32.load/f32.load is gone, which is the point; TurboFan then SSA-renames the copy
+ * away for free.
+ *
+ * It is tempting to emit NOTHING and just record dreg as an alias of the cached vreg, resolving every
+ * later read through the table. That MISCOMPILES, and the failure is not subtle once seen:
+ *
+ *     t7  = load(a,12)     -> entry (a,12) -> t7
+ *     t15 = load(a,12)     -> hit; emit nothing, alias t15 -> t7
+ *     t7  = <redefined>    -> the alias must die (t7 no longer holds the value)
+ *     use t15              -> reads t15's own local, WHICH WAS NEVER WRITTEN -> zero
+ *
+ * jbox2d's min/max ternaries reuse vregs constantly, so this produced garbage floats, NaNs, and a
+ * non-terminating solver loop rather than a crash. Emitting the copy makes dreg a real def with its
+ * normal wasm_st behaviour -- which also keeps the ref frame honest, since a slotted ref dreg still
+ * writes its pin slot exactly where SLOTLIVE/SLOTZERO's liveness walk expects it.
+ *
+ * The ALIAS entry is still recorded, but purely to canonicalise TABLE KEYS: it lets a chained load
+ * (`a.lowerBound.x`, whose base is this load's dreg) find the original base's entry. If it dies, the
+ * only cost is a missed elision. */
+#define LOADM(WOP, AL) do { \
+		int _cb = G_UNLIKELY (lcse != NULL) ? wj_lcse_canon (lcse, ins->sreg1) : -1; \
+		int _hit = (_cb >= 0) ? wj_lcse_find (lcse, ins->opcode, _cb, (gint32) ins->inst_offset) : -1; \
+		if (_hit >= 0 && _hit < nvreg && ins->dreg >= 0 && ins->dreg < nvreg && _hit != ins->dreg && \
+		    !(lc.addrslot && (lc.addrslot [ins->dreg] != -1 || lc.addrslot [_hit] != -1))) { \
+			if (!wasm_ld (&body, &lc, _hit)) { fail = "lcse src"; goto done; } \
+			if (!wasm_st (&body, &lc, ins->dreg)) { fail = "lcse dreg"; goto done; } \
+			wj_lcse_add (lcse, WJ_LCSE_ALIAS, 0, ins->dreg, 0, _hit); \
+			lcse_hits++; \
+			break; \
+		} \
+		if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; } \
+		if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } \
+		wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); \
+		if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; } \
+		if (_cb >= 0 && ins->dreg >= 0 && ins->dreg < nvreg && \
+		    !(lc.addrslot && (lc.addrslot [ins->dreg] != -1 || lc.addrslot [_cb] != -1))) { \
+			wj_lcse_add (lcse, WJ_LCSE_LOAD, ins->opcode, _cb, (gint32) ins->inst_offset, ins->dreg); \
+			lcse_adds++; \
+		} \
+	} while (0)
 			case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE: LOADM (WASM_OP_I32_LOAD, 2); break;
 			case OP_LOADU1_MEMBASE: LOADM (WASM_OP_I32_LOAD8_U, 0); break;
 			case OP_LOADI1_MEMBASE: LOADM (WASM_OP_I32_LOAD8_S, 0); break;
@@ -6845,10 +7355,26 @@ vcall_nullchk_done:
 				GOTO (bb->next_bb, 0);
 			}
 		}
+
+		/* LCSE: hand this block's exit state to whichever single-predecessor successor inherits it. */
+		if (lcse && lcse_exit && i < N && lcse_exit [i])
+			*lcse_exit [i] = *lcse;
 	}
 
-	wasm_op (&body, WASM_OP_END);          /* close loop */
-	wasm_op (&body, WASM_OP_UNREACHABLE);  /* loop never falls through */
+	if (G_UNLIKELY (lcse != NULL)) {
+		extern gboolean mono_wasm_jit_refdiag_name (const char *);
+		if (cfg->method && mono_wasm_jit_refdiag_name (cfg->method->name))
+			printf ("WASM_JIT_LCSE %s: adds=%d hits=%d inherited-nonempty-bbs=%d\n",
+				cfg->method->name, lcse_adds, lcse_hits, lcse_inherits);
+	}
+	/* The table describes nothing outside the block loop; drop it before the shared raise sites and
+	 * the epilogue so a stale entry cannot be consulted. */
+	lcse = NULL;
+
+	if (!skip_dispatch) {
+		wasm_op (&body, WASM_OP_END);          /* close loop */
+		wasm_op (&body, WASM_OP_UNREACHABLE);  /* loop never falls through */
+	}
 
 	/* Shared raise sites, innermost first: close throw[t], then emit its one call to
 	 * mono_wasm_jit_raise_corlib. Only reachable via `br_if $throw_t`, since the dispatch loop above
