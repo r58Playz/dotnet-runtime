@@ -57,6 +57,16 @@ get_tier_up_imethod (InterpMethod *imethod)
 		new_imethod->wasm_jit_invoke_out = old_imethod->wasm_jit_invoke_out;
 		new_imethod->wasm_jit_resv_eslot = old_imethod->wasm_jit_resv_eslot;
 		new_imethod->wasm_jit_resv_fslot = old_imethod->wasm_jit_resv_fslot;
+		/* Carry the parked slot pair too. The function-table allocator has no free, so dropping these on
+		 * tier-up would leak two entries for every method that reserved and then tiered — silently, and
+		 * exactly for the hot methods that tier. */
+		new_imethod->wasm_jit_self_resv_eslot = old_imethod->wasm_jit_self_resv_eslot;
+		new_imethod->wasm_jit_self_resv_fslot = old_imethod->wasm_jit_self_resv_fslot;
+		/* Carry the speculative-devirt profile across tier-up: samples gathered in tier0 describe the
+		 * method's call sites, not one tier's bytecode, and the whole point is to still have them when
+		 * the wasm JIT compiles later. Losing them here would reset the evidence exactly when a method
+		 * gets hot enough to matter. */
+		new_imethod->wasm_jit_vprof = old_imethod->wasm_jit_vprof;
 		mono_internal_hash_table_remove (&jit_mm->interp_code_hash, method);
 		mono_internal_hash_table_insert (&jit_mm->interp_code_hash, method, new_imethod);
 	}

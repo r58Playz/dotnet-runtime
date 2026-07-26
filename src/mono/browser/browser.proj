@@ -354,6 +354,13 @@
       <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableExceptionHandling)' != 'false'">$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_EH_LIB=&quot;eh-wasm&quot;</CMakeBuildRuntimeConfigureCmd>
       <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableExceptionHandling)' == 'false'">$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_EH_LIB=&quot;eh-js&quot;</CMakeBuildRuntimeConfigureCmd>
       <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableThreads)' == 'true'">$(CMakeBuildRuntimeConfigureCmd) -DDISABLE_THREADS=0</CMakeBuildRuntimeConfigureCmd>
+      <!-- Without this a non-threaded build never sets DISABLE_THREADS at all, so cmake keeps its
+           default (OFF = threads on) and corebindings.c / driver.c compile their MT paths — referencing
+           mono_wasm_invoke_jsimport_MT, mono_threads_wasm_*_run_in_target_thread_*,
+           mono_wasm_{install,uninstall}_js_worker_interop and friends, none of which the non-threaded
+           mono libs define. The link then fails with ~16 undefined symbols. Only shows up when someone
+           actually builds singlethread, which this fork normally never does. -->
+      <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableThreads)' != 'true'">$(CMakeBuildRuntimeConfigureCmd) -DDISABLE_THREADS=1</CMakeBuildRuntimeConfigureCmd>
       <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableJsInteropByValue)' == 'true'">$(CMakeBuildRuntimeConfigureCmd) -DENABLE_JS_INTEROP_BY_VALUE=1</CMakeBuildRuntimeConfigureCmd>
       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) $(CMakeConfigurationEmsdkPath)</CMakeBuildRuntimeConfigureCmd>
 
