@@ -164,7 +164,35 @@ struct InterpMethod {
 	gint32 wasm_jit_block_n;   // runtime wasm JIT (Part 3a / Lever C): times this (un-JITted) method BLOCKED a caller's island. Always counted (cheap, compile-time): also a stats-independent "hot at the island boundary" signal for the cold gate.
 	gint32 wasm_jit_invoke_out; // runtime wasm JIT (Lever A): times THIS (interp) method invoked a JITted callee. Drives MONO_WASM_JIT_ENTRY_PROMOTE upward island growth.
 	gint32 wasm_jit_resv_eslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished entry-thunk slot while this method's SCC is being batch-compiled (0 = none)
-	gint32 wasm_jit_resv_fslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished fn slot; get_callee_fslot returns it so cycle members bake each other's f-slot before any member is published/invocable
+	gint32 wasm_jit_resv_fslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished fn slot; get_callee_fslot returns it so cycle members bake each other's f-slot before any member is published/invocable. Because OTHER methods can bake it, it must be cleared the moment the batch ends (wj_park_reservation) — otherwise a caller could bake a slot nothing instantiates into.
+	/* runtime wasm JIT (self-recursion): this method's OWN e/f pair, reserved at the first emit that needs to
+	 * bake a self-call and then held ACROSS re-emits. Deliberately separate from wasm_jit_resv_* above, which
+	 * is a live-batch reservation that get_callee_fslot publishes to other methods: the batch always clears it
+	 * on both the success and abort paths, so a slot other methods can bake is guaranteed to be instantiated.
+	 * A self reservation has to outlive a FAILED emit (that is the whole point — see below), so it must stay
+	 * invisible to get_callee_fslot or an unrelated caller could bake an f-slot nothing ever installs into.
+	 * Only mono_wasm_jit_self_reserved reads these, and only for the method being emitted.
+	 *
+	 * Why hold it across re-emits: mono_jiterp_allocate_table_entry is a bump allocator with NO free, and
+	 * these used to be locals of mono_wasm_emit_method — so every failed emit orphaned two table entries and
+	 * the next attempt allocated a fresh pair. The drivers re-emit hard (wasm_jit_force_island up to 10 passes,
+	 * wasm_jit_compile_scc phase 1 up to WJ_SCC_MAX*2), so the leak scaled with re-emission count rather than
+	 * method count — which is exactly the axis module batching increases. */
+	gint32 wasm_jit_self_resv_eslot;
+	gint32 wasm_jit_self_resv_fslot;
+	/* Speculative-devirtualization profile (MONO_WASM_JIT_DEVIRT_PROFILE): WjVProf*, lazily allocated.
+	 * Records the receiver vtable observed at this method's virtual call sites WHILE IT RUNS
+	 * INTERPRETED, so the wasm JIT has a target to speculate on at its FIRST compile — the JIT's own
+	 * vcall IC only fills in after the method is already JITted, which is too late to shape its code.
+	 *
+	 * Keyed by CALLEE BASE METHOD, not by call site. Interp code offsets are not usable as a key:
+	 * generate_compacted_code lays out a fresh buffer after interp_optimize_code, so any offset taken
+	 * at emit time is stale, and threading a per-site index through would mean a 6th operand on
+	 * MINT_CALLVIRT_FAST (and matching jiterpreter opcode-table changes). The base method is already in
+	 * hand at the dispatch point and needs no encoding change. Two sites in one method calling the same
+	 * base method therefore share an entry; that only costs precision, never correctness, because the
+	 * emitted code guards on the vtable and falls back on a miss. */
+	gpointer wasm_jit_vprof;
 	unsigned int param_count;
 	unsigned int hasthis; // boolean
 	MonoProfilerCallInstrumentationFlags prof_flags;

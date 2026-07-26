@@ -10117,10 +10117,15 @@ mono_wasm_jit_set_resv_owner (MonoMethod *method)
 	wj_resv_owner = method;
 }
 
-/* runtime wasm JIT (multi-method cycle batch): if `method` has a reserved slot pair (it is a member of an
- * SCC currently being batch-compiled by wasm_jit_compile_scc), output it and return 1 — the emitter
- * instantiates INTO these instead of allocating fresh. 0 = none. Falls back to the reservation OWNER
- * (the synchronized-inner wrapper this compile was substituted from — see above). */
+/* runtime wasm JIT: the slot pair this compile must instantiate INTO, if one is already reserved. 0 = none,
+ * allocate fresh.
+ *
+ * Checked in priority order:
+ *  1. a live SCC batch reservation on this method — fellow cycle members have already baked this f-slot into
+ *     their modules, so it MUST win over anything else;
+ *  2. the same, on the reservation OWNER (the synchronized-inner wrapper this compile was substituted from);
+ *  3. this method's private self-recursion reservation, which unlike (1) survives a failed emit.
+ */
 int
 mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
 {
@@ -10131,14 +10136,59 @@ mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
 		return 1;
 	}
 	if (wj_resv_owner && wj_resv_owner != method) {
-		im = mono_interp_get_imethod (wj_resv_owner);
-		if (im && im->wasm_jit_resv_fslot > 0) {
-			*e_out = im->wasm_jit_resv_eslot;
-			*f_out = im->wasm_jit_resv_fslot;
+		InterpMethod *oim = mono_interp_get_imethod (wj_resv_owner);
+		if (oim && oim->wasm_jit_resv_fslot > 0) {
+			*e_out = oim->wasm_jit_resv_eslot;
+			*f_out = oim->wasm_jit_resv_fslot;
 			return 1;
 		}
 	}
+	if (im && im->wasm_jit_self_resv_fslot > 0) {
+		*e_out = im->wasm_jit_self_resv_eslot;
+		*f_out = im->wasm_jit_self_resv_fslot;
+		return 1;
+	}
 	return 0;
+}
+
+/* runtime wasm JIT (self-recursion): the emitter needs an f-slot to bake into a self-call before the method
+ * exists. Reserve one ON THE IMETHOD, idempotently, so a re-emit after a failed attempt reuses it instead of
+ * burning a fresh pair out of a bump allocator that has no free (see wasm_jit_self_resv_* in
+ * interp-internals.h for why that mattered).
+ *
+ * Takes an existing batch/owner reservation if there is one rather than minting a second — a duplicate would
+ * both leak and trip the RESV_BYPASS identity check in wasm_jit_compile_scc.
+ *
+ * Serialized by the caller: every path into mono_wasm_emit_method holds wj_compiling (compile_publish takes
+ * it; the SCC batch takes it around force_compile), so the read-test-write below is not racy.
+ *
+ * Returns 1 with *e_out/*f_out set, or 0 if the function table is exhausted. */
+int
+mono_wasm_jit_reserve_self (MonoMethod *method, int *e_out, int *f_out)
+{
+	extern int mono_jiterp_allocate_table_entry (int type);
+	InterpMethod *im;
+	int e, f;
+
+	if (mono_wasm_jit_self_reserved (method, e_out, f_out))
+		return 1;
+	im = mono_interp_get_imethod (method);
+	if (!im)
+		return 0;
+	e = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+	f = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+	if (e <= 0 || f <= 0) {
+		/* Exhausted. Whichever half succeeded is orphaned — the allocator has no free — but this is
+		 * reachable only once the table is full, which is itself terminal for the JIT. */
+		extern void mono_wasm_jit_note_table_exhausted (void);
+		mono_wasm_jit_note_table_exhausted ();
+		return 0;
+	}
+	im->wasm_jit_self_resv_eslot = e;
+	im->wasm_jit_self_resv_fslot = f;
+	*e_out = e;
+	*f_out = f;
+	return 1;
 }
 
 /* runtime wasm JIT (Lever B): 1 if the callee is PERMANENTLY un-JITtable (slot==-1: EH/unsupported

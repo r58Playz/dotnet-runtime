@@ -394,6 +394,144 @@ wasm_module_method_and_entry (
 	wasm_buf_free (&sec);
 }
 
+/* Append one functype (0x60 form) to a type section buffer. */
+static void
+emit_functype (WasmBuf *sec, const WasmValtype *params, guint32 nparams, WasmValtype ret)
+{
+	guint32 i;
+	wasm_u8 (sec, 0x60);
+	wasm_uleb (sec, nparams);
+	for (i = 0; i < nparams; ++i)
+		wasm_u8 (sec, (guint8) params [i]);
+	if (ret == WASM_VOID) {
+		wasm_uleb (sec, 0);
+	} else {
+		wasm_uleb (sec, 1);
+		wasm_u8 (sec, (guint8) ret);
+	}
+}
+
+void
+wasm_module_methods_and_entries (
+	const WasmModuleMember *members, guint32 nmembers,
+	gboolean import_table,
+	gboolean import_eh_tag, guint32 eh_type_idx,
+	WasmBuf *out)
+{
+	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+	static const WasmLocalGroup no_locals [1] = { { WASM_I32, 0 } };
+	static const WasmValtype entry_params [2] = { WASM_I32, WASM_I32 };
+	WasmBuf sec;
+	guint32 i, j, base = 0;
+
+	g_assert (nmembers > 0);
+
+	wasm_bytes (out, header, 8);
+
+	/* Type section (1): member blocks back to back — { method, entry, extras... } each. */
+	wasm_buf_init (&sec);
+	{
+		guint32 ntypes = 0;
+		for (i = 0; i < nmembers; ++i)
+			ntypes += 2 + members [i].nextra;
+		wasm_uleb (&sec, ntypes);
+	}
+	for (i = 0; i < nmembers; ++i) {
+		const WasmModuleMember *m = &members [i];
+		/* The body already has this base baked into every call_indirect; if the caller computed it
+		 * differently from the layout here, the module would still validate but call through the wrong
+		 * signatures. Fail loudly instead. */
+		g_assertf (m->ti_base == base, "wasm batch member %u: ti_base %u but its block starts at %u",
+		           i, m->ti_base, base);
+		emit_functype (&sec, m->param_types, m->nparams, m->ret_type);
+		emit_functype (&sec, entry_params, 2, WASM_VOID);
+		for (j = 0; j < m->nextra; ++j)
+			emit_functype (&sec, m->extra_types [j].params, m->extra_types [j].nparams, m->extra_types [j].ret);
+		base += 2 + m->nextra;
+	}
+	emit_section (out, 1, &sec);
+	wasm_buf_free (&sec);
+
+	/* Import section (2): identical to the single-method form — the shared heap, optionally the indirect
+	 * function table and the C++ exception tag, and __stack_pointer. */
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 1));
+	wasm_name (&sec, "m");
+	wasm_name (&sec, "h");
+	wasm_u8 (&sec, 0x02);
+	/* must match the runtime heap's shared-ness exactly or instantiation fails */
+#ifdef DISABLE_THREADS
+	wasm_u8 (&sec, 0x01);
+#else
+	wasm_u8 (&sec, 0x03);
+#endif
+	wasm_uleb (&sec, 256);
+	wasm_uleb (&sec, 65535);
+	if (import_table) {
+		wasm_name (&sec, "f");
+		wasm_name (&sec, "f");
+		wasm_u8 (&sec, 0x01);
+		wasm_u8 (&sec, (guint8) WASM_FUNCREF);
+		wasm_u8 (&sec, 0x00);
+		wasm_uleb (&sec, 0);
+	}
+	if (import_eh_tag) {
+		wasm_name (&sec, "x");
+		wasm_name (&sec, "e");
+		wasm_u8 (&sec, 0x04);
+		wasm_u8 (&sec, 0x00);
+		wasm_uleb (&sec, eh_type_idx);
+	}
+	wasm_name (&sec, "s");
+	wasm_name (&sec, "p");
+	wasm_u8 (&sec, 0x03);
+	wasm_u8 (&sec, (guint8) WASM_I32);
+	wasm_u8 (&sec, 0x01);
+	emit_section (out, 2, &sec);
+	wasm_buf_free (&sec);
+
+	/* Function section (3): all N methods first, then all N thunks, so member i's method is funcidx i —
+	 * knowable from batch membership alone, which is what lets each thunk bake `call i`. */
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, nmembers * 2);
+	for (i = 0; i < nmembers; ++i)
+		wasm_uleb (&sec, members [i].ti_base);          /* method type */
+	for (i = 0; i < nmembers; ++i)
+		wasm_uleb (&sec, members [i].ti_base + 1);      /* entry-thunk type */
+	emit_section (out, 3, &sec);
+	wasm_buf_free (&sec);
+
+	/* Export section (7): "f<i>" = method i, "e<i>" = its entry thunk. */
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, nmembers * 2);
+	for (i = 0; i < nmembers; ++i) {
+		char nm [24];
+		g_snprintf (nm, sizeof (nm), "f%u", i);
+		wasm_name (&sec, nm);
+		wasm_u8 (&sec, 0x00);
+		wasm_uleb (&sec, i);
+	}
+	for (i = 0; i < nmembers; ++i) {
+		char nm [24];
+		g_snprintf (nm, sizeof (nm), "e%u", i);
+		wasm_name (&sec, nm);
+		wasm_u8 (&sec, 0x00);
+		wasm_uleb (&sec, nmembers + i);
+	}
+	emit_section (out, 7, &sec);
+	wasm_buf_free (&sec);
+
+	/* Code section (10): same order as the function section. */
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, nmembers * 2);
+	for (i = 0; i < nmembers; ++i)
+		emit_code_entry (&sec, members [i].locals, members [i].nlocal_groups, members [i].f_body);
+	for (i = 0; i < nmembers; ++i)
+		emit_code_entry (&sec, no_locals, 1, members [i].e_body);
+	emit_section (out, 10, &sec);
+	wasm_buf_free (&sec);
+}
+
 void
 wasm_module_append_name_section (WasmBuf *out, const char *module_name, const char *func0_name)
 {
@@ -424,6 +562,60 @@ wasm_module_append_name_section (WasmBuf *out, const char *module_name, const ch
 	wasm_name (&sub, f0);
 	wasm_uleb (&sub, 1);          /* func index 1 */
 	wasm_name (&sub, "entry");
+	wasm_u8 (&sec, 0x01);
+	wasm_uleb (&sec, sub.len);
+	wasm_bytes (&sec, sub.data, sub.len);
+	wasm_buf_free (&sub);
+
+	emit_section (out, 0, &sec);
+	wasm_buf_free (&sec);
+}
+
+/*
+ * Name section for a BATCHED module (wasm_module_methods_and_entries).
+ *
+ * The single-method variant above hardcodes a two-entry map because that module has exactly func0 =
+ * method and func1 = entry thunk. A batch has N methods at indices 0..N-1 followed by N entry thunks at
+ * N..2N-1, and nothing was emitting names for it at all -- so every batched module was anonymous and
+ * the whole profiling toolkit (cdpperf, cdptrace, cdpprofile, the subsystem split) reported
+ * wasm-function[N]. With island batching on by default for Minecraft that would have left the runtime
+ * unprofilable exactly where profiling matters most.
+ *
+ * Name-map entries must be sorted by function index; 0..N-1 then N..2N-1 already is.
+ */
+void
+wasm_module_append_name_section_multi (WasmBuf *out, const char *module_name, const char *const *names, guint32 n)
+{
+	WasmBuf sec, sub;
+	guint32 i;
+
+	if (!n)
+		return;
+
+	wasm_buf_init (&sec);
+	wasm_name (&sec, "name");
+
+	/* subsection 0: module name */
+	wasm_buf_init (&sub);
+	wasm_name (&sub, module_name ? module_name : "wasmjit-batch");
+	wasm_u8 (&sec, 0x00);
+	wasm_uleb (&sec, sub.len);
+	wasm_bytes (&sec, sub.data, sub.len);
+	wasm_buf_free (&sub);
+
+	/* subsection 1: function names, methods then entry thunks */
+	wasm_buf_init (&sub);
+	wasm_uleb (&sub, n * 2);
+	for (i = 0; i < n; ++i) {
+		wasm_uleb (&sub, i);
+		wasm_name (&sub, (names && names [i]) ? names [i] : "method");
+	}
+	for (i = 0; i < n; ++i) {
+		char eb [512];
+		g_snprintf (eb, sizeof (eb), "%s [entry]", (names && names [i]) ? names [i] : "method");
+		wasm_uleb (&sub, n + i);
+		wasm_name (&sub, eb);
+	}
 	wasm_u8 (&sec, 0x01);
 	wasm_uleb (&sec, sub.len);
 	wasm_bytes (&sec, sub.data, sub.len);

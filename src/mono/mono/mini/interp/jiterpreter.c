@@ -1619,6 +1619,24 @@ mono_jiterp_allocate_table_entry (int type) {
 	return index;
 }
 
+/* Entries still available in `type`'s table. Advisory: another thread can consume some between the read and
+ * the caller's allocation, so it is only sound for "is there room for N" checks that tolerate losing a race
+ * (the allocation itself still has to be checked). Used by the wasm JIT's SCC batch to avoid half-reserving
+ * a batch it cannot finish — the allocator has no free, so a partial reservation burns those entries. */
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_table_remaining (int type) {
+	g_assert ((type >= 0) && (type <= JITERPRETER_TABLE_LAST));
+	JiterpreterTableInfo *table = &tables[type];
+	int next, remaining;
+	if (table->first_index <= 0)
+		return 0;
+	next = table->next_index;
+	if (next <= 0)
+		next = table->first_index;
+	remaining = table->last_index - next + 1;
+	return remaining > 0 ? remaining : 0;
+}
+
 int
 mono_jiterp_increment_counter (volatile int *counter) {
 #ifdef DISABLE_THREADS

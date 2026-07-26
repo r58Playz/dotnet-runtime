@@ -272,6 +272,55 @@ void wasm_module_method_and_entry (
 	WasmBuf *out);
 
 /*
+ * One member of a batched module. Mirrors the arguments wasm_module_method_and_entry takes for a single
+ * method, plus `ti_base` — where this member's block starts in the shared type section.
+ *
+ * `ti_base` is not advisory. Type indices are ULEB-encoded inline in the body at every call_indirect, so
+ * they cannot be relocated after emission; the emitter has to have used this exact base while generating
+ * `f_body`. wasm_module_methods_and_entries lays the type section out to match and asserts agreement.
+ */
+typedef struct {
+	const WasmValtype *param_types;
+	guint32 nparams;
+	WasmValtype ret_type;
+	const WasmLocalGroup *locals;
+	guint32 nlocal_groups;
+	const WasmBuf *f_body;
+	const WasmBuf *e_body;
+	const WasmFuncType *extra_types;
+	guint32 nextra;
+	guint32 ti_base;
+} WasmModuleMember;
+
+/*
+ * Frame ONE module holding N methods and their N entry thunks — the island-batching form of
+ * wasm_module_method_and_entry. Layout:
+ *
+ *   types:     member blocks concatenated; member i occupies [ti_base_i .. ti_base_i + 1 + nextra_i],
+ *              namely { method_i, entry_i, extras_i... }, so ti_base_i = sum over j<i of (2 + nextra_j).
+ *   funcs:     0..N-1   = the methods (exported "f0".."f{N-1}")
+ *              N..2N-1  = the entry thunks (exported "e0".."e{N-1}")
+ *   imports:   as the single-method form — memory m.h, table f.f if any member calls indirectly,
+ *              tag x.e if any member has an in-method landing pad, global s.p.
+ *
+ * The point of co-locating is that V8 will not inline across a WebAssembly.Module boundary but inlines
+ * freely — through `call` AND speculatively through `call_indirect` — within one. Measured at ~3.5-6x
+ * per call on accessor-sized callees, and flat out to 500 functions per module (scratchpad/scalerun.mjs).
+ *
+ * Each thunk calls its own method with `call i`, so the emitter must have written member i's index there
+ * rather than the single-method form's constant 0.
+ */
+void wasm_module_methods_and_entries (
+	const WasmModuleMember *members, guint32 nmembers,
+	gboolean import_table,
+	gboolean import_eh_tag, guint32 eh_type_idx,
+	WasmBuf *out);
+
+/* Name section for a batched module: methods at func 0..n-1, entry thunks at n..2n-1. */
+void
+wasm_module_append_name_section_multi (WasmBuf *out, const char *module_name, const char *const *names, guint32 n);
+
+/*
  * Frame a module exporting a single function `t` (the interp-entry thunk) with signature
  * param_types->ret_type, importing shared memory (`m`.`h`) and the indirect function table (`f`.`f`).
  * Beyond the thunk's own type T0, two callee function types are predefined for the body's
