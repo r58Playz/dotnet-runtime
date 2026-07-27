@@ -541,6 +541,25 @@ mono_jiterp_get_interp_entry_data (void)
 //  like resolving the target for delegates and setting up the thread context.
 // rmethod, this_arg, and params_count are passed by value so the wrapper does not need
 //  to share any mutable scratch buffer across threads.
+/*
+ * May the jiterpreter's native->interp entry trampoline forward this method straight to its JITted body?
+ *
+ * Both conditions are per-method constants, so the trampoline checks them once at GENERATION time and
+ * emits no code for them:
+ *   is_invoke           - the prologue resolves a delegate's real target and REPLACES rmethod; a direct
+ *                         call would invoke the Invoke wrapper's own (wrong) body.
+ *   needs_thread_attach - the prologue does mono_threads_attach_coop for methods reachable from native.
+ *                         The fast path skips the prologue entirely, so it must not take those.
+ */
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_wasm_jit_entry_ok (InterpMethod *rmethod)
+{
+	extern int mono_wasm_jit_aot_entry;
+	/* Also the kill switch: trampolines are generated once and cached, so gating here means a run with
+	 * MONO_WASM_JIT_AOT_ENTRY=0 emits no fast path at all and is a clean A/B baseline. */
+	return mono_wasm_jit_aot_entry && rmethod && !rmethod->is_invoke && !rmethod->needs_thread_attach;
+}
+
 EMSCRIPTEN_KEEPALIVE stackval *
 mono_jiterp_interp_entry_prologue (InterpMethod *rmethod, void *this_arg, int params_count)
 {
@@ -1276,6 +1295,7 @@ enum {
 	JITERP_MEMBER_BOXED_VALUE_DATA,
 	JITERP_MEMBER_BACKWARD_BRANCH_TAKEN,
 	JITERP_MEMBER_BAILOUT_OPCODE_COUNT,
+	JITERP_MEMBER_WASM_JIT_FSLOT,
 };
 
 
@@ -1322,6 +1342,8 @@ mono_jiterp_get_member_offset (int member) {
 			return offsetof (JiterpreterCallInfo, backward_branch_taken);
 		case JITERP_MEMBER_BAILOUT_OPCODE_COUNT:
 			return offsetof (JiterpreterCallInfo, bailout_opcode_count);
+		case JITERP_MEMBER_WASM_JIT_FSLOT:
+			return offsetof (InterpMethod, wasm_jit_fslot);
 		default:
 			g_assert_not_reached();
 	}

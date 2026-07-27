@@ -2,16 +2,16 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import { MonoMethod, MonoType, PThreadPtrNull } from "./types/internal";
-import { NativePointer } from "./types/emscripten";
+import { NativePointer, VoidPtr } from "./types/emscripten";
 import { mono_assert } from "./globals";
 import {
     getU32_unaligned,
-    free
+    free, malloc, localHeapViewU8
 } from "./memory";
 import { WasmOpcode } from "./jiterpreter-opcodes";
 import cwraps from "./cwraps";
 import {
-    WasmBuilder, addWasmFunctionPointer,
+    WasmBuilder, addWasmFunctionPointer, getMemberOffset,
     _now, getRawCwrap, importDef,
     getWasmFunctionTable, recordFailure, getOptions,
     JiterpreterOptions,
@@ -23,7 +23,7 @@ import { utf8ToString } from "./strings";
 import WasmEnableThreads from "consts:wasmEnableThreads";
 import { mono_wasm_pthread_ptr } from "./pthreads/shared";
 import {
-    JiterpreterTable, JiterpCounter, JitQueue
+    JiterpreterTable, JiterpCounter, JitQueue, JiterpMember
 } from "./jiterpreter-enums";
 
 // Controls miscellaneous diagnostic output.
@@ -53,6 +53,9 @@ typedef struct {
 const
     maxInlineArgs = 16;
 
+// Scratch for mono_wasm_jit_entry_sig's two output arrays; allocated once, never freed.
+let wjSigScratch: VoidPtr | undefined;
+
 const maxJitQueueLength = 4,
     queueFlushDelayMs = 10;
 
@@ -76,6 +79,7 @@ function getTrampImports () {
     trampImports = [
         importDef("interp_entry_prologue", getRawCwrap("mono_jiterp_interp_entry_prologue")),
         importDef("interp_entry", getRawCwrap("mono_jiterp_interp_entry")),
+        importDef("wasm_jit_slot_live", getRawCwrap("mono_wasm_jit_slot_live")),
         importDef("unbox", getRawCwrap("mono_jiterp_object_unbox")),
         importDef("stackval_from_data", getRawCwrap("mono_jiterp_stackval_from_data")),
     ];
@@ -99,6 +103,14 @@ class TrampolineInfo {
     result: number;
     hitCount: number;
 
+    // wasm-JIT direct-forward info. wjNargs >= 0 means this signature can be forwarded straight to the
+    // JITted body's f-slot: wjKinds[i] is how to load argument i from its pointer, wjVtypes[i] its wasm
+    // type, and wjVtypes[wjNargs] the return type. Computed in C from the same call-info classification
+    // the emitter used to build `f`, because wasm checks call_indirect signatures exactly.
+    wjNargs = -1;
+    wjKinds: Array<number> = [];
+    wjVtypes: Array<number> = [];
+
     constructor (
         imethod: number, method: MonoMethod, argumentCount: number, pParamTypes: NativePointer,
         unbox: boolean, hasThisReference: boolean, hasReturnValue: boolean, defaultImplementation: number
@@ -115,6 +127,30 @@ class TrampolineInfo {
         this.defaultImplementation = defaultImplementation;
         this.result = 0;
         this.hitCount = 0;
+        this.computeWasmJitSig();
+    }
+
+    private computeWasmJitSig () {
+        // is_invoke / needs_thread_attach are per-method constants the fast path cannot honour; check
+        // them once here so the generated code carries no test for them.
+        if (!cwraps.mono_jiterp_wasm_jit_entry_ok(this.imethod))
+            return;
+        if (this.unbox)
+            return;
+        if (!wjSigScratch)
+            wjSigScratch = malloc(2 * (maxInlineArgs + 2));
+        const kinds = <any>wjSigScratch as number;
+        const vtypes = kinds + (maxInlineArgs + 2);
+        const n = cwraps.mono_wasm_jit_entry_sig(this.method, kinds, vtypes, maxInlineArgs + 1);
+        if (n < 0 || n !== this.argumentCount + (this.hasThisReference ? 1 : 0))
+            return;
+        const heap = localHeapViewU8();
+        for (let i = 0; i < n; i++) {
+            this.wjKinds.push(heap[kinds + i]);
+            this.wjVtypes.push(heap[vtypes + i]);
+        }
+        this.wjVtypes.push(heap[vtypes + n]); // return valtype (0x40 = void)
+        this.wjNargs = n;
     }
 
     generateName () {
@@ -312,6 +348,13 @@ function flush_wasm_entry_trampoline_jit_queue () {
             WasmValtype.void, true
         );
         builder.defineType(
+            "wasm_jit_slot_live",
+            {
+                "slot": WasmValtype.i32,
+            },
+            WasmValtype.i32, true
+        );
+        builder.defineType(
             "stackval_from_data",
             {
                 "type": WasmValtype.i32,
@@ -352,6 +395,16 @@ function flush_wasm_entry_trampoline_jit_queue () {
             builder.defineType(
                 info.getTraceName(), sig, WasmValtype.void, false
             );
+
+            // ...and the JITted method's own signature, for the direct call_indirect fast path.
+            if (info.wjNargs >= 0) {
+                const tsig: any = {};
+                for (let a = 0; a < info.wjNargs; a++)
+                    tsig[`p${a}`] = info.wjVtypes[a];
+                builder.defineType(
+                    info.getTraceName() + "_wj", tsig, info.wjVtypes[info.wjNargs], false
+                );
+            }
         }
 
         builder.generateTypeSection();
@@ -370,7 +423,9 @@ function flush_wasm_entry_trampoline_jit_queue () {
         for (let i = 0; i < trampImports.length; i++)
             builder.markImportAsUsed(trampImports[i][0]);
 
-        builder._generateImportSection(false);
+        // Import the indirect function table: the wasm-JIT direct-forward path call_indirects a
+        // JITted method's f-slot in it.
+        builder._generateImportSection(true);
 
         // Function section
         builder.beginSection(3);
@@ -405,6 +460,10 @@ function flush_wasm_entry_trampoline_jit_queue () {
             builder.beginFunction(traceName, {
                 "sp_args": WasmValtype.i32,
                 "need_unbox": WasmValtype.i32,
+                // wasm-JIT direct-forward scratch (unused, hence free, when the fast path is not emitted)
+                "wj_fslot": WasmValtype.i32,
+                // "void" is not a legal local type, and a void-returning target has nothing to stash
+                "wj_ret": (info.wjNargs >= 0 && info.hasReturnValue) ? info.wjVtypes[info.wjNargs] : WasmValtype.i32,
             });
 
             const ok = generate_wasm_body(builder, info);
@@ -585,6 +644,82 @@ function generate_wasm_body (
         builder.local("this_arg");
         builder.callImport("unbox");
         builder.local("this_arg", WasmOpcode.set_local);
+        builder.endBlock();
+    }
+
+    /*
+     * wasm-JIT direct forward. When the target is already JITted and its module is instantiated on THIS
+     * thread, call its `f` straight from here: the prologue (thread-local header + context lookup), the
+     * marshalling of every argument into the interp stack, and the whole of mono_jiterp_interp_entry are
+     * all setup for an interpreter run that will not happen. perf annotate shows interp_entry's cost is
+     * flat across ~74 instructions with no hotspot, i.e. the preamble IS the cost.
+     *
+     * Both runtime guards are load-bearing:
+     *   fslot != 0            the method may not be JITted yet, and becomes so later - so this is a
+     *                         per-call load, not a generation-time decision, and self-heals.
+     *   mono_wasm_jit_slot_live  the function table is PER-THREAD for dynamic entries; skipping the slow
+     *                         path also skips the sync that instantiates this method on this thread, so
+     *                         without this an unsynced thread would call_indirect a placeholder and trap.
+     * Missing either just falls through to the original path below, which syncs and works as before.
+     */
+    if (info.wjNargs >= 0) {
+        builder.block();
+
+        // fslot = rmethod->wasm_jit_fslot  (rmethod's low bit is the unbox flag; masked off)
+        builder.local("rmethod");
+        builder.i32_const(~0x1);
+        builder.appendU8(WasmOpcode.i32_and);
+        builder.appendU8(WasmOpcode.i32_load);
+        builder.appendMemarg(getMemberOffset(JiterpMember.WasmJitFslot), 2);
+        builder.local("wj_fslot", WasmOpcode.tee_local);
+        builder.appendU8(WasmOpcode.i32_eqz);
+        builder.appendU8(WasmOpcode.br_if);
+        builder.appendULeb(0);
+
+        // ...and only if this thread has instantiated it
+        builder.local("wj_fslot");
+        builder.callImport("wasm_jit_slot_live");
+        builder.appendU8(WasmOpcode.i32_eqz);
+        builder.appendU8(WasmOpcode.br_if);
+        builder.appendULeb(0);
+
+        // load each argument by value; the trampoline receives pointers, `f` takes values
+        for (let i = 0; i < info.wjNargs; i++) {
+            const isThis = info.hasThisReference && (i === 0);
+            const valueName = isThis ? "this_arg" : `arg${i - (info.hasThisReference ? 1 : 0)}`;
+            builder.local(valueName);
+            switch (info.wjKinds[i]) {
+                case 8: break; // already a value
+                case 0: builder.appendU8(WasmOpcode.i32_load); builder.appendMemarg(0, 2); break;
+                case 1: builder.appendU8(WasmOpcode.i64_load); builder.appendMemarg(0, 3); break;
+                case 2: builder.appendU8(WasmOpcode.f32_load); builder.appendMemarg(0, 2); break;
+                case 3: builder.appendU8(WasmOpcode.f64_load); builder.appendMemarg(0, 3); break;
+                case 4: builder.appendU8(WasmOpcode.i32_load8_s); builder.appendMemarg(0, 0); break;
+                case 5: builder.appendU8(WasmOpcode.i32_load8_u); builder.appendMemarg(0, 0); break;
+                case 6: builder.appendU8(WasmOpcode.i32_load16_s); builder.appendMemarg(0, 1); break;
+                case 7: builder.appendU8(WasmOpcode.i32_load16_u); builder.appendMemarg(0, 1); break;
+                default: throw new Error(`bad wasm-jit load kind ${info.wjKinds[i]}`);
+            }
+        }
+
+        builder.local("wj_fslot");
+        builder.call_indirect(info.getTraceName() + "_wj", 0);
+
+        // store the result where the caller expects it, then we are done
+        if (info.hasReturnValue) {
+            const rv = info.wjVtypes[info.wjNargs];
+            builder.local("wj_ret", WasmOpcode.set_local);
+            builder.local("res");
+            builder.local("wj_ret");
+            switch (rv) {
+                case WasmValtype.i64: builder.appendU8(WasmOpcode.i64_store); builder.appendMemarg(0, 3); break;
+                case WasmValtype.f32: builder.appendU8(WasmOpcode.f32_store); builder.appendMemarg(0, 2); break;
+                case WasmValtype.f64: builder.appendU8(WasmOpcode.f64_store); builder.appendMemarg(0, 3); break;
+                default: builder.appendU8(WasmOpcode.i32_store); builder.appendMemarg(0, 2); break;
+            }
+        }
+        builder.appendU8(WasmOpcode.return_);
+
         builder.endBlock();
     }
 
