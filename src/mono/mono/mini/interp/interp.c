@@ -13579,6 +13579,72 @@ mono_jiterp_interp_entry (void *res)
 
 	stackval *sp = (stackval*)header.context->stack_pointer;
 
+#if HOST_BROWSER
+	/*
+	 * MONO_WASM_JIT_AOT_ENTRY fast path.
+	 *
+	 * By the time we get here the jiterpreter trampoline has ALREADY marshalled this call's arguments
+	 * into the interp stack at `sp` -- which is exactly the layout the wasm-JIT entry thunk reads. When
+	 * the target is JITted and admitted, everything the slow path below does around the actual call is
+	 * scaffolding for an interpreter run that will not happen: zeroing an InterpFrame, computing
+	 * get_arg_offset_fast, pushing and popping an LMF, re-asking wasm_jit_maybe_compile, and re-running
+	 * the admission DFS. `perf annotate` shows this function's cost is FLAT across ~74 instructions with
+	 * no hotspot, which is what "the whole preamble is the overhead" looks like -- so the only way to
+	 * remove it is not to execute it.
+	 *
+	 * Gated on wasm_jit_entry_fast_ok, which the slow path sets only after admission has succeeded once.
+	 * Admission is a memoized DFS with terminal states, so caching it is sound, and the first entry for
+	 * any method still goes the long way round and does the compile/admit work.
+	 *
+	 * Deliberately kept: the stack-pointer bump (a JITted body can re-enter the interpreter through a
+	 * residual, which would otherwise scribble on these arguments), the GC-mode transition, and the whole
+	 * tail below (thread detach, pending unwind, resume state, return marshalling).
+	 */
+	{
+		extern int mono_wasm_jit_aot_entry;
+		extern int mono_wasm_jit_slot_live (int slot);
+		InterpMethod *fm = header.rmethod;
+		/* wasm_jit_entry_fast_ok is set by whichever thread first got here, but the function TABLE is
+		 * per-thread: skipping the slow path also skips the wasm_jit_maybe_compile that syncs this
+		 * thread's table. Without the liveness check a thread that never synced would call_indirect an
+		 * uninstantiated slot and trap. The bitmap is per-thread and the lookup is a shift and a mask, so
+		 * an unsynced thread simply takes the slow path once and syncs there. */
+		if (G_UNLIKELY (mono_wasm_jit_aot_entry) && fm->wasm_jit_entry_fast_ok && !fm->is_invoke &&
+		    fm->wasm_jit_slot > 0 && mono_wasm_jit_slot_live (fm->wasm_jit_slot)) {
+			extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
+			MonoType *ftype;
+			int fparams_size = get_arg_offset_fast (fm, NULL, header.params_count);
+
+			header.context->stack_pointer = (guchar*)ALIGN_TO ((guchar*)sp + fparams_size, MINT_STACK_ALIGNMENT);
+			g_assert (header.context->stack_pointer < header.context->stack_end);
+
+			MONO_ENTER_GC_UNSAFE;
+			mono_wasm_jit_invoke_caught (fm->method, (gint32) fm->wasm_jit_slot, sp, sp);
+			MONO_EXIT_GC_UNSAFE;
+
+			header.context->stack_pointer = (guchar*)sp;
+
+			if (fm->needs_thread_attach)
+				mono_threads_detach_coop (header.orig_domain, &header.attach_cookie);
+			mono_jiterp_check_pending_unwind (header.context);
+
+			if (mono_llvm_only) {
+				if (header.context->has_resume_state) {
+					mono_llvm_start_native_unwind ();
+					return;
+				}
+			} else if (header.context->has_resume_state) {
+				return;
+			}
+
+			ftype = fm->rtype;
+			if (ftype->type != MONO_TYPE_VOID)
+				mono_jiterp_stackval_to_data (ftype, sp, res);
+			return;
+		}
+	}
+#endif
+
 	InterpFrame frame = {0};
 	frame.imethod = header.rmethod;
 	frame.stack = sp;
@@ -13624,6 +13690,39 @@ mono_jiterp_interp_entry (void *res)
 			extern int mono_wasm_jit_admit (int desc_id);
 			if (G_LIKELY (mono_wasm_jit_admit (wj_rm->wasm_jit_desc))) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
+				/* MONO_WASM_JIT_AOT_ENTRY: everything this function did to get here — the header copy,
+				 * InterpFrame setup, get_arg_offset_fast, the GC-unsafe transition, the LMF push above,
+				 * and the stackval marshalling the jiterp trampoline did on the way in — is overhead
+				 * wrapped around a body we have already compiled. Repoint the MonoFtnDesc that AOT
+				 * callers hold at a direct adapter so subsequent calls never reach this path at all.
+				 *
+				 * Done HERE, lazily, rather than at publish time or in
+				 * interp_create_method_pointer_llvmonly: that function usually runs long before the
+				 * method is hot enough to be JITted, and it caches its ftndesc on jit_entry forever, so
+				 * building the adapter there would miss precisely the hot methods worth redirecting.
+				 * Mutating desc->addr redirects every holder at once (delegates keep the desc pointer,
+				 * not a copy); it is a single aligned word, so a concurrent reader sees the old or the
+				 * new target and both are valid. The desc's `arg` stays as it was and the adapter drops
+				 * it, which is exactly the trailing ftndesc argument the AOT ABI passes. */
+				/* DIAGNOSTIC (verbose>=2): sample which methods actually cross here and whether they even
+				 * have a ftndesc to repoint. Sampled rather than once-per-method so the output is weighted
+				 * by call FREQUENCY -- the first N methods to cross are startup noise, and what matters is
+				 * which ones cross millions of times. */
+				{
+					extern int mono_wasm_jit_verbose;
+					static gint32 wj_probe_n = 0;
+					if (G_UNLIKELY (mono_wasm_jit_verbose >= 2)) {
+					gint32 pn = mono_atomic_inc_i32 (&wj_probe_n);
+						if ((pn % 5000) == 0 && pn <= 200000)
+							printf ("WASM_JIT_AOT_PROBE #%d %s jit_entry=%d unbox_entry=%d ftndesc=%d fslot=%d\n",
+								(int) pn, wj_rm->method ? wj_rm->method->name : "?",
+								wj_rm->jit_entry ? 1 : 0, wj_rm->llvmonly_unbox_entry ? 1 : 0,
+								wj_rm->ftndesc ? 1 : 0, (int) wj_rm->wasm_jit_fslot);
+					}
+				}
+				/* Admission succeeded and is terminal, so later entries for this method may take the
+				 * fast path above and skip this whole preamble. */
+				wj_rm->wasm_jit_entry_fast_ok = 1;
 				mono_wasm_jit_invoke_caught (wj_rm->method, (gint32) wj_rm->wasm_jit_slot, frame.stack, frame.stack);
 				wj_dispatched = TRUE;
 			}

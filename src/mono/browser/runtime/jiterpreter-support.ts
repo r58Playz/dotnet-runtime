@@ -112,6 +112,9 @@ export class WasmBuilder {
 
     compressImportNames = false;
     lockImports = false;
+    // Set when this module's import section declares the indirect function table (`f`.`f`), so
+    // getWasmImports knows to supply it. Only modules that emit call_indirect need it.
+    importsFunctionTable = false;
 
     constructor () {
         this.stack = [new BlobBuilder()];
@@ -205,6 +208,10 @@ export class WasmBuilder {
         const result: any = {
             m: { h: memory },
         };
+        // `f`.`f` is the indirect function table, imported when a generated module uses call_indirect.
+        // Same module/field names the wasm-JIT's own modules use, so both resolve identically.
+        if (this.importsFunctionTable)
+            result.f = { f: getWasmFunctionTable() };
         if (exceptionTag)
             result.x = { e: exceptionTag };
 
@@ -478,8 +485,9 @@ export class WasmBuilder {
         const importsToEmit = this.getImportsToEmit();
         this.lockImports = true;
 
-        if (includeFunctionTable !== false)
-            throw new Error("function table imports are disabled");
+        // The table import is emitted below and has always been written; it was gated off because no
+        // consumer needed call_indirect. The wasm-JIT interp-entry fast path does: it forwards straight
+        // to a JITted method's f-slot in the shared indirect function table.
 
         const enableWasmEh = this.getExceptionTag() !== undefined;
 
@@ -533,6 +541,7 @@ export class WasmBuilder {
         }
 
         if (includeFunctionTable !== false) {
+            this.importsFunctionTable = true;
             this.appendName("f");
             this.appendName("f");
             // tabletype
@@ -673,9 +682,7 @@ export class WasmBuilder {
         this.endSection();
     }
 
-    call_indirect (/* functionTypeName: string, tableIndex: number */) {
-        throw new Error("call_indirect unavailable");
-        /*
+    call_indirect (functionTypeName: string, tableIndex: number) {
         const type = this.functionTypes[functionTypeName];
         if (!type)
             throw new Error("No function type named " + functionTypeName);
@@ -683,7 +690,6 @@ export class WasmBuilder {
         this.appendU8(WasmOpcode.call_indirect);
         this.appendULeb(typeIndex);
         this.appendULeb(tableIndex);
-        */
     }
 
     callImport (name: string) {

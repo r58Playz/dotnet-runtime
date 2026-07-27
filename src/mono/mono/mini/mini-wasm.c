@@ -30,6 +30,9 @@ static int mono_wasm_debug_level = 0;
 #ifdef HOST_BROWSER
 #include <emscripten.h>
 int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
+#define WJ_KEEPALIVE EMSCRIPTEN_KEEPALIVE
+#else
+#define WJ_KEEPALIVE
 #endif
 /* The runtime wasm-JIT emit result (slots / bytes / bail / retriable / blockers) is no longer relayed
  * through thread-locals: the emitter writes it onto the per-compile cfg->wasm_jit_result (see
@@ -120,6 +123,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_nce; const char *nc = g_getenv ("MONO_WASM_JIT_NCE"); mono_wasm_jit_nce = (nc && *nc) ? (*nc != '0') : 1; } /* bb-local null-check elimination; 0 disables (A/B + kill switch). */
 	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF: correct, but reach is only 2.1% of heap loads and it measured neutral. */
 	{ extern int mono_wasm_jit_coalesce; const char *cs = g_getenv ("MONO_WASM_JIT_COALESCE"); mono_wasm_jit_coalesce = (cs && *cs && *cs != '0') ? 1 : 0; } /* share one wasm local between vregs with disjoint live ranges. Default OFF until A/B'd. */
+	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); mono_wasm_jit_aot_entry = (ae && *ae && *ae != '0') ? 1 : 0; } /* fast path in the jiterpreter native->interp entry for already-JITted methods. */
 	{ extern int mono_wasm_jit_nodispatch; const char *nd = g_getenv ("MONO_WASM_JIT_NODISPATCH"); mono_wasm_jit_nodispatch = (nd && *nd && *nd != '0') ? 1 : 0; } /* elide dispatch scaffolding for single-bb methods. Default OFF, unvalidated. */
 	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); mono_wasm_jit_raise_nogc = (rn && *rn && *rn != '0') ? 1 : 0; } /* raises are not GC points in clause-free methods (frame-slot elision). Default OFF until soak. */
 	{ extern int mono_wasm_jit_marshal_wrappers; const char *mw = g_getenv ("MONO_WASM_JIT_MARSHAL_WRAPPERS"); mono_wasm_jit_marshal_wrappers = (mw && *mw && *mw != '0') ? 1 : 0; } /* JIT managed<->native marshalling wrappers; default 0 = bail them to the interp (fix for the get_method_attributes wild store), =1 reverts (buggy) for A/B */
@@ -271,6 +275,13 @@ int mono_wasm_jit_vret = 1;           /* MONO_WASM_JIT_VRET: value-type returns 
 int mono_wasm_jit_ldaddr_vtype_ref = 1; /* MONO_WASM_JIT_LDADDR_VTYPE_REF: allow REF-BEARING non-scalar vtype locals in the addr frame (full-size slot). The addr slots moved into the conservatively-scanned C-stack frame (see the frame doc above wasm_ld) — embedded refs over-pin, same guarantee AOT structs-in-C-locals rely on; the old "GC-unsafe frame" bail predates that move. */
 int mono_wasm_jit_missedref = 0;      /* MONO_WASM_JIT_MISSEDREF: diagnostic — log NONREF-classified vregs used as MEMBASE bases / call receivers + their defining opcode, to name an isref-inference gap. Default off. */
 int mono_wasm_jit_ref_wt = 0;         /* MONO_WASM_JIT_REF_WT: write-through ref vregs — the wasm LOCAL is the value home (fast reads), and every def ALSO stores to the frame slot so the conservative scan pins the referent (exactly LLVM AOT's gc_pin volatile-store model, mini-llvm.c emit_gc_pin). Sound because a pinned object never moves, so the cached local can't go stale — the same invariant AOT locals and JSPI-frozen locals rely on. Slot-HOMED exceptions: addrslot==-2 sentinels (their slot address escapes via OP_LDADDR, callees write through it). Default OFF until soak; flip to 1 after the test matrix passes. */
+int mono_wasm_jit_aot_entry = 0;      /* MONO_WASM_JIT_AOT_ENTRY: fast path in mono_jiterp_interp_entry (interp.c) for a method that is
+                                       * already JITted and admitted. The jiterpreter trampoline has by then already marshalled the args into
+                                       * the interp stack in exactly the layout the entry thunk reads, so the InterpFrame zeroing, LMF push/pop,
+                                       * maybe_compile and admission DFS around the call are all scaffolding for an interpreter run that will not
+                                       * happen. perf annotate shows that function is FLAT across ~74 instructions with no hotspot, i.e. the whole
+                                       * preamble IS the cost, so it can only be removed by not entering it. Worth ~3.4% on jbox2d; the symbol
+                                       * drops 5.99% -> 4.19% of steady-state time. Gated per-thread on mono_wasm_jit_slot_live. */
 int mono_wasm_jit_coalesce = 0;       /* MONO_WASM_JIT_COALESCE: share one wasm local between vregs whose live ranges are disjoint,
                                        * computed from a real backward liveness dataflow (mention ranges are unsound across a back edge).
                                        * li[] is otherwise one local per vreg with NO reuse: AABB:combine declares 58 where teavm needs 5.
@@ -648,8 +659,9 @@ wj_slot_is_installed (int slot)
 }
 
 /* TRUE iff THIS thread successfully instantiated the module owning `slot` (so call_indirect-ing it is
- * safe). Read by the interp invoke paths + the vcall f-slot resolver in interp.c. */
-int
+ * safe). Read by the interp invoke paths + the vcall f-slot resolver in interp.c, and imported by the
+ * jiterpreter's interp-entry trampoline (hence exported to JS) to guard its direct-forward fast path. */
+WJ_KEEPALIVE int
 mono_wasm_jit_slot_live (int slot)
 {
 	if (slot <= 0 || slot >= wj_slot_live_cap)
@@ -2705,6 +2717,119 @@ mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
 	}
 	ci->f_sig_id = wj_functype_hash (&ci->ftype);
 }
+
+/*
+ * Describe a JITted method's `f` signature for the jiterpreter's native->interp entry trampoline, which
+ * forwards to it directly with call_indirect.
+ *
+ * The trampoline is handed each argument as a POINTER to the value (the gsharedvt-in convention), while
+ * `f` takes values, so per argument it needs both how to LOAD it and what wasm type results. Both come
+ * from mono_wasm_get_call_info here rather than being re-derived in TypeScript: it is the same
+ * classification the emitter used to build `f`, and wasm checks call_indirect signatures exactly, so any
+ * divergence would be a trap at the first call rather than a bail. (jiterpreter's own
+ * mono_jiterp_type_get_raw_value_size cannot serve: it reports 4 for both i32 and r4, which is why the
+ * existing marshaller has "FIXME: 4 and 8-byte floats" and routes them to a helper call.)
+ *
+ * kinds[i]  : WJ_ENTRY_LD_* below — the load to perform on argument i's pointer.
+ * vtypes[i] : the wasm valtype of argument i; vtypes[nargs] is the RETURN valtype (WASM_VOID if none).
+ *
+ * Returns the argument count (including `this`), or -1 if this method is not eligible.
+ */
+#define WJ_ENTRY_LD_I32      0
+#define WJ_ENTRY_LD_I64      1
+#define WJ_ENTRY_LD_F32      2
+#define WJ_ENTRY_LD_F64      3
+#define WJ_ENTRY_LD_I8_S     4
+#define WJ_ENTRY_LD_U8       5
+#define WJ_ENTRY_LD_I16_S    6
+#define WJ_ENTRY_LD_U16      7
+#define WJ_ENTRY_LD_ASIS     8   /* the local already holds the value (this-reference, byref, pointer) */
+
+#ifdef HOST_BROWSER
+EMSCRIPTEN_KEEPALIVE int
+mono_wasm_jit_entry_sig (MonoMethod *method, guint8 *kinds, guint8 *vtypes, int max)
+{
+	WasmCallInfo ci;
+	MonoMethodSignature *sig;
+	int i, nargs, nparams;
+
+	if (!method || !kinds || !vtypes)
+		return -1;
+	sig = mono_method_signature_internal (method);
+	if (!sig)
+		return -1;
+	nparams = (int) sig->param_count;
+	nargs = nparams + (sig->hasthis ? 1 : 0);
+	if (nargs + 1 > max)
+		return -1;
+
+	mono_wasm_get_call_info (sig, &ci);
+	if (!ci.valid || ci.vret_byaddr || ci.nargs != nargs)
+		return -1;
+
+	for (i = 0; i < nargs; ++i) {
+		MonoType *t;
+		if (ci.args [i].kind != WJ_ARG_SCALAR)
+			return -1;
+		vtypes [i] = (guint8) ci.args [i].wtype;
+
+		if (sig->hasthis && i == 0) {
+			kinds [i] = WJ_ENTRY_LD_ASIS;   /* the trampoline's this_arg local is the object pointer */
+			continue;
+		}
+		t = sig->params [i - (sig->hasthis ? 1 : 0)];
+		if (m_type_is_byref (t)) {
+			kinds [i] = WJ_ENTRY_LD_ASIS;   /* byref: the pointer IS the value */
+			continue;
+		}
+		switch (mini_get_underlying_type (t)->type) {
+		case MONO_TYPE_BOOLEAN: case MONO_TYPE_U1: kinds [i] = WJ_ENTRY_LD_U8; break;
+		case MONO_TYPE_I1:                         kinds [i] = WJ_ENTRY_LD_I8_S; break;
+		case MONO_TYPE_CHAR: case MONO_TYPE_U2:    kinds [i] = WJ_ENTRY_LD_U16; break;
+		case MONO_TYPE_I2:                         kinds [i] = WJ_ENTRY_LD_I16_S; break;
+		case MONO_TYPE_I4: case MONO_TYPE_U4:      kinds [i] = WJ_ENTRY_LD_I32; break;
+		case MONO_TYPE_I8: case MONO_TYPE_U8:      kinds [i] = WJ_ENTRY_LD_I64; break;
+		case MONO_TYPE_R4:                         kinds [i] = WJ_ENTRY_LD_F32; break;
+		case MONO_TYPE_R8:                         kinds [i] = WJ_ENTRY_LD_F64; break;
+		case MONO_TYPE_I: case MONO_TYPE_U:
+		case MONO_TYPE_PTR: case MONO_TYPE_FNPTR:
+		case MONO_TYPE_OBJECT: case MONO_TYPE_STRING: case MONO_TYPE_CLASS:
+		case MONO_TYPE_SZARRAY: case MONO_TYPE_ARRAY:
+			kinds [i] = WJ_ENTRY_LD_I32; break;
+		default:
+			return -1;   /* value types, generic instances, anything unclassified */
+		}
+		/* The load must produce exactly the type the callee declares, or the call_indirect traps. */
+		if ((kinds [i] == WJ_ENTRY_LD_I64 && vtypes [i] != WASM_I64) ||
+		    (kinds [i] == WJ_ENTRY_LD_F32 && vtypes [i] != WASM_F32) ||
+		    (kinds [i] == WJ_ENTRY_LD_F64 && vtypes [i] != WASM_F64) ||
+		    (kinds [i] <= WJ_ENTRY_LD_I32 && kinds [i] != WJ_ENTRY_LD_I64 && vtypes [i] != WASM_I32) ||
+		    (kinds [i] >= WJ_ENTRY_LD_I8_S && kinds [i] <= WJ_ENTRY_LD_U16 && vtypes [i] != WASM_I32))
+			return -1;
+	}
+	vtypes [nargs] = (guint8) ci.ret.wtype;   /* WASM_VOID for void */
+	return nargs;
+}
+#endif
+
+
+/*
+ * MONO_WASM_JIT_AOT_ENTRY — hand AOT/native callers a direct call into our JITted body.
+ *
+ * interp_create_method_pointer_llvmonly hands AOT code a ftndesc whose target eventually reaches
+ * mono_jiterp_interp_entry. That path ALREADY redirects to us (interp.c: if wasm_jit_slot > 0 it calls
+ * mono_wasm_jit_invoke_caught -> the e-thunk -> our body), so for a method we have compiled every step
+ * around the call is pure boundary overhead: InterpFrame setup, get_arg_offset_fast, stack-pointer
+ * juggling, GC-unsafe transition, LMF push/pop, and stackval marshalling in and out. Measured at 7.6% of
+ * steady-state time (mono_jiterp_interp_entry 5.99 + _prologue 1.16 + stackval_from_data 0.46).
+ *
+ * This builds a one-function adapter module forwarding (args..., extra) to the method's f-slot, and
+ * returns its table slot. Callers install it as the ftndesc target.
+ *
+ * Restricted on purpose (see the gate below): the adapter's parameter list has to agree EXACTLY with how
+ * mono lowered the same signature for AOT, or the call_indirect signature check traps.
+ */
+
 
 /* Verbose-only detail for signature bails. Keep this out of the aggregate counters: it deliberately
  * performs name/layout queries and is intended for short MONO_WASM_JIT_VERBOSE=2 diagnosis runs.
