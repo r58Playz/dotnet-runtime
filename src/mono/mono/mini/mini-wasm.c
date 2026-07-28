@@ -7375,11 +7375,40 @@ vcall_nullchk_done:
 							 * (vtable -> f-slot) entry: a guard failure br 0's to the next way, a hit br 1's to $after.
 							 * A 2-way IC captures the ~63% of miss traffic that are 2-type sites (arity depth-1) which a
 							 * 1-way IC gets 0% of (it thrashes). After all ways: the AOT-IC + resolve_fslot slow path. */
-							for (way = 0; way < mono_wasm_jit_vcall_ways; ++way) {
-							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /*   $way_fail (void) */
-							/* vtab = *(this + 0) */
+							/* vtab = *(this + 0), loaded ONCE for the whole way chain rather than per way. It is
+							 * invariant across the guards: they are pure loads/compares/branches, so there is no
+							 * store and no GC point between them, and `this` itself cannot change. Re-loading it
+							 * per way cost (ways-1) redundant heap loads on the hottest path in the program.
+							 * This also makes a WIDER IC cheaper, which is the direction the measurement points:
+							 * interleaved A/B had 1-way 4-6% SLOWER than 4-way and 8-way ~1.6% faster than 4-way,
+							 * i.e. miss cost dominates guard cost, so shrinking per-way cost compounds.
+							 * Kept as its own load (not shared with the AOT-IC loop below, which re-establishes
+							 * it) so neither loop's correctness depends on the other being emitted. */
+							/* Two blocks wrap the whole way chain so the argument push + call_indirect can be
+							 * emitted ONCE for all ways instead of once PER way (which is where the 24
+							 * call_indirect ops in a single dispatch stub came from -- the AOT-IC's own comment
+							 * already names this as "the aic-only code bloat that made widening the AOT-IC a net
+							 * loss"). Only the GUARD is replicated per way now.
+							 *
+							 * Nesting inside a way body becomes $way_fail(0) $tail(1) $slow(2) $after(3), so:
+							 *   - a guard/liveness miss still br_if 0 -> $way_fail (next way)   [unchanged]
+							 *   - a HIT still br 1, which now exits $tail and lands on the shared call [same
+							 *     encoding as the old "br 1 -> $after", so no per-way branch had to change]
+							 *   - after the chain, br 1 exits $slow, skipping the shared tail
+							 *   - the shared tail ends with br 1 -> $after, as the per-way copies used to
+							 * Both new blocks CLOSE before the AOT-IC/resolve_fslot slow path, so that path and
+							 * everything after it keeps its original depth. This matters because WJ_THROW_BR/GOTO
+							 * take the in-bb nesting count as a hand-passed EXTRA: the region's only throw is the
+							 * `this` null check at the top (WJ_THROW_BR (4, 0)), emitted BEFORE these blocks open,
+							 * so no EXTRA anywhere needed adjusting. */
+							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $slow (void) */
+							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $tail (void) */
 							if (!wasm_ld (&body, &lc, this_vr)) { fail = "ic this ld"; goto done; }
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+							wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
+							for (way = 0; way < mono_wasm_jit_vcall_ways; ++way) {
+							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /*   $way_fail (void) */
+							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
 							/* ic = i64.atomic.load(&vic[way]); $ic = ic; if ((i32)ic != vtab) -> $way_fail */
 							wasm_i32_const (&body, (gint32) (intptr_t) vic + 8 * way);
 							wj_emit_ic_load64 (&body, 0);
@@ -7429,16 +7458,25 @@ vcall_nullchk_done:
 								wasm_op (&body, WASM_OP_I32_EQZ);
 								wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* !live -> $do_slow */
 							}
+							/* HIT: the resolved f-slot is in $vc_fslot; jump to the shared call tail below. */
+							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> exit $tail */
+							wasm_op (&body, WASM_OP_END);                            /* end $way_fail */
+							}   /* for each way */
+							/* every way missed -> exit $slow, skipping the shared tail */
+							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);
+							wasm_op (&body, WASM_OP_END);                            /* end $tail */
+							/* SHARED HIT TAIL, emitted once for the whole chain: push this+args (fresh from
+							 * vregs -- nothing is carried across the block boundary, so both blocks stay void),
+							 * then call_indirect the f-slot the winning guard resolved. */
 							wj_emit_fast_count (&body, WJC_FAST_VIC);   /* profile: inline f-slot IC hit (JIT->JIT) */
-							/* FAST: push this+args (fresh from vregs), fslot, call_indirect(ftd); store; skip slow */
 							for (ai = 0; ai < n2; ++ai)
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "ic fast arg ld"; goto done; }
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
 							if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "ic fast dreg"; goto done; } }
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> $after (skip the C-helper slow path) */
-							wasm_op (&body, WASM_OP_END);                            /* end $way_fail */
-							}   /* for each way -> fall through to the AOT-IC / resolve_fslot slow path */
+							wasm_op (&body, WASM_OP_END);                            /* end $slow */
+							/* falls through to the AOT-IC / resolve_fslot slow path, at its ORIGINAL nesting */
 							/* --- INLINE AOT-VCALL IC (VCALL_AOT_IC), MT-safe: two atomic i64 words, each vtab-tagged. A hit needs
 							 * BOTH words' low32 == this->vtable; then ti/kind (ic1.hi) and rgctx (ic2.hi) are correct for this
 							 * vtable regardless of interleaved fills (a vtable maps to ONE target -> identical values). Only
@@ -7450,10 +7488,13 @@ vcall_nullchk_done:
 								 * for free). 2 ways capture the AOT 2-type sites whose loser vtable was stuck reaching the helper
 								 * behind the 1-entry first-wins cache. */
 								int aic_way;
+								/* v = *this, once for the whole AOT way chain -- same invariance argument as the
+								 * f-slot chain above. Re-established here rather than relying on the f-slot loop's
+								 * copy so this block stands alone. */
+								if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic this ld"; goto done; }
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
 								for (aic_way = 0; aic_way < mono_wasm_jit_vcall_aot_ways; ++aic_way) {
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_way ($after now depth 1) */
-								if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic this ld"; goto done; }
-								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);   /* v = *this */
 								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wj_emit_ic_load64 (&body, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* a = ic1[way] (reuse vc_ic_idx i64) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* a.vtab != v -> $aot_way (next) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);   /* ti_kind = a>>32 */
