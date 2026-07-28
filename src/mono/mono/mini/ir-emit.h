@@ -888,11 +888,18 @@ static int ccount = 0;
 #define MONO_EMIT_NEW_IMPLICIT_EXCEPTION_LOAD_STORE(cfg) do { \
 	} while (0)
 
+/* The OP_NOT_NULL markers below are gated on COMPILE_METHODIR, not COMPILE_LLVM, because the wasm JIT
+ * needs them for exactly the same reason LLVM does. OP_NOT_NULL is abcremoval.c's ONLY source of
+ * non-null facts -- add_non_null() is called from the OP_NOT_NULL case (abcremoval.c:1189) and from
+ * ldlen; the OP_COMPARE_IMM 0 + OP_COND_EXC_EQ pair is only ever CONSUMED there, never treated as a
+ * fact. So without these markers abcrem's null-check removal is inert on wasm even with MONO_OPT_ABCREM
+ * on, and abcrem does run for wasm (mini.c:4051, gated !COMPILE_LLVM plus HAS_LDELEMA|HAS_CHECK_THIS).
+ * Free on both backends: OP_NOT_NULL emits no code anywhere. */
 #define MONO_EMIT_EXPLICIT_NULL_CHECK(cfg, reg) do { \
 		cfg->flags |= MONO_CFG_HAS_CHECK_THIS; \
 		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, (reg), 0);	\
 		MONO_EMIT_NEW_COND_EXC (cfg, EQ, "NullReferenceException");		\
-		if (COMPILE_LLVM (cfg)) MONO_EMIT_NEW_UNALU (cfg, OP_NOT_NULL, -1, reg); \
+		if (COMPILE_METHODIR (cfg)) MONO_EMIT_NEW_UNALU (cfg, OP_NOT_NULL, -1, reg); \
 	} while (0)
 
 /* Emit an explicit null check which doesn't depend on SIGSEGV signal handling */
@@ -903,7 +910,7 @@ static int ccount = 0;
 		} else { \
 			MONO_EMIT_NEW_IMPLICIT_EXCEPTION_LOAD_STORE (cfg); \
 		} \
-		if (COMPILE_LLVM (cfg)) MONO_EMIT_NEW_UNALU (cfg, OP_NOT_NULL, -1, reg); \
+		if (COMPILE_METHODIR (cfg)) MONO_EMIT_NEW_UNALU (cfg, OP_NOT_NULL, -1, reg); \
 	} while (0)
 
 #define MONO_EMIT_NEW_CHECK_THIS(cfg, sreg) do { \
@@ -913,7 +920,7 @@ static int ccount = 0;
 		} else { \
 			MONO_EMIT_NEW_UNALU (cfg, OP_CHECK_THIS, -1, sreg); \
 			MONO_EMIT_NEW_IMPLICIT_EXCEPTION_LOAD_STORE (cfg); \
-			if (COMPILE_LLVM (cfg)) MONO_EMIT_NEW_UNALU (cfg, OP_NOT_NULL, -1, sreg); \
+			if (COMPILE_METHODIR (cfg)) MONO_EMIT_NEW_UNALU (cfg, OP_NOT_NULL, -1, sreg); \
 		} \
 	} while (0)
 
