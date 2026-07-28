@@ -121,7 +121,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_slotlive; const char *sl = g_getenv ("MONO_WASM_JIT_SLOTLIVE"); mono_wasm_jit_slotlive = (sl && *sl) ? (*sl != '0') : 0; } /* GC-point liveness slot elision: an isref vreg whose whole def->use range crosses no GC point keeps NO frame slot (stays a fast wasm local the GC never needs to see). Cuts pin pressure + frame size. Default OFF until soak. */
 	{ extern int mono_wasm_jit_slotzero; const char *sz = g_getenv ("MONO_WASM_JIT_SLOTZERO"); mono_wasm_jit_slotzero = (sz && *sz) ? (*sz != '0') : 0; } /* dead-slot zeroing: null a single-bb ref slot at its last use so dead objects stop pinning (long-lived JSPI frames otherwise pin them until frame pop). Requires REF_WT+SLOTLIVE. Default OFF until soak. */
 	{ extern int mono_wasm_jit_nce; const char *nc = g_getenv ("MONO_WASM_JIT_NCE"); mono_wasm_jit_nce = (nc && *nc) ? (*nc != '0') : 1; } /* bb-local null-check elimination; 0 disables (A/B + kill switch). */
-	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF pending an A/B; the earlier 2.1%-reach reading was a capacity bug (aliases crowding the load table), not the algorithm — see WjLcse. */
+	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF pending an A/B; reach measured 0.69% (54/7830 loads) on jbox2d — correct but nearly inert, see WjLcse. */
 	{ extern int mono_wasm_jit_coalesce; const char *cs = g_getenv ("MONO_WASM_JIT_COALESCE"); mono_wasm_jit_coalesce = (cs && *cs && *cs != '0') ? 1 : 0; } /* share one wasm local between vregs with disjoint live ranges. Default OFF until A/B'd. */
 	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); mono_wasm_jit_aot_entry = (ae && *ae && *ae != '0') ? 1 : 0; } /* fast path in the jiterpreter native->interp entry for already-JITted methods. */
 	{ extern int mono_wasm_jit_nodispatch; const char *nd = g_getenv ("MONO_WASM_JIT_NODISPATCH"); mono_wasm_jit_nodispatch = (nd && *nd && *nd != '0') ? 1 : 0; } /* elide dispatch scaffolding for single-bb methods. Default OFF, unvalidated. */
@@ -2045,15 +2045,22 @@ wj_count (int idx)
  * not a big table, and fixed arrays cost no allocation per bb.
  */
 /*
- * LOADs and ALIASes live in SEPARATE arrays. They shared one 16-entry table originally, and since
- * every scalar move appends an alias unconditionally while mono's call-arg setup and decompose inject
- * moves densely, the table filled with alias entries before a load could get in -- and the add on a
- * full table was silently dropped with no eviction. That, not the algorithm, is why the measured reach
- * was ~2% of heap loads.
+ * LOADs and ALIASes live in SEPARATE arrays, and both evict the OLDEST entry when full rather than
+ * refusing the newest. Sharing one 16-entry table let a dense run of scalar moves (mono's call-arg
+ * setup and decompose emit them freely) fill it with alias entries before a load could get in, and a
+ * full table then dropped adds silently.
  *
- * Both arrays evict the OLDEST entry when full rather than refusing the newest. Dropping either kind
- * of fact only ever costs an elision, never correctness, and the newest fact is the one most likely to
- * be reused next.
+ * MEASURED: that was NOT the reason reach was low. With the split in place, WJC_LCSE_EVICT is 0 on the
+ * jbox2d bench -- the table is never full -- and reach is 54 hits / 7830 loads = 0.69%. 4633 loads DO
+ * get cached, so the entries are being created and then dying before anything matches them. The two
+ * structural reasons, both inherent to the EBB scope rather than to any table size:
+ *   - the whole table is cleared at every call (wj_ins_is_gcpoint's inverted whitelist is default-TRUE),
+ *     and these hot loops are call-dense;
+ *   - a merge block has in_count > 1 and therefore starts empty, which is exactly where the reload in
+ *     the motivating `a < b ? a : b` shape sits.
+ * Fixing reach means a real GVN over the dominator tree with per-field memory dependence (kill only on
+ * stores/calls that can write THAT field), not a bigger table. Until then this pass is correct and
+ * nearly inert, and the 39-vs-14 heap-load gap against teavm stands unaddressed.
  */
 #define WJ_LCSE_LOADS   16
 #define WJ_LCSE_ALIASES 16
