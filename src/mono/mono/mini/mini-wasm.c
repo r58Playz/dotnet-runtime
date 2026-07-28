@@ -2012,6 +2012,13 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean clause_free)
 	case OP_SETRET:
 	/* the emitter's no-op set */
 	case OP_NOP: case OP_IL_SEQ_POINT: case OP_SEQ_POINT:
+	/* OP_NOT_NULL emits nothing (a fact marker, see its emit case), so it can neither reach a GC nor
+	 * write memory. It must be listed: this classifier is an inverted whitelist ending in
+	 * `default: return TRUE`, and MONO_EMIT_NULL_CHECK now emits an OP_NOT_NULL at every null check.
+	 * Left to the default it would make every null check a GC point, forcing a frame slot for every ref
+	 * live across one and undoing most of what MONO_WASM_JIT_SLOTLIVE elides. Note OP_CHECK_THIS is
+	 * deliberately NOT here -- it really can raise. */
+	case OP_NOT_NULL:
 	case OP_DUMMY_USE: case OP_NOT_REACHED: case OP_START_HANDLER:
 	case OP_GC_LIVENESS_DEF: case OP_GC_LIVENESS_USE:
 	case OP_GC_PARAM_SLOT_LIVENESS_DEF: case OP_GC_SPILL_SLOT_LIVENESS_DEF:
@@ -5308,7 +5315,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		for (tb = cfg->bb_entry; tb; tb = tb->next_bb) {
 			MONO_BB_FOR_EACH_INS (tb, ti) {
 				switch (ti->opcode) {
-				case OP_NOT_NULL: case OP_CHECK_THIS:
+				/* NB: OP_NOT_NULL is deliberately absent -- it is a fact marker that emits nothing, so it
+				 * never branches to the NRE block and must not be what keeps that block alive. */
+				case OP_CHECK_THIS:
 				case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
 				case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
 					want [4] = TRUE;   /* NullReferenceException: explicit checks + vcall receiver check */
@@ -6055,7 +6064,24 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "r4const"; goto done; }
 				break;
 			case OP_AND_IMM: BINI32 (WASM_OP_I32_AND); break;
-			case OP_NOT_NULL: case OP_CHECK_THIS: {
+			case OP_NOT_NULL:
+				/* Metadata only, NOT a check. The front end emits this to ASSERT that sreg1 is already
+				 * known non-null -- right after an allocation, or right after the check it just emitted.
+				 * mini-ops.h declares it (NONE, IREG, NONE), so it has no result, and it is a no-op in
+				 * every other backend: amd64/x86/arm/arm64/ppc/s390x/riscv all `break`, and mini-llvm.c
+				 * groups it with OP_NOP/OP_LIVERANGE_START.
+				 *
+				 * Sharing OP_CHECK_THIS's case below inverted its meaning -- it made the one opcode that
+				 * certifies a check is unnecessary emit a load+eqz+branch. That was live cost, not a
+				 * hypothetical: two sites emit OP_NOT_NULL UNGATED by COMPILE_LLVM, after handle_alloc
+				 * for newobj (method-to-ir.c:9649) and after ldlen (method-to-ir.c:10867), so every
+				 * `new` and every `arraylength` in JIT'd code carried a null check on a value the front
+				 * end had just certified non-null. jbox2d is dense in both.
+				 *
+				 * Record the fact so NCE can drop LATER real checks on the same vreg, and emit nothing. */
+				NN_SET (ins->sreg1);
+				break;
+			case OP_CHECK_THIS: {
 				/* Null check: if sreg1 is null, raise a CATCHABLE NullReferenceException, mirroring OP_COND_EXC
 				 * — NOT a raw wasm trap. address 0 is valid in wasm linear memory, so a skipped check silently
 				 * corrupts low memory; and EH methods now compile (MONO_WASM_JIT_EH), so a null this/deref inside
