@@ -121,7 +121,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_slotlive; const char *sl = g_getenv ("MONO_WASM_JIT_SLOTLIVE"); mono_wasm_jit_slotlive = (sl && *sl) ? (*sl != '0') : 0; } /* GC-point liveness slot elision: an isref vreg whose whole def->use range crosses no GC point keeps NO frame slot (stays a fast wasm local the GC never needs to see). Cuts pin pressure + frame size. Default OFF until soak. */
 	{ extern int mono_wasm_jit_slotzero; const char *sz = g_getenv ("MONO_WASM_JIT_SLOTZERO"); mono_wasm_jit_slotzero = (sz && *sz) ? (*sz != '0') : 0; } /* dead-slot zeroing: null a single-bb ref slot at its last use so dead objects stop pinning (long-lived JSPI frames otherwise pin them until frame pop). Requires REF_WT+SLOTLIVE. Default OFF until soak. */
 	{ extern int mono_wasm_jit_nce; const char *nc = g_getenv ("MONO_WASM_JIT_NCE"); mono_wasm_jit_nce = (nc && *nc) ? (*nc != '0') : 1; } /* bb-local null-check elimination; 0 disables (A/B + kill switch). */
-	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF: correct, but reach is only 2.1% of heap loads and it measured neutral. */
+	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF pending an A/B; the earlier 2.1%-reach reading was a capacity bug (aliases crowding the load table), not the algorithm — see WjLcse. */
 	{ extern int mono_wasm_jit_coalesce; const char *cs = g_getenv ("MONO_WASM_JIT_COALESCE"); mono_wasm_jit_coalesce = (cs && *cs && *cs != '0') ? 1 : 0; } /* share one wasm local between vregs with disjoint live ranges. Default OFF until A/B'd. */
 	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); mono_wasm_jit_aot_entry = (ae && *ae && *ae != '0') ? 1 : 0; } /* fast path in the jiterpreter native->interp entry for already-JITted methods. */
 	{ extern int mono_wasm_jit_nodispatch; const char *nd = g_getenv ("MONO_WASM_JIT_NODISPATCH"); mono_wasm_jit_nodispatch = (nd && *nd && *nd != '0') ? 1 : 0; } /* elide dispatch scaffolding for single-bb methods. Default OFF, unvalidated. */
@@ -294,7 +294,8 @@ int mono_wasm_jit_lcse = 0;           /* MONO_WASM_JIT_LCSE: extended-basic-bloc
                                        * TurboFan does NOT clean them up -- its compiled output has 67 memory loads, so all 39
                                        * are real. The dominant shape is javac's `a < b ? a : b` (jbox2d's MathUtils.min/max),
                                        * which reloads BOTH operands in BOTH arms after the compare already loaded them.
-                                       * Default OFF until A/B'd. */
+                                       * Measure reach with MONO_WASM_JIT_STATS=1 and read [wasm-jit lcse]:
+                                       * hits/loads_seen, NOT adds/hits. Default OFF until A/B'd. */
 int mono_wasm_jit_slotlive = 0;       /* MONO_WASM_JIT_SLOTLIVE: GC-point liveness slot elision — an isref vreg gets a frame slot ONLY if a GC can actually observe it there: it is live across a GC-capable instruction (wj_ins_is_gcpoint) or spans basic blocks. A ref defined and fully consumed between two GC points is invisible to the collector (cooperative suspend: this thread only scans at safepoints/calls), so it can stay in an unscanned wasm local. Main pin-pressure lever: most deref-backstop bases and immediately-consumed call results lose their slots. Disabled when STOREGUARD/OBJGUARD are on (they key ref-ness off refslot, so elision would change guard semantics). Default OFF until soak. */
 int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroing — zero a SINGLE-BB slotted ref vreg's frame slot at its last use (only when a GC point follows in the bb), so the dead object stops pinning. Critical for long-lived frames (a JSPI-suspended main loop otherwise pins its stale refs for the app lifetime). Single-bb scope makes death provable without dataflow (a vreg live into any EH handler is multi-bb by definition). Requires REF_WT (reads come from the local, so the slot can be zeroed BEFORE the killing instruction — stack-neutral, no terminator special cases) and SLOTLIVE (which computes the last-use walk). Default OFF until soak. */
 /* MONO_WASM_JIT_NCE: bb-local null-check elimination. cfg->explicit_null_checks is forced on for this
@@ -521,6 +522,10 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
 	printf ("[wasm-jit transition] residual_healed=%lld fast_delegate=%lld delegate_ic_hit=%lld (fast counters require PROFILE_FAST=1)\n",
 		WJC_(WJC_RESIDUAL_HEALED), WJC_(WJC_FAST_DELEGATE), WJC_(WJC_DELEGATE_IC_HIT));
+	/* LCSE reach. hits/loads_seen is the elimination RATE; evict>0 says the load table is the binding
+	 * constraint (raise WJ_LCSE_LOADS) rather than the kill policy. Requires MONO_WASM_JIT_LCSE=1. */
+	printf ("[wasm-jit lcse] loads_seen=%lld adds=%lld hits=%lld evict=%lld\n",
+		WJC_(WJC_LCSE_LOADS_SEEN), WJC_(WJC_LCSE_ADDS), WJC_(WJC_LCSE_HITS), WJC_(WJC_LCSE_EVICT));
 	fflush (stdout);
 	/* the bail histogram (this file) + the island blockers / hot entry-edges (interp.c) */
 	{
@@ -1760,6 +1765,12 @@ wasm_valtype_of_opcode (int opcode)
 	/* float/r4 compare-to-i32 (setcc): standalone, produce a 0/1 i32 result */
 	case OP_FCEQ: case OP_FCNEQ: case OP_FCLT: case OP_FCLT_UN: case OP_FCGT: case OP_FCGT_UN: case OP_FCLE: case OP_FCGE:
 	case OP_RCEQ: case OP_RCNEQ: case OP_RCLT: case OP_RCLT_UN: case OP_RCGT: case OP_RCGT_UN: case OP_RCLE: case OP_RCGE:
+	/* float -> int (saturating trunc; IREG dest per mini-ops.h). _TO_I is native int = i32 on wasm32. */
+	case OP_RCONV_TO_I4: case OP_FCONV_TO_I4: case OP_RCONV_TO_U4: case OP_FCONV_TO_U4:
+	case OP_RCONV_TO_I:  case OP_FCONV_TO_I:
+	case OP_RCONV_TO_I1: case OP_FCONV_TO_I1: case OP_RCONV_TO_U1: case OP_FCONV_TO_U1:
+	case OP_RCONV_TO_I2: case OP_FCONV_TO_I2: case OP_RCONV_TO_U2: case OP_FCONV_TO_U2:
+	case OP_LZCNT32: case OP_POPCNT32:
 		return WASM_I32;
 	case OP_ICONV_TO_I8: case OP_ICONV_TO_U8:
 	case OP_LOADI8_MEMBASE:
@@ -1779,12 +1790,17 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_LSHL_IMM: case OP_LSHR_IMM: case OP_LSHR_UN_IMM:
 	case OP_LNOT: case OP_LNEG:
 	case OP_MOVE_F_TO_I8:  /* f64 bits -> i64 (reinterpret) */
+	case OP_RCONV_TO_I8: case OP_FCONV_TO_I8: case OP_RCONV_TO_U8: case OP_FCONV_TO_U8:  /* float -> i64 */
+	case OP_LZCNT64: case OP_POPCNT64:
 		return WASM_I64;
 	case OP_R8CONST: case OP_FMOVE:
 	case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV: case OP_FNEG:
 	case OP_ICONV_TO_R8: case OP_RCONV_TO_R8:
 	case OP_LCONV_TO_R8:   /* i64 -> f64 */
 	case OP_MOVE_I8_TO_F:  /* i64 bits -> f64 (reinterpret) */
+	/* double math intrinsics (the F-suffixed / R-prefixed forms below are the f32 ones) */
+	case OP_ABS: case OP_SQRT: case OP_CEIL: case OP_FLOOR: case OP_TRUNC: case OP_ROUND:
+	case OP_FMIN: case OP_FMAX: case OP_FCOPYSIGN:
 		return WASM_F64;
 	case OP_R4CONST: case OP_RMOVE:
 	case OP_FCONV_TO_R4:
@@ -1792,6 +1808,9 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_LCONV_TO_R4:   /* i64 -> f32 */
 	case OP_MOVE_I4_TO_F:  /* i32 bits -> f32 (reinterpret) */
 	case OP_RADD: case OP_RSUB: case OP_RMUL: case OP_RDIV: case OP_RNEG:
+	/* float32 math intrinsics */
+	case OP_ABSF: case OP_SQRTF: case OP_CEILF: case OP_FLOORF: case OP_TRUNCF:
+	case OP_RMIN: case OP_RMAX: case OP_RCOPYSIGN:
 		return WASM_F32;
 	default:
 		return 0;
@@ -1952,6 +1971,17 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean clause_free)
 	case OP_ICONV_TO_R4: case OP_ICONV_TO_R8:
 	case OP_LCONV_TO_I4: case OP_LCONV_TO_U4: case OP_LCONV_TO_R4: case OP_LCONV_TO_R8:
 	case OP_FCONV_TO_R4: case OP_RCONV_TO_R4: case OP_RCONV_TO_R8:
+	/* float -> int (saturating trunc): a number, never a managed pointer */
+	case OP_RCONV_TO_I4: case OP_FCONV_TO_I4: case OP_RCONV_TO_U4: case OP_FCONV_TO_U4:
+	case OP_RCONV_TO_I8: case OP_FCONV_TO_I8: case OP_RCONV_TO_U8: case OP_FCONV_TO_U8:
+	case OP_RCONV_TO_I1: case OP_FCONV_TO_I1: case OP_RCONV_TO_U1: case OP_FCONV_TO_U1:
+	case OP_RCONV_TO_I2: case OP_FCONV_TO_I2: case OP_RCONV_TO_U2: case OP_FCONV_TO_U2:
+	case OP_RCONV_TO_I:  case OP_FCONV_TO_I:
+	/* float math + bit intrinsics: likewise pure numbers */
+	case OP_ABS: case OP_SQRT: case OP_CEIL: case OP_FLOOR: case OP_TRUNC: case OP_ROUND:
+	case OP_ABSF: case OP_SQRTF: case OP_CEILF: case OP_FLOORF: case OP_TRUNCF:
+	case OP_FMIN: case OP_FMAX: case OP_RMIN: case OP_RMAX: case OP_FCOPYSIGN: case OP_RCOPYSIGN:
+	case OP_LZCNT32: case OP_LZCNT64: case OP_POPCNT32: case OP_POPCNT64:
 	case OP_SEXT_I4: case OP_ZEXT_I4:
 	/* compares + setcc + branches */
 	case OP_ICEQ: case OP_ICNEQ: case OP_ICLT: case OP_ICLT_UN: case OP_ICGT: case OP_ICGT_UN:
@@ -1990,36 +2020,61 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean clause_free)
 	}
 }
 
+/* Bump a WJC counter only when MONO_WASM_JIT_STATS is on. The counters are atomics, and these sit in
+ * the per-instruction emit path where an unconditional atomic is measurable on compile time. */
+static void
+wj_count (int idx)
+{
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_count (idx);
+}
+
 /*
  * MONO_WASM_JIT_LCSE — redundant heap-load elimination, scoped to an extended basic block.
  *
- * Two entry kinds share one small table:
- *   LOAD  : the value of *(base + off), read with mono opcode `op`, currently lives in vreg `vreg`.
- *   ALIAS : `base` holds the same value as `vreg`, so every read of `base` can read `vreg` instead.
+ * Two kinds of fact are tracked:
+ *   LOAD  : the value of *(base + off), read with a given wasm load opcode, lives in vreg `vreg`.
+ *   ALIAS : `from` holds the same value as `to`, so a lookup keyed on `from` can use `to` instead.
  *
  * ALIAS is what makes CHAINED reloads work, and it is the whole reason this is not just a bb-local
  * peephole. For `a.lowerBound.x` reloaded in a ternary arm, eliding the outer load leaves the arm's
  * `.x` load keyed on the elided load's dreg rather than on the cached vreg; without canonicalising
- * through ALIAS the second load misses and only half the redundancy goes away. wasm_ld resolves through
- * this table, so every existing read site in the emitter picks the elision up untouched.
+ * through ALIAS the second load misses and only half the redundancy goes away.
  *
  * Deliberately small and linearly scanned: the win is a handful of hot locations per extended block,
- * not a big table, and a fixed array costs no allocation per bb.
+ * not a big table, and fixed arrays cost no allocation per bb.
  */
-#define WJ_LCSE_MAX 16
-#define WJ_LCSE_FREE  0
-#define WJ_LCSE_LOAD  1
-#define WJ_LCSE_ALIAS 2
+/*
+ * LOADs and ALIASes live in SEPARATE arrays. They shared one 16-entry table originally, and since
+ * every scalar move appends an alias unconditionally while mono's call-arg setup and decompose inject
+ * moves densely, the table filled with alias entries before a load could get in -- and the add on a
+ * full table was silently dropped with no eviction. That, not the algorithm, is why the measured reach
+ * was ~2% of heap loads.
+ *
+ * Both arrays evict the OLDEST entry when full rather than refusing the newest. Dropping either kind
+ * of fact only ever costs an elision, never correctness, and the newest fact is the one most likely to
+ * be reused next.
+ */
+#define WJ_LCSE_LOADS   16
+#define WJ_LCSE_ALIASES 16
 typedef struct {
-	guint8 kind;
-	int op;        /* LOAD: mono load opcode — distinguishes width/signedness at the same offset */
-	int base;      /* LOAD: base vreg (already canonical)   ALIAS: the aliasing vreg */
-	gint32 off;    /* LOAD: byte offset */
-	int vreg;      /* the vreg that holds the value */
-} WjLcseEnt;
+	int wop;       /* the EMITTED wasm opcode + alignment, NOT the mono opcode: OP_LOAD_MEMBASE,     */
+	int align;     /* OP_LOADI4_MEMBASE and OP_LOADU4_MEMBASE are three keys for one i32.load, so    */
+	               /* keying on the mono opcode makes a ref field and an int field at the same       */
+	               /* address miss each other. Width and signedness stay distinct because they are   */
+	               /* distinct wasm opcodes.                                                          */
+	int base;      /* base vreg (already canonical) */
+	gint32 off;    /* byte offset */
+	int vreg;      /* the vreg that holds the loaded value */
+} WjLcseLoad;
 typedef struct {
-	WjLcseEnt e [WJ_LCSE_MAX];
-	int n;
+	int from;      /* reads of this vreg may use ... */
+	int to;        /* ... this one instead */
+} WjLcseAlias;
+typedef struct {
+	WjLcseLoad ld [WJ_LCSE_LOADS];
+	WjLcseAlias al [WJ_LCSE_ALIASES];
+	int nld, nal;
 } WjLcse;
 
 static int
@@ -2030,10 +2085,10 @@ wj_lcse_canon (WjLcse *t, int v)
 		return v;
 	/* Chains are built by appending and are short; the bound is a hard stop against a cycle, not an
 	 * expected depth. */
-	for (guard = 0; guard < WJ_LCSE_MAX; ++guard) {
+	for (guard = 0; guard < WJ_LCSE_ALIASES; ++guard) {
 		int i, next = -1;
-		for (i = 0; i < t->n; ++i)
-			if (t->e [i].kind == WJ_LCSE_ALIAS && t->e [i].base == v) { next = t->e [i].vreg; break; }
+		for (i = 0; i < t->nal; ++i)
+			if (t->al [i].from == v) { next = t->al [i].to; break; }
 		if (next < 0 || next == v)
 			break;
 		v = next;
@@ -2041,47 +2096,78 @@ wj_lcse_canon (WjLcse *t, int v)
 	return v;
 }
 
-/* Drop every entry mentioning `v` — as a LOAD's base (the address it names may now differ), as the vreg
- * holding a cached value, or as either side of an ALIAS. Called on every def BEFORE the defining
- * instruction is lowered, so the instruction's own sources still resolve against the old state. */
+/*
+ * Drop every fact invalidated by a write to V's storage. Called on every def BEFORE the defining
+ * instruction is lowered, so the instruction's own sources still resolve against the old state.
+ *
+ * Invalidation is by STORAGE, not by vreg number. Under MONO_WASM_JIT_COALESCE several vregs share one
+ * wasm local, so defining any of them overwrites the cached value of all of them -- and the coalescing
+ * liveness cannot have accounted for that, because LCSE's read of a cached vreg is created during
+ * EMISSION, after the IR-derived liveness that chose the sharing has already run. Comparing li[] closes
+ * that gap exactly, and cannot over-kill: each valtype group owns a disjoint range of local indices, so
+ * two vregs share a local only if they really do share storage.
+ */
 static void
-wj_lcse_kill (WjLcse *t, int v)
+wj_lcse_kill (WjLcse *t, const int *li, int nvreg, int v)
 {
-	int i, k = 0;
+	int i, k, lv;
 	if (!t || v < 0)
 		return;
-	for (i = 0; i < t->n; ++i) {
-		if (t->e [i].base == v || t->e [i].vreg == v)
-			continue;
-		t->e [k++] = t->e [i];
-	}
-	t->n = k;
+	lv = (li && v < nvreg) ? li [v] : -1;
+#define WJ_LCSE_DEAD(x) ((x) == v || (lv >= 0 && (x) >= 0 && (x) < nvreg && li [(x)] == lv))
+	for (i = 0, k = 0; i < t->nld; ++i)
+		if (!WJ_LCSE_DEAD (t->ld [i].base) && !WJ_LCSE_DEAD (t->ld [i].vreg))
+			t->ld [k++] = t->ld [i];
+	t->nld = k;
+	for (i = 0, k = 0; i < t->nal; ++i)
+		if (!WJ_LCSE_DEAD (t->al [i].from) && !WJ_LCSE_DEAD (t->al [i].to))
+			t->al [k++] = t->al [i];
+	t->nal = k;
+#undef WJ_LCSE_DEAD
 }
 
 static void
-wj_lcse_add (WjLcse *t, guint8 kind, int op, int base, gint32 off, int vreg)
+wj_lcse_add_load (WjLcse *t, int wop, int align, int base, gint32 off, int vreg)
 {
 	/* base == vreg would be self-referential: `t = load(t, off)` redefines its own base, and caching
 	 * (t,off) -> t would then hand out the loaded value as if it were the address. */
-	if (!t || base < 0 || vreg < 0 || base == vreg || t->n >= WJ_LCSE_MAX)
+	if (!t || base < 0 || vreg < 0 || base == vreg)
 		return;
-	t->e [t->n].kind = kind;
-	t->e [t->n].op = op;
-	t->e [t->n].base = base;
-	t->e [t->n].off = off;
-	t->e [t->n].vreg = vreg;
-	t->n++;
+	if (t->nld >= WJ_LCSE_LOADS) {
+		memmove (&t->ld [0], &t->ld [1], sizeof (t->ld [0]) * (WJ_LCSE_LOADS - 1));
+		t->nld = WJ_LCSE_LOADS - 1;
+	}
+	t->ld [t->nld].wop = wop;
+	t->ld [t->nld].align = align;
+	t->ld [t->nld].base = base;
+	t->ld [t->nld].off = off;
+	t->ld [t->nld].vreg = vreg;
+	t->nld++;
+}
+
+static void
+wj_lcse_add_alias (WjLcse *t, int from, int to)
+{
+	if (!t || from < 0 || to < 0 || from == to)
+		return;
+	if (t->nal >= WJ_LCSE_ALIASES) {
+		memmove (&t->al [0], &t->al [1], sizeof (t->al [0]) * (WJ_LCSE_ALIASES - 1));
+		t->nal = WJ_LCSE_ALIASES - 1;
+	}
+	t->al [t->nal].from = from;
+	t->al [t->nal].to = to;
+	t->nal++;
 }
 
 static int
-wj_lcse_find (WjLcse *t, int op, int base, gint32 off)
+wj_lcse_find (WjLcse *t, int wop, int align, int base, gint32 off)
 {
 	int i;
 	if (!t)
 		return -1;
-	for (i = 0; i < t->n; ++i)
-		if (t->e [i].kind == WJ_LCSE_LOAD && t->e [i].op == op && t->e [i].base == base && t->e [i].off == off)
-			return t->e [i].vreg;
+	for (i = 0; i < t->nld; ++i)
+		if (t->ld [i].wop == wop && t->ld [i].align == align && t->ld [i].base == base && t->ld [i].off == off)
+			return t->ld [i].vreg;
 	return -1;
 }
 
@@ -2143,6 +2229,15 @@ typedef struct {
 	int objguard;     /* MONO_WASM_JIT_OBJGUARD: validate the object base of ref-field stores (check_store kind=2) */
 	int check_ti;
 } WjCtx;
+
+/* A scalar register-to-register copy. These carry no type information of their own — see the
+ * valtype unification pass in mono_wasm_emit_method. OP_VMOVE/OP_XMOVE are NOT moves for this
+ * purpose: they copy value types, which have no wasm valtype at all. */
+static gboolean
+wj_ins_is_move (int opcode)
+{
+	return opcode == OP_MOVE || opcode == OP_LMOVE || opcode == OP_FMOVE || opcode == OP_RMOVE;
+}
 
 /* Emit a memory load/store of an addressable local (addrslot[vreg] >= 0), at addrbase + offset, using the
  * vreg's wasm valtype for the width. Returns FALSE on an unsupported width. */
@@ -2928,7 +3023,7 @@ wj_emit_scalar_vtype_arg (WasmBuf *body, WjCtx *c, MonoType *pt, int argvreg)
 }
 
 /* Store an ArgVtypeAsScalar call result (currently on the wasm stack) through the return-temp
- * address captured in wargs[n]. MINI represents every vtype call result as an addressable temp and
+ * address captured at WjCallArgs position n. MINI represents every vtype call result as an addressable temp and
  * emits OP_VCALL2 with no scalar dreg, even when the native wasm ABI returns the single field directly. */
 static gboolean
 wj_store_scalar_vtype_result (WasmBuf *body, WjCtx *c, WasmValtype vt, int addr_vreg)
@@ -2959,6 +3054,63 @@ wj_store_scalar_vtype_result (WasmBuf *body, WjCtx *c, WasmValtype vt, int addr_
 	return TRUE;
 }
 
+/*
+ * WjCallArgs — the wasm JIT's per-call-site argument descriptor, hung off the (otherwise unused for
+ * wasm) call->call_info. Built by mono_wasm_emit_call at method-to-ir time.
+ *
+ * The emitter reads call arguments POSITIONALLY rather than from the call instruction's sregs: an
+ * instruction has MONO_MAX_SRC_REGS of those and a managed signature has arbitrarily many arguments.
+ * What each position stores is the DEFINING INSTRUCTION, and the vreg is read back out of it through
+ * wj_arg_vreg at the moment of use.
+ *
+ * That indirection is the whole point of the struct. mono_wasm_emit_call runs long before codegen,
+ * and the optimization pipeline in between rewrites vreg NUMBERS -- SSA renaming above all. A cached
+ * number silently becomes some other value's vreg, which is a wrong ARGUMENT rather than a bail.
+ * A MonoInst* is mempool-allocated and stable for the whole compile, and every pass that renumbers a
+ * vreg does it by rewriting exactly the dreg field this reads, so the answer is always current and
+ * nothing has to be resynchronized after the pipeline. (capvreg is a narrow, individually justified
+ * fallback for one instruction-retiring transform -- see wj_arg_vreg -- not a second general record.)
+ */
+typedef struct {
+	int nargs;             /* managed args including `this`; carrier[]/capvreg[] have nargs+1 entries */
+	MonoInst **carrier;    /* [0..nargs-1] arg source; [nargs] the hidden-vret address, or NULL */
+	int *capvreg;          /* the vreg each carrier defined AT CAPTURE TIME — see wj_arg_vreg */
+	gint32 *copyoff;       /* [0..nargs-1] by-addr copy-region byte offset in the addr frame, -1 = none.
+	                        * Filled by the emit-time pre-pass. Not a vreg, so it needs no indirection. */
+} WjCallArgs;
+
+/*
+ * Current vreg of managed argument AI (AI == nargs is the hidden-vret address), or -1 if there is none.
+ * Callers turn -1 into a clean bail rather than emitting an access to local -1.
+ *
+ * Normally this is just carrier->dreg, read live so that any pass which renumbers the vreg is followed
+ * automatically. The capture-time number is the fallback for exactly one situation: mono_local_cprop's
+ * reverse copy propagation rewrites `B <- FOO; A <- B` into `A <- FOO` by pointing FOO's dreg at A and
+ * MONO_DELETE_INS-ing the carrier -- which NULLIFY_INSes it, leaving dreg == -1. The argument still
+ * lands in A, because A is precisely the dreg the producer was retargeted to; only the instruction that
+ * used to name it is gone. So falling back to the captured number is not a guess, it is the same value
+ * by construction.
+ *
+ * Nothing else can retire a carrier: mono_local_deadce marks out_ireg_args vregs used, and both
+ * mono_ssa_deadce and ssa_cprop's folding only touch defs of cfg->varinfo entries, which a carrier dreg
+ * (fresh, singly-defined, non-variable) is not. If a future pass does retire one for another reason,
+ * the fallback stops being sound -- so it is deliberately narrow rather than a general "trust the
+ * snapshot" rule.
+ */
+static int
+wj_arg_vreg (MonoCallInst *call, int ai)
+{
+	WjCallArgs *w = (WjCallArgs *) call->call_info;
+	MonoInst *c;
+
+	if (!w || ai < 0 || ai > w->nargs)
+		return -1;
+	c = w->carrier [ai];
+	if (!c)
+		return -1;
+	return c->dreg >= 0 ? c->dreg : w->capvreg [ai];
+}
+
 /* Emit one managed-call arg (index ai over the managed args, incl. `this` at 0 when hasthis).
  * A BYVAL ref-free scalar-vtype param (MONO_WASM_JIT_VTYPE_SCALAR) is loaded as its single-field etype
  * scalar from the ByVal value's addr-frame slot. A by-addr vtype param (WJ_ARG_VTYPE_BYADDR) is
@@ -2970,13 +3122,13 @@ wj_store_scalar_vtype_result (WasmBuf *body, WjCtx *c, WasmValtype vt, int addr_
  * (the residual spills the pushed value — scalar or copy address — into its scratch slot; the interp
  * side derefs by-addr slots per mono_wasm_jit_arg_is_byaddr). */
 static gboolean
-wj_emit_one_call_arg (WasmBuf *body, WjCtx *c, const WasmCallInfo *ci, MonoMethodSignature *csig, int *wargs, int ai)
+wj_emit_one_call_arg (WasmBuf *body, WjCtx *c, const WasmCallInfo *ci, MonoMethodSignature *csig, MonoCallInst *call, int ai)
 {
 	int pidx = ai - (csig->hasthis ? 1 : 0);
 	if (ci && ai >= 0 && ai < ci->nargs && ci->args [ai].kind == WJ_ARG_VTYPE_BYADDR) {
-		int wn = (int) csig->param_count + (csig->hasthis ? 1 : 0);
-		int srcvreg = wargs [ai];
-		gint32 copyoff = wargs [wn + 1 + ai];
+		WjCallArgs *w = (WjCallArgs *) call->call_info;
+		int srcvreg = wj_arg_vreg (call, ai);
+		gint32 copyoff = (w && ai < w->nargs) ? w->copyoff [ai] : -1;
 		if (copyoff < 0 || srcvreg < 0 || srcvreg >= c->nvreg || !c->addrslot)
 			return FALSE;
 		/* dest: this call site's copy region */
@@ -3004,9 +3156,18 @@ wj_emit_one_call_arg (WasmBuf *body, WjCtx *c, const WasmCallInfo *ci, MonoMetho
 	if (pidx >= 0 && pidx < (int) csig->param_count) {
 		WasmValtype sv;
 		if (wj_scalar_vtype_valtype (csig->params [pidx], &sv))
-			return wj_emit_scalar_vtype_arg (body, c, csig->params [pidx], wargs [ai]);
+			return wj_emit_scalar_vtype_arg (body, c, csig->params [pidx], wj_arg_vreg (call, ai));
 	}
-	return wasm_ld (body, c, wargs [ai]);
+	return wasm_ld (body, c, wj_arg_vreg (call, ai));
+}
+
+/* IC probe load: i64.atomic.load = 0xfe 0x11 (align 3). Shared by the inline vcall and AOT-vcall cache
+ * probes, which read a (vtab-tag, payload) pair packed into one i64 and rely on the load being atomic —
+ * a torn read could match the tag while carrying another receiver type's payload. */
+static void
+wj_emit_ic_load64 (WasmBuf *b, guint32 off)
+{
+	wasm_op (b, WASM_OP_ATOMIC_PREFIX); wasm_u8 (b, 0x11); wasm_memarg (b, 3, off);
 }
 
 /* Fast-path volume profiling (MONO_WASM_JIT_PROFILE_FAST): emit an inline atomic increment of
@@ -3355,6 +3516,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * instruction ordinal links them: sl_kill_head[ord] = first vreg whose slot dies right BEFORE the
 	 * ord-th instruction (its last use), sl_kill_next[vreg] = next vreg dying at the same ordinal. */
 	int *sl_kill_head = NULL;          /* [nins] ordinal -> first dying vreg, or -1 */
+	/* [nvreg] MONO_WASM_JIT_LCSE: vreg holds a reference with NO pin slot (SLOTLIVE elided it). Such a
+	 * value must never be cached or reused by LCSE — see WJ_LCSE_UNPINNED at the LOADM macro. NULL when
+	 * slot elision is not in play, in which case every isref vreg is pinned and the question is moot. */
+	guint8 *lcse_nopin = NULL;
 	int *sl_kill_next = NULL;          /* [nvreg] chain */
 	int addrbase_idx = 0;              /* i32 local: addressable-locals frame base address (OP_LDADDR) */
 	int addr_tmp_idx [4] = { 0, 0, 0, 0 }; /* per-type scratch locals for addr-frame stores (i32/i64/f32/f64) */
@@ -3614,10 +3779,25 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	}
 	ret_vt = self_ci.ret.wtype;   /* WASM_VOID for void and hidden-vret returns, else the scalar ret valtype */
 
-	/* infer vreg valtypes from defining opcodes */
+	/*
+	 * Infer vreg valtypes from defining opcodes.
+	 *
+	 * MOVES ARE DELIBERATELY EXCLUDED and handled by a unification pass further down (search
+	 * "unify move valtypes"). A move is the one shape whose operand type comes from its operands
+	 * rather than from itself, and mono does not always spell it correctly -- leaving SSA turns a
+	 * phi into a move whose opcode comes from the phi's, and mono_ssa_compute has no STACK_R4 case,
+	 * so an f32 phi can reach codegen as an integer OP_MOVE. Taking the opcode at its word there
+	 * declares an f32 vreg to be i32, and the result is a module that only fails at INSTANTIATE
+	 * (WJC_INVALID -- and under module batching that loses every sibling method too), which is the
+	 * one failure mode this emitter must never have. Deriving the type from the operands instead
+	 * makes the answer independent of how the move happens to be spelled.
+	 */
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 		MONO_BB_FOR_EACH_INS (bb, ins) {
-			WasmValtype rt = wasm_valtype_of_opcode (ins->opcode);
+			WasmValtype rt;
+			if (wj_ins_is_move (ins->opcode))
+				continue;
+			rt = wasm_valtype_of_opcode (ins->opcode);
 			if (!rt && (ins->opcode == OP_CALL || ins->opcode == OP_FCALL || ins->opcode == OP_LCALL || ins->opcode == OP_RCALL
 					|| ins->opcode == OP_CALL_REG || ins->opcode == OP_FCALL_REG || ins->opcode == OP_LCALL_REG || ins->opcode == OP_RCALL_REG
 					|| ins->opcode == OP_CALL_MEMBASE || ins->opcode == OP_FCALL_MEMBASE || ins->opcode == OP_LCALL_MEMBASE || ins->opcode == OP_RCALL_MEMBASE)) {
@@ -3735,14 +3915,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * opt passes must not hoist). Residual calls use the same copy (uniform path; the interp copies
 	 * it once more onto its GC-scanned stack before the callee runs). Regions live INSIDE the
 	 * [refbase, entry_sp) frame: conservatively scanned (embedded refs pin their referents) and
-	 * restored-past on every exit/landing pad — never below SP. Offsets land in the wargs side
-	 * array ([n+1+ai], see mono_wasm_emit_call). */
+	 * restored-past on every exit/landing pad — never below SP. Offsets land in WjCallArgs::copyoff
+	 * (see mono_wasm_emit_call). */
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 		MONO_BB_FOR_EACH_INS (bb, ins) {
 			MonoCallInst *call;
 			MonoMethodSignature *csig;
 			WasmCallInfo cci;
-			int *wargs, ai, wn;
+			WjCallArgs *w;
+			int ai;
 			switch (ins->opcode) {
 			case OP_CALL: case OP_VOIDCALL: case OP_FCALL: case OP_LCALL: case OP_RCALL: case OP_VCALL2:
 			case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
@@ -3758,14 +3939,68 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			mono_wasm_get_call_info (csig, &cci);
 			if (!cci.valid)
 				continue;   /* the emit bails with cci.fail_reason */
-			wargs = (int *) call->call_info;
-			wn = (int) csig->param_count + (csig->hasthis ? 1 : 0);
-			for (ai = 0; ai < cci.nargs; ++ai) {
+			w = (WjCallArgs *) call->call_info;
+			for (ai = 0; ai < cci.nargs && ai < w->nargs; ++ai) {
 				if (cci.args [ai].kind != WJ_ARG_VTYPE_BYADDR)
 					continue;
 				naddrbytes = (naddrbytes + 7) & ~7;
-				wargs [wn + 1 + ai] = naddrbytes;
+				w->copyoff [ai] = naddrbytes;
 				naddrbytes += (cci.args [ai].vsize + 7) & ~7;
+			}
+		}
+	}
+
+	/*
+	 * The return vreg's valtype is the wasm function type's, full stop. The epilogue loads
+	 * cfg->ret->dreg and the module declares the function returns ret_vt, so anything else is
+	 * unrepresentable. Seeding it here rather than inferring it matters because mono_arch_emit_setret
+	 * writes cfg->ret->dreg with a MOVE, and moves no longer declare a type (see below) -- this is the
+	 * authoritative source that replaces the one the move used to provide. Skipped for a hidden-vret
+	 * method, whose wasm return is void and whose cfg->ret is a value type in the addr frame.
+	 */
+	if (ret_vt != WASM_VOID && cfg->ret && cfg->ret->dreg >= 0 && cfg->ret->dreg < nvreg &&
+	    li [cfg->ret->dreg] < 0 && addrslot [cfg->ret->dreg] < 0) {
+		if (vt [cfg->ret->dreg] && vt [cfg->ret->dreg] != ret_vt) { fail = "ret valtype conflict"; goto done; }
+		vt [cfg->ret->dreg] = ret_vt;
+	}
+
+	/*
+	 * Unify move valtypes.
+	 *
+	 * Every other valtype seed is final by now (params above, defining opcodes, the OP_LDADDR
+	 * pre-pass), so this is the point at which a move can be resolved from its operands. A move
+	 * asserts only that its two vregs hold the SAME wasm type, so propagate a known type across it
+	 * in whichever direction is known, to a fixpoint (a chain of moves needs more than one sweep;
+	 * the loop terminates because every iteration that continues has typed at least one more vreg).
+	 *
+	 * Both sides typed and DIFFERENT is a genuine disagreement, not a spelling problem: emitting it
+	 * would produce `local.get <f32>; local.set <i32>`, which validates nowhere. Bail the method.
+	 *
+	 * A move whose operands are both untyped simply stays untyped; the vreg then gets no wasm local
+	 * and the first wasm_ld/wasm_st of it bails cleanly -- which is what would have happened anyway,
+	 * since an untyped source cannot be loaded.
+	 */
+	{
+		gboolean changed = TRUE;
+		while (changed) {
+			changed = FALSE;
+			for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+				MONO_BB_FOR_EACH_INS (bb, ins) {
+					int s, d;
+					if (!wj_ins_is_move (ins->opcode))
+						continue;
+					s = ins->sreg1; d = ins->dreg;
+					if (s < 0 || s >= nvreg || d < 0 || d >= nvreg)
+						continue;
+					if (vt [s] && vt [d]) {
+						if (vt [s] != vt [d]) { fail = "move valtype conflict"; fail_op = ins->opcode; goto done; }
+						continue;
+					}
+					/* An ARG vreg's type comes from the wasm param signature and is authoritative;
+					 * it is already set, so this only ever fills in the other side. */
+					if (vt [s] && !vt [d]) { vt [d] = vt [s]; changed = TRUE; }
+					else if (vt [d] && !vt [s]) { vt [s] = vt [d]; changed = TRUE; }
+				}
 			}
 		}
 	}
@@ -3860,11 +4095,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						WJ_CO_USE (insl->dreg);
 					if (MONO_IS_CALL (insl)) {
 						MonoCallInst *cl = (MonoCallInst *) insl;
-						if (cl->call_info && cl->signature) {
-							int *wa = (int *) cl->call_info;
-							int wn = (int) cl->signature->param_count + (cl->signature->hasthis ? 1 : 0);
-							for (u = 0; u <= wn; ++u)
-								WJ_CO_USE (wa [u]);
+						WjCallArgs *cw = (WjCallArgs *) cl->call_info;
+						if (cw) {
+							for (u = 0; u <= cw->nargs; ++u)
+								WJ_CO_USE (wj_arg_vreg (cl, u));
 						}
 					}
 #undef WJ_CO_USE
@@ -4307,7 +4541,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 *     the callee's whole execution: the residual path stages args in an unscanned scratch
 		 *     buffer, so the caller's slot can be the only thing keeping the arg alive.
 		 *   - used at a later "gc generation" than its def (a GC-point ins executed in between) -> slot.
-		 * Call args are read positionally from the wargs capture (call->call_info), NOT sregs — they
+		 * Call args are read positionally from WjCallArgs (call->call_info), NOT sregs — they
 		 * must be enumerated or an arg-only vreg would look dead and lose its slot. Def-position gen
 		 * is recorded AFTER the gc bump so a call RESULT consumed before the next GC point can elide.
 		 * The dreg of a MEMBASE store is its base — a USE, not a def (mirroring the REFBASES pass).
@@ -4370,14 +4604,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							WJ_SL_USE (srcs [u]);
 						if (dreg_is_base)
 							WJ_SL_USE (insl->dreg);
-						/* positional call-arg uses (wargs capture): [0..n-1] args, [n] the vret addr */
+						/* positional call-arg uses (WjCallArgs): [0..n-1] args, [n] the vret addr */
 						if (MONO_IS_CALL (insl)) {
 							MonoCallInst *cl = (MonoCallInst *) insl;
-							if (cl->call_info && cl->signature) {
-								int *wa = (int *) cl->call_info;
-								int wn = (int) cl->signature->param_count + (cl->signature->hasthis ? 1 : 0);
-								for (u = 0; u <= wn; ++u)
-									WJ_SL_USE (wa [u]);
+							WjCallArgs *cw = (WjCallArgs *) cl->call_info;
+							if (cw) {
+								for (u = 0; u <= cw->nargs; ++u)
+									WJ_SL_USE (wj_arg_vreg (cl, u));
 							}
 						}
 #undef WJ_SL_USE
@@ -4404,6 +4637,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					}
 				if (nelide > 0 && mono_wasm_jit_stats)
 					mono_wasm_jit_add (WJC_SLOTS_ELIDED, nelide);
+				/* Hand the elision set to LCSE (function-scope; isref/sl_elide are local to this block).
+				 * An elided ref is only safe because its IR def->use range crosses no GC point, and an
+				 * LCSE reuse read would extend that range. */
+				lcse_nopin = sl_elide;
 				/* DEAD-SLOT ZEROING (MONO_WASM_JIT_SLOTZERO, Phase 3a): a slotted single-bb vreg is
 				 * provably dead after its last use — zero its slot there so the dead object stops
 				 * pinning (a long-lived/JSPI-suspended frame otherwise pins it until frame pop).
@@ -4585,14 +4822,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_VOIDCALL: case OP_VOIDCALL_REG: case OP_VOIDCALL_MEMBASE: {
 						MonoCallInst *c = (MonoCallInst *) ins2;
 						if (c->signature && c->call_info) {
-							int *ci = (int *) c->call_info;
-							int na = (int) c->signature->param_count + (c->signature->hasthis ? 1 : 0);
+							int na = ((WjCallArgs *) c->call_info)->nargs;
 							int k;
 							n += snprintf (b + n, sizeof b - n, " virt=%d ret_ref=%d args[",
 								c->method ? !!(c->method->flags & METHOD_ATTRIBUTE_VIRTUAL) : -1,
 								mini_type_is_reference (c->signature->ret));
-							for (k = 0; k < na && n < (int) sizeof b - 14; ++k)
-								n += snprintf (b + n, sizeof b - n, "%s%d%c", k ? "," : "", ci [k], WJ_RF (ci [k]));
+							for (k = 0; k < na && n < (int) sizeof b - 14; ++k) {
+								int av = wj_arg_vreg (c, k);
+								n += snprintf (b + n, sizeof b - n, "%s%d%c", k ? "," : "", av, WJ_RF (av));
+							}
 							n += snprintf (b + n, sizeof b - n, "]");
 						} else if (c->signature) {
 							n += snprintf (b + n, sizeof b - n, " (no call_info) ret_ref=%d", mini_type_is_reference (c->signature->ret));
@@ -4717,7 +4955,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 
 		lcse = (WjLcse *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjLcse));
 		/* Only blocks that some LATER block inherits from need their exit state kept; for the diamond
-		 * that is just the compare block. Saving one table per bb unconditionally would cost ~340 bytes
+		 * that is just the compare block. Saving one table per bb unconditionally would cost sizeof(WjLcse)
 		 * times the block count, which is real for the 7000-instruction methods here. */
 		for (b3 = cfg->bb_entry; b3; b3 = b3->next_bb) {
 			int ci = bbidx [b3->block_num], pi;
@@ -5200,12 +5438,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		/* LCSE: inherit the load table only across a single-predecessor edge from an already-emitted
 		 * block (see the allocation comment). Anything else starts empty. */
 		if (lcse) {
-			lcse->n = 0;
+			lcse->nld = lcse->nal = 0;
 			if (lcse_exit && bb->in_count == 1 && bb->in_bb [0] && !(bb->flags & BB_EXCEPTION_HANDLER)) {
 				int pi = (bb->in_bb [0]->block_num <= (int) cfg->max_block_num) ? bbidx [bb->in_bb [0]->block_num] : -1;
 				if (pi >= 0 && pi < i && lcse_exit [pi]) {
 					*lcse = *lcse_exit [pi];
-					if (lcse->n) lcse_inherits++;
+					if (lcse->nld) lcse_inherits++;
 				}
 			}
 		}
@@ -5263,17 +5501,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				/* SCALAR moves only. OP_VMOVE/OP_XMOVE copy a value type through memory rather than
 				 * moving a wasm local, so treating one as a value equivalence would key later lookups
 				 * off the wrong storage. */
-				gboolean scalar_move = ins->opcode == OP_MOVE || ins->opcode == OP_LMOVE ||
-					ins->opcode == OP_FMOVE || ins->opcode == OP_RMOVE;
-				int mv_src = scalar_move ? wj_lcse_canon (lcse, ins->sreg1) : -1;
+				int mv_src = wj_ins_is_move (ins->opcode) ? wj_lcse_canon (lcse, ins->sreg1) : -1;
 				if (wj_ins_clobbers_mem (ins))
-					lcse->n = 0;
+					lcse->nld = lcse->nal = 0;
 				else
-					wj_lcse_kill (lcse, ins->dreg);
+					wj_lcse_kill (lcse, li, nvreg, ins->dreg);
 				if (mv_src >= 0 && mv_src < nvreg && ins->dreg >= 0 && ins->dreg < nvreg &&
 				    mv_src != ins->dreg && lc.vt && lc.vt [mv_src] == lc.vt [ins->dreg] &&
 				    !(lc.addrslot && (lc.addrslot [ins->dreg] != -1 || lc.addrslot [mv_src] != -1)))
-					wj_lcse_add (lcse, WJ_LCSE_ALIAS, 0, ins->dreg, 0, mv_src);
+					wj_lcse_add_alias (lcse, ins->dreg, mv_src);
 			}
 			/* SLOTZERO kill point: the vregs chained at this ordinal had their last use at the PREVIOUS
 			 * instruction — zero their (now dead) frame slots so the objects stop pinning. Emitted before
@@ -5285,6 +5521,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
 					wasm_i32_const (&body, 0);
 					wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [kv] * 4));
+					/* The pin is gone, so the value must not be reused past this point: LCSE's reuse
+					 * read is created here at emission and the liveness that decided this slot was dead
+					 * never saw it. Killing the entry keeps the two in agreement. */
+					if (G_UNLIKELY (lcse != NULL))
+						wj_lcse_kill (lcse, li, nvreg, kv);
 					kv = sl_kill_next [kv];
 				}
 			}
@@ -5672,6 +5913,97 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			case OP_LCONV_TO_I: case OP_LCONV_TO_U: UN (WASM_OP_I32_WRAP_I64); break;  /* i64 -> i32/native-int (truncate) */
 			case OP_LCONV_TO_R8: UN (WASM_OP_F64_CONVERT_I64_S); break;  /* i64 -> f64 */
 			case OP_LCONV_TO_R4: UN (WASM_OP_F32_CONVERT_I64_S); break;  /* i64 -> f32 */
+
+			/*
+			 * FLOAT -> INT. Previously ENTIRELY unsupported: the emitter had every int->float and
+			 * float->float conversion but no float->int at all, so any `(int)someFloat` bailed the whole
+			 * method. That shape is pervasive in jbox2d (MathUtils.floor/round) and it was the root bail
+			 * that cascaded into ~29 lost methods once the inline limit was raised past 20.
+			 *
+			 * Always the SATURATING (0xFC-prefixed) forms. The plain truncations TRAP on NaN or
+			 * out-of-range, which would turn an ECMA-"unspecified" conversion into a hard abort. Saturating
+			 * clamps to min/max with NaN->0 -- precisely Java's (int)float rule, and the workload is
+			 * IKVM-translated Java. It also matches the interpreter, whose MINT_CONV_I4_R4 is a plain C
+			 * `(gint32) float` cast that clang lowers to trunc_sat on wasm, so a method cannot change
+			 * behaviour when it tiers from interp to JIT.
+			 *
+			 * Source precision comes from the SOURCE VREG's valtype, not the opcode's R/F prefix: with
+			 * MONO_OPT_FLOAT32 off an R4 value lives in an f64 vreg, and assuming f32 would emit a
+			 * type-invalid module -- the same reason OP_RCONV_TO_R4 above checks vt[] before demoting.
+			 */
+			#define WJ_SRC_IS_F32 (!(ins->sreg1 >= 0 && ins->sreg1 < nvreg && vt [ins->sreg1] == WASM_F64))
+			#define SAT_CONV(SAT32, SAT64, NARROW) do { \
+				gboolean _f32 = WJ_SRC_IS_F32; \
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "fconv sreg"; goto done; } \
+				wasm_op_sat (&body, _f32 ? (SAT32) : (SAT64)); \
+				NARROW; \
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "fconv dreg"; goto done; } \
+			} while (0)
+			#define SAT_NONE   do { } while (0)
+			#define SAT_EXT8   wasm_op (&body, WASM_OP_I32_EXTEND8_S)
+			#define SAT_EXT16  wasm_op (&body, WASM_OP_I32_EXTEND16_S)
+			#define SAT_MASK8  do { wasm_i32_const (&body, 0xFF); wasm_op (&body, WASM_OP_I32_AND); } while (0)
+			#define SAT_MASK16 do { wasm_i32_const (&body, 0xFFFF); wasm_op (&body, WASM_OP_I32_AND); } while (0)
+			/* -> i32 (native int is i32 on wasm32, so _TO_I folds in here) */
+			case OP_RCONV_TO_I4: case OP_FCONV_TO_I4:
+			case OP_RCONV_TO_I:  case OP_FCONV_TO_I:
+				SAT_CONV (WASM_SAT_I32_TRUNC_F32_S, WASM_SAT_I32_TRUNC_F64_S, SAT_NONE); break;
+			case OP_RCONV_TO_U4: case OP_FCONV_TO_U4:
+				SAT_CONV (WASM_SAT_I32_TRUNC_F32_U, WASM_SAT_I32_TRUNC_F64_U, SAT_NONE); break;
+			/* -> i64 */
+			case OP_RCONV_TO_I8: case OP_FCONV_TO_I8:
+				SAT_CONV (WASM_SAT_I64_TRUNC_F32_S, WASM_SAT_I64_TRUNC_F64_S, SAT_NONE); break;
+			case OP_RCONV_TO_U8: case OP_FCONV_TO_U8:
+				SAT_CONV (WASM_SAT_I64_TRUNC_F32_U, WASM_SAT_I64_TRUNC_F64_U, SAT_NONE); break;
+			/* -> sub-word: truncate to i32 SIGNED then narrow, mirroring mono's native lowering
+			 * (cvttsd2si + movsx/movzx) rather than converting straight to the narrow type. */
+			case OP_RCONV_TO_I1: case OP_FCONV_TO_I1:
+				SAT_CONV (WASM_SAT_I32_TRUNC_F32_S, WASM_SAT_I32_TRUNC_F64_S, SAT_EXT8); break;
+			case OP_RCONV_TO_I2: case OP_FCONV_TO_I2:
+				SAT_CONV (WASM_SAT_I32_TRUNC_F32_S, WASM_SAT_I32_TRUNC_F64_S, SAT_EXT16); break;
+			case OP_RCONV_TO_U1: case OP_FCONV_TO_U1:
+				SAT_CONV (WASM_SAT_I32_TRUNC_F32_S, WASM_SAT_I32_TRUNC_F64_S, SAT_MASK8); break;
+			case OP_RCONV_TO_U2: case OP_FCONV_TO_U2:
+				SAT_CONV (WASM_SAT_I32_TRUNC_F32_S, WASM_SAT_I32_TRUNC_F64_S, SAT_MASK16); break;
+			/* NB: the OP_*CONV_TO_OVF_* family is deliberately NOT here. Those must raise
+			 * OverflowException on out-of-range, which needs a range test plus a raise -- saturating
+			 * them would silently return a wrong value instead of throwing. They keep bailing. */
+
+			/*
+			 * Float math intrinsics. Each is ONE wasm instruction and every one was previously an
+			 * unsupported-opcode bail. wasm's semantics match the managed ones: min/max propagate NaN and
+			 * order -0 below +0, and f*.nearest is round-half-to-EVEN, which is Math.Round(double)'s
+			 * default. Precision from the source vreg, as above.
+			 */
+			#define FUN1(W32, W64) do { \
+				gboolean _f32 = WJ_SRC_IS_F32; \
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "fmath sreg"; goto done; } \
+				wasm_op (&body, _f32 ? (W32) : (W64)); \
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "fmath dreg"; goto done; } \
+			} while (0)
+			#define FBIN(W32, W64) do { \
+				gboolean _f32 = WJ_SRC_IS_F32; \
+				if (!wasm_ld (&body, &lc, ins->sreg1) || !wasm_ld (&body, &lc, ins->sreg2)) { fail = "fmath sreg"; goto done; } \
+				wasm_op (&body, _f32 ? (W32) : (W64)); \
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "fmath dreg"; goto done; } \
+			} while (0)
+			case OP_ABS: case OP_ABSF:     FUN1 (WASM_OP_F32_ABS,     WASM_OP_F64_ABS);     break;
+			case OP_SQRT: case OP_SQRTF:   FUN1 (WASM_OP_F32_SQRT,    WASM_OP_F64_SQRT);    break;
+			case OP_CEIL: case OP_CEILF:   FUN1 (WASM_OP_F32_CEIL,    WASM_OP_F64_CEIL);    break;
+			case OP_FLOOR: case OP_FLOORF: FUN1 (WASM_OP_F32_FLOOR,   WASM_OP_F64_FLOOR);   break;
+			case OP_TRUNC: case OP_TRUNCF: FUN1 (WASM_OP_F32_TRUNC,   WASM_OP_F64_TRUNC);   break;
+			case OP_ROUND:                 FUN1 (WASM_OP_F32_NEAREST, WASM_OP_F64_NEAREST); break;
+			case OP_FMIN: case OP_RMIN:    FBIN (WASM_OP_F32_MIN, WASM_OP_F64_MIN); break;
+			case OP_FMAX: case OP_RMAX:    FBIN (WASM_OP_F32_MAX, WASM_OP_F64_MAX); break;
+			case OP_FCOPYSIGN: case OP_RCOPYSIGN:
+				FBIN (WASM_OP_F32_COPYSIGN, WASM_OP_F64_COPYSIGN); break;
+
+			/* Integer bit intrinsics (BitOperations.LeadingZeroCount / PopCount). The 64-bit forms are
+			 * LREG->LREG in mono and i64.clz/i64.popcnt yield i64, so no wrap is needed. */
+			case OP_LZCNT32:  UN (WASM_OP_I32_CLZ);    break;
+			case OP_LZCNT64:  UN (WASM_OP_I64_CLZ);    break;
+			case OP_POPCNT32: UN (WASM_OP_I32_POPCNT); break;
+			case OP_POPCNT64: UN (WASM_OP_I64_POPCNT); break;
 			/* bit-reinterpret (Unsafe.BitCast intrinsic, what IKVM's Float/Double intBitsToFloat etc. lower
 			 * to via intrinsics.c): no value change, just reinterpret the bits */
 			case OP_MOVE_I4_TO_F: UN (WASM_OP_F32_REINTERPRET_I32); break;  /* i32 bits -> f32 */
@@ -5720,25 +6052,37 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * The ALIAS entry is still recorded, but purely to canonicalise TABLE KEYS: it lets a chained load
  * (`a.lowerBound.x`, whose base is this load's dreg) find the original base's entry. If it dies, the
  * only cost is a missed elision. */
+/* An UNPINNED REFERENCE is never cached or reused. lcse_nopin[v] marks an isref vreg whose frame slot
+ * MONO_WASM_JIT_SLOTLIVE elided because its IR def->use range crossed no GC point. LCSE's reuse read is
+ * created at emission and is invisible to that analysis, so it can extend the range past a GC point --
+ * and the two passes disagree about which instructions those are (LCSE deliberately treats a raise as
+ * non-clobbering, since null checks are the commonest thing between a load and its reload, while the
+ * frame model counts a raise as a GC point unless RAISE_NOGC is set on a clause-free method). Refusing
+ * to cache unpinned refs removes the disagreement outright and costs almost nothing: the loads this
+ * pass exists for are the float and int field reads in jbox2d's inner loops, none of which are refs. */
+#define WJ_LCSE_UNPINNED(v)  (lcse_nopin && (v) >= 0 && (v) < nvreg && lcse_nopin [(v)])
 #define LOADM(WOP, AL) do { \
 		int _cb = G_UNLIKELY (lcse != NULL) ? wj_lcse_canon (lcse, ins->sreg1) : -1; \
-		int _hit = (_cb >= 0) ? wj_lcse_find (lcse, ins->opcode, _cb, (gint32) ins->inst_offset) : -1; \
+		int _hit = (_cb >= 0) ? wj_lcse_find (lcse, (WOP), (AL), _cb, (gint32) ins->inst_offset) : -1; \
+		if (G_UNLIKELY (lcse != NULL)) wj_count (WJC_LCSE_LOADS_SEEN); \
 		if (_hit >= 0 && _hit < nvreg && ins->dreg >= 0 && ins->dreg < nvreg && _hit != ins->dreg && \
+		    !WJ_LCSE_UNPINNED (_hit) && \
 		    !(lc.addrslot && (lc.addrslot [ins->dreg] != -1 || lc.addrslot [_hit] != -1))) { \
 			if (!wasm_ld (&body, &lc, _hit)) { fail = "lcse src"; goto done; } \
 			if (!wasm_st (&body, &lc, ins->dreg)) { fail = "lcse dreg"; goto done; } \
-			wj_lcse_add (lcse, WJ_LCSE_ALIAS, 0, ins->dreg, 0, _hit); \
-			lcse_hits++; \
+			wj_lcse_add_alias (lcse, ins->dreg, _hit); \
+			lcse_hits++; wj_count (WJC_LCSE_HITS); \
 			break; \
 		} \
 		if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; } \
 		if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } \
 		wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); \
 		if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; } \
-		if (_cb >= 0 && ins->dreg >= 0 && ins->dreg < nvreg && \
+		if (_cb >= 0 && ins->dreg >= 0 && ins->dreg < nvreg && !WJ_LCSE_UNPINNED (ins->dreg) && \
 		    !(lc.addrslot && (lc.addrslot [ins->dreg] != -1 || lc.addrslot [_cb] != -1))) { \
-			wj_lcse_add (lcse, WJ_LCSE_LOAD, ins->opcode, _cb, (gint32) ins->inst_offset, ins->dreg); \
-			lcse_adds++; \
+			if (lcse->nld >= WJ_LCSE_LOADS) wj_count (WJC_LCSE_EVICT); \
+			wj_lcse_add_load (lcse, (WOP), (AL), _cb, (gint32) ins->inst_offset, ins->dreg); \
+			lcse_adds++; wj_count (WJC_LCSE_ADDS); \
 		} \
 	} while (0)
 			case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE: LOADM (WASM_OP_I32_LOAD, 2); break;
@@ -5750,6 +6094,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			case OP_LOADR8_MEMBASE: LOADM (WASM_OP_F64_LOAD, 3); break;
 			case OP_LOADR4_MEMBASE: LOADM (WASM_OP_F32_LOAD, 2); break;
 #undef LOADM
+#undef WJ_LCSE_UNPINNED
 /* membase store: *(dreg[=inst_destbasereg] + inst_offset) = sreg1. (A reference value still needs its
  * GC write barrier, which mono emits as a separate IR call before the store — so the store is raw.) */
 #define STOREM(WOP, AL) do { \
@@ -5807,9 +6152,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				/* The return value lives in cfg->ret->dreg; the epilogue below
 				 * leaves it on the stack. setret just ensures it holds sreg1. */
 				if (cfg->ret && ins->sreg1 != cfg->ret->dreg) {
-					/* The one write in this emitter that is not ins->dreg, so the generic NCE kill at the
-					 * top of the loop does not cover it. */
+					/* The one write in this emitter that is not ins->dreg, so the generic NCE and LCSE
+					 * kills at the top of the loop do not cover it. Both have to be told by hand. */
 					NN_KILL (cfg->ret->dreg);
+					if (G_UNLIKELY (lcse != NULL))
+						wj_lcse_kill (lcse, li, nvreg, cfg->ret->dreg);
 					if (!wasm_ld (&body, &lc, ins->sreg1) || !wasm_st (&body, &lc, cfg->ret->dreg)) { fail = "setret"; goto done; }
 				}
 				break;
@@ -6103,7 +6450,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				/* Lower a direct managed call to call_indirect through the callee's f-slot.
 				 * Callee args are call->args[0..nparams) (this first, if any); the result goes
 				 * to ins->dreg — except OP_VCALL2 (vtype return): dreg is -1 and the callee writes
-				 * the result through the trailing hidden-vret pointer (wargs[n], the decomposed
+				 * the result through the trailing hidden-vret pointer (WjCallArgs position n, the decomposed
 				 * OUTARG_VTRETADDR address). Bails (whole method -> interp) if the callee isn't
 				 * JITted yet. */
 				MonoCallInst *call = (MonoCallInst *) ins;
@@ -6180,10 +6527,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					uses_calls = TRUE;
 					if (!call->call_info) { fail = "no captured icall args"; goto done; }
 					{
-						int *wargs = (int *) call->call_info;
 						int nm = csig->param_count + (csig->hasthis ? 1 : 0);
 						for (ai = 0; ai < nm; ++ai)
-							if (!wasm_ld (&body, &lc, wargs [ai])) { fail = "icall arg ld"; goto done; }
+							if (!wasm_ld (&body, &lc, wj_arg_vreg (call, ai))) { fail = "icall arg ld"; goto done; }
 					}
 					wasm_i32_const (&body, ifptr);
 					wasm_op (&body, WASM_OP_CALL_INDIRECT);
@@ -6250,21 +6596,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					 * (which gets corrupted by later vreg passes) */
 					if (!call->call_info) { fail = "no captured call args"; goto done; }
 					{
-						int *wargs = (int *) call->call_info;
 						for (ai = 0; ai < cci.nargs; ++ai)
-							if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, wargs, ai)) { fail = "call arg ld"; goto done; }
+							if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, call, ai)) { fail = "call arg ld"; goto done; }
 						/* hidden vret: the trailing param is the ret-buffer address (the decomposed
 						 * OUTARG_VTRETADDR vreg — an addr-frame address the callee writes through) */
-						if (cci.vret_byaddr && !wasm_ld (&body, &lc, wargs [cci.nargs])) { fail = "call vret ld"; goto done; }
+						if (cci.vret_byaddr && !wasm_ld (&body, &lc, wj_arg_vreg (call, cci.nargs))) { fail = "call vret ld"; goto done; }
 					}
 					wasm_i32_const (&body, call_fslot);
 					wasm_op (&body, WASM_OP_CALL_INDIRECT);
 					wasm_uleb (&body, (guint32) type_idx);
 					wasm_uleb (&body, 0); /* table 0 (imported f.f) */
 					if (ct.ret != WASM_VOID) {
-						int *wargs = (int *) call->call_info;
 						if (cci.ret.kind == WJ_ARG_VTYPE_SCALAR) {
-							if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wargs [cci.nargs])) { fail = "call scalar-vtype ret"; goto done; }
+							if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wj_arg_vreg (call, cci.nargs))) { fail = "call scalar-vtype ret"; goto done; }
 						} else if (!wasm_st (&body, &lc, ins->dreg)) { fail = "call dreg"; goto done; }
 					}
 				}
@@ -6321,15 +6665,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								 * in-method catch. The call is pure call_indirect (the per-call perf win); no
 								 * try/catch, no per-call pending-exception check. */
 								wj_emit_fast_count (&body, WJC_FAST_INLINE_AOT);   /* profile: INLINE_AOT direct dispatch */
-								{ int *wargs = (int *) call->call_info; for (ai = 0; ai < cci.nargs; ++ai) if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, wargs, ai)) { fail = "call arg ld"; goto done; } }
+								{ for (ai = 0; ai < cci.nargs; ++ai) if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, call, ai)) { fail = "call arg ld"; goto done; } }
 								if (aot_has_extra) wasm_i32_const (&body, (gint32) (intptr_t) aot_rgctx);   /* trailing rgctx/dummy — only if the body has it */
 								wasm_i32_const (&body, (gint32) (intptr_t) aot_addr);
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) nti); wasm_uleb (&body, 0);
 								if (ct.ret != WASM_VOID) {
 									if (ct.ret == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret);   /* raw AOT body: dirty upper bits */
 									if (cci.ret.kind == WJ_ARG_VTYPE_SCALAR) {
-										int *wargs = (int *) call->call_info;
-										if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wargs [cci.nargs])) { fail = "aot scalar-vtype ret"; goto done; }
+										if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wj_arg_vreg (call, cci.nargs))) { fail = "aot scalar-vtype ret"; goto done; }
 									} else if (!wasm_st (&body, &lc, ins->dreg)) { fail = "call dreg"; goto done; }
 								}
 							}
@@ -6474,15 +6817,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
 							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 							{
-								int *wargs = (int *) call->call_info;
 								for (ai = 0; ai < cci.nargs; ++ai)
-									if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, wargs, ai)) { fail = "late call arg ld"; goto done; }
-								if (cci.vret_byaddr && !wasm_ld (&body, &lc, wargs [cci.nargs])) { fail = "late call vret ld"; goto done; }
+									if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, call, ai)) { fail = "late call arg ld"; goto done; }
+								if (cci.vret_byaddr && !wasm_ld (&body, &lc, wj_arg_vreg (call, cci.nargs))) { fail = "late call vret ld"; goto done; }
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) type_idx); wasm_uleb (&body, 0);
 								if (ct.ret != WASM_VOID) {
 									if (cci.ret.kind == WJ_ARG_VTYPE_SCALAR) {
-										if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wargs [cci.nargs])) { fail = "late scalar-vtype ret"; goto done; }
+										if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wj_arg_vreg (call, cci.nargs))) { fail = "late scalar-vtype ret"; goto done; }
 									} else if (!wasm_st (&body, &lc, ins->dreg)) { fail = "late call dreg"; goto done; }
 								}
 							}
@@ -6522,11 +6864,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) tsi); wasm_uleb (&body, 0);
 					wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) scratch_idx);
 					{
-						int *wargs = (int *) call->call_info;
 						for (ai = 0; ai < cci.nargs; ++ai) {
 							WasmOpcode sop; int al;
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-							if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, wargs, ai)) { fail = "residual arg ld"; goto done; }
+							if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, call, ai)) { fail = "residual arg ld"; goto done; }
 							switch (ct.params [ai]) {
 							case WASM_I32: sop = WASM_OP_I32_STORE; al = 2; break;
 							case WASM_I64: sop = WASM_OP_I64_STORE; al = 3; break;
@@ -6543,7 +6884,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * those per mono_wasm_jit_arg_is_byaddr.) */
 						if (cci.vret_byaddr) {
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-							if (!wasm_ld (&body, &lc, wargs [cci.nargs])) { fail = "residual vret ld"; goto done; }
+							if (!wasm_ld (&body, &lc, wj_arg_vreg (call, cci.nargs))) { fail = "residual vret ld"; goto done; }
 							wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 232 /* WJ_SCRATCH_VRET_OFF */);
 						}
 					}
@@ -6606,8 +6947,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							}
 						}
 						if (cci.ret.kind == WJ_ARG_VTYPE_SCALAR) {
-							int *wargs = (int *) call->call_info;
-							if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wargs [cci.nargs])) { fail = "residual scalar-vtype ret"; goto done; }
+							if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wj_arg_vreg (call, cci.nargs))) { fail = "residual scalar-vtype ret"; goto done; }
 						} else if (!wasm_st (&body, &lc, ins->dreg)) { fail = "residual dreg"; goto done; }
 					}
 					if (late_fslot_block)
@@ -6672,7 +7012,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							m_class_get_parent (call->method->klass) == mono_defaults.multicastdelegate_class;
 						if (!csig->hasthis) { fail = "vcall not instance"; goto done; }
 						if (!call->call_info) { fail = "no captured vcall args"; goto done; }
-						this_vr = ((int *) call->call_info) [0];
+						this_vr = wj_arg_vreg (call, 0);
 						/* byref args/ret go through interp_entry's delicate by-pointer marshalling, which the direct
 						 * residual also bails (stackval_to_data mis-writes byref-of-primitive returns); bail here too. */
 						if (m_type_is_byref (csig->ret)) {
@@ -6951,12 +7291,12 @@ vcall_nullchk_done:
 										if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate ic closed this ld"; goto done; }
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_target_off);
 										for (ai = 1; ai < n2; ++ai)
-											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "delegate ic closed arg ld"; goto done; }
+											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate ic closed arg ld"; goto done; }
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
 									wasm_op (&body, WASM_OP_ELSE);
 										for (ai = 1; ai < n2; ++ai)
-											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "delegate ic open arg ld"; goto done; }
+											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate ic open arg ld"; goto done; }
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) dftdi); wasm_uleb (&body, 0);
 									wasm_op (&body, WASM_OP_END);
@@ -6976,7 +7316,7 @@ vcall_nullchk_done:
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 							/* ic = i64.atomic.load(&vic[way]); $ic = ic; if ((i32)ic != vtab) -> $way_fail */
 							wasm_i32_const (&body, (gint32) (intptr_t) vic + 8 * way);
-							wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0);   /* i64.atomic.load = 0xfe 0x11 (align 3) */
+							wj_emit_ic_load64 (&body, 0);
 							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
 							wasm_op (&body, WASM_OP_I32_WRAP_I64);
 							wasm_op (&body, WASM_OP_I32_NE);
@@ -7026,7 +7366,7 @@ vcall_nullchk_done:
 							wj_emit_fast_count (&body, WJC_FAST_VIC);   /* profile: inline f-slot IC hit (JIT->JIT) */
 							/* FAST: push this+args (fresh from vregs), fslot, call_indirect(ftd); store; skip slow */
 							for (ai = 0; ai < n2; ++ai)
-								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "ic fast arg ld"; goto done; }
+								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "ic fast arg ld"; goto done; }
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
 							if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "ic fast dreg"; goto done; } }
@@ -7048,10 +7388,10 @@ vcall_nullchk_done:
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_way ($after now depth 1) */
 								if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic this ld"; goto done; }
 								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);   /* v = *this */
-								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* a = ic1[way] (reuse vc_ic_idx i64) */
+								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wj_emit_ic_load64 (&body, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* a = ic1[way] (reuse vc_ic_idx i64) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* a.vtab != v -> $aot_way (next) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);   /* ti_kind = a>>32 */
-								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 8); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* b = ic2[way] */
+								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wj_emit_ic_load64 (&body, 8); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* b = ic2[way] */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* b.vtab != v -> $aot_way (next) */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_rgctx_idx);   /* rgctx = b>>32 */
 								wj_emit_fast_count (&body, WJC_FAST_AOTIC);   /* profile: inline AOT-IC hit (JIT->AOT) */
@@ -7060,7 +7400,7 @@ vcall_nullchk_done:
 								 * (params = aic_ati_ne = (this,args)->rv, guaranteed valid: aic==NULL otherwise) carry them into
 								 * whichever arm runs. Halves the emitted arg-load sequence per way — the aic-only code bloat
 								 * that made widening the AOT-IC a net loss (vs the lean f-slot vic). Needs multi-value blocks. */
-								for (ai = 0; ai < n2; ++ai) if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "aot ic arg ld"; goto done; }
+								for (ai = 0; ai < n2; ++ai) if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "aot ic arg ld"; goto done; }
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);   /* kind2bit selector */
 								wasm_op (&body, WASM_OP_IF); wasm_sleb (&body, (gint64) aic_ati_ne);   /* typed block in: (this,args) out: rv */
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);   /* ti */
@@ -7112,7 +7452,7 @@ vcall_nullchk_done:
 							/* FAST PATH: push this + args fresh from their vregs (GC-scanned shadow stack; resolve_fslot did
 							 * not spill, so no GC-invisible window), then the f-slot table index, call_indirect(ftd). */
 							for (ai = 0; ai < n2; ++ai)
-								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "vcall fast arg ld"; goto done; }
+								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vcall fast arg ld"; goto done; }
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 208);            /* f-slot = table index */
 							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
@@ -7166,7 +7506,7 @@ vcall_nullchk_done:
 										int aic_way;
 										wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_filled */
 										for (aic_way = 0; aic_way < mono_wasm_jit_vcall_aot_ways; ++aic_way) {
-										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x11); wasm_memarg (&body, 3, 0); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op (&body, WASM_OP_I32_EQZ);
+										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wj_emit_ic_load64 (&body, 0); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op (&body, WASM_OP_I32_EQZ);
 										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);   /* if (ic1[way].key == 0) */
 										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way);
 										if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic fill v1"; goto done; } wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U);   /* vtab low32 */
@@ -7189,7 +7529,7 @@ vcall_nullchk_done:
 									 * them ONCE and pick the variant with a TYPED if-block (params = ati_ne = (this,args)->rv,
 									 * guaranteed valid — bailed above otherwise). Only the rgctx push + functype differ. */
 									for (ai = 0; ai < n2; ++ai)
-										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "vcall aot arg ld"; goto done; }
+										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vcall aot arg ld"; goto done; }
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
 									wasm_i32_const (&body, 2);
 									wasm_op (&body, WASM_OP_I32_EQ);
@@ -7225,7 +7565,7 @@ vcall_nullchk_done:
 								default:       sop = WASM_OP_I32_STORE; al2 = 2; break;
 								}
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, (int *) call->call_info, ai)) { fail = "vcall arg ld"; goto done; }
+								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vcall arg ld"; goto done; }
 								wasm_op (&body, sop); wasm_memarg (&body, al2, (guint32) (ai * 8));
 							}
 							/* INLINE DELEGATE RECIPE HIT. resolve_fslot/prepare_delegate_call published a
@@ -7436,7 +7776,7 @@ vcall_nullchk_done:
 				nmeth = csig->param_count + (csig->hasthis ? 1 : 0);
 				if (!call->call_info) { fail = "no captured callreg args"; goto done; }
 				for (ai = 0; ai < nmeth; ++ai)
-					if (!wasm_ld (&body, &lc, ((int *) call->call_info) [ai])) { fail = "creg arg ld"; goto done; }
+					if (!wasm_ld (&body, &lc, wj_arg_vreg (call, ai))) { fail = "creg arg ld"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "creg target ld"; goto done; }
 					if (is_membase) { wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) ins->inst_offset); } /* target = *(base + offset) */
 				wasm_op (&body, WASM_OP_CALL_INDIRECT);
@@ -8003,35 +8343,46 @@ mono_arch_emit_call (MonoCompile *cfg, MonoCallInst *call)
  * mono_wasm_emit_call:
  *
  *   COMPILE_WASM analog of mono_llvm_emit_call, invoked from mono_emit_call_args in place of
- * mono_arch_emit_call. The emitter reads call args positionally from a plain int array stored on
- * the (otherwise unused for wasm) call->call_info.
+ * mono_arch_emit_call (an unimplemented stub here). It builds the WjCallArgs descriptor the emitter
+ * reads its arguments from; see the comment on WjCallArgs above for why that descriptor holds
+ * INSTRUCTIONS rather than vreg numbers.
  *
- * Structural capture (the only mode): clone LLVM's mechanism — emit a real OP_*MOVE per scalar/ref/byref
- * arg into a fresh vreg, add it to cfg->cbb, and register the dreg in call->out_ireg_args via
- * mono_call_inst_add_outarg_reg. The moves are ordinary instructions (copyprop/deadce/SSA see the
- * dependency), mono_local_deadce explicitly marks out_ireg_args vregs used, and alias analysis
- * special-cases them (kill_call_arg_alias) — so the captured vregs survive the opt pipeline.
- * The side array then holds the MOVE dregs, and the emitter is unchanged. A ref arg's move dreg is
- * classified ref by the fixpoint's OP_MOVE taint (extra shadow slot per ref arg per call site —
- * the cost of rooting the arg at the call).
+ * Scalar/ref/byref args get a real OP_*MOVE carrier into a fresh vreg, added to cfg->cbb and
+ * registered in call->out_ireg_args -- LLVM's mechanism, and it is what makes these immune to the
+ * pipeline:
+ *   - SSA renaming only renumbers VARIABLES (get_vreg_to_inst != NULL) and multiply-defined local
+ *     vregs; a carrier dreg is a fresh, singly-defined, non-variable vreg, so it is neither.
+ *   - mono_ssa_deadce only nullifies defs of cfg->varinfo entries, so it cannot reach a carrier --
+ *     while the carrier's sreg1 IS a recorded use, which is what keeps the SOURCE alive.
+ *   - mono_local_deadce (local-propagation.c) and alias analysis (kill_call_arg_alias) walk
+ *     out_ireg_args explicitly.
+ * A ref arg's carrier dreg is classified ref by the fixpoint's OP_MOVE taint, costing one shadow
+ * slot per ref arg per call site -- the price of rooting the argument across the call.
  *
- * Vtype args (the VTYPE_SCALAR machinery) get NO move (OP_VMOVE would need vtype plumbing and
- * OP_LLVM_OUTARG_VT has no non-LLVM decompose case): the original dreg is recorded in the side
- * array AND registered in out_ireg_args so DEADCE keeps its def alive. Worst case under opts is a
- * clean "call arg ld" bail, never corruption.
+ * Vtype args get NO carrier of their own: OP_VMOVE would need a fresh vtype VARIABLE, which is
+ * exactly the renameable thing we are trying to avoid, and OP_LLVM_OUTARG_VT has no non-LLVM
+ * decompose case. Instead the source variable is marked MONO_INST_INDIRECT, which takes it out of
+ * SSA entirely (create_new_vars and mono_ssa_remove's coalescer both skip VOLATILE|INDIRECT vars),
+ * so recording the source instruction is enough. That is also honest about the ABI: WJ_ARG_VTYPE_BYADDR
+ * passes these BY ADDRESS out of an addr-frame slot, so their address is genuinely taken. Java (and
+ * therefore IKVM) has no byval structs, so the lost optimization costs nothing on the target workload.
  */
 void
 mono_wasm_emit_call (MonoCompile *cfg, MonoCallInst *call)
 {
 	MonoMethodSignature *sig = call->signature;
 	int n = sig->param_count + sig->hasthis, i;
-	/* Layout: [0..n-1] arg source vregs; [n] the vret ADDRESS vreg (OP_OUTARG_VTRETADDR's dreg —
-	 * decompose turns it into a plain OP_LDADDR of the ret temp) or -1; [n+1..2n] per-arg by-addr
-	 * copy-region byte offsets in the addr frame (filled by the emit-time pre-pass, -1 = none). */
-	int *wargs = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (2 * n + 2));
+	WjCallArgs *w = (WjCallArgs *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjCallArgs));
 
-	for (i = 0; i < 2 * n + 2; ++i)
-		wargs [i] = -1;
+	w->nargs = n;
+	w->carrier = (MonoInst **) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoInst *) * (n + 1));
+	w->capvreg = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (n + 1));
+	w->copyoff = (gint32 *) mono_mempool_alloc (cfg->mempool, sizeof (gint32) * (n > 0 ? n : 1));
+	for (i = 0; i <= n; ++i)
+		w->capvreg [i] = -1;
+	for (i = 0; i < n; ++i)
+		w->copyoff [i] = -1;
+
 	for (i = 0; i < n; ++i) {
 		MonoInst *in = call->args [i];
 		MonoInst *ins;
@@ -8039,8 +8390,12 @@ mono_wasm_emit_call (MonoCompile *cfg, MonoCallInst *call)
 		guint32 opcode = mono_type_to_regmove (cfg, t);
 
 		if (opcode == OP_VMOVE || opcode == OP_XMOVE) {
-			/* vtype: no move — record + register the original dreg (keeps the def live) */
-			wargs [i] = in->dreg;
+			/* vtype: no carrier — pin the source variable out of SSA instead (see above) */
+			MonoInst *var = get_vreg_to_inst (cfg, in->dreg);
+			if (var)
+				var->flags |= MONO_INST_INDIRECT;
+			w->carrier [i] = in;
+			w->capvreg [i] = in->dreg;
 			mono_call_inst_add_outarg_reg (cfg, call, in->dreg, 0, FALSE);
 			continue;
 		}
@@ -8053,19 +8408,22 @@ mono_wasm_emit_call (MonoCompile *cfg, MonoCallInst *call)
 			ins->dreg = mono_alloc_ireg (cfg);
 		ins->sreg1 = in->dreg;
 		MONO_ADD_INS (cfg->cbb, ins);
-		/* always the ireg list (hreg 0), even for f/l moves — positional decode, exactly like
-		 * mono_llvm_emit_call; deadce walks both lists anyway */
+		/* always the ireg list (hreg 0), even for f/l moves — the list is only a liveness hint for
+		 * mono_local_deadce/alias analysis here, not a register assignment */
 		mono_call_inst_add_outarg_reg (cfg, call, ins->dreg, 0, FALSE);
-		wargs [i] = ins->dreg;
+		w->carrier [i] = ins;
+		w->capvreg [i] = ins->dreg;
 	}
-	/* vtype return: capture the hidden-vret ADDRESS vreg (calls.c created call->vret_var before this
-	 * runs). Register it so deadce keeps its defining LDADDR alive; the emitter pushes it as the
-	 * trailing vret param on OP_VCALL2 sites. */
+	/* vtype return: capture the hidden-vret ADDRESS. calls.c created call->vret_var as a real
+	 * OP_OUTARG_VTRETADDR instruction in cfg->cbb (decompose later rewrites it in place into an
+	 * OP_LDADDR of the ret temp, keeping the same MonoInst and dreg), so it is a carrier like any
+	 * other. The emitter pushes it as the trailing vret param on OP_VCALL2 sites. */
 	if (call->vret_var && mini_type_is_vtype (mini_get_underlying_type (sig->ret))) {
-		wargs [n] = call->vret_var->dreg;
+		w->carrier [n] = call->vret_var;
+		w->capvreg [n] = call->vret_var->dreg;
 		mono_call_inst_add_outarg_reg (cfg, call, call->vret_var->dreg, 0, FALSE);
 	}
-	call->call_info = (CallInfo *) wargs;
+	call->call_info = (CallInfo *) w;
 }
 
 void

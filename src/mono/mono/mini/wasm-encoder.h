@@ -157,19 +157,40 @@ typedef enum {
 	WASM_OP_I64_SHL       = 0x86,
 	WASM_OP_I64_SHR_S     = 0x87,
 	WASM_OP_I64_SHR_U     = 0x88,
+	WASM_OP_I64_CLZ       = 0x79,
+	WASM_OP_I64_CTZ       = 0x7a,
+	WASM_OP_I64_POPCNT    = 0x7b,
 	WASM_OP_I64_ROTL      = 0x89,
 	WASM_OP_I64_ROTR      = 0x8a,
 
+	WASM_OP_F32_ABS       = 0x8b,
 	WASM_OP_F32_NEG       = 0x8c,
+	WASM_OP_F32_CEIL      = 0x8d,
+	WASM_OP_F32_FLOOR     = 0x8e,
+	WASM_OP_F32_TRUNC     = 0x8f,
+	WASM_OP_F32_NEAREST   = 0x90,
+	WASM_OP_F32_SQRT      = 0x91,
 	WASM_OP_F32_ADD       = 0x92,
 	WASM_OP_F32_SUB       = 0x93,
 	WASM_OP_F32_MUL       = 0x94,
 	WASM_OP_F32_DIV       = 0x95,
+	WASM_OP_F32_MIN       = 0x96,
+	WASM_OP_F32_MAX       = 0x97,
+	WASM_OP_F32_COPYSIGN  = 0x98,
+	WASM_OP_F64_ABS       = 0x99,
+	WASM_OP_F64_NEG       = 0x9a,
+	WASM_OP_F64_CEIL      = 0x9b,
+	WASM_OP_F64_FLOOR     = 0x9c,
+	WASM_OP_F64_TRUNC     = 0x9d,
+	WASM_OP_F64_NEAREST   = 0x9e,
+	WASM_OP_F64_SQRT      = 0x9f,
 	WASM_OP_F64_ADD       = 0xa0,
 	WASM_OP_F64_SUB       = 0xa1,
 	WASM_OP_F64_MUL       = 0xa2,
 	WASM_OP_F64_DIV       = 0xa3,
-	WASM_OP_F64_NEG       = 0x9a,
+	WASM_OP_F64_MIN       = 0xa4,
+	WASM_OP_F64_MAX       = 0xa5,
+	WASM_OP_F64_COPYSIGN  = 0xa6,
 
 	WASM_OP_I32_WRAP_I64       = 0xa7,
 	WASM_OP_I64_EXTEND_I32_S   = 0xac,
@@ -192,6 +213,28 @@ typedef enum {
 	WASM_OP_I32_EXTEND16_S     = 0xc1,
 } WasmOpcode;
 
+/*
+ * Saturating float->int truncation ("non-trapping float-to-int conversions"), 0xFC-prefixed with a
+ * ULEB sub-opcode -- emit via wasm_op_sat(), not wasm_op(), since these are two-byte forms.
+ *
+ * These are the ONLY correct choice here. The plain 0xa8..0xab / 0xae..0xb1 truncations TRAP on
+ * out-of-range input or NaN, which would turn a merely-unspecified conversion into a hard abort. The
+ * saturating forms clamp to the type's min/max and map NaN to 0, which is exactly Java's (int)float
+ * semantics -- and IKVM-translated Java is the workload. It also matches the interpreter, whose
+ * MINT_CONV_I4_R4 is a plain C `(gint32) float` cast that clang lowers to trunc_sat on wasm, so a
+ * method cannot change behaviour when it tiers from interp to JIT.
+ */
+typedef enum {
+	WASM_SAT_I32_TRUNC_F32_S = 0,
+	WASM_SAT_I32_TRUNC_F32_U = 1,
+	WASM_SAT_I32_TRUNC_F64_S = 2,
+	WASM_SAT_I32_TRUNC_F64_U = 3,
+	WASM_SAT_I64_TRUNC_F32_S = 4,
+	WASM_SAT_I64_TRUNC_F32_U = 5,
+	WASM_SAT_I64_TRUNC_F64_S = 6,
+	WASM_SAT_I64_TRUNC_F64_U = 7,
+} WasmSatOpcode;
+
 /* growable byte buffer */
 typedef struct {
 	guint8 *data;
@@ -211,6 +254,7 @@ void wasm_f64       (WasmBuf *b, double v);
 
 /* convenience instruction emitters (append into a function body buffer) */
 void wasm_op        (WasmBuf *b, WasmOpcode op);
+void wasm_op_sat    (WasmBuf *b, WasmSatOpcode op);   /* 0xFC-prefixed saturating float->int trunc */
 void wasm_op_local  (WasmBuf *b, WasmOpcode op, guint32 local_idx);   /* local.get/set/tee */
 void wasm_i32_const (WasmBuf *b, gint32 v);
 void wasm_i64_const (WasmBuf *b, gint64 v);

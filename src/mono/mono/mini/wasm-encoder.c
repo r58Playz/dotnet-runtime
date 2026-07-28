@@ -115,6 +115,15 @@ wasm_op (WasmBuf *b, WasmOpcode op)
 	wasm_u8 (b, (guint8) op);
 }
 
+/* Saturating float->int truncation: the 0xFC misc prefix plus a ULEB sub-opcode. See WasmSatOpcode
+ * for why the saturating forms are the only correct choice (the plain ones trap). */
+void
+wasm_op_sat (WasmBuf *b, WasmSatOpcode op)
+{
+	wasm_u8 (b, 0xFC);
+	wasm_uleb (b, (guint32) op);
+}
+
 void
 wasm_op_local (WasmBuf *b, WasmOpcode op, guint32 local_idx)
 {

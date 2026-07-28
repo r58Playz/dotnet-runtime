@@ -258,10 +258,11 @@ mini_emit_call_args (MonoCompile *cfg, MonoMethodSignature *sig,
 
 #ifdef TARGET_WASM
 	if (COMPILE_WASM (cfg)) {
-		/* The runtime wasm JIT backend reads call args directly in mono_wasm_emit_method and
+		/* The runtime wasm JIT backend reads call args positionally in mono_wasm_emit_method and
 		 * lowers calls to call_indirect; skip native/LLVM call-arg lowering (mono_arch_emit_call
-		 * is an unimplemented wasm stub). Like LLVM, capture the arg source vregs NOW at
-		 * method-to-ir time — see mono_wasm_emit_call (mini-wasm.c) for the two capture modes. */
+		 * is an unimplemented wasm stub). Like LLVM, the arg carriers are emitted NOW at
+		 * method-to-ir time; the vregs themselves are read back out of those carriers at codegen,
+		 * so the opt pipeline can renumber freely — see WjCallArgs in mini-wasm.c. */
 		mono_wasm_emit_call (cfg, call);
 	} else
 #endif

@@ -3160,42 +3160,69 @@ mini_get_rgctx_access_for_method (MonoMethod *method)
 
 #ifdef TARGET_WASM
 /*
- * wasm_jit_opt_whitelist:
+ * WASM_JIT_OPT_BASE:
  *
- *   MINI opts from the STANDARD pipeline's cfg->opt that the wasm JIT is allowed to inherit
- * (everything else is masked at the compile_wasm fork; the correctness-required base
- * INTRINS|FLOAT32 is always forced back on). Grown one flag at a time per the WS2 rollout
- * (CONSPROP -> COPYPROP -> DEADCE -> BRANCH -> ALIAS -> LOOP -> SSA/ABCREM), each after an
- * offline corpus diff + in-browser GC-guard soak. The vreg-mutating entries are safe to
- * whitelist now that call-arg capture is always structural (mono_wasm_emit_call registers
- * real moves in call->out_ireg_args). NEVER whitelist: CMOV
- * (no OP_CMOV lowering), TAILCALL, SIMD (no v128 lowering), SHARED/GSHARED, LINEARS,
- * EXCEPTION.
+ *   The wasm JIT's optimization set, in full. cfg->opt is REPLACED with this at the compile_wasm
+ * fork rather than filtered from the standard pipeline's value: mono_wasm_force_compile (the
+ * hotness trigger and the virtual-miss force-JIT, i.e. every production compile) passes opts = 0,
+ * so anything derived from the incoming cfg->opt would be unreachable in practice. One mask, one
+ * place, true for every entry path.
+ *
+ *   Both entries are correctness-required, not tuning:
+ *   - INTRINS: without it mini_emit_inst_for_method bails, so intrinsic-only methods like
+ *     Unsafe.As<T>(object) -- whose managed body is `throw PlatformNotSupportedException` -- survive
+ *     as real calls and run that body instead of the intended reinterpret.
+ *   - FLOAT32: sets cfg->r4fp so floats stay native 32-bit (STACK_R4). Without it OP_LOADR4_MEMBASE
+ *     yields a STACK_R8 value while the backend loads a raw f32, and every float-math method fails
+ *     to instantiate with "expected f64, found f32".
+ *
+ * Everything else is opted into through MONO_WASM_JIT_OPT (wasm_jit_extra_opt), which is OR'd on
+ * top. Flags moved here become the default for every JITted method, so move one only after the
+ * offline corpus bail diff and the in-browser GC-guard soak.
  */
-static guint32
-wasm_jit_opt_whitelist (void)
-{
-	return 0;
-}
+#define WASM_JIT_OPT_BASE  (MONO_OPT_INTRINS | MONO_OPT_FLOAT32)
+
+/*
+ * WASM_JIT_OPT_DENY:
+ *
+ *   Flags the wasm emitter cannot survive, cleared unconditionally so that MONO_WASM_JIT_OPT=all
+ * stays a usable bisection tool instead of a way to produce IR with no lowering:
+ *   - SIMD: no v128 lowering, and simd-intrinsics.c only expands vector IR for LLVM, so vector
+ *     methods must stay as calls into AOT'd bodies.
+ *   - CMOV: no OP_CMOV lowering (mono_if_conversion is inert for wasm today only because
+ *     MONO_ARCH_HAVE_CMOV_OPS is undefined -- do not depend on that from two directions).
+ *   - TAILCALL: no OP_TAILCALL lowering.
+ *   - LINEARS: linear-scan global regalloc; the pass is already excluded for COMPILE_WASM in
+ *     mini_method_compile, and wasm has no registers to allocate.
+ *   - SHARED/GSHARED/GSHAREDVT: the emitter bails on shared generic code.
+ *   - EXCEPTION: rewrites clause bodies in ways the island EH lowering does not model.
+ */
+#define WASM_JIT_OPT_DENY  (MONO_OPT_SIMD | MONO_OPT_CMOV | MONO_OPT_TAILCALL | MONO_OPT_LINEARS | \
+                            MONO_OPT_SHARED | MONO_OPT_GSHARED | MONO_OPT_GSHAREDVT | MONO_OPT_EXCEPTION)
 
 /*
  * wasm_jit_extra_opt:
  *
- *   MINI optimization flags to OR onto the wasm-JIT's required base (MONO_OPT_INTRINS | MONO_OPT_FLOAT32)
- * at the compile_wasm fork below. Read once from MONO_WASM_JIT_OPT; default 0 = today's behaviour (-O0
- * bodies: no inlining, so every accessor stays a real call — the call-bound profile).
+ *   MINI optimization flags to OR onto WASM_JIT_OPT_BASE at the compile_wasm fork below. Read once from
+ * MONO_WASM_JIT_OPT; default 0 = base only (-O0 bodies: no inlining, so every accessor stays a real
+ * call — the call-bound profile).
  *
  *   ACCEPTS a comma-separated opt-name list ("inline", "inline,deadce"), "all", or a raw numeric mask.
  * '-name' clears a flag. Unknown names warn and are ignored (never exit(), unlike the driver parser).
+ * WASM_JIT_OPT_DENY is cleared afterwards, so "all" cannot turn on a flag with no lowering.
  *
  *   SAFETY IS PER-FLAG, not uniform:
- *   - INLINE happens in method_to_ir (before codegen) and removes calls outright — the highest-value flag
- *     and the intended first experiment. It does NOT depend on the vreg-mutating passes, so the emitter's
- *     call-arg capture survives; but inlining feeds NEW ref-vreg shapes to the GC-ref passes (isref/
- *     REFBASES), so validate with MONO_WASM_JIT_REFVERIFY=2 + OBJGUARD=1 for missed-ref corruption, not just fps.
- *   - COPYPROP/CONSPROP/DEADCE renumber/coalesce/eliminate vregs. The wasm emitter reads call->args by
- *     vreg number at codegen (see the reset comment at the fork), so these can SILENTLY MISCOMPILE call
- *     args (not a clean bail). Opt-in at your own risk until the emitter captures args robustly.
+ *   - INLINE happens in method_to_ir (before codegen) and removes calls outright — the highest-value flag.
+ *     It does NOT depend on the vreg-mutating passes, but it feeds NEW ref-vreg shapes to the GC-ref passes
+ *     (isref/REFBASES), so validate with MONO_WASM_JIT_REFVERIFY=2 + OBJGUARD=1, not just fps.
+ *   - CONSPROP/COPYPROP/DEADCE are gated on cfg->comp_done & MONO_COMP_SSA in mini_method_compile, so
+ *     they are INERT unless "ssa" (or "abcrem", which implies it) is also set. Setting them alone
+ *     changes nothing but the local passes.
+ *   - SSA/ABCREM rename variable-backed vregs and delete instructions. That is safe for the emitter
+ *     because it re-derives every vreg->local/refslot/addrslot mapping at emit time and reads call args
+ *     through their carrier instructions (mono_wasm_emit_call / wj_arg_vreg) rather than from a
+ *     snapshot — but it does hand the GC-ref classifier vreg shapes it has never seen, so soak with
+ *     REFVERIFY=2 before trusting a number.
  *   The emitter's main switch bails ("unsupported opcode") on any IR shape it can't lower, so an
  * opcode it doesn't know only costs JIT coverage (method -> interp); with MONO_WASM_JIT_STATS=1,
  * mono_wasm_jit_dump_bail_hist() then names the top newly-bailed opcodes for bisection.
@@ -3260,11 +3287,8 @@ wasm_jit_extra_opt (void)
 		g_strfreev (parts);
 		cached = opt;
 	}
-	/* Never allow SIMD: the wasm JIT has no v128 lowering, and simd-intrinsics.c only
-	 * expands vector IR for LLVM — vector methods must stay as calls into AOT'd bodies.
-	 * (Also guards "all".) */
-	cached &= ~ (guint32) MONO_OPT_SIMD;
-	printf ("MONO_WASM_JIT_OPT = 0x%x (added to the INTRINS|FLOAT32 base)\n", cached);
+	cached &= ~ (guint32) WASM_JIT_OPT_DENY;
+	printf ("MONO_WASM_JIT_OPT = 0x%x (added to base 0x%x)\n", cached, (unsigned) WASM_JIT_OPT_BASE);
 	fflush (stdout);
 	return cached;
 }
@@ -3461,28 +3485,14 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 			 * regalloc/spill passes that read it never run for COMPILE_WASM; the OP_GC_LIVENESS_*
 			 * annotations decompose emits under it are NOPs in the wasm emitter. */
 			cfg->compute_gc_maps = TRUE;
-			/* Disable IR optimizations: the wasm backend reads call->args directly at codegen,
-			 * but copyprop/etc. (which assume a native/LLVM emit_call consumes them) mangle the
-			 * call-arg vregs. opt=0 keeps the explicit arg-setup moves so calls lower correctly. */
-			/* Keep MONO_OPT_INTRINS on: without it mini_emit_inst_for_method bails (intrinsics.c),
-				 * so intrinsic-only methods like Unsafe.As<T>(object) — managed body `throw
-				 * PlatformNotSupportedException` — survive as real calls, get residualed, and run that
-				 * throwing/garbage body instead of the intended reinterpret. Intrinsic substitution only
-				 * replaces calls with inline ops, so it doesn't disturb the call-arg-vreg capture that
-				 * the copyprop concern (below) is about. */
-				/* MONO_OPT_FLOAT32 sets cfg->r4fp: floats stay native 32-bit (STACK_R4) instead of
-				 * being promoted to R8 on the stack. Without it, OP_LOADR4_MEMBASE yields a STACK_R8
-				 * value (mono widens the loaded f32 to f64) but the wasm backend loads raw f32 -> an f32
-				 * feeds f64 ops -> "expected f64, found f32" module CompileErrors on every float-math
-				 * method. With r4fp on, the backend's native-f32 load/store/const handling matches and
-				 * float arithmetic lowers to the OP_R* (f32) ops below. */
-				/* Whitelist instead of the old hard reset: keep the opts from the standard pipeline
-				 * that are known-safe for the wasm emitter (wasm_jit_opt_whitelist — currently empty,
-				 * grown per WS2 soak step), always force the correctness-required base, and OR the
-				 * MONO_WASM_JIT_OPT experiment knob. "inline" is the intended first try (removes calls
-				 * before codegen). */
-				cfg->opt = (cfg->opt & wasm_jit_opt_whitelist ()) | MONO_OPT_INTRINS | MONO_OPT_FLOAT32;
-				cfg->opt |= wasm_jit_extra_opt ();
+			/*
+			 * REPLACE cfg->opt outright rather than filtering it. The incoming value is not a useful
+			 * starting point: mono_wasm_force_compile — the hotness trigger and the virtual-miss
+			 * force-JIT, i.e. every production compile — passes opts = 0, so anything AND-ed with it
+			 * is zero. WASM_JIT_OPT_BASE (above) documents why its two flags are correctness-required;
+			 * everything beyond that is opted into through MONO_WASM_JIT_OPT.
+			 */
+			cfg->opt = WASM_JIT_OPT_BASE | wasm_jit_extra_opt ();
 			/* Opt-in: emit llvmonly indirect-dispatch IR (ftndesc) for virtual/interp calls.
 			 * Required for virtual dispatch on wasm (the normal vtable-slot dispatch calls a
 			 * fixed-signature trampoline → call_indirect mismatch). The codegen fork still routes

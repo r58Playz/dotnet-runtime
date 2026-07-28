@@ -140,6 +140,39 @@ op_phi_to_move (int opcode)
 	return -1;
 }
 
+/*
+ * phi_move_opcode:
+ *
+ *   The move opcode that materializes PHI's value into VAR when leaving SSA form.
+ *
+ * Derived from the VARIABLE's eval-stack type rather than from the phi opcode, because the phi
+ * opcode is not a faithful record of it: mono_ssa_compute's opcode switch has no STACK_R4 case, so
+ * an R4 variable keeps NEW_PHI's default OP_PHI and op_phi_to_move turns it into an INTEGER
+ * OP_MOVE. That is invisible on a backend where a register move is type-agnostic, but fatal on one
+ * where the move opcode determines the machine type of the copy: the wasm JIT types every vreg from
+ * its defining opcode, so an integer move on an f32 value makes it emit `local.get <i32>` for an f32
+ * local -- a module that fails validation at instantiate rather than a clean bail.
+ *
+ * STACK_I8 is here for the same reason, and only reaches this path on a 32-bit target that keeps
+ * longs native (COMPILE_METHODIR, see mono_ssa_compute); everywhere else it either uses a plain
+ * 64-bit OP_MOVE or is excluded from SSA entirely.
+ */
+static int
+phi_move_opcode (MonoCompile *cfg, MonoInst *phi, MonoInst *var)
+{
+	if (var) {
+		switch (var->type) {
+		case STACK_R4:
+			return cfg->r4fp ? OP_RMOVE : OP_FMOVE;
+		case STACK_I8:
+			return SIZEOF_REGISTER == 8 ? OP_MOVE : OP_LMOVE;
+		default:
+			break;
+		}
+	}
+	return op_phi_to_move (phi->opcode);
+}
+
 static void
 record_use (MonoCompile *cfg, MonoInst *var, MonoBasicBlock *bb, MonoInst *ins)
 {
@@ -295,8 +328,16 @@ create_new_vars (MonoCompile *cfg, int max_vars, MonoBasicBlock *bb, gboolean *o
 				info->def_bb = bb;
 			}
 			else if (G_UNLIKELY (!var && lvreg_defined [ins->dreg] && (ins->dreg >= MONO_MAX_IREGS))) {
-				/* Perform renaming for local vregs */
-				lvreg_stack [ins->dreg] = vreg_is_ref (cfg, ins->dreg) ? mono_alloc_ireg_ref (cfg) : mono_alloc_preg (cfg);
+				/* Perform renaming for local vregs.
+				 *
+				 * The new vreg must inherit the GC classification of the old one. mono_alloc_preg
+				 * marks nothing, so a MANAGED POINTER vreg used to come out of renaming
+				 * unclassified -- and a backend that decides frame residency from vreg_is_mp (the
+				 * wasm JIT does; see mono_compile_create_var_for_vreg) would then leave an interior
+				 * pointer in an unscanned location, where a moving collection makes it stale
+				 * exactly as it would an object reference. */
+				lvreg_stack [ins->dreg] = vreg_is_ref (cfg, ins->dreg) ? mono_alloc_ireg_ref (cfg)
+					: (vreg_is_mp (cfg, ins->dreg) ? mono_alloc_ireg_mp (cfg) : mono_alloc_preg (cfg));
 				ins->dreg = lvreg_stack [ins->dreg];
 			}
 			else
@@ -458,7 +499,18 @@ mono_ssa_compute (MonoCompile *cfg)
 		guint idx;
 
 #if SIZEOF_REGISTER == 4
-		if (var->type == STACK_I8 && !COMPILE_LLVM (cfg))
+		/*
+		 * A long variable on a 32-bit target normally lives in a register PAIR, and
+		 * mono_decompose_long_opts (which runs BEFORE this pass) rewrites every long op into i32
+		 * halves, so nothing defines the pair vreg directly and it needs no phi.
+		 *
+		 * COMPILE_METHODIR targets keep longs native and SKIP that decomposition (see the
+		 * !COMPILE_METHODIR guard on mono_decompose_long_opts in mini_method_compile), so their
+		 * long ops define the variable's own vreg. Skipping phi insertion there while
+		 * create_new_vars still RENAMES those defs produces SSA with no merge at joins -- a use
+		 * after a join silently reads the immediate dominator's version. So they get phis.
+		 */
+		if (var->type == STACK_I8 && !COMPILE_METHODIR (cfg))
 			continue;
 #endif
 		if (var->flags & (MONO_INST_VOLATILE|MONO_INST_INDIRECT))
@@ -638,7 +690,7 @@ mono_ssa_remove (MonoCompile *cfg)
 						break;
 
 				if ((bb->in_count > 1) && (j == bb->in_count)) {
-					ins->opcode = GINT_TO_OPCODE (op_phi_to_move (ins->opcode));
+					ins->opcode = GINT_TO_OPCODE (phi_move_opcode (cfg, ins, var));
 					if (ins->opcode == OP_VMOVE)
 						g_assert (ins->klass);
 					ins->sreg1 = first;
@@ -650,7 +702,7 @@ mono_ssa_remove (MonoCompile *cfg)
 						if (cfg->verbose_level >= 4)
 							printf ("\tADD R%d <- R%d in BB%d\n", var->dreg, sreg, pred->block_num);
 						if (var->dreg != sreg) {
-							MONO_INST_NEW (cfg, move, op_phi_to_move (ins->opcode));
+							MONO_INST_NEW (cfg, move, phi_move_opcode (cfg, ins, var));
 							if (move->opcode == OP_VMOVE) {
 								g_assert (ins->klass);
 								move->klass = ins->klass;
@@ -704,7 +756,8 @@ mono_ssa_remove (MonoCompile *cfg)
 					 * during deadce.
 					 */
 					if ((vmv->reg != -1) && (vmv->idx != vmv->reg) && (MONO_VARINFO (cfg, vmv->reg)->reg != -1)) {
-						printf ("COALESCE: R%d -> R%d\n", ins->dreg, cfg->varinfo [vmv->reg]->dreg);
+						if (cfg->verbose_level >= 4)
+							printf ("COALESCE: R%d -> R%d\n", ins->dreg, cfg->varinfo [vmv->reg]->dreg);
 						ins->dreg = cfg->varinfo [vmv->reg]->dreg;
 					}
 				}
@@ -718,7 +771,8 @@ mono_ssa_remove (MonoCompile *cfg)
 					MonoMethodVar *vmv = MONO_VARINFO (cfg, var->inst_c0);
 
 					if ((vmv->reg != -1) && (vmv->idx != vmv->reg) && (MONO_VARINFO (cfg, vmv->reg)->reg != -1)) {
-						printf ("COALESCE: R%d -> R%d\n", sregs [i], cfg->varinfo [vmv->reg]->dreg);
+						if (cfg->verbose_level >= 4)
+							printf ("COALESCE: R%d -> R%d\n", sregs [i], cfg->varinfo [vmv->reg]->dreg);
 						sregs [i] = cfg->varinfo [vmv->reg]->dreg;
 					}
 				}
