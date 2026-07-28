@@ -189,6 +189,11 @@ enum {
 	 * SLOT_ZERO_STORES = dead-slot zero stores emitted at a vreg's last use;
 	 * FRAME_BYTES = total C-stack frame bytes across compiled methods (ref + addr slots). */
 	WJC_REF_SLOTS, WJC_REF_WT_VREGS, WJC_SLOTS_ELIDED, WJC_SLOT_ZERO_STORES, WJC_FRAME_BYTES,
+	/* MONO_WASM_JIT_LCSE reach. LOADS_SEEN is every membase load routed through the LOADM macro while
+	 * the pass is on, so HITS/LOADS_SEEN is the true elimination rate -- ADDS/HITS is not, because ADDS
+	 * silently under-counts whenever the table is full. EVICT counts adds that displaced an older entry,
+	 * i.e. tells you directly whether WJ_LCSE_LOADS is the binding constraint. */
+	WJC_LCSE_LOADS_SEEN, WJC_LCSE_ADDS, WJC_LCSE_HITS, WJC_LCSE_EVICT,
 	WJC_MAX
 };
 
