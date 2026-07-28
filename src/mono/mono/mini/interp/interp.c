@@ -5292,6 +5292,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	gboolean use_ic = TRUE;   /* virtual-dispatch resolve cache (always on) */
 	int ic_ways = mono_wasm_jit_vcall_ways;
 	gboolean ic_hit = FALSE;
+	int ic_way = -1;
 	if (use_ic) {
 		/* N-way scan: first vtable match wins, in the SAME order the emitted inline IC checks the ways, so
 		 * the C helper and the inline fast path stay in agreement. */
@@ -5302,12 +5303,32 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 				imethod = (InterpMethod *) (gsize) (guint32) (c >> 32);   /* IC hit: skip the resolve + get_imethod */
 				target = imethod->method;
 				ic_hit = TRUE;
+				ic_way = k;
 				break;
 			}
 		}
 	}
 	if (ic_hit) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_HIT);
+		/* FOLLOW TIERING BEFORE READING THE F-SLOT. Tiering REPLACES an InterpMethod rather than mutating
+		 * it (get_tier_up_imethod swaps the interp_code_hash entry and links old->optimized_imethod), and
+		 * wasm_jit_compile_publish deliberately re-looks-up the CANONICAL imethod under the jit-mm lock
+		 * before writing wasm_jit_fslot. So an IC entry cached before tier-up permanently addresses an
+		 * object that will never receive an f-slot: the fslot check below reads 0 forever, every call falls
+		 * back to interp_entry, and wasm_jit_maybe_compile can't help because the canonical method is
+		 * already compiled. That is a PERMANENT residual on the hottest monomorphic sites — measured as
+		 * 144,464 of 144,464 steady-state residuals in the jbox2d bench, ~99% of them one method
+		 * (PolygonShape:computeAABB), with ic_hit tracking the residual count exactly.
+		 * Re-cache the forwarded imethod so subsequent hits skip the walk. The delegate IC already does
+		 * exactly this (wasm_jit_prepare_delegate_call); the vcall IC was missing it. */
+		InterpMethod *cached_imethod = imethod;
+		while (imethod->optimized_imethod)
+			imethod = imethod->optimized_imethod;
+		if (G_UNLIKELY (imethod != cached_imethod)) {
+			target = imethod->method;
+			mono_atomic_store_i64 ((volatile gint64 *) (icp + ic_way),
+				(gint64) (((guint64) (guint32) (gsize) imethod << 32) | (guint32) (gsize) vt));
+		}
 	} else {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_MISS);
 		/* FAST MISS PATH: resolve the override via the interp's per-(vtable,slot) cache
@@ -5343,6 +5364,11 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 				gvm_slot = (gint32) (guint32) meta;
 			}
 			imethod = get_virtual_method_fast (base_im, vt, gvm_slot);
+			/* Same tiering hazard as the IC-hit path above: interp_vtable[slot] is filled once and is not
+			 * re-pointed when the override tiers up, so resolve the forwarding link BEFORE this imethod is
+			 * cached into the IC — otherwise the entry we are about to publish is born stale. */
+			while (imethod->optimized_imethod)
+				imethod = imethod->optimized_imethod;
 			target = imethod->method;
 		}
 		/* SIGNATURE-COMPATIBILITY GUARD. The wasm-JIT bakes the call_indirect functype from the CALL SITE's
