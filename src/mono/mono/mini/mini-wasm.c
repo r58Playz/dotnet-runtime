@@ -13,6 +13,7 @@
 #include <mono/metadata/gc-internals.h>
 #include <mono/metadata/mono-hash-internals.h>
 #include <mono/utils/mono-time.h>
+#include <mono/utils/mono-memory-model.h>   /* MONO_MEMORY_BARRIER_* for OP_MEMORY_BARRIER lowering */
 
 #ifdef HOST_BROWSER
 #ifndef DISABLE_THREADS
@@ -5623,12 +5624,44 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			}
 			case OP_MEMORY_BARRIER:
 #ifndef DISABLE_THREADS
-				/* Match the jiterpreter (MINT_MONO_MEMORY_BARRIER): emit a seq-cst atomic.fence
-				 * (0xfe 0x03 0x00). Valid because our module imports shared memory. On a non-threads
-				 * build the heap isn't shared and the barrier is a no-op. */
-				wasm_u8 (&body, 0xfe);  /* atomic prefix */
-				wasm_u8 (&body, 0x03);  /* atomic.fence */
-				wasm_u8 (&body, 0x00);  /* memory order: sequentially consistent */
+				/* Only a SEQ barrier gets a fence, as mini-amd64.c does.
+				 *
+				 * This used to fence unconditionally ("match the jiterpreter"), but
+				 * MINT_MONO_MEMORY_BARRIER is the lowering of the SEQ case only; copying it for ACQ/REL
+				 * was the mistake. V8 lowers atomic.fence to a real `mfence` on x64, and it cost 4.24%
+				 * of total profiled time on jbox2d -- the largest single unclassified instruction in the
+				 * profile, ahead of `ret`, and 54% of the stelemref wrapper by itself. EVERY implicit
+				 * barrier the front end emits is ACQ or REL (reference stores under !weak_memory_model:
+				 * memory-access.c:522, method-to-ir.c:2373 and friends); SEQ comes only from explicit
+				 * Interlocked / Thread.MemoryBarrier / Volatile intrinsics.
+				 *
+				 * Why dropping ACQ/REL is sound, in order of how load-bearing it is:
+				 *
+				 * 1. This emitter has no OP_ATOMIC_LOAD / OP_ATOMIC_STORE cases at all -- the only wasm
+				 *    atomics it emits are for its own inline caches. So a method containing a managed
+				 *    volatile or Interlocked access bails and runs in the interpreter or AOT'd code.
+				 *    Every OP_MEMORY_BARRIER we actually emit therefore orders ORDINARY, non-atomic
+				 *    accesses. Per the wasm relaxed-memory model that is a data race with or without
+				 *    the fence: atomic.fence does not make an ordinary store a synchronising one, so it
+				 *    never conferred the ordering it looked like it did.
+				 * 2. Where synchronisation does go through wasm atomics, all wasm atomics are currently
+				 *    seq-cst, so the ordering is carried by the atomic access itself -- same-thread
+				 *    accesses are happens-before ordered and an atomic read-from establishes cross-thread
+				 *    happens-before. A separate ACQ/REL fence cannot strengthen that. Binaryen encodes
+				 *    exactly this: visitAtomicFence lowers atomic.fence to nothing while only seq-cst
+				 *    atomics exist.
+				 * 3. Corroboration, not justification: the 210 MB AOT'd dotnet.native.wasm contains ZERO
+				 *    atomic.fence. mini-llvm.c does pass the kind to mono_llvm_build_fence and LLVM does
+				 *    emit a fence for every ordering -- wasm-opt then strips them all, for reason (2).
+				 *
+				 * SEQ keeps a real fence deliberately: .NET permits low-level patterns that expect
+				 * Thread.MemoryBarrier to be a physical full barrier, and those sites are rare enough
+				 * that the mfence costs nothing measurable. */
+				if (ins->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_SEQ) {
+					wasm_u8 (&body, 0xfe);  /* atomic prefix */
+					wasm_u8 (&body, 0x03);  /* atomic.fence */
+					wasm_u8 (&body, 0x00);  /* memory order: sequentially consistent */
+				}
 #endif
 				break;
 			case OP_AOTCONST: {
