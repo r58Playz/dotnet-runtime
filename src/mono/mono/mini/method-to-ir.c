@@ -4518,22 +4518,99 @@ mini_emit_array_store (MonoCompile *cfg, MonoClass *klass, MonoInst **sp, gboole
 		iargs [1] = index_ins;
 		iargs [0] = sp [0];
 
-		MonoClass *array_class = sp [0]->klass;
-		if (array_class && m_class_get_rank (array_class) == 1) {
-			MonoClass *eclass = m_class_get_element_class (array_class);
-			if (m_class_is_sealed (eclass)) {
-				helper = mono_marshal_get_virtual_stelemref (array_class);
-				/* Make a non-virtual call if possible */
-				return mono_emit_method_call (cfg, helper, iargs, NULL);
+		/*
+		 * WASM: inline the exact-runtime-type fast path.
+		 *
+		 * Every reference array store otherwise costs a VIRTUAL call into the stelemref wrapper
+		 * (virtual because the element class is usually not sealed, so array covariance means the
+		 * runtime array may be a subtype array and only its own vtable knows the real element
+		 * class). On the jbox2d profile that wrapper is 6.90% of total time across its JITted and
+		 * AOT'd copies -- about 85% of ALL runtime-wrapper time and the single most concentrated
+		 * cost in the program.
+		 *
+		 * The wrapper's own logic (marshal-lightweight.c, STELEMREF_CLASS) is:
+		 *     slot = ldelema (array, index)            // bound check
+		 *     if (!value) goto store
+		 *     aklass = array->vtable->klass->element_class
+		 *     vklass = value->vtable->klass
+		 *     if (vklass->idepth < aklass->idepth)                  throw
+		 *     if (vklass->supertypes [aklass->idepth - 1] != aklass) throw
+		 *     store
+		 * We inline the two cases that need no supertype walk at all:
+		 *   - value == NULL   -- null is assignable to any reference array.
+		 *   - vklass == aklass -- an EXACT runtime match. Sound because supertypes[idepth-1] of a
+		 *     class is the class itself, so the wrapper's second test would pass trivially. Note
+		 *     this compares the element class loaded from the ACTUAL array at runtime, NOT the
+		 *     static sp[0]->klass: comparing against the static type would be unsound under
+		 *     covariance (a Pair[]-typed local can hold a SubPair[], where storing a Pair must
+		 *     throw). Anything else -- including every genuinely polymorphic store -- falls
+		 *     through to the unchanged wrapper call, so semantics and exceptions are preserved.
+		 *
+		 * Exception ordering is preserved too. The wrapper bound-checks before the type check, and
+		 * so does this: a null value branches straight to the store whose ldelema carries the same
+		 * bound check, and a type mismatch reaches the wrapper which redoes ldelema first. A null
+		 * ARRAY faults on the vtable load here (FAULT flag) and in ldelema there -- NRE either way.
+		 */
+		MonoBasicBlock *fast_store_bb = NULL, *slow_bb = NULL, *end_bb = NULL;
+		if (COMPILE_WASM (cfg)) {
+			int avt_reg = alloc_preg (cfg), ak_reg = alloc_preg (cfg), aec_reg = alloc_preg (cfg);
+			int vvt_reg = alloc_preg (cfg), vk_reg = alloc_preg (cfg);
+
+			NEW_BBLOCK (cfg, fast_store_bb);
+			NEW_BBLOCK (cfg, slow_bb);
+			NEW_BBLOCK (cfg, end_bb);
+
+			/* if (value == NULL) goto fast_store */
+			MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, sp [2]->dreg, 0);
+			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, fast_store_bb);
+
+			/* aklass = array->vtable->klass->element_class */
+			MONO_EMIT_NEW_LOAD_MEMBASE_FAULT (cfg, avt_reg, sp [0]->dreg, MONO_STRUCT_OFFSET (MonoObject, vtable));
+			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, ak_reg, avt_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
+			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, aec_reg, ak_reg, GINTPTR_TO_TMREG (m_class_offsetof_element_class ()));
+
+			/* vklass = value->vtable->klass  (value is known non-null here) */
+			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, vvt_reg, sp [2]->dreg, MONO_STRUCT_OFFSET (MonoObject, vtable));
+			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, vk_reg, vvt_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
+
+			/* if (vklass != aklass) goto slow */
+			MONO_EMIT_NEW_BIALU (cfg, OP_COMPARE, -1, vk_reg, aec_reg);
+			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, slow_bb);
+
+			/* fast store: same sequence the non-reference path below emits, plus the barrier */
+			MONO_START_BB (cfg, fast_store_bb);
+			{
+				MonoInst *addr, *sins;
+				addr = mini_emit_ldelema_1_ins (cfg, klass, sp [0], sp [1], TRUE, FALSE);
+				if (!mini_debug_options.weak_memory_model)
+					mini_emit_memory_barrier (cfg, MONO_MEMORY_BARRIER_REL);
+				EMIT_NEW_STORE_MEMBASE_TYPE (cfg, sins, m_class_get_byval_arg (klass), addr->dreg, 0, sp [2]->dreg);
+				mini_emit_write_barrier (cfg, addr, sp [2]);
 			}
+			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, end_bb);
+
+			MONO_START_BB (cfg, slow_bb);
 		}
 
-		helper = mono_marshal_get_virtual_stelemref (obj_array);
-		if (!helper->slot)
-			mono_class_setup_vtable (obj_array);
-		g_assert (helper->slot);
+		MonoInst *res;
+		MonoClass *array_class = sp [0]->klass;
+		if (array_class && m_class_get_rank (array_class) == 1 &&
+			m_class_is_sealed (m_class_get_element_class (array_class))) {
+			helper = mono_marshal_get_virtual_stelemref (array_class);
+			/* Make a non-virtual call if possible */
+			res = mono_emit_method_call (cfg, helper, iargs, NULL);
+		} else {
+			helper = mono_marshal_get_virtual_stelemref (obj_array);
+			if (!helper->slot)
+				mono_class_setup_vtable (obj_array);
+			g_assert (helper->slot);
 
-		return mono_emit_method_call (cfg, helper, iargs, sp [0]);
+			res = mono_emit_method_call (cfg, helper, iargs, sp [0]);
+		}
+
+		if (COMPILE_WASM (cfg))
+			MONO_START_BB (cfg, end_bb);
+		return res;
 	} else {
 		MonoInst *ins;
 
