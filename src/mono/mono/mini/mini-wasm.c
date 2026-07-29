@@ -76,11 +76,18 @@ int mono_wasm_jit_devirt_profile = 0;
 /* MONO_WASM_JIT_BATCH_MODULE=1: emit an SCC batch's members into ONE WebAssembly.Module instead of one
  * module each. V8 never inlines across a module boundary but inlines freely within one, so co-location
  * alone takes an accessor-sized call from ~1.5ns to the ~0.25ns no-call floor (scratchpad/callbench.mjs).
- * Default off while the driver is a re-emit second pass. */
+ * Mode 1 is the automatic graph batcher; modes 2/3 remain diagnostic controls. */
 int mono_wasm_jit_batch_module = 0;
 /* MONO_WASM_JIT_BATCH_ALL_AT: with BATCH_MODULE=3, the registered-method count at which the whole
  * program is folded into a single module (the co-location upper-bound experiment). */
 int mono_wasm_jit_batch_all_at = 250;
+/* BATCH_MODULE=1 is the shipping automatic batcher.  It waits for the discovered method/edge graph
+ * to settle, then greedily co-locates its hot connected components.  These are planner bounds rather
+ * than a trigger count: registration/edge stability decides WHEN to plan. */
+int mono_wasm_jit_batch_settle = 128;
+int mono_wasm_jit_batch_min = 16;
+int mono_wasm_jit_batch_max = 384;
+int mono_wasm_jit_batch_bytes = 786432;
 int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC (1 = monomorphic/legacy). Clamped [1,8]. 2 captures the ~63% of the miss population that are 2-type sites (arity depth-1) which a 1-way IC gets 0% of. */
 int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inline AOT-vcall IC (1 = monomorphic first-wins/legacy). Clamped [1,8]. 2 captures the AOT-backed 2-type sites (arity depth-0 once VCALL_WAYS>=2): the loser vtable of a 2-way AOT site is stuck reaching the resolve helper behind the 1-entry cache. */
 int mono_wasm_jit_vcall_shared_miss_enabled = 1; /* MONO_WASM_JIT_VCALL_SHARED_MISS: one signature-neutral cold miss stub using a lazy GC-pinned worker frame */
@@ -116,6 +123,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_profile; const char *dp = g_getenv ("MONO_WASM_JIT_DEVIRT_PROFILE"); mono_wasm_jit_devirt_profile = (dp && *dp && *dp != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_batch_module; const char *bm = g_getenv ("MONO_WASM_JIT_BATCH_MODULE"); mono_wasm_jit_batch_module = (bm && *bm) ? atoi (bm) : 0; }   /* 1 = batch islands; 2 = single-member batches (bisect); 3 = whole program in one module (upper bound) */
 	{ extern int mono_wasm_jit_batch_all_at; const char *ba = g_getenv ("MONO_WASM_JIT_BATCH_ALL_AT"); mono_wasm_jit_batch_all_at = (ba && *ba) ? atoi (ba) : 250; }
+	{ extern int mono_wasm_jit_batch_settle; const char *bs = g_getenv ("MONO_WASM_JIT_BATCH_SETTLE"); mono_wasm_jit_batch_settle = (bs && *bs && atoi (bs) > 0) ? atoi (bs) : 128; }
+	{ extern int mono_wasm_jit_batch_min; const char *bn = g_getenv ("MONO_WASM_JIT_BATCH_MIN"); mono_wasm_jit_batch_min = (bn && *bn && atoi (bn) > 1) ? atoi (bn) : 16; }
+	{ extern int mono_wasm_jit_batch_max; const char *bx = g_getenv ("MONO_WASM_JIT_BATCH_MAX"); int n = (bx && *bx) ? atoi (bx) : 384; mono_wasm_jit_batch_max = n < 2 ? 2 : (n > 512 ? 512 : n); }
+	{ extern int mono_wasm_jit_batch_bytes; const char *bb = g_getenv ("MONO_WASM_JIT_BATCH_BYTES"); mono_wasm_jit_batch_bytes = (bb && *bb && atoi (bb) > 0) ? atoi (bb) : 786432; }
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
 	{ extern int mono_wasm_jit_vcall_aot_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_AOT_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_aot_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline AOT-vcall IC; clamp [1,8]; 1 = legacy first-wins */
 	{ extern int mono_wasm_jit_vcall_shared_miss_enabled; const char *sm = g_getenv ("MONO_WASM_JIT_VCALL_SHARED_MISS"); mono_wasm_jit_vcall_shared_miss_enabled = (sm && *sm) ? (*sm != '0') : 1; }
@@ -843,12 +854,15 @@ typedef struct {
 	int n;
 	int *e;          /* n entry-thunk slots, member order */
 	int *f;          /* n method slots */
+	int *desc;       /* registry descriptor ids; lets admission mark every sibling generation live */
 	void *bytes;     /* the one module; owned here, shared by all members */
 	int len;
+	guint32 generation;
 } WjBatchDesc;
 
 typedef struct {
 	int e, f, len;
+	int body_len;       /* original single-method module size; retained across generational rebatches */
 	void *bytes;
 	MonoMethod *body_method;    /* method whose IR was emitted */
 	MonoMethod *logical_method; /* wrapper/method whose InterpMethod publishes this descriptor */
@@ -859,11 +873,13 @@ typedef struct {
 	guint32 *dep_sig;
 	MonoMethod **dep_method; /* callee behind each dep f-slot (diagnostics only) */
 	WjBatchDesc *batch;      /* non-NULL iff this method shares a module with others */
+	guint32 generation;      /* zero for standalone; bumped whenever the slots are rebound */
 } WjRegEntry;
 #define WJ_REG_CHUNK   8192
 #define WJ_REG_NCHUNKS 1024      /* up to 8M JITted methods; the 4KB top-level pointer array never moves */
 static WjRegEntry *wj_reg_chunks [WJ_REG_NCHUNKS];
 static volatile int wj_reg_n = 0;
+static volatile gint32 wj_batch_generation;
 #define WJ_SLOT_CHUNK 8192
 #define WJ_SLOT_NCHUNKS 1024
 static gint32 *wj_fslot_desc_chunks [WJ_SLOT_NCHUNKS]; /* f-slot -> descriptor id (registry index + 1) */
@@ -907,6 +923,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			chunk [n % WJ_REG_CHUNK].f = f_slot;
 			chunk [n % WJ_REG_CHUNK].bytes = bytes;
 			chunk [n % WJ_REG_CHUNK].len = len;
+			chunk [n % WJ_REG_CHUNK].body_len = len;
 			chunk [n % WJ_REG_CHUNK].body_method = method;
 			chunk [n % WJ_REG_CHUNK].logical_method = method;
 			chunk [n % WJ_REG_CHUNK].f_sig_id = f_sig_id;
@@ -1033,6 +1050,7 @@ wj_desc_for_fslot (int fslot)
 /* Per-worker admission state. Generated direct calls contain no liveness checks: a root may enter only
  * after this DFS has installed its complete immutable direct-call closure in the worker's table. */
 static __thread guint8 *wj_desc_state;
+static __thread guint32 *wj_desc_generation;
 static __thread int wj_desc_state_cap;
 
 static void
@@ -1044,7 +1062,9 @@ wj_desc_state_ensure (int id)
 		int old = wj_desc_state_cap, cap = old ? old : 1024;
 		while (id >= cap) cap *= 2;
 		wj_desc_state = (guint8 *) g_realloc (wj_desc_state, cap);
+		wj_desc_generation = (guint32 *) g_realloc (wj_desc_generation, sizeof (guint32) * cap);
 		memset (wj_desc_state + old, 0, cap - old);
+		memset (wj_desc_generation + old, 0, sizeof (guint32) * (cap - old));
 		wj_desc_state_cap = cap;
 	}
 }
@@ -1069,10 +1089,15 @@ mono_wasm_jit_admit (int desc_id)
 		printf ("WASM_JIT_ADMIT_BEGIN desc=%d method=%s state=%d e=%d/live%d f=%d/live%d deps=%d\n",
 			desc_id, re->logical_method->name, wj_desc_state [desc_id], re->e,
 			mono_wasm_jit_slot_live (re->e), re->f, mono_wasm_jit_slot_live (re->f), re->ndeps);
-	if (wj_desc_state [desc_id] == 2) {
+	/* A standalone descriptor may be rebound into an automatic batch after this worker admitted it.
+	 * Generation mismatch invalidates only the local admission cache; the old instance remains valid
+	 * for any invocation already in flight while this boundary overwrites the same e/f table slots. */
+	if (wj_desc_state [desc_id] == 2 && wj_desc_generation [desc_id] == re->generation) {
 		if (watch) printf ("WASM_JIT_ADMIT_CACHED desc=%d\n", desc_id);
 		return 1;
 	}
+	if (wj_desc_generation [desc_id] != re->generation)
+		wj_desc_state [desc_id] = 0;
 	if (wj_desc_state [desc_id] == 1)
 		return 1; /* dependency cycle within this admission DFS */
 	if (wj_desc_state [desc_id] == 3)
@@ -1113,7 +1138,8 @@ mono_wasm_jit_admit (int desc_id)
 	/* The compiling worker already installed this descriptor; other workers instantiate it once here.
 	 * A batch member brings up the ENTIRE module (its exports are e<i>/f<i>, so there is no way to
 	 * instantiate one member alone) — which also installs its siblings, so they skip this. */
-	if (!wj_slot_is_installed (re->e) || !wj_slot_is_installed (re->f)) {
+	if (!wj_slot_is_installed (re->e) || !wj_slot_is_installed (re->f) ||
+	    wj_desc_generation [desc_id] != re->generation) {
 		eb [0] = 0;
 		if (re->batch) {
 			extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
@@ -1131,6 +1157,21 @@ mono_wasm_jit_admit (int desc_id)
 	wj_mark_slot_live (re->e);
 	wj_mark_slot_live (re->f);
 	wj_desc_state [desc_id] = 2;
+	wj_desc_generation [desc_id] = re->generation;
+	if (re->batch) {
+		/* One instantiation installed every export. Mark the siblings now so later dependency/root
+		 * admission does not instantiate the same module once per member on this worker. */
+		for (i = 0; i < re->batch->n; ++i) {
+			int sibling = re->batch->desc [i];
+			if (sibling <= 0)
+				continue;
+			wj_desc_state_ensure (sibling + 1);
+			wj_desc_state [sibling] = 2;
+			wj_desc_generation [sibling] = re->batch->generation;
+			wj_mark_slot_live (re->batch->e [i]);
+			wj_mark_slot_live (re->batch->f [i]);
+		}
+	}
 #ifdef HOST_BROWSER
 	/* The native/AOT vtable entry initially points at a guarded interp-entry trampoline. Admission is
 	 * per worker, just like the function table, so this is the earliest point where THIS worker may
@@ -1163,7 +1204,12 @@ mono_wasm_jit_sync_thread (void)
 		 * directly in mono_wasm_emit_method (before registering it), so without this it would redundantly
 		 * re-instantiate its own just-compiled modules over live table slots on its next sync. */
 		if (mono_wasm_jit_slot_live (re->e)) { synced++; continue; }
-		if (!mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len, eb, (int) sizeof (eb), &ms)) {
+		if (re->batch
+		    ? !mono_wasm_jit_instantiate_batch_local (re->batch->e, re->batch->f, re->batch->n,
+		                                               re->batch->bytes, re->batch->len,
+		                                               eb, (int) sizeof (eb), &ms)
+		    : !mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len,
+		                                        eb, (int) sizeof (eb), &ms)) {
 			/* A module that instantiated fine on the COMPILING thread failed here on another thread:
 			 * names the corruption (e.g. magic-word/type) + which slot, so we can tell a byte-corruption
 			 * (race) apart from a thread-local structural issue. Slot stays a placeholder -> interp.
@@ -3324,12 +3370,14 @@ wj_emit_ic_load64 (WasmBuf *b, guint32 off)
  * threads share the site; the returned old value is dropped. No-op unless profile_fast is set at emit time,
  * so normal STATS runs pay nothing. Only called from HOST_BROWSER fast-path sites; G_GNUC_UNUSED for the
  * cross-compiler build (which never reaches those sites). */
+static __thread gboolean wj_batch_profile_suppressed;
+
 static G_GNUC_UNUSED void
 wj_emit_fast_count (WasmBuf *body, int idx)
 {
 	extern int mono_wasm_jit_profile_fast;
 	extern gint64 mono_wasm_jit_counters [];
-	if (!mono_wasm_jit_profile_fast)
+	if (!mono_wasm_jit_profile_fast || wj_batch_profile_suppressed)
 		return;
 	wasm_i32_const (body, (gint32) (intptr_t) &mono_wasm_jit_counters [idx]);
 	wasm_i64_const (body, 1);
@@ -3382,6 +3430,8 @@ typedef struct {
 typedef struct {
 	int n;                          /* members captured so far */
 	int cur;                        /* index of the member being emitted (its funcidx, and its thunk's callee) */
+	int planned_n;                  /* complete predeclared membership, enabling forward direct calls */
+	MonoMethod *planned [WJ_BATCH_MAX];
 	gboolean in_member;             /* a member emit is in progress; a NESTED emit must not join */
 	guint32 next_ti_base;           /* running total of (2 + nextra) over captured members */
 	gboolean uses_calls;            /* union over members: import the indirect table */
@@ -3395,6 +3445,7 @@ typedef struct {
 static __thread WjBatch *wj_batch;
 
 int mono_wasm_jit_batch_begin (void);
+int mono_wasm_jit_batch_begin_members (MonoMethod *const *members, int n);
 void mono_wasm_jit_batch_end (void);
 int mono_wasm_jit_batch_count (void);
 int mono_wasm_jit_batch_member_index (MonoMethod *method);
@@ -3408,6 +3459,19 @@ mono_wasm_jit_batch_begin (void)
 		return 0;
 	wj_batch = g_new0 (WjBatch, 1);
 	wj_batch->cur = -1;
+	wj_batch_profile_suppressed = TRUE;
+	return 1;
+}
+
+int
+mono_wasm_jit_batch_begin_members (MonoMethod *const *members, int n)
+{
+	int i;
+	if (!members || n <= 0 || n > WJ_BATCH_MAX || !mono_wasm_jit_batch_begin ())
+		return 0;
+	wj_batch->planned_n = n;
+	for (i = 0; i < n; ++i)
+		wj_batch->planned [i] = members [i];
 	return 1;
 }
 
@@ -3424,6 +3488,7 @@ mono_wasm_jit_batch_end (void)
 	}
 	g_free (wj_batch);
 	wj_batch = NULL;
+	wj_batch_profile_suppressed = FALSE;
 }
 
 int
@@ -3513,8 +3578,8 @@ mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_b
 
 /* Enumerate the JIT registry, so a caller can rebuild ALL registered methods as one module (the
  * whole-program co-location experiment). Returns the entry count; mono_wasm_jit_reg_entry fills in the
- * method and its slots for index i, or returns 0 if the entry is unusable (not registered, already part
- * of a batch, or missing its logical method). */
+ * method and its slots for index i, or returns 0 if the entry is unusable (not registered or missing
+ * its logical method). Existing batch members remain enumerable for generational merging. */
 int mono_wasm_jit_reg_count (void);
 int
 mono_wasm_jit_reg_count (void)
@@ -3532,9 +3597,8 @@ mono_wasm_jit_reg_entry (int i, MonoMethod **out_method, int *out_e, int *out_f,
 	re = wj_reg_at (i);
 	if (!re || re->e <= 0 || re->f <= 0)
 		return 0;
-	/* Already co-located: re-batching it would orphan the module its siblings still point at. */
-	if (re->batch)
-		return 0;
+	/* Automatic rebatching may deliberately move a complete old batch into a larger generation.
+	 * The planner treats old batches as indivisible, so none of their siblings can be orphaned. */
 	/* logical_method is only filled in by mono_wasm_jit_bind_logical, which the SCC publish path calls;
 	 * ordinary force_island registrations leave it NULL, so fall back to the method whose IR was emitted. */
 	if (!re->logical_method && !re->body_method)
@@ -3544,6 +3608,43 @@ mono_wasm_jit_reg_entry (int i, MonoMethod **out_method, int *out_e, int *out_f,
 	*out_f = re->f;
 	*out_desc = i + 1;
 	return 1;
+}
+
+/* Read-only graph view used by the automatic batch planner.  Unlike reg_entry this also exposes
+ * dependency topology and reports already-batched entries rather than silently dropping them. */
+int
+mono_wasm_jit_reg_graph_entry (int i, MonoMethod **out_method, int *out_len, int *out_ndeps,
+	gboolean *out_batched)
+{
+	WjRegEntry *re;
+	if (i < 0 || i >= wj_reg_n || !(re = wj_reg_at (i)))
+		return 0;
+	if (!re->logical_method && !re->body_method)
+		return 0;
+	if (out_method) *out_method = re->logical_method ? re->logical_method : re->body_method;
+	if (out_len) *out_len = re->body_len;
+	if (out_ndeps) *out_ndeps = re->ndeps;
+	if (out_batched) *out_batched = re->batch != NULL;
+	return 1;
+}
+
+guint32
+mono_wasm_jit_reg_batch_generation (int i)
+{
+	WjRegEntry *re;
+	if (i < 0 || i >= wj_reg_n || !(re = wj_reg_at (i)))
+		return 0;
+	return re->batch ? re->generation : 0;
+}
+
+MonoMethod *
+mono_wasm_jit_reg_graph_dep (int i, int dep)
+{
+	WjRegEntry *re;
+	if (i < 0 || i >= wj_reg_n || !(re = wj_reg_at (i)) ||
+	    dep < 0 || dep >= re->ndeps || !re->dep_method)
+		return NULL;
+	return re->dep_method [dep];
 }
 
 /* Attach one shared WjBatchDesc to every member's registry entry, so whichever member a worker admits
@@ -3571,10 +3672,13 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	bd->n = n;
 	bd->e = (int *) g_malloc (sizeof (int) * n);
 	bd->f = (int *) g_malloc (sizeof (int) * n);
+	bd->desc = (int *) g_malloc (sizeof (int) * n);
 	memcpy (bd->e, e_slots, sizeof (int) * n);
 	memcpy (bd->f, f_slots, sizeof (int) * n);
+	memcpy (bd->desc, desc_ids, sizeof (int) * n);
 	bd->bytes = bytes;
 	bd->len = len;
+	bd->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 	for (i = 0; i < n; i++) {
 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
 		re->batch = bd;
@@ -3582,6 +3686,14 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 		 * real module rather than the discarded standalone one. */
 		re->bytes = bytes;
 		re->len = len;
+		mono_memory_barrier ();
+		re->generation = bd->generation;
+		/* batch_finish instantiated this generation on the compiling worker already. */
+		wj_desc_state_ensure (desc_ids [i] + 1);
+		wj_desc_state [desc_ids [i]] = 2;
+		wj_desc_generation [desc_ids [i]] = bd->generation;
+		wj_mark_slot_live (e_slots [i]);
+		wj_mark_slot_live (f_slots [i]);
 	}
 	return 1;
 }
@@ -3602,6 +3714,9 @@ mono_wasm_jit_batch_member_index (MonoMethod *method)
 	int i;
 	if (!wj_batch)
 		return -1;
+	for (i = 0; i < wj_batch->planned_n; i++)
+		if (wj_batch->planned [i] == method)
+			return i;
 	for (i = 0; i < wj_batch->n; i++)
 		if (wj_batch->m [i].method == method)
 			return i;
@@ -7038,7 +7153,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				MonoMethodSignature *csig = call->signature;
 				WasmFuncType ct;
 				WasmCallInfo cci;
-				int call_fslot, type_idx = -1, k, ai;
+				int call_fslot, type_idx = -1, k, ai, batch_callee = -1;
 #ifdef HOST_BROWSER
 				gboolean late_fslot_block = FALSE;
 #endif
@@ -7062,6 +7177,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * instance so its f-slot is found across re-emits — see wj_canonical_callee. MUST match the
 				 * pre-scan, which canonicalizes identically, so the recorded blocker == this f-slot key. */
 				call_method = wj_canonical_callee (call_method);
+				batch_callee = mono_wasm_jit_batch_member_index (call_method);
 #endif
 				if (!call->method) {
 					/* method==NULL: a runtime JIT-icall. On the cold path of an llvmonly
@@ -7165,14 +7281,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wj_result_add_direct_dep (&cfg->wasm_jit_result, call_fslot, wj_functype_hash (&ct), call_method);
 					if (cfg->wasm_jit_result.direct_deps_truncated) { fail = "too many direct dependencies"; goto done; }
 #endif
-					for (k = 0; k < nextra; ++k)
-						if (functype_eq (&extra_types [k], &ct)) { type_idx = ti_base + k; break; }
-					if (type_idx < 0) {
-						if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
-						extra_types [nextra] = ct;
-						type_idx = ti_base + nextra++;
+					if (batch_callee < 0) {
+						for (k = 0; k < nextra; ++k)
+							if (functype_eq (&extra_types [k], &ct)) { type_idx = ti_base + k; break; }
+						if (type_idx < 0) {
+							if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
+							extra_types [nextra] = ct;
+							type_idx = ti_base + nextra++;
+						}
+						uses_calls = TRUE;
 					}
-					uses_calls = TRUE;
 					/* arg source vregs captured at method-to-ir time (calls.c), not call->args
 					 * (which gets corrupted by later vreg passes) */
 					if (!call->call_info) { fail = "no captured call args"; goto done; }
@@ -7183,10 +7301,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * OUTARG_VTRETADDR vreg — an addr-frame address the callee writes through) */
 						if (cci.vret_byaddr && !wasm_ld (&body, &lc, wj_arg_vreg (call, cci.nargs))) { fail = "call vret ld"; goto done; }
 					}
-					wasm_i32_const (&body, call_fslot);
-					wasm_op (&body, WASM_OP_CALL_INDIRECT);
-					wasm_uleb (&body, (guint32) type_idx);
-					wasm_uleb (&body, 0); /* table 0 (imported f.f) */
+					if (batch_callee >= 0) {
+						/* Membership is predeclared before any body is captured, so forward callees have a
+						 * stable function index too.  A direct call is both smaller and immediately eligible
+						 * for V8 inlining; the standalone discovery tier retains call_indirect semantics. */
+						wasm_op (&body, WASM_OP_CALL);
+						wasm_uleb (&body, (guint32) batch_callee);
+					} else {
+						wasm_i32_const (&body, call_fslot);
+						wasm_op (&body, WASM_OP_CALL_INDIRECT);
+						wasm_uleb (&body, (guint32) type_idx);
+						wasm_uleb (&body, 0); /* table 0 (imported f.f) */
+					}
 					if (ct.ret != WASM_VOID) {
 						if (cci.ret.kind == WJ_ARG_VTYPE_SCALAR) {
 							if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wj_arg_vreg (call, cci.nargs))) { fail = "call scalar-vtype ret"; goto done; }
@@ -7593,6 +7719,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						MonoVTable *pred_vt = NULL;
 						MonoMethod *pred_target = NULL;
 						int pred_fslot = 0;
+						int pred_batch_index = -1;
 						gboolean slim_pred = FALSE;
 						gboolean is_delegate_invoke = !strcmp (call->method->name, "Invoke") &&
 							m_class_get_parent (call->method->klass) == mono_defaults.multicastdelegate_class;
@@ -7702,6 +7829,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 										slim_pred = mono_wasm_jit_vcall_slim &&
 											mono_wasm_jit_vcall_inline_ic &&
 											mono_wasm_jit_vcall_shared_miss_enabled;
+										pred_batch_index = mono_wasm_jit_batch_member_index (pred_target);
 									}
 								}
 							}
@@ -7828,8 +7956,13 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									for (ai = 0; ai < n2; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "devirt arg ld"; goto done; }
-									wasm_i32_const (&body, pred_fslot);
-									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
+									if (pred_batch_index >= 0) {
+										wasm_op (&body, WASM_OP_CALL);
+										wasm_uleb (&body, (guint32) pred_batch_index);
+									} else {
+										wasm_i32_const (&body, pred_fslot);
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
+									}
 									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "devirt dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred_miss */
@@ -8011,7 +8144,7 @@ vcall_nullchk_done:
 									 * run, so the batcher gets both aggregate and per-target volume from one flag. */
 									{
 										extern int mono_wasm_jit_profile_fast;
-										if (mono_wasm_jit_profile_fast) {
+										if (mono_wasm_jit_profile_fast && !wj_batch_profile_suppressed) {
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 12);
@@ -8047,7 +8180,7 @@ vcall_nullchk_done:
 											wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
 											{
 												extern int mono_wasm_jit_profile_fast;
-												if (mono_wasm_jit_profile_fast) {
+												if (mono_wasm_jit_profile_fast && !wj_batch_profile_suppressed) {
 													wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
 													wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
 													wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 12);
