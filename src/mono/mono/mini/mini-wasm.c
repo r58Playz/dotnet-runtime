@@ -62,19 +62,16 @@ int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiv
  * both the runtime and the offline cross-compiler (mono-aot-cross), which has no interpreter — same
  * reason as mono_wasm_jit_residual_mode. Costs ~0.7% when on. Default off.
  *
- * The original broad consumer — a guarded speculative-devirt diamond at every profiled callvirt — was
- * REMOVED, and the reason is worth keeping because it is not obvious: V8 already devirtualizes call_indirect
- * speculatively from its own call-site feedback, with no branch in the instruction stream, but ONLY
- * when the callee is in the same WebAssembly.Module. Measured with scratchpad/callbench.mjs, a
- * same-module indirect call costs the same as no call at all (0.25 ns) while any cross-module call
- * costs ~1.1-1.3 ns however it is spelled. So an IR-level guard bought something V8 does better and
- * could not collect the inlining payoff anyway, the callee being in another module — it measured as a
- * 1.5x REGRESSION (3.37-3.47 vs 2.298 ms/step). See WASM-JIT.md "Call-shape costs".
+ * The first broad consumer added a guarded direct-call diamond in front of the complete PIC/AOT
+ * lowering at every profiled callvirt. That duplicated both paths and measured as a 1.5x regression.
+ * The adaptive slim consumer below is materially different: for a perfectly-monomorphic site whose
+ * target already has an admitted f-slot, it emits only one checked target plus the signature-shared
+ * cold miss. There is no duplicated PIC/AOT diamond. Terminal forwarding calls additionally retain
+ * bottom-up island blocking so their predicted target can be published before re-emission.
  *
- * The retained consumer is intentionally much narrower: only a proven terminal virtual forwarding
- * call (the same shape whose caller roots can be handed off) receives a strict, perfectly-monomorphic
- * vtable guard. That removes the forwarding adapter's PIC work without adding diamonds throughout
- * ordinary compute methods. The profile also remains useful as batching's observed call graph. */
+ * The guard is still necessary for correctness if feedback becomes stale. In batch mode its stable
+ * call_indirect also gives V8 same-module target feedback; outside batch mode it still replaces a much
+ * larger worker-PIC hit path. The profile remains batching's observed virtual call graph too. */
 int mono_wasm_jit_devirt_profile = 0;
 /* MONO_WASM_JIT_BATCH_MODULE=1: emit an SCC batch's members into ONE WebAssembly.Module instead of one
  * module each. V8 never inlines across a module boundary but inlines freely within one, so co-location
@@ -87,6 +84,8 @@ int mono_wasm_jit_batch_all_at = 250;
 int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC (1 = monomorphic/legacy). Clamped [1,8]. 2 captures the ~63% of the miss population that are 2-type sites (arity depth-1) which a 1-way IC gets 0% of. */
 int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inline AOT-vcall IC (1 = monomorphic first-wins/legacy). Clamped [1,8]. 2 captures the AOT-backed 2-type sites (arity depth-0 once VCALL_WAYS>=2): the loser vtable of a 2-way AOT site is stuck reaching the resolve helper behind the 1-entry cache. */
 int mono_wasm_jit_vcall_shared_miss_enabled = 1; /* MONO_WASM_JIT_VCALL_SHARED_MISS: one signature-neutral cold miss stub using a lazy GC-pinned worker frame */
+int mono_wasm_jit_vcall_slim = 1; /* MONO_WASM_JIT_VCALL_SLIM: replace a perfectly-monomorphic profiled site's whole PIC/AOT diamond with one guarded admitted f-slot call + the shared cold miss. */
+int mono_wasm_jit_structured_cfg = 1; /* MONO_WASM_JIT_STRUCTURED_CFG: elide the dispatch br_table for verified forward CFGs and single-entry natural loops; irregular/nested shapes retain the universal dispatcher. */
 
 /* NB: compiled into BOTH the browser runtime and mono-aot-cross (no longer HOST_BROWSER-gated) so the
  * OFFLINE cross-compiler dump path (mini.c COMPILE_WASM fork) reads MONO_WASM_JIT_VERBOSE/DUMP_IR/STATS +
@@ -120,6 +119,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
 	{ extern int mono_wasm_jit_vcall_aot_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_AOT_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_aot_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline AOT-vcall IC; clamp [1,8]; 1 = legacy first-wins */
 	{ extern int mono_wasm_jit_vcall_shared_miss_enabled; const char *sm = g_getenv ("MONO_WASM_JIT_VCALL_SHARED_MISS"); mono_wasm_jit_vcall_shared_miss_enabled = (sm && *sm) ? (*sm != '0') : 1; }
+	{ extern int mono_wasm_jit_vcall_slim; const char *sl = g_getenv ("MONO_WASM_JIT_VCALL_SLIM"); mono_wasm_jit_vcall_slim = (sl && *sl) ? (*sl != '0') : 1; }
+	{ extern int mono_wasm_jit_structured_cfg; const char *sc = g_getenv ("MONO_WASM_JIT_STRUCTURED_CFG"); mono_wasm_jit_structured_cfg = (sc && *sc) ? (*sc != '0') : 1; }
 	{ extern int mono_wasm_jit_over_aot; const char *oa = g_getenv ("MONO_WASM_JIT_OVER_AOT"); mono_wasm_jit_over_aot = (oa && *oa && *oa != '0') ? 1 : 0; } /* experimental second compiler tier for hot AOT bodies; safe fallback remains the AOT entry */
 	{ extern int mono_wasm_jit_island; const char *il = g_getenv ("MONO_WASM_JIT_ISLAND"); mono_wasm_jit_island = (il && *il && *il == '0') ? 0 : 1; } /* 0 = no eager island formation (bottom-up retry only) */
 	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia) ? (*ia != '0') : 1; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). 1 = on, default 0 = off. */
@@ -3608,6 +3609,154 @@ mono_wasm_jit_batch_member_index (MonoMethod *method)
 }
 #endif /* HOST_BROWSER */
 
+/*
+ * Conservative structured-CFG recognizer.
+ *
+ * The universal lowering below handles every graph with a dispatch loop + br_table.  Most hot Java
+ * methods need much less: either every edge is forward, or all backward edges return to one natural
+ * loop header.  The latter is exactly the shape of a while/for loop after MINI's block ordering.
+ *
+ * Do not attempt a general relooper here.  Accept only graphs whose dense layout proves the lexical
+ * structure directly:
+ *   - no edge from outside the loop enters its interior (the header is the sole entry);
+ *   - every backward edge in the loop targets that header;
+ *   - prefix and suffix CFGs are acyclic.
+ * Anything nested, discontiguous or irreducible keeps the old dispatcher unchanged.
+ */
+enum {
+	WJ_CFG_DISPATCH = 0,
+	WJ_CFG_FORWARD = 1,
+	WJ_CFG_SINGLE_LOOP = 2
+};
+
+static int
+wj_structured_cfg_kind (MonoCompile *cfg, int *bbidx, int n, int *out_h, int *out_l)
+{
+	MonoBasicBlock *bb;
+	int i, h = -1, l = -1;
+
+	if (!mono_wasm_jit_structured_cfg || !cfg || !cfg->header ||
+	    cfg->header->num_clauses != 0 || n <= 0)
+		return WJ_CFG_DISPATCH;
+
+	i = 0;
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
+		int k;
+		if (bb->flags & BB_EXCEPTION_HANDLER)
+			return WJ_CFG_DISPATCH;
+		for (k = 0; k < bb->out_count; ++k) {
+			MonoBasicBlock *tb = bb->out_bb [k];
+			int t;
+			if (!tb || tb->block_num < 0 || tb->block_num > (int) cfg->max_block_num)
+				return WJ_CFG_DISPATCH;
+			t = bbidx [tb->block_num];
+			if (t < 0)
+				return WJ_CFG_DISPATCH;
+			if (t <= i) {
+				if (h < 0)
+					h = t;
+				else if (h != t)
+					return WJ_CFG_DISPATCH; /* nested/multiple loop headers */
+				if (i > l)
+					l = i;
+			}
+		}
+	}
+	if (h < 0) {
+		*out_h = *out_l = -1;
+		return WJ_CFG_FORWARD;
+	}
+	if (h > l || l >= n)
+		return WJ_CFG_DISPATCH;
+
+	/* Prove the loop is a contiguous, single-entry region and that no secondary backedge exists. */
+	i = 0;
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
+		int k;
+		for (k = 0; k < bb->out_count; ++k) {
+			int t = bbidx [bb->out_bb [k]->block_num];
+			if (i < h) {
+				if (t <= i || (t > h && t <= l))
+					return WJ_CFG_DISPATCH;
+			} else if (i <= l) {
+				if (t <= i && t != h)
+					return WJ_CFG_DISPATCH;
+				if (t < h)
+					return WJ_CFG_DISPATCH;
+			} else if (t <= i) {
+				return WJ_CFG_DISPATCH;
+			}
+			if ((i < h || i > l) && t > h && t <= l)
+				return WJ_CFG_DISPATCH;
+		}
+	}
+
+	*out_h = h;
+	*out_l = l;
+	return WJ_CFG_SINGLE_LOOP;
+}
+
+/* Label depth for an edge in one of the verified structured layouts. */
+static int
+wj_structured_branch_depth (int kind, int h, int l, int n, int from, int to)
+{
+	int s = l + 1;
+	if (kind == WJ_CFG_FORWARD)
+		return to > from ? to - from - 1 : -1;
+	if (kind != WJ_CFG_SINGLE_LOOP)
+		return -1;
+	if (from < h) {
+		if (to > from && to < h)
+			return to - from - 1;
+		if (to == h)
+			return h - from - 1; /* dedicated loop-entry block */
+		if (to >= s && to < n)
+			return (h - from) + (to - s);
+		return -1;
+	}
+	if (from <= l) {
+		if (to == h)
+			return l - from; /* remaining body blocks, then the loop label */
+		if (to > from && to <= l)
+			return to - from - 1;
+		if (to >= s && to < n)
+			return (l - from) + 1 + (to - s); /* body labels + loop + suffix label */
+		return -1;
+	}
+	return to > from && to < n ? to - from - 1 : -1;
+}
+
+static gboolean
+wj_structured_target_has_label (int kind, int h, int l, int from, int to)
+{
+	if (kind == WJ_CFG_FORWARD)
+		return to > from;
+	if (kind != WJ_CFG_SINGLE_LOOP)
+		return FALSE;
+	if (from < h)
+		return (to > from && to <= h) || to >= l + 1;
+	if (from <= l)
+		return to == h || (to > from && to <= l) || to >= l + 1;
+	return to > from;
+}
+
+/* Number of lexical control labels between bb code and the shared throw blocks. */
+static int
+wj_structured_outer_depth (int kind, int h, int l, int n, int from)
+{
+	if (kind == WJ_CFG_FORWARD)
+		return n - 1 - from;
+	if (kind == WJ_CFG_SINGLE_LOOP) {
+		int s = l + 1;
+		if (from < h)
+			return (h - from) + (n - s);
+		if (from <= l)
+			return (l - from) + 1 + (n - s);
+		return n - 1 - from;
+	}
+	return -1;
+}
+
 
 
 void
@@ -3680,6 +3829,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int naddrbytes = 0;                /* total bytes of addressable-locals frame (8 per address-taken local) */
 	WjCtx lc;
 	int *bbidx;
+	int structured_cfg_kind = WJ_CFG_DISPATCH;
+	int structured_loop_h = -1, structured_loop_l = -1;
 	WasmFuncType extra_types [WJ_EXTRA_TYPES_MAX]; /* callee functypes for call_indirect, after T0/T1 */
 	int nextra = 0;
 	/* Base of THIS method's block in the module's type section. Standalone that block is the whole
@@ -5247,6 +5398,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	N = 0;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
 		bbidx [bb->block_num] = N++;
+	structured_cfg_kind = wj_structured_cfg_kind (cfg, bbidx, N,
+		&structured_loop_h, &structured_loop_l);
 
 	/* MONO_WASM_JIT_LCSE state.
 	 *
@@ -5445,9 +5598,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		}
 	}
 
-	/* prologue: dispatch index ($blk) starts at the entry block (dense index 0). Unneeded when the
-	 * dispatch scaffolding is skipped (see skip_dispatch) -- nothing ever reads it. */
-	if (!(mono_wasm_jit_nodispatch && N == 1 && !eh_on && cfg->bb_entry && cfg->bb_entry->out_count == 0)) {
+	/* Prologue: $blk is needed only by the universal dispatcher/EH landing pad. Structured non-EH
+	 * layouts enter their first lexical block directly and never read it. */
+	if (structured_cfg_kind == WJ_CFG_DISPATCH &&
+	    !(mono_wasm_jit_nodispatch && N == 1 && !eh_on && cfg->bb_entry && cfg->bb_entry->out_count == 0)) {
 		wasm_i32_const (&body, 0);
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
 	}
@@ -5600,7 +5754,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * no branch can target it and no back edge exists), and there is no EH wrapper whose landing pad
 	 * would re-dispatch through $blk.
 	 */
-	gboolean skip_dispatch = mono_wasm_jit_nodispatch && (N == 1 && !eh_on && cfg->bb_entry && cfg->bb_entry->out_count == 0);
+	gboolean legacy_skip_dispatch = mono_wasm_jit_nodispatch && (N == 1 && !eh_on &&
+		cfg->bb_entry && cfg->bb_entry->out_count == 0);
+	gboolean structured_cfg = structured_cfg_kind != WJ_CFG_DISPATCH;
+	gboolean skip_dispatch = structured_cfg || legacy_skip_dispatch;
 
 	int wj_throw_slot [WJ_EXC_IDS];
 	int nthrow = 0;
@@ -5644,6 +5801,20 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		for (i = 0; i < N; ++i)
 			wasm_uleb (&body, (guint32) i);
 		wasm_uleb (&body, 0); /* default -> block 0 */
+	} else if (structured_cfg_kind == WJ_CFG_FORWARD) {
+		/* One lexical label per bb. Closing the first label enters bb0; the remaining labels are
+		 * precisely the direct targets of forward edges. A one-bb leaf needs no label at all. */
+		if (N > 1)
+			for (i = 0; i < N; ++i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
+	} else if (structured_cfg_kind == WJ_CFG_SINGLE_LOOP) {
+		int suffix_n = N - (structured_loop_l + 1);
+		/* Suffix labels surround the whole prefix+loop so an early exit can jump over both. Prefix
+		 * labels are innermost and close one-by-one until execution reaches the loop entry. */
+		for (i = 0; i < suffix_n; ++i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
+		/* One extra prefix block labels the loop entry itself, so a branch can skip the remaining
+		 * prefix without requiring a dispatcher. No prefix means entry falls straight into the loop. */
+		if (structured_loop_h > 0)
+			for (i = 0; i < structured_loop_h + 1; ++i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
 	}
 
 /*
@@ -5670,10 +5841,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define GOTO(TBB, EXTRA) do { \
 		int _ti = bbidx [(TBB)->block_num]; \
 		if (_ti < 0) { fail = "bad branch target"; goto done; } \
-		/* skip_dispatch removed every branch label; if an edge shows up anyway the depths would be
-		 * garbage, so bail the method instead of emitting a wrong branch. */ \
-		if (skip_dispatch) { fail = "branch in a single-bb method"; goto done; } \
-		if (_ti > i) { \
+		if (structured_cfg) { \
+			int _d = wj_structured_branch_depth (structured_cfg_kind, structured_loop_h, \
+				structured_loop_l, N, i, _ti); \
+			if (_d < 0) { fail = "structured cfg edge escaped verifier"; goto done; } \
+			/* A direct adjacent forward edge is lexical fallthrough. A self/back edge at depth zero \
+			 * still needs a br to the loop label. */ \
+			if (_d + (EXTRA) != 0 || _ti <= i) { wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) (_d + (EXTRA))); } \
+		} else if (legacy_skip_dispatch) { \
+			fail = "branch in a single-bb method"; goto done; \
+		} else if (_ti > i) { \
 			int _d = _ti - i - 1 + (EXTRA); \
 			/* depth 0 at bb top level is the fallthrough edge: emitting nothing gets there. */ \
 			if (_d != 0) { wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) _d); } \
@@ -5689,15 +5866,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * the prescan did not reserve a block for this id, so the caller can fall back to the inline form. */
 #define WJ_HAS_THROW(EXC_ID) ((EXC_ID) >= 0 && (EXC_ID) < WJ_EXC_IDS && wj_throw_slot [(EXC_ID)] >= 0)
 #define WJ_THROW_BR(EXC_ID, EXTRA) do { \
-		/* labels from inside bb_i: B_{i+1}..B_{N-1} (N-1-i), then the dispatch loop IF PRESENT, then
-		 * throw[0..K-1]. Without the scaffolding N==1 and there are no B blocks, so it collapses to t. */ \
+		int _od = structured_cfg ? wj_structured_outer_depth (structured_cfg_kind, structured_loop_h, \
+			structured_loop_l, N, i) : ((N - 1 - i) + (skip_dispatch ? 0 : 1)); \
+		if (_od < 0) { fail = "structured throw depth"; goto done; } \
 		wasm_op (&body, WASM_OP_BR_IF); \
-		wasm_uleb (&body, (guint32) ((N - 1 - i) + (skip_dispatch ? 0 : 1) + wj_throw_slot [(EXC_ID)] + (EXTRA))); \
+		wasm_uleb (&body, (guint32) (_od + wj_throw_slot [(EXC_ID)] + (EXTRA))); \
 	} while (0)
 
-/* TRUE when GOTO(TBB, EXTRA) would lower to a plain forward `br`, i.e. the target needs no $blk write.
- * Used to fuse a conditional branch into `br_if` instead of an if/else pair of gotos. */
-#define GOTO_IS_FWD(TBB) (bbidx [(TBB)->block_num] > i)
+/* TRUE when the target has a lexical label at this point, allowing a direct br_if. The verified
+ * prefix -> loop-header edge is deliberately fallthrough-only because the loop label is not open yet. */
+#define GOTO_HAS_LABEL(TBB) (structured_cfg ? \
+	wj_structured_target_has_label (structured_cfg_kind, structured_loop_h, structured_loop_l, i, \
+		bbidx [(TBB)->block_num]) : (bbidx [(TBB)->block_num] > i))
 
 /*
  * Two-way branch, with the comparison result already on the wasm stack.
@@ -5709,9 +5889,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * inside a br_if.
  */
 #define COND_BRANCH() do { \
-		if (GOTO_IS_FWD (ins->inst_true_bb)) { \
+		if (GOTO_HAS_LABEL (ins->inst_true_bb)) { \
+			int _ct = bbidx [ins->inst_true_bb->block_num]; \
+			int _cd = structured_cfg ? wj_structured_branch_depth (structured_cfg_kind, structured_loop_h, \
+				structured_loop_l, N, i, _ct) : (_ct - i - 1); \
+			if (_cd < 0) { fail = "structured conditional edge escaped verifier"; goto done; } \
 			wasm_op (&body, WASM_OP_BR_IF); \
-			wasm_uleb (&body, (guint32) (bbidx [ins->inst_true_bb->block_num] - i - 1)); \
+			wasm_uleb (&body, (guint32) _cd); \
 			GOTO (ins->inst_false_bb, 0); \
 		} else { \
 			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
@@ -5763,8 +5947,26 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			}
 		}
 
+		if (structured_cfg_kind == WJ_CFG_SINGLE_LOOP && i == structured_loop_h) {
+			int body_n = structured_loop_l - structured_loop_h + 1;
+			if (structured_loop_h > 0)
+				wasm_op (&body, WASM_OP_END); /* branch target for the loop entry */
+			wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40); /* natural-loop header */
+			for (int _bi = 0; _bi < body_n; ++_bi) {
+				wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);
+			}
+		}
+		if (structured_cfg_kind == WJ_CFG_SINGLE_LOOP && i == structured_loop_l + 1)
+			wasm_op (&body, WASM_OP_END); /* close natural loop before suffix */
 		if (!skip_dispatch)
-			wasm_op (&body, WASM_OP_END); /* close block B_i; bb_i code follows */
+			wasm_op (&body, WASM_OP_END); /* close dispatcher block B_i; bb_i code follows */
+		else if (structured_cfg_kind == WJ_CFG_FORWARD) {
+			if (N > 1)
+				wasm_op (&body, WASM_OP_END); /* close lexical forward label for bb_i */
+		} else if (structured_cfg_kind == WJ_CFG_SINGLE_LOOP) {
+			/* Prefix, loop body and suffix each opened exactly one label per member. */
+			wasm_op (&body, WASM_OP_END);
+		}
 
 #ifdef HOST_BROWSER
 		/* bbtrace: log this bb's dense index at runtime (reuses the (i32,i32)->i32 dispatch functype + drop) */
@@ -7391,6 +7593,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						MonoVTable *pred_vt = NULL;
 						MonoMethod *pred_target = NULL;
 						int pred_fslot = 0;
+						gboolean slim_pred = FALSE;
 						gboolean is_delegate_invoke = !strcmp (call->method->name, "Invoke") &&
 							m_class_get_parent (call->method->klass) == mono_defaults.multicastdelegate_class;
 						if (!csig->hasthis) { fail = "vcall not instance"; goto done; }
@@ -7447,21 +7650,20 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						memset (&ftd, 0, sizeof (ftd)); for (vk = 0; vk < npp; ++vk) ftd.params [vk] = pp [vk]; ftd.nparams = (guint32) npp; ftd.ret = rv;
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &ftd)) { ftdi = ti_base + vk; break; }
 						if (ftdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ftd; ftdi = ti_base + nextra++; }
-						/* Narrow speculative devirtualization: consume the interpreter profile only for
-						 * the terminal GC-point selected by the root-handoff proof. A valid JITtable
-						 * prediction becomes an island edge when its target has not acquired an f-slot
-						 * yet. This matters for forwarding chains: the outer adapter normally reaches its
-						 * threshold before the inner body has published a slot, so merely checking the
-						 * slot here would silently reject every useful prediction. The retriable blocker
-						 * compiles the chain bottom-up and re-emits this adapter with the stable slot.
+						/* Adaptive speculative devirtualization. A perfectly-monomorphic interpreter profile
+						 * can slim ANY ordinary virtual site whose target already owns an admitted f-slot.
+						 * Terminal forwarding calls retain the stronger bottom-up behavior: if their target
+						 * has not compiled yet, make it an island blocker and re-emit after publication.
+						 * Ordinary compute methods never grow their island merely for speculation; a target
+						 * not already present simply leaves that site on the compact PIC.
 						 *
 						 * Native-AOT and permanently un-JITtable targets retain the ordinary PIC/AOT miss
-						 * routes; self-recursive virtual calls also stay on the PIC to avoid manufacturing
-						 * a self blocker. Registering a successful direct dependency makes the predicted
-						 * target available in every worker before this caller is admitted there. */
+						 * routes. Registering a successful direct dependency makes the predicted target
+						 * available in every worker before this caller is admitted there. */
 #ifdef HOST_BROWSER
-						if (terminal_vcall_handoff && terminal_vcall_ins == ins &&
-						    mono_wasm_jit_devirt_profile) {
+						if (!is_delegate_invoke && mono_wasm_jit_devirt_profile &&
+						    (mono_wasm_jit_vcall_slim ||
+						     (terminal_vcall_handoff && terminal_vcall_ins == ins))) {
 							if (mono_wasm_jit_vprof_predict (mono_interp_get_imethod (cfg->method),
 							    call->method, &pred_vt, &pred_target, NULL)) {
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
@@ -7479,7 +7681,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								} else {
 									pred_fslot = mono_wasm_jit_get_callee_fslot (pred_target);
 									if (pred_fslot <= 0) {
-										if (pred_target != cfg->method &&
+										if (terminal_vcall_handoff && terminal_vcall_ins == ins &&
+										    pred_target != cfg->method &&
 										    !mono_wasm_jit_callee_perm_unjittable (pred_target) &&
 										    !mono_interp_jit_call_supported (pred_target, pred_sig)) {
 											wj_result_add_blocker (&cfg->wasm_jit_result, pred_target);
@@ -7496,6 +7699,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 											fail = "too many direct dependencies";
 											goto done;
 										}
+										slim_pred = mono_wasm_jit_vcall_slim &&
+											mono_wasm_jit_vcall_inline_ic &&
+											mono_wasm_jit_vcall_shared_miss_enabled;
 									}
 								}
 							}
@@ -7520,7 +7726,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						  /* Delegate wrapper selection depends on the instance's target shape, not just its vtable.
 						   * A vtable-keyed AOT IC could therefore reuse a normal wrapper for an open-virtual or bound
 						   * delegate of the same delegate type. Leave those sites on the instance-aware helper path. */
-						  if (!is_delegate_invoke && mono_wasm_jit_vcall_aot_ic && mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_aot) {
+						  if (!slim_pred && !is_delegate_invoke && mono_wasm_jit_vcall_aot_ic && mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_aot) {
 #ifdef HOST_BROWSER
 							extern gpointer mono_wasm_jit_alloc_aot_ic (void); aic = mono_wasm_jit_alloc_aot_ic ();
 #else
@@ -7609,10 +7815,10 @@ vcall_nullchk_done:
 #endif
 							int way;
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
-							/* Strict monomorphic terminal-forwarder guard. A hit bypasses the worker PIC
-							 * completely; a miss falls through unchanged. The branch remains correct if
-							 * the profile later becomes stale because receiver vtable identity is checked
-							 * on every invocation. */
+							/* Strict monomorphic guard. A hit bypasses the worker PIC completely. In adaptive
+							 * slim mode the miss jumps directly to the signature-shared cold helper, so neither
+							 * the N-way JIT PIC nor the AOT PIC is emitted at this site. The branch remains
+							 * correct if feedback becomes stale because every invocation checks vtable identity. */
 							if (pred_fslot > 0 && pred_vt && pred_target && !is_delegate_invoke) {
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_miss */
 									if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt this ld"; goto done; }
@@ -7628,6 +7834,8 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred_miss */
 							}
+							if (slim_pred)
+								goto vcall_cold_miss_emit;
 							/* OBJGUARD (once, hoisted above the N ways): validate the receiver before any raw
 							 * this->vtable load. Otherwise a type-confused scalar/garbage receiver traps as a bare
 							 * wasm OOB before the C resolver can print anything. */
@@ -7798,12 +8006,12 @@ vcall_nullchk_done:
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
 								wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64);
 								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
-								/* Exact target-frequency writes are opt-in: normal dispatch must not dirty a
-								 * cache line on every hit. PROFILE_FAST already denotes a dedicated sampling
-								 * run, so the batcher gets both aggregate and per-target volume from one flag. */
-								{
-									extern int mono_wasm_jit_profile_fast;
-									if (mono_wasm_jit_profile_fast) {
+									/* Exact target-frequency writes are opt-in: normal dispatch must not dirty a
+									 * cache line on every hit. PROFILE_FAST already denotes a dedicated sampling
+									 * run, so the batcher gets both aggregate and per-target volume from one flag. */
+									{
+										extern int mono_wasm_jit_profile_fast;
+										if (mono_wasm_jit_profile_fast) {
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 12);
@@ -7945,6 +8153,7 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_END);   /* selected entry invalid/absent -> resolve */
 								}
 							}
+vcall_cold_miss_emit:
 							{
 							extern int mono_wasm_jit_vcall_shared_miss_enabled;
 							if (!mono_wasm_jit_vcall_shared_miss_enabled) {
@@ -8478,6 +8687,8 @@ vcall_nullchk_done:
 	 * the epilogue so a stale entry cannot be consulted. */
 	lcse = NULL;
 
+	if (structured_cfg_kind == WJ_CFG_SINGLE_LOOP && structured_loop_l + 1 == N)
+		wasm_op (&body, WASM_OP_END);          /* loop reaches the method's final bb */
 	if (!skip_dispatch) {
 		wasm_op (&body, WASM_OP_END);          /* close loop */
 		wasm_op (&body, WASM_OP_UNREACHABLE);  /* loop never falls through */
