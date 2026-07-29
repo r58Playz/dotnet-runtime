@@ -119,6 +119,8 @@ const fn_signatures: SigLine[] = [
     [true, "mono_jiterp_get_arg_offset", "number", ["number", "number", "number"]],
     [true, "mono_wasm_jit_entry_sig", "number", ["number", "number", "number", "number"]],
     [true, "mono_wasm_jit_slot_live", "number", ["number"]],
+    [true, "mono_wasm_jit_slot_live_ptr_addr", "number", []],
+    [true, "mono_wasm_jit_slot_live_cap_addr", "number", []],
     [true, "mono_jiterp_wasm_jit_entry_ok", "number", ["number"]],
     [true, "mono_jiterp_get_opcode_info", "number", ["number", "number"]],
     [true, "mono_wasm_is_zero_page_reserved", "number", []],
@@ -253,6 +255,8 @@ export interface t_Cwraps {
     // wasm valtypes, with the return valtype last). Returns the arg count, or -1 if ineligible.
     mono_wasm_jit_entry_sig(method: MonoMethod, kinds: number, vtypes: number, max: number): number;
     mono_wasm_jit_slot_live(slot: number): number;
+    mono_wasm_jit_slot_live_ptr_addr(): number;
+    mono_wasm_jit_slot_live_cap_addr(): number;
     mono_jiterp_wasm_jit_entry_ok(rmethod: number): number;
     mono_jiterp_get_opcode_info(opcode: number, type: number): number;
     mono_wasm_is_zero_page_reserved(): number;

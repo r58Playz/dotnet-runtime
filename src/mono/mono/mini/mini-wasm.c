@@ -682,12 +682,12 @@ mono_wasm_jit_slot_live (int slot)
  * CURRENT bitmap pointer + cap THROUGH the cached address, so a realloc-on-grow (wj_mark_slot_live) is picked
  * up transparently — the var's value moves, its address doesn't. Per-thread, so no cross-thread race, and no
  * stale-pointer window (we never cache the bitmap pointer itself, only the address of the slot holding it). */
-guint8 **
+WJ_KEEPALIVE guint8 **
 mono_wasm_jit_slot_live_ptr_addr (void)
 {
 	return &wj_slot_live;
 }
-int *
+WJ_KEEPALIVE int *
 mono_wasm_jit_slot_live_cap_addr (void)
 {
 	return &wj_slot_live_cap;
@@ -714,7 +714,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 		var t0 = performance.now ();
 		try {
 			var b = HEAPU8.slice (p, p + $3);
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"] } });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8 } });
 			if (op) HEAPF64[op >> 3] = performance.now () - t0;
 			if ($0 < 0) {
 				wasmTable.set ($1, inst.exports.t); /* interp-entry thunk: scalar -> interpreter */
@@ -728,7 +728,8 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			if (eb) stringToUTF8 ("" + e, eb, $5); /* surface the WebAssembly error to the caller */
 			return 0;
 		}
-	}, e_slot, f_slot, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms);
+	}, e_slot, f_slot, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms,
+	   (int) (intptr_t) &wj_slot_live, (int) (intptr_t) &wj_slot_live_cap);
 	if (_ok) {
 		/* Physical installation is not dispatch admission. A freshly compiled module can have unchecked
 		 * direct dependencies that are still placeholders on this thread; only mono_wasm_jit_admit marks
@@ -768,7 +769,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 		var t0 = performance.now ();
 		try {
 			var b = HEAPU8.slice (p, p + $4);
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"] } });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9 } });
 			if (op) HEAPF64[op >> 3] = performance.now () - t0;
 			var k = 0;
 			var ef = null;
@@ -787,7 +788,8 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 			if (eb) stringToUTF8 ("" + e, eb, $6);
 			return 0;
 		}
-	}, (int) (intptr_t) e_slots, (int) (intptr_t) f_slots, n, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms);
+	}, (int) (intptr_t) e_slots, (int) (intptr_t) f_slots, n, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms,
+	   (int) (intptr_t) &wj_slot_live, (int) (intptr_t) &wj_slot_live_cap);
 	if (_ok) {
 		for (i = 0; i < n; i++) {
 			wj_mark_slot_installed (e_slots [i]);
@@ -5204,30 +5206,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx);
 		}
 	}
-	/* INLINE f-slot-IC liveness prologue: fetch the STABLE per-thread addresses of the wj_slot_live bitmap
-	 * pointer + capacity ONCE (2 tiny ()->i32 calls per invocation), caching them in locals. Each vcall IC hit
-	 * then does the liveness check inline (load the current bitmap ptr/cap through these addresses + a bit
-	 * test) instead of a per-hit mono_wasm_jit_slot_live call_indirect (the profiled ~1.3M/frame boundary).
-	 * Only when the method has a vcall site AND the inline IC is on. */
+	/* INLINE f-slot-IC liveness prologue: cache this dynamic instance's imported addresses of the
+	 * wj_slot_live bitmap pointer + capacity. The imports are bound to the current worker's TLS block when
+	 * the cached module is instantiated, so two global.get operations replace the former two C-boundary
+	 * address-helper calls per invocation. Each IC hit still loads THROUGH these stable addresses, making
+	 * a later bitmap realloc/capacity growth visible with no stale-pointer window. */
 	if (mono_wasm_jit_vcall_inline_ic && has_vcall) {
-		WasmFuncType pt; int pti = -1, k3;
-		memset (&pt, 0, sizeof pt); pt.nparams = 0; pt.ret = WASM_I32;   /* ()->i32 */
-		for (k3 = 0; k3 < nextra; ++k3) if (functype_eq (&extra_types [k3], &pt)) { pti = ti_base + k3; break; }
-		if (pti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt; pti = ti_base + nextra++; }
-		uses_calls = TRUE;
-#ifdef HOST_BROWSER
-		{ extern guint8 **mono_wasm_jit_slot_live_ptr_addr (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_slot_live_ptr_addr); }
-#else
-		wasm_i32_const (&body, 0x7ff4);
-#endif
-		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) pti); wasm_uleb (&body, 0);
+		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 1); /* imported s.l = &wj_slot_live */
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_ptr_idx);
-#ifdef HOST_BROWSER
-		{ extern int *mono_wasm_jit_slot_live_cap_addr (void); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_slot_live_cap_addr); }
-#else
-		wasm_i32_const (&body, 0x7ff5);
-#endif
-		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) pti); wasm_uleb (&body, 0);
+		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 2); /* imported s.c = &wj_slot_live_cap */
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_cap_idx);
 	}
 #endif
