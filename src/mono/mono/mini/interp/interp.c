@@ -4953,6 +4953,59 @@ mono_wasm_jit_imethod_fslot_off (void)
 	return (int) G_STRUCT_OFFSET (InterpMethod, wasm_jit_fslot);
 }
 
+/* Cold ways of the compact JIT->AOT PIC. Return the address of a complete two-word entry so the
+ * generated caller can use one common kind/argument/call tail for both way zero and cold-way hits. */
+gpointer
+mono_wasm_jit_vcall_aot_pic_lookup (MonoVTable *vt, gpointer aic)
+{
+	extern int mono_wasm_jit_vcall_aot_ways;
+	guint64 *p = (guint64 *) aic;
+	int k;
+
+	if (!vt || !p || mono_wasm_jit_vcall_aot_ways <= 1)
+		return NULL;
+	for (k = 1; k < mono_wasm_jit_vcall_aot_ways; ++k) {
+		guint64 a = (guint64) mono_atomic_load_i64 ((volatile gint64 *) (p + 2 * k));
+		guint64 b;
+		if ((guint32) a != (guint32) (gsize) vt)
+			continue;
+		b = (guint64) mono_atomic_load_i64 ((volatile gint64 *) (p + 2 * k + 1));
+		if ((guint32) b == (guint32) (gsize) vt)
+			return p + 2 * k;
+	}
+	return NULL;
+}
+
+static void
+wj_vcall_aot_ic_fill (gpointer aic, MonoVTable *vt, gpointer addr, gpointer rgctx, int kind)
+{
+	extern int mono_wasm_jit_vcall_aot_ways;
+	guint64 *p = (guint64 *) aic;
+	int k, victim = -1;
+	guint32 v = (guint32) (gsize) vt;
+	guint32 ti_kind = ((guint32) (gsize) addr << 1) | (kind == 2 ? 1u : 0u);
+
+	if (!p || !vt || !addr)
+		return;
+	for (k = 0; k < mono_wasm_jit_vcall_aot_ways; ++k) {
+		guint64 a = (guint64) mono_atomic_load_i64 ((volatile gint64 *) (p + 2 * k));
+		guint64 b = (guint64) mono_atomic_load_i64 ((volatile gint64 *) (p + 2 * k + 1));
+		if ((guint32) a == v && (guint32) b == v)
+			return;
+		if (victim < 0 && (guint32) a == 0 && (guint32) b == 0)
+			victim = k;
+	}
+	if (victim < 0)
+		victim = (int) ((((gsize) vt >> 4) ^ ((gsize) vt >> 11)) % (guint) mono_wasm_jit_vcall_aot_ways);
+
+	/* Publish payload word first, discriminator word last. Readers require both vtable tags to match,
+	 * so any interleaved writer produces only a benign miss, never a mixed target/rgctx dispatch. */
+	mono_atomic_store_i64 ((volatile gint64 *) (p + 2 * victim + 1),
+		(gint64) (((guint64) (guint32) (gsize) rgctx << 32) | v));
+	mono_atomic_store_i64 ((volatile gint64 *) (p + 2 * victim),
+		(gint64) (((guint64) ti_kind << 32) | v));
+}
+
 enum {
 	WJ_DELEGATE_NONE,
 	WJ_DELEGATE_CLOSED_INSTANCE,
@@ -5555,7 +5608,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
  *   1 = AOT-backed, body HAS the trailing extra arg -> call (this,args,rgctx)->ret
  *   2 = AOT-backed, body has NO trailing arg (exempt wrapper kind) -> call (this,args)->ret */
 int
-mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj)
+mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj, gpointer aic)
 {
 	extern gboolean mono_wasm_jit_aot_call_target (MonoMethod *m, gpointer *out_addr, gpointer *out_rgctx, gboolean *out_has_extra_arg);
 	MonoMethod *target = *(MonoMethod **) (scratch + 200);
@@ -5588,6 +5641,7 @@ mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj)
 		return 0;
 	*(gpointer *) (scratch + 212) = addr;
 	*(gpointer *) (scratch + 216) = rgctx;
+	wj_vcall_aot_ic_fill (aic, this_obj ? this_obj->vtable : NULL, addr, rgctx, has_extra_arg ? 1 : 2);
 	if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VCALL_AOT_FAST);
 	/* DIAGNOSTIC: name the resolved override taking the AOT-fast path, deduped per distinct target (probabilistic
 	 * hash dedup, so ~one line per method instead of per call). The JITted caller does the bare call_indirect

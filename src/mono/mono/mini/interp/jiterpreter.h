@@ -120,6 +120,8 @@ mono_interp_jit_wasm_entry_trampoline (
 	void *imethod, MonoMethod *method, int argument_count, MonoType *param_types,
 	int unbox, int has_this, int has_return, void *default_implementation
 );
+extern void
+mono_jiterp_wasm_jit_patch_interp_entry (void *imethod);
 
 // Fast-path implemented in C
 JiterpreterThunk
