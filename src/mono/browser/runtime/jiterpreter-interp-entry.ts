@@ -101,6 +101,8 @@ class TrampolineInfo {
     defaultImplementation: number;
     result: number;
     hitCount: number;
+    directImplementation?: Function;
+    directInstalled = false;
 
     // wasm-JIT direct-forward info. wjNargs >= 0 means this signature can be forwarded straight to the
     // JITted body's f-slot: wjKinds[i] is how to load argument i from its pointer, wjVtypes[i] its wasm
@@ -201,7 +203,28 @@ function has_live_pthread () {
 export function mono_jiterp_free_method_data_interp_entry (imethod: number) {
     // Normalize so an imethod pointer >= 2GB matches the unsigned key used by infoTable
     imethod = imethod >>> 0;
+    const info = infoTable[imethod];
+    // A direct adapter is installed only in this worker's table. Restore the signature-correct slow
+    // implementation before dropping the JS references so a stale AOT vtable entry can never retain
+    // or enter a freed adapter module.
+    if (info && fnTable && info.result > 0) {
+        const fallback = fnTable.get(info.defaultImplementation);
+        if (fallback)
+            fnTable.set(info.result, fallback);
+    }
     delete infoTable[imethod];
+}
+
+// Called by mono_wasm_jit_admit after the method's complete direct-call closure has been installed in
+// THIS worker's function table. Every worker owns a distinct table and a distinct infoTable, so this
+// patches only the worker whose admission just succeeded.
+export function mono_jiterp_wasm_jit_patch_interp_entry (imethod: number) {
+    imethod = imethod >>> 0;
+    const info = infoTable[imethod];
+    if (!info || !info.directImplementation || info.directInstalled || !fnTable || info.result <= 0)
+        return;
+    fnTable.set(info.result, info.directImplementation);
+    info.directInstalled = true;
 }
 
 // FIXME: move this counter into C and make it thread safe
@@ -419,9 +442,11 @@ function flush_wasm_entry_trampoline_jit_queue () {
         // JITted method's f-slot in it.
         builder._generateImportSection(true);
 
+        const directQueue = jitQueue.filter((info) => info.wjNargs >= 0);
+
         // Function section
         builder.beginSection(3);
-        builder.appendULeb(jitQueue.length);
+        builder.appendULeb(jitQueue.length + directQueue.length);
         for (let i = 0; i < jitQueue.length; i++) {
             const info = jitQueue[i];
             const traceName = info.getTraceName();
@@ -429,10 +454,15 @@ function flush_wasm_entry_trampoline_jit_queue () {
             mono_assert(builder.functionTypes[traceName], "func type missing");
             builder.appendULeb(builder.functionTypes[traceName][0]);
         }
+        // A direct adapter has the same native/AOT-facing pointer ABI as its guarded wrapper.
+        for (let i = 0; i < directQueue.length; i++) {
+            const traceName = directQueue[i].getTraceName();
+            builder.appendULeb(builder.functionTypes[traceName][0]);
+        }
 
         // Export section
         builder.beginSection(7);
-        builder.appendULeb(jitQueue.length);
+        builder.appendULeb(jitQueue.length + directQueue.length);
         for (let i = 0; i < jitQueue.length; i++) {
             const info = jitQueue[i];
             const traceName = info.getTraceName();
@@ -442,10 +472,16 @@ function flush_wasm_entry_trampoline_jit_queue () {
             //  the count of imported functions to get the index of our compiled trace
             builder.appendULeb(builder.importedFunctionCount + i);
         }
+        for (let i = 0; i < directQueue.length; i++) {
+            const traceName = directQueue[i].getTraceName();
+            builder.appendName(traceName + "_direct");
+            builder.appendU8(0);
+            builder.appendULeb(builder.importedFunctionCount + jitQueue.length + i);
+        }
 
         // Code section
         builder.beginSection(10);
-        builder.appendULeb(jitQueue.length);
+        builder.appendULeb(jitQueue.length + directQueue.length);
         for (let i = 0; i < jitQueue.length; i++) {
             const info = jitQueue[i];
             const traceName = info.getTraceName();
@@ -461,6 +497,19 @@ function flush_wasm_entry_trampoline_jit_queue () {
             const ok = generate_wasm_body(builder, info);
             if (!ok)
                 throw new Error(`Failed to generate ${traceName}`);
+
+            builder.appendU8(WasmOpcode.end);
+            builder.endFunction(true);
+        }
+        for (let i = 0; i < directQueue.length; i++) {
+            const info = directQueue[i];
+            const traceName = info.getTraceName();
+            builder.beginFunction(traceName, {
+                "wj_fslot": WasmValtype.i32,
+                "wj_ret": info.hasReturnValue ? info.wjVtypes[info.wjNargs] : WasmValtype.i32,
+            });
+
+            generate_wasm_jit_direct_body(builder, info);
 
             builder.appendU8(WasmOpcode.end);
             builder.endFunction(true);
@@ -484,10 +533,20 @@ function flush_wasm_entry_trampoline_jit_queue () {
             const info = jitQueue[i];
             const traceName = info.getTraceName();
 
-            // Get the exported trampoline
+            // Get the exported guarded trampoline.
             const fn = traceInstance.exports[traceName];
-            // Patch the function pointer for this function to use the trampoline now
+            // Patch the function pointer for this function to use the trampoline now.
             fnTable.set(info.result, fn);
+            info.directInstalled = false;
+            if (info.wjNargs >= 0) {
+                info.directImplementation = traceInstance.exports[traceName + "_direct"] as Function;
+                // Admission may have happened before this wrapper crossed its compilation threshold.
+                // In that ordering, install the adapter immediately instead of waiting for another
+                // native/AOT entry to discover an already-live f-slot.
+                const fslot = getU32_unaligned(<any>(info.imethod + getMemberOffset(JiterpMember.WasmJitFslot)));
+                if (fslot > 0 && cwraps.mono_wasm_jit_slot_live(fslot))
+                    mono_jiterp_wasm_jit_patch_interp_entry(info.imethod);
+            }
 
             rejected = false;
         }
@@ -609,6 +668,61 @@ function append_stackval_from_data (
 
             builder.callImport("stackval_from_data");
             break;
+        }
+    }
+}
+
+/*
+ * Guard-free native/AOT -> wasm-JIT adapter. It is never installed until mono_wasm_jit_admit has
+ * installed and admitted the target's complete direct-call closure in this worker. Consequently the
+ * per-call fslot==0 and slot-live bitmap guards from generate_wasm_body are admission-time work now.
+ *
+ * Keep loading wasm_jit_fslot rather than baking it: tiering forwards to a replacement InterpMethod
+ * while preserving the published slot, and reading the canonical rmethod field keeps that contract
+ * explicit without adding a branch.
+ */
+function generate_wasm_jit_direct_body (builder: WasmBuilder, info: TrampolineInfo) {
+    mono_assert(info.wjNargs >= 0, "direct adapter without wasm-jit signature");
+
+    builder.local("rmethod");
+    builder.i32_const(~0x1);
+    builder.appendU8(WasmOpcode.i32_and);
+    builder.appendU8(WasmOpcode.i32_load);
+    builder.appendMemarg(getMemberOffset(JiterpMember.WasmJitFslot), 2);
+    builder.local("wj_fslot", WasmOpcode.set_local);
+
+    // The trampoline ABI passes pointers; the scalar wasm-JIT body takes values.
+    for (let i = 0; i < info.wjNargs; i++) {
+        const isThis = info.hasThisReference && (i === 0);
+        const valueName = isThis ? "this_arg" : `arg${i - (info.hasThisReference ? 1 : 0)}`;
+        builder.local(valueName);
+        switch (info.wjKinds[i]) {
+            case 8: break; // already a value
+            case 0: builder.appendU8(WasmOpcode.i32_load); builder.appendMemarg(0, 2); break;
+            case 1: builder.appendU8(WasmOpcode.i64_load); builder.appendMemarg(0, 3); break;
+            case 2: builder.appendU8(WasmOpcode.f32_load); builder.appendMemarg(0, 2); break;
+            case 3: builder.appendU8(WasmOpcode.f64_load); builder.appendMemarg(0, 3); break;
+            case 4: builder.appendU8(WasmOpcode.i32_load8_s); builder.appendMemarg(0, 0); break;
+            case 5: builder.appendU8(WasmOpcode.i32_load8_u); builder.appendMemarg(0, 0); break;
+            case 6: builder.appendU8(WasmOpcode.i32_load16_s); builder.appendMemarg(0, 1); break;
+            case 7: builder.appendU8(WasmOpcode.i32_load16_u); builder.appendMemarg(0, 1); break;
+            default: throw new Error(`bad wasm-jit load kind ${info.wjKinds[i]}`);
+        }
+    }
+
+    builder.local("wj_fslot");
+    builder.call_indirect(info.getTraceName() + "_wj", 0);
+
+    if (info.hasReturnValue) {
+        const rv = info.wjVtypes[info.wjNargs];
+        builder.local("wj_ret", WasmOpcode.set_local);
+        builder.local("res");
+        builder.local("wj_ret");
+        switch (rv) {
+            case WasmValtype.i64: builder.appendU8(WasmOpcode.i64_store); builder.appendMemarg(0, 3); break;
+            case WasmValtype.f32: builder.appendU8(WasmOpcode.f32_store); builder.appendMemarg(0, 2); break;
+            case WasmValtype.f64: builder.appendU8(WasmOpcode.f64_store); builder.appendMemarg(0, 3); break;
+            default: builder.appendU8(WasmOpcode.i32_store); builder.appendMemarg(0, 2); break;
         }
     }
 }

@@ -31,6 +31,8 @@ static int mono_wasm_debug_level = 0;
 #ifdef HOST_BROWSER
 #include <emscripten.h>
 int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
+gpointer mono_interp_get_imethod (MonoMethod *method); /* interp/interp.c; kept opaque in this emitter */
+void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
 #define WJ_KEEPALIVE EMSCRIPTEN_KEEPALIVE
 #else
 #define WJ_KEEPALIVE
@@ -1111,6 +1113,15 @@ mono_wasm_jit_admit (int desc_id)
 	wj_mark_slot_live (re->e);
 	wj_mark_slot_live (re->f);
 	wj_desc_state [desc_id] = 2;
+#ifdef HOST_BROWSER
+	/* The native/AOT vtable entry initially points at a guarded interp-entry trampoline. Admission is
+	 * per worker, just like the function table, so this is the earliest point where THIS worker may
+	 * replace it with the generated guard-free pointer-ABI -> scalar-ABI adapter. If the adapter has
+	 * not crossed its own compilation threshold yet the TS side records nothing; its later install
+	 * checks the already-live f-slot and completes the patch in the opposite ordering. */
+	if (re->logical_method)
+		mono_jiterp_wasm_jit_patch_interp_entry (mono_interp_get_imethod (re->logical_method));
+#endif
 	if (watch) printf ("WASM_JIT_ADMIT_OK desc=%d e_live=%d f_live=%d\n", desc_id, mono_wasm_jit_slot_live (re->e), mono_wasm_jit_slot_live (re->f));
 	return 1;
 fail:
@@ -7057,6 +7068,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * and the i32 pair can tear -> a bad call_indirect that traps and kills the worker). */
 						extern gpointer mono_wasm_jit_scratch (void);
 						extern int mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic);
+						extern gpointer mono_wasm_jit_vcall_aot_pic_lookup (MonoVTable *vt, gpointer aic);
 							extern int mono_wasm_jit_call_interp (MonoMethod *m, guint8 *buf);
 							extern int mono_wasm_jit_call_delegate (MonoMethod *m, guint8 *buf);
 						WasmFuncType vts, vtrf, vtd, ftd, dftd; WasmCallInfo vci; int vtsi = -1, vtrfi = -1, vtdi = -1, ftdi = -1, dftdi = -1, vk, ai, n2, this_vr; int aic_ati = -1, aic_ati_ne = -1;
@@ -7358,31 +7370,26 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_END); /* $delegate_way_fail */
 								}
 							}
-							/* N-WAY inline IC (MONO_WASM_JIT_VCALL_WAYS, default 1 = monomorphic). One BLOCK per cached
-							 * (vtable -> f-slot) entry: a guard failure br 0's to the next way, a hit br 1's to $after.
-							 * A 2-way IC captures the ~63% of miss traffic that are 2-type sites (arity depth-1) which a
-							 * 1-way IC gets 0% of (it thrashes). After all ways: the AOT-IC + resolve_fslot slow path. */
-							/* vtab = *(this + 0), loaded ONCE for the whole way chain rather than per way. It is
-							 * invariant across the guards: they are pure loads/compares/branches, so there is no
-							 * store and no GC point between them, and `this` itself cannot change. Re-loading it
-							 * per way cost (ways-1) redundant heap loads on the hottest path in the program.
-							 * This also makes a WIDER IC cheaper, which is the direction the measurement points:
-							 * interleaved A/B had 1-way 4-6% SLOWER than 4-way and 8-way ~1.6% faster than 4-way,
-							 * i.e. miss cost dominates guard cost, so shrinking per-way cost compounds.
-							 * Kept as its own load (not shared with the AOT-IC loop below, which re-establishes
-							 * it) so neither loop's correctness depends on the other being emitted. */
-							/* Two blocks wrap the whole way chain so the argument push + call_indirect can be
-							 * emitted ONCE for all ways instead of once PER way (which is where the 24
-							 * call_indirect ops in a single dispatch stub came from -- the AOT-IC's own comment
-							 * already names this as "the aic-only code bloat that made widening the AOT-IC a net
-							 * loss"). Only the GUARD is replicated per way now.
+							/* Compact N-way JIT IC (MONO_WASM_JIT_VCALL_WAYS). Way zero remains straight-line;
+							 * ways 1..N live only in the data cache and are scanned by one constant-size wasm
+							 * loop. Interleaved A/B had 1-way 4-6% slower than 4-way because a way-zero miss
+							 * entered the full resolver. The loop retains that polymorphic capacity without
+							 * replicating the fslot+liveness guard N times or crossing into an AOT helper on
+							 * every polymorphic hit.
 							 *
-							 * Nesting inside a way body becomes $way_fail(0) $tail(1) $slow(2) $after(3), so:
-							 *   - a guard/liveness miss still br_if 0 -> $way_fail (next way)   [unchanged]
-							 *   - a HIT still br 1, which now exits $tail and lands on the shared call [same
-							 *     encoding as the old "br 1 -> $after", so no per-way branch had to change]
+							 * vtab = *(this + 0) is invariant across both guards: they contain no store or GC
+							 * point, and `this` cannot change. The AOT IC below reloads it deliberately so
+							 * neither cache's correctness depends on the other being enabled.
+							 *
+							 * Two blocks wrap the guards so the argument push + call_indirect are emitted ONCE
+							 * for all ways instead of once per way (the source of the former 24 call_indirect
+							 * operations in one dispatch stub).
+							 *
+							 * Nesting inside the way-zero guard is $way_fail(0) $tail(1) $slow(2) $after(3):
+							 *   - a guard/liveness miss br_if 0 -> $way_fail, then enters the compact scan
+							 *   - a hit br 1 exits $tail and lands on the shared call
 							 *   - after the chain, br 1 exits $slow, skipping the shared tail
-							 *   - the shared tail ends with br 1 -> $after, as the per-way copies used to
+							 *   - the shared tail ends with br 1 -> $after
 							 * Both new blocks CLOSE before the AOT-IC/resolve_fslot slow path, so that path and
 							 * everything after it keeps its original depth. This matters because WJ_THROW_BR/GOTO
 							 * take the in-bb nesting count as a hand-passed EXTRA: the region's only throw is the
@@ -7393,7 +7400,8 @@ vcall_nullchk_done:
 							if (!wasm_ld (&body, &lc, this_vr)) { fail = "ic this ld"; goto done; }
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 							wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
-							for (way = 0; way < mono_wasm_jit_vcall_ways; ++way) {
+							/* Only the monomorphic/MRU way is emitted. Capacity remains N-way in linear memory. */
+							for (way = 0; way < 1; ++way) {
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /*   $way_fail (void) */
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
 							/* ic = i64.atomic.load(&vic[way]); $ic = ic; if ((i32)ic != vtab) -> $way_fail */
@@ -7449,6 +7457,67 @@ vcall_nullchk_done:
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> exit $tail */
 							wasm_op (&body, WASM_OP_END);                            /* end $way_fail */
 							}   /* for each way */
+							if (mono_wasm_jit_vcall_ways > 1) {
+								/* Way zero missed: scan ways 1..N with one constant-size wasm loop. Reuse
+								 * aic_ti_idx as the cursor; the AOT PIC overwrites it below before use. */
+								wasm_i32_const (&body, 0);
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+								wasm_i32_const (&body, (gint32) (intptr_t) vic + 8);
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $cold_done */
+								wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);  /* $cold_loop */
+									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $cold_next */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+										wj_emit_ic_load64 (&body, 0);
+										wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
+										wasm_op (&body, WASM_OP_I32_WRAP_I64);
+										wasm_op (&body, WASM_OP_I32_NE);
+										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
+										wasm_i64_const (&body, 32);
+										wasm_op (&body, WASM_OP_I64_SHR_U);
+										wasm_op (&body, WASM_OP_I32_WRAP_I64);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) fslot_off);
+										wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+										wasm_op (&body, WASM_OP_I32_EQZ);
+										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+										/* Same worker-local admission gate as way zero. */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+										wasm_op (&body, WASM_OP_I32_LT_U);
+										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
+											wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+											wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+											wasm_op (&body, WASM_OP_I32_ADD);
+											wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+											wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
+											wasm_op (&body, WASM_OP_I32_SHR_U);
+											wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);
+										wasm_op (&body, WASM_OP_ELSE);
+											wasm_i32_const (&body, 0);
+										wasm_op (&body, WASM_OP_END);
+										wasm_op (&body, WASM_OP_I32_EQZ);
+										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+										wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 2); /* hit -> $cold_done */
+									wasm_op (&body, WASM_OP_END); /* $cold_next */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+									wasm_i32_const (&body, 8); wasm_op (&body, WASM_OP_I32_ADD);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_ti_idx);
+									wasm_i32_const (&body, (gint32) (intptr_t) vic + 8 * mono_wasm_jit_vcall_ways);
+									wasm_op (&body, WASM_OP_I32_LT_U);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0); /* -> $cold_loop */
+									wasm_i32_const (&body, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+								wasm_op (&body, WASM_OP_END); /* $cold_loop */
+								wasm_op (&body, WASM_OP_END); /* $cold_done */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+								wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0); /* hit -> exit $tail */
+							}
 							/* every way missed -> exit $slow, skipping the shared tail */
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);
 							wasm_op (&body, WASM_OP_END);                            /* end $tail */
@@ -7469,31 +7538,51 @@ vcall_nullchk_done:
 							 * vtable regardless of interleaved fills (a vtable maps to ONE target -> identical values). Only
 							 * atomic i64 loads (no plain-vs-atomic ordering, which wasm's memory model does not provide). */
 							if (aic) {
-								/* N-WAY AOT-IC (MONO_WASM_JIT_VCALL_AOT_WAYS): one BLOCK per cached AOT entry (two vtab-tagged
-								 * i64 at aic+16*way). A hit needs BOTH words' low32 == vtab (already tear-safe: a torn 2-word
-								 * entry fails the both-match check -> miss, never a wrong dispatch, so N-way LRU/fill is MT-safe
-								 * for free). 2 ways capture the AOT 2-type sites whose loser vtable was stuck reaching the helper
-								 * behind the 1-entry first-wins cache. */
-								int aic_way;
-								/* v = *this, once for the whole AOT way chain -- same invariance argument as the
-								 * f-slot chain above. Re-established here rather than relying on the f-slot loop's
-								 * copy so this block stands alone. */
+								/* Compact N-way AOT PIC. Way zero stays inline; ways 1..N are scanned by one
+								 * signature-independent helper which returns an entry address. Both routes then
+								 * use this single tag validation, payload extraction, argument load and typed
+								 * call tail. Cache capacity therefore no longer multiplies generated code. */
 								if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic this ld"; goto done; }
 								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
-								for (aic_way = 0; aic_way < mono_wasm_jit_vcall_aot_ways; ++aic_way) {
-								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_way ($after now depth 1) */
-								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wj_emit_ic_load64 (&body, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* a = ic1[way] (reuse vc_ic_idx i64) */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* a.vtab != v -> $aot_way (next) */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);   /* ti_kind = a>>32 */
-								wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wj_emit_ic_load64 (&body, 8); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);   /* b = ic2[way] */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* b.vtab != v -> $aot_way (next) */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_rgctx_idx);   /* rgctx = b>>32 */
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_selected */
+									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_way0_fail */
+										wasm_i32_const (&body, (gint32) (intptr_t) aic); wj_emit_ic_load64 (&body, 0);
+										wasm_op (&body, WASM_OP_I32_WRAP_I64);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+										wasm_i32_const (&body, (gint32) (intptr_t) aic); wj_emit_ic_load64 (&body, 8);
+										wasm_op (&body, WASM_OP_I32_WRAP_I64);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+										wasm_i32_const (&body, (gint32) (intptr_t) aic);
+										wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx); /* selected entry ptr */
+										wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* skip cold scan */
+									wasm_op (&body, WASM_OP_END);
+									if (mono_wasm_jit_vcall_aot_ways > 1) {
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										wasm_i32_const (&body, (gint32) (intptr_t) aic);
+#ifdef HOST_BROWSER
+										wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_aot_pic_lookup);
+#else
+										wasm_i32_const (&body, 0x7fe2);
+#endif
+										wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) vtdi); wasm_uleb (&body, 0);
+									} else {
+										wasm_i32_const (&body, 0);
+									}
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+								wasm_op (&body, WASM_OP_END);
+								/* Revalidate both tags while loading the payload. A concurrent eviction between
+								 * selection and this load becomes a miss rather than mixed target data. */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx); wj_emit_ic_load64 (&body, 0); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx); wj_emit_ic_load64 (&body, 8); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_ic_idx);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx); wasm_op (&body, WASM_OP_I32_NE); wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_rgctx_idx);
 								wj_emit_fast_count (&body, WJC_FAST_AOTIC);   /* profile: inline AOT-IC hit (JIT->AOT) */
-								/* Collapsed kind branch: the args are identical in both arms — only the trailing rgctx push
-								 * and the call_indirect functype differ — so load args ONCE here and let a TYPED if-block
-								 * (params = aic_ati_ne = (this,args)->rv, guaranteed valid: aic==NULL otherwise) carry them into
-								 * whichever arm runs. Halves the emitted arg-load sequence per way — the aic-only code bloat
-								 * that made widening the AOT-IC a net loss (vs the lean f-slot vic). Needs multi-value blocks. */
 								for (ai = 0; ai < n2; ++ai) if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "aot ic arg ld"; goto done; }
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);   /* kind2bit selector */
 								wasm_op (&body, WASM_OP_IF); wasm_sleb (&body, (gint64) aic_ati_ne);   /* typed block in: (this,args) out: rv */
@@ -7506,8 +7595,7 @@ vcall_nullchk_done:
 								wasm_op (&body, WASM_OP_END);   /* end kind if/else */
 								if (rv != WASM_VOID) { if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "aot ic dreg"; goto done; } }
 								wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* hit -> $after */
-								wasm_op (&body, WASM_OP_END);   /* end $aot_way */
-								}   /* for each AOT way -> fall through to resolve_fslot slow path */
+								wasm_op (&body, WASM_OP_END);   /* selected entry invalid/absent -> resolve */
 							}
 						}
 						/* $scratch = mono_wasm_jit_scratch() */
@@ -7560,16 +7648,16 @@ vcall_nullchk_done:
 							{
 								extern int mono_wasm_jit_vcall_aot;
 								if (mono_wasm_jit_vcall_aot) {
-									extern int mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj);
+									extern int mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj, gpointer aic);
 									WasmFuncType at, at_ne, aott; int ati = -1, ati_ne = -1, aotti = -1;
 									if (n2 + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "vcall aot nparams"; goto done; }
-									/* aott (i32,i32)->i32 = the resolve helper (scratch, receiver), returning
+									/* aott (i32,i32,i32)->i32 = the resolve helper (scratch, receiver, AOT IC), returning
 									 * 0=residual / 1=AOT+rgctx / 2=AOT,no-extra-arg.
 									 * at (this,params,i32 rgctx)->rv = AOT body WITH the trailing extra (rgctx/dummy) arg; at_ne
 									 * (this,params)->rv = AOT body of an exempt wrapper kind WITHOUT it. The override is resolved at
 									 * RUNTIME but the call_indirect functype is baked here, so emit BOTH variants and pick by the
 									 * helper's return code (kind==2 -> at_ne). Keeps every AOT-backed vcall fast (no residual). */
-									memset (&aott, 0, sizeof (aott)); aott.params [0] = WASM_I32; aott.params [1] = WASM_I32; aott.nparams = 2; aott.ret = WASM_I32;
+									memset (&aott, 0, sizeof (aott)); aott.params [0] = WASM_I32; aott.params [1] = WASM_I32; aott.params [2] = WASM_I32; aott.nparams = 3; aott.ret = WASM_I32;
 									for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &aott)) { aotti = ti_base + vk; break; }
 									if (aotti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = aott; aotti = ti_base + nextra++; }
 									memset (&at, 0, sizeof (at)); for (vk = 0; vk < n2; ++vk) at.params [vk] = pp [vk]; at.params [n2] = WASM_I32; at.nparams = (guint32) (n2 + 1); at.ret = rv;
@@ -7580,9 +7668,11 @@ vcall_nullchk_done:
 									if (ati_ne < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = at_ne; ati_ne = ti_base + nextra++; }
 									uses_calls = TRUE;
 									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $no_aot */
-									/* kind = mono_wasm_jit_vcall_aot_target(scratch,this); if (kind==0) br $no_aot (-> residual) */
+									/* Resolve and fill the compact AOT IC in C. This removes the former N-way
+									 * unrolled empty-slot search and atomic publication sequence from every site. */
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 									if (!wasm_ld (&body, &lc, this_vr)) { fail = "vcall aot this ld"; goto done; }
+									wasm_i32_const (&body, (gint32) (intptr_t) aic);
 #ifdef HOST_BROWSER
 									wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_aot_target);
 #else
@@ -7592,31 +7682,6 @@ vcall_nullchk_done:
 									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_aotkind_idx);   /* stash kind, keep on stack */
 									wasm_op (&body, WASM_OP_I32_EQZ);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* kind==0 -> $no_aot -> residual */
-									if (aic) {   /* FILL the FIRST EMPTY of the N AOT-IC entries (each two i64: ic1=vtab|((ti<<1|kind2)<<32), ic2=vtab|(rgctx<<32)) */
-										/* first-empty-win, no eviction: on a MISS the receiver vtab is (was) in no entry, so filling any
-										 * empty slot with it can't dup. A 2-type AOT site fills slot0 with the winner, then slot1 with the
-										 * loser -> both hit thereafter (fixes the 1-entry first-wins thrash). br out after the first fill so
-										 * one miss fills exactly one slot (else the winner would fill every empty slot -> no room for the loser). */
-										int aic_way;
-										wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $aot_filled */
-										for (aic_way = 0; aic_way < mono_wasm_jit_vcall_aot_ways; ++aic_way) {
-										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way); wj_emit_ic_load64 (&body, 0); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op (&body, WASM_OP_I32_EQZ);
-										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);   /* if (ic1[way].key == 0) */
-										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way);
-										if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic fill v1"; goto done; } wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U);   /* vtab low32 */
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHL);   /* ti<<1 */
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx); wasm_i32_const (&body, 2); wasm_op (&body, WASM_OP_I32_EQ); wasm_op (&body, WASM_OP_I32_OR);   /* | kind2bit */
-										wasm_op (&body, WASM_OP_I64_EXTEND_I32_U); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHL); wasm_op (&body, WASM_OP_I64_OR);
-										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 0);   /* i64.atomic.store ic1[way] */
-										wasm_i32_const (&body, (gint32) (intptr_t) aic + 16 * aic_way);
-										if (!wasm_ld (&body, &lc, this_vr)) { fail = "aot ic fill v2"; goto done; } wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHL); wasm_op (&body, WASM_OP_I64_OR);
-										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x18); wasm_memarg (&body, 3, 8);   /* i64.atomic.store ic2[way] */
-										wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* filled one slot -> exit $aot_filled (skip remaining ways) */
-										wasm_op (&body, WASM_OP_END);   /* end if-empty(way) */
-										}   /* for each AOT way */
-										wasm_op (&body, WASM_OP_END);   /* end $aot_filled */
-									}
 									/* cppeh: bare AOT call — a throwing callee C++-unwinds natively to the nearest landing
 									 * pad (an in-method catch or the interp e-thunk boundary). No try/catch wrapper. */
 									/* Collapsed kind branch (mirror of the inline AOT-IC): args identical in both arms, so load
