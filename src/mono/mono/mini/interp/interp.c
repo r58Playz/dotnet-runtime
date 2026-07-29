@@ -1092,6 +1092,165 @@ typedef struct {
 	volatile gint32 scalar;
 } WjDelegateIC;
 
+/*
+ * The generated dispatch PIC is deliberately worker-local.  Dynamic wasm table entries are local to
+ * a worker, so caching an InterpMethod process-wide forced every hit to load its fslot and consult a
+ * second TLS liveness bitmap.  A local entry can cache the final admitted fslot directly:
+ *
+ *   +0  atomic-looking hot pair [i32 receiver vtable | i32 admitted fslot]
+ *   +8  resolved MonoMethod* (cold profile consumer only)
+ *   +12 hit count (plain: only this worker writes it)
+ *
+ * The 16-byte stride keeps the hot pair naturally aligned.  The i64 pair is loaded with an ordinary
+ * wasm load: although the heap is shared, a TLS block has one writer/reader worker.  `target` and
+ * `hits` are the target-frequency feed for dynamic batching and are intentionally outside the pair,
+ * so they do not enlarge the dispatch key.
+ */
+typedef struct {
+	guint64 key_fslot;
+	MonoMethod *target;
+	guint32 hits;
+} WjLocalVcallPicEntry;
+
+typedef struct {
+	guint32 site_id;
+	/* Keep the resolver IC which immediately follows this header naturally 8-byte aligned. On
+	 * wasm32 the two pointers below are 4 bytes each, so without this explicit word the header was
+	 * 12 bytes and every i64.atomic access in vcall_resolve_fslot trapped as unaligned. */
+	guint32 reserved;
+	MonoMethod *caller;
+	MonoMethod *base;
+} WjVcallSite;
+
+g_static_assert ((sizeof (WjVcallSite) & 7) == 0);
+
+static volatile gint32 wj_vcall_site_count;
+#define WJ_VCALL_SITE_MAX 65536
+static WjVcallSite * volatile wj_vcall_sites [WJ_VCALL_SITE_MAX];
+static __thread WjLocalVcallPicEntry *wj_vcall_pic;
+static __thread gint32 wj_vcall_pic_cap; /* sites, not entries */
+
+static inline WjVcallSite *
+wj_vcall_site (gpointer ic)
+{
+	return (WjVcallSite *) ((guint8 *) ic - sizeof (WjVcallSite));
+}
+
+static WjLocalVcallPicEntry *
+wj_vcall_pic_for_site (gpointer ic, gboolean grow)
+{
+	extern int mono_wasm_jit_vcall_ways;
+	WjVcallSite *site = wj_vcall_site (ic);
+	guint32 need = site->site_id + 1;
+	if (G_UNLIKELY (need > (guint32) wj_vcall_pic_cap)) {
+		gint32 oldcap, ncap;
+		gsize oldbytes, nbytes;
+		if (!grow)
+			return NULL;
+		oldcap = wj_vcall_pic_cap;
+		ncap = oldcap ? oldcap : 256;
+		while (need > (guint32) ncap)
+			ncap *= 2;
+		oldbytes = (gsize) oldcap * mono_wasm_jit_vcall_ways * sizeof (WjLocalVcallPicEntry);
+		nbytes = (gsize) ncap * mono_wasm_jit_vcall_ways * sizeof (WjLocalVcallPicEntry);
+		wj_vcall_pic = (WjLocalVcallPicEntry *) g_realloc (wj_vcall_pic, nbytes);
+		memset ((guint8 *) wj_vcall_pic + oldbytes, 0, nbytes - oldbytes);
+		/* Publish the pointer before the capacity. Generated wasm reads cap first and only dereferences
+		 * the pointer when the site fits. Both are same-thread accesses; this ordering also makes the
+		 * invariant explicit for a future shared profile reader. */
+		mono_memory_barrier ();
+		wj_vcall_pic_cap = ncap;
+	}
+	return wj_vcall_pic + (gsize) site->site_id * mono_wasm_jit_vcall_ways;
+}
+
+static void
+wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fslot)
+{
+	extern int mono_wasm_jit_vcall_ways;
+	WjLocalVcallPicEntry *p = wj_vcall_pic_for_site (ic, TRUE);
+	guint64 pair = ((guint64) (guint32) fslot << 32) | (guint32) (gsize) vt;
+	int k, victim = 0;
+	guint32 least = 0xffffffffu;
+
+	/* Refresh an existing receiver in place. Otherwise prefer an empty way, then replace the least
+	 * frequent target. This is steadier than cross-thread LRU and preserves V8's monomorphic feedback
+	 * at one-target sites. */
+	for (k = 0; k < mono_wasm_jit_vcall_ways; ++k) {
+		if ((guint32) p [k].key_fslot == (guint32) (gsize) vt) {
+			p [k].target = target;
+			p [k].key_fslot = pair;
+			if (p [k].hits != 0xffffffffu) p [k].hits++;
+			return;
+		}
+		if (!p [k].key_fslot) { victim = k; least = 0; break; }
+		if (p [k].hits < least) { least = p [k].hits; victim = k; }
+	}
+	p [victim].target = target;
+	p [victim].hits = 1;
+	mono_memory_barrier ();
+	p [victim].key_fslot = pair; /* publish the guard+payload last */
+}
+
+/* Imported as immutable globals by each dynamic method instance.  They are the addresses of the TLS
+ * pointer/cap variables, not snapshots of their values, so realloc-on-growth is visible immediately. */
+gpointer *
+mono_wasm_jit_vcall_pic_ptr_addr (void)
+{
+	return (gpointer *) &wj_vcall_pic;
+}
+
+gint32 *
+mono_wasm_jit_vcall_pic_cap_addr (void)
+{
+	return &wj_vcall_pic_cap;
+}
+
+guint32
+mono_wasm_jit_vcall_pic_site_id (gpointer ic)
+{
+	return wj_vcall_site (ic)->site_id;
+}
+
+/* Current-worker profile enumeration for the dynamic batcher. A row is keyed by
+ * (site_index,way); zero-hit/empty rows return 0. The caller/base/target identities and exact hit
+ * count are enough to build weighted caller->target edges without instrumenting call_indirect itself. */
+int
+mono_wasm_jit_vcall_profile_count (void)
+{
+	gint32 n = mono_atomic_load_i32 (&wj_vcall_site_count);
+	return n < WJ_VCALL_SITE_MAX ? n : WJ_VCALL_SITE_MAX;
+}
+
+int
+mono_wasm_jit_vcall_profile_entry (int site_index, int way, MonoMethod **caller,
+	MonoMethod **base, MonoMethod **target, guint32 *hits)
+{
+	extern int mono_wasm_jit_vcall_ways;
+	WjVcallSite *site;
+	WjLocalVcallPicEntry *p;
+	if (site_index < 0 || site_index >= mono_wasm_jit_vcall_profile_count () ||
+	    way < 0 || way >= mono_wasm_jit_vcall_ways)
+		return 0;
+	site = wj_vcall_sites [site_index];
+	if (!site)
+		return 0;
+	p = wj_vcall_pic_for_site ((guint8 *) site + sizeof (WjVcallSite), FALSE);
+	if (!p || !p [way].key_fslot || !p [way].hits || !p [way].target)
+		return 0;
+	if (caller) *caller = site->caller;
+	if (base) *base = site->base;
+	if (target) *target = p [way].target;
+	if (hits) *hits = p [way].hits;
+	return 1;
+}
+
+int
+mono_wasm_jit_vcall_pic_stride (void)
+{
+	return (int) sizeof (WjLocalVcallPicEntry);
+}
+
 static WjDelegateIC *
 wj_delegate_ic (gpointer ic)
 {
@@ -4326,16 +4485,25 @@ mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
  * virtual call site).
  */
 gpointer
-mono_wasm_jit_alloc_ic (int delegate_site)
+mono_wasm_jit_alloc_ic (int delegate_site, MonoMethod *caller, MonoMethod *base)
 {
 	/* Layout: [ways x i64 IC entries][i64 fast-miss meta][optional delegate recipe][optional arity shadow]. `ways` and the arity
 	 * flag are fixed at startup, so alloc-time and run-time (resolve_fslot / wj_arity_record) agree on the
 	 * offsets. The arity shadow is allocated only when MONO_WASM_JIT_ARITY=1. */
 	extern int mono_wasm_jit_arity, mono_wasm_jit_vcall_ways;
-	int sz = 8 * (mono_wasm_jit_vcall_ways + 1);   /* N IC entries + one fast-miss meta i64 */
+	int sz = 8 * (mono_wasm_jit_vcall_ways + 1);   /* N resolve entries + one fast-miss meta i64 */
+	WjVcallSite *site;
 	if (delegate_site) sz += wj_delegate_ic_size ();
 	if (mono_wasm_jit_arity) sz += WJ_ARITY_WAYS * (int) sizeof (guint32);
-	return g_malloc0 (sz);
+	site = (WjVcallSite *) g_malloc0 (sizeof (WjVcallSite) + sz);
+	site->site_id = (guint32) mono_atomic_inc_i32 (&wj_vcall_site_count) - 1;
+	site->caller = caller;
+	site->base = base;
+	if (site->site_id < WJ_VCALL_SITE_MAX) {
+		mono_memory_barrier ();
+		wj_vcall_sites [site->site_id] = site;
+	}
+	return (guint8 *) site + sizeof (WjVcallSite);
 }
 
 /* Per-call-site AOT-vcall inline cache cell (VCALL_AOT_IC): TWO atomic i64 words
@@ -4445,12 +4613,62 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
  * differs per thread), so the JITted code fetches it via mono_wasm_jit_scratch() at each call site. */
 static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE];
 
+/*
+ * Cold virtual misses need a marshalling frame whose reference slots remain valid while resolution
+ * allocates or triggers a moving GC. Keeping 256 bytes in every generated caller's C-stack frame made
+ * the steady-state hit path pay a larger prologue/epilogue and inflated deep virtual-call stacks.
+ *
+ * Allocate these frames lazily per worker instead. Each frame is permanently registered as a
+ * conservative pinning root, cleared before it is returned to the pool, and selected by a depth
+ * counter so resolver/cctor re-entry cannot overwrite an outer miss. We intentionally retain the
+ * allocation/root for the worker lifetime: unregistering a TLS address during worker teardown races
+ * the collector, while the maximum storage is only 256 bytes per observed nesting level.
+ */
+static __thread guint8 **wj_vcall_miss_frames;
+static __thread gint32 wj_vcall_miss_frame_cap;
+static __thread gint32 wj_vcall_miss_frame_depth;
+
 extern int mono_wasm_jit_stats;
 
 gpointer
 mono_wasm_jit_scratch (void)
 {
 	return wj_scratch;
+}
+
+gpointer
+mono_wasm_jit_vcall_miss_frame_acquire (void)
+{
+	gint32 depth = wj_vcall_miss_frame_depth;
+	if (G_UNLIKELY (depth == wj_vcall_miss_frame_cap)) {
+		gint32 oldcap = wj_vcall_miss_frame_cap;
+		gint32 ncap = oldcap ? oldcap * 2 : 4;
+		wj_vcall_miss_frames = (guint8 **) g_realloc (wj_vcall_miss_frames,
+			(gsize) ncap * sizeof (guint8 *));
+		memset (wj_vcall_miss_frames + oldcap, 0, (gsize) (ncap - oldcap) * sizeof (guint8 *));
+		wj_vcall_miss_frame_cap = ncap;
+	}
+	if (G_UNLIKELY (!wj_vcall_miss_frames [depth])) {
+		guint8 *frame = (guint8 *) g_malloc0 (WJ_SCRATCH_SIZE);
+		/* A NULL descriptor is SGen's conservative/pinning-root form: object-looking words in this
+		 * mixed scalar/reference frame pin their targets instead of being rewritten as typed refs. */
+		gboolean ok = mono_gc_register_root ((char *) frame, WJ_SCRATCH_SIZE,
+			MONO_GC_DESCRIPTOR_NULL, MONO_ROOT_SOURCE_JIT, frame, "wasm-jit vcall miss frame");
+		g_assert (ok);
+		wj_vcall_miss_frames [depth] = frame;
+	}
+	wj_vcall_miss_frame_depth = depth + 1;
+	return wj_vcall_miss_frames [depth];
+}
+
+void
+mono_wasm_jit_vcall_miss_frame_release (gpointer frame)
+{
+	gint32 depth = wj_vcall_miss_frame_depth;
+	g_assert (depth > 0 && wj_vcall_miss_frames [depth - 1] == frame);
+	/* Drop all conservative roots before making this level reusable. */
+	memset (frame, 0, WJ_SCRATCH_SIZE);
+	wj_vcall_miss_frame_depth = depth - 1;
 }
 
 /*
@@ -5532,6 +5750,9 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 		 * thread; the slot then holds a jiterpreter placeholder and call_indirect-ing it traps the worker.
 		 * Fall through to the interp residual (call_interp) instead. */
 		if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
+			/* Publish only after this worker admitted the target. Therefore a generated PIC hit can use
+			 * the cached fslot without a second liveness test or an InterpMethod load. */
+			wj_vcall_pic_publish (ic, vt, target, imethod->wasm_jit_fslot);
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
 				mono_wasm_jit_count (WJC_FASTVCALL);
 				mono_wasm_jit_count (had_fslot ? WJC_VFAST_HAD : WJC_VFAST_NEW);
@@ -5591,6 +5812,56 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 		}
 	}
 	return 0;
+}
+
+/*
+ * Cold virtual-call miss stub shared by every scalar signature.
+ *
+ * Generated callers retain only their necessarily signature-specific stores/return load. Resolution,
+ * first-call JIT entry, delegate selection, AOT-PIC population and interpreter fallback live here once.
+ * `frame` is a lazily acquired 256-byte worker-local buffer registered as a conservative pinning root
+ * (not the re-entrant TLS residual scratch), so reference arguments remain valid while resolution can
+ * allocate or trigger a moving GC.
+ */
+int
+mono_wasm_jit_vcall_shared_miss (MonoObject *this_obj, MonoMethod *base_method, guint8 *frame,
+	gpointer ic, gpointer aic)
+{
+	int fslot = mono_wasm_jit_vcall_resolve_fslot (this_obj, base_method, frame, ic);
+	MonoMethod *target = *(MonoMethod **) (frame + 200);
+	int delegate_shape = *(gint32 *) (frame + 220);
+
+	if (G_UNLIKELY (!target))
+		return 1; /* resolver already raised/installed the managed exception */
+
+	if (fslot > 0) {
+		InterpMethod *imethod = mono_interp_get_imethod (target);
+		while (imethod->optimized_imethod)
+			imethod = imethod->optimized_imethod;
+		/* resolve_fslot admitted this worker before returning fslot, so its paired e-slot is safe too.
+		 * Use the uniform e-thunk for this one cold invocation; the newly-published local PIC sends all
+		 * subsequent calls straight to fslot with the caller's typed ABI. */
+		if (imethod->wasm_jit_slot > 0) {
+			extern void mono_wasm_jit_invoke_caught (MonoMethod *, gint32, gpointer, gpointer);
+			memset (frame + WJ_SCRATCH_RET_OFF, 0, 8);
+			mono_wasm_jit_invoke_caught (target, imethod->wasm_jit_slot,
+				frame, frame + WJ_SCRATCH_RET_OFF);
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_INVOKE);
+			return get_context ()->has_resume_state ? 1 : 0;
+		}
+	}
+
+	if (delegate_shape != WJ_DELEGATE_NONE)
+		return mono_wasm_jit_call_delegate (target, frame);
+
+	/* Populate the existing AOT PIC on the first miss, but execute this single cold call through the
+	 * generic interpreter bridge. The next call hits the caller's compact AOT guard and uses its typed
+	 * direct body. C cannot portably invoke an arbitrary wasm signature itself. */
+	if (aic) {
+		extern int mono_wasm_jit_vcall_aot_target (guint8 *, MonoObject *, gpointer);
+		(void) mono_wasm_jit_vcall_aot_target (frame, this_obj, aic);
+	}
+	return mono_wasm_jit_call_interp (target, frame);
 }
 
 /* Fast AOT-vcall dispatch (MONO_WASM_JIT_VCALL_AOT). Called by JITted code ONLY after a vcall_resolve_fslot
