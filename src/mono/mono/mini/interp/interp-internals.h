@@ -352,6 +352,10 @@ mono_interp_transform_init (void);
 InterpMethod *
 mono_interp_get_imethod (MonoMethod *method);
 
+gboolean
+mono_wasm_jit_vprof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
+	MonoMethod **out_target, guint32 *out_samples);
+
 void
 mono_interp_print_code (InterpMethod *imethod);
 
