@@ -837,6 +837,7 @@ typedef struct {
 	MonoMethod *body_method;    /* method whose IR was emitted */
 	MonoMethod *logical_method; /* wrapper/method whose InterpMethod publishes this descriptor */
 	guint32 f_sig_id;
+	guint8 no_gc;               /* transitive effect: body reaches no returning GC/safepoint */
 	int ndeps;
 	int *deps; /* immutable f-slot dependency list */
 	guint32 *dep_sig;
@@ -864,7 +865,7 @@ wj_reg_at (int i)
 }
 
 int
-mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps)
+mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, gboolean no_gc, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps)
 {
 	int desc_id = 0;
 	mono_loader_lock ();
@@ -893,6 +894,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			chunk [n % WJ_REG_CHUNK].body_method = method;
 			chunk [n % WJ_REG_CHUNK].logical_method = method;
 			chunk [n % WJ_REG_CHUNK].f_sig_id = f_sig_id;
+			chunk [n % WJ_REG_CHUNK].no_gc = no_gc ? 1 : 0;
 			chunk [n % WJ_REG_CHUNK].ndeps = ndeps;
 			if (ndeps > 0) {
 				chunk [n % WJ_REG_CHUNK].deps = g_new (int, ndeps);
@@ -2235,6 +2237,8 @@ typedef struct {
 	guint8 *ref_wt;
 	int refbase;   /* wasm local: ref-frame base address */
 	int rtmp;      /* wasm local: scratch i32 for ref stores */
+	int lazy_frame;       /* frame is absent until the first effective returning GC point */
+	int frame_active;     /* wasm i32 local: lazy frame has been materialized */
 	/* OP_LDADDR support: address-taken SCALAR locals live in the per-thread addressable-locals frame
 	 * (linear memory) instead of a wasm local, so their address can be passed to callees. addrslot[vreg]
 	 * is the byte offset into that frame (>=0 if the vreg is such a local, else -1); addrbase is the wasm
@@ -2405,6 +2409,12 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		 * — adjacent to the def, with no GC point in between — so the pin copy is always current. */
 		int stash = (c->ref_wt && c->ref_wt [vreg]) ? c->li [vreg] : c->rtmp;
 		wasm_op_local (b, WASM_OP_LOCAL_SET, (guint32) stash);
+		if (c->lazy_frame) {
+			/* Before materialization the wasm local is the sole value home and there is no valid
+			 * refbase to mirror into. Once active, retain ordinary write-through semantics. */
+			wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->frame_active);
+			wasm_op (b, WASM_OP_IF); wasm_u8 (b, 0x40);
+		}
 #ifdef HOST_BROWSER
 		if (G_UNLIKELY (c->storeguard)) {
 			/* check_store(refbase + slot*4, 0) before the store (STOREGUARD; arenas+helper are HOST_BROWSER) */
@@ -2420,6 +2430,8 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) stash);
 		wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, (guint32) (c->refslot [vreg] * 4));
+		if (c->lazy_frame)
+			wasm_op (b, WASM_OP_END);
 		return TRUE;
 	}
 	if (c->li [vreg] < 0)
@@ -2515,6 +2527,65 @@ wj_canonical_callee (MonoMethod *m)
 	if (!canon) { canon = m; g_hash_table_insert (wj_sync_inner_canon, wrapped, m); }
 	mono_loader_unlock ();
 	return canon;
+}
+
+/* Published method effect used by the caller's GC-liveness pass. Direct callees are island-built and
+ * registered before their callers, so looking through the immutable f-slot descriptor gives us a
+ * naturally transitive bottom-up no-GC classification without a separate whole-program pass. */
+static gboolean
+wj_fslot_is_nogc (int fslot)
+{
+	int ci, desc_id;
+	WjRegEntry *re;
+	if (fslot <= 0)
+		return FALSE;
+	ci = fslot / WJ_SLOT_CHUNK;
+	if (ci < 0 || ci >= WJ_SLOT_NCHUNKS || !wj_fslot_desc_chunks [ci])
+		return FALSE;
+	mono_memory_barrier ();
+	desc_id = wj_fslot_desc_chunks [ci][fslot % WJ_SLOT_CHUNK];
+	if (desc_id <= 0 || desc_id > wj_reg_n)
+		return FALSE;
+	re = wj_reg_at (desc_id - 1);
+	return re && re->f == fslot && re->no_gc;
+}
+
+/* Return the admitted direct managed callee's f-slot, or zero for every shape whose dispatch can enter
+ * the runtime (rgctx, icall, virtual/residual, unresolved, or recursion). Keep the synchronized-wrapper
+ * normalization identical to the actual OP_CALL lowering. */
+static int
+wj_direct_admitted_fslot (MonoCompile *cfg, MonoInst *ins)
+{
+	MonoCallInst *call;
+	MonoMethod *m;
+	extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+	extern MonoMethod *mono_marshal_get_synchronized_wrapper (MonoMethod *enter_method);
+	switch (ins->opcode) {
+	case OP_CALL: case OP_VOIDCALL: case OP_FCALL: case OP_LCALL: case OP_RCALL: case OP_VCALL2:
+		break;
+	default:
+		return 0;
+	}
+	call = (MonoCallInst *) ins;
+	m = call->method;
+	if (!m || call->rgctx_reg || m == cfg->method)
+		return 0;
+	if (m->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)
+		m = mono_marshal_get_synchronized_wrapper (m);
+	m = wj_canonical_callee (m);
+	if (!m || m == cfg->method)
+		return 0;
+	return mono_wasm_jit_get_callee_fslot (m);
+}
+
+/* GC-point classifier after resolving direct method effects. Calls outside this narrow admitted-direct
+ * set remain conservative. A no-GC callee may itself call earlier no-GC callees, making this transitive. */
+static gboolean
+wj_ins_is_effective_gcpoint (MonoCompile *cfg, MonoInst *ins)
+{
+	if (!wj_ins_is_gcpoint (ins, cfg->header->num_clauses == 0))
+		return FALSE;
+	return !wj_fslot_is_nogc (wj_direct_admitted_fslot (cfg, ins));
 }
 
 /* Append a blocking callee to the cfg result, deduped + capped. Shared by the residual=0 pre-scan
@@ -3526,6 +3597,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int spentry_idx = 0;               /* i32 local: C-stack SP at entry (exit/landing-pad restore target) */
 	int framebytes = 0, refbytes_al = 0; /* C-stack frame size (16-aligned) / 8-aligned ref-slot bytes */
+	gboolean method_nogc = FALSE;        /* transitive direct-call effect published in WjRegEntry */
+	int effective_gcp_count = 0;         /* static returning GC points after direct no-GC resolution */
+	gboolean lazy_ref_frame = FALSE;     /* defer a pure ref frame until the first effective GC point */
 	int vc_fslot_idx = 0;              /* i32 local: inline virtual-IC fast-path resolved f-slot */
 	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
 	int aic_vtab_idx = 0, aic_ti_idx = 0, aic_rgctx_idx = 0; /* i32 locals: AOT-vcall IC — this->vtable, ti<<1|kind2, rgctx */
@@ -4336,6 +4410,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	groups [3].type = WASM_F64; groups [3].count = cnt [3];
 
 	lc.li = li; lc.nvreg = nvreg; lc.refslot = NULL; lc.ref_wt = NULL; lc.refbase = refbase_idx; lc.rtmp = rtmp_idx;
+	/* In lazy methods spentry is zero until materialization, then becomes the nonzero entry SP.
+	 * Reuse it as the active marker instead of reserving one extra i32 local in every JIT method. */
+	lc.lazy_frame = 0; lc.frame_active = spentry_idx;
 	lc.vt = vt; lc.addrbase = addrbase_idx;
 	{ /* addrslot must be visible to the OP_LDADDR emit when there are ONLY sentinel entries (refvt -2 /
 	   * by-addr arg -3, no addr-frame bytes) — otherwise naddrbytes==0 would NULL it and those ldaddrs
@@ -4605,15 +4682,26 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					int av = cfg->args [i]->dreg;
 					if (av >= 0 && av < nvreg) { ev_bb [av] = 0; def_gen [av] = 0; sl_def_first [av] = 1; }
 				}
+				/* EH landing pads and their runtime dispatch are deliberately excluded from the
+				 * frame-free class. Otherwise, every instruction must be locally pure or a direct
+				 * call to an already-published no-GC method. */
+				method_nogc = cfg->header->num_clauses == 0;
 				bbn = 0;
 				for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
 					int gc_gen = 0;
 					MONO_BB_FOR_EACH_INS (bbl, insl) {
 						int srcs [MONO_MAX_SRC_REGS];
 						int nsrc = mono_inst_get_src_registers (insl, srcs);
-						gboolean gcp = wj_ins_is_gcpoint (insl, cfg->header->num_clauses == 0);
+						gboolean gcp = wj_ins_is_effective_gcpoint (cfg, insl);
+						gboolean forward_call = gcp && wj_direct_admitted_fslot (cfg, insl) > 0;
+						MonoCallInst *sl_call = MONO_IS_CALL (insl) ? (MonoCallInst *) insl : NULL;
+						WjCallArgs *sl_cw = sl_call ? (WjCallArgs *) sl_call->call_info : NULL;
 						gboolean dreg_is_base = FALSE;
 						int u, d;
+						if (gcp) {
+							method_nogc = FALSE;
+							effective_gcp_count++;
+						}
 						switch (insl->opcode) {
 						case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 						case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
@@ -4621,24 +4709,32 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							dreg_is_base = TRUE; break;
 						default: break;
 						}
-#define WJ_SL_USE(v) do { int _u = (v); \
+#define WJ_SL_USE(v,FWD) do { int _u = (v); gboolean _fwd = (FWD); \
 	if (_u >= 0 && _u < nvreg && isref [_u]) { \
 		if (ev_bb [_u] == -1) { ev_bb [_u] = bbn; needs_slot [_u] = TRUE; } /* use before any def (loop-carried) */ \
 		else if (ev_bb [_u] != bbn) { sl_multi [_u] = 1; needs_slot [_u] = TRUE; } \
-		else if (gcp || def_gen [_u] != gc_gen) needs_slot [_u] = TRUE; \
+		else if (def_gen [_u] != gc_gen) needs_slot [_u] = TRUE; \
+		else if (gcp && !_fwd) needs_slot [_u] = TRUE; \
 		last_use_ord [_u] = ord; \
 	} } while (0)
-						for (u = 0; u < nsrc; ++u)
-							WJ_SL_USE (srcs [u]);
+						for (u = 0; u < nsrc; ++u) {
+							gboolean is_forward_arg = FALSE;
+							int au;
+							if (forward_call && sl_cw)
+								for (au = 0; au <= sl_cw->nargs; ++au)
+									if (wj_arg_vreg (sl_call, au) == srcs [u]) {
+										is_forward_arg = TRUE;
+										break;
+									}
+							WJ_SL_USE (srcs [u], is_forward_arg);
+						}
 						if (dreg_is_base)
-							WJ_SL_USE (insl->dreg);
+							WJ_SL_USE (insl->dreg, FALSE);
 						/* positional call-arg uses (WjCallArgs): [0..n-1] args, [n] the vret addr */
-						if (MONO_IS_CALL (insl)) {
-							MonoCallInst *cl = (MonoCallInst *) insl;
-							WjCallArgs *cw = (WjCallArgs *) cl->call_info;
-							if (cw) {
-								for (u = 0; u <= cw->nargs; ++u)
-									WJ_SL_USE (wj_arg_vreg (cl, u));
+						if (sl_call) {
+							if (sl_cw) {
+								for (u = 0; u <= sl_cw->nargs; ++u)
+									WJ_SL_USE (wj_arg_vreg (sl_call, u), forward_call);
 							}
 						}
 #undef WJ_SL_USE
@@ -4659,8 +4755,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				nins = ord;
 				sl_elide = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
 				for (i = 0; i < nvreg; ++i)
-					if (li [i] >= 0 && isref [i] && !needs_slot [i]) {
-						sl_elide [i] = 1;   /* elide: stays a plain wasm local, GC never needs to see it */
+					if (li [i] >= 0 && isref [i] && (method_nogc || !needs_slot [i])) {
+						/* A reference used at an admitted direct GC-capable call only may hand its
+						 * root to the callee when that call is its final use. There is no safepoint
+						 * between the caller's local.get and the callee's eager/lazy root setup.
+						 * Any later use is in a new gc_gen and set needs_slot above. For a whole
+						 * transitively no-GC method, even cross-bb/loop-carried refs are invisible
+						 * to the collector, so the method effect safely overrides sl_multi too. */
+						sl_elide [i] = 1;
 						nelide++;
 					}
 				if (nelide > 0 && mono_wasm_jit_stats)
@@ -4747,6 +4849,23 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * 16-aligned per the emscripten SP ABI. */
 		refbytes_al = (nrefslots * 4 + 7) & ~7;
 		framebytes = (refbytes_al + naddrbytes + 15) & ~15;
+		/* Lazy materialization is restricted to the representation where every root has a wasm-local
+		 * value home. Address frames and EH need a valid frame from entry; slot-homed ref-vtype
+		 * sentinels likewise cannot be reconstructed. Debug store guards intentionally keep the old
+		 * eager path. */
+		if (framebytes > 0 && effective_gcp_count == 1 && naddrbytes == 0 && !eh_on && lc.ref_wt &&
+		    !lc.storeguard && !lc.objguard) {
+			gboolean all_wt = TRUE;
+			for (i = 0; i < nvreg; ++i)
+				if (refslot [i] >= 0 && (!lc.ref_wt [i] || li [i] < 0)) {
+					all_wt = FALSE;
+					break;
+				}
+			if (all_wt) {
+				lazy_ref_frame = TRUE;
+				lc.lazy_frame = 1;
+			}
+		}
 		if (mono_wasm_jit_stats) {
 			mono_wasm_jit_add (WJC_REF_SLOTS, nrefslots);
 			mono_wasm_jit_add (WJC_FRAME_BYTES, framebytes);
@@ -4919,8 +5038,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * frame-less methods. */
 #ifdef HOST_BROWSER
 #define EMIT_REF_LEAVE() do { if (framebytes > 0) { \
+		if (lazy_ref_frame) { \
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+		} \
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
 		wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); \
+		if (lazy_ref_frame) wasm_op (&body, WASM_OP_END); \
 	} \
 	if (eh_on) {   /* pop this EH method's il_state island (pushed by enter_island in the prologue) */ \
 		extern void mono_wasm_jit_leave_island (void); \
@@ -4929,6 +5053,38 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	} } while (0)
 #else
 #define EMIT_REF_LEAVE() do { } while (0)
+#endif
+
+/* Materialize a lazy pure-ref frame immediately before the first instruction that can return after a
+ * GC. The current SP is still this method's entry SP: everything executed before here is inline-pure or
+ * a transitively no-GC/frame-free direct callee. Copy every write-through local only after reserving and
+ * zeroing the frame. The captured nonzero entry SP is also the active marker; later definitions use it
+ * to mirror conditionally in wasm_st. */
+#ifdef HOST_BROWSER
+#define ENSURE_REF_FRAME() do { if (lazy_ref_frame) { int _rf_i; \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+	wasm_op (&body, WASM_OP_I32_EQZ); \
+	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0); \
+	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+	wasm_i32_const (&body, framebytes); wasm_op (&body, WASM_OP_I32_SUB); \
+	wasm_i32_const (&body, -16); wasm_op (&body, WASM_OP_I32_AND); \
+	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	wasm_i32_const (&body, 0); wasm_i32_const (&body, framebytes); \
+	wasm_u8 (&body, 0xFC); wasm_uleb (&body, 11); wasm_u8 (&body, 0); \
+	for (_rf_i = 0; _rf_i < nvreg; ++_rf_i) if (refslot [_rf_i] >= 0) { \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) li [_rf_i]); \
+		wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [_rf_i] * 4)); \
+	} \
+	wasm_op (&body, WASM_OP_END); \
+} } while (0)
+#else
+#define ENSURE_REF_FRAME() do { } while (0)
 #endif
 
 
@@ -5167,12 +5323,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * callee frames fall below the SP and stop being scanned — no zeroing, no balance bookkeeping).
 	 * An EH method with an EMPTY frame still captures entry_sp (refbase = entry_sp) so its landing
 	 * pad can pop the frames of callees the C++ unwind tore through. */
-	if (framebytes > 0 || eh_on) {
+	if ((framebytes > 0 && !lazy_ref_frame) || eh_on) {
 		uses_calls = TRUE;
 		/* entry_sp = __stack_pointer (imported wasm global 0) */
 		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx);
-		if (framebytes > 0) {
+		if (framebytes > 0 && !lazy_ref_frame) {
 			/* refbase (frame base) = (entry_sp - framebytes) & ~15; __stack_pointer = refbase */
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx);
 			wasm_i32_const (&body, framebytes);
@@ -5217,6 +5373,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx);
 		}
 	}
+	if (lazy_ref_frame)
+		uses_calls = TRUE; /* imports the mutable __stack_pointer global used by ENSURE_REF_FRAME */
 	/* INLINE f-slot-IC liveness prologue: cache this dynamic instance's imported addresses of the
 	 * wj_slot_live bitmap pointer + capacity. The imports are bound to the current worker's TLS block when
 	 * the cached module is instantiated, so two global.get operations replace the former two C-boundary
@@ -5532,6 +5690,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			 * from the wasm local, so a zeroed slot is never read. */
 			if (G_UNLIKELY (sl_kill_head != NULL)) {
 				int kv = sl_kill_head [my_ord];
+				if (lazy_ref_frame && kv >= 0) {
+					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx);
+					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+				}
 				while (kv >= 0) {
 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
 					wasm_i32_const (&body, 0);
@@ -5543,7 +5705,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						wj_lcse_kill (lcse, li, nvreg, kv);
 					kv = sl_kill_next [kv];
 				}
+				if (lazy_ref_frame && sl_kill_head [my_ord] >= 0)
+					wasm_op (&body, WASM_OP_END);
 			}
+#ifdef HOST_BROWSER
+			if (wj_ins_is_effective_gcpoint (cfg, ins))
+				ENSURE_REF_FRAME ();
+#endif
 			switch (ins->opcode) {
 			case OP_NOP: case OP_IL_SEQ_POINT: case OP_SEQ_POINT:
 			case OP_DUMMY_USE: case OP_NOT_REACHED: case OP_START_HANDLER:
@@ -8282,12 +8450,12 @@ vcall_nullchk_done:
 					if (self_has_byaddr) mono_wasm_jit_count (WJC_VT_BYADDR_METHODS);
 					if (self_ci.vret_byaddr) mono_wasm_jit_count (WJC_VRET_METHODS);
 				}
-				{ extern int mono_wasm_jit_register (MonoMethod *, int, int, void *, int, guint32, const int *, const guint32 *, MonoMethod *const *, int);
+				{ extern int mono_wasm_jit_register (MonoMethod *, int, int, void *, int, guint32, gboolean, const int *, const guint32 *, MonoMethod *const *, int);
 				  /* the fingerprint is the self-sig WasmCallInfo's — the same descriptor call sites hash
 				   * into dep_sig, so caller/callee can never disagree structurally */
 				  cfg->wasm_jit_result.f_sig_id = self_ci.f_sig_id;
 				  cfg->wasm_jit_result.desc_id = mono_wasm_jit_register (cfg->method, e_slot, f_slot, cached, (int) out.len,
-					cfg->wasm_jit_result.f_sig_id, cfg->wasm_jit_result.direct_deps,
+					cfg->wasm_jit_result.f_sig_id, method_nogc, cfg->wasm_jit_result.direct_deps,
 					cfg->wasm_jit_result.direct_dep_sig, cfg->wasm_jit_result.direct_dep_method, cfg->wasm_jit_result.ndirect_deps); }
 				if (cfg->wasm_jit_result.desc_id <= 0) {
 					g_free (cached);
