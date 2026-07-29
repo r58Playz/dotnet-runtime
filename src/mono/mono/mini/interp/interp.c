@@ -2112,6 +2112,7 @@ static void
 wasm_jit_maybe_compile (InterpMethod *cmethod)
 {
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island, mono_wasm_jit_island_budget;
+	extern int mono_wasm_jit_over_aot;
 	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
 	/* Hotness gate. The bump MUST be atomic: wasm_jit_hits lives on the SHARED InterpMethod and is bumped
 	 * from every worker (render/server/pool) in the auto-walk. A plain `++` loses updates AND lets one
@@ -2127,10 +2128,12 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 	 * again, so it still re-fires exactly once per cycle. */
 	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) && mono_atomic_inc_i32 (&cmethod->wasm_jit_hits) == mono_wasm_jit_thresh) {
 		int r;
-		/* Don't whole-method-JIT a method that already has AOT code — it runs faster as native AOT, reached
-		 * via do_jit_call (the residual / vcall-fallback now routes AOT'd callees there). Mark permanent so
-		 * we stop counting + stop wasting compile attempts (+ ldaddr bails) on already-compiled code. */
-		if (mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
+		/* Normal policy: don't whole-method-JIT a method that already has AOT code. The OVER_AOT experiment
+		 * deliberately lets the same hotness/island machinery compile it again with the runtime wasm
+		 * emitter. code_type remains IMETHOD_CODE_COMPILED, so any emit/admission failure still reaches
+		 * the original AOT body through do_jit_call; only a successfully published slot redirects it. */
+		if (!mono_wasm_jit_over_aot &&
+		    mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
 			cmethod->wasm_jit_slot = -1;
 			return;
 		}
@@ -8946,6 +8949,25 @@ interp_call:
 		}
 		MINT_IN_CASE(MINT_JIT_CALL) {
 			InterpMethod *rmethod = (InterpMethod*)frame->imethod->data_items [ip [3]];
+#if HOST_BROWSER
+			/* transform.c replaces a statically-bound call with MINT_JIT_CALL when an AOT body exists.
+			 * That opcode used to bypass wasm_jit_maybe_compile, so merely relaxing the AOT eligibility
+			 * gate could only tier virtual or external-entry AOT methods. In OVER_AOT mode feed direct
+			 * calls through the same hotness/dispatch block as MINT_CALL. Advancing ip first gives the
+			 * JITted-call exception path the same resume address as the original do_jit_call below.
+			 * If compilation or admission fails, jit_call_aot executes that untouched AOT path. */
+			{
+				extern int mono_wasm_jit_over_aot;
+				if (G_UNLIKELY (mono_wasm_jit_over_aot)) {
+					cmethod = rmethod;
+					return_offset = ip [1];
+					call_args_offset = ip [2];
+					ip += 4;
+					WASM_JIT_TRY_INVOKE (jit_call_aot);
+					goto jit_call_aot;
+				}
+			}
+#endif
 			error_init_reuse (error);
 			/* for calls, have ip pointing at the start of next instruction */
 			frame->state.ip = ip + 4;
@@ -8959,6 +8981,19 @@ interp_call:
 			ip += 4;
 
 			MINT_IN_BREAK;
+#if HOST_BROWSER
+jit_call_aot:
+			error_init_reuse (error);
+			/* ip was advanced above; cmethod/offsets retain the original call operands. */
+			frame->state.ip = ip;
+			do_jit_call (context, (stackval*)(locals + return_offset), (stackval*)(locals + call_args_offset), frame, rmethod, FALSE, error);
+			if (!is_ok (error)) {
+				MonoException *call_ex = interp_error_convert_to_exception (frame, error, ip);
+				THROW_EX (call_ex, ip);
+			}
+			CHECK_RESUME_STATE (context);
+			MINT_IN_BREAK;
+#endif
 		}
 		MINT_IN_CASE(MINT_JIT_CALL2) {
 #ifdef ENABLE_EXPERIMENT_TIERED
