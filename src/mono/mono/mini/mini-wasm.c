@@ -48,6 +48,11 @@ int mono_wasm_jit_island = 1;   /* eager transitive island-JIT; MONO_WASM_JIT_IS
  * instead of requiring the method to be named in MONO_WASM_JIT_METHOD. -1 = uninitialized. */
 int mono_wasm_jit_auto = -1;
 int mono_wasm_jit_thresh = 2000;
+/* MONO_WASM_JIT_OVER_AOT=1: let the runtime wasm method-JIT compete with an already-available AOT
+ * body. The interpreter still retains code_type=COMPILED and therefore falls back to the original AOT
+ * entry if emission, publication, or per-thread admission fails. Default off: AOT methods are marked
+ * permanently ineligible at their hotness threshold, preserving the normal AOT-first policy. */
+int mono_wasm_jit_over_aot = 0;
 int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiver-arity histogram for the vcall miss population (N-way IC capture curve). Diagnostic — perturbs timing (like PROFILE_FAST); default off */
 /* MONO_WASM_JIT_DEVIRT_PROFILE=1: record the receiver vtable seen at interp virtual call sites.
  * Collection lives in interp.c (wj_vprof_*), observable via mono_wasm_jit_vprof_stat. Defined HERE,
@@ -112,6 +117,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_batch_all_at; const char *ba = g_getenv ("MONO_WASM_JIT_BATCH_ALL_AT"); mono_wasm_jit_batch_all_at = (ba && *ba) ? atoi (ba) : 250; }
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
 	{ extern int mono_wasm_jit_vcall_aot_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_AOT_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_aot_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline AOT-vcall IC; clamp [1,8]; 1 = legacy first-wins */
+	{ extern int mono_wasm_jit_over_aot; const char *oa = g_getenv ("MONO_WASM_JIT_OVER_AOT"); mono_wasm_jit_over_aot = (oa && *oa && *oa != '0') ? 1 : 0; } /* experimental second compiler tier for hot AOT bodies; safe fallback remains the AOT entry */
 	{ extern int mono_wasm_jit_island; const char *il = g_getenv ("MONO_WASM_JIT_ISLAND"); mono_wasm_jit_island = (il && *il && *il == '0') ? 0 : 1; } /* 0 = no eager island formation (bottom-up retry only) */
 	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia) ? (*ia != '0') : 1; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). 1 = on, default 0 = off. */
 	{ extern int mono_wasm_jit_ldaddr_vtype; const char *lv = g_getenv ("MONO_WASM_JIT_LDADDR_VTYPE"); mono_wasm_jit_ldaddr_vtype = (lv && *lv) ? (*lv != '0') : 1; } /* OP_LDADDR of NON-SCALAR ref-free local via a full-size addr-frame slot. DEFAULT OFF (exonerated re: corruption but kept for repro parity). */
