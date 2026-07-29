@@ -7943,10 +7943,12 @@ vcall_nullchk_done:
 #endif
 							int way;
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
-							/* Strict monomorphic guard. A hit bypasses the worker PIC completely. In adaptive
-							 * slim mode the miss jumps directly to the signature-shared cold helper, so neither
-							 * the N-way JIT PIC nor the AOT PIC is emitted at this site. The branch remains
-							 * correct if feedback becomes stale because every invocation checks vtable identity. */
+							/* Strict monomorphic guard. A hit bypasses the worker PIC completely. The prediction
+							 * is deliberately speculative: interpreter warmup can see one receiver before the
+							 * steady-state workload introduces another. Adaptive slim therefore retains one
+							 * worker-local alternate way below. It costs one bounds check + one i64 guard on a
+							 * prediction miss, but turns the second and later calls of the common alternate into
+							 * direct f-slot dispatch instead of repeatedly entering the shared resolver. */
 							if (pred_fslot > 0 && pred_vt && pred_target && !is_delegate_invoke) {
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_miss */
 									if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt this ld"; goto done; }
@@ -7967,8 +7969,57 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred_miss */
 							}
-							if (slim_pred)
+							if (slim_pred) {
+								/* One compact worker-local alternate PIC entry. The first prediction miss reaches
+								 * vcall_resolve_fslot, which publishes its admitted {vtable,fslot} into way zero.
+								 * Thereafter this guard handles that receiver without the miss frame, Mono lookup,
+								 * admission walk, or interpreter bridge. More polymorphic sites still retain the
+								 * shared cold path; keeping only one alternate is what preserves slim code size. */
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $slim_pic_miss */
+									/* site < *TLS-cap, otherwise the worker has not allocated this PIC yet */
+									wasm_i32_const (&body, (gint32) vpic_site);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_cap_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_op (&body, WASM_OP_I32_GE_U);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* entry = *TLS-ptr + site * ways * stride */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_ptr_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_i32_const (&body, (gint32) (vpic_site * mono_wasm_jit_vcall_ways * vpic_stride));
+									wasm_op (&body, WASM_OP_I32_ADD);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_ti_idx);
+									wasm_op (&body, WASM_OP_I64_LOAD); wasm_memarg (&body, 3, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
+									wasm_op (&body, WASM_OP_I32_WRAP_I64);
+									if (!wasm_ld (&body, &lc, this_vr)) { fail = "slim pic this ld"; goto done; }
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_op (&body, WASM_OP_I32_NE);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
+									wasm_i64_const (&body, 32);
+									wasm_op (&body, WASM_OP_I64_SHR_U);
+									wasm_op (&body, WASM_OP_I32_WRAP_I64);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+									/* Preserve exact alternate-target frequency when profiling is enabled. */
+									{
+										extern int mono_wasm_jit_profile_fast;
+										if (mono_wasm_jit_profile_fast && !wj_batch_profile_suppressed) {
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+											wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 12);
+											wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_ADD);
+											wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 12);
+										}
+									}
+									for (ai = 0; ai < n2; ++ai)
+										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "slim pic arg ld"; goto done; }
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
+									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "slim pic dreg"; goto done; }
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
+								wasm_op (&body, WASM_OP_END); /* $slim_pic_miss */
 								goto vcall_cold_miss_emit;
+							}
 							/* OBJGUARD (once, hoisted above the N ways): validate the receiver before any raw
 							 * this->vtable load. Otherwise a type-confused scalar/garbage receiver traps as a bare
 							 * wasm OOB before the C resolver can print anything. */

@@ -1269,7 +1269,7 @@ emit_marshal_scalar_ilgen (EmitMarshalContext *m, int argnum, MonoType *t,
 static void
 emit_virtual_stelemref_ilgen (MonoMethodBuilder *mb, const char **param_names, MonoStelemrefKind kind)
 {
-	guint32 b1, b2, b3, b4;
+	guint32 b1, b2, b3, b4, b_exact;
 	int aklass, vklass, vtable, uiid;
 	int array_slot_addr;
 
@@ -1457,6 +1457,12 @@ emit_virtual_stelemref_ilgen (MonoMethodBuilder *mb, const char **param_names, M
 		/* vklass = value->vtable->klass */
 		load_value_class (mb, vklass);
 
+		/* Exact runtime element type is overwhelmingly common for managed arrays. It is also
+		 * sufficient by definition, so avoid the idepth/supertypes walk in that case. */
+		mono_mb_emit_ldloc (mb, vklass);
+		mono_mb_emit_ldloc (mb, aklass);
+		b_exact = mono_mb_emit_branch (mb, CEE_BEQ);
+
 		/* if (vklass->idepth < aklass->idepth) goto failue */
 		mono_mb_emit_ldloc (mb, vklass);
 		mono_mb_emit_ldflda (mb, GINTPTR_TO_INT32 (m_class_offsetof_idepth ()));
@@ -1488,6 +1494,7 @@ emit_virtual_stelemref_ilgen (MonoMethodBuilder *mb, const char **param_names, M
 
 		/* do_store: */
 		mono_mb_patch_branch (mb, b1);
+		mono_mb_patch_branch (mb, b_exact);
 		mono_mb_emit_ldloc (mb, array_slot_addr);
 		mono_mb_emit_ldarg (mb, 2);
 		mono_mb_emit_byte (mb, CEE_STIND_REF);
@@ -1539,6 +1546,12 @@ emit_virtual_stelemref_ilgen (MonoMethodBuilder *mb, const char **param_names, M
 		/* vklass = value->vtable->klass */
 		load_value_class (mb, vklass);
 
+		/* The small-idepth wrapper is the dominant object-array store path. Exact-class values need
+		 * neither the element idepth load nor the indexed supertypes lookup. */
+		mono_mb_emit_ldloc (mb, vklass);
+		mono_mb_emit_ldloc (mb, aklass);
+		b_exact = mono_mb_emit_branch (mb, CEE_BEQ);
+
 		/* if (vklass->supertypes [aklass->idepth - 1] != aklass) goto failure */
 		mono_mb_emit_ldloc (mb, vklass);
 		mono_mb_emit_ldflda (mb, GINTPTR_TO_INT32 (m_class_offsetof_supertypes ()));
@@ -1559,6 +1572,7 @@ emit_virtual_stelemref_ilgen (MonoMethodBuilder *mb, const char **param_names, M
 
 		/* do_store: */
 		mono_mb_patch_branch (mb, b1);
+		mono_mb_patch_branch (mb, b_exact);
 		mono_mb_emit_ldloc (mb, array_slot_addr);
 		mono_mb_emit_ldarg (mb, 2);
 		mono_mb_emit_byte (mb, CEE_STIND_REF);
