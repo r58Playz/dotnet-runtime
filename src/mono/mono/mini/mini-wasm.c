@@ -32,6 +32,8 @@ static int mono_wasm_debug_level = 0;
 #include <emscripten.h>
 int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
 gpointer mono_interp_get_imethod (MonoMethod *method); /* interp/interp.c; kept opaque in this emitter */
+gboolean mono_wasm_jit_vprof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
+	MonoMethod **out_target, guint32 *out_samples); /* interp.c; lock-free pre-JIT receiver profile */
 void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
 #define WJ_KEEPALIVE EMSCRIPTEN_KEEPALIVE
 #else
@@ -60,8 +62,8 @@ int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiv
  * both the runtime and the offline cross-compiler (mono-aot-cross), which has no interpreter — same
  * reason as mono_wasm_jit_residual_mode. Costs ~0.7% when on. Default off.
  *
- * The original consumer — a guarded speculative-devirt diamond in method_to_ir — was REMOVED, and the
- * reason is worth keeping because it is not obvious: V8 already devirtualizes call_indirect
+ * The original broad consumer — a guarded speculative-devirt diamond at every profiled callvirt — was
+ * REMOVED, and the reason is worth keeping because it is not obvious: V8 already devirtualizes call_indirect
  * speculatively from its own call-site feedback, with no branch in the instruction stream, but ONLY
  * when the callee is in the same WebAssembly.Module. Measured with scratchpad/callbench.mjs, a
  * same-module indirect call costs the same as no call at all (0.25 ns) while any cross-module call
@@ -69,11 +71,10 @@ int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiv
  * could not collect the inlining payoff anyway, the callee being in another module — it measured as a
  * 1.5x REGRESSION (3.37-3.47 vs 2.298 ms/step). See WASM-JIT.md "Call-shape costs".
  *
- * The profile itself is kept: caller->observed-target edges through virtual sites are exactly the
- * call-graph edges the island builder cannot see statically, which is what module batching needs.
- * Its old read API (vprof_predict/_for) was devirt-shaped — "what does THIS one site resolve to" —
- * and went with the emitter; batching wants "enumerate every observed edge out of this caller", a
- * different accessor over the same table. */
+ * The retained consumer is intentionally much narrower: only a proven terminal virtual forwarding
+ * call (the same shape whose caller roots can be handed off) receives a strict, perfectly-monomorphic
+ * vtable guard. That removes the forwarding adapter's PIC work without adding diamonds throughout
+ * ordinary compute methods. The profile also remains useful as batching's observed call graph. */
 int mono_wasm_jit_devirt_profile = 0;
 /* MONO_WASM_JIT_BATCH_MODULE=1: emit an SCC batch's members into ONE WebAssembly.Module instead of one
  * module each. V8 never inlines across a module boundary but inlines freely within one, so co-location
@@ -2602,6 +2603,38 @@ wj_ins_is_effective_gcpoint (MonoCompile *cfg, MonoInst *ins)
 	return !wj_fslot_is_nogc (wj_direct_admitted_fslot (cfg, ins));
 }
 
+/*
+ * A virtual forwarding call can take ownership of its reference roots at the call boundary:
+ *
+ *  - a compact-PIC hit has no managed safepoint between loading the caller's wasm locals and entering
+ *    the already-admitted target;
+ *  - a miss first acquires a worker-local conservative root frame (native allocation/root-table work,
+ *    no managed allocation), copies every argument into it, and only then resolves or invokes code
+ *    which may collect.
+ *
+ * Keep this tied to the exact machinery providing that guarantee. The legacy residual scratch is not
+ * a GC root and must continue to make the caller retain its slots.
+ */
+static gboolean
+wj_ins_is_pinned_vcall_forward (MonoInst *ins)
+{
+	MonoCallInst *call;
+	extern int mono_wasm_jit_vcall_inline_ic;
+	extern int mono_wasm_jit_vcall_shared_miss_enabled;
+
+	switch (ins->opcode) {
+	case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
+	case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
+		break;
+	default:
+		return FALSE;
+	}
+	call = (MonoCallInst *) ins;
+	return mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_shared_miss_enabled &&
+		call->method && (call->method->flags & METHOD_ATTRIBUTE_VIRTUAL) &&
+		call->signature && call->signature->hasthis && call->call_info;
+}
+
 /* Append a blocking callee to the cfg result, deduped + capped. Shared by the residual=0 pre-scan
  * (enumerates the full set) and the emit bail site (records the first blocker it hits) so the two can't
  * disagree on the head of the list. */
@@ -3614,6 +3647,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean method_nogc = FALSE;        /* transitive direct-call effect published in WjRegEntry */
 	int effective_gcp_count = 0;         /* static returning GC points after direct no-GC resolution */
 	gboolean lazy_ref_frame = FALSE;     /* defer a pure ref frame until the first effective GC point */
+	MonoInst *terminal_vcall_ins = NULL; /* last GC point in an acyclic forwarding wrapper; owns root handoff + guarded specialization */
+	int terminal_vcall_ord = -1;         /* layout ordinal used to prove every elided reference dies at/before that handoff */
+	gboolean terminal_vcall_handoff = FALSE; /* all pre-call references die at the terminal vcall; poll-prefix frames may stay cold */
+	gboolean terminal_vcall_poll_prefix = FALSE; /* every earlier effective GC point is a conditional OP_GC_SAFE_POINT poll */
 	int vc_fslot_idx = 0;              /* i32 local: inline virtual-IC fast-path resolved f-slot */
 	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
 	int aic_vtab_idx = 0, aic_ti_idx = 0, aic_rgctx_idx = 0; /* i32 locals: AOT-vcall IC — this->vtable, ti<<1|kind2, rgctx */
@@ -4687,15 +4724,44 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				int *ev_bb = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg); /* bb of first event, -1 = unseen */
 				int *def_gen = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nvreg);
 				int *last_use_ord = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
-				int *bb_last_gcp; int nbbs = 0, nins = 0;
+				int *last_def_ord = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+				int *bb_last_gcp, *sl_bbidx; int nbbs = 0, nins = 0;
 				MonoBasicBlock *bbl; MonoInst *insl;
-				int bbn, nelide = 0, ord = 0;
+				MonoInst *last_gcp_ins = NULL;
+				int bbn, nelide = 0, ord = 0, last_gcp_ord = -1;
+				gboolean sl_has_backedge = FALSE, prior_gcps_are_polls = TRUE;
 				for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb)
 					nbbs++;
 				bb_last_gcp = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nbbs ? nbbs : 1));
+				sl_bbidx = (int *) mono_mempool_alloc (cfg->mempool,
+					sizeof (int) * ((int) cfg->max_block_num + 1));
 				for (i = 0; i < nbbs; ++i)
 					bb_last_gcp [i] = -1;
-				for (i = 0; i < nvreg; ++i) { ev_bb [i] = -1; last_use_ord [i] = -1; }
+				for (i = 0; i <= (int) cfg->max_block_num; ++i)
+					sl_bbidx [i] = -1;
+				bbn = 0;
+				for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb)
+					sl_bbidx [bbl->block_num] = bbn++;
+				/* A layout-backward CFG edge can execute a textual "last use" again after the call.
+				 * Terminal handoff therefore requires a DAG. This deliberately treats self-edges as
+				 * backedges and declines the optimization rather than attempting loop liveness. */
+				bbn = 0;
+				for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
+					int oi;
+					for (oi = 0; oi < bbl->out_count; ++oi) {
+						MonoBasicBlock *out = bbl->out_bb [oi];
+						int outi = (out && out->block_num >= 0 &&
+							out->block_num <= (int) cfg->max_block_num) ?
+							sl_bbidx [out->block_num] : -1;
+						if (outi >= 0 && outi <= bbn)
+							sl_has_backedge = TRUE;
+					}
+				}
+				for (i = 0; i < nvreg; ++i) {
+					ev_bb [i] = -1;
+					last_use_ord [i] = -1;
+					last_def_ord [i] = -1;
+				}
 				/* args are defined by the prologue: entry bb (walk ordinal 0), generation 0 */
 				for (i = 0; i < nargs; ++i) {
 					int av = cfg->args [i]->dreg;
@@ -4712,7 +4778,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						int srcs [MONO_MAX_SRC_REGS];
 						int nsrc = mono_inst_get_src_registers (insl, srcs);
 						gboolean gcp = wj_ins_is_effective_gcpoint (cfg, insl);
-						gboolean forward_call = gcp && wj_direct_admitted_fslot (cfg, insl) > 0;
+						gboolean pinned_vforward = gcp && wj_ins_is_pinned_vcall_forward (insl);
+						gboolean forward_call = gcp &&
+							(wj_direct_admitted_fslot (cfg, insl) > 0 || pinned_vforward);
 						MonoCallInst *sl_call = MONO_IS_CALL (insl) ? (MonoCallInst *) insl : NULL;
 						WjCallArgs *sl_cw = sl_call ? (WjCallArgs *) sl_call->call_info : NULL;
 						gboolean dreg_is_base = FALSE;
@@ -4720,6 +4788,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						if (gcp) {
 							method_nogc = FALSE;
 							effective_gcp_count++;
+							if (last_gcp_ins && last_gcp_ins->opcode != OP_GC_SAFE_POINT)
+								prior_gcps_are_polls = FALSE;
+							last_gcp_ins = insl;
+							last_gcp_ord = ord;
 						}
 						switch (insl->opcode) {
 						case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
@@ -4764,6 +4836,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						/* def AFTER the bump: a call result belongs to the post-call generation */
 						d = dreg_is_base ? -1 : insl->dreg;
 						if (d >= 0 && d < nvreg && isref [d]) {
+							last_def_ord [d] = ord;
 							if (ev_bb [d] == -1) { ev_bb [d] = bbn; sl_def_first [d] = 1; def_gen [d] = gc_gen; }
 							else if (ev_bb [d] != bbn) { sl_multi [d] = 1; needs_slot [d] = TRUE; }
 							else def_gen [d] = gc_gen;
@@ -4772,9 +4845,34 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					}
 				}
 				nins = ord;
+				/* With a terminal pinned virtual call and no way to loop back, every reference whose
+				 * textual final use is at/before this call is dead in the caller while the callee runs
+				 * or owns a root in the callee/miss frame. Earlier effective points are allowed only
+				 * when they are conditional polls; those materialize and release the caller frame
+				 * entirely inside their taken arms. */
+				if (cfg->header->num_clauses == 0 && last_gcp_ins &&
+				    wj_ins_is_pinned_vcall_forward (last_gcp_ins) && !sl_has_backedge) {
+					gboolean all_pre_refs_die = TRUE;
+					terminal_vcall_ins = last_gcp_ins;
+					terminal_vcall_ord = last_gcp_ord;
+					terminal_vcall_poll_prefix = prior_gcps_are_polls;
+					/* A reference defined by the terminal call itself is not live while that call
+					 * executes. Every reference defined earlier must have its final use at/before
+					 * the call before the whole frame can be handed off. */
+					for (i = 0; i < nvreg; ++i)
+						if (li [i] >= 0 && isref [i] && last_def_ord [i] < terminal_vcall_ord &&
+						    last_use_ord [i] > terminal_vcall_ord) {
+							all_pre_refs_die = FALSE;
+							break;
+						}
+					terminal_vcall_handoff = all_pre_refs_die;
+				}
 				sl_elide = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
 				for (i = 0; i < nvreg; ++i)
-					if (li [i] >= 0 && isref [i] && (method_nogc || !needs_slot [i])) {
+					if (li [i] >= 0 && isref [i] &&
+					    (method_nogc || !needs_slot [i] ||
+					     (effective_gcp_count == 1 && terminal_vcall_handoff &&
+					      last_use_ord [i] <= terminal_vcall_ord))) {
 						/* A reference used at an admitted direct GC-capable call only may hand its
 						 * root to the callee when that call is its final use. There is no safepoint
 						 * between the caller's local.get and the callee's eager/lazy root setup.
@@ -4872,7 +4970,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * value home. Address frames and EH need a valid frame from entry; slot-homed ref-vtype
 		 * sentinels likewise cannot be reconstructed. Debug store guards intentionally keep the old
 		 * eager path. */
-		if (framebytes > 0 && effective_gcp_count == 1 && naddrbytes == 0 && !eh_on && lc.ref_wt &&
+		if (framebytes > 0 &&
+		    (effective_gcp_count == 1 ||
+		     (terminal_vcall_handoff && terminal_vcall_poll_prefix)) &&
+		    naddrbytes == 0 && !eh_on && lc.ref_wt &&
 		    !lc.storeguard && !lc.objguard) {
 			gboolean all_wt = TRUE;
 			for (i = 0; i < nvreg; ++i)
@@ -5104,6 +5205,24 @@ mono_wasm_emit_method (MonoCompile *cfg)
 } } while (0)
 #else
 #define ENSURE_REF_FRAME() do { } while (0)
+#endif
+
+/* A conditional safepoint poll needs roots only in its taken arm. After the poll returns, the wasm
+ * locals contain the same pinned object addresses and no GC can observe them again until the next
+ * materialization/handoff. Pop the lazy frame and clear its active marker so a later poll can rebuild
+ * it. This is what keeps the overwhelmingly-common poll-not-requested path frame-free. */
+#ifdef HOST_BROWSER
+#define RELEASE_LAZY_REF_FRAME() do { if (lazy_ref_frame) { \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+	wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); \
+	wasm_i32_const (&body, 0); \
+	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx); \
+	wasm_op (&body, WASM_OP_END); \
+} } while (0)
+#else
+#define RELEASE_LAZY_REF_FRAME() do { } while (0)
 #endif
 
 
@@ -5732,7 +5851,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_op (&body, WASM_OP_END);
 			}
 #ifdef HOST_BROWSER
-			if (wj_ins_is_effective_gcpoint (cfg, ins))
+			if (wj_ins_is_effective_gcpoint (cfg, ins) &&
+			    !(lazy_ref_frame && ins->opcode == OP_GC_SAFE_POINT) &&
+			    !(lazy_ref_frame && terminal_vcall_handoff && ins == terminal_vcall_ins))
 				ENSURE_REF_FRAME ();
 #endif
 			switch (ins->opcode) {
@@ -5911,8 +6032,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_i32_const (&body, (gint32) (intptr_t) &mono_polling_required);
 					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);              /* if (flag != 0) */
+					/* Materialize roots inside the rare taken arm, not before the flag load. */
+					ENSURE_REF_FRAME ();
 					wasm_i32_const (&body, (gint32) (intptr_t) &mono_threads_state_poll);
 					wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) pti); wasm_uleb (&body, 0);
+					RELEASE_LAZY_REF_FRAME ();
 					wasm_op (&body, WASM_OP_END);
 				}
 #endif
@@ -7264,6 +7388,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							extern int mono_wasm_jit_call_delegate (MonoMethod *m, guint8 *buf);
 						WasmFuncType vts, vtrf, vtd, ftd, dftd; WasmCallInfo vci; int vtsi = -1, vtrfi = -1, vtdi = -1, ftdi = -1, dftdi = -1, vk, ai, n2, this_vr; int aic_ati = -1, aic_ati_ne = -1;
 						WasmValtype pp [WASM_FUNCTYPE_MAX_PARAMS], rv; int npp = 0; gpointer vic;
+						MonoVTable *pred_vt = NULL;
+						MonoMethod *pred_target = NULL;
+						int pred_fslot = 0;
 						gboolean is_delegate_invoke = !strcmp (call->method->name, "Invoke") &&
 							m_class_get_parent (call->method->klass) == mono_defaults.multicastdelegate_class;
 						if (!csig->hasthis) { fail = "vcall not instance"; goto done; }
@@ -7320,6 +7447,60 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						memset (&ftd, 0, sizeof (ftd)); for (vk = 0; vk < npp; ++vk) ftd.params [vk] = pp [vk]; ftd.nparams = (guint32) npp; ftd.ret = rv;
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &ftd)) { ftdi = ti_base + vk; break; }
 						if (ftdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ftd; ftdi = ti_base + nextra++; }
+						/* Narrow speculative devirtualization: consume the interpreter profile only for
+						 * the terminal GC-point selected by the root-handoff proof. A valid JITtable
+						 * prediction becomes an island edge when its target has not acquired an f-slot
+						 * yet. This matters for forwarding chains: the outer adapter normally reaches its
+						 * threshold before the inner body has published a slot, so merely checking the
+						 * slot here would silently reject every useful prediction. The retriable blocker
+						 * compiles the chain bottom-up and re-emits this adapter with the stable slot.
+						 *
+						 * Native-AOT and permanently un-JITtable targets retain the ordinary PIC/AOT miss
+						 * routes; self-recursive virtual calls also stay on the PIC to avoid manufacturing
+						 * a self blocker. Registering a successful direct dependency makes the predicted
+						 * target available in every worker before this caller is admitted there. */
+#ifdef HOST_BROWSER
+						if (terminal_vcall_handoff && terminal_vcall_ins == ins &&
+						    mono_wasm_jit_devirt_profile) {
+							if (mono_wasm_jit_vprof_predict (mono_interp_get_imethod (cfg->method),
+							    call->method, &pred_vt, &pred_target, NULL)) {
+								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
+								extern gboolean mono_interp_jit_call_supported (MonoMethod *method,
+									MonoMethodSignature *sig);
+								MonoMethodSignature *pred_sig = mono_method_signature_internal (pred_target);
+								WasmCallInfo pred_ci;
+								mono_wasm_get_call_info (pred_sig, &pred_ci);
+								if (!pred_ci.valid || pred_ci.vret_byaddr ||
+								    !functype_eq (&pred_ci.ftype, &ftd)) {
+									pred_vt = NULL;
+									pred_target = NULL;
+									pred_fslot = 0;
+								} else {
+									pred_fslot = mono_wasm_jit_get_callee_fslot (pred_target);
+									if (pred_fslot <= 0) {
+										if (pred_target != cfg->method &&
+										    !mono_wasm_jit_callee_perm_unjittable (pred_target) &&
+										    !mono_interp_jit_call_supported (pred_target, pred_sig)) {
+											wj_result_add_blocker (&cfg->wasm_jit_result, pred_target);
+											fail = "callee not jitted (terminal devirt)";
+											goto done;
+										}
+										pred_vt = NULL;
+										pred_target = NULL;
+										pred_fslot = 0;
+									} else {
+										wj_result_add_direct_dep (&cfg->wasm_jit_result, pred_fslot,
+											wj_functype_hash (&ftd), pred_target);
+										if (cfg->wasm_jit_result.direct_deps_truncated) {
+											fail = "too many direct dependencies";
+											goto done;
+										}
+									}
+								}
+							}
+						}
+#endif
 						/* Open-static/open-instance delegate targets consume the Invoke arguments after
 						 * dropping the delegate receiver. Their canonical f-thunk type is therefore ftd
 						 * without parameter zero. Closed-instance/bound-static retain the full ftd. */
@@ -7428,6 +7609,25 @@ vcall_nullchk_done:
 #endif
 							int way;
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
+							/* Strict monomorphic terminal-forwarder guard. A hit bypasses the worker PIC
+							 * completely; a miss falls through unchanged. The branch remains correct if
+							 * the profile later becomes stale because receiver vtable identity is checked
+							 * on every invocation. */
+							if (pred_fslot > 0 && pred_vt && pred_target && !is_delegate_invoke) {
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_miss */
+									if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt this ld"; goto done; }
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_i32_const (&body, (gint32) (intptr_t) pred_vt);
+									wasm_op (&body, WASM_OP_I32_NE);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									for (ai = 0; ai < n2; ++ai)
+										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "devirt arg ld"; goto done; }
+									wasm_i32_const (&body, pred_fslot);
+									wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ftdi); wasm_uleb (&body, 0);
+									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "devirt dreg"; goto done; }
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
+								wasm_op (&body, WASM_OP_END); /* $pred_miss */
+							}
 							/* OBJGUARD (once, hoisted above the N ways): validate the receiver before any raw
 							 * this->vtable load. Otherwise a type-confused scalar/garbage receiver traps as a bare
 							 * wasm OOB before the C resolver can print anything. */

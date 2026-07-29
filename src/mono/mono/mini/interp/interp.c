@@ -966,6 +966,60 @@ wj_vprof_record (InterpMethod *caller, MonoMethod *base, MonoVTable *vt, MonoMet
 	p->n = i + 1;
 }
 
+/*
+ * Return a prediction only for a sufficiently warmed, perfectly monomorphic site.
+ *
+ * vt_hits is a Boyer-Moore margin rather than an occurrence counter, so equality with total is the
+ * one useful exact statement it can make: every observation had the same receiver.  The generated
+ * code still guards on that vtable, making a stale/racy prediction a performance miss rather than a
+ * correctness assumption.  Read the tuple twice because the recorder is deliberately lock-free; a
+ * replacement in progress must not pair one receiver's vtable with another receiver's target.
+ */
+gboolean
+mono_wasm_jit_vprof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **out_vt,
+	MonoMethod **out_target, guint32 *out_samples)
+{
+	InterpMethod *caller = (InterpMethod *) caller_ptr;
+	WjVProf *p;
+	guint32 i, n;
+
+	if (!caller || !base || !out_vt || !out_target)
+		return FALSE;
+	p = (WjVProf *) caller->wasm_jit_vprof;
+	if (!p)
+		return FALSE;
+	mono_memory_barrier ();
+	n = p->n;
+	if (n > WJ_VPROF_MAX_SITES)
+		n = WJ_VPROF_MAX_SITES;
+	for (i = 0; i < n; ++i) {
+		MonoVTable *vt1, *vt2;
+		MonoMethod *target1, *target2;
+		guint32 hits1, hits2, total1, total2;
+		if (p->sites [i].base != base)
+			continue;
+		vt1 = p->sites [i].vt;
+		target1 = p->sites [i].target;
+		hits1 = p->sites [i].vt_hits;
+		total1 = p->sites [i].total;
+		mono_memory_barrier ();
+		vt2 = p->sites [i].vt;
+		target2 = p->sites [i].target;
+		hits2 = p->sites [i].vt_hits;
+		total2 = p->sites [i].total;
+		if (vt1 != vt2 || target1 != target2 || hits1 != hits2 || total1 != total2)
+			return FALSE;
+		if (!vt1 || !target1 || total1 < 8 || hits1 != total1)
+			return FALSE;
+		*out_vt = vt1;
+		*out_target = target1;
+		if (out_samples)
+			*out_samples = total1;
+		return TRUE;
+	}
+	return FALSE;
+}
+
 
 #define WJ_WAITER_SLOTS 4096
 #define WJ_WAITER_MAX   256   /* cap waiters tracked per callee (beyond this it's force-compiled anyway) */
