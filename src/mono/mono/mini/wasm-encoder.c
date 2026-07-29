@@ -329,10 +329,10 @@ wasm_module_method_and_entry (
 	/* Import section (2): shared memory m.h (matches the threads runtime heap); — when the method body
 	 * uses call_indirect — the indirect function table f.f as table 0; — when it uses try/catch — the
 	 * C++ exception tag x.e (matches the runtime's __cpp_exception export, like the jiterpreter); and
-	 * three runtime globals: the mutable C stack pointer plus immutable addresses of this instance's
-	 * thread-local wasm-JIT slot-liveness pointer/capacity. */
+	 * five runtime globals: the mutable C stack pointer plus immutable addresses of this instance's
+	 * thread-local slot-liveness pointer/capacity and vcall-PIC pointer/capacity. */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 3 /* s.p/l/c globals */));
+	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 5 /* s.p/l/c/v/n globals */));
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);   /* memory */
@@ -388,6 +388,21 @@ wasm_module_method_and_entry (
 		wasm_u8 (&sec, 0x03);
 		wasm_u8 (&sec, (guint8) WASM_I32);
 		wasm_u8 (&sec, 0x00);            /* immutable */
+	}
+	{
+		/* Worker-local virtual PIC pointer/capacity variable addresses, global indices 3 and 4.
+		 * Generated virtual dispatch loads the current pointer through s.v and bounds its stable site
+		 * id against *s.n before touching the array. */
+		wasm_name (&sec, "s");
+		wasm_name (&sec, "v");
+		wasm_u8 (&sec, 0x03);
+		wasm_u8 (&sec, (guint8) WASM_I32);
+		wasm_u8 (&sec, 0x00);
+		wasm_name (&sec, "s");
+		wasm_name (&sec, "n");
+		wasm_u8 (&sec, 0x03);
+		wasm_u8 (&sec, (guint8) WASM_I32);
+		wasm_u8 (&sec, 0x00);
 	}
 	emit_section (out, 2, &sec);
 	wasm_buf_free (&sec);
@@ -481,9 +496,9 @@ wasm_module_methods_and_entries (
 	wasm_buf_free (&sec);
 
 	/* Import section (2): identical to the single-method form — the shared heap, optionally the indirect
-	 * function table and the C++ exception tag, __stack_pointer, and the two per-instance TLS addresses. */
+	 * function table and the C++ exception tag, __stack_pointer, and the four per-instance TLS addresses. */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 3));
+	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 5));
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);
@@ -522,6 +537,16 @@ wasm_module_methods_and_entries (
 	wasm_u8 (&sec, 0x00);
 	wasm_name (&sec, "s");
 	wasm_name (&sec, "c");
+	wasm_u8 (&sec, 0x03);
+	wasm_u8 (&sec, (guint8) WASM_I32);
+	wasm_u8 (&sec, 0x00);
+	wasm_name (&sec, "s");
+	wasm_name (&sec, "v");
+	wasm_u8 (&sec, 0x03);
+	wasm_u8 (&sec, (guint8) WASM_I32);
+	wasm_u8 (&sec, 0x00);
+	wasm_name (&sec, "s");
+	wasm_name (&sec, "n");
 	wasm_u8 (&sec, 0x03);
 	wasm_u8 (&sec, (guint8) WASM_I32);
 	wasm_u8 (&sec, 0x00);

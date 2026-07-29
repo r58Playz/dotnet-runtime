@@ -85,6 +85,7 @@ int mono_wasm_jit_batch_module = 0;
 int mono_wasm_jit_batch_all_at = 250;
 int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC (1 = monomorphic/legacy). Clamped [1,8]. 2 captures the ~63% of the miss population that are 2-type sites (arity depth-1) which a 1-way IC gets 0% of. */
 int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inline AOT-vcall IC (1 = monomorphic first-wins/legacy). Clamped [1,8]. 2 captures the AOT-backed 2-type sites (arity depth-0 once VCALL_WAYS>=2): the loser vtable of a 2-way AOT site is stuck reaching the resolve helper behind the 1-entry cache. */
+int mono_wasm_jit_vcall_shared_miss_enabled = 1; /* MONO_WASM_JIT_VCALL_SHARED_MISS: one signature-neutral cold miss stub using a lazy GC-pinned worker frame */
 
 /* NB: compiled into BOTH the browser runtime and mono-aot-cross (no longer HOST_BROWSER-gated) so the
  * OFFLINE cross-compiler dump path (mini.c COMPILE_WASM fork) reads MONO_WASM_JIT_VERBOSE/DUMP_IR/STATS +
@@ -117,6 +118,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_batch_all_at; const char *ba = g_getenv ("MONO_WASM_JIT_BATCH_ALL_AT"); mono_wasm_jit_batch_all_at = (ba && *ba) ? atoi (ba) : 250; }
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
 	{ extern int mono_wasm_jit_vcall_aot_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_AOT_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_aot_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline AOT-vcall IC; clamp [1,8]; 1 = legacy first-wins */
+	{ extern int mono_wasm_jit_vcall_shared_miss_enabled; const char *sm = g_getenv ("MONO_WASM_JIT_VCALL_SHARED_MISS"); mono_wasm_jit_vcall_shared_miss_enabled = (sm && *sm) ? (*sm != '0') : 1; }
 	{ extern int mono_wasm_jit_over_aot; const char *oa = g_getenv ("MONO_WASM_JIT_OVER_AOT"); mono_wasm_jit_over_aot = (oa && *oa && *oa != '0') ? 1 : 0; } /* experimental second compiler tier for hot AOT bodies; safe fallback remains the AOT entry */
 	{ extern int mono_wasm_jit_island; const char *il = g_getenv ("MONO_WASM_JIT_ISLAND"); mono_wasm_jit_island = (il && *il && *il == '0') ? 0 : 1; } /* 0 = no eager island formation (bottom-up retry only) */
 	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia) ? (*ia != '0') : 1; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). 1 = on, default 0 = off. */
@@ -709,6 +711,8 @@ int
 mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms)
 {
 	int _ok;
+	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);
+	extern gint32 *mono_wasm_jit_vcall_pic_cap_addr (void);
 	/* $2/$4/$6 below are pointers passed as 32-bit ints; a g_malloc buffer above 2GB (MC's heap grows past
 	 * it) arrives NEGATIVE in JS, and HEAPU8.slice(negative,..) reads the wrong region -> garbage module
 	 * bytes -> a magic-word CompileError. Re-add 2^32 to recover the real unsigned address. (Use a C-valid
@@ -722,7 +726,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 		var t0 = performance.now ();
 		try {
 			var b = HEAPU8.slice (p, p + $3);
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8 } });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8, v: $9, n: $10 } });
 			if (op) HEAPF64[op >> 3] = performance.now () - t0;
 			if ($0 < 0) {
 				wasmTable.set ($1, inst.exports.t); /* interp-entry thunk: scalar -> interpreter */
@@ -737,7 +741,8 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			return 0;
 		}
 	}, e_slot, f_slot, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms,
-	   (int) (intptr_t) &wj_slot_live, (int) (intptr_t) &wj_slot_live_cap);
+	   (int) (intptr_t) &wj_slot_live, (int) (intptr_t) &wj_slot_live_cap,
+	   (int) (intptr_t) mono_wasm_jit_vcall_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_vcall_pic_cap_addr ());
 	if (_ok) {
 		/* Physical installation is not dispatch admission. A freshly compiled module can have unchecked
 		 * direct dependencies that are still placeholders on this thread; only mono_wasm_jit_admit marks
@@ -762,6 +767,8 @@ int
 mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms)
 {
 	int _ok, i;
+	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);
+	extern gint32 *mono_wasm_jit_vcall_pic_cap_addr (void);
 	/* Same >2GB pointer caveat as mono_wasm_jit_instantiate_local: a g_malloc buffer above 2GB arrives
 	 * negative in JS, so re-add 2^32 before slicing.
 	 *
@@ -777,7 +784,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 		var t0 = performance.now ();
 		try {
 			var b = HEAPU8.slice (p, p + $4);
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9 } });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11 } });
 			if (op) HEAPF64[op >> 3] = performance.now () - t0;
 			var k = 0;
 			var ef = null;
@@ -797,7 +804,8 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 			return 0;
 		}
 	}, (int) (intptr_t) e_slots, (int) (intptr_t) f_slots, n, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms,
-	   (int) (intptr_t) &wj_slot_live, (int) (intptr_t) &wj_slot_live_cap);
+	   (int) (intptr_t) &wj_slot_live, (int) (intptr_t) &wj_slot_live_cap,
+	   (int) (intptr_t) mono_wasm_jit_vcall_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_vcall_pic_cap_addr ());
 	if (_ok) {
 		for (i = 0; i < n; i++) {
 			wj_mark_slot_installed (e_slots [i]);
@@ -3610,6 +3618,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
 	int aic_vtab_idx = 0, aic_ti_idx = 0, aic_rgctx_idx = 0; /* i32 locals: AOT-vcall IC — this->vtable, ti<<1|kind2, rgctx */
 	int slotlive_ptr_idx = 0, slotlive_cap_idx = 0; /* i32 locals: cached &wj_slot_live / &wj_slot_live_cap for the INLINE f-slot-IC liveness check (dead in methods with no vcall) */
+	int vpic_ptr_idx = 0, vpic_cap_idx = 0; /* i32 locals: addresses of this worker's TLS vcall PIC pointer/cap */
 	gboolean has_vcall = FALSE;        /* TRUE: method has >=1 OP_*CALL_MEMBASE (a vcall-IC site) -> emit the prologue slotlive fetch */
 	int vc_ic_idx = 0;                 /* i64 local: inline virtual-IC fast-path IC value (vtable|imethod<<32) */
 	int eh_exc_idx = 0, eh_h_idx = 0;  /* i32 locals: in-method EH catch landing pad — saved C++ exc ptr + dispatch result */
@@ -4377,6 +4386,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	slotlive_ptr_idx = nwparams + cnt [0];
 	cnt [0] += 1;
 	slotlive_cap_idx = nwparams + cnt [0];
+	cnt [0] += 1;
+	vpic_ptr_idx = nwparams + cnt [0];
+	cnt [0] += 1;
+	vpic_cap_idx = nwparams + cnt [0];
 	cnt [0] += 1;
 	/* two i32 locals for the in-method EH catch landing pad (dead in methods with no clauses) */
 	eh_exc_idx = nwparams + cnt [0];
@@ -5391,6 +5404,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_ptr_idx);
 		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 2); /* imported s.c = &wj_slot_live_cap */
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_cap_idx);
+		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 3); /* imported s.v = &wj_vcall_pic */
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vpic_ptr_idx);
+		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 4); /* imported s.n = &wj_vcall_pic_cap */
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vpic_cap_idx);
 	}
 #endif
 
@@ -7097,7 +7114,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_pretransform);
 						wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) tpi); wasm_uleb (&body, 0);
 					}
-					/* $scratch = mono_wasm_jit_scratch() */
+						/* $scratch = mono_wasm_jit_scratch() */
 					wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_scratch);
 					wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) tsi); wasm_uleb (&body, 0);
 					wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) scratch_idx);
@@ -7345,7 +7362,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						/* Per-call-site N-way virtual IC plus miss metadata in shared memory. Delegate.Invoke
 						 * sites append a single-cast dispatch recipe used by the instance-aware helper. */
 #ifdef HOST_BROWSER
-						{ extern gpointer mono_wasm_jit_alloc_ic (int delegate_site); vic = mono_wasm_jit_alloc_ic (is_delegate_invoke); }
+						{ extern gpointer mono_wasm_jit_alloc_ic (int delegate_site, MonoMethod *caller, MonoMethod *base);
+						  vic = mono_wasm_jit_alloc_ic (is_delegate_invoke, cfg->method, call->method); }
 #else
 						vic = (gpointer) (intptr_t) 0x7ff0;
 #endif
@@ -7370,24 +7388,20 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							WJ_THROW_BR (4, 0);
 						}
 vcall_nullchk_done:
-						/* --- INLINE MONOMORPHIC IC FAST PATH (skip the resolve_fslot C helper on a hit) ---
-						 * ~97.8% of MC vcalls hit the IC; each otherwise pays TWO C calls (scratch() + resolve_fslot:
-						 * atomic load + resolve/checks + sync_thread) before the real call_indirect — the profiled
-						 * #1 game-thread cost (vcall_resolve_fslot ~17%). Do the hit inline in wasm:
-						 *   vtab = *this; ic = atomic_load(&vic);
-						 *   if (vtab == (i32)ic) { im = (i32)(ic>>32); fslot = im->wasm_jit_fslot;
-						 *     if (fslot != 0 && mono_wasm_jit_slot_live(fslot)) { call_indirect(fslot); skip slow } }
-						 * The liveness check is essential + is what makes inline dispatch MT-safe: the IC is shared
-						 * but the function table is PER-THREAD, so a slot another thread cached may be absent on THIS
-						 * thread. The ORIGINAL inline check (table[fslot] != null via ref.is_null) was WRONG — the
-						 * per-thread table grows with a NON-null jiterpreter placeholder, so it passed for un-instantiated
-						 * slots -> signature-mismatch trap (jit138). Fixed below: gate on the authoritative per-thread
-						 * bitmap via one cheap mono_wasm_jit_slot_live() call (wasm has no funcref equality to compare the
-						 * slot against the placeholder inline). Env-gated (MONO_WASM_JIT_VCALL_INLINE_IC=1) for A/B. */
+						/* --- WORKER-LOCAL INLINE VCALL PIC ---
+						 * A stable site id selects this worker's compact {receiver-vtable, admitted-fslot}
+						 * entries through imported TLS pointer/capacity addresses. Because a miss publishes only
+						 * after admitting the target into this worker's function table, a hit needs neither the old
+						 * shared InterpMethod load nor a slot-liveness bitmap test. Way zero remains straight-line;
+						 * the remaining ways use one compact loop and all hits share one typed call tail. */
 						if (mono_wasm_jit_vcall_inline_ic) {
 #ifdef HOST_BROWSER
 							extern int mono_wasm_jit_imethod_fslot_off (void);
 							int fslot_off = mono_wasm_jit_imethod_fslot_off ();
+							extern guint32 mono_wasm_jit_vcall_pic_site_id (gpointer ic);
+							extern int mono_wasm_jit_vcall_pic_stride (void);
+							guint32 vpic_site = mono_wasm_jit_vcall_pic_site_id (vic);
+							int vpic_stride = mono_wasm_jit_vcall_pic_stride ();
 							extern gpointer mono_wasm_jit_delegate_ic_base (gpointer ic);
 							extern int mono_wasm_jit_delegate_ic_stride (void);
 							extern int mono_wasm_jit_delegate_ic_field_off (int field);
@@ -7405,6 +7419,8 @@ vcall_nullchk_done:
 							int delegate_list_off = mono_wasm_jit_delegate_field_off (2);
 #else
 							int fslot_off = 0x40; /* placeholder for offline encoder validation (real offset only matters at runtime) */
+							guint32 vpic_site = 0;
+							int vpic_stride = 16;
 							gpointer delegate_ic = (gpointer) (intptr_t) 0x7000;
 							int delegate_ic_stride = 32, dic_seq_off = 0, dic_source_off = 4;
 							int dic_receiver_off = 8, dic_imethod_off = 16, dic_shape_off = 20, dic_scalar_off = 28;
@@ -7544,145 +7560,102 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_END); /* $delegate_way_fail */
 								}
 							}
-							/* Compact N-way JIT IC (MONO_WASM_JIT_VCALL_WAYS). Way zero remains straight-line;
-							 * ways 1..N live only in the data cache and are scanned by one constant-size wasm
-							 * loop. Interleaved A/B had 1-way 4-6% slower than 4-way because a way-zero miss
-							 * entered the full resolver. The loop retains that polymorphic capacity without
-							 * replicating the fslot+liveness guard N times or crossing into an AOT helper on
-							 * every polymorphic hit.
-							 *
-							 * vtab = *(this + 0) is invariant across both guards: they contain no store or GC
-							 * point, and `this` cannot change. The AOT IC below reloads it deliberately so
-							 * neither cache's correctness depends on the other being enabled.
-							 *
-							 * Two blocks wrap the guards so the argument push + call_indirect are emitted ONCE
-							 * for all ways instead of once per way (the source of the former 24 call_indirect
-							 * operations in one dispatch stub).
-							 *
-							 * Nesting inside the way-zero guard is $way_fail(0) $tail(1) $slow(2) $after(3):
-							 *   - a guard/liveness miss br_if 0 -> $way_fail, then enters the compact scan
-							 *   - a hit br 1 exits $tail and lands on the shared call
-							 *   - after the chain, br 1 exits $slow, skipping the shared tail
-							 *   - the shared tail ends with br 1 -> $after
-							 * Both new blocks CLOSE before the AOT-IC/resolve_fslot slow path, so that path and
-							 * everything after it keeps its original depth. This matters because WJ_THROW_BR/GOTO
-							 * take the in-bb nesting count as a hand-passed EXTRA: the region's only throw is the
-							 * `this` null check at the top (WJ_THROW_BR (4, 0)), emitted BEFORE these blocks open,
-							 * so no EXTRA anywhere needed adjusting. */
+								/* Worker-local compact N-way {vtable,fslot} PIC. The stable site id indexes the
+								 * current worker's TLS array selected by imported s.v/s.n. The miss helper publishes
+								 * only an admitted local fslot, eliminating the InterpMethod load and liveness bitmap
+								 * test from a hit. Each 16-byte entry keeps the hot pair at +0 and cold
+								 * {target,count} batching feedback at +8/+12. Way zero stays straight-line for V8's
+								 * monomorphic feedback; cold ways share one loop and all ways share one typed tail. */
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $slow (void) */
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $tail (void) */
 							if (!wasm_ld (&body, &lc, this_vr)) { fail = "ic this ld"; goto done; }
-							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-							wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
-							/* Only the monomorphic/MRU way is emitted. Capacity remains N-way in linear memory. */
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
+								/* Bounds-check before dereferencing the TLS PIC pointer. */
+								wasm_i32_const (&body, (gint32) vpic_site);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_cap_idx);
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+								wasm_op (&body, WASM_OP_I32_GE_U);
+								wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1); /* miss -> $slow */
+								/* cursor = *s.v + site * ways * stride */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_ptr_idx);
+								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+								wasm_i32_const (&body, (gint32) (vpic_site * mono_wasm_jit_vcall_ways * vpic_stride));
+								wasm_op (&body, WASM_OP_I32_ADD);
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);
+								/* Only the monomorphic/MRU way is emitted straight-line. */
 							for (way = 0; way < 1; ++way) {
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /*   $way_fail (void) */
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
-							/* ic = i64.atomic.load(&vic[way]); $ic = ic; if ((i32)ic != vtab) -> $way_fail */
-							wasm_i32_const (&body, (gint32) (intptr_t) vic + 8 * way);
-							wj_emit_ic_load64 (&body, 0);
+								/* ic = i64.load(local entry); if ((i32)ic != vtab) -> $way_fail */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+								wasm_op (&body, WASM_OP_I64_LOAD); wasm_memarg (&body, 3, 0);
 							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
 							wasm_op (&body, WASM_OP_I32_WRAP_I64);
 							wasm_op (&body, WASM_OP_I32_NE);
 							wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
-							/* im = (i32)(ic >> 32); fslot = im->wasm_jit_fslot; if (fslot == 0) -> $do_slow */
-							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
-							wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64);
-							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) fslot_off);
-							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
-							wasm_op (&body, WASM_OP_I32_EQZ);
-							wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
-							/* liveness: if (!slot_live(fslot)) -> $do_slow. The function table is PER-THREAD, so a slot
-							 * can hold the jiterpreter placeholder (NON-null, (i32,i32,i32,i32)->void) on a thread that
-							 * hasn't instantiated the callee -> call_indirect would signature-mismatch trap (jit138). The
-							 * authoritative per-thread signal is the wj_slot_live bitmap. INLINE it (no per-hit C call —
-							 * the profiled ~1.3M/frame boundary): read the CURRENT bitmap ptr + cap through the prologue-
-							 * cached &wj_slot_live / &wj_slot_live_cap (stable per-thread addresses; a realloc-on-grow moves
-							 * the values, not their addresses, so this stays correct with zero stale-pointer window):
-							 *   live = (fslot < cap) ? ((bitmap[fslot>>3] >> (fslot&7)) & 1) : 0;   if (!live) -> $do_slow
-							 * The cap gate short-circuits the bitmap load, so cap==0 / bitmap==NULL (never instantiated on
-							 * this thread) safely takes the slow path with no OOB/NULL read. fslot!=0 is already ensured by
-							 * the EQZ check above. Falls back to the C call only if the prologue fetch didn't run (should
-							 * not happen: has_vcall gates both), guarded by slotlive_ptr_idx being a valid local. */
-							{
-								/* fslot < cap ? */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
-								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);        /* cap = *(&wj_slot_live_cap) */
-								wasm_op (&body, WASM_OP_I32_LT_U);
-								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);    /* if (fslot<cap) { bit } else { 0 } */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
-									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);    /* bitmap = *(&wj_slot_live) */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-									wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
-									wasm_op (&body, WASM_OP_I32_ADD);                                 /* &bitmap[fslot>>3] */
-									wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);  /* byte */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-									wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
-									wasm_op (&body, WASM_OP_I32_SHR_U);                               /* byte >> (fslot&7) */
-									wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);      /* bit */
-								wasm_op (&body, WASM_OP_ELSE);
-									wasm_i32_const (&body, 0);
-								wasm_op (&body, WASM_OP_END);
-								wasm_op (&body, WASM_OP_I32_EQZ);
-								wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* !live -> $do_slow */
-							}
+								/* fslot = high32. A matching real vtable implies a nonzero admitted fslot. */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
+								wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64);
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+								/* Exact target-frequency writes are opt-in: normal dispatch must not dirty a
+								 * cache line on every hit. PROFILE_FAST already denotes a dedicated sampling
+								 * run, so the batcher gets both aggregate and per-target volume from one flag. */
+								{
+									extern int mono_wasm_jit_profile_fast;
+									if (mono_wasm_jit_profile_fast) {
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 12);
+										wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_ADD);
+										wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 12);
+									}
+								}
 							/* HIT: the resolved f-slot is in $vc_fslot; jump to the shared call tail below. */
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> exit $tail */
 							wasm_op (&body, WASM_OP_END);                            /* end $way_fail */
 							}   /* for each way */
 							if (mono_wasm_jit_vcall_ways > 1) {
-								/* Way zero missed: scan ways 1..N with one constant-size wasm loop. Reuse
-								 * aic_ti_idx as the cursor; the AOT PIC overwrites it below before use. */
-								wasm_i32_const (&body, 0);
-								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
-								wasm_i32_const (&body, (gint32) (intptr_t) vic + 8);
-								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);
+									/* Way zero missed: scan ways 1..N with one constant-size wasm loop. */
+									wasm_i32_const (&body, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+									wasm_i32_const (&body, vpic_stride); wasm_op (&body, WASM_OP_I32_ADD);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $cold_done */
 								wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);  /* $cold_loop */
 									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $cold_next */
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
-										wj_emit_ic_load64 (&body, 0);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+											wasm_op (&body, WASM_OP_I64_LOAD); wasm_memarg (&body, 3, 0);
 										wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
 										wasm_op (&body, WASM_OP_I32_WRAP_I64);
 										wasm_op (&body, WASM_OP_I32_NE);
 										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
-										wasm_i64_const (&body, 32);
-										wasm_op (&body, WASM_OP_I64_SHR_U);
-										wasm_op (&body, WASM_OP_I32_WRAP_I64);
-										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) fslot_off);
-										wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
-										wasm_op (&body, WASM_OP_I32_EQZ);
-										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
-										/* Same worker-local admission gate as way zero. */
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
-										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-										wasm_op (&body, WASM_OP_I32_LT_U);
-										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
-											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
-											wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-											wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
-											wasm_op (&body, WASM_OP_I32_ADD);
-											wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
-											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-											wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
-											wasm_op (&body, WASM_OP_I32_SHR_U);
-											wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);
-										wasm_op (&body, WASM_OP_ELSE);
-											wasm_i32_const (&body, 0);
-										wasm_op (&body, WASM_OP_END);
-										wasm_op (&body, WASM_OP_I32_EQZ);
-										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
-										wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 2); /* hit -> $cold_done */
+											wasm_i64_const (&body, 32);
+											wasm_op (&body, WASM_OP_I64_SHR_U);
+											wasm_op (&body, WASM_OP_I32_WRAP_I64);
+											wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+											{
+												extern int mono_wasm_jit_profile_fast;
+												if (mono_wasm_jit_profile_fast) {
+													wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+													wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+													wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 12);
+													wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_ADD);
+													wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 12);
+												}
+											}
+											wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 2); /* hit -> $cold_done */
 									wasm_op (&body, WASM_OP_END); /* $cold_next */
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
-									wasm_i32_const (&body, 8); wasm_op (&body, WASM_OP_I32_ADD);
-									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_ti_idx);
-									wasm_i32_const (&body, (gint32) (intptr_t) vic + 8 * mono_wasm_jit_vcall_ways);
+										wasm_i32_const (&body, vpic_stride); wasm_op (&body, WASM_OP_I32_ADD);
+										wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_ti_idx);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_ptr_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+										wasm_i32_const (&body, (gint32) ((vpic_site + 1) * mono_wasm_jit_vcall_ways * vpic_stride));
+										wasm_op (&body, WASM_OP_I32_ADD);
 									wasm_op (&body, WASM_OP_I32_LT_U);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0); /* -> $cold_loop */
 									wasm_i32_const (&body, 0);
@@ -7769,10 +7742,14 @@ vcall_nullchk_done:
 								wasm_op (&body, WASM_OP_END);   /* end kind if/else */
 								if (rv != WASM_VOID) { if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "aot ic dreg"; goto done; } }
 								wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* hit -> $after */
-								wasm_op (&body, WASM_OP_END);   /* selected entry invalid/absent -> resolve */
+									wasm_op (&body, WASM_OP_END);   /* selected entry invalid/absent -> resolve */
+								}
 							}
-						}
-						/* $scratch = mono_wasm_jit_scratch() */
+							{
+							extern int mono_wasm_jit_vcall_shared_miss_enabled;
+							if (!mono_wasm_jit_vcall_shared_miss_enabled) {
+							/* Legacy per-caller cold miss lowering, retained for an env-var A/B. */
+							/* $scratch = mono_wasm_jit_scratch() */
 #ifdef HOST_BROWSER
 						wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_scratch);
 #else
@@ -8070,8 +8047,140 @@ vcall_nullchk_done:
 								}
 								if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall dreg"; goto done; }
 							}
-						wasm_op (&body, WASM_OP_END);   /* end the fslot if/else (slow path) */
-						if (mono_wasm_jit_vcall_inline_ic)
+							wasm_op (&body, WASM_OP_END);   /* end the fslot if/else (slow path) */
+							} else {
+								/* Signature-neutral shared miss ABI:
+								 *   (this, base_method, frame, site_ic, aot_ic) -> threw
+								 * Only the unavoidable typed stores/load remain in this caller. */
+								WasmFuncType smt;
+								WasmFuncType rlt;
+								int smti = -1, rlti = -1;
+								extern int mono_wasm_jit_vcall_shared_miss (MonoObject *, MonoMethod *, guint8 *, gpointer, gpointer);
+								extern gpointer mono_wasm_jit_vcall_miss_frame_acquire (void);
+								extern void mono_wasm_jit_vcall_miss_frame_release (gpointer);
+								memset (&smt, 0, sizeof (smt));
+								for (vk = 0; vk < 5; ++vk) smt.params [vk] = WASM_I32;
+								smt.nparams = 5; smt.ret = WASM_I32;
+								for (vk = 0; vk < nextra; ++vk)
+									if (functype_eq (&extra_types [vk], &smt)) { smti = ti_base + vk; break; }
+								if (smti < 0) {
+									if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
+									extra_types [nextra] = smt; smti = ti_base + nextra++;
+								}
+								memset (&rlt, 0, sizeof (rlt));
+								rlt.params [0] = WASM_I32; rlt.nparams = 1; rlt.ret = WASM_VOID;
+								for (vk = 0; vk < nextra; ++vk)
+									if (functype_eq (&extra_types [vk], &rlt)) { rlti = ti_base + vk; break; }
+								if (rlti < 0) {
+									if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
+									extra_types [nextra] = rlt; rlti = ti_base + nextra++;
+								}
+								/* The cold helper can C++/wasm-EH unwind during resolution or target entry.
+								 * Import x.e even for an otherwise EH-free caller so a tiny cleanup catch can
+								 * release the pinned frame and immediately rethrow the original exception. */
+								uses_eh_tag = TRUE;
+								if (eh_type_idx < 0)
+									eh_type_idx = rlti; /* both are (i32)->void */
+								uses_calls = TRUE;
+								/* Acquire a GC-pinned, nesting-safe worker-local frame only on this cold edge.
+								 * Unlike adding 256 bytes to naddrbytes, this has zero prologue/stack cost on hits. */
+#ifdef HOST_BROWSER
+								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_miss_frame_acquire);
+#else
+								wasm_i32_const (&body, 0x7ff5);
+#endif
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) vtsi); wasm_uleb (&body, 0);
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) scratch_idx);
+								for (ai = 0; ai < n2; ++ai) {
+									WasmOpcode sop; guint32 al2;
+									switch (pp [ai]) {
+									case WASM_I64: sop = WASM_OP_I64_STORE; al2 = 3; break;
+									case WASM_F32: sop = WASM_OP_F32_STORE; al2 = 2; break;
+									case WASM_F64: sop = WASM_OP_F64_STORE; al2 = 3; break;
+									default:       sop = WASM_OP_I32_STORE; al2 = 2; break;
+									}
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+									if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "shared vcall arg ld"; goto done; }
+									wasm_op (&body, sop); wasm_memarg (&body, al2, (guint32) (ai * 8));
+								}
+								/* Preserve caller attribution used by the residual diagnostics. */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+#ifdef HOST_BROWSER
+								wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+#else
+								wasm_i32_const (&body, 0x7ff8);
+#endif
+								wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224);
+								wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);
+								if (!wasm_ld (&body, &lc, this_vr)) { fail = "shared vcall this ld"; goto done; }
+#ifdef HOST_BROWSER
+								wasm_i32_const (&body, (gint32) (intptr_t) call->method);
+#else
+								wasm_i32_const (&body, 0x7ffd);
+#endif
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+								wasm_i32_const (&body, (gint32) (intptr_t) vic);
+								wasm_i32_const (&body, (gint32) (intptr_t) aic);
+#ifdef HOST_BROWSER
+								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_shared_miss);
+#else
+								wasm_i32_const (&body, 0x7ff6);
+#endif
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) smti); wasm_uleb (&body, 0);
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx); /* threw */
+								wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0); /* x.e; exception ptr on stack */
+								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+#ifdef HOST_BROWSER
+								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_miss_frame_release);
+#else
+								wasm_i32_const (&body, 0x7ff4);
+#endif
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) rlti); wasm_uleb (&body, 0);
+								wasm_op (&body, WASM_OP_RETHROW); wasm_uleb (&body, 0);
+								wasm_op (&body, WASM_OP_END);
+								/* Transfer a successful return into its GC-tracked destination before clearing
+								 * the conservative frame root. */
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+								wasm_op (&body, WASM_OP_I32_EQZ);
+								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+									if (rv != WASM_VOID) {
+										WasmOpcode lop; guint32 al2;
+										switch (rv) {
+										case WASM_I64: lop = WASM_OP_I64_LOAD; al2 = 3; break;
+										case WASM_F32: lop = WASM_OP_F32_LOAD; al2 = 2; break;
+										case WASM_F64: lop = WASM_OP_F64_LOAD; al2 = 3; break;
+										default:       lop = WASM_OP_I32_LOAD; al2 = 2; break;
+										}
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+										wasm_op (&body, lop); wasm_memarg (&body, al2, 192);
+										if (rv == WASM_I32)
+											wasm_emit_subword_ret_norm (&body, csig->ret);
+										if (!wasm_st (&body, &lc, ins->dreg)) { fail = "shared vcall dreg"; goto done; }
+									}
+								wasm_op (&body, WASM_OP_END);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+#ifdef HOST_BROWSER
+								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_vcall_miss_frame_release);
+#else
+								wasm_i32_const (&body, 0x7ff4);
+#endif
+								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) rlti); wasm_uleb (&body, 0);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+									switch (ret_vt) {
+									case WASM_I32: wasm_i32_const (&body, 0); break;
+									case WASM_I64: wasm_i64_const (&body, 0); break;
+									case WASM_F32: wasm_f32_const (&body, 0); break;
+									case WASM_F64: wasm_f64_const (&body, 0); break;
+									default: break;
+									}
+									EMIT_REF_LEAVE ();
+									wasm_op (&body, WASM_OP_RETURN);
+								wasm_op (&body, WASM_OP_END);
+							}
+							}
+							if (mono_wasm_jit_vcall_inline_ic)
 							wasm_op (&body, WASM_OP_END);   /* end $after (only emitted when the inline-IC fast path is on) */
 						break;
 					}
