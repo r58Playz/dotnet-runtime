@@ -79,7 +79,6 @@ function getTrampImports () {
     trampImports = [
         importDef("interp_entry_prologue", getRawCwrap("mono_jiterp_interp_entry_prologue")),
         importDef("interp_entry", getRawCwrap("mono_jiterp_interp_entry")),
-        importDef("wasm_jit_slot_live", getRawCwrap("mono_wasm_jit_slot_live")),
         importDef("unbox", getRawCwrap("mono_jiterp_object_unbox")),
         importDef("stackval_from_data", getRawCwrap("mono_jiterp_stackval_from_data")),
     ];
@@ -346,13 +345,6 @@ function flush_wasm_entry_trampoline_jit_queue () {
                 "res": WasmValtype.i32,
             },
             WasmValtype.void, true
-        );
-        builder.defineType(
-            "wasm_jit_slot_live",
-            {
-                "slot": WasmValtype.i32,
-            },
-            WasmValtype.i32, true
         );
         builder.defineType(
             "stackval_from_data",
@@ -657,9 +649,11 @@ function generate_wasm_body (
      * Both runtime guards are load-bearing:
      *   fslot != 0            the method may not be JITted yet, and becomes so later - so this is a
      *                         per-call load, not a generation-time decision, and self-heals.
-     *   mono_wasm_jit_slot_live  the function table is PER-THREAD for dynamic entries; skipping the slow
-     *                         path also skips the sync that instantiates this method on this thread, so
-     *                         without this an unsynced thread would call_indirect a placeholder and trap.
+     *   slot-live bitmap       the function table is PER-THREAD for dynamic entries; skipping the slow
+     *                          path also skips the sync that instantiates this method on this thread, so
+     *                          without this an unsynced thread would call_indirect a placeholder and trap.
+     *                          The two embedded addresses name this worker's stable TLS pointer/cap slots;
+     *                          loading through the pointer slot observes bitmap reallocations.
      * Missing either just falls through to the original path below, which syncs and works as before.
      */
     if (info.wjNargs >= 0) {
@@ -676,9 +670,32 @@ function generate_wasm_body (
         builder.appendU8(WasmOpcode.br_if);
         builder.appendULeb(0);
 
-        // ...and only if this thread has instantiated it
+        // ...and only if this thread has instantiated it:
+        // live = fslot < cap && ((bitmap[fslot >> 3] >> (fslot & 7)) & 1)
         builder.local("wj_fslot");
-        builder.callImport("wasm_jit_slot_live");
+        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_cap_addr());
+        builder.appendU8(WasmOpcode.i32_load);
+        builder.appendMemarg(0, 2);
+        builder.appendU8(WasmOpcode.i32_lt_u);
+        builder.appendU8(WasmOpcode.i32_eqz);
+        builder.appendU8(WasmOpcode.br_if);
+        builder.appendULeb(0);
+
+        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_ptr_addr());
+        builder.appendU8(WasmOpcode.i32_load);
+        builder.appendMemarg(0, 2);
+        builder.local("wj_fslot");
+        builder.i32_const(3);
+        builder.appendU8(WasmOpcode.i32_shr_u);
+        builder.appendU8(WasmOpcode.i32_add);
+        builder.appendU8(WasmOpcode.i32_load8_u);
+        builder.appendMemarg(0, 0);
+        builder.local("wj_fslot");
+        builder.i32_const(7);
+        builder.appendU8(WasmOpcode.i32_and);
+        builder.appendU8(WasmOpcode.i32_shr_u);
+        builder.i32_const(1);
+        builder.appendU8(WasmOpcode.i32_and);
         builder.appendU8(WasmOpcode.i32_eqz);
         builder.appendU8(WasmOpcode.br_if);
         builder.appendULeb(0);

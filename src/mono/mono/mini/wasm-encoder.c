@@ -327,10 +327,12 @@ wasm_module_method_and_entry (
 	wasm_buf_free (&sec);
 
 	/* Import section (2): shared memory m.h (matches the threads runtime heap); — when the method body
-	 * uses call_indirect — the indirect function table f.f as table 0; and — when it uses try/catch — the
-	 * C++ exception tag x.e (matches the runtime's __cpp_exception export, like the jiterpreter). */
+	 * uses call_indirect — the indirect function table f.f as table 0; — when it uses try/catch — the
+	 * C++ exception tag x.e (matches the runtime's __cpp_exception export, like the jiterpreter); and
+	 * three runtime globals: the mutable C stack pointer plus immutable addresses of this instance's
+	 * thread-local wasm-JIT slot-liveness pointer/capacity. */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 1 /* s.p global (always) */));
+	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 3 /* s.p/l/c globals */));
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);   /* memory */
@@ -360,7 +362,7 @@ wasm_module_method_and_entry (
 		wasm_uleb (&sec, eh_type_idx);   /* function type index ((i32)->void) */
 	}
 	{
-		/* __stack_pointer as global s.p (kind 0x03), i32 mutable. Only global in the module -> global index 0.
+		/* __stack_pointer as global s.p (kind 0x03), i32 mutable. It is global index 0.
 		 * The C-stack frame prologue/epilogue use global.get/set 0 for the SP save/restore. Requires the main
 		 * module to export __stack_pointer (-Wl,--export=__stack_pointer, set in browser.proj +
 		 * BrowserWasmApp.targets) and the instantiation to pass it as s.p. */
@@ -369,6 +371,23 @@ wasm_module_method_and_entry (
 		wasm_u8 (&sec, 0x03);            /* import kind: global */
 		wasm_u8 (&sec, (guint8) WASM_I32); /* global type: i32 */
 		wasm_u8 (&sec, 0x01);            /* mutability: mutable */
+	}
+	{
+		/* Per-instance TLS addresses, global indices 1 and 2. Dynamic wasm modules are cached process-wide
+		 * but instantiated once per worker, so these cannot be baked into the module body. Supplying them
+		 * as immutable imports selects the current worker's TLS block at instantiation without paying two
+		 * C-boundary calls on every invocation of every virtual-call-containing method. The pointed-to
+		 * values remain live: a slot-bitmap realloc updates *s.l and the capacity update is visible at *s.c. */
+		wasm_name (&sec, "s");
+		wasm_name (&sec, "l");
+		wasm_u8 (&sec, 0x03);
+		wasm_u8 (&sec, (guint8) WASM_I32);
+		wasm_u8 (&sec, 0x00);            /* immutable */
+		wasm_name (&sec, "s");
+		wasm_name (&sec, "c");
+		wasm_u8 (&sec, 0x03);
+		wasm_u8 (&sec, (guint8) WASM_I32);
+		wasm_u8 (&sec, 0x00);            /* immutable */
 	}
 	emit_section (out, 2, &sec);
 	wasm_buf_free (&sec);
@@ -462,9 +481,9 @@ wasm_module_methods_and_entries (
 	wasm_buf_free (&sec);
 
 	/* Import section (2): identical to the single-method form — the shared heap, optionally the indirect
-	 * function table and the C++ exception tag, and __stack_pointer. */
+	 * function table and the C++ exception tag, __stack_pointer, and the two per-instance TLS addresses. */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 1));
+	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 3));
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);
@@ -496,6 +515,16 @@ wasm_module_methods_and_entries (
 	wasm_u8 (&sec, 0x03);
 	wasm_u8 (&sec, (guint8) WASM_I32);
 	wasm_u8 (&sec, 0x01);
+	wasm_name (&sec, "s");
+	wasm_name (&sec, "l");
+	wasm_u8 (&sec, 0x03);
+	wasm_u8 (&sec, (guint8) WASM_I32);
+	wasm_u8 (&sec, 0x00);
+	wasm_name (&sec, "s");
+	wasm_name (&sec, "c");
+	wasm_u8 (&sec, 0x03);
+	wasm_u8 (&sec, (guint8) WASM_I32);
+	wasm_u8 (&sec, 0x00);
 	emit_section (out, 2, &sec);
 	wasm_buf_free (&sec);
 
