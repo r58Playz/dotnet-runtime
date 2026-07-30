@@ -340,10 +340,20 @@ int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroi
  * Soundness rests on seeing every write to a tracked vreg. Every value-producing store in the emitter
  * goes through wasm_st(ins->dreg) (plus the one cfg->ret->dreg in OP_SETRET, killed explicitly), and
  * address-taken vregs -- whose home is memory a callee can write through -- are never tracked at all.
- * Mode 2 additionally propagates never-written facts down Mono's dominator tree. It is diagnostic:
- * the normal CFG/dominator relation does not account for every implicit exception transfer, so a fact
- * established only on a null check's normal continuation can be unsound in a catch/finally block.
- * Keep mode 1 as the default/shipping setting; =0 is the kill switch. */
+ * Mode 2 additionally propagates never-written facts down Mono's dominator tree, restricted to methods
+ * with no EH clauses. The dominator relation does not model implicit exception transfers, so a fact
+ * established on a null check's normal continuation can be false inside a catch/finally entered from
+ * before that check ran; a clause-free method has no such transfer, which makes the propagation sound
+ * without any dataflow reasoning (same argument, same property, as the RAISE_NOGC gate below).
+ *
+ * Mode 1 remains the default. Mode 2's measured value on the jbox2d workload is ~0, from an interleaved
+ * A/B of mode 1 against mode 2 on this branch: 0.721/0.744 vs 0.733/0.738 ms/step, i.e. inside run-to-run
+ * spread and slightly worse if anything, checksum identical throughout. Note this contradicts the reach
+ * argument above (AABB:combine's eight repeated parameter checks are real, and mode 2 does remove them) --
+ * removing those null checks simply does not move wall clock here, because the bodies are not
+ * null-check-bound once the entry tier is working. The pass is kept because the clause-free gate makes it
+ * correct and it may pay off on other EH-free numeric code, but do not enable it without re-measuring.
+ * =0 is the kill switch. */
 int mono_wasm_jit_nce = 1;
 /* MONO_WASM_JIT_RAISE_NOGC: treat raising instructions as non-GC-points in clause-free methods, so
  * SLOTLIVE stops forcing every live ref into the GC frame just because a null check sits between its
@@ -5805,7 +5815,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * shape MONO_EMIT_NULL_CHECK expands to and the same rule abcremoval.c uses. Requiring adjacency
 	 * (modulo nops) can only miss facts, never invent them. */
 	guint8 **nn_in = NULL;
-	if (mono_wasm_jit_nce >= 2 && nn && cfg->bb_entry && (cfg->comp_done & MONO_COMP_IDOM)) {
+	/* Clause-free only. The dominator relation does not model implicit exception transfers, so a
+	 * non-null fact established on a null check's normal continuation can be false inside a catch or
+	 * finally reached from BEFORE that check ran. A method with no EH clauses has no such transfer to
+	 * be wrong about, which makes the propagation sound without any dataflow reasoning -- the same
+	 * argument, keyed off the same property, as the RAISE_NOGC gate above. */
+	if (mono_wasm_jit_nce >= 2 && nn && cfg->bb_entry && (cfg->comp_done & MONO_COMP_IDOM) &&
+	    cfg->header->num_clauses == 0) {
 		guint8 *nn_written = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
 		MonoBasicBlock **stk, *b2;
 		MonoInst *i2;
