@@ -451,6 +451,8 @@ export function mono_interp_flush_jitcall_queue (): void {
         if (trace > 0)
             mono_log_info(`do_jit_call queue flush generated ${buffer.length} byte(s) of wasm`);
         modifyCounter(JiterpCounter.BytesGenerated, buffer.length);
+        (globalThis as any).__wj_bytes = (globalThis as any).__wj_bytes || { trace: 0, jitCall: 0, entry: 0 };
+        (globalThis as any).__wj_bytes.jitCall += buffer.length;
         const traceModule = new WebAssembly.Module(buffer);
         const wasmImports = builder.getWasmImports();
 

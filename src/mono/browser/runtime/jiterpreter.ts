@@ -863,6 +863,8 @@ function generate_wasm (
         if (trace > 0)
             mono_log_info(`${(<any>(builder.base)).toString(16)} ${methodFullName || traceName} generated ${buffer.length} byte(s) of wasm`);
         modifyCounter(JiterpCounter.BytesGenerated, buffer.length);
+        (globalThis as any).__wj_bytes = (globalThis as any).__wj_bytes || { trace: 0, jitCall: 0, entry: 0 };
+        (globalThis as any).__wj_bytes.trace += buffer.length;
 
         if (buffer.length >= builder.options.maxModuleSize) {
             mono_log_warn(`Jiterpreter generated too much code (${buffer.length} bytes) for trace ${traceName}. Please report this issue.`);

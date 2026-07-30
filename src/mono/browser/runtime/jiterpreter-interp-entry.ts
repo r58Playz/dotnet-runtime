@@ -81,7 +81,6 @@ function getTrampImports () {
         importDef("interp_entry", getRawCwrap("mono_jiterp_interp_entry")),
         importDef("unbox", getRawCwrap("mono_jiterp_object_unbox")),
         importDef("stackval_from_data", getRawCwrap("mono_jiterp_stackval_from_data")),
-        importDef("wasm_jit_admitted", getRawCwrap("mono_jiterp_wasm_jit_admitted")),
     ];
 
     return trampImports;
@@ -224,6 +223,16 @@ export function mono_jiterp_free_method_data_interp_entry (imethod: number) {
 const wjPatchStats: Record<string, number> = {
     installed: 0, unpatched: 0,
     noInfo: 0, noDirectImpl: 0, alreadyInstalled: 0, noFnTable: 0, badResult: 0,
+    flushGateOpen: 0, flushGateShut: 0,
+    // Localise where the adapter is lost: did the flush run at all (flushCalls / flushNoPthread), did it
+    // install guarded trampolines (guardedInstalled), and of those how many had no wasm-jit signature so
+    // no _direct export could exist (noWjSig)?
+    flushCalls: 0, flushNoPthread: 0, guardedInstalled: 0, noWjSig: 0,
+    // Is the hit-counter path even reaching the queue? maxHitCount vs the configured thresholds says
+    // whether wrappers are simply never getting hot enough to be queued for compilation.
+    recordCalls: 0, recordNoInfo: 0, recordNoPthread: 0, recordAdds: 0, maxHitCount: 0,
+    queueDrained: 0, trampolinesCreated: 0, createdNoWjSig: 0,
+    bailBudget: 0, bailLimit: 0, bailBytes: 0, genAttempts: 0, genThrew: 0,
 };
 (globalThis as any).__wj_patch_stats = () => wjPatchStats;
 
@@ -277,24 +286,32 @@ export function mono_interp_record_interp_entry (imethod: number) {
     // clear the unbox bit
     imethod = (imethod & ~0x1) >>> 0;
 
+    wjPatchStats.recordCalls++;
     const info = infoTable[imethod];
     // This shouldn't happen but it's not worth crashing over
-    if (!info)
+    if (!info) {
+        wjPatchStats.recordNoInfo++;
         return;
+    }
 
     if (!mostRecentOptions)
         mostRecentOptions = getOptions();
 
     info.hitCount++;
+    if (info.hitCount > wjPatchStats.maxHitCount)
+        wjPatchStats.maxHitCount = info.hitCount;
     if (info.hitCount === mostRecentOptions!.interpEntryFlushThreshold)
         flush_wasm_entry_trampoline_jit_queue();
     else if (info.hitCount !== mostRecentOptions!.interpEntryHitCount)
         return;
 
-    if (!has_live_pthread())
+    if (!has_live_pthread()) {
+        wjPatchStats.recordNoPthread++;
         return;
+    }
 
     const jitQueueLength = cwraps.mono_jiterp_tlqueue_add(JitQueue.InterpEntry, <any>imethod);
+    wjPatchStats.recordAdds++;
     if (jitQueueLength >= maxJitQueueLength)
         flush_wasm_entry_trampoline_jit_queue();
     else
@@ -318,6 +335,9 @@ export function mono_interp_jit_wasm_entry_trampoline (
         imethod, method, argumentCount, pParamTypes,
         unbox, hasThisReference, hasReturnValue, defaultImplementation
     );
+    wjPatchStats.trampolinesCreated++;
+    if (info.wjNargs < 0)
+        wjPatchStats.createdNoWjSig++;
     if (!fnTable)
         fnTable = getWasmFunctionTable();
 
@@ -366,8 +386,11 @@ function ensure_jit_is_scheduled () {
 }
 
 function flush_wasm_entry_trampoline_jit_queue () {
-    if (!has_live_pthread())
+    wjPatchStats.flushCalls++;
+    if (!has_live_pthread()) {
+        wjPatchStats.flushNoPthread++;
         return;
+    }
 
     const jitQueue : TrampolineInfo[] = [];
     let methodPtr = <MonoMethod><any>0;
@@ -380,6 +403,7 @@ function flush_wasm_entry_trampoline_jit_queue () {
             continue;
         }
         jitQueue.push(info);
+        wjPatchStats.queueDrained++;
     }
 
     if (!jitQueue.length)
@@ -427,12 +451,18 @@ function flush_wasm_entry_trampoline_jit_queue () {
         builder.clear();
 
     if (builder.options.wasmBytesLimit <= getCounter(JiterpCounter.BytesGenerated)) {
+        // Silent, and it drops the entries just drained off the tlqueue. The budget is SHARED with
+        // jiterpreter traces and jit-call wrappers, so whoever spends it first starves the others.
+        wjPatchStats.bailBudget++;
+        wjPatchStats.bailLimit = builder.options.wasmBytesLimit;
+        wjPatchStats.bailBytes = getCounter(JiterpCounter.BytesGenerated);
         return;
     }
 
     const started = _now();
     let compileStarted = 0;
     let rejected = true, threw = false;
+    wjPatchStats.genAttempts++;
 
     try {
         // Magic number and version
@@ -567,6 +597,8 @@ function flush_wasm_entry_trampoline_jit_queue () {
         if (trace > 0)
             mono_log_info(`jit queue generated ${buffer.length} byte(s) of wasm`);
         modifyCounter(JiterpCounter.BytesGenerated, buffer.length);
+        (globalThis as any).__wj_bytes = (globalThis as any).__wj_bytes || { trace: 0, jitCall: 0, entry: 0 };
+        (globalThis as any).__wj_bytes.entry += buffer.length;
         const traceModule = new WebAssembly.Module(buffer);
         const wasmImports = builder.getWasmImports();
 
@@ -582,6 +614,9 @@ function flush_wasm_entry_trampoline_jit_queue () {
             const fn = traceInstance.exports[traceName];
             // Patch the function pointer for this function to use the trampoline now.
             fnTable.set(info.result, fn);
+            wjPatchStats.guardedInstalled++;
+            if (info.wjNargs < 0)
+                wjPatchStats.noWjSig++;
             info.guardedImplementation = fn as Function;
             info.directInstalled = false;
             if (info.wjNargs >= 0) {
@@ -589,8 +624,23 @@ function flush_wasm_entry_trampoline_jit_queue () {
                 // Admission may have happened before this wrapper crossed its compilation threshold.
                 // In that ordering, install the adapter immediately instead of waiting for another
                 // native/AOT entry to discover an already-live f-slot.
-                if (cwraps.mono_jiterp_wasm_jit_admitted(info.imethod))
+                //
+                // This is the ONLY install site keyed on info.imethod, i.e. the same pointer infoTable is
+                // keyed by. The C-side calls out of mono_wasm_jit_admit pass
+                // mono_interp_get_imethod (re->logical_method), which for most methods is a DIFFERENT
+                // InterpMethod than the one the entry wrapper was created for, so they miss infoTable
+                // entirely (measured: 1795 misses vs 0 installs). Gating this site on full descriptor
+                // admission therefore did not "delay" the install, it removed the only one that works:
+                // at flush time the module is instantiated (f-slot live) but this worker has typically
+                // not yet admitted the descriptor's whole dependency union, so the stricter gate is
+                // simply never open here.
+                const fslot = getU32_unaligned(<any>(info.imethod + getMemberOffset(JiterpMember.WasmJitFslot)));
+                if (fslot > 0 && cwraps.mono_wasm_jit_slot_live(fslot)) {
+                    wjPatchStats.flushGateOpen++;
                     mono_jiterp_wasm_jit_patch_interp_entry(info.imethod);
+                } else {
+                    wjPatchStats.flushGateShut++;
+                }
             }
 
             rejected = false;
@@ -602,6 +652,8 @@ function flush_wasm_entry_trampoline_jit_queue () {
         // console.error(`${traceName} failed: ${exc} ${exc.stack}`);
         // HACK: exc.stack is enormous garbage in v8 console
         mono_log_error(`interp_entry code generation failed: ${exc}`);
+        wjPatchStats.genThrew++;
+        (wjPatchStats as any).lastError = String(exc).slice(0, 300);
         recordFailure();
     } finally {
         const finished = _now();
@@ -827,11 +879,40 @@ function generate_wasm_body (
         builder.appendU8(WasmOpcode.br_if);
         builder.appendULeb(0);
 
-        // ...and only if this worker admitted rmethod's current registry generation:
-        builder.local("rmethod");
-        builder.i32_const(~0x1);
+        // ...and only if this thread has instantiated it:
+        // live = fslot < cap && ((bitmap[fslot >> 3] >> (fslot & 7)) & 1)
+        //
+        // Kept as inline wasm rather than a call out to mono_jiterp_wasm_jit_admitted. Routing this
+        // through an import needs a matching builder.defineType for it; without one, every entry-wrapper
+        // module fails to generate with "No function type named wasm_jit_admitted", which silently
+        // disables the WHOLE interp-entry trampoline tier and sends every managed entry down the classic
+        // C interp_entry path (measured: ~12% of steady-state cycles, adapter share 0.00%). The inline
+        // form also keeps the guarded path cheap, which is what makes a future install-ordering bug a
+        // mild slowdown instead of a cliff.
+        builder.local("wj_fslot");
+        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_cap_addr());
+        builder.appendU8(WasmOpcode.i32_load);
+        builder.appendMemarg(0, 2);
+        builder.appendU8(WasmOpcode.i32_lt_u);
+        builder.appendU8(WasmOpcode.i32_eqz);
+        builder.appendU8(WasmOpcode.br_if);
+        builder.appendULeb(0);
+
+        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_ptr_addr());
+        builder.appendU8(WasmOpcode.i32_load);
+        builder.appendMemarg(0, 2);
+        builder.local("wj_fslot");
+        builder.i32_const(3);
+        builder.appendU8(WasmOpcode.i32_shr_u);
+        builder.appendU8(WasmOpcode.i32_add);
+        builder.appendU8(WasmOpcode.i32_load8_u);
+        builder.appendMemarg(0, 0);
+        builder.local("wj_fslot");
+        builder.i32_const(7);
         builder.appendU8(WasmOpcode.i32_and);
-        builder.callImport("wasm_jit_admitted");
+        builder.appendU8(WasmOpcode.i32_shr_u);
+        builder.i32_const(1);
+        builder.appendU8(WasmOpcode.i32_and);
         builder.appendU8(WasmOpcode.i32_eqz);
         builder.appendU8(WasmOpcode.br_if);
         builder.appendULeb(0);
