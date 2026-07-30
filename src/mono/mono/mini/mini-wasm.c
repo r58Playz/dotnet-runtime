@@ -35,6 +35,7 @@ gpointer mono_interp_get_imethod (MonoMethod *method); /* interp/interp.c; kept 
 gboolean mono_wasm_jit_vprof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
 	MonoMethod **out_target, guint32 *out_samples); /* interp.c; lock-free pre-JIT receiver profile */
 void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
+void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
 #define WJ_KEEPALIVE EMSCRIPTEN_KEEPALIVE
 #else
 #define WJ_KEEPALIVE
@@ -144,7 +145,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_ref_wt; const char *wt = g_getenv ("MONO_WASM_JIT_REF_WT"); mono_wasm_jit_ref_wt = (wt && *wt) ? (*wt != '0') : 0; } /* write-through ref vregs: wasm local is the value home, the frame slot is a def-mirrored pin (the LLVM-AOT gc_pin model); reads stop touching memory. Default OFF until soak. */
 	{ extern int mono_wasm_jit_slotlive; const char *sl = g_getenv ("MONO_WASM_JIT_SLOTLIVE"); mono_wasm_jit_slotlive = (sl && *sl) ? (*sl != '0') : 0; } /* GC-point liveness slot elision: an isref vreg whose whole def->use range crosses no GC point keeps NO frame slot (stays a fast wasm local the GC never needs to see). Cuts pin pressure + frame size. Default OFF until soak. */
 	{ extern int mono_wasm_jit_slotzero; const char *sz = g_getenv ("MONO_WASM_JIT_SLOTZERO"); mono_wasm_jit_slotzero = (sz && *sz) ? (*sz != '0') : 0; } /* dead-slot zeroing: null a single-bb ref slot at its last use so dead objects stop pinning (long-lived JSPI frames otherwise pin them until frame pop). Requires REF_WT+SLOTLIVE. Default OFF until soak. */
-	{ extern int mono_wasm_jit_nce; const char *nc = g_getenv ("MONO_WASM_JIT_NCE"); mono_wasm_jit_nce = (nc && *nc) ? (*nc != '0') : 1; } /* bb-local null-check elimination; 0 disables (A/B + kill switch). */
+	{ extern int mono_wasm_jit_nce; const char *nc = g_getenv ("MONO_WASM_JIT_NCE"); int n = (nc && *nc) ? atoi (nc) : 1; mono_wasm_jit_nce = n < 0 ? 0 : (n > 2 ? 2 : n); } /* 0=off; 1=safe bb-local NCE; 2=experimental dominator propagation. */
 	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF pending an A/B; reach measured 0.69% (54/7830 loads) on jbox2d — correct but nearly inert, see WjLcse. */
 	{ extern int mono_wasm_jit_coalesce; const char *cs = g_getenv ("MONO_WASM_JIT_COALESCE"); mono_wasm_jit_coalesce = (cs && *cs && *cs != '0') ? 1 : 0; } /* share one wasm local between vregs with disjoint live ranges. Default OFF until A/B'd. */
 	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); mono_wasm_jit_aot_entry = (ae && *ae && *ae != '0') ? 1 : 0; } /* fast path in the jiterpreter native->interp entry for already-JITted methods. */
@@ -322,7 +323,7 @@ int mono_wasm_jit_lcse = 0;           /* MONO_WASM_JIT_LCSE: extended-basic-bloc
                                        * hits/loads_seen, NOT adds/hits. Default OFF until A/B'd. */
 int mono_wasm_jit_slotlive = 0;       /* MONO_WASM_JIT_SLOTLIVE: GC-point liveness slot elision — an isref vreg gets a frame slot ONLY if a GC can actually observe it there: it is live across a GC-capable instruction (wj_ins_is_gcpoint) or spans basic blocks. A ref defined and fully consumed between two GC points is invisible to the collector (cooperative suspend: this thread only scans at safepoints/calls), so it can stay in an unscanned wasm local. Main pin-pressure lever: most deref-backstop bases and immediately-consumed call results lose their slots. Disabled when STOREGUARD/OBJGUARD are on (they key ref-ness off refslot, so elision would change guard semantics). Default OFF until soak. */
 int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroing — zero a SINGLE-BB slotted ref vreg's frame slot at its last use (only when a GC point follows in the bb), so the dead object stops pinning. Critical for long-lived frames (a JSPI-suspended main loop otherwise pins its stale refs for the app lifetime). Single-bb scope makes death provable without dataflow (a vreg live into any EH handler is multi-bb by definition). Requires REF_WT (reads come from the local, so the slot can be zeroed BEFORE the killing instruction — stack-neutral, no terminator special cases) and SLOTLIVE (which computes the last-use walk). Default OFF until soak. */
-/* MONO_WASM_JIT_NCE: bb-local null-check elimination. cfg->explicit_null_checks is forced on for this
+/* MONO_WASM_JIT_NCE: null-check elimination. cfg->explicit_null_checks is forced on for this
  * backend (mini.c, at the compile_wasm fork) because wasm linear-memory address 0 is a perfectly valid
  * address and cannot fault, so EVERY dereference carries its own COMPARE_IMM+COND_EXC pair. Nothing in
  * the mini pipeline removes them: abcremoval's null-check rule only CONSUMES facts produced by
@@ -330,7 +331,7 @@ int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroi
  * with the consumer's full opt set on: 40 of 40 call_indirect in AABB:combine are null-check throw
  * helpers, and 7781 of 16417 (47%) program-wide.
  *
- * The analysis is deliberately the cheap one -- a per-bb bitmap of vregs already proven non-null,
+ * Mode 1 is deliberately the cheap one -- a per-bb bitmap of vregs already proven non-null,
  * killed at any redefinition -- because that is what the dominant pattern needs: a chain of
  * dereferences off one receiver (a.lowerBound.x, a.lowerBound.y, ...) re-tests the same vreg within a
  * single basic block. It also removes the emitter's OWN vcall receiver check, which duplicates the
@@ -339,7 +340,10 @@ int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroi
  * Soundness rests on seeing every write to a tracked vreg. Every value-producing store in the emitter
  * goes through wasm_st(ins->dreg) (plus the one cfg->ret->dreg in OP_SETRET, killed explicitly), and
  * address-taken vregs -- whose home is memory a callee can write through -- are never tracked at all.
- * Default ON; =0 is the kill switch. */
+ * Mode 2 additionally propagates never-written facts down Mono's dominator tree. It is diagnostic:
+ * the normal CFG/dominator relation does not account for every implicit exception transfer, so a fact
+ * established only on a null check's normal continuation can be unsound in a catch/finally block.
+ * Keep mode 1 as the default/shipping setting; =0 is the kill switch. */
 int mono_wasm_jit_nce = 1;
 /* MONO_WASM_JIT_RAISE_NOGC: treat raising instructions as non-GC-points in clause-free methods, so
  * SLOTLIVE stops forcing every live ref into the GC frame just because a null check sits between its
@@ -868,6 +872,7 @@ typedef struct {
 	MonoMethod *logical_method; /* wrapper/method whose InterpMethod publishes this descriptor */
 	guint32 f_sig_id;
 	guint8 no_gc;               /* transitive effect: body reaches no returning GC/safepoint */
+	guint8 batch_incompatible;  /* force-compile cannot reproduce this descriptor's captured body */
 	int ndeps;
 	int *deps; /* immutable f-slot dependency list */
 	guint32 *dep_sig;
@@ -1069,40 +1074,33 @@ wj_desc_state_ensure (int id)
 	}
 }
 
-int
-mono_wasm_jit_admit (int desc_id)
+int mono_wasm_jit_admit (int desc_id);
+
+/* The slot-live bitmap answers only whether some generation has occupied this table slot. Automatic
+ * rebatching deliberately reuses the same e/f slots, so root-entry fast paths must additionally verify
+ * that THIS worker admitted the registry entry's current generation. */
+WJ_KEEPALIVE int
+mono_wasm_jit_desc_admitted (int desc_id)
 {
 	WjRegEntry *re;
-	int i;
-	gboolean watch;
-	char eb [192]; double ms = 0;
-	if (desc_id <= 0 || desc_id > wj_reg_n)
+	if (desc_id <= 0 || desc_id > wj_reg_n || desc_id >= wj_desc_state_cap)
 		return 0;
-	wj_desc_state_ensure (desc_id + 1);
 	mono_memory_barrier ();
 	re = wj_reg_at (desc_id - 1);
 	if (!re)
 		return 0;
-	watch = mono_wasm_jit_watch && re->logical_method && re->logical_method->name &&
-		strstr (re->logical_method->name, mono_wasm_jit_watch);
-	if (watch)
-		printf ("WASM_JIT_ADMIT_BEGIN desc=%d method=%s state=%d e=%d/live%d f=%d/live%d deps=%d\n",
-			desc_id, re->logical_method->name, wj_desc_state [desc_id], re->e,
-			mono_wasm_jit_slot_live (re->e), re->f, mono_wasm_jit_slot_live (re->f), re->ndeps);
-	/* A standalone descriptor may be rebound into an automatic batch after this worker admitted it.
-	 * Generation mismatch invalidates only the local admission cache; the old instance remains valid
-	 * for any invocation already in flight while this boundary overwrites the same e/f table slots. */
-	if (wj_desc_state [desc_id] == 2 && wj_desc_generation [desc_id] == re->generation) {
-		if (watch) printf ("WASM_JIT_ADMIT_CACHED desc=%d\n", desc_id);
-		return 1;
-	}
-	if (wj_desc_generation [desc_id] != re->generation)
-		wj_desc_state [desc_id] = 0;
-	if (wj_desc_state [desc_id] == 1)
-		return 1; /* dependency cycle within this admission DFS */
-	if (wj_desc_state [desc_id] == 3)
-		return 0;
-	wj_desc_state [desc_id] = 1;
+	return wj_desc_state [desc_id] == 2 &&
+		wj_desc_generation [desc_id] == re->generation &&
+		mono_wasm_jit_slot_live (re->e) &&
+		mono_wasm_jit_slot_live (re->f);
+}
+
+/* Validate and admit one descriptor's external direct-call closure. Batch-internal edges encounter
+ * siblings pre-marked state=1 by mono_wasm_jit_admit and therefore terminate as ordinary DFS cycles. */
+static gboolean
+wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
+{
+	int i;
 	for (i = 0; i < re->ndeps; ++i) {
 		int dep_id = wj_desc_for_fslot (re->deps [i]);
 		WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
@@ -1130,10 +1128,90 @@ mono_wasm_jit_admit (int desc_id)
 				dep_id, dm ? mono_wasm_jit_get_callee_fslot (dm) : -1,
 				cn ? cn : "?", dn ? dn : "?");
 			g_free (cn); g_free (dn);
-			goto fail;
+			return FALSE;
 		}
 		if (!mono_wasm_jit_admit (dep_id))
-			goto fail;
+			return FALSE;
+	}
+	return TRUE;
+}
+
+int
+mono_wasm_jit_admit (int desc_id)
+{
+	WjRegEntry *re;
+	WjBatchDesc *batch;
+	int i;
+	gboolean watch;
+	char eb [192]; double ms = 0;
+	if (desc_id <= 0 || desc_id > wj_reg_n)
+		return 0;
+	wj_desc_state_ensure (desc_id + 1);
+	mono_memory_barrier ();
+	re = wj_reg_at (desc_id - 1);
+	if (!re)
+		return 0;
+	watch = mono_wasm_jit_watch && re->logical_method && re->logical_method->name &&
+		strstr (re->logical_method->name, mono_wasm_jit_watch);
+	if (watch)
+		printf ("WASM_JIT_ADMIT_BEGIN desc=%d method=%s state=%d e=%d/live%d f=%d/live%d deps=%d\n",
+			desc_id, re->logical_method->name, wj_desc_state [desc_id], re->e,
+			mono_wasm_jit_slot_live (re->e), re->f, mono_wasm_jit_slot_live (re->f), re->ndeps);
+	/* A standalone descriptor may be rebound into an automatic batch after this worker admitted it.
+	 * Generation mismatch invalidates only the local admission cache; the old instance remains valid
+	 * for any invocation already in flight while this boundary overwrites the same e/f table slots. */
+	if (wj_desc_state [desc_id] == 2 && wj_desc_generation [desc_id] == re->generation) {
+		if (watch) printf ("WASM_JIT_ADMIT_CACHED desc=%d\n", desc_id);
+		return 1;
+	}
+	if (wj_desc_generation [desc_id] != re->generation) {
+#ifdef HOST_BROWSER
+		/* A generated AOT adapter is guard-free after admission. Restore its guarded wrapper before
+		 * replacing this worker's table slots with a newer batch generation, then repatch it below
+		 * only after the new dependency union has been admitted. */
+		if (re->logical_method)
+			mono_jiterp_wasm_jit_unpatch_interp_entry (mono_interp_get_imethod (re->logical_method));
+#endif
+		wj_desc_state [desc_id] = 0;
+	}
+	if (wj_desc_state [desc_id] == 1)
+		return 1; /* dependency cycle within this admission DFS */
+	if (wj_desc_state [desc_id] == 3)
+		return 0;
+	wj_desc_state [desc_id] = 1;
+	batch = re->batch;
+	if (batch) {
+		/* Instantiating any member installs every export, but that does NOT make every sibling
+		 * dispatchable: each sibling can have different unchecked external call_indirect targets.
+		 * Mark the complete generation visiting first (so intra-batch edges are DFS cycles), then
+		 * admit the union of all sibling dependency closures before publishing any sibling live.
+		 *
+		 * The old code walked only the triggering member and then marked all siblings state=2. On a
+		 * secondary worker, RealEmitOpCode became live through sibling DoEmit while its
+		 * RuntimeILGenerator.Emit dependency was still the table placeholder, producing V8's
+		 * "function signature mismatch" trap. */
+		for (i = 0; i < batch->n; ++i) {
+			int sibling = batch->desc [i];
+			WjRegEntry *sre;
+			if (sibling <= 0 || sibling > wj_reg_n || !(sre = wj_reg_at (sibling - 1)) ||
+			    sre->batch != batch)
+				goto fail;
+			wj_desc_state_ensure (sibling + 1);
+			if (wj_desc_generation [sibling] != batch->generation)
+				wj_desc_state [sibling] = 0;
+			if (wj_desc_state [sibling] == 3)
+				goto fail;
+			wj_desc_state [sibling] = 1;
+			wj_desc_generation [sibling] = batch->generation;
+		}
+		for (i = 0; i < batch->n; ++i) {
+			int sibling = batch->desc [i];
+			WjRegEntry *sre = wj_reg_at (sibling - 1);
+			if (!wj_admit_dependencies (sre, sibling, watch && sibling == desc_id))
+				goto fail;
+		}
+	} else if (!wj_admit_dependencies (re, desc_id, watch)) {
+		goto fail;
 	}
 	/* The compiling worker already installed this descriptor; other workers instantiate it once here.
 	 * A batch member brings up the ENTIRE module (its exports are e<i>/f<i>, so there is no way to
@@ -1184,7 +1262,16 @@ mono_wasm_jit_admit (int desc_id)
 	if (watch) printf ("WASM_JIT_ADMIT_OK desc=%d e_live=%d f_live=%d\n", desc_id, mono_wasm_jit_slot_live (re->e), mono_wasm_jit_slot_live (re->f));
 	return 1;
 fail:
-	wj_desc_state [desc_id] = 3;
+	if (batch) {
+		for (i = 0; i < batch->n; ++i) {
+			int sibling = batch->desc [i];
+			if (sibling > 0 && sibling < wj_desc_state_cap &&
+			    wj_desc_generation [sibling] == batch->generation)
+				wj_desc_state [sibling] = 3;
+		}
+	} else {
+		wj_desc_state [desc_id] = 3;
+	}
 	return 0;
 }
 
@@ -3423,6 +3510,10 @@ typedef struct {
 	WasmBuf e_body;
 	WasmFuncType *extra_types;      /* g_malloc'd, nextra entries; inline storage would be MBs at 512 members */
 	guint32 nextra;
+	int *deps;                      /* direct f-slot closure captured by THIS batch re-emission */
+	guint32 *dep_sig;
+	MonoMethod **dep_method;
+	int ndeps;
 	guint32 ti_base;
 	gboolean captured;
 } WjBatchMember;
@@ -3485,6 +3576,9 @@ mono_wasm_jit_batch_end (void)
 		wasm_buf_free (&wj_batch->m [i].f_body);
 		wasm_buf_free (&wj_batch->m [i].e_body);
 		g_free (wj_batch->m [i].extra_types);
+		g_free (wj_batch->m [i].deps);
+		g_free (wj_batch->m [i].dep_sig);
+		g_free (wj_batch->m [i].dep_method);
 	}
 	g_free (wj_batch);
 	wj_batch = NULL;
@@ -3523,6 +3617,22 @@ mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_b
 	if (!wj_batch || wj_batch->n <= 0)
 		return 0;
 	n = wj_batch->n;
+	/* A batch re-emission can discover direct targets that were not available when a member's
+	 * standalone registry entry was produced. Every baked f-slot must already have an authoritative
+	 * descriptor; a parked reservation is still a jiterpreter placeholder and would turn into a
+	 * call_indirect signature trap. Reject before batch_finish overwrites any table slots. */
+	for (i = 0; i < n; i++) {
+		WjBatchMember *bm = &wj_batch->m [i];
+		int d;
+		for (d = 0; d < bm->ndeps; ++d) {
+			if (!wj_desc_for_fslot (bm->deps [d])) {
+				if (errbuf && errcap)
+					g_snprintf (errbuf, errcap, "member %d has unregistered dependency fslot %d",
+						i, bm->deps [d]);
+				return 0;
+			}
+		}
+	}
 	members = (WasmModuleMember *) g_malloc0 (sizeof (WasmModuleMember) * n);
 	for (i = 0; i < n; i++) {
 		WjBatchMember *bm = &wj_batch->m [i];
@@ -3628,6 +3738,62 @@ mono_wasm_jit_reg_graph_entry (int i, MonoMethod **out_method, int *out_len, int
 	return 1;
 }
 
+/* The method identity whose IR was actually emitted for a registry entry.  This can differ from the
+ * logical InterpMethod owner (notably synchronized/intrinsic wrappers), and batch capture/predeclared
+ * direct-call membership must use this identity or a correct re-emit looks like divergence. */
+MonoMethod *
+mono_wasm_jit_reg_body_method (int i)
+{
+	WjRegEntry *re;
+	if (i < 0 || i >= wj_reg_n || !(re = wj_reg_at (i)))
+		return NULL;
+	return re->body_method;
+}
+
+/* Some runtime intrinsics have a useful standalone descriptor but force-compiling their logical
+ * method does not reproduce a normal captured body.  They must remain external f-slot calls when
+ * automatic batches are re-emitted.  If such a member is ever discovered while growing an existing
+ * batch, quarantine that complete old generation: excluding only one sibling would let a replacement
+ * module orphan the other members of the still-live old module. */
+int
+mono_wasm_jit_reg_mark_batch_incompatible (MonoMethod *method)
+{
+	WjBatchDesc *batch = NULL;
+	int i, marked = 0;
+
+	if (!method)
+		return 0;
+	mono_loader_lock ();
+	for (i = 0; i < wj_reg_n; ++i) {
+		WjRegEntry *re = wj_reg_at (i);
+		if (re && (re->logical_method == method || re->body_method == method)) {
+			batch = re->batch;
+			break;
+		}
+	}
+	for (i = 0; i < wj_reg_n; ++i) {
+		WjRegEntry *re = wj_reg_at (i);
+		if (!re || re->batch_incompatible)
+			continue;
+		if ((batch && re->batch == batch) ||
+		    (!batch && (re->logical_method == method || re->body_method == method))) {
+			re->batch_incompatible = 1;
+			marked++;
+		}
+	}
+	mono_loader_unlock ();
+	return marked;
+}
+
+int
+mono_wasm_jit_reg_batch_incompatible (int i)
+{
+	WjRegEntry *re;
+	if (i < 0 || i >= wj_reg_n || !(re = wj_reg_at (i)))
+		return 1;
+	return re->batch_incompatible != 0;
+}
+
 guint32
 mono_wasm_jit_reg_batch_generation (int i)
 {
@@ -3681,20 +3847,54 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	bd->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 	for (i = 0; i < n; i++) {
 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
+		WjBatchMember *bm = wj_batch && i < wj_batch->n ? &wj_batch->m [i] : NULL;
+		int *new_deps = NULL;
+		guint32 *new_dep_sig = NULL;
+		MonoMethod **new_dep_method = NULL;
+#ifdef HOST_BROWSER
+		/* batch_finish has already overwritten these slots on the compiling worker. Any previously
+		 * installed guard-free AOT adapter must stop entering them until admission below succeeds. */
+		if (re->logical_method)
+			mono_jiterp_wasm_jit_unpatch_interp_entry (mono_interp_get_imethod (re->logical_method));
+#endif
 		re->batch = bd;
 		/* Point the per-entry bytes at the shared module too, so anything reading re->bytes sees the
 		 * real module rather than the discarded standalone one. */
 		re->bytes = bytes;
 		re->len = len;
+		/* Code generation is not topology-invariant: as more callees become JITted, a later batch
+		 * re-emission can replace a residual with a new direct f-slot call. Publish the dependency
+		 * set captured from this exact body generation. Old arrays intentionally remain allocated:
+		 * another worker may still be walking the prior generation lock-free. */
+		if (bm) {
+			if (bm->ndeps > 0) {
+				new_deps = g_new (int, bm->ndeps);
+				new_dep_sig = g_new (guint32, bm->ndeps);
+				new_dep_method = g_new0 (MonoMethod *, bm->ndeps);
+				memcpy (new_deps, bm->deps, sizeof (int) * bm->ndeps);
+				memcpy (new_dep_sig, bm->dep_sig, sizeof (guint32) * bm->ndeps);
+				memcpy (new_dep_method, bm->dep_method, sizeof (MonoMethod *) * bm->ndeps);
+			}
+			re->deps = new_deps;
+			re->dep_sig = new_dep_sig;
+			re->dep_method = new_dep_method;
+			re->ndeps = bm->ndeps;
+		}
 		mono_memory_barrier ();
 		re->generation = bd->generation;
-		/* batch_finish instantiated this generation on the compiling worker already. */
+		/* batch_finish physically installed this generation on the compiling worker, but installation
+		 * is not admission. Invalidate the old standalone/batch admission cache before walking the
+		 * complete new batch's external dependency union below. */
 		wj_desc_state_ensure (desc_ids [i] + 1);
-		wj_desc_state [desc_ids [i]] = 2;
+		wj_desc_state [desc_ids [i]] = 0;
 		wj_desc_generation [desc_ids [i]] = bd->generation;
-		wj_mark_slot_live (e_slots [i]);
-		wj_mark_slot_live (f_slots [i]);
 	}
+	/* Admit from one member: mono_wasm_jit_admit premarks every sibling, admits the union of all their
+	 * external closures, and only then republishes every e/f slot live. Keep the registry binding even
+	 * if admission fails; callers will remain on guarded interpreter paths and the diagnostic identifies
+	 * the invalid dependency rather than freeing bytes still owned by the registry. */
+	if (!mono_wasm_jit_admit (desc_ids [0]))
+		printf ("WASM_JIT_BATCH_ADMIT_FAIL generation=%u members=%d\n", bd->generation, n);
 	return 1;
 }
 
@@ -5590,7 +5790,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * shape MONO_EMIT_NULL_CHECK expands to and the same rule abcremoval.c uses. Requiring adjacency
 	 * (modulo nops) can only miss facts, never invent them. */
 	guint8 **nn_in = NULL;
-	if (nn && cfg->bb_entry && (cfg->comp_done & MONO_COMP_IDOM)) {
+	if (mono_wasm_jit_nce >= 2 && nn && cfg->bb_entry && (cfg->comp_done & MONO_COMP_IDOM)) {
 		guint8 *nn_written = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
 		MonoBasicBlock **stk, *b2;
 		MonoInst *i2;
@@ -9085,6 +9285,15 @@ vcall_cold_miss_emit:
 			if (nextra)
 				memcpy (bm->extra_types, extra_types, sizeof (WasmFuncType) * nextra);
 			bm->nextra = (guint32) nextra;
+			bm->ndeps = cfg->wasm_jit_result.ndirect_deps;
+			if (bm->ndeps > 0) {
+				bm->deps = g_new (int, bm->ndeps);
+				bm->dep_sig = g_new (guint32, bm->ndeps);
+				bm->dep_method = g_new0 (MonoMethod *, bm->ndeps);
+				memcpy (bm->deps, cfg->wasm_jit_result.direct_deps, sizeof (int) * bm->ndeps);
+				memcpy (bm->dep_sig, cfg->wasm_jit_result.direct_dep_sig, sizeof (guint32) * bm->ndeps);
+				memcpy (bm->dep_method, cfg->wasm_jit_result.direct_dep_method, sizeof (MonoMethod *) * bm->ndeps);
+			}
 			bm->ti_base = (guint32) (ti_base - 2);   /* the encoder wants the block start, not the extras start */
 			/* Take ownership of both buffers: they must outlive this frame, so do NOT free them here. */
 			bm->f_body = body;

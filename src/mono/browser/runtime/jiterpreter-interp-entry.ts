@@ -81,6 +81,7 @@ function getTrampImports () {
         importDef("interp_entry", getRawCwrap("mono_jiterp_interp_entry")),
         importDef("unbox", getRawCwrap("mono_jiterp_object_unbox")),
         importDef("stackval_from_data", getRawCwrap("mono_jiterp_stackval_from_data")),
+        importDef("wasm_jit_admitted", getRawCwrap("mono_jiterp_wasm_jit_admitted")),
     ];
 
     return trampImports;
@@ -101,6 +102,7 @@ class TrampolineInfo {
     defaultImplementation: number;
     result: number;
     hitCount: number;
+    guardedImplementation?: Function;
     directImplementation?: Function;
     directInstalled = false;
 
@@ -225,6 +227,19 @@ export function mono_jiterp_wasm_jit_patch_interp_entry (imethod: number) {
         return;
     fnTable.set(info.result, info.directImplementation);
     info.directInstalled = true;
+}
+
+// Automatic rebatching reuses the target's f-slot. Admission calls this before replacing a worker's
+// slot so an already-installed guard-free adapter cannot enter the new generation prematurely.
+export function mono_jiterp_wasm_jit_unpatch_interp_entry (imethod: number) {
+    imethod = imethod >>> 0;
+    const info = infoTable[imethod];
+    if (!info || !info.directInstalled || !fnTable || info.result <= 0)
+        return;
+    const guarded = info.guardedImplementation || fnTable.get(info.defaultImplementation);
+    if (guarded)
+        fnTable.set(info.result, guarded);
+    info.directInstalled = false;
 }
 
 // FIXME: move this counter into C and make it thread safe
@@ -537,14 +552,14 @@ function flush_wasm_entry_trampoline_jit_queue () {
             const fn = traceInstance.exports[traceName];
             // Patch the function pointer for this function to use the trampoline now.
             fnTable.set(info.result, fn);
+            info.guardedImplementation = fn as Function;
             info.directInstalled = false;
             if (info.wjNargs >= 0) {
                 info.directImplementation = traceInstance.exports[traceName + "_direct"] as Function;
                 // Admission may have happened before this wrapper crossed its compilation threshold.
                 // In that ordering, install the adapter immediately instead of waiting for another
                 // native/AOT entry to discover an already-live f-slot.
-                const fslot = getU32_unaligned(<any>(info.imethod + getMemberOffset(JiterpMember.WasmJitFslot)));
-                if (fslot > 0 && cwraps.mono_wasm_jit_slot_live(fslot))
+                if (cwraps.mono_jiterp_wasm_jit_admitted(info.imethod))
                     mono_jiterp_wasm_jit_patch_interp_entry(info.imethod);
             }
 
@@ -763,11 +778,9 @@ function generate_wasm_body (
      * Both runtime guards are load-bearing:
      *   fslot != 0            the method may not be JITted yet, and becomes so later - so this is a
      *                         per-call load, not a generation-time decision, and self-heals.
-     *   slot-live bitmap       the function table is PER-THREAD for dynamic entries; skipping the slow
-     *                          path also skips the sync that instantiates this method on this thread, so
-     *                          without this an unsynced thread would call_indirect a placeholder and trap.
-     *                          The two embedded addresses name this worker's stable TLS pointer/cap slots;
-     *                          loading through the pointer slot observes bitmap reallocations.
+     *   descriptor admission  the function table is PER-THREAD and automatic rebatching reuses slots.
+     *                          This rejects both an unsynced worker and a stale slot whose current
+     *                          generation's complete dependency union has not yet been admitted.
      * Missing either just falls through to the original path below, which syncs and works as before.
      */
     if (info.wjNargs >= 0) {
@@ -784,32 +797,11 @@ function generate_wasm_body (
         builder.appendU8(WasmOpcode.br_if);
         builder.appendULeb(0);
 
-        // ...and only if this thread has instantiated it:
-        // live = fslot < cap && ((bitmap[fslot >> 3] >> (fslot & 7)) & 1)
-        builder.local("wj_fslot");
-        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_cap_addr());
-        builder.appendU8(WasmOpcode.i32_load);
-        builder.appendMemarg(0, 2);
-        builder.appendU8(WasmOpcode.i32_lt_u);
-        builder.appendU8(WasmOpcode.i32_eqz);
-        builder.appendU8(WasmOpcode.br_if);
-        builder.appendULeb(0);
-
-        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_ptr_addr());
-        builder.appendU8(WasmOpcode.i32_load);
-        builder.appendMemarg(0, 2);
-        builder.local("wj_fslot");
-        builder.i32_const(3);
-        builder.appendU8(WasmOpcode.i32_shr_u);
-        builder.appendU8(WasmOpcode.i32_add);
-        builder.appendU8(WasmOpcode.i32_load8_u);
-        builder.appendMemarg(0, 0);
-        builder.local("wj_fslot");
-        builder.i32_const(7);
+        // ...and only if this worker admitted rmethod's current registry generation:
+        builder.local("rmethod");
+        builder.i32_const(~0x1);
         builder.appendU8(WasmOpcode.i32_and);
-        builder.appendU8(WasmOpcode.i32_shr_u);
-        builder.i32_const(1);
-        builder.appendU8(WasmOpcode.i32_and);
+        builder.callImport("wasm_jit_admitted");
         builder.appendU8(WasmOpcode.i32_eqz);
         builder.appendU8(WasmOpcode.br_if);
         builder.appendULeb(0);

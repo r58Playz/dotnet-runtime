@@ -9,7 +9,7 @@ import { SystemInteropJS_BindJSImportST, SystemInteropJS_InvokeJSFunction, Syste
 import { mono_interp_tier_prepare_jiterpreter, mono_wasm_free_method_data } from "./jiterpreter";
 import {
     mono_interp_jit_wasm_entry_trampoline, mono_interp_record_interp_entry,
-    mono_jiterp_wasm_jit_patch_interp_entry
+    mono_jiterp_wasm_jit_patch_interp_entry, mono_jiterp_wasm_jit_unpatch_interp_entry
 } from "./jiterpreter-interp-entry";
 import { mono_interp_jit_wasm_jit_call_trampoline, mono_interp_invoke_wasm_jit_call_trampoline, mono_interp_flush_jitcall_queue } from "./jiterpreter-jit-call";
 import { SystemInteropJS_ResolveOrRejectPromise } from "./marshal-to-js";
@@ -71,6 +71,7 @@ export const mono_wasm_imports = [
     mono_interp_record_interp_entry,
     mono_interp_jit_wasm_entry_trampoline,
     mono_jiterp_wasm_jit_patch_interp_entry,
+    mono_jiterp_wasm_jit_unpatch_interp_entry,
     mono_interp_jit_wasm_jit_call_trampoline,
     mono_interp_invoke_wasm_jit_call_trampoline,
     mono_interp_flush_jitcall_queue,
