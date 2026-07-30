@@ -217,16 +217,45 @@ export function mono_jiterp_free_method_data_interp_entry (imethod: number) {
     delete infoTable[imethod];
 }
 
+// Diagnostic tally of why the guard-free adapter did or did not get installed, plus how many times it was
+// removed again. Zero cost unless read: dump it from the console with globalThis.__wj_patch_stats().
+// An `unpatched` count far above `installed` means adapters are being removed faster than they are being
+// restored, which strands hot methods on the guarded interp-entry trampoline.
+const wjPatchStats: Record<string, number> = {
+    installed: 0, unpatched: 0,
+    noInfo: 0, noDirectImpl: 0, alreadyInstalled: 0, noFnTable: 0, badResult: 0,
+};
+(globalThis as any).__wj_patch_stats = () => wjPatchStats;
+
 // Called by mono_wasm_jit_admit after the method's complete direct-call closure has been installed in
 // THIS worker's function table. Every worker owns a distinct table and a distinct infoTable, so this
 // patches only the worker whose admission just succeeded.
 export function mono_jiterp_wasm_jit_patch_interp_entry (imethod: number) {
     imethod = imethod >>> 0;
     const info = infoTable[imethod];
-    if (!info || !info.directImplementation || info.directInstalled || !fnTable || info.result <= 0)
+    if (!info) {
+        wjPatchStats.noInfo++;
         return;
+    }
+    if (info.directInstalled) {
+        wjPatchStats.alreadyInstalled++;
+        return;
+    }
+    if (!info.directImplementation) {
+        wjPatchStats.noDirectImpl++;
+        return;
+    }
+    if (!fnTable) {
+        wjPatchStats.noFnTable++;
+        return;
+    }
+    if (info.result <= 0) {
+        wjPatchStats.badResult++;
+        return;
+    }
     fnTable.set(info.result, info.directImplementation);
     info.directInstalled = true;
+    wjPatchStats.installed++;
 }
 
 // Automatic rebatching reuses the target's f-slot. Admission calls this before replacing a worker's
@@ -240,6 +269,7 @@ export function mono_jiterp_wasm_jit_unpatch_interp_entry (imethod: number) {
     if (guarded)
         fnTable.set(info.result, guarded);
     info.directInstalled = false;
+    wjPatchStats.unpatched++;
 }
 
 // FIXME: move this counter into C and make it thread safe
