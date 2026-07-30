@@ -1248,6 +1248,19 @@ mono_wasm_jit_admit (int desc_id)
 			wj_desc_generation [sibling] = re->batch->generation;
 			wj_mark_slot_live (re->batch->e [i]);
 			wj_mark_slot_live (re->batch->f [i]);
+#ifdef HOST_BROWSER
+			/* Patch EVERY sibling, not just the descriptor that triggered this admission.
+			 * mono_wasm_jit_batch_bind unpatches all n members before rebinding them (their e/f slots are
+			 * reused by the new generation), so repatching only the triggering member strands the other
+			 * n-1 on the guarded interp-entry trampoline for the rest of the process. At the batch sizes
+			 * this planner produces (211 members on the jbox2d workload) that is the difference between
+			 * ~0% and ~12% of steady-state cycles spent in interp_entry. */
+			{
+				WjRegEntry *sre = (sibling <= wj_reg_n) ? wj_reg_at (sibling - 1) : NULL;
+				if (sre && sre->logical_method)
+					mono_jiterp_wasm_jit_patch_interp_entry (mono_interp_get_imethod (sre->logical_method));
+			}
+#endif
 		}
 	}
 #ifdef HOST_BROWSER
@@ -1255,8 +1268,10 @@ mono_wasm_jit_admit (int desc_id)
 	 * per worker, just like the function table, so this is the earliest point where THIS worker may
 	 * replace it with the generated guard-free pointer-ABI -> scalar-ABI adapter. If the adapter has
 	 * not crossed its own compilation threshold yet the TS side records nothing; its later install
-	 * checks the already-live f-slot and completes the patch in the opposite ordering. */
-	if (re->logical_method)
+	 * checks the already-live f-slot and completes the patch in the opposite ordering.
+	 *
+	 * Batched descriptors were already covered by the sibling loop above (desc_id is one of them). */
+	if (!re->batch && re->logical_method)
 		mono_jiterp_wasm_jit_patch_interp_entry (mono_interp_get_imethod (re->logical_method));
 #endif
 	if (watch) printf ("WASM_JIT_ADMIT_OK desc=%d e_live=%d f_live=%d\n", desc_id, mono_wasm_jit_slot_live (re->e), mono_wasm_jit_slot_live (re->f));
