@@ -122,6 +122,7 @@ const fn_signatures: SigLine[] = [
     [true, "mono_wasm_jit_slot_live_ptr_addr", "number", []],
     [true, "mono_wasm_jit_slot_live_cap_addr", "number", []],
     [true, "mono_jiterp_wasm_jit_entry_ok", "number", ["number"]],
+    [true, "mono_jiterp_wasm_jit_admitted", "number", ["number"]],
     [true, "mono_jiterp_get_opcode_info", "number", ["number", "number"]],
     [true, "mono_wasm_is_zero_page_reserved", "number", []],
     [true, "mono_jiterp_is_special_interface", "number", ["number"]],
@@ -258,6 +259,7 @@ export interface t_Cwraps {
     mono_wasm_jit_slot_live_ptr_addr(): number;
     mono_wasm_jit_slot_live_cap_addr(): number;
     mono_jiterp_wasm_jit_entry_ok(rmethod: number): number;
+    mono_jiterp_wasm_jit_admitted(rmethod: number): number;
     mono_jiterp_get_opcode_info(opcode: number, type: number): number;
     mono_wasm_is_zero_page_reserved(): number;
     mono_jiterp_is_special_interface(klass: number): number;

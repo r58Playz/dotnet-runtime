@@ -560,6 +560,17 @@ mono_jiterp_wasm_jit_entry_ok (InterpMethod *rmethod)
 	return mono_wasm_jit_aot_entry && rmethod && !rmethod->is_invoke && !rmethod->needs_thread_attach;
 }
 
+/* Per-call guard used by a generated interp-entry wrapper until admission installs its guard-free
+ * adapter. Unlike slot liveness, this rejects a stale slot whose descriptor has since been rebound into
+ * a newer automatic-batch generation. */
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_wasm_jit_admitted (InterpMethod *rmethod)
+{
+	extern int mono_wasm_jit_desc_admitted (int desc_id);
+	return rmethod && rmethod->wasm_jit_desc > 0 &&
+		mono_wasm_jit_desc_admitted (rmethod->wasm_jit_desc);
+}
+
 EMSCRIPTEN_KEEPALIVE stackval *
 mono_jiterp_interp_entry_prologue (InterpMethod *rmethod, void *this_arg, int params_count)
 {
