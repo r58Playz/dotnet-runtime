@@ -889,6 +889,18 @@ function generate_wasm_body (
         // C interp_entry path (measured: ~12% of steady-state cycles, adapter share 0.00%). The inline
         // form also keeps the guarded path cheap, which is what makes a future install-ordering bug a
         // mild slowdown instead of a cliff.
+        //
+        // Deliberately NO per-generation check here, even though automatic rebatching reuses f-slots.
+        // Slot liveness cannot report a slot holding a generation this worker has not admitted:
+        //   - mono_wasm_jit_admit admits the dependency closure FIRST, instantiates SECOND, and only
+        //     marks e/f live THIRD, so a live slot always implies its closure is admitted on this thread.
+        //   - mono_wasm_jit_batch_bind clears desc_state and then calls mono_wasm_jit_admit for the new
+        //     generation synchronously, before it returns; no managed code runs in that window.
+        //   - Function tables are per-thread, so batch_finish overwriting the COMPILING worker's slots
+        //     leaves every other worker still pointing at the previous generation's instance, which stays
+        //     valid (the old module is not freed) until that worker admits the new one itself.
+        // Adding a generation probe here would therefore cost inline work on the guarded path to defend a
+        // window that is closed by construction. If any of those three orderings changes, revisit this.
         builder.local("wj_fslot");
         builder.ptr_const(cwraps.mono_wasm_jit_slot_live_cap_addr());
         builder.appendU8(WasmOpcode.i32_load);
