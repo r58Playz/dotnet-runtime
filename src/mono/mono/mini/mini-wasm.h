@@ -126,9 +126,13 @@ mini_wasm_is_scalar_vtype (MonoType *type, MonoType **etype);
  * and WJC_BYTES_GENERATED which holds bytes. Storage is gint64 because on wasm32 `long` is 32-bit
  * and the per-frame transition counts (hundreds of thousands/frame) overflow it over a 60s bench.
  *
- * The consumer harness (ikvmcraft frontend/src/dotnet.ts, enum WasmJitCounter) mirrors this enum BY
+ * The consumer harness (ikvmcraft frontend/src/dotnet/jitbench.ts, `const WJ`) mirrors this enum BY
  * INDEX and reads each counter via the mono_wasm_jit_get_counter export. KEEP THE ORDER STABLE:
  * append new counters immediately before WJC_MAX only, and update the harness mirror in lockstep.
+ * There is no way to detect index drift from JS — mono_wasm_jit_get_counter returns 0 for an
+ * out-of-range index, so a stale mirror reads as "that counter never moved" rather than as an error.
+ * The `g_static_assert (WJC_MAX == N)` above mono_wasm_jit_dump_stats breaks the build on every
+ * append: that is the reminder to update BOTH printers (that function and jitbench.ts).
  */
 enum {
 	WJC_REGISTERED, WJC_BAILED, WJC_INVALID,
@@ -136,7 +140,13 @@ enum {
 	WJC_AOT_ROUTED, WJC_INTERP_ROUTED,
 	WJC_VIC_HIT, WJC_VIC_MISS, WJC_VFAST_HAD, WJC_VFAST_NEW, WJC_VFB_THRESH, WJC_VFB_PERM, WJC_VSYNC_WORK,
 	WJC_VPERM_EH, WJC_VPERM_LDADDR, WJC_VPERM_LCMP, WJC_VPERM_OTHEROP, WJC_VPERM_OTHER,
-	WJC_REF_HWM,
+	/* NB: WJC_REF_HWM sat here and was REMOVED, shifting every counter below it down by one. It held the
+	 * high-water depth of the old ref shadow stack (wj_ref_sp - wj_ref_base, against WJ_REFSTACK_SLOTS),
+	 * which no longer exists — pins are per-frame C-stack slots now (WJC_REF_SLOTS / WJC_FRAME_BYTES), and
+	 * the enter/leave imbalance it was meant to reveal is caught directly, with the method named, by the
+	 * C-stack balance checks in interp.c. This is the one exception to append-only: it had no writer, so
+	 * nothing could regress, and leaving a permanently-zero slot in a hot-path array is worse than the
+	 * one-time cost of renumbering the harness mirror alongside it. */
 	/* compile-time accounting (Part 2) */
 	WJC_BYTES_GENERATED, WJC_ELAPSED_GENERATION, WJC_ELAPSED_INSTANTIATION, WJC_COMPILE_ATTEMPTS,
 	/* island formation outcomes (Part 3b/5) */
@@ -201,6 +211,5 @@ extern int mono_wasm_jit_stats;                     /* master gate: MONO_WASM_JI
 extern gint64 mono_wasm_jit_counters [WJC_MAX];     /* the counters (raw counts / microseconds) */
 void mono_wasm_jit_count (int idx);                 /* atomic += 1 */
 void mono_wasm_jit_add (int idx, gint64 v);         /* atomic += v (bytes / microseconds) */
-void mono_wasm_jit_max (int idx, gint64 v);         /* racy max (ref-stack high-water) */
 
 #endif /* __MONO_MINI_WASM_H__ */

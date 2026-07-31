@@ -28,7 +28,9 @@ typedef struct {
 
 static gboolean do_gchandle_stats = FALSE;
 
-static SgenHashTable gchandle_class_hash_table = SGEN_HASH_TABLE_INIT (INTERNAL_MEM_STATISTICS, INTERNAL_MEM_STAT_GCHANDLE_CLASS, sizeof (GCHandleClassEntry), g_str_hash, g_str_equal);
+/* Keyed on the vtable pointer, not a name string: the counting pass runs with the world
+ * stopped, where g_strdup_printf's malloc could deadlock against a suspended mutator. */
+static SgenHashTable gchandle_class_hash_table = SGEN_HASH_TABLE_INIT (INTERNAL_MEM_STATISTICS, INTERNAL_MEM_STAT_GCHANDLE_CLASS, sizeof (GCHandleClassEntry), g_direct_hash, g_direct_equal);
 #endif
 
 /*
@@ -537,17 +539,14 @@ sgen_gchandle_stats_register_vtable (GCVTable vtable, int handle_type)
 {
 	GCHandleClassEntry *entry;
 
-	char *name = g_strdup_printf ("%s.%s", sgen_client_vtable_get_namespace (vtable), sgen_client_vtable_get_name (vtable));
-	entry = (GCHandleClassEntry*) sgen_hash_table_lookup (&gchandle_class_hash_table, name);
+	entry = (GCHandleClassEntry*) sgen_hash_table_lookup (&gchandle_class_hash_table, vtable);
 
-	if (entry) {
-		g_free (name);
-	} else {
+	if (!entry) {
 		// Create the entry for this class and get the address of it
 		GCHandleClassEntry empty_entry;
 		memset (&empty_entry, 0, sizeof (GCHandleClassEntry));
-		sgen_hash_table_replace (&gchandle_class_hash_table, name, &empty_entry, NULL);
-		entry = (GCHandleClassEntry*) sgen_hash_table_lookup (&gchandle_class_hash_table, name);
+		sgen_hash_table_replace (&gchandle_class_hash_table, vtable, &empty_entry, NULL);
+		entry = (GCHandleClassEntry*) sgen_hash_table_lookup (&gchandle_class_hash_table, vtable);
 	}
 
 	entry->num_handles [handle_type]++;
@@ -576,10 +575,29 @@ sgen_gchandle_stats_count (void)
 	}
 }
 
+/*
+ * As with the pinning histogram, the counting pass runs with the world stopped, where
+ * neither allocation nor stdio is safe (a suspended mutator may hold the malloc or stderr
+ * lock). Snapshot raw vtables here; sgen_gchandle_stats_flush_report() names and logs them
+ * once the mutators are live again.
+ */
+#define GCHANDLE_SNAPSHOT_MAX_CLASSES 1024
+
+typedef struct {
+	GCVTable vtable;
+	size_t normal, weak, pinned;
+} GCHandleSnapshotEntry;
+
+static GCHandleSnapshotEntry gchandle_snapshot [GCHANDLE_SNAPSHOT_MAX_CLASSES];
+static int gchandle_snapshot_count, gchandle_snapshot_dropped;
+static int gchandle_snapshot_classes_seen;
+static size_t gchandle_snapshot_totals [3];   /* pinned, normal, weak -- across ALL classes */
+static gboolean gchandle_snapshot_pending;
+
 void
 sgen_gchandle_stats_report (void)
 {
-	char *name;
+	GCVTable vtable;
 	GCHandleClassEntry *gchandle_entry;
 
 	if (!do_gchandle_stats)
@@ -587,17 +605,82 @@ sgen_gchandle_stats_report (void)
 
 	sgen_gchandle_stats_count ();
 
-	mono_gc_printf (sgen_gc_debug_file, "\n%-60s  %10s  %10s  %10s\n", "Class", "Normal", "Weak", "Pinned");
-	SGEN_HASH_TABLE_FOREACH (&gchandle_class_hash_table, char *, name, GCHandleClassEntry *, gchandle_entry) {
-		mono_gc_printf (sgen_gc_debug_file, "%-60s", name);
-		mono_gc_printf (sgen_gc_debug_file, "  %10ld", (long)gchandle_entry->num_handles [HANDLE_NORMAL]);
-		size_t weak_handles = gchandle_entry->num_handles [HANDLE_WEAK] +
+	gchandle_snapshot_count = gchandle_snapshot_dropped = gchandle_snapshot_classes_seen = 0;
+	gchandle_snapshot_totals [0] = gchandle_snapshot_totals [1] = gchandle_snapshot_totals [2] = 0;
+
+	SGEN_HASH_TABLE_FOREACH (&gchandle_class_hash_table, GCVTable, vtable, GCHandleClassEntry *, gchandle_entry) {
+		size_t pinned = gchandle_entry->num_handles [HANDLE_PINNED];
+		size_t normal = gchandle_entry->num_handles [HANDLE_NORMAL];
+		size_t weak = gchandle_entry->num_handles [HANDLE_WEAK] +
 				gchandle_entry->num_handles [HANDLE_WEAK_TRACK] +
 				gchandle_entry->num_handles [HANDLE_WEAK_FIELDS];
-		mono_gc_printf (sgen_gc_debug_file, "  %10ld", (long)weak_handles);
-		mono_gc_printf (sgen_gc_debug_file, "  %10ld", (long)gchandle_entry->num_handles [HANDLE_PINNED]);
-		mono_gc_printf (sgen_gc_debug_file, "\n");
+
+		++gchandle_snapshot_classes_seen;
+		gchandle_snapshot_totals [0] += pinned;
+		gchandle_snapshot_totals [1] += normal;
+		gchandle_snapshot_totals [2] += weak;
+
+		/*
+		 * Only pinned holders get a per-class row. Weak and normal handles neither pin nor
+		 * fragment the nursery, yet they are held by orders of magnitude more classes -- letting
+		 * them into the buffer overflows it and evicts the pinned holders we are looking for
+		 * (the truncation happens here, before the flush sorts, so an evicted class simply
+		 * vanishes from the report). Aggregate totals above still account for every class.
+		 */
+		if (!pinned)
+			continue;
+
+		if (gchandle_snapshot_count < GCHANDLE_SNAPSHOT_MAX_CLASSES) {
+			GCHandleSnapshotEntry *dst = &gchandle_snapshot [gchandle_snapshot_count++];
+			dst->vtable = vtable;
+			dst->normal = normal;
+			dst->weak = weak;
+			dst->pinned = pinned;
+		} else {
+			++gchandle_snapshot_dropped;
+		}
 	} SGEN_HASH_TABLE_FOREACH_END;
+
+	gchandle_snapshot_pending = TRUE;
+}
+
+/* Must run only after the world has restarted -- see sgen_pin_stats_flush_report(). */
+void
+sgen_gchandle_stats_flush_report (void)
+{
+	int i, j;
+
+	if (!gchandle_snapshot_pending)
+		return;
+	gchandle_snapshot_pending = FALSE;
+
+	/* Worst pinned-handle holder first; pinned handles are what fragment the nursery. */
+	for (i = 0; i < gchandle_snapshot_count; ++i) {
+		int best = i;
+		for (j = i + 1; j < gchandle_snapshot_count; ++j) {
+			if (gchandle_snapshot [j].pinned > gchandle_snapshot [best].pinned)
+				best = j;
+		}
+		if (best != i) {
+			GCHandleSnapshotEntry tmp = gchandle_snapshot [i];
+			gchandle_snapshot [i] = gchandle_snapshot [best];
+			gchandle_snapshot [best] = tmp;
+		}
+	}
+
+	mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_GC,
+			"GC_HANDLE_STATS: handles pinned:%ld normal:%ld weak:%ld over %d classes; %d pinned holders listed%s",
+			(long)gchandle_snapshot_totals [0], (long)gchandle_snapshot_totals [1],
+			(long)gchandle_snapshot_totals [2], gchandle_snapshot_classes_seen,
+			gchandle_snapshot_count, gchandle_snapshot_dropped ? " (TRUNCATED)" : "");
+
+	for (i = 0; i < gchandle_snapshot_count; ++i) {
+		GCHandleSnapshotEntry *e = &gchandle_snapshot [i];
+		mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_GC, "GC_HANDLE_CLASS: pinned:%-7ld normal:%-7ld weak:%-7ld  %s.%s",
+				(long)e->pinned, (long)e->normal, (long)e->weak,
+				sgen_client_vtable_get_namespace (e->vtable),
+				sgen_client_vtable_get_name (e->vtable));
+	}
 }
 #endif
 

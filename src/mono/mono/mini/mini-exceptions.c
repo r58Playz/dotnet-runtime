@@ -3557,7 +3557,16 @@ mini_llvmonly_throw_corlib_exception (guint32 ex_token_index)
 	MonoException *ex;
 
 	ex = mono_exception_from_token (m_class_get_image (mono_defaults.exception_class), ex_token);
-	jit_tls->thrown_exc = mono_gchandle_new_internal ((MonoObject*)ex, TRUE);
+	/*
+	 * Retarget an existing handle instead of overwriting the field: a plain assignment leaks the
+	 * previous exception's gchandle, and because it is PINNED the leaked object can never be moved
+	 * out of the nursery, so each leak permanently raises the nursery's fragmentation floor. Every
+	 * other writer of thrown_exc (including mini_llvmonly_throw_exception below) already does this.
+	 */
+	if (jit_tls->thrown_exc)
+		mono_gchandle_set_target (jit_tls->thrown_exc, (MonoObject*)ex);
+	else
+		jit_tls->thrown_exc = mono_gchandle_new_internal ((MonoObject*)ex, TRUE);
 
 	mini_llvmonly_throw_exception ((MonoObject*)ex);
 }

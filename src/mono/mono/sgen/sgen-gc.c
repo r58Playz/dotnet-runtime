@@ -4033,6 +4033,10 @@ sgen_restart_world (int generation, gboolean serial_collection)
 		sgen_client_bridge_processing_finish (generation);
 
 	sgen_memgov_collection_end (generation, stw_time);
+
+	/* Deferred to here because formatting it allocates -- see sgen_pin_stats_flush_report(). */
+	sgen_pin_stats_flush_report ();
+	sgen_gchandle_stats_flush_report ();
 }
 
 gboolean
