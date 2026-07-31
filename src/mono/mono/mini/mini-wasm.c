@@ -216,14 +216,8 @@ mono_wasm_jit_add (int idx, gint64 v)
 	mono_atomic_add_i64 (&mono_wasm_jit_counters [idx], v);
 }
 
-/* Racy max (no atomic CAS loop): a high-water mark read for diagnosis only, where an occasional lost
- * update under a race is harmless. */
-void
-mono_wasm_jit_max (int idx, gint64 v)
-{
-	if (v > mono_wasm_jit_counters [idx])
-		mono_wasm_jit_counters [idx] = v;
-}
+/* (mono_wasm_jit_max — a racy high-water setter — lived here. Its only counter was WJC_REF_HWM, the old
+ * ref shadow stack's depth; both are gone. Reintroduce it if a future counter is a max rather than a sum.) */
 
 /* Per-method emit LOG verbosity (MONO_WASM_JIT_VERBOSE), independent of the counters: 0 silent, 1
  * registered+invalid, 2 +bail, 3 +emit-enter. Default 0 so a stats run no longer floods stdout. */
@@ -530,12 +524,18 @@ mono_wasm_jit_get_counter (int idx)
 
 #define WJC_(i) ((long long) mono_wasm_jit_counters [i])
 
+/* Every counter in the WJC_* enum must appear BOTH here and in the harness mirror (ikvmcraft
+ * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
+ * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
+ * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
+g_static_assert (WJC_MAX == 63);
+
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
 {
-	printf ("[wasm-jit stats] registered=%lld bailed=%lld invalid=%lld invoked=%lld residual=%lld fastvcall=%lld ref_hwm=%lld/%d (counting %s)\n",
+	printf ("[wasm-jit stats] registered=%lld bailed=%lld invalid=%lld invoked=%lld residual=%lld fastvcall=%lld (counting %s)\n",
 		WJC_(WJC_REGISTERED), WJC_(WJC_BAILED), WJC_(WJC_INVALID),
-		WJC_(WJC_INVOKE), WJC_(WJC_RESIDUAL), WJC_(WJC_FASTVCALL), WJC_(WJC_REF_HWM), 64 * 1024,
+		WJC_(WJC_INVOKE), WJC_(WJC_RESIDUAL), WJC_(WJC_FASTVCALL),
 		mono_wasm_jit_stats ? "on" : "OFF — set MONO_WASM_JIT_STATS=1");
 	printf ("[wasm-jit time] gen=%.1fms instantiate=%.1fms attempts=%lld bytes=%lld\n",
 		(double) WJC_(WJC_ELAPSED_GENERATION) / 1000.0, (double) WJC_(WJC_ELAPSED_INSTANTIATION) / 1000.0,
@@ -543,15 +543,31 @@ mono_wasm_jit_dump_stats (void)
 	printf ("[wasm-jit island] attempt=%lld completed=%lld budget_exhausted=%lld depth_exceeded=%lld blocked_perm=%lld blocked_cold=%lld promoted_up=%lld promoted_down=%lld\n",
 		WJC_(WJC_ISLAND_ATTEMPT), WJC_(WJC_ISLAND_COMPLETED), WJC_(WJC_ISLAND_BUDGET_EXHAUSTED), WJC_(WJC_ISLAND_DEPTH_EXCEEDED),
 		WJC_(WJC_ISLAND_BLOCKED_PERM), WJC_(WJC_ISLAND_BLOCKED_COLD), WJC_(WJC_PROMOTED_UP), WJC_(WJC_PROMOTED_DOWN));
+	/* Event-driven blocker waiting (the island driver's alternative to poll-retrying a cold callee).
+	 * woken/parked is the mean number of re-queues each park eventually produced. */
+	printf ("[wasm-jit park] parked=%lld waiters_woken=%lld\n",
+		WJC_(WJC_PARKED), WJC_(WJC_WAITER_WOKEN));
 	printf ("[wasm-jit vcall] ic_hit=%lld ic_miss=%lld vfast_had=%lld vfast_new=%lld vfb_thresh=%lld vfb_perm=%lld vsync_work=%lld\n",
 		WJC_(WJC_VIC_HIT), WJC_(WJC_VIC_MISS), WJC_(WJC_VFAST_HAD), WJC_(WJC_VFAST_NEW),
 		WJC_(WJC_VFB_THRESH), WJC_(WJC_VFB_PERM), WJC_(WJC_VSYNC_WORK));
+	/* vfb_thresh split by the target's slot state. cold = still counting (interp is the right answer);
+	 * parked = crossed the threshold but its island won't close, i.e. interpreted on EVERY call and the
+	 * real interp-residual driver; retry = transient compile-lock contention. Sum == vfb_thresh. */
+	printf ("[wasm-jit vfb] cold=%lld parked=%lld retry=%lld (sum should equal vfb_thresh=%lld)\n",
+		WJC_(WJC_VFB_COLD), WJC_(WJC_VFB_PARKED), WJC_(WJC_VFB_RETRY), WJC_(WJC_VFB_THRESH));
 	printf ("[wasm-jit vperm] aot=%lld eh=%lld ldaddr=%lld lcompare=%lld sig=%lld byref=%lld gshared=%lld rgctx=%lld sync=%lld eh_other=%lld other_opcode=%lld other=%lld\n",
 		WJC_(WJC_VPERM_AOT), WJC_(WJC_VPERM_EH), WJC_(WJC_VPERM_LDADDR), WJC_(WJC_VPERM_LCMP),
 		WJC_(WJC_VPERM_SIG), WJC_(WJC_VPERM_BYREF), WJC_(WJC_VPERM_GSHARED), WJC_(WJC_VPERM_RGCTX), WJC_(WJC_VPERM_SYNC), WJC_(WJC_VPERM_EHOTHER),
 		WJC_(WJC_VPERM_OTHEROP), WJC_(WJC_VPERM_OTHER));
 	printf ("[wasm-jit aotroute] aot_routed=%lld interp_routed=%lld vcall_aot_fast=%lld\n",
 		WJC_(WJC_AOT_ROUTED), WJC_(WJC_INTERP_ROUTED), WJC_(WJC_VCALL_AOT_FAST));
+	/* Fast-path VOLUME. These dispatches are pure emitted wasm and call no counting helper, so without
+	 * MONO_WASM_JIT_PROFILE_FAST=1 they are invisible and the counted totals above (invoked / fastvcall /
+	 * residual) understate real dispatch volume — frame cost then can't be attributed. The counters are
+	 * emitted INTO the JITted code, so they cost something: profile in a dedicated run, not a timing one. */
+	printf ("[wasm-jit fast] inline_aot=%lld fslot_ic_hit=%lld aot_ic_hit=%lld%s\n",
+		WJC_(WJC_FAST_INLINE_AOT), WJC_(WJC_FAST_VIC), WJC_(WJC_FAST_AOTIC),
+		mono_wasm_jit_profile_fast ? "" : " (not profiled — set MONO_WASM_JIT_PROFILE_FAST=1)");
 	printf ("[wasm-jit gcref] refbases_extra=%lld (0 across a soak with REFBASES=1 => REFBASES subsumed by structural seeds)\n",
 		WJC_(WJC_REFBASES_EXTRA));
 	printf ("[wasm-jit gcpin] ref_slots=%lld wt_vregs=%lld slots_elided=%lld slot_zero_stores=%lld frame_bytes=%lld\n",
@@ -1513,7 +1529,7 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 		 * A byref is not an object header (no vtable to validate), and a byref to a byte/short field is legally
 		 * unaligned — so DON'T alignment-check (that would false-trap). Just a loose in-memory range check to
 		 * catch a wildly stale byref. (The control-var check above already caught the specific in-range case
-		 * where the byref points at wj_ref_sp — that is the real garbage-SP catch.) NULL is a NRE elsewhere. */
+		 * where the byref points at the C-stack pointer — that is the real garbage-SP catch.) NULL is a NRE elsewhere. */
 		if (G_UNLIKELY (addr != NULL)) {
 			gsize a = (gsize) addr;
 			gsize memsz = wj_memsz ();
@@ -7062,7 +7078,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define STOREMI(WOP, AL) do { \
 		if (G_UNLIKELY (lc.objguard) && lc.refslot && ins->dreg >= 0 && ins->dreg < nvreg && lc.refslot [ins->dreg] >= 0) { \
 			/* OBJGUARD: storing an immediate THROUGH a ref/byref base (e.g. `*outparam = 0`); a stale/wild \
-			 * byref can land on wj_ref_sp. Range/control-var check the base (kind 3) before the store. */ \
+			 * byref can land on the C-stack pointer. Range/control-var check the base (kind 3) before the store. */ \
 			extern void mono_wasm_jit_check_store (guint8 *addr, int kind); \
 			if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "objguard imm base"; goto done; } \
 			wasm_i32_const (&body, 3); \

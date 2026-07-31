@@ -479,20 +479,28 @@ void sgen_free_internal_dynamic (void *addr, size_t size, int type);
 void sgen_pin_stats_enable (void);
 void sgen_pin_stats_register_object (GCObject *obj, int generation);
 void sgen_pin_stats_register_global_remset (GCObject *obj);
+/* Snapshots the histogram; safe to call with the world stopped. */
 void sgen_pin_stats_report (void);
+/* Formats the snapshot; must run only after the world has restarted. */
+void sgen_pin_stats_flush_report (void);
 #else
 static inline void sgen_pin_stats_enable (void) { }
 static inline void sgen_pin_stats_register_object (GCObject *obj, int generation) { }
 static inline void sgen_pin_stats_register_global_remset (GCObject *obj) { }
 static inline void sgen_pin_stats_report (void) { }
+static inline void sgen_pin_stats_flush_report (void) { }
 #endif
 
 #ifndef DISABLE_SGEN_DEBUG_HELPERS
 void sgen_gchandle_stats_enable (void);
+/* Snapshots the histogram; safe to call with the world stopped. */
 void sgen_gchandle_stats_report (void);
+/* Formats the snapshot; must run only after the world has restarted. */
+void sgen_gchandle_stats_flush_report (void);
 #else
 static inline void sgen_gchandle_stats_enable (void) { }
 static inline void sgen_gchandle_stats_report (void) { }
+static inline void sgen_gchandle_stats_flush_report (void) { }
 #endif
 
 void sgen_sort_addresses (void **array, size_t size);

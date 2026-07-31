@@ -81,11 +81,21 @@ free_filename (char *filename)
 	sgen_free_internal_dynamic (filename, strlen (filename_or_prefix) + 32, INTERNAL_MEM_BINARY_PROTOCOL);
 }
 
+/*
+ * The write lock only keeps two processes from clobbering a shared protocol file, which
+ * cannot happen under wasm. Emscripten has no working F_SETLK either way: legacy MEMFS
+ * fakes success, while WasmFS (-sWASMFS) always returns EACCES, which we would otherwise
+ * misread as "someone else owns the file" and turn into a fatal g_error below.
+ */
+#if defined(F_SETLK) && !defined(HOST_WASM)
+#define SGEN_PROTOCOL_USE_FILE_LOCK 1
+#endif
+
 static void
 binary_protocol_open_file (gboolean assert_on_failure)
 {
 	char *filename;
-#ifdef F_SETLK
+#ifdef SGEN_PROTOCOL_USE_FILE_LOCK
 	struct flock lock;
 	lock.l_type = F_WRLCK;
 	lock.l_whence = SEEK_SET;
@@ -106,7 +116,7 @@ binary_protocol_open_file (gboolean assert_on_failure)
 		if (binary_protocol_file == -1) {
 			if (errno != EINTR)
 				break; /* Failed */
-#ifdef F_SETLK
+#ifdef SGEN_PROTOCOL_USE_FILE_LOCK
 		} else if (fcntl (binary_protocol_file, F_SETLK, &lock) == -1) {
 			/* The lock for the file is already taken. Fail */
 			close (binary_protocol_file);
