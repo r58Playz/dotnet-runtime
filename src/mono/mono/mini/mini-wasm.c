@@ -101,6 +101,7 @@ int mono_wasm_jit_structured_cfg = 1; /* MONO_WASM_JIT_STRUCTURED_CFG: elide the
  * `mono-aot-cross --aot <dll>` with MONO_WASM_JIT_METHOD set a faithful offline emit/bail dumper.
  * Idempotent (guarded on the auto<0 sentinel). The 4 trigger globals above are only USED by the browser
  * interp hotness/island code; defining them for the cross build is harmless (unreferenced there). */
+
 void
 mono_wasm_jit_auto_init (void)
 {
@@ -150,9 +151,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_coalesce; const char *cs = g_getenv ("MONO_WASM_JIT_COALESCE"); mono_wasm_jit_coalesce = (cs && *cs && *cs != '0') ? 1 : 0; } /* share one wasm local between vregs with disjoint live ranges. Default OFF until A/B'd. */
 	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); mono_wasm_jit_aot_entry = (ae && *ae && *ae != '0') ? 1 : 0; } /* fast path in the jiterpreter native->interp entry for already-JITted methods. */
 	{ extern int mono_wasm_jit_nodispatch; const char *nd = g_getenv ("MONO_WASM_JIT_NODISPATCH"); mono_wasm_jit_nodispatch = (nd && *nd && *nd != '0') ? 1 : 0; } /* elide dispatch scaffolding for single-bb methods. Default OFF, unvalidated. */
-	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); mono_wasm_jit_raise_nogc = (rn && *rn && *rn != '0') ? 1 : 0; } /* raises are not GC points in clause-free methods (frame-slot elision). Default OFF until soak. */
+	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); mono_wasm_jit_raise_nogc = (rn && *rn) ? atoi (rn) : 0; } /* 0=off, 1=liveness-only exemption, 2=also publish nogc/gcp-count (measured unsound). See wj_ins_is_gcpoint. */
 	{ extern int mono_wasm_jit_marshal_wrappers; const char *mw = g_getenv ("MONO_WASM_JIT_MARSHAL_WRAPPERS"); mono_wasm_jit_marshal_wrappers = (mw && *mw && *mw != '0') ? 1 : 0; } /* JIT managed<->native marshalling wrappers; default 0 = bail them to the interp (fix for the get_method_attributes wild store), =1 reverts (buggy) for A/B */
-	{ extern int mono_wasm_jit_eh_nocxa; const char *en = g_getenv ("MONO_WASM_JIT_EH_NOCXA"); mono_wasm_jit_eh_nocxa = (en && *en && *en != '0') ? 1 : 0; } /* bisection: skip begin/end_catch in the EH landing pad */
 	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
 	/* Island heuristic levers (Part 5), all default off. */
 	{ extern int mono_wasm_jit_entry_promote; const char *ep = g_getenv ("MONO_WASM_JIT_ENTRY_PROMOTE"); mono_wasm_jit_entry_promote = (ep && *ep) ? atoi (ep) : 0; }      /* Lever A: 0=off */
@@ -272,7 +272,6 @@ void mono_wasm_jit_check_store (guint8 *addr, int kind);
 void mono_wasm_jit_check_store (guint8 *addr, int kind) { (void) addr; (void) kind; }
 #endif
 int mono_wasm_jit_inline_aot = 1;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the inline direct same-ABI AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry/frame/LMF) instead of the residual, for AOT'd callees. Build 1 = no wasm-EH yet (test non-throwing callees). default off. */
-int mono_wasm_jit_eh_nocxa = 0;       /* MONO_WASM_JIT_EH_NOCXA=1 (bisection): skip the __cxa_begin_catch/end_catch in the in-method catch landing pad, to test whether the cxa lifecycle (on nested catch + try re-entry) is the world-load corruption. */
 /* rgctx handling: methods that call a generic-shared callee needing a runtime generic context
  * (cfg->uses_rgctx_reg) route each such call through the interp residual (which derives the
  * context from the concrete inflated call->method — both interp_entry and do_jit_call-via-gsharedvt_out
@@ -351,7 +350,16 @@ int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroi
 int mono_wasm_jit_nce = 1;
 /* MONO_WASM_JIT_RAISE_NOGC: treat raising instructions as non-GC-points in clause-free methods, so
  * SLOTLIVE stops forcing every live ref into the GC frame just because a null check sits between its
- * def and its use. See the argument in wj_ins_is_gcpoint. Default OFF (silent-corruption risk class). */
+ * def and its use. See the argument in wj_ins_is_gcpoint. A LEVEL, not a boolean:
+ *   0 — off (default). A raise is an ordinary GC point everywhere.
+ *   1 — liveness-only. The exemption applies to THIS method's own def/use generations (gc_gen ->
+ *       needs_slot -> sl_elide) and NOT to method_nogc, effective_gcp_count, prior_gcps_are_polls or
+ *       the terminal-vcall handoff, all of which publish "no collection can happen across here" to
+ *       OTHER code — a claim a raise falsifies, since the raise allocates. Strictly more honest than
+ *       level 2, and MEASURED STILL BROKEN (4/4 dead under a 4 MB nursery). That is how we know the
+ *       frame-local half of the argument is the unsound one, not the published half.
+ *   2 — everything, i.e. the original behaviour. MEASURED UNSOUND; see wj_ins_is_gcpoint.
+ * Default OFF (silent-corruption risk class). */
 int mono_wasm_jit_raise_nogc = 0;
 /* MONO_WASM_JIT_NODISPATCH: skip the loop/block/br_table scaffolding for a single-bb, edge-free,
  * clause-free method (see skip_dispatch). Shape-wise it is strictly less code, but the first two
@@ -393,6 +401,12 @@ int mono_wasm_jit_vcall_aot_ic = 1;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-
  * equality / funcref->i32 to compare the slot against the placeholder inline). Still one C boundary per hit
  * vs two + resolve for the helper; a full pure-wasm gate would need __tls_base imported to read the bitmap. */
 int mono_wasm_jit_vcall_inline_ic = 1;
+
+static gboolean
+wj_method_raise_exempt (MonoCompile *cfg)
+{
+	return mono_wasm_jit_raise_nogc && cfg->header->num_clauses == 0;
+}
 
 /* TRUE if `name` is in the comma-separated MONO_WASM_JIT_METHOD list (bring-up targeting). */
 gboolean
@@ -2115,8 +2129,32 @@ wj_exc_id_for_name (const char *en)
 
 #define WJ_EXC_IDS 7
 
+/* The instructions MONO_WASM_JIT_RAISE_NOGC exempts: everything whose only way to reach the collector is
+ * by raising, i.e. by allocating an exception and never returning to this frame. Factored out of
+ * wj_ins_is_gcpoint so the two classes of consumer can disagree about them -- see the level-1 argument
+ * there. OP_CHECK_THIS and OP_[L]DIV/REM are deliberately absent: those are handled elsewhere or raise
+ * through paths this set does not describe. */
 static gboolean
-wj_ins_is_gcpoint (MonoInst *ins, gboolean clause_free)
+wj_ins_is_raise (MonoInst *ins)
+{
+	switch (ins->opcode) {
+	case OP_THROW: case OP_RETHROW:
+	case OP_COND_EXC_EQ: case OP_COND_EXC_NE_UN: case OP_COND_EXC_LT: case OP_COND_EXC_LT_UN:
+	case OP_COND_EXC_GT: case OP_COND_EXC_GT_UN: case OP_COND_EXC_LE: case OP_COND_EXC_LE_UN:
+	case OP_COND_EXC_GE: case OP_COND_EXC_GE_UN:
+	case OP_COND_EXC_IEQ: case OP_COND_EXC_INE_UN: case OP_COND_EXC_ILT: case OP_COND_EXC_ILT_UN:
+	case OP_COND_EXC_IGT: case OP_COND_EXC_IGT_UN: case OP_COND_EXC_ILE: case OP_COND_EXC_ILE_UN:
+	case OP_COND_EXC_IGE: case OP_COND_EXC_IGE_UN:
+	case OP_COND_EXC_OV: case OP_COND_EXC_NO: case OP_COND_EXC_C: case OP_COND_EXC_NC:
+	case OP_COND_EXC_IOV: case OP_COND_EXC_INO: case OP_COND_EXC_IC: case OP_COND_EXC_INC:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+static gboolean
+wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 {
 	/* MONO_WASM_JIT_RAISE_NOGC. A raise is not a GC point in the sense SLOTLIVE cares about.
 	 *
@@ -2137,21 +2175,68 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean clause_free)
 	 *
 	 * This is the one change in this series where a mistake is silent heap corruption rather than a
 	 * crash, so it is default OFF until soaked with REFVERIFY=2 + OBJGUARD=1 + STOREGUARD=1. */
-	if (clause_free && mono_wasm_jit_raise_nogc) {
-		switch (ins->opcode) {
-		case OP_THROW: case OP_RETHROW:
-		case OP_COND_EXC_EQ: case OP_COND_EXC_NE_UN: case OP_COND_EXC_LT: case OP_COND_EXC_LT_UN:
-		case OP_COND_EXC_GT: case OP_COND_EXC_GT_UN: case OP_COND_EXC_LE: case OP_COND_EXC_LE_UN:
-		case OP_COND_EXC_GE: case OP_COND_EXC_GE_UN:
-		case OP_COND_EXC_IEQ: case OP_COND_EXC_INE_UN: case OP_COND_EXC_ILT: case OP_COND_EXC_ILT_UN:
-		case OP_COND_EXC_IGT: case OP_COND_EXC_IGT_UN: case OP_COND_EXC_ILE: case OP_COND_EXC_ILE_UN:
-		case OP_COND_EXC_IGE: case OP_COND_EXC_IGE_UN:
-		case OP_COND_EXC_OV: case OP_COND_EXC_NO: case OP_COND_EXC_C: case OP_COND_EXC_NC:
-		case OP_COND_EXC_IOV: case OP_COND_EXC_INO: case OP_COND_EXC_IC: case OP_COND_EXC_INC:
-			return FALSE;
-		default: break;
-		}
-	}
+	/* MEASURED UNSOUND: this exemption loses references. Keep MONO_WASM_JIT_RAISE_NOGC=0 (the default).
+	 *
+	 * With the nursery shrunk to 4m so that collections are frequent enough to expose it, booting
+	 * ikvmcraft / MCSR Ranked 1.16.1 gives:
+	 *     default (RAISE_NOGC=1)      4/4 boots dead, "unexpected GC filler class" in ~25s
+	 *     MONO_WASM_JIT_RAISE_NOGC=0  0/4
+	 *     MONO_WASM_JIT_SLOTLIVE=0    0/4      (RAISE_NOGC has no effect except through SLOTLIVE)
+	 *     MONO_WASM_JIT_AUTO=0        0/4
+	 *     MONO_WASM_JIT_SLOTZERO=0    3/4      negative control: a different elision knob does NOT help
+	 * MONO_CLASS_GC_FILLER is what sgen refills reclaimed nursery memory with (class-init.c:4227), so
+	 * the receiver really had been collected out from under a live reference.
+	 *
+	 * The blame is the OP_COND_EXC_* arm, not OP_THROW. Dropping only OP_THROW/OP_RETHROW from this
+	 * switch was built and measured and did NOT help (3/4 still dead), which stands to reason: explicit
+	 * throws are rare, whereas the implicit null/bounds/overflow checks are everywhere, so they are what
+	 * actually drives effective_gcp_count down -- and that count gates lazy ref-frame materialization
+	 * (`effective_gcp_count == 1` => lazy_ref_frame) as well as method_nogc. A raise on the taken path
+	 * allocates the exception, which can collect before the lazily materialized frame exists, and then
+	 * nothing in that frame is scannable.
+	 *
+	 * Why this workload and not the jbox2d kernel the series was tuned against: it throws constantly.
+	 * IKVM's class-loading probes alone raise ~8.8k NPEs per boot inside
+	 * sun.misc.URLClassPath.Loader.findResource, each caught by that method's own catch(Exception).
+	 *
+	 * THE FIX (level 1, plus the taken-arm materialization below). Two independent holes were closed:
+	 *
+	 *   a. The "never returns to this frame" argument is about THIS FRAME. It says nothing about
+	 *      method_nogc / effective_gcp_count / prior_gcps_are_polls / terminal_vcall_handoff, which all
+	 *      publish "no collection happens across here" to OTHER code -- the caller that elides a root
+	 *      across a direct call, the handoff that gives its roots to a callee. A raise allocates, so a
+	 *      raising instruction is a collection point for every one of those consumers. Level 1 keeps the
+	 *      exemption only for gc_gen/needs_slot, the one consumer whose question really is frame-local.
+	 *   b. Even frame-locally, the exemption drives effective_gcp_count to 1 and so turns on
+	 *      lazy_ref_frame; a raise reached BEFORE the one real GC point then allocates with no frame
+	 *      materialized, and the slots that do exist are nowhere the collector can see. Every raise site
+	 *      now emits ENSURE_REF_FRAME inside its taken arm (WJ_THROW_BR's shared blocks and LDIV_RAISE),
+	 *      exactly as the conditional safepoint poll already does. The hot not-taken path is unchanged.
+	 *
+	 * Level 2 is the original all-consumers behaviour, retained only so the two can be A/B'd; it must be
+	 * judged on failure rate under GC stress -- not on a clean run with OBJGUARD/STOREGUARD, because
+	 * those disable SLOTLIVE (mini-wasm.c:5218) and therefore cannot exercise it at all.
+	 *
+	 * BOTH LEVELS MEASURED STILL BROKEN (4/4 dead each, 4 MB nursery, against a positive control that
+	 * reproduces on demand). So neither hole above was the cause, and the frame-local exemption -- not
+	 * bumping gc_gen at a raise -- is the unsound part on its own.
+	 *
+	 * MECHANISM (measured): the exemption removes an accidental pin.
+	 * WJ_SL_USE lets a forwarding virtual call's argument skip the used-at-a-GC-point clause (`_fwd`,
+	 * wj_ins_is_pinned_vcall_forward) because the callee is supposed to take ownership of the root.
+	 * Normally the span clause still fires -- a raise counts as a GC point, bumps gc_gen, and the
+	 * argument gets a slot anyway. Exempt the raise and BOTH clauses go quiet: the argument has no slot
+	 * anywhere, and the handoff guarantee is all that is left. It does not hold: every failure lands in
+	 * mini_llvmonly_init_vtable_slot -> resolve_vcall, the PIC MISS path, at the resolve step, on a
+	 * receiver that is already a nursery filler -- before the miss frame has pinned anything.
+	 * Disabling the classification (VCALL_INLINE_IC=0 or VCALL_SHARED_MISS=0) makes level 2 clean.
+	 * Fixed in WJ_SL_USE by honouring `_fwd` only while no raise has been exempted in the current
+	 * generation; see gen_skipped_raises.
+	 *
+	 * The issue is a shared rule rather than a single bad method; see scratchpad/mcsr/FINDINGS.md
+	 * Finding 18 for the measurement record. */
+	if (raise_exempt && wj_ins_is_raise (ins))
+		return FALSE;
 
 	switch (ins->opcode) {
 	/* constants + moves (incl. STACK_OBJ ICONST: a pure literal-table i32.load) */
@@ -2773,9 +2858,24 @@ wj_direct_admitted_fslot (MonoCompile *cfg, MonoInst *ins)
 static gboolean
 wj_ins_is_effective_gcpoint (MonoCompile *cfg, MonoInst *ins)
 {
-	if (!wj_ins_is_gcpoint (ins, cfg->header->num_clauses == 0))
+	if (!wj_ins_is_gcpoint (ins, wj_method_raise_exempt (cfg)))
 		return FALSE;
 	return !wj_fslot_is_nogc (wj_direct_admitted_fslot (cfg, ins));
+}
+
+/* The same classification as seen by the consumers that PUBLISH a no-collection claim outside this
+ * frame -- method_nogc (read by every caller's direct-call admission), effective_gcp_count (gates the
+ * lazy frame), prior_gcps_are_polls and the terminal-vcall handoff. At RAISE_NOGC level 1 a raise counts
+ * here even though it does not count for this method's own def/use generations, because the raise really
+ * does allocate; only the "nothing in THIS frame reads a vreg afterwards" half of the argument survives.
+ * Identical to wj_ins_is_effective_gcpoint at levels 0 and 2. */
+static gboolean
+wj_ins_is_published_gcpoint (MonoCompile *cfg, MonoInst *ins)
+{
+	if (mono_wasm_jit_raise_nogc == 1 && wj_ins_is_raise (ins))
+		return TRUE;   /* no raise opcode is a call, so the direct-callee resolution cannot apply */
+	/* level 2 with the shard knob: a method the shard excluded gets the honest answer from below. */
+	return wj_ins_is_effective_gcpoint (cfg, ins);
 }
 
 /*
@@ -4169,6 +4269,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	WasmEhTable *eh_table = NULL;      /* in-method EH clause table (built below, baked into the catch landing pad) */
 	gboolean eh_on = FALSE;            /* TRUE: emit the in-method try/catch wrapper for this method */
 	int eh_dispatch_ti = -1, eh_endcatch_ti = -1;  /* functype indices: (i32,i32)->i32 dispatch + ()->void end_catch */
+	int resid_void_ti = -1;            /* ()->void: mono_wasm_jit_continue_unwind. Registered UNCONDITIONALLY --
+	                                    * the residual/vcall/delegate threw==1 sites occur in non-EH methods too,
+	                                    * where eh_endcatch_ti is never set up. */
 	int nrefslots = 0;                 /* number of reference vregs routed to the GC ref shadow stack */
 	/* MONO_WASM_JIT_SLOTZERO: dead-slot kill chains, built by the SLOTLIVE walk (classifier block) and
 	 * consumed by the emit loop below. Both iterate the identical bb/ins sequence, so a plain running
@@ -4268,10 +4371,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	}
 #endif /* !HOST_BROWSER (offline IR dump) */
 	if (cfg->header && cfg->header->num_clauses > 0) {
-		/* in-method EH lowering (native wasm-EH) is always attempted for clause-bearing methods. */
-		/* bisection: MONO_WASM_JIT_EH_ONLY=<substr> emits the in-method wrapper only for methods whose full
-		 * name contains <substr> (others bail like EH=0) — to pin down which EH method corrupts world load. */
-		{ char *_o = g_getenv ("MONO_WASM_JIT_EH_ONLY"); gboolean _skip = _o && *_o && (!mname || !strstr (mname, _o)); if (_o) g_free (_o); if (_skip) { fail = "eh-only filter"; goto done; } }
 		{ guint _ci;   /* in-method EH clauses always propagate via C++/wasm-EH (cppeh is the only model) */
 		  /* Supported native wasm-EH clauses: catch (NONE), finally (FINALLY, including Java
 		   * try-with-resources), and fault (FAULT). Filters still bail to the interpreter. */
@@ -5237,6 +5336,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				MonoInst *last_gcp_ins = NULL;
 				int bbn, nelide = 0, ord = 0, last_gcp_ord = -1;
 				gboolean sl_has_backedge = FALSE, prior_gcps_are_polls = TRUE;
+				/* Raises the exemption hid anywhere in this method. The terminal-vcall handoff below is
+				 * only sound while this is zero -- see there. */
+				int method_skipped_raises = 0;
 				for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb)
 					nbbs++;
 				bb_last_gcp = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nbbs ? nbbs : 1));
@@ -5281,10 +5383,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				bbn = 0;
 				for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
 					int gc_gen = 0;
+					/* Raises exempted since the current generation began. A forwarded call argument may
+					 * only skip the used-at-a-GC-point clause below while this is zero -- see there. */
+					int gen_skipped_raises = 0;
 					MONO_BB_FOR_EACH_INS (bbl, insl) {
 						int srcs [MONO_MAX_SRC_REGS];
 						int nsrc = mono_inst_get_src_registers (insl, srcs);
+						/* Two views, identical unless RAISE_NOGC==1 (see wj_ins_is_published_gcpoint):
+						 * `gcp` drives this method's own def/use generations, `gcp_pub` drives every
+						 * claim published to other code. */
 						gboolean gcp = wj_ins_is_effective_gcpoint (cfg, insl);
+						gboolean gcp_pub = wj_ins_is_published_gcpoint (cfg, insl);
 						gboolean pinned_vforward = gcp && wj_ins_is_pinned_vcall_forward (insl);
 						gboolean forward_call = gcp &&
 							(wj_direct_admitted_fslot (cfg, insl) > 0 || pinned_vforward);
@@ -5292,7 +5401,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						WjCallArgs *sl_cw = sl_call ? (WjCallArgs *) sl_call->call_info : NULL;
 						gboolean dreg_is_base = FALSE;
 						int u, d;
-						if (gcp) {
+						if (gcp_pub) {
 							method_nogc = FALSE;
 							effective_gcp_count++;
 							if (last_gcp_ins && last_gcp_ins->opcode != OP_GC_SAFE_POINT)
@@ -5312,7 +5421,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		if (ev_bb [_u] == -1) { ev_bb [_u] = bbn; needs_slot [_u] = TRUE; } /* use before any def (loop-carried) */ \
 		else if (ev_bb [_u] != bbn) { sl_multi [_u] = 1; needs_slot [_u] = TRUE; } \
 		else if (def_gen [_u] != gc_gen) needs_slot [_u] = TRUE; \
-		else if (gcp && !_fwd) needs_slot [_u] = TRUE; \
+		/* `_fwd` lets a forwarding call's argument skip this clause because the callee is supposed to
+		 * take ownership of the root (wj_ins_is_pinned_vcall_forward). That leaves the argument with NO
+		 * slot at all -- which was survivable only by accident: without the raise exemption a raise in
+		 * the span bumps gc_gen, the clause above fires, and the argument gets pinned anyway. With the
+		 * exemption both clauses go quiet and the handoff guarantee is the only thing left, and the
+		 * measured crash (always mini_llvmonly_init_vtable_slot -> resolve_vcall on a filler-class
+		 * receiver) says it does not hold on the PIC miss path. So honour `_fwd` only when no raise was
+		 * skipped in this generation. */ \
+		else if (gcp && (!_fwd || gen_skipped_raises > 0)) needs_slot [_u] = TRUE; \
 		last_use_ord [_u] = ord; \
 	} } while (0)
 						for (u = 0; u < nsrc; ++u) {
@@ -5338,7 +5455,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #undef WJ_SL_USE
 						if (gcp) {
 							gc_gen++;
+							gen_skipped_raises = 0;   /* a real GC point starts a new generation */
 							bb_last_gcp [bbn] = ord;
+						} else if (wj_ins_is_raise (insl)) {
+							gen_skipped_raises++;     /* exempted raise: the accidental pinning is gone */
+							method_skipped_raises++;
 						}
 						/* def AFTER the bump: a call result belongs to the post-call generation */
 						d = dreg_is_base ? -1 : insl->dreg;
@@ -5357,7 +5478,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * or owns a root in the callee/miss frame. Earlier effective points are allowed only
 				 * when they are conditional polls; those materialize and release the caller frame
 				 * entirely inside their taken arms. */
-				if (cfg->header->num_clauses == 0 && last_gcp_ins &&
+				/* MEASURED: this handoff is the RAISE_NOGC corruption path. Its third arm in sl_elide
+				 * below drops a reference's frame slot WITHOUT consulting needs_slot at all, so nothing
+				 * in the liveness walk can restrain it -- and its enabling condition,
+				 * effective_gcp_count == 1, is exactly what the raise exemption manufactures (a method
+				 * with one real call and any number of null checks now looks single-GC-point). The
+				 * references it drops are then unpinned for the whole method, and the claim that they
+				 * "own a root in the callee/miss frame" is the same promise the PIC miss path breaks:
+				 * every failure lands in mini_llvmonly_init_vtable_slot -> resolve_vcall on a receiver
+				 * already reclaimed. Disabling wj_ins_is_pinned_vcall_forward outright (SHARED_MISS=0)
+				 * is clean 0/4 against a 4/4 control; gating only the `_fwd` skip in WJ_SL_USE changed
+				 * nothing (3/4 vs 2/4), which is what pins it to THIS consumer. So: no handoff in a
+				 * method where the exemption hid a raise. */
+				if (cfg->header->num_clauses == 0 && last_gcp_ins && method_skipped_raises == 0 &&
 				    wj_ins_is_pinned_vcall_forward (last_gcp_ins) && !sl_has_backedge) {
 					gboolean all_pre_refs_die = TRUE;
 					terminal_vcall_ins = last_gcp_ins;
@@ -5629,15 +5762,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define BINI64L(WOP) do { if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "imm sreg"; goto done; } wasm_i64_const (&body, (gint64) ins->inst_l); wasm_op (&body, (WOP)); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "imm dreg"; goto done; } } while (0)
 /* Raise a corlib exception (by id; see OP_COND_EXC's exc_id map) from inside an `if`, then leave the method
  * — used by the inline OP_LDIV/OP_LREM div-by-zero/overflow guards (wasm32's decompose omits them for the
- * long opcodes). cppeh: the raise C++-throws and never returns (unreachable). resume-state: dummy ret +
- * ref/addr-frame leave + return, mirroring OP_COND_EXC. `ldiv_rti` (the (i32)->void functype index) must be
- * in scope. */
+ * long opcodes). cppeh: the raise C++-throws and never returns (unreachable). `ldiv_rti` (the (i32)->void
+ * functype index) must be in scope. Both uses sit inside an `if` arm, so the ENSURE_REF_FRAME here costs
+ * the hot path nothing; see the shared throw blocks for why a raise needs a materialized frame. */
 #ifdef HOST_BROWSER
 #define LDIV_RAISE_FPTR() do { extern void mono_wasm_jit_raise_corlib (int exc_id); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_raise_corlib); } while (0)
 #else
 #define LDIV_RAISE_FPTR() wasm_i32_const (&body, 0x7ff8)
 #endif
 #define LDIV_RAISE(EXC_ID) do { \
+		RAISE_ENSURE_REF_FRAME ();   /* raise_corlib allocates: roots must be scannable. Taken arm only. */ \
 		wasm_i32_const (&body, (EXC_ID)); \
 		LDIV_RAISE_FPTR (); \
 		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ldiv_rti); wasm_uleb (&body, 0); \
@@ -5663,6 +5797,37 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * return: a popped frame falls below the SP and stops being GC-scanned — no zeroing needed. The
  * global.set consumes only entry_sp, so it leaves any return value on the stack. No-op for
  * frame-less methods. */
+/* A residual/vcall/delegate callee reported threw==1: CONTINUE THE NATIVE UNWIND, never return.
+ *
+ * The boundary (mono_wasm_jit_invoke_caught) has already caught the C++ unwind and, for a handler in a
+ * JITted island above us, deliberately keeps the exception armed in the interp resume state. Returning
+ * normally here loses the exceptional edge: this frame's own landing pad is skipped, its JIT caller runs
+ * on unaware, and the exception surfaces later at an unrelated frame (see FINDINGS Finding 15).
+ *
+ * Deliberately NO EMIT_REF_LEAVE() before the call. If this method has a matching handler, its landing
+ * pad needs the frame and island still live; the pad restores __stack_pointer to its own refbase itself
+ * (REF-SP-1). If it has no match, its pad does leave_island + rethrow, a non-EH frame is simply torn
+ * through, and the next outer pad -- or the interp boundary's saved SP -- does the restore. Popping the
+ * roots here would strip them before this method's own catch/finally gets control.
+ *
+ * No dummy return value either: `unreachable` makes the rest of the block polymorphic, so the void
+ * blocktype validates without one. */
+#define EMIT_RESIDUAL_THROW_CONTINUATION() do { \
+		g_assert (resid_void_ti >= 0); \
+		WJ_EMIT_CONTINUE_UNWIND_ADDR (); \
+		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) resid_void_ti); wasm_uleb (&body, 0); \
+		wasm_op (&body, WASM_OP_UNREACHABLE); \
+	} while (0)
+
+#ifdef HOST_BROWSER
+#define WJ_EMIT_CONTINUE_UNWIND_ADDR() do { \
+		extern void mono_wasm_jit_continue_unwind (void); \
+		wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_continue_unwind); \
+	} while (0)
+#else
+#define WJ_EMIT_CONTINUE_UNWIND_ADDR() do { wasm_i32_const (&body, 0x7ff8); } while (0)
+#endif
+
 #ifdef HOST_BROWSER
 #define EMIT_REF_LEAVE() do { if (framebytes > 0) { \
 		if (lazy_ref_frame) { \
@@ -5731,6 +5896,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #else
 #define RELEASE_LAZY_REF_FRAME() do { } while (0)
 #endif
+
+/* Materialize before a call that C++-throws, so exception allocation cannot run while this method's
+ * roots live only in wasm locals. */
+#define RAISE_ENSURE_REF_FRAME() ENSURE_REF_FRAME ()
 
 
 	/* MONO_WASM_JIT_NCE: per-bb "already proven non-null" vreg bitmap (see the flag's comment).
@@ -5896,6 +6065,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	if (eh_on) {
 		guint _ci; int _d;
 		eh_table = (WasmEhTable *) g_malloc0 (sizeof (WasmEhTable));
+		eh_table->method = cfg->method;
 		eh_table->name = mname ? g_strdup (mname) : NULL;   /* diagnostics */
 		eh_table->nbbs = N;
 		eh_table->nclauses = (gint32) cfg->header->num_clauses;
@@ -6057,6 +6227,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * landing pad maps the throwing bb ($blk) -> a handler bb (set $blk + br $outer to re-dispatch) or
 	 * rethrows. The inner dispatch + all GOTO depths are UNCHANGED — outer-loop/try sit ABOVE the inner
 	 * loop, so a GOTO's depth to the inner loop is unaffected. */
+	{
+		/* ()->void for mono_wasm_jit_continue_unwind. Registered for every method, not just eh_on ones:
+		 * a non-EH JIT frame must ALSO continue the unwind rather than return, otherwise it is skipped
+		 * and the exception is delivered late at an unrelated frame. functype_eq dedups, so an eh_on
+		 * method shares this entry with eh_endcatch_ti. */
+		WasmFuncType _t; int _k;
+		memset (&_t, 0, sizeof _t); _t.nparams = 0; _t.ret = WASM_VOID;
+		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { resid_void_ti = ti_base + _k; break; }
+		if (resid_void_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; resid_void_ti = ti_base + nextra++; }
+	}
 	if (eh_on) {
 		WasmFuncType _t; int _k;
 		/* (i32)->void: the x.e tag type AND mono_jiterp_begin_catch */
@@ -6268,9 +6448,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		} \
 	} while (0)
 
-	/* MONO_WASM_JIT_BBTRACE=<substr>: per-bb runtime $blk trace for a matching EH method (debug only). */
-	gboolean eh_bbtrace = FALSE;
-	{ char *_bbt = g_getenv ("MONO_WASM_JIT_BBTRACE"); if (_bbt) { eh_bbtrace = *_bbt && eh_on && mname && strstr (mname, _bbt); g_free (_bbt); } }
 #ifdef HOST_BROWSER
 	/* Islands (residual=0): enumerate the full un-JITted-callee blocker set up front so the auto-JIT trigger
 	 * forms the whole island in ONE emit cycle (see wj_prescan_blockers). No-op under residual!=0. */
@@ -6331,15 +6508,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		}
 
 #ifdef HOST_BROWSER
-		/* bbtrace: log this bb's dense index at runtime (reuses the (i32,i32)->i32 dispatch functype + drop) */
-		if (eh_bbtrace) {
-			extern int mono_wasm_jit_bbtrace_log (WasmEhTable *t, int blk);
-			wasm_i32_const (&body, (gint32) (intptr_t) eh_table);
-			wasm_i32_const (&body, i);
-			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_bbtrace_log);
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_dispatch_ti); wasm_uleb (&body, 0);
-			wasm_op (&body, WASM_OP_DROP);
-		}
 		/* AOT-style in-method EH (milestone 2b): record this bb's IL offset into the active island il_state
 		 * (pushed at the interp->JIT boundary) so mono's exception pass-1 matches THIS method's enclosing
 		 * try and finds its catch as the NEAREST handler for a throwing AOT callee — stopping the walk here
@@ -6961,7 +7129,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			case OP_CHECK_THIS: {
 				/* Null check: if sreg1 is null, raise a CATCHABLE NullReferenceException, mirroring OP_COND_EXC
 				 * — NOT a raw wasm trap. address 0 is valid in wasm linear memory, so a skipped check silently
-				 * corrupts low memory; and EH methods now compile (MONO_WASM_JIT_EH), so a null this/deref inside
+				 * corrupts low memory; and EH methods now compile, so a null this/deref inside
 				 * a try must reach managed EH/finally rather than `unreachable`. Hot path = ld + eqz + not-taken
 				 * branch; cold path raises NRE (exc_id 4) then C++-unwinds (cppeh) or bails to interp resume-state. */
 				if (NN_GET (ins->sreg1)) break;   /* NCE: already proven non-null earlier in this bb */
@@ -7267,6 +7435,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * the wasm stack unwinds natively to the nearest landing pad (an in-method catch, or the interp
 				 * e-thunk boundary). Unconditional bb terminator -> mark terminated. */
 				WasmFuncType tt; int tti = -1, tk;
+				/* mono_wasm_jit_throw captures a stack trace, i.e. it allocates. The thrown object
+				 * itself lives in a wasm local until this point, so a lazy frame has to exist before
+				 * the call -- same reason as the shared raise blocks below. (RETHROW implies eh_on,
+				 * where lazy frames are off and this expands to nothing.) */
+				RAISE_ENSURE_REF_FRAME ();
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "throw sreg"; goto done; }
 				memset (&tt, 0, sizeof (tt)); tt.params [0] = WASM_I32; tt.nparams = 1; tt.ret = WASM_VOID;
 				for (tk = 0; tk < nextra; ++tk) if (functype_eq (&extra_types [tk], &tt)) { tti = ti_base + tk; break; }
@@ -7854,19 +8027,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 					wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_call_interp);
 					wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) tii); wasm_uleb (&body, 0);
-					/* call_interp returns 1 if the callee threw: the result slot is stale, so abort this
-					 * method now (return a dummy of its return type). The interp sees the resume-state
-					 * after the e-thunk returns and unwinds via `goto resume`. */
+					/* call_interp returns 1 if the callee threw: the result slot is stale AND an exception
+					 * is armed. Continue the native unwind (never a normal return -- that skipped this
+					 * frame's own landing pad and delivered the exception late; FINDINGS Finding 15). */
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-					switch (ret_vt) {
-					case WASM_I32: wasm_i32_const (&body, 0); break;
-					case WASM_I64: wasm_i64_const (&body, 0); break;
-					case WASM_F32: wasm_f32_const (&body, 0); break;
-					case WASM_F64: wasm_f64_const (&body, 0); break;
-					default: break; /* void: return nothing */
-					}
-					EMIT_REF_LEAVE ();
-					wasm_op (&body, WASM_OP_RETURN);
+					/* threw: continue the native unwind; do NOT return and do NOT pop roots first. */
+					EMIT_RESIDUAL_THROW_CONTINUATION ();
 					wasm_op (&body, WASM_OP_END);
 					if (ct.ret != WASM_VOID) {
 						WasmOpcode lop; int al;
@@ -8845,18 +9011,11 @@ vcall_cold_miss_emit:
 #endif
 							wasm_op (&body, WASM_OP_END);
 							wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) vtdi); wasm_uleb (&body, 0);
-							/* call_interp returns 1 if the vcall fallback threw. Abort immediately instead of
-							 * reading the stale scratch result; mirrors the direct residual path exactly. */
+							/* call_interp returns 1 if the vcall fallback threw. Continue the native unwind
+							 * instead of reading the stale scratch result; mirrors the direct residual path. */
 							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-								switch (ret_vt) {
-								case WASM_I32: wasm_i32_const (&body, 0); break;
-								case WASM_I64: wasm_i64_const (&body, 0); break;
-								case WASM_F32: wasm_f32_const (&body, 0); break;
-								case WASM_F64: wasm_f64_const (&body, 0); break;
-								default: break;
-								}
-								EMIT_REF_LEAVE ();
-								wasm_op (&body, WASM_OP_RETURN);
+								/* threw: continue the native unwind; do NOT return and do NOT pop roots first. */
+								EMIT_RESIDUAL_THROW_CONTINUATION ();
 							wasm_op (&body, WASM_OP_END);
 							if (is_delegate_invoke)
 								wasm_op (&body, WASM_OP_END); /* $delegate_done */
@@ -9008,15 +9167,8 @@ vcall_cold_miss_emit:
 								wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) rlti); wasm_uleb (&body, 0);
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
 								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-									switch (ret_vt) {
-									case WASM_I32: wasm_i32_const (&body, 0); break;
-									case WASM_I64: wasm_i64_const (&body, 0); break;
-									case WASM_F32: wasm_f32_const (&body, 0); break;
-									case WASM_F64: wasm_f64_const (&body, 0); break;
-									default: break;
-									}
-									EMIT_REF_LEAVE ();
-									wasm_op (&body, WASM_OP_RETURN);
+									/* threw: continue the native unwind; do NOT return and do NOT pop roots first. */
+									EMIT_RESIDUAL_THROW_CONTINUATION ();
 								wasm_op (&body, WASM_OP_END);
 							}
 							}
@@ -9127,7 +9279,15 @@ vcall_cold_miss_emit:
 
 	/* Shared raise sites, innermost first: close throw[t], then emit its one call to
 	 * mono_wasm_jit_raise_corlib. Only reachable via `br_if $throw_t`, since the dispatch loop above
-	 * never falls through and every raise ends in `unreachable`. */
+	 * never falls through and every raise ends in `unreachable`.
+	 *
+	 * Each block materializes the lazy ref frame first. mono_wasm_jit_raise_corlib ALLOCATES (the
+	 * exception object, its stack trace), so a collection can happen here, and with lazy_ref_frame the
+	 * method's roots may still be nowhere but unscannable wasm locals -- exactly the MONO_WASM_JIT_RAISE_NOGC
+	 * corruption documented at wj_ins_is_gcpoint. This is the same shape as the conditional safepoint
+	 * poll: materialize inside the rare taken arm, leaving the hot not-taken path frame-free. No
+	 * RELEASE_LAZY_REF_FRAME follows, because the raise never returns; the C-stack SP is resynced from
+	 * the boundary snapshot in mono_wasm_jit_invoke_caught's thrown path. */
 	if (nthrow > 0) {
 		WasmFuncType st; int sti = -1, sk, eid;
 		memset (&st, 0, sizeof (st)); st.params [0] = WASM_I32; st.nparams = 1; st.ret = WASM_VOID;
@@ -9142,6 +9302,7 @@ vcall_cold_miss_emit:
 			for (sk = 0; sk < WJ_EXC_IDS; ++sk) if (wj_throw_slot [sk] == i) { eid = sk; break; }
 			if (eid < 0) { fail = "throw slot without exc id"; goto done; }
 			wasm_op (&body, WASM_OP_END);   /* close throw[i]; br_if $throw_i lands here */
+			RAISE_ENSURE_REF_FRAME ();
 			wasm_i32_const (&body, eid);
 #ifdef HOST_BROWSER
 			{ extern void mono_wasm_jit_raise_corlib (int exc_id); wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_raise_corlib); }
@@ -9186,8 +9347,6 @@ vcall_cold_miss_emit:
 		wasm_op (&body, WASM_OP_RETHROW); wasm_uleb (&body, 1); /* depth 1 = the enclosing try -> re-propagate */
 		wasm_op (&body, WASM_OP_END);                          /* end if */
 		/* matched: claim+release the C++ exception (balance the cxa handler count), then dispatch. */
-		{ extern int mono_wasm_jit_eh_nocxa;
-		if (!mono_wasm_jit_eh_nocxa) {   /* MONO_WASM_JIT_EH_NOCXA=1 skips the cxa claim (bisection) */
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_exc_idx);
 #ifdef HOST_BROWSER
 		{ extern void mono_jiterp_begin_catch (void *e); wasm_i32_const (&body, (gint32) (intptr_t) mono_jiterp_begin_catch); }
@@ -9201,7 +9360,6 @@ vcall_cold_miss_emit:
 		wasm_i32_const (&body, 0x7ff3);
 #endif
 		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0);   /* ()->void */
-		} }
 		/* REF-SP-1: restore __stack_pointer to THIS method's frame base before re-dispatching into the
 		 * handler. A C++/wasm-EH unwind into this catch skipped the EMIT_REF_LEAVE of every JITted frame
 		 * it tore through (nested non-EH callees, and EH callees that escaped via their own h<0 rethrow),
