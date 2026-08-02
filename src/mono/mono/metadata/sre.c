@@ -3680,28 +3680,55 @@ mono_reflection_get_dynamic_overrides (MonoClass *klass, MonoMethod ***overrides
 	*num_overrides = onum;
 }
 
+/*
+ * DEADLOCK WARNING: this takes the ModuleBuilder's MANAGED monitor, the same one
+ * RuntimeModuleBuilder.Mono.cs takes with `lock (this)` in a dozen places (GetNextTableIndex itself is one
+ * of them, and it touches the very same table_indexes array, so the sharing is required and this monitor
+ * cannot be swapped for a private one).
+ *
+ * Managed callers hold that monitor and then re-enter the runtime through icalls that take the loader
+ * lock, i.e. their order is  module monitor -> loader lock.  Anything on the C side that takes this
+ * monitor while ALREADY holding the loader lock therefore closes a cycle:
+ *
+ *   thread A: ves_icall_TypeBuilder_create_runtime_class -> mono_loader_lock -> [this] -> wants lock(mb)
+ *   thread B: RuntimeModuleBuilder.<anything> -> lock(this) -> icall -> wants mono_loader_lock
+ *
+ * Observed as a hard hang with 6 threads queued on mono_loader_lock (mono_vtable_alloc_slots,
+ * mono_class_create_from_typedef via interp_get_method and via tier_up_method) behind one thread parked in
+ * mono_monitor_enter_internal inside create_runtime_class. See scratchpad/mcsr/FINDINGS.md Finding 4b.
+ *
+ * So: CALL THIS WITHOUT THE LOADER LOCK HELD. (There is no cheap assert for that here --
+ * mono_loader_lock_is_owned_by_self() itself asserts that mono_loader_lock_track_ownership() was enabled,
+ * and it is off by default.)
+ */
 static gint32
-modulebuilder_get_next_table_index (MonoReflectionModuleBuilder *mb, gint32 table, gint32 num_fields, MonoError *error)
+modulebuilder_get_next_table_index (MonoReflectionModuleBuilderHandle mb, gint32 table, gint32 num_fields, MonoError *error)
 {
-	error_init (error);
-	mono_monitor_enter_internal ((MonoObject *) mb);
+	HANDLE_FUNCTION_ENTER ();
+	MonoArrayHandle table_indexes = MONO_HANDLE_NEW (MonoArray, NULL);
+	gint32 index = 0;
 
-	if (mb->table_indexes == NULL) {
-		MonoArray *arr = mono_array_new_checked (mono_defaults.int_class, 64, error);
+	error_init (error);
+	mono_monitor_enter_internal ((MonoObject *) MONO_HANDLE_RAW (mb));
+
+	MONO_HANDLE_GET (table_indexes, mb, table_indexes);
+	if (MONO_HANDLE_IS_NULL (table_indexes)) {
+		MonoArrayHandle arr = mono_array_new_handle (mono_defaults.int_class, 64, error);
 		if (!is_ok (error)) {
-			mono_monitor_exit_internal ((MonoObject *) mb);
-			return 0;
+			mono_monitor_exit_internal ((MonoObject *) MONO_HANDLE_RAW (mb));
+			goto leave;
 		}
-		for (int i = 0; i < 64; i++) {
-			mono_array_set_internal (arr, int, i, 1);
-		}
-		MONO_OBJECT_SETREF_INTERNAL (mb, table_indexes, arr);
+		for (int i = 0; i < 64; i++)
+			MONO_HANDLE_ARRAY_SETVAL (arr, gint32, i, 1);
+		MONO_HANDLE_SET (mb, table_indexes, arr);
+		MONO_HANDLE_ASSIGN (table_indexes, arr);
 	}
-	gint32 index = mono_array_get_internal (mb->table_indexes, gint32, table);
+	MONO_HANDLE_ARRAY_GETVAL (index, table_indexes, gint32, table);
 	gint32 next_index = index + num_fields;
-	mono_array_set_internal (mb->table_indexes, gint32, table, next_index);
-	mono_monitor_exit_internal ((MonoObject *) mb);
-	return index;
+	MONO_HANDLE_ARRAY_SETVAL (table_indexes, gint32, table, next_index);
+	mono_monitor_exit_internal ((MonoObject *) MONO_HANDLE_RAW (mb));
+leave:
+	HANDLE_FUNCTION_RETURN_VAL (index);
 }
 
 static void
@@ -3799,8 +3826,12 @@ leave:
 
 /* This initializes the same data as mono_class_setup_fields () */
 static void
-typebuilder_setup_fields (MonoClass *klass, MonoError *error)
+typebuilder_setup_fields (MonoClass *klass, gint32 first_idx, MonoError *error)
 {
+	/* first_idx is allocated by the CALLER, before it takes the loader lock: allocating it here would
+	 * mean entering the ModuleBuilder's managed monitor while holding the loader lock, which deadlocks
+	 * against managed `lock (this)` regions that take the loader lock via icalls. See the comment on
+	 * modulebuilder_get_next_table_index. 0 means "this type has no fields". */
 	MonoReflectionTypeBuilder *tb = mono_class_get_ref_info_raw (klass); /* FIXME use handles */
 	MonoFieldDefaultValue *def_values;
 	MonoImage *image = klass->image;
@@ -3819,11 +3850,6 @@ typebuilder_setup_fields (MonoClass *klass, MonoError *error)
 	int fcount = tb->num_fields;
 	mono_class_set_field_count (klass, fcount);
 
-	gint32 first_idx = 0;
-	if (tb->num_fields > 0) {
-		first_idx = modulebuilder_get_next_table_index (tb->module, MONO_TABLE_FIELD, (gint32)tb->num_fields, error);
-		return_if_nok (error);
-	}
 	mono_class_set_first_field_idx (klass, first_idx - 1); /* Why do we subtract 1? because mono_class_create_from_typedef does it, too. */
 
 	if (tb->class_size) {
@@ -4108,6 +4134,39 @@ ves_icall_TypeBuilder_create_runtime_class (MonoReflectionTypeBuilderHandle ref_
 	MonoArrayHandle cattrs = MONO_HANDLE_NEW_GET (MonoArray, ref_tb, cattrs);
 	mono_save_custom_attrs (klass->image, klass, MONO_HANDLE_RAW (cattrs)); /* FIXME use handles */
 
+	/*
+	 * Reserve the field-table range BEFORE taking the loader lock.
+	 *
+	 * typebuilder_setup_fields() used to do this itself, deep inside the loader-locked region below, and
+	 * it enters the ModuleBuilder's MANAGED monitor to do it. Managed code takes that same monitor with
+	 * `lock (this)` and then calls icalls that take the loader lock, so doing it under the loader lock
+	 * closes a cycle and hangs the process:
+	 *
+	 *   this thread : mono_loader_lock -> ... -> wants lock(ModuleBuilder)
+	 *   other thread: lock(ModuleBuilder) -> icall -> wants mono_loader_lock
+	 *
+	 * Hoisting it here is enough because this is the only place SRE takes a managed monitor from C.
+	 * Establishing the reverse order (monitor before loader lock) would also work but would serialise the
+	 * whole of CreateType on one ModuleBuilder, which matters when many types are defined concurrently.
+	 *
+	 * The wastypebuilder pre-check mirrors the authoritative one under the lock: it only avoids burning a
+	 * range for a type that is already created. Losing that race costs an unused range, never correctness,
+	 * because each type gets its own contiguous block.
+	 */
+	gint32 field_first_idx = 0;
+	{
+		/* num_fields via GETVAL and the module kept in a HANDLE: modulebuilder_get_next_table_index
+		 * allocates (mono_array_new_handle) on the first call for a module, so a raw MonoObject* held
+		 * across it can move. The old call site passed tb->module raw and was already marked
+		 * "FIXME use handles"; do not reintroduce that here. */
+		int num_fields = MONO_HANDLE_GETVAL (ref_tb, num_fields);
+		if (!klass->wastypebuilder && num_fields > 0) {
+			MonoReflectionModuleBuilderHandle ref_module = MONO_HANDLE_NEW_GET (MonoReflectionModuleBuilder, ref_tb, module);
+			field_first_idx = modulebuilder_get_next_table_index (ref_module, MONO_TABLE_FIELD, (gint32)num_fields, error);
+			return_val_if_nok (error, MONO_HANDLE_CAST (MonoReflectionType, NULL_HANDLE));
+		}
+	}
+
 	mono_loader_lock ();
 
 	if (klass->wastypebuilder) {
@@ -4186,7 +4245,7 @@ ves_icall_TypeBuilder_create_runtime_class (MonoReflectionTypeBuilderHandle ref_
 
 	klass->nested_classes_inited = TRUE;
 
-	typebuilder_setup_fields (klass, error);
+	typebuilder_setup_fields (klass, field_first_idx, error);
 	goto_if_nok (error, failure);
 	typebuilder_refresh_runtime_vtable_gc_state (klass);
 	typebuilder_setup_properties (klass, error);

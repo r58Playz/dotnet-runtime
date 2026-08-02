@@ -1217,6 +1217,15 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 		mono_memory_barrier ();
 		wj_vcall_pic_cap = ncap;
 	}
+	{
+		/* Bounds invariant the generated code relies on but cannot check. If this ever fires, the inline
+		 * load at base + site_id*stride would have read past the array -- catching it here names the site
+		 * instead of leaving an opaque wasm trap. */
+		gsize off = (gsize) site->site_id * mono_wasm_jit_vcall_ways;
+		gsize lim = (gsize) wj_vcall_pic_cap * mono_wasm_jit_vcall_ways;
+		if (G_UNLIKELY (!wj_vcall_pic || off + mono_wasm_jit_vcall_ways > lim))
+			return NULL;
+	}
 	return wj_vcall_pic + (gsize) site->site_id * mono_wasm_jit_vcall_ways;
 }
 
@@ -1228,6 +1237,10 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 	guint64 pair = ((guint64) (guint32) fslot << 32) | (guint32) (gsize) vt;
 	int k, victim = 0;
 	guint32 least = 0xffffffffu;
+
+	/* Publishing is a pure optimisation, so skipping a failed bounds invariant is always safe. */
+	if (G_UNLIKELY (!p))
+		return;
 
 	/* Refresh an existing receiver in place. Otherwise prefer an empty way, then replace the least
 	 * frequent target. This is steadier than cross-thread LRU and preserves V8's monomorphic feedback
@@ -4595,8 +4608,9 @@ interp_runtime_invoke (MonoMethod *method, void *obj, void **params, MonoObject 
 		 * This can happen on wasm where native frames cannot be skipped during EH.
 		 * EH processing will continue when control returns to the interpreter.
 		 */
-		if (mono_aot_mode == MONO_AOT_MODE_LLVMONLY_INTERP)
+		if (mono_aot_mode == MONO_AOT_MODE_LLVMONLY_INTERP) {
 			mono_llvm_start_native_unwind ();
+		}
 		return NULL;
 	}
 	// The return value is at the bottom of the stack
@@ -6479,8 +6493,32 @@ wasm_jit_cpp_unwind (MonoObject *exc)
 	 * can load it (mini_llvmonly_load_exception) for the type check + OP_GET_EX_OBJ. pass 1 set only the
 	 * interp/il_state resume-state (for an OUTER handler), not thrown_exc. */
 	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
-	if (!jit_tls->thrown_exc)
+	/* Install THIS exception, not merely "one if none is recorded".
+	 *
+	 * The old `if (!thrown_exc)` guard exists for RE-throws: endfinally_rethrow sets thrown_exc = h and
+	 * then rethrows the same object, and pass 1 is meant to reuse that handle rather than double-root it.
+	 * But the guard cannot tell a re-throw of the SAME object from a NEW throw arriving while a stale
+	 * handle lingers -- and a stale handle is reachable, because only a JIT landing pad clears
+	 * thrown_exc. An exception that unwinds out of JIT code and is caught by an INTERPRETED or AOT frame
+	 * leaves it set forever. The next throw from JIT code then keeps the OLD exception, so every landing
+	 * pad loads and TYPE-MATCHES the wrong object.
+	 *
+	 * That is what the field evidence shows: an exception reported as OffThreadException unwinding out of
+	 * LocalChannel.doBeginRead's `inboundBuffer.isEmpty()` (IL 22, confirmed genuine by the bb-header
+	 * execution trail), a call that cannot raise it, on netty's read cycle where channelRead0 -- the only
+	 * thing that throws OffThreadException -- does not even appear on the stack.
+	 *
+	 * Comparing the target object keeps the re-throw optimisation exact while replacing a stale handle. */
+	if (jit_tls->thrown_exc) {
+		MonoObject *cur = mono_gchandle_get_target_internal (jit_tls->thrown_exc);
+		if (cur != exc) {
+			/* Retarget in place: unlike free+new this cannot expose raw EXC across a handle allocation,
+			 * and it preserves the established pinned-handle reuse discipline used by the other writers. */
+			mono_gchandle_set_target (jit_tls->thrown_exc, exc);
+		}
+	} else {
 		jit_tls->thrown_exc = mono_gchandle_new_internal (exc, TRUE);
+	}
 	mono_llvm_start_native_unwind ();
 	g_assert_not_reached ();   /* the C++ throw above does not return */
 }
@@ -6813,6 +6851,37 @@ wj_finally_trim (int baseline)
 	}
 }
 
+/*
+ * mono_wasm_jit_continue_unwind:
+ *
+ *   Called from JITted code when a residual/vcall/delegate callee reported threw==1. Its ONLY job is to
+ * resume the native unwind that is already armed.
+ *
+ * The emitted code used to treat "abort" as a plain wasm RETURN, which loses the exceptional control-flow
+ * edge: the boundary (mono_wasm_jit_invoke_caught) has caught the C++ unwind and deliberately KEPT the
+ * exception for "a JITted island still ABOVE us", so returning normally means this frame's own landing pad
+ * and every JIT frame above it are skipped. The exception then sits in context->has_resume_state until an
+ * unrelated later interp return trips need_native_unwind and fires it at a frame that cannot handle it.
+ *
+ * Deliberately does NOT call mono_wasm_jit_rethrow/mono_wasm_jit_throw/mono_handle_exception: pass 1 has
+ * already run and installed the resume state. Re-running it could process finally clauses twice, replace
+ * the resume state, or trip the existing resume-state gchandle assertions. This must only perform the
+ * unwind, exactly as wasm_jit_aot_call_lean already does for the JIT->JIT f-slot path.
+ */
+void
+mono_wasm_jit_continue_unwind (void)
+{
+	if (G_UNLIKELY (mono_opt_llvm_emulate_unwind)) {
+		/* Emulated unwind sets a flag and RETURNS instead of throwing; the wasm JIT's in-method EH is
+		 * built on real wasm/C++ EH and has no flag-polling in its emitted code, so there is no correct
+		 * behaviour here. Fail loudly rather than falling through to `unreachable` (an opaque worker
+		 * trap) and rather than restoring the old dummy-return, which is the bug this replaces. */
+		g_error ("wasm-jit: in-method EH requires real wasm EH; emulate-unwind is unsupported");
+	}
+	mono_llvm_start_native_unwind ();
+	g_assert_not_reached ();   /* the C++ throw above does not return */
+}
+
 void
 mono_wasm_jit_enter_island (MonoMethod *method)
 {
@@ -6876,6 +6945,26 @@ mono_wasm_jit_set_il_offset (int il_offset)
 {
 	if (mono_wasm_jit_cur_island_il_state)
 		mono_wasm_jit_cur_island_il_state->il_offset = il_offset;
+}
+
+/* Find the innermost active wasm-JIT EH invocation of METHOD. The landing pad normally belongs to the
+ * current island, but matching by method makes that ownership explicit and remains correct while an
+ * inner EH method is unwinding through its own landing pad. Searching from the top also selects the
+ * right activation for recursion. */
+static int
+wj_island_il_offset_for_method (MonoMethod *method)
+{
+	int i;
+
+	if (!method || !wj_island_chunks)
+		return -1;
+	for (i = wj_island_sp - 1; i >= 0; --i) {
+		WjIsland *is = wj_island_at (i);
+		MonoMethodILState *il = (MonoMethodILState *) is->st;
+		if (il->method == method)
+			return il->il_offset;
+	}
+	return -1;
 }
 
 /* TRUE if il_state is one of THIS thread's live wasm-JIT EH islands (vs a real AOT il_state emitted by
@@ -6974,7 +7063,7 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 	ERROR_DECL (error);
 	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
 	MonoObject *exc;
-	int il, i;
+	int blk_il, island_il, il, i;
 	/* mini_llvmonly_load_exception dereferences thrown_exc while updating trace_ips. A wasm/C++
 	 * exception without Mono's managed payload is not ours to dispatch; let the pad rethrow it. */
 	if (!jit_tls || !jit_tls->thrown_exc)
@@ -6982,15 +7071,11 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 	exc = mini_llvmonly_load_exception ();
 	if (!exc)
 		return -1;
-	il = (blk >= 0 && blk < t->nbbs) ? t->il_offsets [blk] : -1;
-	{ extern int mono_wasm_jit_verbose; static int _ehd = 0;
-	  if (mono_wasm_jit_verbose >= 3 && _ehd++ < 200) {
-		/* DIAG: log the INCOMING resume-state pass-1 installed (if any) BEFORE we clear it. il_state!=0 or
-		 * has_resume_state=1 means the throw ran mono_handle_exception pass-1, which WALKED PAST this JITted
-		 * frame (it's unwinder-invisible) and found an OUTER handler — running any intervening finally
-		 * clauses prematurely. That premature pass-1 processing is the suspected loot-table corruption. */
-		ThreadContext *_ctx = get_context (); MonoJitTlsData *_jt = mono_get_jit_tls (); extern gboolean mono_llvm_only;
-		printf ("EHDISP %s blk=%d il=%d ncl=%d exc=%s cl0=[%d,%d)f%d | llvmonly=%d INSTATE hrs=%d hf=%p ctxexc=%d il_state=%p rsexc=%d\n", t->name ? t->name : "?", blk, il, t->nclauses, exc ? m_class_get_name (mono_object_class (exc)) : "?", t->nclauses > 0 ? t->clauses[0].try_start : -1, t->nclauses > 0 ? t->clauses[0].try_start + t->clauses[0].try_len : -1, t->nclauses > 0 ? t->clauses[0].flags : -1, mono_llvm_only, _ctx->has_resume_state, (void*)_ctx->handler_frame, _ctx->exc_gchandle != 0, (void*)_jt->resume_state.il_state, _jt->resume_state.ex_gchandle != 0); } }
+	/* Mono's exception pass 1 already consumes the active island's IL offset. Use that same authoritative
+	 * position for the landing-pad clause walk, retaining the bb mapping only as a defensive fallback. */
+	blk_il = (blk >= 0 && blk < t->nbbs) ? t->il_offsets [blk] : -1;
+	island_il = wj_island_il_offset_for_method (t->method);
+	il = island_il >= 0 ? island_il : blk_il;
 	if (il < 0)
 		return -1;
 	/* mirror mono's is_address_protected + clause walk: iterate clauses in table order; the first CATCH
@@ -7021,7 +7106,6 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 				ctx->handler_frame = NULL;
 				if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
 				jit_tls->resume_state.il_state = NULL;
-				{ extern int mono_wasm_jit_verbose; static int _ehm = 0; if (mono_wasm_jit_verbose >= 3 && _ehm++ < 200) { printf ("EHDISP   -> MATCH %s cl%d -> bb%d\n", t->name ? t->name : "?", i, c->handler_bbidx); } }
 				return c->handler_bbidx;
 			}
 			mono_error_cleanup (error);
@@ -7048,7 +7132,6 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 			jit_tls->resume_state.il_state = NULL;
 			wj_finally_push (jit_tls->thrown_exc);   /* take ownership of the gchandle for OP_ENDFINALLY's re-raise */
 			jit_tls->thrown_exc = 0;                 /* clear so a nested throw inside the finally body can't free it */
-			{ extern int mono_wasm_jit_verbose; static int _ehf = 0; if (mono_wasm_jit_verbose >= 3 && _ehf++ < 200) { printf ("EHDISP   -> FINALLY %s cl%d -> bb%d\n", t->name ? t->name : "?", i, c->handler_bbidx); } }
 			/* Tag the FINALLY/FAULT dispatch so the landing pad sets finally_ind = -1 ONLY for it (see
 			 * WJ_EH_DISPATCH_FINALLY_BIT in mini.h): a CATCH dispatch must NOT clobber a normal-leave
 			 * continuation an in-flight OP_CALL_HANDLER stored there. */
@@ -7114,23 +7197,6 @@ mono_wasm_jit_release_caught_exc (void)
 	wj_caught_clear ();
 }
 
-/* MONO_WASM_JIT_BBTRACE=<substr>: the emitter inserts a call to this at the start of every bb of a
- * matching method, so we can SEE the exact runtime $blk path (and spot a divergence / wrong re-dispatch /
- * loop). blk>=0 = a bb entry; blk==-1 = the method is returning. Bounded + gated by STATS. Returns blk so
- * the emitter can `drop` it (reusing the (i32,i32)->i32 dispatch functype). */
-int
-mono_wasm_jit_bbtrace_log (WasmEhTable *t, int blk)
-{
-	static int _n = 0;
-	extern int mono_wasm_jit_verbose;
-	if (mono_wasm_jit_verbose >= 2 && _n++ < 600) {
-		if (blk == -1)
-			printf ("BBTRACE %s RETURN\n", t && t->name ? t->name : "?");
-		else
-			printf ("BBTRACE %s bb=%d\n", t && t->name ? t->name : "?", blk);
-	}
-	return blk;
-}
 #endif
 
 static void
