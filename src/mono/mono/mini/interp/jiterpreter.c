@@ -1622,6 +1622,28 @@ mono_jiterp_initialize_table (int type, int first_index, int last_index) {
 #endif
 }
 
+/* Human-readable table name. The enum is TRACE, JIT_CALL, then four regular runs of nine argument-count
+ * buckets (static, static_ret, instance, instance_ret), so decode it rather than carry a 38-entry string
+ * table that would rot silently the next time a shape is added. */
+static const char *
+jiterp_table_name (int type, char *buf, size_t buflen) {
+	static const char *shapes [] = { "static", "static_ret", "instance", "instance_ret" };
+	int k, group, argc;
+	if (type == JITERPRETER_TABLE_TRACE)
+		return "trace";
+	if (type == JITERPRETER_TABLE_JIT_CALL)
+		return "jit_call";
+	k = type - JITERPRETER_TABLE_INTERP_ENTRY_STATIC_0;
+	group = k / 9;
+	argc = k % 9;
+	if (k < 0 || group >= (int) G_N_ELEMENTS (shapes)) {
+		g_snprintf (buf, (gulong) buflen, "table%d", type);
+		return buf;
+	}
+	g_snprintf (buf, (gulong) buflen, "interp_entry_%s_%d", shapes [group], argc);
+	return buf;
+}
+
 EMSCRIPTEN_KEEPALIVE int
 mono_jiterp_allocate_table_entry (int type) {
 	g_assert ((type >= 0) && (type <= JITERPRETER_TABLE_LAST));
@@ -1645,8 +1667,19 @@ mono_jiterp_allocate_table_entry (int type) {
 #endif
 
 	if (index > table->last_index) {
-		if (index == (table->last_index + 1))
-			g_printf ("MONO_WASM: Jiterpreter table %d is out of space (%d entries allocated)\n", type, index - table->first_index + 1);
+		/* Exactly one allocator gets last_index+1, so this reports once per table. */
+		if (index == (table->last_index + 1)) {
+			char nb [64];
+			/* Name the table AND the option that sizes it. "table 27 is out of space" was not
+			 * actionable: 36 of the 38 tables are interp-entry shape buckets sized by a DIFFERENT
+			 * option than the trace/jit_call pair, so the bare number does not say which knob to
+			 * turn -- and turning the wrong one presents as the fix having done nothing. */
+			g_printf ("MONO_WASM: jiterpreter table %s (type %d) out of space after %d entries; raise --jiterpreter-%s\n",
+			          jiterp_table_name (type, nb, sizeof (nb)), type,
+			          table->last_index - table->first_index + 1,
+			          type <= JITERPRETER_TABLE_JIT_CALL ? "table-size" : "aot-table-size");
+			{ extern void mono_wasm_jit_note_table_exhausted_quiet (void); mono_wasm_jit_note_table_exhausted_quiet (); }
+		}
 		return 0;
 	}
 	return index;

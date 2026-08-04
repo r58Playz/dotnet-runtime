@@ -212,4 +212,9 @@ extern gint64 mono_wasm_jit_counters [WJC_MAX];     /* the counters (raw counts 
 void mono_wasm_jit_count (int idx);                 /* atomic += 1 */
 void mono_wasm_jit_add (int idx, gint64 v);         /* atomic += v (bytes / microseconds) */
 
+/* Per-worker instantiation census: MONO_WASM_JIT_ENTRYCENSUS=1. Separate from the WJC_* counters
+ * because those are process-wide and this question is per-thread. See mini-wasm.c. */
+extern int mono_wasm_jit_entry_census;
+void mono_wasm_jit_census_note_entry (int eslot);
+
 #endif /* __MONO_MINI_WASM_H__ */
