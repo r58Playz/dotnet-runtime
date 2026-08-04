@@ -781,6 +781,28 @@ mono_get_lmf (void)
 void
 mono_set_lmf (MonoLMF *lmf)
 {
+#if defined (TARGET_WASM) && defined (HOST_BROWSER)
+	/* Catch the publisher of an incomplete LMF head. exceptions-wasm.c's unwinder reads ->method (on wasm a
+	 * managed frame never has jit info, so there is no IP to resolve), and something publishes a head whose
+	 * body was never written: lmf_addr == 0 with ->method as stack residue. Checking here names the caller
+	 * instead of discovering it later at the consumer, where the stack no longer says who stored it.
+	 * lmf_addr == 0 is the discriminator: every real push writes it. Gated on an env var so the normal path
+	 * is untouched, and rate-limited. */
+	{
+		extern int mono_wasm_jit_lmf_publish_diag;
+		/* Must exclude MonoLMFExt. The ext tag is bit 2 of the ext's OWN previous_lmf, and for an ext the
+		 * lmf_addr/method fields are by definition unused -- interp_push_lmf memsets them to 0. So
+		 * "lmf_addr == 0" alone flags every legitimate ext push. Only a PLAIN LMF (tag clear) with
+		 * lmf_addr == 0 is an incomplete push, because a real plain push writes lmf_addr. */
+		if (G_UNLIKELY (mono_wasm_jit_lmf_publish_diag) && lmf && !((gsize) lmf & 3) &&
+		    !(((gsize) lmf->previous_lmf) & 2) && !lmf->lmf_addr) {
+			static int n;
+			if (n++ < 20)
+				printf ("WASM_JIT_LMF_PUBLISH_BAD: mono_set_lmf(%p) PLAIN with lmf_addr=0 prev=%p method=%p\n",
+					(void *) lmf, (void *) lmf->previous_lmf, (void *) lmf->method);
+		}
+	}
+#endif
 	(*mono_get_lmf_addr ()) = lmf;
 }
 
@@ -802,6 +824,30 @@ mono_set_lmf_addr (MonoLMF **lmf_addr)
 {
 	MonoThreadInfo *info;
 
+#if defined (TARGET_WASM) && defined (HOST_BROWSER)
+	/* Report where the CHAIN HEAD IS STORED, and what it currently holds.
+	 *
+	 * Bracketing showed the head is already a stale C-stack address on entry to interp_entry, and that the
+	 * same address's previous_lmf changes under us (0 -> 0x4) -- i.e. it is recycled stack, not an LMF. The
+	 * remaining way that happens without anyone "writing an LMF" is for lmf_addr itself to be re-pointed:
+	 * every read of the head then comes from wherever this points. setup_jit_tls_data passes
+	 * &jit_tls->lmf (heap); anything else -- a coop attach/detach or a JSPI TLS handoff pointing it at a
+	 * stack slot or another jit_tls -- makes the head live in memory that can be reused underneath it.
+	 * Print the target and the value it currently holds so the two cases are distinguishable. */
+	{
+		extern int mono_wasm_jit_lmf_publish_diag;
+		if (G_UNLIKELY (mono_wasm_jit_lmf_publish_diag)) {
+			static int n;
+			MonoJitTlsData *cur = mono_tls_get_jit_tls ();
+			gboolean expected = cur && lmf_addr == &cur->lmf;
+			if (!expected && n++ < 20)
+				printf ("WASM_JIT_LMF_ADDR_SET: lmf_addr=%p (jit_tls=%p, &jit_tls->lmf=%p) holds=%p %s\n",
+					(void *) lmf_addr, (void *) cur, cur ? (void *) &cur->lmf : NULL,
+					lmf_addr ? (void *) *lmf_addr : NULL,
+					cur ? "NOT &jit_tls->lmf" : "no jit_tls yet");
+		}
+	}
+#endif
 	mono_tls_set_lmf_addr (lmf_addr);
 
 	/* Save it into MonoThreadInfo so it can be accessed by mono_thread_state_init_from_handle () */
@@ -946,6 +992,22 @@ setup_jit_tls_data (gpointer stack_start, MonoAbortFunction abort_func)
 
 	jit_tls->lmf = lmf;
 
+#if defined (TARGET_WASM) && defined (HOST_BROWSER)
+	/* Record every root LMF handed out, so a later stale head can be matched against a PREVIOUS thread's
+	 * root rather than guessed at. The heap first_lmf is freed on detach and that case is already covered by
+	 * the freed-root ring (which found nothing); this covers the other direction -- a root that is still
+	 * allocated but belongs to a superseded jit_tls. */
+	{
+		extern int mono_wasm_jit_lmf_publish_diag;
+		if (G_UNLIKELY (mono_wasm_jit_lmf_publish_diag)) {
+			static int n;
+			if (n++ < 20)
+				printf ("WASM_JIT_LMF_ROOT: thread attached jit_tls=%p first_lmf=%p (&jit_tls->lmf=%p)\n",
+					(void *) jit_tls, (void *) lmf, (void *) &jit_tls->lmf);
+		}
+	}
+#endif
+
 #ifdef MONO_ARCH_HAVE_TLS_INIT
 	mono_arch_tls_init ();
 #endif
@@ -966,6 +1028,17 @@ free_jit_tls_data (MonoJitTlsData *jit_tls)
 	if (jit_tls->interp_context)
 		mini_get_interp_callbacks ()->free_context (jit_tls->interp_context);
 
+#ifdef TARGET_WASM
+	/* Record the root LMF address before releasing it. On wasm, mono_arch_unwind_frame can still reach a
+	 * root LMF through a chain captured before a detach (see exceptions-wasm.c): the block is reused by a
+	 * later allocation, so ->method reads as unrelated data and used to be handed to
+	 * mono_compile_method_checked. This lets that diagnostic state whether the bad entry is a freed root
+	 * LMF rather than guessing. Address-only, no dereference. */
+	{
+		extern void mono_wasm_note_freed_root_lmf (gpointer lmf);
+		mono_wasm_note_freed_root_lmf (jit_tls->first_lmf);
+	}
+#endif
 	g_free (jit_tls->first_lmf);
 	g_free (jit_tls);
 }
