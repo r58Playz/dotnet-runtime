@@ -121,7 +121,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm && *nm != '0') ? 1 : 0; }
 	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = per-worker instantiated-vs-entered census; adds a load+test to the interp->JIT boundary, so off while timing */
-	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; } /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
+	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
+	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
 	{ extern int mono_wasm_jit_guard_keep_slotlive; const char *gk = g_getenv ("MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE"); mono_wasm_jit_guard_keep_slotlive = (gk && *gk && *gk != '0') ? 1 : 0; } /* 1 = keep elision on under STOREGUARD/OBJGUARD (partial guard coverage, real configuration) */
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
@@ -235,6 +236,11 @@ int mono_wasm_jit_entry_census = 0;
 /* MONO_WASM_JIT_ELIDEDIAG=1: per-method, per-ARM ref-slot elision attribution (WASM_JIT_ELIDE lines).
  * Defined out here for the same mono-aot-cross link reason as the knobs above. */
 int mono_wasm_jit_elidediag = 0;
+
+/* MONO_WASM_JIT_LMF_PUBLISH_DIAG=1: make mono_set_lmf (mini-runtime.c) report any attempt to publish an LMF
+ * chain head whose lmf_addr is still 0 -- i.e. a push that never wrote the LMF body. Defined here, OUTSIDE
+ * HOST_BROWSER, for the same reason the other wasm-JIT flags are: mono-aot-cross links this file. */
+int mono_wasm_jit_lmf_publish_diag = 0;
 /* MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE=1: do not silently disable SLOTLIVE when STOREGUARD/OBJGUARD is on,
  * so the guards can actually be pointed at an elision-dependent corruption. Costs guard COVERAGE only
  * (OBJGUARD kind 2's ref proxy goes partial); every address-range check stays sound. */

@@ -4703,6 +4703,52 @@ static MONO_NEVER_INLINE void do_jit_call (ThreadContext *context, stackval *ret
 
 /* Main function for entering the interpreter from compiled code */
 // Do not inline in case order of frame addresses matters.
+#if HOST_BROWSER
+/*
+ * BRACKETING PROBE (MONO_WASM_JIT_LMF_PUBLISH_DIAG=1).
+ *
+ * exceptions-wasm.c's unwinder keeps finding the LMF chain head pointing at C-stack memory whose body was
+ * never written (previous_lmf == 0, lmf_addr == 0, ->method = residue that differs every build). None of the
+ * publishers account for it: mono_set_lmf instrumentation catches only the legitimate all-zero heap
+ * first_lmf, mono_push_lmf tags bit 2 and this entry is untagged, mini-wasm.c refuses save_lmf methods
+ * outright, and two attempts at initialising it in emit_push_lmf left the observed fields untouched.
+ *
+ * wasm has no watchpoints, so instead of asking "who writes it" ask "between which two points does the head
+ * become bad". Sampling at labelled, nested choke points and reporting only the first good->bad TRANSITION
+ * localises the writer to one region: if the head is sound entering AOT'd code and bad on the way out, the
+ * writer is generated code; if it goes bad across the JIT boundary, it is the JITted body; and so on.
+ *
+ * first_lmf must be excluded -- it is legitimately all-zero (g_new0 plus an empty
+ * MONO_ARCH_INIT_TOP_LMF_ENTRY), which is exactly the shape being hunted.
+ */
+void
+mono_wasm_jit_lmf_bracket (const char *where)
+{
+	extern int mono_wasm_jit_lmf_publish_diag;
+	MonoJitTlsData *jit_tls;
+	MonoLMF *l;
+	gboolean bad;
+	static __thread gboolean was_bad;
+
+	if (G_LIKELY (!mono_wasm_jit_lmf_publish_diag))
+		return;
+	l = mono_get_lmf ();
+	jit_tls = mono_get_jit_tls ();
+	bad = l && !((gsize) l & 3) && (gsize) l >= 65536 && (!jit_tls || l != jit_tls->first_lmf) &&
+		!(((gsize) l->previous_lmf) & 2) && !l->lmf_addr;
+	if (bad && !was_bad) {
+		static int n;
+		if (n++ < 20)
+			printf ("WASM_JIT_LMF_BRACKET: head became bad at %s: lmf=%p prev=%p addr=%p method=%p\n",
+				where, (void *) l, (void *) l->previous_lmf, (void *) l->lmf_addr, (void *) l->method);
+	}
+	was_bad = bad;
+}
+#define WJ_LMF_BRACKET(where) mono_wasm_jit_lmf_bracket (where)
+#else
+#define WJ_LMF_BRACKET(where) do { } while (0)
+#endif
+
 static MONO_NEVER_INLINE void
 interp_entry (InterpEntryData *data)
 {
@@ -4786,6 +4832,12 @@ interp_entry (InterpEntryData *data)
 	 * dropped to the interpreter, never touching the AOT body. Eligibility is cached on code_type, like
 	 * the interp's MINT_JIT_CALL. */
 	gboolean wj_did_jit_call = FALSE;
+	/* NOTE: this one flag gates two different things -- the hotness/compile trigger AND the protective
+	 * entry LMF. Splitting them so delegate-invoke entries (is_invoke, which have no island LMF either)
+	 * also got the LMF was TRIED and did not reduce the dangling-LMF-head events at all, so it was
+	 * reverted rather than left in: it adds a push/pop to every delegate-invoke entry for no measured
+	 * benefit. The leak is a SKIPPED POP elsewhere, not a missing push here -- see the
+	 * WASM_JIT_LMF_IMBALANCE resync in mono_wasm_jit_invoke_caught. */
 	gboolean wj_external_entry = !wj_entry_is_residual (data) && !rmethod->is_invoke;
 	MonoLMFExt wj_entry_ext;
 	/* Native/AOT callers enter an interpreted target here without executing a MINT_CALL or
@@ -4797,6 +4849,7 @@ interp_entry (InterpEntryData *data)
 	 * counted the callee, and counting it again would make residual-heavy call sites promote at twice
 	 * the configured rate. Delegate Invoke is replaced with a generated wrapper above; that wrapper
 	 * dispatches its actual target through MINT_CALL, so leave it to the normal call-site trigger. */
+	WJ_LMF_BRACKET ("ie-enter");
 	if (G_UNLIKELY (wj_external_entry)) {
 		/* Unlike a wasm-JIT residual caller, a native/AOT caller has no wasm island LMF protecting
 		 * this transition. Compilation can safepoint, and a successfully compiled non-EH method has
@@ -4836,8 +4889,10 @@ interp_entry (InterpEntryData *data)
 			}
 		}
 	}
+	WJ_LMF_BRACKET ("ie-body-done");
 	if (G_UNLIKELY (wj_external_entry))
 		interp_pop_lmf (&wj_entry_ext);
+	WJ_LMF_BRACKET ("ie-popped");
 	if (!wj_did_jit_call && G_UNLIKELY (wj_entry_is_residual (data))) {
 		InterpMethodCodeType ct = rmethod->code_type;
 		if (ct == IMETHOD_CODE_UNKNOWN) {
@@ -6688,6 +6743,27 @@ wj_shadow_balance_warn_m (const char *method, int leak)
 	g_warning ("wasm-jit: C-stack imbalance on CLEAN return from %s (leak=%d bytes) — a return path is missing EMIT_REF_LEAVE; resynced at boundary", method, leak);
 }
 
+/* WHERE THE CORRUPTED UNWIND LMF COMES FROM (kept as a note; the scaffolding that found it is gone).
+ *
+ * A throwaway LMF-balance check here, plus a walk of the entries between the exit head and the entry head,
+ * separated two populations at this boundary:
+ *
+ *  - the thread's own outer island chain (IL_STATE exts in the per-thread island array, contiguous:
+ *    runtime_invoke -> ExecutionContext.RunInternal -> Thread/StartHelper.RunWorker -> Thread.threadProc ->
+ *    threadProc2 -> ForkJoinWorkerThread.run -> ForkJoinTask.doExec -> CompletableFuture/AsyncSupply.run).
+ *    These appear "above" the saved head only because pass 1 rewound the chain PAST it. Not a leak.
+ *
+ *  - one PLAIN entry at a C-STACK address whose previous_lmf is 0 and whose lmf_addr is 0, with ->method as
+ *    uninitialised residue. previous_lmf == 0 rules out a push (mono_push_lmf writes old|2), and
+ *    lmf_addr == 0 rules out a completed AOT save-LMF. So the chain head was published as a RAW STACK
+ *    ADDRESS with the body never written -- the "AOT entry's incomplete plain save-LMF" this file already
+ *    mentions above. It is that entry, not any interp/wasm-JIT push, that reaches
+ *    mono_arch_unwind_frame and used to be handed to mono_compile_method_checked.
+ *
+ * Fixing it belongs in whatever publishes that save-LMF (AOT/LLVM prologue ordering), not here.
+ * exceptions-wasm.c validates before compiling, which is what stops the crash meanwhile.
+ */
+
 void
 mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret)
 {
@@ -6695,6 +6771,12 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 	 * native landing pads may or may not have run for the torn-through JIT frames) can be resynced
 	 * precisely, and a clean return can be balance-checked. */
 	uintptr_t c_sp_saved = emscripten_stack_get_current ();
+	/* NOTE: do NOT try to resync the LMF chain head here the way c_sp_saved resyncs the SP. It was tried,
+	 * and it is wrong: pass 1 legitimately rewinds the chain PAST this boundary's entry head (measured --
+	 * the head at exit was the thread's outer island chain: runtime_invoke -> ExecutionContext.RunInternal
+	 * -> Thread.threadProc -> ForkJoinWorkerThread.run -> ...), so restoring the saved head resurrects
+	 * frames the unwinder deliberately retired. That is the same hazard mono_wasm_jit_leave_island's
+	 * conditional pop guards against, and the boot regressed from RENDERING to TIMEOUT with it in. */
 	gboolean thrown = FALSE;
 	WasmJitEThunkArgs a;
 
@@ -6723,9 +6805,12 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 	extern void mono_wasm_jit_island_sp_restore (int sp);
 	int island_sp_saved = mono_wasm_jit_island_sp_save ();
 
+	WJ_LMF_BRACKET ("wj-enter");
 	mono_llvm_catch_exception (wasm_jit_ethunk_cb, &a, &thrown);
+	WJ_LMF_BRACKET ("wj-exit");
 
 	mono_wasm_jit_island_sp_restore (island_sp_saved);
+	WJ_LMF_BRACKET ("wj-island-restored");
 	/* DIAG (loot-NPE bisection): on a catch-taken, non-thrown return, log the return value + the C-stack
 	 * balance. bal!=0 => a JIT frame's EMIT_REF_LEAVE didn't restore the SP across the catch. Bounded. */
 	{ extern int mono_wasm_jit_verbose; extern __thread int mono_wasm_jit_eh_caught_flag;
@@ -7620,6 +7705,7 @@ mono_jiterp_register_jit_call_thunk (void *cinfo, WasmJitCallThunk thunk) {
 }
 #endif
 
+
 static MONO_NEVER_INLINE void
 do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame *frame, InterpMethod *rmethod, gboolean wj_residual G_GNUC_UNUSED, MonoError *error)
 {
@@ -7662,6 +7748,7 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 			ftndesc.addr = cinfo->addr;
 			ftndesc.arg = cinfo->extra_arg;
 			if (!wj_residual) interp_push_lmf (&ext, frame);
+			WJ_LMF_BRACKET ("aot-enter");
 			if (
 				mono_opt_jiterpreter_wasm_eh_enabled ||
 				(mono_aot_mode != MONO_AOT_MODE_LLVMONLY_INTERP)
@@ -7677,7 +7764,9 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 					thunk, ret_sp, sp, &ftndesc, &thrown
 				);
 			}
+			WJ_LMF_BRACKET ("aot-exit");
 			if (!wj_residual) interp_pop_lmf (&ext);
+			WJ_LMF_BRACKET ("aot-popped");
 
 			// We reuse do_jit_call's epilogue to do things like propagate thrown exceptions
 			//  and sign-extend return values instead of inlining that logic into every thunk

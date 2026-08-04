@@ -68,6 +68,35 @@ wasm_ptr_in_memory (gconstpointer p)
  * is the discriminator: it is a small enum, a corrupted pointer essentially never lands on a valid one, and
  * it is the exact field whose out-of-range value trips debug-helpers.c's
  * "wrapper_type < MONO_WRAPPER_NUM" assertion further downstream. */
+/* Ring of recently-freed root (first_lmf) addresses, recorded by free_jit_tls_data in mini-runtime.c.
+ * Address-only and never dereferenced: the point is to answer whether an implausible LMF the unwinder
+ * reaches is a root LMF belonging to a thread that has already detached -- i.e. a use-after-free reached
+ * through a stale chain -- or some other corruption. Process-wide because the stale chain can be walked by a
+ * different thread than the one that detached. */
+#define WASM_FREED_ROOT_LMF_RING 32
+static gpointer wasm_freed_root_lmfs [WASM_FREED_ROOT_LMF_RING];
+static gint32 wasm_freed_root_lmf_pos;
+
+void
+mono_wasm_note_freed_root_lmf (gpointer lmf)
+{
+	gint32 i;
+	if (!lmf)
+		return;
+	i = mono_atomic_inc_i32 (&wasm_freed_root_lmf_pos) - 1;
+	wasm_freed_root_lmfs [((guint32) i) % WASM_FREED_ROOT_LMF_RING] = lmf;
+}
+
+static gboolean
+wasm_lmf_was_freed_root (gpointer lmf)
+{
+	int i;
+	for (i = 0; i < WASM_FREED_ROOT_LMF_RING; ++i)
+		if (wasm_freed_root_lmfs [i] == lmf)
+			return TRUE;
+	return FALSE;
+}
+
 /* Print a method name only if the pointer survives validation, and free what mono_method_get_full_name
  * allocates. The old dump did neither: it called mono_method_get_full_name on unvalidated pointers (which is
  * what trips "wrapper_type < MONO_WRAPPER_NUM") and leaked every name on the grounds that it was aborting
@@ -187,7 +216,25 @@ mono_arch_unwind_frame (MonoJitTlsData *jit_tls,
 		if (G_UNLIKELY (!wasm_lmf_method_plausible ((*lmf)->method))) {
 			MonoLMF *l = *lmf;
 			int n = 0;
-			printf ("WASM_JIT_LMF_NULL_METHOD: LMF chain from %p (first_lmf=%p):\n", (void *) *lmf, (void *) jit_tls->first_lmf);
+			printf ("WASM_JIT_LMF_NULL_METHOD: LMF chain from %p (first_lmf=%p)%s:\n", (void *) *lmf,
+				(void *) jit_tls->first_lmf,
+				wasm_lmf_was_freed_root (*lmf) ? " [THIS IS A FREED ROOT LMF — use-after-free]" : "");
+			/* Classify what memory the bad entry lives in, which identifies who owns it. The address is
+			 * stable across runs while heap addresses shift, so it is very unlikely to be malloc'd; this
+			 * says whether it is on THIS thread's C stack (an LMF pushed by a frame below us), on another
+			 * thread's stack (a chain captured elsewhere), or in static data. */
+#if defined (HOST_BROWSER) && defined (__wasm__)
+			{
+				extern uintptr_t emscripten_stack_get_base (void);
+				extern uintptr_t emscripten_stack_get_end (void);
+				gsize a = (gsize) *lmf;
+				gsize hi = (gsize) emscripten_stack_get_base ();   /* stack grows DOWN: base is the high end */
+				gsize lo = (gsize) emscripten_stack_get_end ();
+				printf ("WASM_JIT_LMF_WHERE: lmf=%p this_thread_stack=[%p,%p) on_this_stack=%s prev=%p addr=%p\n",
+					(void *) a, (void *) lo, (void *) hi, (a >= lo && a < hi) ? "YES" : "no",
+					(void *) (*lmf)->previous_lmf, (void *) (*lmf)->lmf_addr);
+			}
+#endif
 			while (l && n < 64) {
 				gsize prev;
 				/* The CHAIN is the corrupted thing, so each link must be checked before it is followed:
