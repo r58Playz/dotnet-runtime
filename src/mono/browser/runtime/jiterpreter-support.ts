@@ -2128,35 +2128,76 @@ function jiterpreter_allocate_table (type: JiterpreterTable, base: number, size:
 // we need to ensure we only ever initialize tables once on each js worker.
 let jiterpreter_tables_allocated = false;
 
+/*
+ * Size ONE interp-entry table.
+ *
+ * The 36 interp-entry tables are shape buckets: {static, instance} x {void, ret} x argument count 0..8,
+ * laid out as four consecutive runs of nine (see JiterpreterTable). They were all given aot-table-size
+ * regardless of shape, so at the app's 65536 that reserved 36 * 65536 = 2359296 of the 2621441 entries every
+ * worker allocated -- 90% of them -- and in threaded builds every reserved slot also had to be filled with a
+ * placeholder, which is the bulk of the ~255 ms "Filling table" cost, 25 workers over.
+ *
+ * That reservation is what pushed world load into V8's process-wide per-table-entry limit: a worker 582 ms
+ * old holding 29 MB of JS heap died in NewJSDispatchHandle (V8 javascript OOM / CALL_AND_RETRY_LAST), which
+ * is not a heap-size failure.
+ *
+ * Taper by argument count instead. Call shapes are heavily skewed toward few arguments, and that is borne
+ * out here: with a flat 4096 the ONLY tables to overflow were interp_entry_static_ret_0 and _ret_1, i.e. two
+ * argc<=1 shapes, while all 34 others fit comfortably. So argc 0-1 keeps the full configured size (16x the
+ * ceiling that actually overflowed), argc 2-3 gets a sixteenth, argc>=4 a sixty-fourth.
+ *
+ * Overflow is graceful -- addWasmFunctionPointer returns 0 and the caller falls back to the classic
+ * interp_entry path (measured: with two tables overflowing, the game still reached a world) -- so tapering
+ * trades a little speed on exotic shapes for an order of magnitude fewer reserved entries, rather than
+ * risking a hard failure.
+ *
+ * MUST stay a pure function of (table, aotTableSize): every worker computes this independently and the
+ * resulting layout has to be IDENTICAL on all of them. Interp-entry wrapper indices are stored in
+ * InterpMethod, which is shared across threads, so worker A publishes an index that worker B calls. A
+ * layout that varies per worker -- e.g. allocating these lazily in first-use order, which was tried -- makes
+ * the same index mean different things on different threads and crashes with an uncaught
+ * WebAssembly.Exception on a pthread.
+ */
+function interp_entry_table_size (table: JiterpreterTable, aotTableSize: number) {
+    const argc = (table - JiterpreterTable.InterpEntryStatic0) % 9;
+    if (argc <= 1)
+        return aotTableSize;
+    if (argc <= 3)
+        return Math.max(1, aotTableSize >>> 4);
+    return Math.max(1, aotTableSize >>> 6);
+}
+
 export function jiterpreter_allocate_tables () {
     if (jiterpreter_tables_allocated)
         return;
     jiterpreter_tables_allocated = true;
 
     const options = getOptions();
-    // FIXME: Unfortunately the interp entry tables need to be REALLY big. I'm not sure why.
-    // A partial solution would be to merge the tables based on argument count instead of exact type,
-    //  then create special placeholder functions that examine the rmethod to determine which kind
-    //  of method is being called.
+    // The interp entry tables no longer all get aot-table-size; interp_entry_table_size tapers them by
+    // argument count, which is where the reservation was actually going. (Supersedes the old FIXME here
+    // about merging the tables by argument count: this keeps them separate, so no placeholder needs to
+    // inspect the rmethod, and just stops paying full price for the exotic shapes.)
     const traceTableSize = options.tableSize,
         // With AOT off, do_jit_call is unused, so the runtime wasm JIT (mono_wasm_emit_method)
         // repurposes the JIT_CALL table for its per-method entry-thunk slots — size it like the
         // trace table so many JITted methods fit (was hard-capped at 1, which only fit one method).
         jitCallTableSize = options.tableSize,
         interpEntryTableSize = runtimeHelpers.emscriptenBuildOptions.runAOTCompilation ? options.aotTableSize : 1,
-        numInterpEntryTables = JiterpreterTable.LAST - JiterpreterTable.InterpEntryStatic0 + 1,
-        totalSize = traceTableSize + jitCallTableSize + (numInterpEntryTables * interpEntryTableSize) + 1,
         wasmTable = getWasmFunctionTable();
+    let interpEntryTotal = 0;
+    for (let table = JiterpreterTable.InterpEntryStatic0; table <= JiterpreterTable.LAST; table++)
+        interpEntryTotal += interp_entry_table_size(table, interpEntryTableSize);
+    const totalSize = traceTableSize + jitCallTableSize + interpEntryTotal + 1;
     let base = wasmTable.length;
     const beforeGrow = performance.now();
     wasmTable.grow(totalSize);
     const afterGrow = performance.now();
     if (options.enableStats)
-        mono_log_info(`Allocated ${totalSize} function table entries for jiterpreter, bringing total table size to ${wasmTable.length}`);
+        mono_log_info(`Allocated ${totalSize} function table entries for jiterpreter (interp-entry tapered by argc), bringing total table size to ${wasmTable.length}`);
     base = jiterpreter_allocate_table(JiterpreterTable.Trace, base, traceTableSize, getRawCwrap("mono_jiterp_placeholder_trace"));
     base = jiterpreter_allocate_table(JiterpreterTable.JitCall, base, jitCallTableSize, getRawCwrap("mono_jiterp_placeholder_jit_call"));
     for (let table = JiterpreterTable.InterpEntryStatic0; table <= JiterpreterTable.LAST; table++)
-        base = jiterpreter_allocate_table(table, base, interpEntryTableSize, wasmTable.get(cwraps.mono_jiterp_get_interp_entry_func(table)));
+        base = jiterpreter_allocate_table(table, base, interp_entry_table_size(table, interpEntryTableSize), wasmTable.get(cwraps.mono_jiterp_get_interp_entry_func(table)));
     const afterTables = performance.now();
     if (options.enableStats)
         mono_log_info(`Growing wasm function table took ${afterGrow - beforeGrow}. Filling table took ${afterTables - afterGrow}.`);
