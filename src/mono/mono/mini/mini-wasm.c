@@ -120,6 +120,9 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_verbose; const char *vb = g_getenv ("MONO_WASM_JIT_VERBOSE"); mono_wasm_jit_verbose = (vb && *vb) ? atoi (vb) : 0; }
 	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm && *nm != '0') ? 1 : 0; }
+	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = per-worker instantiated-vs-entered census; adds a load+test to the interp->JIT boundary, so off while timing */
+	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; } /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
+	{ extern int mono_wasm_jit_guard_keep_slotlive; const char *gk = g_getenv ("MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE"); mono_wasm_jit_guard_keep_slotlive = (gk && *gk && *gk != '0') ? 1 : 0; } /* 1 = keep elision on under STOREGUARD/OBJGUARD (partial guard coverage, real configuration) */
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
 	{ extern int mono_wasm_jit_devirt_profile; const char *dp = g_getenv ("MONO_WASM_JIT_DEVIRT_PROFILE"); mono_wasm_jit_devirt_profile = (dp && *dp && *dp != '0') ? 1 : 0; }
@@ -224,6 +227,18 @@ mono_wasm_jit_add (int idx, gint64 v)
 int mono_wasm_jit_verbose = 0;
 const char *mono_wasm_jit_watch = NULL;
 int mono_wasm_jit_names = 0;   /* MONO_WASM_JIT_NAMES=1 emits a wasm name section per JITted module so traps self-symbolicate */
+/* MONO_WASM_JIT_ENTRYCENSUS=1; the census state and reader live in the HOST_BROWSER section below, but
+ * this flag must be defined OUT here: mono_wasm_jit_auto_init reads it and mini-wasm.c is linked into
+ * mono-aot-cross as well as the runtime, so a browser-only definition is an undefined symbol at the
+ * cross-compiler link (same reason mono_wasm_jit_devirt_profile is defined here rather than interp.c). */
+int mono_wasm_jit_entry_census = 0;
+/* MONO_WASM_JIT_ELIDEDIAG=1: per-method, per-ARM ref-slot elision attribution (WASM_JIT_ELIDE lines).
+ * Defined out here for the same mono-aot-cross link reason as the knobs above. */
+int mono_wasm_jit_elidediag = 0;
+/* MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE=1: do not silently disable SLOTLIVE when STOREGUARD/OBJGUARD is on,
+ * so the guards can actually be pointed at an elision-dependent corruption. Costs guard COVERAGE only
+ * (OBJGUARD kind 2's ref proxy goes partial); every address-range check stays sound. */
+int mono_wasm_jit_guard_keep_slotlive = 0;
 
 /* Aggregated bail-reason histogram (Part 4): the per-method WASM_JIT_BAIL lines (7028 of them in the
  * jit121 capture) buried the signal — 151 ldaddr, 47 EH. This rolls every bail into category buckets +
@@ -458,7 +473,88 @@ mono_wasm_jit_residual_name_skipped (const char *name)
 /* Coverage-stable bisection denylist: TRUE if `name` (a method's simple name) is in the comma-separated
  * MONO_WASM_JIT_NO_METHOD list, so the auto-JIT trigger leaves it in the interpreter. Lets us pin which
  * JITted method computes a wrong value WITHOUT turning auto-JIT off (which perturbs startup) — deny
- * halves of the registered set and re-run. */
+ * halves of the registered set and re-run.
+ *
+ * Simple names alone cannot finish a bisection when the suspect set shares one name: this codebase has 187
+ * distinct `accept` methods (the visitor pattern, plus every IKVM-generated functional-interface bridge), so
+ * "deny accept" is all-or-nothing and the search stops exactly where it needs to get finer. Accept
+ * class-qualified segments too -- "Class:name" or "Ns.Class:name" -- which makes the set bisectable down to a
+ * single method. Segments without a ':' keep the original simple-name meaning, so existing denylists behave
+ * identically. */
+gboolean
+mono_wasm_jit_method_denied (MonoMethod *m)
+{
+	const char *t = g_getenv ("MONO_WASM_JIT_NO_METHOD");
+	const char *p;
+	const char *name, *kn, *ns;
+	if (!t || !m || !m->name)
+		return FALSE;
+	name = m->name;
+	kn = m->klass ? m_class_get_name (m->klass) : NULL;
+	ns = m->klass ? m_class_get_name_space (m->klass) : NULL;
+	for (p = t; *p; ) {
+		const char *c = strchr (p, ',');
+		size_t seg = c ? (size_t) (c - p) : strlen (p);
+		const char *colon = memchr (p, ':', seg);
+		if (!colon) {
+			/* simple name, original behaviour */
+			if (seg == strlen (name) && !strncmp (p, name, seg))
+				return TRUE;
+		} else {
+			size_t clen = (size_t) (colon - p);
+			const char *mp = colon + 1;
+			size_t mlen = seg - clen - 1;
+			int want_argc = -1;
+			/* Optional "/N" arity suffix: "Class:accept/3" denies only the 3-parameter overload. Needed
+			 * because class+name cannot separate overloads, and ClassReader:accept is TWO methods -- a
+			 * 931-byte forwarder and the 18 KB class parser -- which a class-qualified segment denies
+			 * together. A '/' here is unambiguous: nested classes put their '/' in the CLASS part, before
+			 * the colon. */
+			{
+				const char *slash = memchr (mp, '/', mlen);
+				if (slash) {
+					want_argc = atoi (slash + 1);
+					mlen = (size_t) (slash - mp);
+				}
+			}
+			if (want_argc >= 0) {
+				MonoMethodSignature *sig = mono_method_signature_internal (m);
+				if (!sig || sig->param_count != want_argc) { if (!c) break; p = c + 1; continue; }
+			}
+			if (mlen == strlen (name) && !strncmp (mp, name, mlen)) {
+				gboolean hit = FALSE;
+				/* match the class part against either "Class" or "Ns.Class" */
+				if (kn && clen == strlen (kn) && !strncmp (p, kn, clen))
+					hit = TRUE;
+				if (!hit && kn && ns && *ns) {
+					size_t want = strlen (ns) + 1 + strlen (kn);
+					if (clen == want && !strncmp (p, ns, strlen (ns)) &&
+					    p [strlen (ns)] == '.' && !strncmp (p + strlen (ns) + 1, kn, strlen (kn)))
+						hit = TRUE;
+				}
+				if (hit) {
+					/* Announce it. A qualified segment that matches NOTHING -- one typo in a class name --
+					 * denies nothing and the run comes back "clean", which during a bisection reads as
+					 * "the culprit is in the other half" and sends the search down the wrong branch. The
+					 * tally lets the runner assert that the arm actually removed a method. Capped so a
+					 * retrying trigger cannot flood the log. */
+					static int shown;
+					if (shown < 64) {
+						shown++;
+						printf ("WASM_JIT_DENY_QUALIFIED %s%s%s:%s\n",
+							ns && *ns ? ns : "", ns && *ns ? "." : "", kn ? kn : "?", name);
+					}
+					return TRUE;
+				}
+			}
+		}
+		if (!c)
+			break;
+		p = c + 1;
+	}
+	return FALSE;
+}
+
 gboolean
 mono_wasm_jit_name_denied (const char *name)
 {
@@ -760,6 +856,28 @@ mono_wasm_jit_slot_live_cap_addr (void)
 	return &wj_slot_live_cap;
 }
 
+/* Census counters (MONO_WASM_JIT_ENTRYCENSUS=1) — see the long note above mono_wasm_jit_liveness.
+ *
+ * PROCESS-WIDE ATOMICS, not just thread-locals, and that is forced rather than preferred: the worker
+ * isolates whose numbers we want are pthreads parked in synchronous wasm, so CDP Runtime.evaluate never
+ * returns for them (33 of 34 worker targets read "unreachable"). The same blocking is why the unlanded
+ * SHARE_MODULES postMessage relay cannot work without JSPI suspends. Aggregating in C and reading the
+ * total from the page target is the only reliable channel. These live in the wasm heap, which pthreads
+ * share, so any thread's increment is visible.
+ *
+ * Split by PATH because the paths mean different things: the eager per-thread sweep (sync_thread) is
+ * waste a lazy scheme would remove, whereas admit and the fslot backstop are demand-driven and would
+ * still happen. A first attempt instrumented only sync_thread and read a flat zero at 11,069 registered
+ * methods -- not because nothing was duplicated, but because admit is the path that actually instantiates
+ * on other workers ("The compiling worker already installed this descriptor; other workers instantiate it
+ * once here"). Hooking the two instantiate_*_local choke points instead makes the total unmissable. */
+static gint32 wj_census_inst_total;   /* every successful instantiation, any path, any thread */
+static gint32 wj_census_inst_sync;    /* via mono_wasm_jit_sync_thread (eager sweep) */
+static gint32 wj_census_inst_admit;   /* via mono_wasm_jit_admit (per-worker, on demand at dispatch) */
+static gint32 wj_census_inst_fslot;   /* via mono_wasm_jit_instantiate_fslot (direct-call backstop) */
+static gint32 wj_census_entered_total;/* distinct (thread, e-slot) pairs actually entered */
+static gint32 wj_census_inst_us_total;/* microseconds spent instantiating, all threads */
+
 /* Instantiate a cached JITted module into the CURRENT thread's wasm function table. The table is
  * per-thread for dynamically-added entries, so each thread must do this once (lazily, on its first
  * invoke of the method — interp.c MINT_CALL) before call_indirect-ing the slot. Returns 1 on success,
@@ -806,6 +924,10 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 		 * e/f live after recursively admitting the complete closure. */
 		wj_mark_slot_installed (e_slot);
 		wj_mark_slot_installed (f_slot);
+		if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
+			mono_atomic_inc_i32 (&wj_census_inst_total);
+			mono_atomic_add_i32 (&wj_census_inst_us_total, (gint32) (*out_ms * 1000.0));
+		}
 	}
 	return _ok;
 }
@@ -867,6 +989,13 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 		for (i = 0; i < n; i++) {
 			wj_mark_slot_installed (e_slots [i]);
 			wj_mark_slot_installed (f_slots [i]);
+		}
+		/* One MODULE, n methods — count it as one instantiation, because the WebAssembly.Instance and
+		 * its export JSFunctions (the JSDispatchTable entries the renderer dies allocating) are what a
+		 * batch amortizes. Counting n here would hide exactly the win batching is supposed to deliver. */
+		if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
+			mono_atomic_inc_i32 (&wj_census_inst_total);
+			mono_atomic_add_i32 (&wj_census_inst_us_total, (gint32) (*out_ms * 1000.0));
 		}
 	}
 	return _ok;
@@ -1026,6 +1155,68 @@ mono_wasm_jit_note_table_exhausted (void)
 		          "Raise --jiterpreter-table-size.\n");
 }
 
+/* Counter-only variant. mono_jiterp_allocate_table_entry knows WHICH table ran dry and which option
+ * sizes it, so it prints its own (more specific) line; this exists so that event still shows up in
+ * mono_wasm_jit_liveness(3). Previously only the wasm_jit's own slot allocation fed that counter, so
+ * an interp-entry table filling up left the probe reading zero while tiering had already stopped. */
+void mono_wasm_jit_note_table_exhausted_quiet (void);
+void
+mono_wasm_jit_note_table_exhausted_quiet (void)
+{
+	mono_atomic_inc_i32 (&wj_table_exhausted);
+}
+
+/* Per-worker instantiation census — MONO_WASM_JIT_ENTRYCENSUS=1, off by default.
+ *
+ * mono_wasm_jit_sync_thread instantiates EVERY registered module on EVERY thread, eagerly. Whether that
+ * is waste depends on a number nothing currently reports: how many of those modules the worker goes on to
+ * actually enter. It is not a cosmetic question. Each instantiation is a WebAssembly.Instance whose two
+ * exported functions (e and f) are JSFunctions, and V8 charges a JSDispatchTable entry per JSFunction that
+ * is reclaimed only on a major GC — so the cost scales as registered_methods x threads. V8 already shares
+ * the compiled NativeModule across isolates via its wire-byte cache, which shares the machine code and
+ * none of this.
+ *
+ * "Entered" is counted at the interp->JIT boundary only (mono_wasm_jit_invoke_caught), keyed on e-slot.
+ * That deliberately UNDERCOUNTS the demand set: a JITted method reached by a direct call_indirect from
+ * another JITted method never crosses that boundary. So entered <= demanded <= instantiated, and the
+ * census is sized to answer "is there an order-of-magnitude gap" rather than "which modules exactly".
+ * A lazy scheme would still have to serve the JIT->JIT callees, but those already have a demand path
+ * (mono_wasm_jit_instantiate_fslot), so they are instantiations that would have happened anyway.
+ *
+ * Gated because it puts a load+test on the interp->JIT boundary, and anything that costs time inside a
+ * measured region is off by default here.
+ *
+ * The mono_wasm_jit_entry_census flag itself is defined near the other knobs, outside HOST_BROWSER.
+ */
+#define WJ_CENSUS_SLOTS (1 << 18)   /* e-slots below this are deduplicated; above it each entry counts once */
+
+static __thread int      wj_census_instantiated;   /* modules THIS thread instantiated (any path) */
+static __thread int      wj_census_entered;        /* distinct e-slots THIS thread actually entered */
+static __thread gint64   wj_census_inst_us;        /* wall-clock THIS thread spent instantiating */
+static __thread guint32 *wj_census_seen;           /* dedup bitmap over e-slot numbers */
+
+void
+mono_wasm_jit_census_note_entry (int eslot)
+{
+	guint32 word, bit;
+	if (eslot <= 0 || eslot >= WJ_CENSUS_SLOTS) {
+		wj_census_entered++;   /* out of bitmap range: count it rather than silently dropping it */
+		return;
+	}
+	if (!wj_census_seen) {
+		wj_census_seen = (guint32 *) g_malloc0 ((WJ_CENSUS_SLOTS / 32) * sizeof (guint32));
+		if (!wj_census_seen)
+			return;
+	}
+	word = (guint32) eslot >> 5;
+	bit = 1u << ((guint32) eslot & 31);
+	if (wj_census_seen [word] & bit)
+		return;
+	wj_census_seen [word] |= bit;
+	wj_census_entered++;
+	mono_atomic_inc_i32 (&wj_census_entered_total);
+}
+
 /* Always-on liveness probe: is the wasm method-JIT actually running, and how much has it compiled?
  *
  * Every WJC_* counter (including WJC_REGISTERED) is gated behind MONO_WASM_JIT_STATS so release
@@ -1056,6 +1247,27 @@ mono_wasm_jit_liveness (int field)
 	 * There is no way to infer this from the outside: the allocator has no free and exposes no cursor. */
 	case 4: { extern int mono_jiterp_table_remaining (int type); return mono_jiterp_table_remaining (1); }
 #endif
+	/* Census (MONO_WASM_JIT_ENTRYCENSUS=1). Fields 5-7 are THREAD-LOCAL and only meaningful on a thread
+	 * you can actually evaluate in; 8-12 are process-wide atomics and are the ones to trust, because the
+	 * pthread workers are parked in blocking wasm and CDP cannot evaluate in them at all.
+	 *
+	 * The headline is field 8 against field 2: total instantiations vs distinct methods registered. A
+	 * ratio near 1.0 means each module is instantiated about once and there is no per-worker duplication
+	 * to remove; N means every module is being instantiated on ~N threads, and each of those instances
+	 * costs two export JSFunctions and therefore two JSDispatchTable entries. Field 9 (distinct
+	 * (thread, method) pairs actually entered) is the lower bound on how many were genuinely needed --
+	 * a lower bound, because direct JIT->JIT calls never cross the interp boundary where entry is
+	 * counted. Fields 10-12 split the total by path, which is what says whether laziness would help:
+	 * sync_thread is the eager sweep, admit and fslot are already demand-driven. */
+	case 5: return wj_census_instantiated;
+	case 6: return wj_census_entered;
+	case 7: return (int) (wj_census_inst_us / 1000);        /* ms this thread spent instantiating */
+	case 8: return wj_census_inst_total;                    /* ALL instantiations, all threads, all paths */
+	case 9: return wj_census_entered_total;                 /* distinct (thread, e-slot) pairs entered */
+	case 10: return wj_census_inst_admit;                   /* of which: via mono_wasm_jit_admit */
+	case 11: return wj_census_inst_fslot;                   /* of which: via instantiate_fslot backstop */
+	case 12: return wj_census_inst_sync;                    /* of which: via the eager sync_thread sweep */
+	case 13: return wj_census_inst_us_total / 1000;         /* ms spent instantiating, all threads */
 	default: return -1;
 	}
 }
@@ -1270,6 +1482,13 @@ mono_wasm_jit_admit (int desc_id)
 			printf ("WASM_JIT_ADMIT_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
 			goto fail;
 		}
+		/* Path tag only; the total is counted inside instantiate_*_local. This is THE per-worker path --
+		 * already demand-driven at dispatch, so a high count here is not by itself removable waste. */
+		if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
+			wj_census_instantiated++;
+			wj_census_inst_us += (gint64) (ms * 1000.0);
+			mono_atomic_inc_i32 (&wj_census_inst_admit);
+		}
 	}
 	/* Publish dispatchability only after every unchecked direct dependency is admitted. */
 	wj_mark_slot_live (re->e);
@@ -1368,6 +1587,13 @@ mono_wasm_jit_sync_thread (void)
 		}
 		/* per-thread table-sync instantiation is real compile wall-cost too — fold it into the same timer */
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_add (WJC_ELAPSED_INSTANTIATION, (gint64) (ms * 1000.0));
+		/* Per-path attribution: this is the EAGER sweep, the one a lazy scheme would remove. The totals
+		 * themselves are counted at the instantiate_*_local choke points, so this only tags the path. */
+		if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
+			wj_census_instantiated++;
+			wj_census_inst_us += (gint64) (ms * 1000.0);
+			mono_atomic_inc_i32 (&wj_census_inst_sync);
+		}
 		synced++;
 	}
 	mono_loader_unlock ();
@@ -1404,8 +1630,14 @@ mono_wasm_jit_instantiate_fslot (int fslot)
 				if (!bytes || len <= 0 || len >= (16 * 1024 * 1024))
 					break;   /* registry entry not fully published / bogus length */
 				mono_wasm_jit_instantiate_local (re->e, re->f, bytes, len, eb, (int) sizeof (eb), &ms);
-				if (mono_wasm_jit_slot_live (fslot))
+				if (mono_wasm_jit_slot_live (fslot)) {
+					if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
+						wj_census_instantiated++;
+						wj_census_inst_us += (gint64) (ms * 1000.0);
+						mono_atomic_inc_i32 (&wj_census_inst_fslot);
+					}
 					return 1;
+				}
 				mono_memory_barrier ();   /* before the next attempt: re-read shared bytes coherently */
 			}
 			break;   /* fslot is unique in the registry */
@@ -5318,8 +5550,23 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			gboolean slotlive_on = mono_wasm_jit_slotlive != 0;
 #ifdef HOST_BROWSER
 			{
-				extern int mono_wasm_jit_storeguard, mono_wasm_jit_objguard;
-				if (mono_wasm_jit_storeguard || mono_wasm_jit_objguard)
+				extern int mono_wasm_jit_storeguard, mono_wasm_jit_objguard, mono_wasm_jit_guard_keep_slotlive;
+				/* MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE=1 keeps elision ON under the guards.
+				 *
+				 * The unconditional override below makes the guards unable to validate the one feature most
+				 * likely to need it: enabling either guard silently turns SLOTLIVE off, so a corruption that
+				 * only reproduces with elision on cannot be caught by the very tool built to catch it. That
+				 * gap is already on record (a.txt: "OBJGUARD/STOREGUARD cannot validate SLOTLIVE because
+				 * they disable it"), and it cost this investigation a full round.
+				 *
+				 * The override protects COVERAGE, not correctness. refslot is used as a complete "is a ref"
+				 * proxy by exactly one check -- OBJGUARD kind 2 (is the stored VALUE a ref) -- and elision
+				 * makes that proxy partial. Every other check is an address-range test that does not consult
+				 * ref-ness at all: STOREGUARD kinds 0/1 run inside the slot store path, and OBJGUARD kinds
+				 * 3/4/5 (byref base, generic membase, vcall receiver) bounds-check a computed address. Those
+				 * stay sound with elision on; they simply see fewer stores. Partial coverage of the real
+				 * configuration beats complete coverage of a configuration that does not reproduce. */
+				if ((mono_wasm_jit_storeguard || mono_wasm_jit_objguard) && !mono_wasm_jit_guard_keep_slotlive)
 					slotlive_on = FALSE;
 			}
 #endif
@@ -5508,11 +5755,27 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					terminal_vcall_handoff = all_pre_refs_die;
 				}
 				sl_elide = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
+				/* Per-ARM elision attribution (MONO_WASM_JIT_ELIDEDIAG=1).
+				 *
+				 * The three arms below mean different things and have different soundness arguments, but
+				 * nelide lumps them together, so a corruption reproducer cannot tell which one dropped the
+				 * slot. arm3 (terminal-vcall handoff) is the one already fixed via method_skipped_raises;
+				 * arm1 (method_nogc) overrides the liveness walk wholesale, including cross-bb and
+				 * loop-carried refs; arm2 is the walk's own verdict. Counting them separately is what
+				 * distinguishes "the walk is wrong" from "an arm bypassed the walk" -- the same role
+				 * span_gcp=0 played for the handoff arm. Attribution follows the || short-circuit order. */
+				int nref_total = 0, nel_nogc = 0, nel_needs = 0, nel_handoff = 0;
+				for (i = 0; i < nvreg; ++i)
+					if (li [i] >= 0 && isref [i])
+						nref_total++;
 				for (i = 0; i < nvreg; ++i)
 					if (li [i] >= 0 && isref [i] &&
 					    (method_nogc || !needs_slot [i] ||
 					     (effective_gcp_count == 1 && terminal_vcall_handoff &&
 					      last_use_ord [i] <= terminal_vcall_ord))) {
+						if (method_nogc) nel_nogc++;
+						else if (!needs_slot [i]) nel_needs++;
+						else nel_handoff++;
 						/* A reference used at an admitted direct GC-capable call only may hand its
 						 * root to the callee when that call is its final use. There is no safepoint
 						 * between the caller's local.get and the callee's eager/lazy root setup.
@@ -5524,6 +5787,52 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					}
 				if (nelide > 0 && mono_wasm_jit_stats)
 					mono_wasm_jit_add (WJC_SLOTS_ELIDED, nelide);
+				/* Ground truth for "which arm dropped the slot", printed per method so an inline-on vs
+				 * inline-off pair can be diffed directly. clauses/gcp/skipped are the enabling conditions:
+				 * method_nogc requires num_clauses==0, and arm3 additionally requires gcp==1. */
+				if (G_UNLIKELY (mono_wasm_jit_elidediag)) {
+					/* INDEPENDENT CROSS-CHECK of the generation bookkeeping, by ORDINAL rather than by
+					 * gc_gen. The arm-2 soundness claim is "an elided ref's def->use range crosses no GC
+					 * point", but the walk enforces that through def_gen/gc_gen, and gc_gen RESETS per
+					 * basic block while def_gen[] persists. Re-deriving the same property from raw
+					 * instruction ordinals cannot share a bug with the generation counters, so a nonzero
+					 * span_bad here is proof the walk elided a ref that a collector can observe -- the
+					 * same role span_gcp=0 played when it exonerated the walk for the handoff arm.
+					 * Second walk mirrors the first's bb/ins iteration exactly, so ordinals line up. */
+					int span_bad = 0, span_max = 0, ngcp = 0, ncap = 0, o2 = 0, k;
+					int *gords;
+					MonoBasicBlock *b2;
+					MonoInst *i2;
+					for (b2 = cfg->bb_entry; b2; b2 = b2->next_bb)
+						MONO_BB_FOR_EACH_INS (b2, i2)
+							ncap++;
+					gords = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * (ncap + 1));
+					for (b2 = cfg->bb_entry; b2; b2 = b2->next_bb)
+						MONO_BB_FOR_EACH_INS (b2, i2) {
+							if (wj_ins_is_published_gcpoint (cfg, i2))
+								gords [ngcp++] = o2;
+							o2++;
+						}
+					for (i = 0; i < nvreg; ++i)
+						if (li [i] >= 0 && isref [i] && sl_elide [i] && !method_nogc && !needs_slot [i] &&
+						    last_def_ord [i] >= 0 && last_use_ord [i] > last_def_ord [i]) {
+							int c = 0;
+							for (k = 0; k < ngcp; ++k)
+								if (gords [k] > last_def_ord [i] && gords [k] < last_use_ord [i])
+									c++;
+							if (c > 0) {
+								span_bad++;
+								if (c > span_max)
+									span_max = c;
+							}
+						}
+					char *_en = mono_method_get_full_name (cfg->method);
+					printf ("WASM_JIT_ELIDE %s nogc=%d clauses=%d gcp=%d skipped=%d handoff=%d refs=%d elided=%d arm1_nogc=%d arm2_needs=%d arm3_handoff=%d span_bad=%d span_max=%d\n",
+					        _en, method_nogc ? 1 : 0, (int) cfg->header->num_clauses, effective_gcp_count,
+					        method_skipped_raises, terminal_vcall_handoff ? 1 : 0,
+					        nref_total, nelide, nel_nogc, nel_needs, nel_handoff, span_bad, span_max);
+					g_free (_en);
+				}
 				/* Hand the elision set to LCSE (function-scope; isref/sl_elide are local to this block).
 				 * An elided ref is only safe because its IR def->use range crosses no GC point, and an
 				 * LCSE reuse read would extend that range. */
@@ -9527,6 +9836,23 @@ vcall_cold_miss_emit:
 	}
 
 #ifdef HOST_BROWSER
+	{
+		/* Live single-method hex dump, selected by full-name substring (MONO_WASM_JIT_HEX_METHOD).
+		 *
+		 * DUMP_ONLY cannot answer "what does the failing run actually execute". It suppresses registration
+		 * for EVERY method, so no callee owns an f-slot and the emitter takes different direct-call and
+		 * devirt decisions -- the bytes it prints are a different module than the live one. Filtering by
+		 * name leaves the rest of the process on its normal path, so the dumped module IS the one that
+		 * runs. */
+		const char *want = g_getenv ("MONO_WASM_JIT_HEX_METHOD");
+		if (want && *want && mname && strstr (mname, want)) {
+			GString *hex = g_string_sized_new (out.len * 2 + 1);
+			for (i = 0; i < (int) out.len; ++i)
+				g_string_append_printf (hex, "%02x", out.data [i]);
+			printf ("WASM_JIT_LIVEHEX %s : %u : %s\n", mname, out.len, hex->str);
+			g_string_free (hex, TRUE);
+		}
+	}
 	if (g_getenv ("MONO_WASM_JIT_DUMP_ONLY") != NULL) {
 		/* debug: forward the emitted module as hex to the UI console but DON'T register it, so the
 		 * method runs in the interpreter — lets us inspect JIT-path codegen without executing it. */

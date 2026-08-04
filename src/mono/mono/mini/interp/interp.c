@@ -1531,12 +1531,12 @@ static int
 wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 {
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
-	extern gboolean mono_wasm_jit_name_denied (const char *name);
+	extern gboolean mono_wasm_jit_method_denied (MonoMethod *m);
 	MonoWasmJitResult r;
 	memset (&r, 0, sizeof (r));
 	if (out)
 		memset (out, 0, sizeof (*out));
-	if (im->method->name && mono_wasm_jit_name_denied (im->method->name))
+	if (mono_wasm_jit_method_denied (im->method))
 		return -1;
 	/* serialize compilation (see wj_compiling): skip + retry if another thread (or a re-entrant cctor
 	 * compile on this thread) holds it. Non-blocking, so it can't deadlock the GC. */
@@ -1559,7 +1559,28 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 		}
 		return WASM_JIT_COMPILE_JITTED;
 	}
-	mono_wasm_force_compile (im->method, &r);
+	/* MONO_WASM_JIT_COMPILE_TRACE: name the method around the compile, so a fault INSIDE the compiler can
+	 * be attributed. The captured trap is an out-of-bounds access in jit_compile_method_with_opt_cb --
+	 * mini's own frontend -- reached only from a JITted cold-miss edge (which is why MONO_WASM_JIT_DUMP_ONLY
+	 * never reproduces it: nothing is registered there, so no JITted code runs to trigger the admission that
+	 * compiles the target). Printed as a PAIR: compiles are serialized by the wj_compiling CAS above, so a
+	 * COMPILING with no matching COMPILED is unambiguously the method that died. */
+	{
+		static int trace = -1;
+		if (G_UNLIKELY (trace < 0))
+			trace = g_getenv ("MONO_WASM_JIT_COMPILE_TRACE") != NULL;
+		if (trace) {
+			char *tn = mono_method_get_full_name (im->method);
+			printf ("WASM_JIT_COMPILING %s\n", tn);
+			g_free (tn);
+			mono_wasm_force_compile (im->method, &r);
+			tn = mono_method_get_full_name (im->method);
+			printf ("WASM_JIT_COMPILED %s e=%d f=%d\n", tn, r.e_slot, r.f_slot);
+			g_free (tn);
+		} else {
+			mono_wasm_force_compile (im->method, &r);
+		}
+	}
 	mono_atomic_store_i32 (&wj_compiling, 0);
 	if (out)
 		*out = r;
@@ -6676,6 +6697,18 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 	uintptr_t c_sp_saved = emscripten_stack_get_current ();
 	gboolean thrown = FALSE;
 	WasmJitEThunkArgs a;
+
+	/* Census hook (MONO_WASM_JIT_ENTRYCENSUS=1): this is the interp->JIT boundary, so it is the one
+	 * choke point where "this worker actually entered that module" can be observed without touching
+	 * generated code. Undercounts by design — direct JIT->JIT f-slot calls bypass it. See mini-wasm.c.
+	 * Both symbols live in mini-wasm.c for the mono-aot-cross link reason noted above wj_vprof_stat. */
+	{
+		extern int mono_wasm_jit_entry_census;
+		extern void mono_wasm_jit_census_note_entry (int eslot);
+		if (G_UNLIKELY (mono_wasm_jit_entry_census))
+			mono_wasm_jit_census_note_entry (slot);
+	}
+
 	a.thunk = (gpointer) (intptr_t) slot;
 	a.args = args;
 	a.ret = ret;
