@@ -1150,9 +1150,28 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 		var t0 = performance.now ();
 		try {
 			var b = HEAPU8.slice (p, p + $4);
-			/* Batched members are emitted with helper imports OFF (the batch framer declares none), so `h` is
-			 * only passed for symmetry — an unused import-object property is ignored, a missing one is not. */
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14 }, h: Module.__wjHelperImports || {} });
+			/* A BATCHED module declares helper imports too, and has since wasm_module_methods_and_entries
+			 * started taking the batch-wide union. The resolver therefore has to exist HERE as well.
+			 *
+			 * It used to say `Module.__wjHelperImports || {}` under a comment claiming batched members are
+			 * emitted with helper imports off, which stopped being true when the batch framer gained them.
+			 * The Proxy is created lazily in mono_wasm_jit_instantiate_local, so on any worker that
+			 * instantiated a BATCHED module before it ever instantiated a standalone one, `{}` was supplied
+			 * and every `h.<index>` import was missing — a LinkError, i.e. the member silently falls back to
+			 * the interpreter and shows up only as a lower `registered` count. That is the exact failure
+			 * shape that is indistinguishable from a performance result.
+			 *
+			 * Same lazy creation, same per-worker cache, so ordering no longer matters. */
+			if (!Module.__wjHelperImports) {
+				var _wjHelperCache = {};
+				Module.__wjHelperImports = new Proxy ({}, { get: function (t, k) {
+					if (typeof k !== "string" || !/^[0-9]+$/.test (k)) return undefined;
+					var f = _wjHelperCache[k];
+					if (f === undefined) { f = wasmTable.get (Number (k)); _wjHelperCache[k] = f; }
+					return f;
+				} });
+			}
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14 }, h: Module.__wjHelperImports });
 			if (op) HEAPF64[op >> 3] = performance.now () - t0;
 			var k = 0;
 			var ef = null;
