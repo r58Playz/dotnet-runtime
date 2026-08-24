@@ -391,6 +391,226 @@ describe_nursery_ptr (char *ptr, gboolean need_setup)
 	}
 }
 
+/*
+ * SCANNED-REFERENCE CHECK (MONO_GC_DEBUG=check-scanned-refs).
+ *
+ * Names the object that holds a corrupt reference, at the moment the minor collector follows it.
+ *
+ * WHY NOT REUSE is_valid_object_pointer / bad_pointer_spew DIRECTLY. Those are built for the whole-heap check,
+ * which runs BEFORE a collection: the nursery arm goes through find_object_in_nursery_dump, which reads the
+ * valid_nursery_objects[] snapshot that setup_valid_nursery_objects() builds at that point. Called from the
+ * scan path they would consult a stale or absent snapshot mid-collection, with objects already forwarded, and
+ * answer nonsense. The whole-heap check is also O(heap) and on this workload (a ~2.7 GB heap) cannot finish a
+ * boot, which is why the failure has never been attributable.
+ *
+ * So this is deliberately RANGE-ONLY, which is sufficient for the failure being chased: a wasm
+ * "memory access out of bounds" means the address left linear memory, so a bounds test catches it, is O(1),
+ * needs no snapshot, and is correct at any point in a collection. It reads at most one word, and only after
+ * range-checking the address it is about to read -- so the check itself can never trap.
+ *
+ * Two distinct faults are reported separately, because they mean different things:
+ *   REF_OOR   the reference VALUE is not a plausible address -> whoever wrote this field wrote a non-pointer.
+ *   REF_VT    the reference is in range but the referent's vtable word is not -> the field points at memory
+ *             that is not an object (freed/reused nursery space, or an object whose header was overwritten).
+ */
+gboolean sgen_check_scanned_refs = FALSE;
+
+static gsize
+scanned_ref_memsz (void)
+{
+#if defined (HOST_BROWSER) && defined (__wasm__)
+	/* Same idiom as mini-wasm.c's wj_memsz: pages -> bytes, and never 0 (which would reject everything). */
+	gsize s = (gsize) __builtin_wasm_memory_size (0) << 16;
+	return s ? s : (gsize) -1;
+#else
+	return (gsize) -1;
+#endif
+}
+
+/*
+ * Context for a bad slot: the container's array length and the neighbouring words.
+ *
+ * This is the question the first round of reports could not answer. Every report was identical --
+ * value 0xfffffff8 (-8) at offset 5680 in a System.Object[] -- and the two candidate mechanisms are
+ * distinguished purely by where 5680 sits and what surrounds it:
+ *
+ *   index == max_length - 1, neighbours valid  -> a write one PAST the intended range (an overrun storing a
+ *                                                 count/sentinel just after the data)
+ *   index mid-array, neighbours also non-pointers -> a run of primitives in a reference array (type confusion)
+ *   index mid-array, neighbours all valid refs  -> a single targeted bad store
+ *
+ * max_length lives at MONO_STRUCT_OFFSET(MonoArray, max_length); reading it via the raw offset keeps sgen
+ * free of client type dependencies, and it is only read after a range check. Every read here is bounded, so
+ * the diagnostic cannot trap even on a wildly corrupt container.
+ */
+static void
+scanned_ref_context (GCObject *container, void **slot, gsize memsz)
+{
+	gsize base = (gsize) container;
+	gsize off = (gsize) ((char *) slot - (char *) container);
+	int i;
+
+	/* MonoObject{vtable,sync} + MonoArray{bounds,max_length}: max_length is the 4th pointer-sized word. */
+	gsize lenoff = 3 * SIZEOF_VOID_P;
+	if (base < memsz && memsz - base > lenoff + SIZEOF_VOID_P) {
+		guint32 len = *(guint32 *) (base + lenoff);
+		gsize dataoff = 4 * SIZEOF_VOID_P;
+		SGEN_LOG (0, "REF_CTX container %p offset %ld candidate max_length=%u (index %ld of %u; %s)",
+				container, (long) off, len,
+				(long) ((off - dataoff) / SIZEOF_VOID_P), len,
+				((off - dataoff) / SIZEOF_VOID_P) == (gsize) (len - 1) ? "LAST ELEMENT" : "mid-array");
+	}
+
+	/* Four words either side, so a run of primitives is distinguishable from one bad store.
+	 *
+	 * Each neighbour's CLASS is reported too, which is what identifies the table: an Object[] is typeless by
+	 * declaration, so the only way to learn what it holds is to ask the elements. Guarded in layers -- the
+	 * element value, then its vtable word, then the vtable's first word (MonoVTable.klass) -- because naming
+	 * a class dereferences vtable->klass->name and a diagnostic that traps is worse than no diagnostic. Only
+	 * a neighbour that passes all three is named; anything else prints its raw value alone. */
+	for (i = -4; i <= 4; i++) {
+		gsize a = base + off + (gsize) (i * (int) SIZEOF_VOID_P);
+		gsize v, vtw, klass;
+		const char *ns = NULL, *nm = NULL;
+
+		if (a < base || a >= memsz || memsz - a < SIZEOF_VOID_P)
+			continue;
+		v = (gsize) *(void **) a;
+		if (v && !(v & (SIZEOF_VOID_P - 1)) && v < memsz && memsz - v >= SIZEOF_VOID_P) {
+			vtw = (gsize) SGEN_POINTER_UNTAG_ALL (*(void **) v);
+			if (vtw && !(vtw & (SIZEOF_VOID_P - 1)) && vtw < memsz && memsz - vtw >= SIZEOF_VOID_P) {
+				klass = (gsize) *(void **) vtw;
+				if (klass && !(klass & (SIZEOF_VOID_P - 1)) && klass < memsz && memsz - klass >= SIZEOF_VOID_P) {
+					ns = sgen_client_vtable_get_namespace ((GCVTable) vtw);
+					nm = sgen_client_vtable_get_name ((GCVTable) vtw);
+				}
+			}
+		}
+		SGEN_LOG (0, "REF_CTX   [%+d] @%p = %p  %s%s%s", i, (void *) a, (void *) v,
+				ns ? ns : "(unnamed)", ns && *ns ? "." : "", nm ? nm : "");
+	}
+}
+
+void
+sgen_check_scanned_ref (GCObject *container, void **slot)
+{
+	gsize memsz = scanned_ref_memsz ();
+	gsize ref = (gsize) *slot;
+	gsize vtw;
+	GCVTable cvt;
+
+	if (!ref)
+		return;
+
+	/* A tagged (forwarded/pinned) reference is not what a field holds; only object starts are tagged. */
+	if (ref & (SIZEOF_VOID_P - 1) || ref >= memsz || memsz - ref < SIZEOF_VOID_P) {
+		cvt = SGEN_LOAD_VTABLE (container);
+		SGEN_LOG (0, "REF_OOR bad reference %p at offset %ld in object %p (%s.%s) — the value in this field is "
+				"not an address (memsz %p)", (void*) ref, (long) ((char*) slot - (char*) container),
+				container, sgen_client_vtable_get_namespace (cvt), sgen_client_vtable_get_name (cvt),
+				(void*) memsz);
+		broken_heap = TRUE;
+		scanned_ref_context (container, slot, memsz);
+		return;
+	}
+
+	/* Safe: the word at `ref` was just range-checked. Untag before judging it — a referent that is already
+	 * forwarded or pinned legitimately carries tag bits in its first word. */
+	vtw = (gsize) SGEN_POINTER_UNTAG_ALL (*(void**) ref);
+	if (!vtw || (vtw & (SIZEOF_VOID_P - 1)) || vtw >= memsz || memsz - vtw < SIZEOF_VOID_P) {
+		cvt = SGEN_LOAD_VTABLE (container);
+		SGEN_LOG (0, "REF_VT reference %p at offset %ld in object %p (%s.%s) points at a non-object — its "
+				"vtable word is %p (memsz %p)", (void*) ref, (long) ((char*) slot - (char*) container),
+				container, sgen_client_vtable_get_namespace (cvt), sgen_client_vtable_get_name (cvt),
+				(void*) vtw, (void*) memsz);
+		broken_heap = TRUE;
+		scanned_ref_context (container, slot, memsz);
+	}
+}
+
+/*
+ * STORE-SIDE guard: judge a reference as it is WRITTEN, instead of when the collector trips over it.
+ *
+ * check-scanned-refs answered "what is corrupt" -- a growing System.Object[] of
+ * System.Reflection.Emit.DynamicMethod, one element replaced by 0xfffffff8 (-8) or by a stale nursery address,
+ * mid-array, with valid neighbours. It cannot answer "who wrote it", because by the time a collection runs the
+ * writer is many thousands of frames gone.
+ *
+ * The interpreter is not the writer, and that is established rather than assumed: MINT_STELEM_REF runs
+ * mono_interp_isinst on every non-null value, which dereferences the value's vtable, so storing -8 through it
+ * would trap inside the type check instead of surviving to the next GC. That leaves the store paths with no
+ * type check at all -- Array.Copy on a reference array, a raw store through a byref, and native runtime code
+ * calling mono_array_setref_fast -- and every one of those passes through a write barrier. So the barriers are
+ * the chokepoint, and this is a guard on all five of them.
+ *
+ * The check is the same range-only plausibility test the scan-side guard uses, for the same reason: it reads at
+ * most one word and only after range-checking it, so the diagnostic cannot itself trap.
+ *
+ * On a hit it prints the wasm stack, which is the entire point -- that names the writer. Rate-limited, because
+ * a corrupt slot rewritten in a loop would otherwise produce a log too large to read; the one-line report is
+ * unlimited so the total count stays honest.
+ */
+#if defined (HOST_BROWSER) && defined (__wasm__)
+/* Defined in mini-wasm.c. Logs a JS `new Error().stack`, which is the only stack source here that resolves wasm
+ * frame names without a rebuild. Declared by hand rather than via a mini header: sgen deliberately does not
+ * depend on the JIT's headers, and one extern is a smaller violation than one include. */
+extern void mono_wasm_print_stack_trace (void);
+#else
+#define mono_wasm_print_stack_trace() do { } while (0)
+#endif
+
+gboolean sgen_check_stored_refs = FALSE;
+static int stored_ref_stacks = 0;
+
+/* Non-NULL values only; a null store is legal. Reports the referent's vtable word for the caller's message. */
+static gboolean
+stored_ref_is_bad (gsize v, gsize memsz, gsize *vtw_out)
+{
+	gsize vtw;
+
+	*vtw_out = 0;
+	if (!v)
+		return FALSE;
+	if ((v & (SIZEOF_VOID_P - 1)) || v >= memsz || memsz - v < SIZEOF_VOID_P)
+		return TRUE;
+	/* Safe: just range-checked. Untag -- a value copied out of a heap slot mid-collection can be forwarded. */
+	vtw = (gsize) SGEN_POINTER_UNTAG_ALL (*(void **) v);
+	*vtw_out = vtw;
+	return !vtw || (vtw & (SIZEOF_VOID_P - 1)) || vtw >= memsz || memsz - vtw < SIZEOF_VOID_P;
+}
+
+/**
+ * \param container the object being stored into, or NULL when the barrier only knows the slot address
+ * \param slot the destination
+ * \param value the reference being stored
+ * \param where which barrier caught it, for the report
+ */
+void
+sgen_check_stored_ref (GCObject *container, void **slot, void *value, const char *where)
+{
+	gsize memsz = scanned_ref_memsz ();
+	gsize v = (gsize) value, vtw = 0;
+
+	if (!stored_ref_is_bad (v, memsz, &vtw))
+		return;
+
+	if (container) {
+		GCVTable cvt = SGEN_LOAD_VTABLE (container);
+		SGEN_LOG (0, "STORED_REF %s wrote non-object %p (vtable word %p) at offset %ld into %p (%s.%s), memsz %p",
+				where, (void *) v, (void *) vtw, (long) ((char *) slot - (char *) container), container,
+				sgen_client_vtable_get_namespace (cvt), sgen_client_vtable_get_name (cvt), (void *) memsz);
+	} else {
+		SGEN_LOG (0, "STORED_REF %s wrote non-object %p (vtable word %p) into slot %p, memsz %p",
+				where, (void *) v, (void *) vtw, slot, (void *) memsz);
+	}
+
+	if (++stored_ref_stacks <= 12) {
+		if (container)
+			scanned_ref_context (container, slot, memsz);
+		mono_wasm_print_stack_trace ();
+	}
+}
+
 static gboolean
 is_valid_object_pointer (char *object)
 {

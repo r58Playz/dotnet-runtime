@@ -3111,6 +3111,17 @@ void
 mono_gc_wbarrier_arrayref_copy_internal (gpointer dest_ptr, gconstpointer src_ptr, int count)
 {
 	HEAVY_STAT (++stat_wbarrier_arrayref_copy);
+
+	/* Before the nursery early-out, so a bulk copy into a nursery array is checked too. This is the highest
+	 * suspect of the five barriers: Array.Copy/Array.Resize on a reference array lands here, it does no
+	 * per-element type check, and the corrupt container is an Object[] that GROWS -- i.e. one that is
+	 * repeatedly reallocated and bulk-copied. */
+	if (G_UNLIKELY (sgen_check_stored_refs)) {
+		int i;
+		for (i = 0; i < count; ++i)
+			sgen_check_stored_ref (NULL, (void**)dest_ptr + i, *((void**)src_ptr + i), "arrayref_copy");
+	}
+
 	/*This check can be done without taking a lock since dest_ptr array is pinned*/
 	if (ptr_in_nursery (dest_ptr) || count <= 0) {
 		mono_gc_memmove_aligned (dest_ptr, src_ptr, count * sizeof (gpointer));
@@ -3143,6 +3154,14 @@ mono_gc_wbarrier_generic_nostore_internal (gpointer ptr)
 	HEAVY_STAT (++stat_wbarrier_generic_store);
 
 	obj = *(gpointer*)ptr;
+
+	/* This barrier runs AFTER its caller's store, so `obj` is the value that was just written -- which makes
+	 * this the arm that sees AOT and JIT-emitted reference stores, whose barrier takes only the slot address
+	 * and never the value. Placed before the binary-protocol line below, which does an unguarded LOAD_VTABLE
+	 * (obj) and would therefore trap on exactly the value being hunted, under a protocol build. */
+	if (G_UNLIKELY (sgen_check_stored_refs))
+		sgen_check_stored_ref (NULL, (void**)ptr, obj, "generic_nostore");
+
 	if (obj)
 		sgen_binary_protocol_wbarrier (ptr, obj, (gpointer)LOAD_VTABLE (obj));
 
@@ -3166,6 +3185,11 @@ mono_gc_wbarrier_generic_nostore_internal (gpointer ptr)
 void
 mono_gc_wbarrier_generic_store_internal (void volatile* ptr, GCObject* value)
 {
+	/* Before the store, so the report names the value the caller intended rather than whatever the slot ends up
+	 * holding. This is the arm that native runtime code and reflection use. */
+	if (G_UNLIKELY (sgen_check_stored_refs))
+		sgen_check_stored_ref (NULL, (void**)ptr, value, "generic_store");
+
 	SGEN_LOG (8, "Wbarrier store at %p to %p (%s)", ptr, value, value ? sgen_client_vtable_get_name (SGEN_LOAD_VTABLE (value)) : "null");
 	SGEN_UPDATE_REFERENCE_ALLOW_NULL ((void*)ptr, value); // FIXME volatile
 	if (ptr_in_nursery (value) || sgen_concurrent_collection_in_progress)
@@ -3182,6 +3206,9 @@ void
 mono_gc_wbarrier_generic_store_atomic_internal (gpointer ptr, GCObject *value)
 {
 	HEAVY_STAT (++stat_wbarrier_generic_store_atomic);
+
+	if (G_UNLIKELY (sgen_check_stored_refs))
+		sgen_check_stored_ref (NULL, (void**)ptr, value, "generic_store_atomic");
 
 	SGEN_LOG (8, "Wbarrier atomic store at %p to %p (%s)", ptr, value, value ? sgen_client_vtable_get_name (SGEN_LOAD_VTABLE (value)) : "null");
 
@@ -3828,6 +3855,10 @@ sgen_gc_init (void)
 				sgen_nursery_clear_policy = CLEAR_AT_TLAB_CREATION_DEBUG;
 			} else if (!strcmp (opt, "check-scan-starts")) {
 				do_scan_starts_check = TRUE;
+			} else if (!strcmp (opt, "check-scanned-refs")) {
+				sgen_check_scanned_refs = TRUE;
+			} else if (!strcmp (opt, "check-stored-refs")) {
+				sgen_check_stored_refs = TRUE;
 			} else if (!strcmp (opt, "verify-nursery-at-minor-gc")) {
 				do_verify_nursery = TRUE;
 			} else if (!strcmp (opt, "check-concurrent")) {
@@ -3886,6 +3917,8 @@ sgen_gc_init (void)
 				fprintf (stderr, "  check-nursery-untag\n");
 				fprintf (stderr, "  verify-before-collections\n");
 				fprintf (stderr, "  verify-nursery-at-minor-gc\n");
+				fprintf (stderr, "  check-scanned-refs\n");
+				fprintf (stderr, "  check-stored-refs\n");
 				fprintf (stderr, "  dump-nursery-at-minor-gc\n");
 				fprintf (stderr, "  disable-minor\n");
 				fprintf (stderr, "  disable-major\n");
