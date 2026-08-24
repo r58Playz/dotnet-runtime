@@ -82,6 +82,11 @@ newer, so re-check if something surprising turns up).
 **The bottleneck is the call boundary.** The guards, spills and memory traffic are downstream of it. Judge a
 proposed change by whether it removes calls, shortens prologues, or shortens live ranges across calls.
 
+Note what that does NOT imply. Mono's inliner is the only inliner in the pipeline, but raising its limit does
+not remove calls here — the caller absorbs the callee's body *including the callee's own call sites*, while the
+callee stays separately JITted because it is independently hot. Measured: +4.4% body opcodes, +1.0% calls per
+method. "More inlining" and "fewer calls" are not the same thing on a one-method-per-module tier.
+
 ## Closed leads — do not re-run these
 
 | lead | why it is closed |
@@ -95,6 +100,7 @@ proposed change by whether it removes calls, shortens prologues, or shortens liv
 | `__<>DynamicBinder__` receiver castclass | load-bearing — the adapter's cast *is* the type check; removing it turns a ClassCastException into memory corruption |
 | shrinking `__<>MHC` stubs as a ~6% lever | their `call_indirect` density is cold alternative dispatch routes, one of which runs per invoke |
 | `MONO_WASM_JIT_INLINE_ILOFS=1` | 9.8% worse on p50 at ±1.1% |
+| raising `MONO_INLINELIMIT` above the default 20 | closed on mechanism: bodies +3.5-4.4%, saturating by 60, and calls/method goes UP 1.0% (the caller absorbs the callee's own calls while the callee stays separately JITted). Costs nothing at boot; buys nothing measurable |
 | ikvmc static compilation of Minecraft+Fabric | out of scope on product grounds: runtime version loading and drop-in mods are requirements |
 
 ## Measurement discipline
