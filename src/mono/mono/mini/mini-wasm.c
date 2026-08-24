@@ -40,6 +40,42 @@ void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-i
 #else
 #define WJ_KEEPALIVE
 #endif
+/* ============================================================================================
+ * HOW TO READ THE COMMENTS BELOW  (see CLAUDE.md at the repo root for the full rules)
+ * ============================================================================================
+ *
+ * This emitter carries a lot of recorded measurement, because most of its shape was decided by A/B
+ * rather than by argument. Three conventions make that usable instead of misleading:
+ *
+ *  1. A KNOB'S DEFAULT IS STATED ONCE, AT ITS INITIALISER, AND NOWHERE ELSE. If a comment somewhere
+ *     else tells you what a default is, it is stale by construction -- do not add one. Six comments
+ *     here once said "DEFAULT OFF" beside an initialiser holding 1, which is how the inline-AOT path
+ *     (~90k calls per frame) came to read as inactive.
+ *
+ *  2. A NUMBER WITHOUT A WORKLOAD IS NOT A RESULT. Two different workloads were used: the jbox2d
+ *     fixed-work kernel (early; homogeneous, one number, low variance) and full Minecraft (current;
+ *     three phases, ~5% measurement floor, and a thermally throttled box). A percentage measured on
+ *     jbox2d says nothing about Minecraft and vice versa, so every measurement below should name its
+ *     workload. Where one does not, treat it as unverified history rather than as a current fact.
+ *
+ *  3. AN EXPERIMENT THAT FAILED IS WORTH MORE THAN ONE THAT SUCCEEDED, and is kept deliberately --
+ *     see MONO_WASM_JIT_INLINE_ILOFS below for the model: hypothesis, measured result, and the
+ *     general lesson. Deleting those invites the next reader to re-run them. What must NOT survive is
+ *     an argument for a value the code no longer holds, or a number a later round retracted.
+ *
+ * Two facts about V8 are load-bearing for everything here and are cheap to re-check in
+ * ~/Documents/ikvm-wasm/chromium/v8 rather than re-derive:
+ *
+ *  * `local.get` / `local.set` / `local.tee` emit NO instructions -- they are reads and writes of
+ *    Turboshaft's SSA environment (src/wasm/turboshaft-graph-interface.cc, LocalGet/LocalSet/LocalTee).
+ *    Local COUNT and local reuse are therefore a wire-size question only. What costs is how many
+ *    values are live across a call.
+ *  * V8 cannot inline anything this emitter produces. Inlining candidates come from the module's own
+ *    call sites, and an imported function has wire_byte_size 0 and so scores 0
+ *    (src/wasm/inlining-tree.h). One method per module means every call stays a real call, forever.
+ *    That is why mono's own inliner, and the cost of the call sequence itself, are the levers here.
+ * ============================================================================================ */
+
 /* The runtime wasm-JIT emit result (slots / bytes / bail / retriable / blockers) is no longer relayed
  * through thread-locals: the emitter writes it onto the per-compile cfg->wasm_jit_result (see
  * MonoWasmJitResult in mini.h) and mono_wasm_force_compile copies it out after the compile returns.
@@ -89,8 +125,18 @@ int mono_wasm_jit_batch_settle = 128;
 int mono_wasm_jit_batch_min = 16;
 int mono_wasm_jit_batch_max = 384;
 int mono_wasm_jit_batch_bytes = 786432;
-int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC (1 = monomorphic/legacy). Clamped [1,8]. 2 captures the ~63% of the miss population that are 2-type sites (arity depth-1) which a 1-way IC gets 0% of. */
-int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inline AOT-vcall IC (1 = monomorphic first-wins/legacy). Clamped [1,8]. 2 captures the AOT-backed 2-type sites (arity depth-0 once VCALL_WAYS>=2): the loser vtable of a 2-way AOT site is stuck reaching the resolve helper behind the 1-entry cache. */
+int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC. Clamped [1,8].
+ * DEFAULT 1, and that is measured, not conservative: on the plateau instrument (Minecraft, 2026-08, no-walk,
+ * 240s cooldown per arm) 4 -> 2 -> 1 improves MONOTONICALLY -- 4 vs 1 is fps 23.7 -> 26.0, msFrame 42.2 -> 38.5 ms,
+ * p90 49.7 -> 45.5 ms. Each way adds a guard to EVERY dispatch (~350M per in-game window) to catch misses that
+ * are ~1% of that traffic, and MethodHandle/delegate stubs carry the chain unrolled (an `object(object)` MHC
+ * adapter measured 1648 B at 4 ways). ic_autosize can only shrink a site the interpreter observed, and
+ * runtime-generated stubs never are, so they keep the full width. Costs world generation ~9%. */
+int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inline AOT-vcall IC. Clamped [1,8].
+ * DEFAULT 1. ways>1 is what makes the emitter emit the outlined `vcall_aot_pic_lookup` helper call at every
+ * AOT-IC site, and an outlined call on a dispatch path costs more here than the code it saves. Measured vs 4
+ * (Minecraft plateau, 2026-08, 2 rounds): p90 -12.8%, mean frame -12.0%, fps +13.6%. Costs boot: classload
+ * +5.0%, resources +7.1% -- fewer ways means more misses while receivers are still being discovered. */
 int mono_wasm_jit_vcall_shared_miss_enabled = 1; /* MONO_WASM_JIT_VCALL_SHARED_MISS: one signature-neutral cold miss stub using a lazy GC-pinned worker frame */
 int mono_wasm_jit_vcall_slim = 1; /* MONO_WASM_JIT_VCALL_SLIM: replace a perfectly-monomorphic profiled site's whole PIC/AOT diamond with one guarded admitted f-slot call + the shared cold miss. */
 int mono_wasm_jit_structured_cfg = 1; /* MONO_WASM_JIT_STRUCTURED_CFG: elide the dispatch br_table for verified forward CFGs and single-entry natural loops; irregular/nested shapes retain the universal dispatcher. */
@@ -149,9 +195,9 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_over_aot; const char *oa = g_getenv ("MONO_WASM_JIT_OVER_AOT"); mono_wasm_jit_over_aot = (oa && *oa && *oa != '0') ? 1 : 0; } /* experimental second compiler tier for hot AOT bodies; safe fallback remains the AOT entry */
 	{ extern int mono_wasm_jit_island; const char *il = g_getenv ("MONO_WASM_JIT_ISLAND"); mono_wasm_jit_island = (il && *il && *il == '0') ? 0 : 1; } /* 0 = no eager island formation (bottom-up retry only) */
 	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia) ? (*ia != '0') : 1; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). 1 = on, default 0 = off. */
-	{ extern int mono_wasm_jit_ldaddr_vtype; const char *lv = g_getenv ("MONO_WASM_JIT_LDADDR_VTYPE"); mono_wasm_jit_ldaddr_vtype = (lv && *lv) ? (*lv != '0') : 1; } /* OP_LDADDR of NON-SCALAR ref-free local via a full-size addr-frame slot. DEFAULT OFF (exonerated re: corruption but kept for repro parity). */
-	{ extern int mono_wasm_jit_vtype_scalar_ref; const char *vr = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR_REF"); mono_wasm_jit_vtype_scalar_ref = (vr && *vr) ? (*vr != '0') : 1; } /* ref-etype scalar-vtype arg via a GC-scanned ref-shadow slot; GC-critical, default OFF */
-	{ extern int mono_wasm_jit_vtype_scalar; const char *vs = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR"); mono_wasm_jit_vtype_scalar = (vs && *vs) ? (*vs != '0') : 1; } /* pass a BYVAL ref-free scalar-vtype call arg as its single-field etype scalar (LLVMArgWasmVtypeAsScalar ABI). Default OFF; needs LDADDR_VTYPE. */
+	{ extern int mono_wasm_jit_ldaddr_vtype; const char *lv = g_getenv ("MONO_WASM_JIT_LDADDR_VTYPE"); mono_wasm_jit_ldaddr_vtype = (lv && *lv) ? (*lv != '0') : 1; } /* OP_LDADDR of NON-SCALAR ref-free local via a full-size addr-frame slot. Exonerated re: corruption; kept gated for repro parity. */
+	{ extern int mono_wasm_jit_vtype_scalar_ref; const char *vr = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR_REF"); mono_wasm_jit_vtype_scalar_ref = (vr && *vr) ? (*vr != '0') : 1; } /* ref-etype scalar-vtype arg via a GC-scanned ref-shadow slot; GC-critical. */
+	{ extern int mono_wasm_jit_vtype_scalar; const char *vs = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR"); mono_wasm_jit_vtype_scalar = (vs && *vs) ? (*vs != '0') : 1; } /* pass a BYVAL ref-free scalar-vtype call arg as its single-field etype scalar (LLVMArgWasmVtypeAsScalar ABI). Needs LDADDR_VTYPE. */
 	{ extern int mono_wasm_jit_vtype_byaddr; const char *vb = g_getenv ("MONO_WASM_JIT_VTYPE_BYADDR"); mono_wasm_jit_vtype_byaddr = (vb && *vb) ? (*vb != '0') : 1; } /* multi-field/large vtype args as i32 pointer to a caller-owned C-stack copy (ArgValuetypeAddrOnStack). Default ON. Read ONCE (process-lifetime): f_sig_id fingerprints must not split mid-process. */
 	{ extern int mono_wasm_jit_vret; const char *vr2 = g_getenv ("MONO_WASM_JIT_VRET"); mono_wasm_jit_vret = (vr2 && *vr2) ? (*vr2 != '0') : 1; } /* vtype returns via hidden vret pointer (trailing i32 param internally). Default ON. Same process-lifetime rule. */
 	{ extern int mono_wasm_jit_byref; const char *br = g_getenv ("MONO_WASM_JIT_BYREF"); mono_wasm_jit_byref = (br && *br) ? (*br != '0') : 1; } /* lower calls whose callee sig has byref args/ret through the residual + vcall fallback instead of bailing the caller (-7). Default ON; =0 reverts to the pre-hardening bails for A/B. */
@@ -182,7 +228,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_block_force; const char *bf = g_getenv ("MONO_WASM_JIT_BLOCK_FORCE"); mono_wasm_jit_block_force = (bf && *bf) ? atoi (bf) : 4; }
 	{ extern int mono_wasm_jit_hot_root; const char *hr = g_getenv ("MONO_WASM_JIT_HOT_ROOT"); mono_wasm_jit_hot_root = (hr && *hr && *hr != '0') ? 1 : 0; } /* own-threshold island = promoted root, 0=off */
 	{ extern int mono_wasm_jit_vcall_aot; const char *va = g_getenv ("MONO_WASM_JIT_VCALL_AOT"); mono_wasm_jit_vcall_aot = (va && *va) ? (*va != '0') : 1; } /* fast AOT-vcall dispatch: 0=off (residual) */
-	{ extern int mono_wasm_jit_vcall_aot_ic; const char *vc = g_getenv ("MONO_WASM_JIT_VCALL_AOT_IC"); mono_wasm_jit_vcall_aot_ic = (vc && *vc) ? (*vc != '0') : 1; } /* per-call-site AOT-vcall IC; needs VCALL_INLINE_IC+VCALL_AOT; default off */
+	{ extern int mono_wasm_jit_vcall_aot_ic; const char *vc = g_getenv ("MONO_WASM_JIT_VCALL_AOT_IC"); mono_wasm_jit_vcall_aot_ic = (vc && *vc) ? (*vc != '0') : 1; } /* per-call-site AOT-vcall IC; needs VCALL_INLINE_IC+VCALL_AOT. */
 #ifdef HOST_BROWSER
 	/* These three are DEBUG store/GC guards whose globals + runtime-check emission are HOST_BROWSER-only
 	 * (they insert per-store checks that only do anything when the JITted code actually RUNS). The offline
@@ -265,10 +311,16 @@ int mono_wasm_jit_helper_imports = 1;
  * shows up as fewer `registered` methods + a WJC_INVALID bump rather than as a crash. */
 int mono_wasm_jit_aot_imports = 1;
 /* MONO_WASM_JIT_MAX_HIMP: how many distinct (table index, functype) helper/AOT-callee imports one module may
- * declare before further direct calls fall back to call_indirect. Was a compile-time 32, then 64, then 192;
- * raising 64 -> 192 alone moved plateau fps 23.23 -> 24.12 (+3.9%, n=6 vs 3), because AOT_IMPORTS made the
- * array far busier than the ~25 fixed runtime helpers it was originally sized for. A knob so the cap can be
- * bisected rather than guessed; bounded by WJ_MAX_HELPER_IMPORTS, which is only the array size. */
+ * declare before further direct calls fall back to call_indirect. Was a compile-time 32, then 64, then 192, because
+ * AOT_IMPORTS made the array far busier than the ~25 fixed runtime helpers it was originally sized for.
+ *
+ * THE CAP IS NOT BINDING and raising it buys nothing. A cross-binary reading once suggested 64 -> 192 was
+ * worth +3.9% fps; the within-binary A/B that this knob exists to make possible put every metric inside noise
+ * with the direction if anything favouring the SMALLER cap, so that +3.9% was noise (n=3 vs 6 at 5-9% spread
+ * is exactly the regime that manufactures a 4% difference). Counting imports in the hot set directly agrees:
+ * max 30 declared in any hot module, median 3, against a cap of 192. Kept as a knob because the cap could
+ * start binding if the emitter ever imports per-callee rather than per-helper. Bounded by
+ * WJ_MAX_HELPER_IMPORTS, which is only the array size. */
 int mono_wasm_jit_max_himp = 192;
 /* MONO_WASM_JIT_INLINE_ILOFS: store the per-basic-block IL offset INLINE (3 wasm ops against a method-long
  * local holding this activation's MonoMethodILState) instead of calling mono_wasm_jit_set_il_offset.
@@ -388,7 +440,7 @@ int mono_wasm_jit_residual_mode = 1;
 void mono_wasm_jit_check_store (guint8 *addr, int kind);
 void mono_wasm_jit_check_store (guint8 *addr, int kind) { (void) addr; (void) kind; }
 #endif
-int mono_wasm_jit_inline_aot = 1;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the inline direct same-ABI AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry/frame/LMF) instead of the residual, for AOT'd callees. Build 1 = no wasm-EH yet (test non-throwing callees). default off. */
+int mono_wasm_jit_inline_aot = 1;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the inline direct same-ABI AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry/frame/LMF) instead of the residual, for AOT'd callees. Build 1 = no wasm-EH yet (test non-throwing callees). Default ON, and hot: ~90k inline-AOT calls per frame. */
 /* rgctx handling: methods that call a generic-shared callee needing a runtime generic context
  * (cfg->uses_rgctx_reg) route each such call through the interp residual (which derives the
  * context from the concrete inflated call->method — both interp_entry and do_jit_call-via-gsharedvt_out
@@ -402,8 +454,8 @@ int mono_wasm_jit_inline_aot = 1;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the in
  * extra arg/rgctx (cinfo->extra_arg in llvm_only, or the matching fallback recovery below);
  * indirect/virtual rgctx calls still bail (untested shape). */
 int mono_wasm_jit_marshal_wrappers = 0; /* MONO_WASM_JIT_MARSHAL_WRAPPERS: JIT the managed<->native marshalling wrappers (managed-to-native icall/pinvoke, native-to-managed, runtime-invoke). Default 0 = bail them to the interpreter. Their marshalling IR (LMF save/restore, the native fptr baked as an iconst, handle/byref marshal stores, coop-GC transitions) produces a ref store through a garbage/stale object base that the isref classifier + raw membase-store lowering mishandle -> wild store -> intermittent heap/metadata corruption (confirmed live: System.Reflection.MonoMethodInfo:get_method_attributes -> OBJGUARD kind 2 -> AIOOBE / mono_metadata_token_table assert). =1 reverts (buggy) for A/B. The synchronized (SYNCHRONIZED/OTHER) wrapper path is unaffected. */
-int mono_wasm_jit_ldaddr_vtype = 1;   /* MONO_WASM_JIT_LDADDR_VTYPE: extend OP_LDADDR to NON-SCALAR ref-free valuetype locals via a full-size addr-frame slot. DEFAULT OFF (exonerated: jit17 corrupted with it off; kept gated for binary/repro parity). */
-int mono_wasm_jit_vtype_scalar_ref = 1; /* MONO_WASM_JIT_VTYPE_SCALAR_REF: extend VTYPE_SCALAR to a scalar-vtype whose SINGLE field is a managed REFERENCE (e.g. RuntimeTypeHandle{RuntimeType}). Backed by a GC-SCANNED ref-shadow-stack slot (not the un-scanned addr frame): OP_LDADDR yields refbase+slot*4 so the field store/load track the ref as a conservative pinning root, and the store's inline card-barrier marks a HARMLESS card (wasm32 has no overlapping cards — the 8MB table covers the whole 32-bit space, so a non-heap mark is in-bounds and never scanned). GC-CRITICAL: validate in-browser with STOREGUARD/OBJGUARD. Default OFF. */
+int mono_wasm_jit_ldaddr_vtype = 1;   /* MONO_WASM_JIT_LDADDR_VTYPE: extend OP_LDADDR to NON-SCALAR ref-free valuetype locals via a full-size addr-frame slot. Default ON (exonerated: jit17 corrupted with it OFF; kept gated for binary/repro parity). */
+int mono_wasm_jit_vtype_scalar_ref = 1; /* MONO_WASM_JIT_VTYPE_SCALAR_REF: extend VTYPE_SCALAR to a scalar-vtype whose SINGLE field is a managed REFERENCE (e.g. RuntimeTypeHandle{RuntimeType}). Backed by a GC-SCANNED ref-shadow-stack slot (not the un-scanned addr frame): OP_LDADDR yields refbase+slot*4 so the field store/load track the ref as a conservative pinning root, and the store's inline card-barrier marks a HARMLESS card (wasm32 has no overlapping cards — the 8MB table covers the whole 32-bit space, so a non-heap mark is in-bounds and never scanned). GC-CRITICAL: validate in-browser with STOREGUARD/OBJGUARD. */
 int mono_wasm_jit_vtype_scalar = 1;   /* MONO_WASM_JIT_VTYPE_SCALAR: pass a BYVAL scalar-vtype call arg (mini_wasm_is_scalar_vtype: struct <=8 bytes, one field) as its single-field SCALAR — the ABI the AOT callee was compiled with (LLVMArgWasmVtypeAsScalar). The vtype value is addr-frame-backed (LDADDR_VTYPE), so we load its field (offset 0) from the addr-frame slot and pass that. Ref-free etype only; the ref-etype variant is gated separately (VTYPE_SCALAR_REF, GC-scanned ref-shadow slot). Requires LDADDR_VTYPE. */
 int mono_wasm_jit_vtype_byaddr = 1;   /* MONO_WASM_JIT_VTYPE_BYADDR: multi-field/large value-type args as an i32 pointer to a caller-owned copy (native ArgValuetypeAddrOnStack). The copy lives in the caller's C-stack frame — conservatively GC-scanned, so ref-bearing structs (IKVM MHA`8) pin their referents exactly like AOT'd structs in C locals. Classification is process-lifetime-constant (read once here) so f_sig_id fingerprints can't split across an in-process flag flip. */
 int mono_wasm_jit_vret = 1;           /* MONO_WASM_JIT_VRET: value-type returns via a hidden vret pointer — internally a TRAILING i32 param (the native AOT ABI puts vret FIRST; the inline-AOT call path reorders). Same process-lifetime rule as VTYPE_BYADDR. */
@@ -512,7 +564,7 @@ int mono_wasm_jit_hot_root = 0; /* MONO_WASM_JIT_HOT_ROOT=1 — a method crossin
  * -> do_jit_call: double arg-marshalling + an LMF frame). Default 0; mirrors INLINE_AOT's EH handling
  * (resume-state try/catch, or bare under CPPEH). Off-by-default so the validated residual path is unchanged. */
 int mono_wasm_jit_vcall_aot = 1;
-int mono_wasm_jit_vcall_aot_ic = 1;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-site inline cache for AOT-backed virtual targets — skip scratch()+resolve_fslot()+aot_target() (3 C calls/vcall) on a monomorphic hit, call_indirect the cached AOT body directly. Needs VCALL_INLINE_IC + VCALL_AOT. Default OFF; hottest-path + MT — validate in-browser. */
+int mono_wasm_jit_vcall_aot_ic = 1;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-site inline cache for AOT-backed virtual targets — skip scratch()+resolve_fslot()+aot_target() (3 C calls/vcall) on a monomorphic hit, call_indirect the cached AOT body directly. Needs VCALL_INLINE_IC + VCALL_AOT. Hottest-path + MT — validate in-browser after any change. */
 /* MONO_WASM_JIT_VCALL_INLINE_IC: the inline monomorphic vcall IC fast-path (call_indirect the cached
  * f-slot in wasm, skipping the scratch() + resolve_fslot C helpers on a hit — the profiled #1 game-thread
  * cost, vcall_resolve_fslot ~17%). DEFAULT OFF; =1 enables. NOW MT-SAFE on threaded builds: the original
@@ -5145,7 +5197,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * struct in a C local. Still bailed: ref/byref SCALAR locals (a lone ref slot wants the ref-shadow
 	 * region, only the scalar-ref vtype sentinel -2 does that today) and address-taken ARGUMENTS (still
 	 * in a wasm param). Anything unsupported bails the whole method (the prior behaviour for any
-	 * OP_LDADDR). MONO_WASM_JIT_LDADDR=0 disables the pass so OP_LDADDR bails as before.
+	 * OP_LDADDR). There is no knob for the pass itself -- it always runs; MONO_WASM_JIT_LDADDR_VTYPE and
+	 * MONO_WASM_JIT_LDADDR_VTYPE_REF gate only which SHAPES it accepts.
 	 * NB: NOT HOST_BROWSER-gated. This is a pure compile-time classification pass (it assigns addrslot
 	 * offsets / decides which ldaddr shapes are supported); the addr-frame runtime helpers it feeds
 	 * (the C-stack frame prologue, baked by the emit below) is HOST_BROWSER-gated separately. Un-gating it
@@ -6905,10 +6958,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * a later bitmap realloc/capacity growth visible with no stale-pointer window. */
 	if (mono_wasm_jit_vcall_inline_ic && has_vcall) {
 		extern int mono_wasm_jit_delegate_local_pic;
-		/* METHOD-LONG LOCALS ARE NOT FREE. The census of V8's x86 output attributes 24.2% of emitted
-		 * instructions to TurboFan's OWN register spills (rbp/rsp traffic) — the direct symptom of handing it
-		 * more simultaneously-live values than it has registers. Every local this prologue keeps alive for the
-		 * whole body competes with the method's real values, so the set is now the minimum:
+		/* METHOD-LONG LIVE RANGES ARE NOT FREE -- the LOCALS are.
+		 *
+		 * Be precise about which, because the two suggest opposite work. A wasm local is free: V8's
+		 * `LocalGet` is `result->op = ssa_env_[imm.index]` and `LocalSet` is `ssa_env_[imm.index] = value.op`
+		 * (v8/src/wasm/turboshaft-graph-interface.cc:1030-1043), so local ops emit NO instructions and
+		 * renaming or reusing local slots cannot change anything at runtime (which is why MONO_WASM_JIT_COALESCE
+		 * measured inert). What costs is the DATAFLOW: a value that is live across other calls has to survive
+		 * them, and the census of V8's x86 output attributes 24.2% of emitted instructions to TurboFan's own
+		 * register spills (rbp/rsp traffic).
+		 *
+		 * So the thing to minimise is not the local count but how many values this prologue keeps alive for the
+		 * whole body, each competing with the method's real values. That set is now the minimum:
 		 *   - s.l / s.c (slot-live bitmap) are read ONLY by the shared WjDelegateIC arm, so they are not
 		 *     fetched at all when the worker-local delegate PIC is on (the default) — 2 locals reclaimed;
 		 *   - the cap ADDRESSES are consumed immediately to load their values, so they never need a local at
@@ -8596,7 +8657,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						extern int mono_wasm_jit_residual_mode;
 						int rm = mono_wasm_jit_residual_mode;
 						/* record the blocking callee on the cfg result so the trigger can eagerly form the island */
-						/* rgctx calls (MONO_WASM_JIT_RGCTX): if INLINE_AOT couldn't take it (gsharedvt-variable, or
+						/* rgctx calls: if INLINE_AOT couldn't take it (gsharedvt-variable, or
 						 * inline-aot off/byref), keep the method JITted by routing this one call through the residual
 						 * (mono_wasm_jit_call_interp derives the context from the concrete callee) rather than bailing
 						 * the whole method at the RESIDUAL=0 gate. The rgctx call is the cold catch-block edge; the hot
