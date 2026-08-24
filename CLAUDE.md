@@ -141,3 +141,17 @@ captures:
 `scratchpad/` is excluded via `.git/info/exclude`, not `.gitignore` — it holds tens of GB of captures and must
 never be added. Chrome profile dumps are ~1 GB each and jitdumps ~4 GB; keep the newest of each kind and
 delete the rest. Do not commit `*.orig-backup` files.
+
+**`scratchpad/mcsr/seed` is load-bearing and is NOT crash-harness leftovers.** It is a ~690 MB browser
+profile holding Minecraft 1.16.1 + Fabric, the mods, `options.txt` and the "New World" save in OPFS.
+`lib/mcdrive.mjs`'s `seedProfile()` reflink-copies it for every run; without it the app re-downloads
+Minecraft *inside the boot phase* and boot measures the network. It is easy to mistake for junk because it
+sits in the otherwise-dead `mcsr/` directory — it was in fact deleted once during a cleanup.
+
+It can be rebuilt: `node scratchpad/wj/seedbuild.mjs` extracts
+`ikvmcraft/frontend/public/ikvmcraft-mcsrranked.tar` into OPFS from a page on the dev server's origin
+(`/vite.svg`, deliberately not the app — `main.tsx`'s `mount()` starts the download at load and would race
+the extraction). Takes ~1 minute; the dev server must be up.
+
+Note that everything in `scratchpad/wj/` — the whole harness and every instrument — is untracked for the
+same reason the captures are. Treat the tools as valuable and the data as disposable.
