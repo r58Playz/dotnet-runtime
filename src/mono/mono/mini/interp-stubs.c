@@ -252,6 +252,14 @@ stub_compile_interp_method (MonoMethod *method, MonoError *error)
 	return NULL;
 }
 
+static int
+stub_find_il_clause_for_offset (MonoMethod *method, int il_offset)
+{
+	/* -2 means "no cached ranges, parse the header", which is the correct answer for a build with no
+	 * interpreter and is reachable rather than impossible -- so it returns instead of asserting. */
+	return -2;
+}
+
 #undef MONO_EE_CALLBACK
 #define MONO_EE_CALLBACK(ret, name, sig) stub_ ## name,
 

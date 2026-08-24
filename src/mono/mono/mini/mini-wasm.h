@@ -204,6 +204,8 @@ enum {
 	 * silently under-counts whenever the table is full. EVICT counts adds that displaced an older entry,
 	 * i.e. tells you directly whether WJ_LCSE_LOADS is the binding constraint. */
 	WJC_LCSE_LOADS_SEEN, WJC_LCSE_ADDS, WJC_LCSE_HITS, WJC_LCSE_EVICT,
+	/* residual calls that entered the callee's own JITted e-slot directly, skipping interp_entry */
+	WJC_ESLOT_RESIDUAL,
 	WJC_MAX
 };
 

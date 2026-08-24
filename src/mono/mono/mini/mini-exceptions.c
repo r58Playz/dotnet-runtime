@@ -462,20 +462,36 @@ arch_unwind_frame (MonoJitTlsData *jit_tls,
 				mono_error_assert_ok (error);
 				g_assert (frame->ji);
 
-				MonoMethodHeader *header = mono_method_get_header_checked (frame->method, error);
-				mono_error_assert_ok (error);
-
-				/* Find try clause containing IL offset */
+				/* Find try clause containing IL offset.
+				 *
+				 * Ask the interpreter first, which snapshots the IL try ranges at transform time. The header
+				 * parse below is the fallback, and it is worth avoiding: mono_method_get_header_checked
+				 * "is allocated from malloc memory ... the user needs to free it" (loader.c), and
+				 * mono_metadata_free_mh then frees the header AND one MonoType per local. That is several
+				 * malloc/free pairs PER FRAME PER UNWIND, and on wasm every one of them contends the single
+				 * dlmalloc lock across 16+ pthreads.
+				 *
+				 * Measured on this workload's boot: v8::base::Mutex::Lock is 9.27% of samples, 94.8% of those
+				 * also contain dlmalloc/dlfree, 96.6% are under exception handling, and 83.0% contain
+				 * mono_method_get_header_internal -- i.e. this line. It was the single largest identified boot
+				 * cost, and it is pure bookkeeping: only try_offset/try_len are ever read from the header. */
 				int il_offset = ((MonoMethodILState*)frame->il_state)->il_offset;
-				int clause_index = -1;
-				for (guint i = 0; i < header->num_clauses; ++i) {
-					if (GINT_TO_UINT32(il_offset) >= header->clauses [i].try_offset && GINT_TO_UINT32(il_offset) < header->clauses [i].try_offset + header->clauses [i].try_len) {
-						clause_index = i;
-						break;
-					}
-				}
+				int clause_index = mini_get_interp_callbacks ()->find_il_clause_for_offset (frame->method, il_offset);
 
-				mono_metadata_free_mh (header);
+				if (clause_index == -2) {
+					MonoMethodHeader *header = mono_method_get_header_checked (frame->method, error);
+					mono_error_assert_ok (error);
+
+					clause_index = -1;
+					for (guint i = 0; i < header->num_clauses; ++i) {
+						if (GINT_TO_UINT32(il_offset) >= header->clauses [i].try_offset && GINT_TO_UINT32(il_offset) < header->clauses [i].try_offset + header->clauses [i].try_len) {
+							clause_index = i;
+							break;
+						}
+					}
+
+					mono_metadata_free_mh (header);
+				}
 
 				if (clause_index == -1) {
 					frame->native_offset = 0xffffff;
@@ -485,6 +501,34 @@ arch_unwind_frame (MonoJitTlsData *jit_tls,
 					frame->native_offset = GPTRDIFF_TO_INT ((guint8*)frame->ji->clauses [clause_index].try_start - (guint8*)frame->ji->code_start);
 				}
 			} else {
+				/* Unreachable by construction: the block is entered on previous_lmf & 2 ("this is an LMFExt")
+				 * and every defined kind is handled above (mini-runtime.h: DEBUGGER_INVOKE=1 .. IL_STATE=5). So
+				 * getting here means kind is 0 or out of range -- an LMFExt published with the ext bit set whose
+				 * kind was never initialized, or whose memory was clobbered.
+				 *
+				 * Identify the producer before dying. This is NOT the stale-LMF fault that cfcf341f867 /
+				 * 2c5979f0d40 chased: WASM_JIT_LMF_NULL_METHOD stays silent across every occurrence here, i.e.
+				 * (*lmf)->method is plausible and only `kind` is wrong. Reached deterministically (215 times in
+				 * one boot) by the IKVM generational trampoline once its recompiled DynamicMethods are live, so
+				 * the workload that prints this is the reproducer the earlier hunt lacked. */
+				static int bad_kind_reported;
+				if (bad_kind_reported < 8) {
+					bad_kind_reported++;
+					printf ("WASM_JIT_LMFEXT_BAD_KIND: kind=%d lmf=%p previous_lmf=%p method=%p ji=%p first_lmf=%p\n",
+						ext->kind, (void *) *lmf, (void *) (*lmf)->previous_lmf, (void *) (*lmf)->method,
+						(void *) ji, (void *) jit_tls->first_lmf);
+				}
+
+				/* Recovering here was TRIED and is worse: `return FALSE` ends the walk, the in-flight exception
+				 * then never finds its handler, and the process WEDGES instead of aborting -- measured as a 90s
+				 * no-output stall where the abort had at least been immediate and diagnosable. So keep the assert.
+				 *
+				 * That also rules out extending cfcf341f867's consumer-side recovery to this branch as a
+				 * workaround. Its guard covers the direction where the wild store CLEARS bit 2, so the ext is
+				 * misread as a plain LMF and caught by wasm_lmf_method_plausible; here bit 2 is SET on something
+				 * that is not an LMFExt. Same corruption, opposite branch -- but the corrupted frame is load
+				 * bearing for exception dispatch, so it cannot simply be skipped. The producer of the wild store
+				 * is what needs finding. */
 				g_assert_not_reached ();
 			}
 
@@ -1762,17 +1806,41 @@ setup_stack_trace (MonoException *mono_ex, GSList **dynamic_methods, GList *trac
 		if (*dynamic_methods) {
 			/* These methods could go away anytime, so save a reference to them in the exception object */
 			int methods_len = g_slist_length (*dynamic_methods);
-			MonoArray *old_methods = mono_ex->dynamic_methods;
 			int old_methods_len = 0;
 
-			if (old_methods) {
-				old_methods_len = mono_array_length_internal (old_methods);
+			/* Take only the LENGTH here, and re-read the array pointer after the allocation below. A raw
+			 * MonoArray* must not be held across an allocation: mono_array_new_checked can collect, sgen moves
+			 * objects, and nothing updates a C local. On wasm it is worse than on other targets -- a value LLVM
+			 * keeps in a wasm local does not live in linear memory at all, so the conservative stack scan cannot
+			 * even see it to PIN it, which is the mechanism that accidentally rescues this pattern elsewhere.
+			 *
+			 * Held across the allocation, `old_methods` becomes the from-space image of an array that has just
+			 * been promoted. Its references were never forwarded, so the copy below faithfully reproduces
+			 * pointers to nursery objects that the same collection reclaimed -- and the resulting array is
+			 * corrupt in the tail of its copied prefix, because the newest entries are the ones still pointing
+			 * into the nursery while older ones already reference promoted objects. That is precisely the
+			 * observed signature. */
+			if (mono_ex->dynamic_methods) {
+				old_methods_len = mono_array_length_internal (mono_ex->dynamic_methods);
 				methods_len += old_methods_len;
 			}
+
+			/* The old, buggy read, kept ONLY as a probe: if the array moves during the allocation below, this
+			 * raw local and the re-read field disagree, which is direct proof of the hazard rather than an
+			 * inference from "the crash went away". Gated on an env var so it costs one static load normally.
+			 * A static flag rather than sgen's, to keep mini-exceptions.c free of a GC-specific symbol. */
+			static int probe_stale = -1;
+			if (G_UNLIKELY (probe_stale < 0))
+				probe_stale = g_hasenv ("MONO_DEBUG_STALE_OLDMETHODS") ? 1 : 0;
+			MonoArray *old_before = probe_stale ? mono_ex->dynamic_methods : NULL;
 
 			MonoArray *all_methods = mono_array_new_checked (mono_defaults.object_class, methods_len, error);
 			mono_error_assert_ok (error);
 
+			MonoArray *old_methods = mono_ex->dynamic_methods;
+			if (G_UNLIKELY (probe_stale) && old_before != old_methods)
+				g_print ("STALE_OLDMETHODS dynamic_methods moved across the allocation: %p -> %p (len %d, new len %d)\n",
+						old_before, old_methods, old_methods_len, methods_len);
 			if (old_methods)
 				mono_array_full_copy_unchecked_size (old_methods, all_methods, mono_defaults.object_class, old_methods_len);
 			int index = old_methods_len;
@@ -1782,7 +1850,22 @@ setup_stack_trace (MonoException *mono_ex, GSList **dynamic_methods, GList *trac
 
 				if (dis_link) {
 					MonoObject *o = mono_gchandle_get_target_internal (dis_link);
-					mono_array_set_internal (all_methods, MonoObject *, index, o);
+					/* setref, not set: `all_methods` is an object[], so this is a REFERENCE store and needs a
+					 * write barrier. mono_array_set_internal is the value-type store -- a bare *p = v -- and
+					 * using it here loses the barrier, which is a live heap-corruption bug rather than a style
+					 * problem. `all_methods` is freshly allocated, so it starts in the nursery where a missing
+					 * barrier is harmless; but this array GROWS with every propagation step through a dynamic
+					 * frame, and once it is promoted (or, past ~1996 elements, allocated straight into LOS) the
+					 * unbarriered store creates an old->young reference that is in no remset. The young
+					 * DynamicMethod is then never marked, gets collected, and the slot is left pointing at
+					 * reclaimed nursery space -- which the next collection follows into a wasm OOB trap.
+					 *
+					 * That is exactly the failure this was found by: an Object[] densely packed with
+					 * System.Reflection.Emit.DynamicMethod, corrupt only in its TAIL, because the prefix is
+					 * copied by mono_array_full_copy_unchecked_size (which does barrier) and only the entries
+					 * appended by this loop are unprotected. Workloads that throw through deep stacks of
+					 * dynamic methods -- IKVM's MethodHandle/LambdaForm dispatch, here -- hit it constantly. */
+					mono_array_setref_internal (all_methods, index, o);
 					index++;
 				}
 			}

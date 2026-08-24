@@ -240,6 +240,16 @@ typedef struct {
 	guint8 *data;
 	guint32 len;
 	guint32 cap;
+	/* Peephole state for `local.set N; local.get N` -> `local.tee N` (wasm_op_local).
+	 *
+	 * `tee_end` is the buffer length immediately after the last local.set was written, and `tee_off` where
+	 * its opcode byte sits. The rewrite fires only when the very next thing emitted is a local.get of the
+	 * same index AND nothing else has been appended since — which is exactly the test `tee_end == len`.
+	 * That adjacency check is what makes it safe: any intervening instruction, including a block/end that
+	 * could make the get reachable without the set, moves `len` and disarms it. */
+	guint32 tee_off;
+	guint32 tee_end;
+	guint32 tee_idx;
 } WasmBuf;
 
 void wasm_buf_init  (WasmBuf *b);
@@ -291,6 +301,28 @@ void wasm_module_single_func (
 	WasmBuf *out);
 
 /*
+ * One runtime helper the method body calls DIRECTLY, declared as a wasm function import.
+ *
+ * Without this a call to a C helper is `i32.const <table index>; call_indirect`, because under wasm a C
+ * function pointer IS an indirect-function-table index, so the emitter naturally has an index rather than a
+ * name. V8 lowers every call_indirect -- even one whose index is a compile-time constant -- to a bounds check,
+ * a signature check, table-index arithmetic and `call *`; it does not fold a constant index into a direct
+ * call. Measured: a 54-byte-IL MethodHandle stub emits 21 call_indirect, 12 of them to constant helper
+ * indices, and the x86 for it contains exactly 21 `call *`.
+ *
+ * Declaring the helper as an import turns the site into `call <slot>` with none of that preamble. `name` is
+ * the table index in decimal, under module name "h"; the instantiation side resolves it with
+ * WebAssembly.Table.prototype.get, so no linker export and no fixed helper registry is needed.
+ *
+ * `type_idx` is an index into this module's type section -- reuse the same callee functype the call_indirect
+ * already referenced.
+ */
+typedef struct {
+	guint32 table_index;    /* C function pointer value == indirect-function-table index */
+	guint32 type_idx;       /* functype index (T0=method, T1=entry, 2+k = extra_types [k]) */
+} WasmFuncImport;
+
+/*
  * Frame a module with TWO functions and a shared-memory import (`m`.`h`):
  *   func 0 = the method `f` (signature param_types→ret_type, with `locals`/`f_body`);
  *   func 1 = an entry thunk `e` (signature (i32 args_ptr, i32 ret_ptr)→void, `e_body`,
@@ -303,6 +335,14 @@ void wasm_module_single_func (
  * module also imports the indirect function table as `f`.`f` (table 0) for those call_indirects.
  * If `import_eh_tag` is TRUE the module imports the C++ exception tag as `x`.`e` (kind 0x04) with
  * function type index `eh_type_idx` ((i32)->void) — for `catch <x.e>` in `f_body` (inline-AOT-call EH).
+ *
+ * `fimports`/`nfimports` declare direct-call helper imports (see WasmFuncImport). Function imports take
+ * function indices 0..nfimports-1 in the order given, so the module's own two functions shift to
+ * nfimports (the method `f`) and nfimports+1 (the entry thunk `e`) — any `call` immediate in `f_body`/`e_body`
+ * naming a DEFINED function must already account for that offset, since those immediates are ULEB-encoded
+ * inline and cannot be shifted after the fact. Helper `call` immediates need no such adjustment: slot i is
+ * function index i regardless of how many slots end up being used, which is what makes it safe to assign
+ * them in first-use order while the body is still being emitted.
  */
 void wasm_module_method_and_entry (
 	const WasmValtype *param_types, guint32 nparams,
@@ -313,6 +353,7 @@ void wasm_module_method_and_entry (
 	const WasmFuncType *extra_types, guint32 nextra,
 	gboolean import_table,
 	gboolean import_eh_tag, guint32 eh_type_idx,
+	const WasmFuncImport *fimports, guint32 nfimports,
 	WasmBuf *out);
 
 /*
@@ -358,11 +399,18 @@ void wasm_module_methods_and_entries (
 	const WasmModuleMember *members, guint32 nmembers,
 	gboolean import_table,
 	gboolean import_eh_tag, guint32 eh_type_idx,
+	const WasmFuncImport *fimports, guint32 nfimports,
 	WasmBuf *out);
 
-/* Name section for a batched module: methods at func 0..n-1, entry thunks at n..2n-1. */
+/* A u32 ULEB padded to exactly 5 bytes, and an in-place rewrite of one. Lets a value be baked into a body
+ * before it is known -- specifically a batched entry thunk's `call <funcidx>`, which is offset by the batch's
+ * final function-import count. */
+void wasm_uleb5 (WasmBuf *b, guint32 value);
+void wasm_uleb5_patch (WasmBuf *b, guint32 off, guint32 value);
+
+/* Name section for a batched module: methods at func nfimports..nfimports+n-1, thunks after them. */
 void
-wasm_module_append_name_section_multi (WasmBuf *out, const char *module_name, const char *const *names, guint32 n);
+wasm_module_append_name_section_multi (WasmBuf *out, const char *module_name, const char *const *names, guint32 n, guint32 nfimports);
 
 /*
  * Frame a module exporting a single function `t` (the interp-entry thunk) with signature
@@ -386,6 +434,9 @@ void wasm_module_interp_thunk (
  * (`func0_name`) and func1 = "entry"; sets the module name to `module_name`. Cheap; only emit
  * when symbolication is wanted (gated by MONO_WASM_JIT_NAMES in the emitter).
  */
-void wasm_module_append_name_section (WasmBuf *out, const char *module_name, const char *func0_name);
+/* `nfimports` is the module's function-import count: the defined method/entry thunk are named at
+ * nfimports+0 and nfimports+1, because imported functions occupy the lower indices. Passing 0 when the
+ * module actually imports helpers names the imports and leaves the bodies anonymous to perf. */
+void wasm_module_append_name_section (WasmBuf *out, const char *module_name, const char *func0_name, guint32 nfimports);
 
 #endif /* __MONO_MINI_WASM_ENCODER_H__ */

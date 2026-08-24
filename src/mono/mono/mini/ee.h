@@ -65,6 +65,11 @@ typedef gpointer MonoInterpFrameHandle;
 	MONO_EE_CALLBACK (void, entry_llvmonly, (gpointer res, gpointer *args, gpointer imethod)) \
 	MONO_EE_CALLBACK (gpointer, get_interp_method, (MonoMethod *method)) \
 	MONO_EE_CALLBACK (MonoJitInfo*, compile_interp_method, (MonoMethod *method, MonoError *error)) \
+	/* Clause index whose IL try range covers il_offset, -1 if none, -2 if this method has no cached IL ranges
+	 * and the caller must fall back to parsing the header. Exists purely to keep mono_handle_exception_internal
+	 * off mono_method_get_header_checked, which mallocs a header AND a MonoType per local on every single frame
+	 * of every unwind -- measured as the largest component of this workload's boot cost. */ \
+	MONO_EE_CALLBACK (int, find_il_clause_for_offset, (MonoMethod *method, int il_offset)) \
 
 typedef struct _MonoEECallbacks {
 
