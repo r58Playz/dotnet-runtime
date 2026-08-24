@@ -184,7 +184,7 @@ function wrapPromisingSerialized (rawFn: Function): Function {
         // suspend the dead thread. Attach a LOGGING-ONLY observer (separate branch, doesn't affect the
         // queue) so the trap is attributable. With MONO_WASM_JIT_NAMES the wasm frames carry method names.
         next.then(undefined, (err: any) => {
-            mono_log_error(`JSPI mailbox export REJECTED — a wasm trap on a suspended stack silently killed this thread (GC will then stall trying to suspend it): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`);
+            mono_log_error(`JSPI mailbox export REJECTED (wasm trap/other error would have silently been swallowed): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`);
         });
         tail = next.catch(() => undefined);
         return next;

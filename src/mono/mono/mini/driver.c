@@ -1500,8 +1500,12 @@ load_agent (MonoDomain *domain, char *desc)
 		main_args = (MonoArray*)mono_array_new_checked (mono_defaults.string_class, 1, error);
 		if (main_args) {
 			MonoString *str = mono_string_new_checked (args, error);
+			/* setref: same missing-barrier mistake as the one fixed in setup_stack_trace, and reachable for the
+			 * same reason -- mono_string_new_checked below can trigger a collection that promotes main_args, so
+			 * the store can be old->young. Latent rather than live (this is the standalone driver, and the
+			 * window is one allocation wide), but it is the identical defect. */
 			if (str)
-				mono_array_set_internal (main_args, MonoString*, 0, str);
+				mono_array_setref_internal (main_args, 0, str);
 		}
 	} else {
 		main_args = (MonoArray*)mono_array_new_checked (mono_defaults.string_class, 0, error);

@@ -131,6 +131,14 @@ struct InterpMethod {
 	unsigned short *code;
 	MonoPIFunc func;
 	MonoExceptionClause *clauses; // num_clauses
+	/* 2 * num_clauses entries: (try_offset, try_len) in IL offsets, or NULL when num_clauses == 0.
+	 *
+	 * clauses[] above CANNOT serve this purpose: transform.c rewrites its offsets in place to interp bytecode
+	 * offsets via get_native_offset, so after transformation the IL ranges are gone. Exception handling needs
+	 * the IL ranges (it matches against MonoMethodILState.il_offset), and its only other source is
+	 * mono_method_get_header_checked -- which mallocs. Captured here before the rewrite, from the same mempool
+	 * as the rest of InterpMethod, so it lives and dies with the method and adds no lifetime hazard. */
+	guint32 *il_try_ranges;
 	void **data_items;
 	guint32 *local_offsets;
 	guint32 *arg_offsets;

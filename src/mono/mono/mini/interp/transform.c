@@ -9924,6 +9924,16 @@ retry:
 	rtm->code = (gushort*)td->new_code;
 	rtm->init_locals = header->init_locals;
 	rtm->num_clauses = header->num_clauses;
+	/* Snapshot the IL try ranges BEFORE the loop below rewrites rtm->clauses to bytecode offsets. Read from
+	 * header->clauses rather than rtm->clauses so it stays correct regardless of where it sits relative to the
+	 * rewrite. See the field comment in interp-internals.h for why EH cannot use rtm->clauses. */
+	if (header->num_clauses) {
+		rtm->il_try_ranges = (guint32*)imethod_alloc0 (td, header->num_clauses * 2 * sizeof (guint32));
+		for (guint i = 0; i < header->num_clauses; i++) {
+			rtm->il_try_ranges [i * 2] = header->clauses [i].try_offset;
+			rtm->il_try_ranges [i * 2 + 1] = header->clauses [i].try_len;
+		}
+	}
 	for (guint i = 0; i < header->num_clauses; i++) {
 		MonoExceptionClause *c = rtm->clauses + i;
 		int end_off = c->try_offset + c->try_len;

@@ -360,7 +360,7 @@ function cwrap (name: string, returnType: string | null, argTypes: string[] | un
             // caller that does handle the result is unaffected.
             if (ret && typeof ret.then === "function") {
                 (ret as Promise<any>).then(undefined, (err: any) => {
-                    mono_log_error(`JSPI promising export '${name}' REJECTED — a wasm trap on a suspended stack silently kills this thread (the GC then stalls trying to suspend it): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`);
+                    mono_log_error(`JSPI promising export '${name}' REJECTED (wasm trap/other error would have silently been swallowed): ${err}\n${(err && err.stack) ? err.stack : "(no stack)"}`);
                 });
             }
             return ret;
