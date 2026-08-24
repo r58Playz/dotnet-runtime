@@ -170,6 +170,15 @@ void
 mono_gc_wbarrier_set_arrayref_internal (MonoArray *arr, gpointer slot_ptr, MonoObject* value)
 {
 	HEAVY_STAT (++stat_wbarrier_set_arrayref);
+
+	/* The only barrier that knows the CONTAINER, so it is the only one that can name the destination's class and
+	 * element index -- which is what confirms a hit is the same Object[] of DynamicMethod the scan-side guard
+	 * reports. Deliberately before the nursery early-out below: that path stores with no barrier at all, so a
+	 * guard placed after it would be blind to every store into a nursery-resident array, and the corrupt
+	 * containers have been observed nursery-resident as well as in the major heap. */
+	if (G_UNLIKELY (sgen_check_stored_refs))
+		sgen_check_stored_ref ((GCObject*)arr, (void**)slot_ptr, value, "set_arrayref");
+
 	if (sgen_ptr_in_nursery (slot_ptr)) {
 		*(void**)slot_ptr = value;
 		return;

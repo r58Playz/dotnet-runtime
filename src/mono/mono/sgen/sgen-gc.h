@@ -1172,6 +1172,13 @@ void sgen_debug_enable_heap_dump (const char *filename);
 void sgen_debug_dump_heap (const char *type, int num, const char *reason);
 
 void sgen_debug_verify_nursery (gboolean do_dump_nursery_content);
+/* MONO_GC_DEBUG=check-scanned-refs: validate each reference the minor collector follows and name the object
+ * that holds a bad one. Range-only and snapshot-free, so unlike the whole-heap check it is safe to call from
+ * inside a collection and cheap enough to leave on for a whole boot. See sgen-debug.c for why. */
+extern gboolean sgen_check_scanned_refs;
+void sgen_check_scanned_ref (GCObject *container, void **slot);
+extern gboolean sgen_check_stored_refs;
+void sgen_check_stored_ref (GCObject *container, void **slot, void *value, const char *where);
 void sgen_debug_check_nursery_is_clean (void);
 
 /* Environment variable parsing */
