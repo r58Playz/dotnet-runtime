@@ -6813,7 +6813,33 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			MonoBasicBlock *_prev = NULL;
 			for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 				int _bd = bbidx [bb->block_num];
-				gint32 _off = bb->cil_code ? (gint32) (bb->cil_code - cfg->header->code) : -1;
+				/* bb->cil_code points into the IL of whichever method the block came FROM. For an INLINED
+				 * block that is the INLINEE's buffer, so `bb->cil_code - cfg->header->code` is pointer
+				 * arithmetic across two unrelated allocations and yields an arbitrary offset -- which is then
+				 * what eh_dispatch tests against THIS method's try ranges at runtime. It is wrong in both
+				 * directions: an inlined block genuinely inside a try can be scored outside it, so a catch
+				 * that should fire does not and the exception escapes; or one outside can be scored inside,
+				 * and the landing pad over-catches.
+				 *
+				 * mono keeps the caller-space offset in bb->real_offset: inline_method seeds the inlined
+				 * blocks with the CALL SITE's offset (method-to-ir.c, sbblock/ebblock->real_offset =
+				 * real_offset, called with cfg->real_offset), and mono's own mark_bb_in_region compares
+				 * real_offset -- not cil_code arithmetic -- against clause ranges. It is also the
+				 * semantically right answer here: inlined code is logically at the call site, so it should
+				 * inherit exactly the call site's protection.
+				 *
+				 * Found via MONO_INLINELIMIT: the default of 20 IL bytes inlines too little to expose this,
+				 * but at 30 enough inlined blocks land inside EH methods that a gson catch stopped firing and
+				 * Fabric's mixin bootstrap died during boot. `auto=0` (whole JIT tier off) at the same limit
+				 * boots fine, which is what pins it here rather than in the inliner. */
+				gint32 _off = -1;
+				if (bb->cil_code) {
+					if (bb->cil_code >= cfg->header->code &&
+					    bb->cil_code < cfg->header->code + cfg->header->code_size)
+						_off = (gint32) (bb->cil_code - cfg->header->code);
+					else
+						_off = (gint32) bb->real_offset;   /* inlined: cil_code belongs to the inlinee */
+				}
 				/* A decompose-synthesized bb carries NO cil_code (il_offset -1). The important case is the
 				 * InvalidCastException COND_EXC block that mono_decompose_typechecks splits out of a
 				 * castclass/isinst INSIDE a try: with il_offset -1, eh_dispatch's `if (il < 0) return -1`
@@ -6841,7 +6867,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			_wc->try_len = (gint32) _c->try_len;
 			_wc->catch_class = (_c->flags == MONO_EXCEPTION_CLAUSE_NONE) ? _c->data.catch_class : NULL;
 			for (_hb = cfg->bb_entry; _hb; _hb = _hb->next_bb)
-				if (_hb->cil_code && (gint32) (_hb->cil_code - cfg->header->code) == (gint32) _c->handler_offset) { _hbb = bbidx [_hb->block_num]; break; }
+				/* Range-guarded for the same reason as the il_offsets loop above: only a block whose
+				 * cil_code lies inside THIS method's IL can be the clause's handler entry. Without the test,
+				 * an inlined block's cross-buffer difference can equal handler_offset by coincidence and --
+				 * because this loop breaks on the first match -- send every catch to the wrong code. Rarer
+				 * than the offset bug, worse when it happens. */
+				if (_hb->cil_code &&
+				    _hb->cil_code >= cfg->header->code &&
+				    _hb->cil_code < cfg->header->code + cfg->header->code_size &&
+				    (gint32) (_hb->cil_code - cfg->header->code) == (gint32) _c->handler_offset) { _hbb = bbidx [_hb->block_num]; break; }
 			if (_hbb < 0) { fail = "eh handler bb not found"; goto done; }
 			_wc->handler_bbidx = _hbb;
 		}
