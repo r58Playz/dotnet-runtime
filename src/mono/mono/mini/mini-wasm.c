@@ -3136,8 +3136,7 @@ wasm_addr_st (WasmBuf *b, WjCtx *c, int vreg)
 		wasm_i32_const (b, (gint32) off);
 		wasm_op (b, WASM_OP_I32_ADD);
 		wasm_i32_const (b, 1);
-		wasm_i32_const (b, (gint32) (intptr_t) mono_wasm_jit_check_store);
-		wasm_op (b, WASM_OP_CALL_INDIRECT); wasm_uleb (b, (guint32) c->check_ti); wasm_uleb (b, 0);
+		wj_emit_helper_call (b, c, (gpointer) mono_wasm_jit_check_store, (guint32) c->check_ti);
 	}
 #endif
 	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->addrbase);
@@ -3208,8 +3207,7 @@ wasm_guard_memaddr (WasmBuf *b, WjCtx *c, int base_vreg, gint32 offset)
 			wasm_op (b, WASM_OP_I32_ADD);
 		}
 		wasm_i32_const (b, 4);   /* generic membase access address */
-		wasm_i32_const (b, (gint32) (intptr_t) mono_wasm_jit_check_store);
-		wasm_op (b, WASM_OP_CALL_INDIRECT); wasm_uleb (b, (guint32) c->check_ti); wasm_uleb (b, 0);
+		wj_emit_helper_call (b, c, (gpointer) mono_wasm_jit_check_store, (guint32) c->check_ti);
 	}
 #endif
 	return TRUE;
@@ -3244,8 +3242,7 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 			wasm_i32_const (b, (gint32) (c->refslot [vreg] * 4));
 			wasm_op (b, WASM_OP_I32_ADD);
 			wasm_i32_const (b, 0);
-			wasm_i32_const (b, (gint32) (intptr_t) mono_wasm_jit_check_store);
-			wasm_op (b, WASM_OP_CALL_INDIRECT); wasm_uleb (b, (guint32) c->check_ti); wasm_uleb (b, 0);
+			wj_emit_helper_call (b, c, (gpointer) mono_wasm_jit_check_store, (guint32) c->check_ti);
 		}
 #endif
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
@@ -6526,13 +6523,25 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #else
 #define LDIV_RAISE_FPTR() wasm_i32_const (&body, 0x7ff8)
 #endif
+#ifdef HOST_BROWSER
+/* Direct import rather than `i32.const <addr>; call_indirect` -- same reason as EMIT_REF_LEAVE: a constant
+ * index is not folded into a direct call by V8. raise_corlib is a C function in dotnet.native.wasm. */
 #define LDIV_RAISE(EXC_ID) do { \
 		RAISE_ENSURE_REF_FRAME ();   /* raise_corlib allocates: roots must be scannable. Taken arm only. */ \
+		extern void mono_wasm_jit_raise_corlib (int exc_id); \
+		wasm_i32_const (&body, (EXC_ID)); \
+		wj_emit_helper_call (&body, &lc, (gpointer) mono_wasm_jit_raise_corlib, (guint32) ldiv_rti); \
+		wasm_op (&body, WASM_OP_UNREACHABLE);   /* mono_wasm_jit_raise_corlib C++-throws and never returns */ \
+	} while (0)
+#else
+#define LDIV_RAISE(EXC_ID) do { \
+		RAISE_ENSURE_REF_FRAME (); \
 		wasm_i32_const (&body, (EXC_ID)); \
 		LDIV_RAISE_FPTR (); \
 		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) ldiv_rti); wasm_uleb (&body, 0); \
-		wasm_op (&body, WASM_OP_UNREACHABLE);   /* mono_wasm_jit_raise_corlib C++-throws and never returns */ \
+		wasm_op (&body, WASM_OP_UNREACHABLE); \
 	} while (0)
+#endif
 /* unary: dreg = WOP(sreg1) — conversions/sign-extends */
 #define UN(WOP)      do { if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "un sreg"; goto done; } wasm_op (&body, (WOP)); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "un dreg"; goto done; } } while (0)
 /* dreg = sreg1 & M (i32) — unsigned narrowing conversions (conv.u1/u2) */
@@ -6596,8 +6605,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	} \
 	if (eh_on) {   /* pop this EH method's il_state island (pushed by enter_island in the prologue) */ \
 		extern void mono_wasm_jit_leave_island (void); \
-		wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_leave_island); \
-		wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) eh_endcatch_ti); wasm_uleb (&body, 0); \
+		/* Direct import, not `i32.const <addr>; call_indirect`: V8 does not fold a constant index into a \
+		 * direct call, so the indirect form pays a table bounds check, a canonical-type check, index->code \
+		 * arithmetic and a validity check -- about fifteen x86 instructions where a direct `call` is one. \
+		 * This macro runs before EVERY return of an EH-bearing method, so it is one of the densest constant \
+		 * targets in the whole tier. Safe to import because the address is a C function in \
+		 * dotnet.native.wasm: fixed for the process, never repointed. (Contrast the method f-slot in the \
+		 * ordinary direct-call path, which IS repointed on rebind and therefore must stay indirect.) */ \
+		wj_emit_helper_call (&body, &lc, (gpointer) mono_wasm_jit_leave_island, (guint32) eh_endcatch_ti); \
 	} } while (0)
 #else
 #define EMIT_REF_LEAVE() do { } while (0)
@@ -7638,8 +7653,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);              /* if (flag != 0) */
 					/* Materialize roots inside the rare taken arm, not before the flag load. */
 					ENSURE_REF_FRAME ();
-					wasm_i32_const (&body, (gint32) (intptr_t) &mono_threads_state_poll);
-					wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) pti); wasm_uleb (&body, 0);
+					/* Direct import: a C function address in dotnet.native.wasm, fixed for the process. */
+					wj_emit_helper_call (&body, &lc, (gpointer) &mono_threads_state_poll, (guint32) pti);
 					RELEASE_LAZY_REF_FRAME ();
 					wasm_op (&body, WASM_OP_END);
 				}
@@ -8101,8 +8116,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			extern void mono_wasm_jit_check_store (guint8 *addr, int kind); \
 			if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "objguard base"; goto done; } \
 			wasm_i32_const (&body, _ogkind); \
-			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_check_store); \
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) lc.check_ti); wasm_uleb (&body, 0); \
+			wj_emit_helper_call (&body, &lc, (gpointer) mono_wasm_jit_check_store, (guint32) lc.check_ti); \
 		} \
 		if (!wasm_guard_memaddr (&body, &lc, ins->dreg, (gint32) ins->inst_offset)) { fail = "store addr guard"; goto done; } \
 		if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store base"; goto done; } if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "store val"; goto done; } wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
@@ -8122,8 +8136,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			extern void mono_wasm_jit_check_store (guint8 *addr, int kind); \
 			if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "objguard imm base"; goto done; } \
 			wasm_i32_const (&body, 3); \
-			wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_check_store); \
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, (guint32) lc.check_ti); wasm_uleb (&body, 0); \
+			wj_emit_helper_call (&body, &lc, (gpointer) mono_wasm_jit_check_store, (guint32) lc.check_ti); \
 		} \
 		if (!wasm_guard_memaddr (&body, &lc, ins->dreg, (gint32) ins->inst_offset)) { fail = "store-imm addr guard"; goto done; } \
 		if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store-imm base"; goto done; } wasm_i32_const (&body, (gint32) ins->inst_imm); wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
