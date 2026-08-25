@@ -122,6 +122,54 @@ int mono_wasm_jit_batch_all_at = 250;
  * to settle, then greedily co-locates its hot connected components.  These are planner bounds rather
  * than a trigger count: registration/edge stability decides WHEN to plan. */
 int mono_wasm_jit_batch_settle = 128;
+/* MONO_WASM_JIT_BATCH_INLINE: select batch members for V8 INLINE ELIGIBILITY rather than for raw call-graph
+ * connectivity. Default 1; inert unless MONO_WASM_JIT_BATCH_MODULE is on.
+ *
+ * Co-location has exactly one remaining justification. Everything else was measured away: the per-module
+ * engine tax is ~0.4 ms (about 4-5% of boot+world CPU in total, and under 1% in-game, where registration has
+ * finished before the window opens), per-method memory does not improve with batching, and the VMA-count
+ * hazard does not exist on this hardware. What is left is letting V8 inline across what are otherwise module
+ * boundaries -- one method per module means V8's inlining candidates are always empty.
+ *
+ * For a call A -> B to actually be inlined, five things must hold, and the planner only controls two:
+ *   1. A and B in one module                      <- the planner
+ *   2. the call emitted direct, not call_indirect <- follows from 1
+ *   3. A itself reaches TurboFan                  <- per-FUNCTION tiering budget, ~37k returns for a ~300 B body
+ *   4. B's body <= 500 wire bytes                 <- v8_flags.wasm_inlining_max_size
+ *   5. it wins V8's ranking, count/wire_byte_size <- not queryable
+ *
+ * The old planner tested member count and total bytes, i.e. none of 3, 4 or 5. This encodes 4, via the
+ * body_len size predictor (module <= 932 B predicts body <= 500 B at 97.7% accuracy, calibrated over a
+ * 23,330-module tier dump where body ~= 0.987 * module - 419).
+ *
+ * MEASURED AS A REGRESSION, TWICE, AND THEREFORE DEFAULT OFF. Whole-tier dumps, batch_module=1, counting
+ * intra-module `call` sites whose callee body is under the cap -- the only number that matters here:
+ *
+ *   planner                                    batched mods   methods batched   intra-mod calls   inlinable
+ *   old (connectivity only)                            184     3,335 (14.0%)            15,150       6,126
+ *   v1: either endpoint small, + a 60-member cap       196     ...                      10,950       3,919
+ *   v2: directional, callee-only, no cap               201     1,361 ( 5.7%)             8,235       2,344
+ *   old with caps raised to the maximum                184     3,183 (13.3%)            15,187       5,847
+ *
+ * Three things that reading tells you and measuring does not:
+ *
+ *   - The gate is at the WRONG LEVEL. It prunes EDGES in a spanning merge, and pruning an edge does not
+ *     remove an oversized member -- it just stops a merge, so components stay small. Inlinable-call volume
+ *     tracks component SIZE, so a better-targeted but smaller batch loses. Eligibility belongs in the
+ *     MEMBERSHIP decision, not in the merge.
+ *   - batch_max and batch_bytes are NOT BINDING. Raising them to the maximum the code allows moved nothing
+ *     (184 -> 184 modules, 15,150 -> 15,187 calls). Component size is set by call-graph topology and by the
+ *     once-at-a-plateau planning schedule, not by the caps.
+ *   - So selection quality is not the limiter; REACH is. The planner only ever batches ~14% of the tier,
+ *     because it plans once at an early plateau and most methods are registered after that. 6,126 inlinable
+ *     calls against 332,027 call_indirect is ~1.8% of the call population, and that is the ceiling of the
+ *     current architecture regardless of how members are chosen.
+ *
+ * Kept as a knob rather than deleted because `pair_ok` is the right primitive for a membership-level gate,
+ * which is where this idea would have to move to be worth anything. Condition 3 is still not encoded at all:
+ * it needs a POST-JIT per-method execution count, and wasm_jit_hits stops at the JIT threshold and is then
+ * reset, so it cannot see the ~37k returns that decide tier-up. */
+int mono_wasm_jit_batch_inline = 0;
 int mono_wasm_jit_batch_min = 16;
 int mono_wasm_jit_batch_max = 384;
 int mono_wasm_jit_batch_bytes = 786432;
@@ -185,6 +233,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_batch_all_at; const char *ba = g_getenv ("MONO_WASM_JIT_BATCH_ALL_AT"); mono_wasm_jit_batch_all_at = (ba && *ba) ? atoi (ba) : 250; }
 	{ extern int mono_wasm_jit_batch_settle; const char *bs = g_getenv ("MONO_WASM_JIT_BATCH_SETTLE"); mono_wasm_jit_batch_settle = (bs && *bs && atoi (bs) > 0) ? atoi (bs) : 128; }
 	{ extern int mono_wasm_jit_batch_min; const char *bn = g_getenv ("MONO_WASM_JIT_BATCH_MIN"); mono_wasm_jit_batch_min = (bn && *bn && atoi (bn) > 1) ? atoi (bn) : 16; }
+	{ extern int mono_wasm_jit_batch_inline; const char *bi = g_getenv ("MONO_WASM_JIT_BATCH_INLINE"); mono_wasm_jit_batch_inline = (bi && *bi) ? (*bi != '0') : 0; } /* MEASURED WORSE -- see the note at the definition. Default OFF; =1 only to re-run the A/B. */
 	{ extern int mono_wasm_jit_batch_max; const char *bx = g_getenv ("MONO_WASM_JIT_BATCH_MAX"); int n = (bx && *bx) ? atoi (bx) : 384; mono_wasm_jit_batch_max = n < 2 ? 2 : (n > 512 ? 512 : n); }
 	{ extern int mono_wasm_jit_batch_bytes; const char *bb = g_getenv ("MONO_WASM_JIT_BATCH_BYTES"); mono_wasm_jit_batch_bytes = (bb && *bb && atoi (bb) > 0) ? atoi (bb) : 786432; }
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */

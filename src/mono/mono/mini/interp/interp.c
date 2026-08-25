@@ -2606,12 +2606,32 @@ typedef struct {
 	int parent;
 	int members;
 	int cluster_bytes;
+	/* Inline eligibility, in the planner's own terms. V8 will only inline a callee whose FUNCTION BODY is
+	 * <= wasm_inlining_max_size (500 wire bytes). The planner cannot see body size -- membership has to be
+	 * fixed before anything is emitted -- but the registry retains body_len, the standalone MODULE size,
+	 * and the two are tightly related: measured over 23,330 modules of a whole-tier dump,
+	 *     body ~= 0.987 * module - 419          (the framing overhead is very nearly constant)
+	 * so module <= 932 B predicts body <= 500 B with 97.7% accuracy (0.9% false positives). */
+	guint8 small;        /* predicted to fit under V8's inline cap */
+	int nsmall;          /* on a component ROOT: how many of its members are `small` */
 } WjAutoNode;
 
 typedef struct {
 	guint16 a, b;
 	guint64 weight;
 } WjAutoEdge;
+
+/* Calibrated against a whole-tier dump (23,330 modules): body ~= 0.987 * module - 419, so a standalone
+ * module of 932 B predicts a function body of 500 B -- V8's wasm_inlining_max_size. 97.7% accurate, 0.9%
+ * false positives. Deliberately the accurate threshold rather than the strictly-safe one (800 B, 100%
+ * precision but 92.5% recall): a false positive costs one wasted co-location, a false negative discards a
+ * real candidate, and candidates are the scarce thing -- only 22.8% of execution-weighted mass is under
+ * the cap at all. */
+#define WJ_INLINE_MODULE_BYTES 932
+/* NOTE: v8's InliningTree::kMaxInlinedCount (60) is deliberately NOT used as a per-module cap here. It
+ * bounds how many callees are inlined INTO ONE FUNCTION, not how many inlinable functions a module may
+ * hold. Capping a component's inline-eligible members at 60 was measured to cut inline-eligible
+ * intra-module calls from 6,126 to 3,919 -- it blocked the growth that was working. */
 
 static int
 wj_auto_find (WjAutoNode *nodes, int n, MonoMethod *m)
@@ -2621,6 +2641,20 @@ wj_auto_find (WjAutoNode *nodes, int n, MonoMethod *m)
 		if (nodes [i].method == m)
 			return i;
 	return -1;
+}
+
+/* "Some observed direct call between these two nodes has a callee under V8's inline cap."
+ *
+ * Built from the direct-dep edges rather than from the weight table, because the weight table is symmetric
+ * and inline eligibility is not: whether co-locating i and j can produce an inlinable call depends on the
+ * size of whichever one is CALLED, not on either in isolation. Indexed by ORIGINAL node index, so the merge
+ * loop must consult it with the edge's endpoints and not with their current component roots. */
+static gboolean
+wj_auto_pair_inlinable (const guint8 *pair_ok, int n, int i, int j)
+{
+	if (i < 0 || j < 0 || i >= n || j >= n)
+		return FALSE;
+	return pair_ok [(gsize) i * n + j] || pair_ok [(gsize) j * n + i];
 }
 
 static int
@@ -2768,14 +2802,16 @@ wj_auto_batch_plan (gboolean force_pending, gboolean *out_replan)
 	extern int mono_wasm_jit_vcall_profile_entry (int site_index, int way,
 		MonoMethod **caller, MonoMethod **base, MonoMethod **target, guint32 *hits);
 	extern int mono_wasm_jit_vcall_ways;
-	extern int mono_wasm_jit_batch_max, mono_wasm_jit_batch_bytes;
+	extern int mono_wasm_jit_batch_max, mono_wasm_jit_batch_bytes, mono_wasm_jit_batch_inline;
 	extern int mono_wasm_jit_verbose;
 	WjAutoNode nodes [WJ_AUTO_BATCH_CANDIDATES];
 	guint64 *weights;
+	guint8 *pair_ok;      /* n*n: caller i -> callee j where j is predicted inline-eligible */
 	WjAutoEdge *edges;
 	MonoMethod **members, **body_members;
 	int cap = mono_wasm_jit_reg_count ();
 	int i, j, n = 0, ne = 0, emitted = 0;
+	int skipped_nosmall = 0;
 	guint64 total_weight = 0, internal_weight = 0;
 	gboolean replan = FALSE;
 
@@ -2802,11 +2838,15 @@ wj_auto_batch_plan (gboolean force_pending, gboolean *out_replan)
 		nodes [n].parent = n;
 		nodes [n].members = 1;
 		nodes [n].cluster_bytes = nodes [n].bytes;
+		nodes [n].small = mono_wasm_jit_batch_inline && nodes [n].bytes > 0 &&
+			nodes [n].bytes <= WJ_INLINE_MODULE_BYTES;
+		nodes [n].nsmall = nodes [n].small ? 1 : 0;
 		n++;
 	}
 	if (n < 2)
 		return 0;
 	weights = g_new0 (guint64, (gsize) n * n);
+	pair_ok = g_new0 (guint8, (gsize) n * n);
 
 	/* Preserve old ownership before considering new graph edges.  This is both the migration safety
 	 * rule (no sibling remains pointed at an orphaned old batch) and the bottom-up island mechanism:
@@ -2825,6 +2865,7 @@ wj_auto_batch_plan (gboolean force_pending, gboolean *out_replan)
 			nodes [b].parent = a;
 			nodes [a].members += nodes [b].members;
 			nodes [a].cluster_bytes += nodes [b].cluster_bytes;
+			nodes [a].nsmall += nodes [b].nsmall;
 		}
 	}
 
@@ -2835,10 +2876,14 @@ wj_auto_batch_plan (gboolean force_pending, gboolean *out_replan)
 		InterpMethod *cim = mono_interp_get_imethod (nodes [i].method);
 		guint64 prior = cim && cim->wasm_jit_hits > 0 ? (guint64) cim->wasm_jit_hits : 1;
 		mono_wasm_jit_reg_graph_entry (nodes [i].reg_index, NULL, &len, &ndeps, NULL);
-		for (j = 0; j < ndeps; ++j)
-			wj_auto_weight (weights, n, i,
-				wj_auto_find (nodes, n, mono_wasm_jit_reg_graph_dep (nodes [i].reg_index, j)),
-				prior);
+		for (j = 0; j < ndeps; ++j) {
+			int callee = wj_auto_find (nodes, n, mono_wasm_jit_reg_graph_dep (nodes [i].reg_index, j));
+			wj_auto_weight (weights, n, i, callee, prior);
+			/* This is the only place the CALL DIRECTION is still known, so it is where inline
+			 * eligibility has to be recorded: i calls callee, so what matters is callee's size. */
+			if (callee >= 0 && nodes [callee].small)
+				pair_ok [(gsize) i * n + callee] = 1;
+		}
 	}
 
 	/* Interpreter evidence is cumulative and precedes method-JIT hotness. Entry edges cover direct and
@@ -2893,19 +2938,47 @@ wj_auto_batch_plan (gboolean force_pending, gboolean *out_replan)
 		if (nodes [a].members + nodes [b].members > mono_wasm_jit_batch_max ||
 		    nodes [a].cluster_bytes + nodes [b].cluster_bytes > mono_wasm_jit_batch_bytes)
 			continue;
+		if (mono_wasm_jit_batch_inline) {
+			/* Co-locating two methods pays only if it turns a call between them into one V8 will
+			 * INLINE, and that depends on the CALLEE's size alone -- a small caller of a huge callee
+			 * gains nothing. So the test has to be DIRECTIONAL, which the weight table is not: it is
+			 * symmetric and direction is gone by the time this spanning merge runs. `inlinable_pair`
+			 * is therefore built alongside the weights, from the direct-dep edges, and records "some
+			 * observed call between these two has a callee under the cap".
+			 *
+			 * The first version of this gate tested `small` on either endpoint instead, which let
+			 * through every hot edge whose SMALL side was the caller. */
+			if (!wj_auto_pair_inlinable (pair_ok, n, edges [i].a, edges [i].b)) {
+				skipped_nosmall++;
+				continue;
+			}
+			/* NO kMaxInlinedCount CAP HERE, and the first version of this code was wrong to add one.
+			 * kMaxInlinedCount (60) bounds how many callees V8 inlines INTO ONE FUNCTION -- it says
+			 * nothing about how many inlinable functions may coexist in a module. Capping a component's
+			 * inline-eligible member count at 60 therefore blocked exactly the growth that was working:
+			 * measured, it cut inline-eligible intra-module calls from 6,126 (no gate at all) to 3,919.
+			 * The engine limit that does apply per module is the code-space/compile cost, which
+			 * batch_bytes already bounds. */
+		}
 		if (nodes [a].members < nodes [b].members) { int t = a; a = b; b = t; }
 		nodes [b].parent = a;
 		nodes [a].members += nodes [b].members;
 		nodes [a].cluster_bytes += nodes [b].cluster_bytes;
+		nodes [a].nsmall += nodes [b].nsmall;
 		internal_weight += edges [i].weight;
 	}
 
 	members = g_new (MonoMethod *, n);
 	body_members = g_new (MonoMethod *, n);
 	if (mono_wasm_jit_verbose >= 1)
-		printf ("WASM_JIT_AUTO_PLAN candidates=%d edges=%d edge_cover=%.1f%% caps=%d/%d\n",
-			n, ne, total_weight ? 100.0 * (double) internal_weight / (double) total_weight : 0.0,
-			mono_wasm_jit_batch_max, mono_wasm_jit_batch_bytes);
+		{
+			int nsm = 0;
+			for (j = 0; j < n; ++j) if (nodes [j].small) nsm++;
+			printf ("WASM_JIT_AUTO_PLAN candidates=%d small=%d edges=%d edge_cover=%.1f%% caps=%d/%d inline=%d skip_noninlinable=%d\n",
+				n, nsm, ne, total_weight ? 100.0 * (double) internal_weight / (double) total_weight : 0.0,
+				mono_wasm_jit_batch_max, mono_wasm_jit_batch_bytes,
+				mono_wasm_jit_batch_inline, skipped_nosmall);
+		}
 	for (i = 0; i < n; ++i) {
 		int root, nm = 0;
 		int largest_old = 0;
@@ -2959,6 +3032,7 @@ wj_auto_batch_plan (gboolean force_pending, gboolean *out_replan)
 	g_free (members);
 	g_free (edges);
 	g_free (weights);
+	g_free (pair_ok);
 	if (out_replan)
 		*out_replan = replan;
 	return emitted;
