@@ -170,8 +170,8 @@ int mono_wasm_jit_batch_settle = 128;
  * it needs a POST-JIT per-method execution count, and wasm_jit_hits stops at the JIT threshold and is then
  * reset, so it cannot see the ~37k returns that decide tier-up. */
 /* MONO_WASM_JIT_LAZY_GCP: how many effective GC points a method may have and still defer its GC ref frame
- * until the first one is reached. 1 = the historical behaviour; <= 0 = no limit. See the gate for why this
- * is a heuristic rather than a correctness bound. */
+ * until the first one is reached. 1 = the historical behaviour and the MEASURED BEST; <= 0 = no limit.
+ * See the gate for the A/B: relaxing it costs 19.3% p50 and triples world generation. */
 int mono_wasm_jit_lazy_gcp = 1;
 int mono_wasm_jit_batch_inline = 0;
 int mono_wasm_jit_batch_min = 16;
@@ -6427,7 +6427,27 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * Pinning it at 1 confined the mechanism to almost nothing. Measured on a whole-tier dump weighted
 		 * by an in-game profile: 94.3% of our tier's execution time is in EAGER-frame methods, 2.4% lazy,
 		 * 3.3% frameless -- while the prologue is 21.4% of that tier's time. MONO_WASM_JIT_LAZY_GCP makes
-		 * the limit sweepable; <= 0 means no limit. */
+		 * the limit sweepable; <= 0 means no limit.
+		 *
+		 * SWEPT, AND 1 IS RIGHT. Removing the limit does exactly what it should to the emitted code -- eager
+		 * frames fall from 94.3% of our tier's execution to 9.1%, lazy rises 2.4% -> 87.5% -- and is a large
+		 * REGRESSION anyway. Interleaved A/B, plateau instrument, 240s cooldown per arm, 2 rounds:
+		 *
+		 *     p50        45.8 -> 54.6 ms   +19.3%   (spread +/-1.7%, far outside noise)
+		 *     fps        21.6 -> 16.7      -22.7%
+		 *     msFrame    46.3 -> 59.8 ms   +29.3%
+		 *     world.gen  42.7 -> 134.0 s  +214.1%
+		 *     boot.classload             +9.1%
+		 *
+		 * The price is code: median module 800 -> 1064 B (+33%), p90 2925 -> 5652 (+93%), because ENSURE
+		 * lands at every GC point. Note WHERE it hurt most -- world generation, the compile-heavy phase,
+		 * tripled. Compile cost alone cannot explain that (29.4 us fixed + 15.4 ns/wire-byte measured
+		 * separately, so +264 B across 24k modules is ~0.1 s, not 91 s), so the bulk is more likely TurboFan
+		 * coping badly with ~20 extra ops and a branch at every GC point, on a target already shown to be
+		 * register-starved. Not chased further.
+		 *
+		 * An intermediate value was NOT swept: at 2 or 3 only methods with exactly that many GC points become
+		 * lazy -- a small population -- and the gradient from 1 to unlimited is steeply negative. */
 		if (framebytes > 0 &&
 		    ((mono_wasm_jit_lazy_gcp <= 0 || effective_gcp_count <= mono_wasm_jit_lazy_gcp) ||
 		     (terminal_vcall_handoff && terminal_vcall_poll_prefix)) &&
