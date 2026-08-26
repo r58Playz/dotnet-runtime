@@ -169,6 +169,10 @@ int mono_wasm_jit_batch_settle = 128;
  * which is where this idea would have to move to be worth anything. Condition 3 is still not encoded at all:
  * it needs a POST-JIT per-method execution count, and wasm_jit_hits stops at the JIT threshold and is then
  * reset, so it cannot see the ~37k returns that decide tier-up. */
+/* MONO_WASM_JIT_LAZY_GCP: how many effective GC points a method may have and still defer its GC ref frame
+ * until the first one is reached. 1 = the historical behaviour; <= 0 = no limit. See the gate for why this
+ * is a heuristic rather than a correctness bound. */
+int mono_wasm_jit_lazy_gcp = 1;
 int mono_wasm_jit_batch_inline = 0;
 int mono_wasm_jit_batch_min = 16;
 int mono_wasm_jit_batch_max = 384;
@@ -233,6 +237,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_batch_all_at; const char *ba = g_getenv ("MONO_WASM_JIT_BATCH_ALL_AT"); mono_wasm_jit_batch_all_at = (ba && *ba) ? atoi (ba) : 250; }
 	{ extern int mono_wasm_jit_batch_settle; const char *bs = g_getenv ("MONO_WASM_JIT_BATCH_SETTLE"); mono_wasm_jit_batch_settle = (bs && *bs && atoi (bs) > 0) ? atoi (bs) : 128; }
 	{ extern int mono_wasm_jit_batch_min; const char *bn = g_getenv ("MONO_WASM_JIT_BATCH_MIN"); mono_wasm_jit_batch_min = (bn && *bn && atoi (bn) > 1) ? atoi (bn) : 16; }
+	{ extern int mono_wasm_jit_lazy_gcp; const char *lg = g_getenv ("MONO_WASM_JIT_LAZY_GCP"); mono_wasm_jit_lazy_gcp = (lg && *lg) ? atoi (lg) : 1; } /* GC points a method may have and still defer its ref frame; <=0 = unlimited */
 	{ extern int mono_wasm_jit_batch_inline; const char *bi = g_getenv ("MONO_WASM_JIT_BATCH_INLINE"); mono_wasm_jit_batch_inline = (bi && *bi) ? (*bi != '0') : 0; } /* MEASURED WORSE -- see the note at the definition. Default OFF; =1 only to re-run the A/B. */
 	{ extern int mono_wasm_jit_batch_max; const char *bx = g_getenv ("MONO_WASM_JIT_BATCH_MAX"); int n = (bx && *bx) ? atoi (bx) : 384; mono_wasm_jit_batch_max = n < 2 ? 2 : (n > 512 ? 512 : n); }
 	{ extern int mono_wasm_jit_batch_bytes; const char *bb = g_getenv ("MONO_WASM_JIT_BATCH_BYTES"); mono_wasm_jit_batch_bytes = (bb && *bb && atoi (bb) > 0) ? atoi (bb) : 786432; }
@@ -6412,8 +6417,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * value home. Address frames and EH need a valid frame from entry; slot-homed ref-vtype
 		 * sentinels likewise cannot be reconstructed. Debug store guards intentionally keep the old
 		 * eager path. */
+		/* The GC-point count is a HEURISTIC here, not a correctness requirement, and it was pinned at 1.
+		 * ENSURE_REF_FRAME is idempotent -- it tests whether the frame has already been materialised -- and
+		 * the main emit loop already emits it before EVERY effective GC point (see the
+		 * wj_ins_is_effective_gcpoint site), so a method with N of them is handled correctly today. The
+		 * only question a larger limit raises is whether it PAYS: lazy costs a 3-op check at each GC point
+		 * and saves the whole ~15-op frame prologue on any path that reaches none.
+		 *
+		 * Pinning it at 1 confined the mechanism to almost nothing. Measured on a whole-tier dump weighted
+		 * by an in-game profile: 94.3% of our tier's execution time is in EAGER-frame methods, 2.4% lazy,
+		 * 3.3% frameless -- while the prologue is 21.4% of that tier's time. MONO_WASM_JIT_LAZY_GCP makes
+		 * the limit sweepable; <= 0 means no limit. */
 		if (framebytes > 0 &&
-		    (effective_gcp_count == 1 ||
+		    ((mono_wasm_jit_lazy_gcp <= 0 || effective_gcp_count <= mono_wasm_jit_lazy_gcp) ||
 		     (terminal_vcall_handoff && terminal_vcall_poll_prefix)) &&
 		    naddrbytes == 0 && !eh_on && lc.ref_wt &&
 		    !lc.storeguard && !lc.objguard) {
