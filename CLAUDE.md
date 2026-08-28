@@ -13,6 +13,7 @@ exists because a previous pass got it wrong at real cost.
 | | |
 |---|---|
 | the emitter | `src/mono/mono/mini/mini-wasm.c` (~11k lines), `wasm-encoder.c` |
+| the assembler (`wj_assemble`) | resolves a body's relocations and frames N members into one module |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h` |
 | the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
 | IKVM (Java -> CLR, also uncommitted work) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm` |
@@ -102,6 +103,61 @@ method. "More inlining" and "fewer calls" are not the same thing on a one-method
 | `MONO_WASM_JIT_INLINE_ILOFS=1` | 9.8% worse on p50 at ±1.1% |
 | raising `MONO_INLINELIMIT` above the default 20 | closed on mechanism: bodies +3.5-4.4%, saturating by 60, and calls/method goes UP 1.0% (the caller absorbs the callee's own calls while the callee stays separately JITted). Costs nothing at boot; buys nothing measurable |
 | ikvmc static compilation of Minecraft+Fabric | out of scope on product grounds: runtime version loading and drop-in mods are requirements |
+| **module batching, as it was BUILT** | measured negative four times (-26.6% R61b, -35.7% R96, -13.0% R105, regression R123), always for the same two mechanical reasons, and BOTH are now being removed rather than re-tuned. (1) Producing a batched body cost one full `mini_method_compile` per member, because the body baked module-dependent indices; R141 made bodies relocatable, so re-framing is a memcpy. (2) The planner plans a plateau ONCE, on a globally-quiescent-graph trigger this workload never satisfies — reach 14% of the tier / 1.8% of calls, and `batch_max`/`batch_bytes` measured non-binding. Do not re-run the OLD arms or re-tune the OLD knobs; the numbers above are what they are worth. The redesign is planned (relocatable emission -> SCC-closed assembly + direct-import -> one call profile -> a weight-driven planner behind `MONO_WASM_JIT_BATCH_MODULE`, still default 0). Note the ceiling before spending on it: 55.0% of real call sites target the main module and can never be co-located (R129), only 22.8% of execution-weighted callee mass is under V8's 500-byte inline cap (R121b), and a callee is only inlined if the CALLER itself crosses V8's ~37,000-return tiering budget (R120). |
+
+## Building: the runtime and the app are two different builds
+
+The **runtime** (this repo) is built and packed with
+
+```
+WASM_ENABLE_JSPI=true ../FNA-WASM-Build/build-dotnet.sh . true ./dotnet-jspi.zip     # ~9 min
+```
+
+which wraps `./build.sh -os browser -s mono+libs /p:RunAOTCompilation=true /p:WasmEnableThreads=true
+/p:WasmEnableJSPI=true -c Release`. A plain `./build.sh mono` is NOT that build and its pack has to be
+hand-patched; Round 5's whole result was taken on one.
+
+Then **deploy it**, which is a separate step and is not optional:
+
+```
+scratchpad/mcsr/deploy.sh '<a string constant your change added>'                    # ~12 min
+```
+
+Copying the zip over `statics/dotnet.zip` is not a deploy — the bytes the page loads are
+`frontend/public/_framework/dotnet.native.<hash>.wasm`, which only changes when the loader is republished.
+`deploy.sh` republishes, applies the two mandatory post-publish patches, and PROVES the marker is in the
+served bytes over HTTP. A whole measurement matrix once ran on a stale runtime.
+
+Before either, `scratchpad/wj/csyn.sh <file>` compiles one source file with the real command line in under a
+second. It checks both compilation databases, which matters: `mini-wasm.c` builds twice, with and without
+`HOST_BROWSER`.
+
+## Build the product configuration: `make build AOT=true`
+
+**The shipped build is MIXED-AOT** — corlib and IKVM are AOT-compiled, the rest is JIT/interp. In
+`~/Documents/ikvm-wasm/ikvmcraft` that is:
+
+```
+make build AOT=true        # NOT `make build`
+```
+
+`make build` alone produces a non-AOT build that **is not the product and does not boot**. It fails
+deterministically (bootcheck 0/3) ~44 s in with
+
+```
+Assertion at mono/metadata/loader.c:1826,
+  condition `mono_metadata_token_table (m->token) == MONO_TABLE_METHOD' not met
+```
+
+from `interp_delegate_ctor` constructing a `Comparison`1` (`comparer.Compare` in
+`ArraySortHelper`1.Sort`), and with the JIT tier denied for `Sort` it fails instead on
+`RuntimeError: memory access out of bounds`. **Neither is a real regression.** Both are artifacts of the
+missing AOT half.
+
+This cost most of a session (Rounds 133-135): the non-AOT build was mistaken for a broken HEAD, `git stash` +
+a clean-HEAD rebuild "confirmed" it, and the crash was then chased through eleven knob bisections, three
+instrumented builds and a full diagnosis of a bug that does not exist in the product. If a boot fails in a
+way that looks like a runtime regression, **check the build command before believing it.**
 
 ## Measurement discipline
 
@@ -141,6 +197,14 @@ captures:
 * `wasmtier.mjs` — snapshots the entire JIT tier (~24k modules) as emitted bytecode over one run. Reading the
   emitted wasm is what found the last two real wins.
 * `mcab.mjs` / `mcperf.mjs` / `mcbench.mjs` — the interleaved A/B, the perf capture, and the phase-sliced run.
+* `tiershape.py` — per-method STRUCTURAL identity between two tier dumps: opcodes, type indices, function
+  indices, local indices, branch depths, with the run-dependent immediates blanked. The gate for "is this
+  change a pure refactor". **Its noise floor is measured: 0.15%** (18 of 12,291 methods differ between two
+  runs of the SAME binary, because a callee that JITs in one run and not the other changes its caller).
+  Do NOT write a byte-identity gate instead — R141 explains why one cannot work.
+* `enctest/run.sh` — three host-side encoder gates in seconds, against frozen copies of the framers the
+  relocatable rewrite deleted. Run it before believing anything else about the encoder.
+* `csyn.sh` — one-file syntax check with the real build's command line, both compilation databases.
 
 ## Housekeeping
 

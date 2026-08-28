@@ -22,6 +22,13 @@ wasm_buf_init (WasmBuf *b)
 	b->tee_off = 0;
 	b->tee_end = 0;
 	b->tee_idx = 0;
+	b->relocs = NULL;
+}
+
+void
+wasm_buf_init_relocs (WasmBuf *b)
+{
+	b->relocs = g_new0 (WasmRelocs, 1);
 }
 
 void
@@ -30,6 +37,94 @@ wasm_buf_free (WasmBuf *b)
 	g_free (b->data);
 	b->data = NULL;
 	b->len = b->cap = 0;
+	if (b->relocs) {
+		g_free (b->relocs->r);
+		g_free (b->relocs);
+		b->relocs = NULL;
+	}
+}
+
+void
+wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, gpointer sym)
+{
+	WasmRelocs *rl = b->relocs;
+	WasmReloc *e;
+
+	g_assert (rl);   /* a body that emits holes must have had wasm_buf_init_relocs called on it */
+	if (rl->n == rl->cap) {
+		rl->cap = rl->cap ? rl->cap * 2 : 16;
+		rl->r = (WasmReloc *) g_realloc (rl->r, sizeof (WasmReloc) * (gsize) rl->cap);
+	}
+	e = &rl->r [rl->n++];
+	e->off = b->len;
+	e->kind = (guint16) kind;
+	e->tpool = (guint16) tpool;
+	e->table_index = table_index;
+	e->sym = sym;
+	/* See the header: a zero-length hole would otherwise leave the local.tee peephole armed ACROSS it. */
+	b->tee_end = 0;
+}
+
+/* One resolved call site. `ti` is the module type index; `fix` says which of the three forms to use. */
+static void
+emit_call_site (WasmBuf *out, const WasmReloc *r, const WasmRelocFix *fix, guint32 ti)
+{
+	switch (fix->form) {
+	case WASM_FORM_IMPORT:
+	case WASM_FORM_LOCAL:
+		/* Identical encoding; they differ only in which half of the function index space `idx` names,
+		 * and therefore in what V8 makes of them (three loads and an indirect call, versus one
+		 * `call rel32` that is also the only form V8 will inline through). */
+		wasm_op (out, WASM_OP_CALL);
+		wasm_uleb (out, fix->idx);
+		break;
+	default:
+		wasm_i32_const (out, (gint32) r->table_index);
+		wasm_op (out, WASM_OP_CALL_INDIRECT);
+		wasm_uleb (out, ti);
+		wasm_uleb (out, 0);   /* table 0 (the imported f.f) */
+		break;
+	}
+}
+
+void
+wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_base, WasmBuf *out)
+{
+	const WasmRelocs *rl = src->relocs;
+	guint32 k, prev = 0, n = rl ? rl->n : 0;
+
+	for (k = 0; k < n; ++k) {
+		const WasmReloc *r = &rl->r [k];
+		guint32 ti = ti_base + r->tpool;
+		g_assert (r->off >= prev && r->off <= src->len);   /* relocs are sorted and in range */
+		wasm_bytes (out, src->data + prev, r->off - prev);
+		prev = r->off;
+		switch ((WasmRelocKind) r->kind) {
+		case WASM_RELOC_TYPE_U:
+			wasm_uleb (out, ti);
+			break;
+		case WASM_RELOC_TYPE_S:
+			wasm_sleb (out, (gint64) ti);
+			break;
+		case WASM_RELOC_INDIRECT:
+			wasm_op (out, WASM_OP_CALL_INDIRECT);
+			wasm_uleb (out, ti);
+			wasm_uleb (out, 0);
+			break;
+		case WASM_RELOC_SELF:
+			/* The entry thunk calling its own method. Always module-local: they are framed together. */
+			g_assert (fix [k].form == WASM_FORM_LOCAL);
+			wasm_op (out, WASM_OP_CALL);
+			wasm_uleb (out, fix [k].idx);
+			break;
+		default:
+			emit_call_site (out, r, &fix [k], ti);
+			break;
+		}
+	}
+	wasm_bytes (out, src->data + prev, src->len - prev);
+	/* Serializing must never disturb the peephole state of a buffer that is still being appended to. */
+	out->tee_end = 0;
 }
 
 static void
@@ -67,31 +162,6 @@ wasm_bytes (WasmBuf *b, const guint8 *p, guint32 n)
 	b->len += n;
 }
 
-/* A u32 ULEB padded to exactly 5 bytes, so its value can be rewritten later without moving any other byte.
- *
- * Needed because a batched member's entry thunk bakes `call <method funcidx>` DURING that member's compile,
- * but the offset it needs -- the batch module's total function-import count -- is only final once every
- * member has been emitted (a later member can intern a helper the earlier ones did not). LEB128 permits
- * redundant continuation bytes, so a 5-byte encoding of a small value is valid and patchable in place. */
-void
-wasm_uleb5 (WasmBuf *b, guint32 value)
-{
-	int k;
-	for (k = 0; k < 4; ++k)
-		wasm_u8 (b, (guint8) ((value >> (7 * k)) & 0x7F) | 0x80);
-	wasm_u8 (b, (guint8) ((value >> 28) & 0x0F));
-}
-
-/* Rewrite a wasm_uleb5 already in the buffer. `off` is the offset wasm_uleb5 was called at. */
-void
-wasm_uleb5_patch (WasmBuf *b, guint32 off, guint32 value)
-{
-	int k;
-	g_assert (off + 5 <= b->len);
-	for (k = 0; k < 4; ++k)
-		b->data [off + k] = (guint8) ((value >> (7 * k)) & 0x7F) | 0x80;
-	b->data [off + 4] = (guint8) ((value >> 28) & 0x0F);
-}
 
 void
 wasm_uleb (WasmBuf *b, guint64 value)
@@ -229,81 +299,6 @@ emit_section (WasmBuf *out, guint8 id, const WasmBuf *sec)
 	wasm_bytes (out, sec->data, sec->len);
 }
 
-void
-wasm_module_single_func (
-	const char *export_name,
-	const WasmValtype *param_types, guint32 nparams,
-	WasmValtype ret_type,
-	const WasmLocalGroup *locals, guint32 nlocal_groups,
-	const WasmBuf *body,
-	WasmBuf *out)
-{
-	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-	WasmBuf sec;
-	guint32 i;
-
-	wasm_bytes (out, header, 8);
-
-	/* Type section (1): a single function type */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 1);
-	wasm_u8 (&sec, 0x60);
-	wasm_uleb (&sec, nparams);
-	for (i = 0; i < nparams; ++i)
-		wasm_u8 (&sec, (guint8) param_types [i]);
-	if (ret_type == WASM_VOID) {
-		wasm_uleb (&sec, 0);
-	} else {
-		wasm_uleb (&sec, 1);
-		wasm_u8 (&sec, (guint8) ret_type);
-	}
-	emit_section (out, 1, &sec);
-	wasm_buf_free (&sec);
-
-	/* Function section (3): one function of type 0 */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 1);
-	wasm_uleb (&sec, 0);
-	emit_section (out, 3, &sec);
-	wasm_buf_free (&sec);
-
-	/* Export section (7): export the function (func index 0, no func imports) */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 1);
-	wasm_name (&sec, export_name);
-	wasm_u8 (&sec, 0x00);
-	wasm_uleb (&sec, 0);
-	emit_section (out, 7, &sec);
-	wasm_buf_free (&sec);
-
-	/* Code section (10): one code entry = locals decl + body + end */
-	wasm_buf_init (&sec);
-	{
-		WasmBuf entry;
-		guint32 ngroups = 0;
-		wasm_buf_init (&entry);
-
-		for (i = 0; i < nlocal_groups; ++i)
-			if (locals [i].count > 0)
-				ngroups++;
-		wasm_uleb (&entry, ngroups);
-		for (i = 0; i < nlocal_groups; ++i) {
-			if (locals [i].count == 0)
-				continue;
-			wasm_uleb (&entry, locals [i].count);
-			wasm_u8 (&entry, (guint8) locals [i].type);
-		}
-		wasm_bytes (&entry, body->data, body->len);
-		wasm_u8 (&entry, WASM_OP_END);
-
-		wasm_uleb (&sec, 1);          /* one code entry */
-		wasm_uleb (&sec, entry.len);  /* entry size */
-		wasm_bytes (&sec, entry.data, entry.len);
-		wasm_buf_free (&entry);
-	}
-	emit_section (out, 10, &sec);
-	wasm_buf_free (&sec);
-}
 
 static void
 emit_code_entry (WasmBuf *sec, const WasmLocalGroup *locals, guint32 nlocal_groups, const WasmBuf *body)
@@ -328,206 +323,6 @@ emit_code_entry (WasmBuf *sec, const WasmLocalGroup *locals, guint32 nlocal_grou
 	wasm_buf_free (&entry);
 }
 
-void
-wasm_module_method_and_entry (
-	const WasmValtype *param_types, guint32 nparams,
-	WasmValtype ret_type,
-	const WasmLocalGroup *locals, guint32 nlocal_groups,
-	const WasmBuf *f_body,
-	const WasmBuf *e_body,
-	const WasmFuncType *extra_types, guint32 nextra,
-	gboolean import_table,
-	gboolean import_eh_tag, guint32 eh_type_idx,
-	const WasmFuncImport *fimports, guint32 nfimports,
-	WasmBuf *out)
-{
-	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-	WasmBuf sec;
-	guint32 i, j;
-	static const WasmLocalGroup no_locals [1] = { { WASM_I32, 0 } };
-
-	wasm_bytes (out, header, 8);
-
-	/* Type section (1): T0 = method (params->ret), T1 = entry thunk ((i32,i32)->void),
-	 * T2.. = callee function types referenced by call_indirect in the method body */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 2 + nextra);
-	wasm_u8 (&sec, 0x60);
-	wasm_uleb (&sec, nparams);
-	for (i = 0; i < nparams; ++i)
-		wasm_u8 (&sec, (guint8) param_types [i]);
-	if (ret_type == WASM_VOID) {
-		wasm_uleb (&sec, 0);
-	} else {
-		wasm_uleb (&sec, 1);
-		wasm_u8 (&sec, (guint8) ret_type);
-	}
-	wasm_u8 (&sec, 0x60);
-	wasm_uleb (&sec, 2);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_uleb (&sec, 0);
-	for (i = 0; i < nextra; ++i) {
-		wasm_u8 (&sec, 0x60);
-		wasm_uleb (&sec, extra_types [i].nparams);
-		for (j = 0; j < extra_types [i].nparams; ++j)
-			wasm_u8 (&sec, (guint8) extra_types [i].params [j]);
-		if (extra_types [i].ret == WASM_VOID) {
-			wasm_uleb (&sec, 0);
-		} else {
-			wasm_uleb (&sec, 1);
-			wasm_u8 (&sec, (guint8) extra_types [i].ret);
-		}
-	}
-	emit_section (out, 1, &sec);
-	wasm_buf_free (&sec);
-
-	/* Import section (2): shared memory m.h (matches the threads runtime heap); — when the method body
-	 * uses call_indirect — the indirect function table f.f as table 0; — when it uses try/catch — the
-	 * C++ exception tag x.e (matches the runtime's __cpp_exception export, like the jiterpreter); and
-	 * five runtime globals: the mutable C stack pointer plus immutable addresses of this instance's
-	 * thread-local slot-liveness pointer/capacity and vcall-PIC pointer/capacity. */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 8 /* s.p/l/c/v/n/d/m/b globals */ + nfimports));
-	wasm_name (&sec, "m");
-	wasm_name (&sec, "h");
-	wasm_u8 (&sec, 0x02);   /* memory */
-	/* limits flag must match the runtime heap's SHARED-ness exactly: a threads build has a shared
-	 * memory (0x03 = shared+max), a single-threaded build an unshared one (0x01 = max only) — a
-	 * mismatch fails instantiation ("mismatch in shared state of memory"). */
-#ifdef DISABLE_THREADS
-	wasm_u8 (&sec, 0x01);   /* limits: max, unshared */
-#else
-	wasm_u8 (&sec, 0x03);   /* limits: shared + max */
-#endif
-	wasm_uleb (&sec, 256);
-	wasm_uleb (&sec, 65535); /* must be >= the runtime heap's max (65535 pages); 32768 fails to match */
-	if (import_table) {
-		wasm_name (&sec, "f");
-		wasm_name (&sec, "f");
-		wasm_u8 (&sec, 0x01);                  /* import kind: table */
-		wasm_u8 (&sec, (guint8) WASM_FUNCREF); /* element type funcref (0x70) */
-		wasm_u8 (&sec, 0x00);                  /* limits: min only (matches any actual table) */
-		wasm_uleb (&sec, 0);                   /* min 0 */
-	}
-	if (import_eh_tag) {
-		wasm_name (&sec, "x");
-		wasm_name (&sec, "e");
-		wasm_u8 (&sec, 0x04);            /* import kind: tag */
-		wasm_u8 (&sec, 0x00);            /* tag attribute: exception */
-		wasm_uleb (&sec, eh_type_idx);   /* function type index ((i32)->void) */
-	}
-	{
-		/* __stack_pointer as global s.p (kind 0x03), i32 mutable. It is global index 0.
-		 * The C-stack frame prologue/epilogue use global.get/set 0 for the SP save/restore. Requires the main
-		 * module to export __stack_pointer (-Wl,--export=__stack_pointer, set in browser.proj +
-		 * BrowserWasmApp.targets) and the instantiation to pass it as s.p. */
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "p");
-		wasm_u8 (&sec, 0x03);            /* import kind: global */
-		wasm_u8 (&sec, (guint8) WASM_I32); /* global type: i32 */
-		wasm_u8 (&sec, 0x01);            /* mutability: mutable */
-	}
-	{
-		/* Per-instance TLS addresses, global indices 1 and 2. Dynamic wasm modules are cached process-wide
-		 * but instantiated once per worker, so these cannot be baked into the module body. Supplying them
-		 * as immutable imports selects the current worker's TLS block at instantiation without paying two
-		 * C-boundary calls on every invocation of every virtual-call-containing method. The pointed-to
-		 * values remain live: a slot-bitmap realloc updates *s.l and the capacity update is visible at *s.c. */
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "l");
-		wasm_u8 (&sec, 0x03);
-		wasm_u8 (&sec, (guint8) WASM_I32);
-		wasm_u8 (&sec, 0x00);            /* immutable */
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "c");
-		wasm_u8 (&sec, 0x03);
-		wasm_u8 (&sec, (guint8) WASM_I32);
-		wasm_u8 (&sec, 0x00);            /* immutable */
-	}
-	{
-		/* Worker-local virtual PIC pointer/capacity variable addresses, global indices 3 and 4.
-		 * Generated virtual dispatch loads the current pointer through s.v and bounds its stable site
-		 * id against *s.n before touching the array. */
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "v");
-		wasm_u8 (&sec, 0x03);
-		wasm_u8 (&sec, (guint8) WASM_I32);
-		wasm_u8 (&sec, 0x00);
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "n");
-		wasm_u8 (&sec, 0x03);
-		wasm_u8 (&sec, (guint8) WASM_I32);
-		wasm_u8 (&sec, 0x00);
-	}
-	{
-		/* Worker-local DELEGATE recipe PIC pointer/capacity addresses, global indices 5 and 6. Same
-		 * contract as s.v/s.n above; separate array because delegate recipes carry a different payload
-		 * (source method + admitted fslot + receiver vtable + shape) than receiver-vtable dispatch. */
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "d");
-		wasm_u8 (&sec, 0x03);
-		wasm_u8 (&sec, (guint8) WASM_I32);
-		wasm_u8 (&sec, 0x00);
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "m");
-		wasm_u8 (&sec, 0x03);
-		wasm_u8 (&sec, (guint8) WASM_I32);
-		wasm_u8 (&sec, 0x00);
-		/* s.b, global index 7: the VALUE of this worker's residual scratch base. Unlike s.v/s.d it is not an
-		 * address to load through — `wj_scratch` is a __thread ARRAY, so its address is constant for the
-		 * thread's life and can be consumed directly, replacing a `mono_wasm_jit_scratch()` helper CALL on
-		 * every residual and every vcall cold miss. */
-		wasm_name (&sec, "s");
-		wasm_name (&sec, "b");
-		wasm_u8 (&sec, 0x03);
-		wasm_u8 (&sec, (guint8) WASM_I32);
-		wasm_u8 (&sec, 0x00);
-	}
-	/* Direct-call helper imports, LAST so that being the only kind-0x00 imports they take function indices
-	 * 0..nfimports-1 in exactly this order — which is the invariant the body relies on when it emits
-	 * `call <slot>` for a helper long before the final count is known. Named by table index in decimal;
-	 * the instantiation side resolves each with wasmTable.get(Number(name)). */
-	for (i = 0; i < nfimports; ++i) {
-		char idxname [16];
-		g_snprintf (idxname, sizeof (idxname), "%u", (unsigned) fimports [i].table_index);
-		wasm_name (&sec, "h");
-		wasm_name (&sec, idxname);
-		wasm_u8 (&sec, 0x00);                          /* import kind: function */
-		wasm_uleb (&sec, fimports [i].type_idx);
-	}
-	emit_section (out, 2, &sec);
-	wasm_buf_free (&sec);
-
-	/* Function section (3): func0 = method (type 0), func1 = entry (type 1) */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 2);
-	wasm_uleb (&sec, 0);
-	wasm_uleb (&sec, 1);
-	emit_section (out, 3, &sec);
-	wasm_buf_free (&sec);
-
-	/* Export section (7): the method `f` (for call_indirect from JITted callers) and the entry thunk `e`
-	 * (for interp entry). Both are DEFINED functions, so their indices sit above the imported ones. */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 2);
-	wasm_name (&sec, "f");
-	wasm_u8 (&sec, 0x00);
-	wasm_uleb (&sec, nfimports + 0);
-	wasm_name (&sec, "e");
-	wasm_u8 (&sec, 0x00);
-	wasm_uleb (&sec, nfimports + 1);
-	emit_section (out, 7, &sec);
-	wasm_buf_free (&sec);
-
-	/* Code section (10): method body, then entry-thunk body */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 2);
-	emit_code_entry (&sec, locals, nlocal_groups, f_body);
-	emit_code_entry (&sec, no_locals, 1, e_body);
-	emit_section (out, 10, &sec);
-	wasm_buf_free (&sec);
-}
 
 /* Append one functype (0x60 form) to a type section buffer. */
 static void
@@ -546,164 +341,164 @@ emit_functype (WasmBuf *sec, const WasmValtype *params, guint32 nparams, WasmVal
 	}
 }
 
-void
-wasm_module_methods_and_entries (
-	const WasmModuleMember *members, guint32 nmembers,
-	gboolean import_table,
-	gboolean import_eh_tag, guint32 eh_type_idx,
-	const WasmFuncImport *fimports, guint32 nfimports,
-	WasmBuf *out)
+/*
+ * The import section, which is byte-identical in every module this backend frames. Factored out of the
+ * two legacy framers so the hand-maintained import COUNT literal below exists exactly once: when it fell
+ * out of step with the emits that follow it, every module was rejected with "section was shorter than
+ * expected size", `registered` sat at 0 from boot, and it cost a whole measurement session to find.
+ * Count the emits below before editing the literal.
+ *
+ * The global index space is a fixed contract with the emitter, which hard-codes `global.get/set 0..7`:
+ *   0 s.p  __stack_pointer, i32 MUTABLE (the only mutable import; every framed method reads and writes it)
+ *   1 s.l  &wj_slot_live          2 s.c  &wj_slot_live_cap
+ *   3 s.v  &wj_vcall_pic          4 s.n  &wj_vcall_pic_cap
+ *   5 s.d  &wj_delegate_pic       6 s.m  &wj_delegate_pic_cap
+ *   7 s.b  the VALUE of this worker's residual scratch base (wj_scratch is a __thread ARRAY, so its
+ *          address is constant for the thread's life and can be consumed directly, replacing a
+ *          mono_wasm_jit_scratch() helper CALL on every residual and every vcall cold miss)
+ * Every module declares all eight whether or not it uses them, because the emitter's indices are absolute.
+ *
+ * Function imports come LAST in this section but FIRST in the function index space -- wasm gives imported
+ * functions indices 0..nfimports-1 regardless of section order -- which is why every defined-function
+ * index elsewhere is offset by nfimports.
+ */
+static void
+emit_import_section (WasmBuf *out, gboolean import_table, gboolean import_eh_tag, guint32 eh_type_idx,
+                     const WasmFuncImport *fimports, guint32 nfimports)
 {
-	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-	static const WasmLocalGroup no_locals [1] = { { WASM_I32, 0 } };
-	static const WasmValtype entry_params [2] = { WASM_I32, WASM_I32 };
+	static const char *const gnames [8] = { "p", "l", "c", "v", "n", "d", "m", "b" };
 	WasmBuf sec;
-	guint32 i, j, base = 0;
+	guint32 i;
 
-	g_assert (nmembers > 0);
-
-	wasm_bytes (out, header, 8);
-
-	/* Type section (1): member blocks back to back — { method, entry, extras... } each. */
 	wasm_buf_init (&sec);
-	{
-		guint32 ntypes = 0;
-		for (i = 0; i < nmembers; ++i)
-			ntypes += 2 + members [i].nextra;
-		wasm_uleb (&sec, ntypes);
-	}
-	for (i = 0; i < nmembers; ++i) {
-		const WasmModuleMember *m = &members [i];
-		/* The body already has this base baked into every call_indirect; if the caller computed it
-		 * differently from the layout here, the module would still validate but call through the wrong
-		 * signatures. Fail loudly instead. */
-		g_assertf (m->ti_base == base, "wasm batch member %u: ti_base %u but its block starts at %u",
-		           i, m->ti_base, base);
-		emit_functype (&sec, m->param_types, m->nparams, m->ret_type);
-		emit_functype (&sec, entry_params, 2, WASM_VOID);
-		for (j = 0; j < m->nextra; ++j)
-			emit_functype (&sec, m->extra_types [j].params, m->extra_types [j].nparams, m->extra_types [j].ret);
-		base += 2 + m->nextra;
-	}
-	emit_section (out, 1, &sec);
-	wasm_buf_free (&sec);
+	wasm_uleb (&sec, (guint32) (1 /* m.h */ + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 8 /* s.* */ + nfimports));
 
-	/* Import section (2): identical to the single-method form — the shared heap, optionally the indirect
-	 * function table and the C++ exception tag, __stack_pointer, and the four per-instance TLS addresses. */
-	wasm_buf_init (&sec);
-	/* +nfimports: batched members may now declare direct-call helper imports, exactly as the single-method
-	 * emitter does. This literal is hand-maintained and has already cost one whole measurement session when
-	 * it fell out of step with what is actually emitted below -- every module was rejected with "section was
-	 * shorter than expected size" and `registered` sat at 0 from boot. Count the emits below before editing. */
-	wasm_uleb (&sec, (guint32) (1 + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 8 /* s.p/l/c/v/n/d/m/b */ + nfimports));
+	/* Shared heap m.h. The limits flag must match the runtime heap's SHARED-ness exactly: a threads build
+	 * has a shared memory (0x03 = shared+max), a single-threaded build an unshared one (0x01 = max only);
+	 * a mismatch fails instantiation with "mismatch in shared state of memory". */
 	wasm_name (&sec, "m");
 	wasm_name (&sec, "h");
 	wasm_u8 (&sec, 0x02);
-	/* must match the runtime heap's shared-ness exactly or instantiation fails */
 #ifdef DISABLE_THREADS
 	wasm_u8 (&sec, 0x01);
 #else
 	wasm_u8 (&sec, 0x03);
 #endif
 	wasm_uleb (&sec, 256);
-	wasm_uleb (&sec, 65535);
+	wasm_uleb (&sec, 65535);   /* must be >= the runtime heap's max (65535 pages); 32768 fails to match */
+
 	if (import_table) {
 		wasm_name (&sec, "f");
 		wasm_name (&sec, "f");
-		wasm_u8 (&sec, 0x01);
+		wasm_u8 (&sec, 0x01);                  /* kind: table */
 		wasm_u8 (&sec, (guint8) WASM_FUNCREF);
-		wasm_u8 (&sec, 0x00);
+		wasm_u8 (&sec, 0x00);                  /* limits: min only (matches any actual table) */
 		wasm_uleb (&sec, 0);
 	}
 	if (import_eh_tag) {
 		wasm_name (&sec, "x");
 		wasm_name (&sec, "e");
-		wasm_u8 (&sec, 0x04);
-		wasm_u8 (&sec, 0x00);
-		wasm_uleb (&sec, eh_type_idx);
+		wasm_u8 (&sec, 0x04);                  /* kind: tag */
+		wasm_u8 (&sec, 0x00);                  /* attribute: exception */
+		wasm_uleb (&sec, eh_type_idx);         /* functype (i32)->void */
 	}
-	wasm_name (&sec, "s");
-	wasm_name (&sec, "p");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x01);
-	wasm_name (&sec, "s");
-	wasm_name (&sec, "l");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x00);
-	wasm_name (&sec, "s");
-	wasm_name (&sec, "c");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x00);
-	wasm_name (&sec, "s");
-	wasm_name (&sec, "v");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x00);
-	wasm_name (&sec, "s");
-	wasm_name (&sec, "n");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x00);
-	/* s.d / s.m — worker-local delegate PIC pointer/cap. Declared here as well as in the single-method
-	 * module: both emitters share the body's global index space, so a batch module missing these would
-	 * leave global.get 5/6 unresolved. */
-	wasm_name (&sec, "s");
-	wasm_name (&sec, "d");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x00);
-	wasm_name (&sec, "s");
-	wasm_name (&sec, "m");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x00);
-	wasm_name (&sec, "s");   /* s.b — residual scratch base value; see the single-method emitter */
-	wasm_name (&sec, "b");
-	wasm_u8 (&sec, 0x03);
-	wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_u8 (&sec, 0x00);
-	/* Function imports LAST in this section but FIRST in the function index space (wasm gives imported
-	 * functions indices 0..nfimports-1 regardless of section order), which is why every defined-function
-	 * index below is offset by nfimports. Module "h", name = the helper's decimal table index; the page's
-	 * import resolver is a Proxy over wasmTable.get, so no registry is needed. */
+	for (i = 0; i < 8; ++i) {
+		wasm_name (&sec, "s");
+		wasm_name (&sec, gnames [i]);
+		wasm_u8 (&sec, 0x03);                  /* kind: global */
+		wasm_u8 (&sec, (guint8) WASM_I32);
+		wasm_u8 (&sec, i == 0 ? 0x01 : 0x00);  /* only s.p is mutable */
+	}
+	/* Named by table index in decimal; the page's import resolver is a Proxy over wasmTable.get, so any
+	 * table index resolves and no linker export or fixed helper registry is needed. */
 	for (i = 0; i < nfimports; ++i) {
-		char idx [16];
-		g_snprintf (idx, sizeof (idx), "%u", fimports [i].table_index);
+		char idxname [16];
+		g_snprintf (idxname, sizeof (idxname), "%u", (unsigned) fimports [i].table_index);
 		wasm_name (&sec, "h");
-		wasm_name (&sec, idx);
-		wasm_u8 (&sec, 0x00);
+		wasm_name (&sec, idxname);
+		wasm_u8 (&sec, 0x00);                  /* kind: function */
 		wasm_uleb (&sec, fimports [i].type_idx);
 	}
 	emit_section (out, 2, &sec);
 	wasm_buf_free (&sec);
+}
 
-	/* Function section (3): all N methods first, then all N thunks, so member i's method is funcidx i —
-	 * knowable from batch membership alone, which is what lets each thunk bake `call i`. */
+/*
+ * Frame N members into one module. N == 1 produces byte-for-byte what wasm_module_method_and_entry
+ * produced, which is the gate the relocatable-body refactor is verified against.
+ *
+ * Unlike the framers it replaces, this one bakes NOTHING into the bodies: `f_body`/`e_body` arrive already
+ * relocated by the caller, which is what makes re-framing a member set a byte copy rather than a re-compile.
+ * The type-index base a member's body was relocated against is `ti_base` as computed here -- the running
+ * sum of `ntypes` -- and the caller must have used the same value. There is no assert for it any more
+ * because the caller now derives it from this same rule rather than remembering it from an earlier emit.
+ *
+ * Layout:
+ *   types:   member blocks back to back; member i occupies [ti_base_i .. ti_base_i + ntypes_i - 1] and its
+ *            block is { method_i, entry_i, extras_i... }, so types[0] and types[1] are load-bearing.
+ *   funcs:   0..nfimports-1 imported, then the N methods, then the N entry thunks. Methods precede thunks
+ *            so member i's method is funcidx nfimports + i.
+ *   exports: N == 1 -> "f"/"e" (the single-method instantiate path); N > 1 -> "f<i>"/"e<i>" (the batch one).
+ */
+void
+wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers,
+                      gboolean import_table, gboolean import_eh_tag, guint32 eh_type_idx,
+                      const WasmFuncImport *fimports, guint32 nfimports,
+                      WasmBuf *out)
+{
+	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+	static const WasmLocalGroup no_locals [1] = { { WASM_I32, 0 } };
+	WasmBuf sec;
+	guint32 i, j, base;
+
+	g_assert (nmembers > 0);
+
+	wasm_bytes (out, header, 8);
+
+	/* Type section (1) */
+	wasm_buf_init (&sec);
+	{
+		guint32 ntypes = 0;
+		for (i = 0; i < nmembers; ++i) {
+			g_assert (members [i].ntypes >= 2);   /* method + entry are mandatory */
+			ntypes += members [i].ntypes;
+		}
+		wasm_uleb (&sec, ntypes);
+	}
+	for (i = 0; i < nmembers; ++i)
+		for (j = 0; j < members [i].ntypes; ++j)
+			emit_functype (&sec, members [i].types [j].params, members [i].types [j].nparams,
+			               members [i].types [j].ret);
+	emit_section (out, 1, &sec);
+	wasm_buf_free (&sec);
+
+	emit_import_section (out, import_table, import_eh_tag, eh_type_idx, fimports, nfimports);
+
+	/* Function section (3): all N methods, then all N thunks. */
 	wasm_buf_init (&sec);
 	wasm_uleb (&sec, nmembers * 2);
-	for (i = 0; i < nmembers; ++i)
-		wasm_uleb (&sec, members [i].ti_base);          /* method type */
-	for (i = 0; i < nmembers; ++i)
-		wasm_uleb (&sec, members [i].ti_base + 1);      /* entry-thunk type */
+	for (i = 0, base = 0; i < nmembers; base += members [i].ntypes, ++i)
+		wasm_uleb (&sec, base);          /* method type = the member block's first entry */
+	for (i = 0, base = 0; i < nmembers; base += members [i].ntypes, ++i)
+		wasm_uleb (&sec, base + 1);      /* entry-thunk type = its second */
 	emit_section (out, 3, &sec);
 	wasm_buf_free (&sec);
 
-	/* Export section (7): "f<i>" = method i, "e<i>" = its entry thunk. */
+	/* Export section (7) */
 	wasm_buf_init (&sec);
 	wasm_uleb (&sec, nmembers * 2);
 	for (i = 0; i < nmembers; ++i) {
 		char nm [24];
-		g_snprintf (nm, sizeof (nm), "f%u", i);
+		if (nmembers == 1) { nm [0] = 'f'; nm [1] = 0; }
+		else g_snprintf (nm, sizeof (nm), "f%u", i);
 		wasm_name (&sec, nm);
 		wasm_u8 (&sec, 0x00);
-		wasm_uleb (&sec, nfimports + i);        /* defined functions sit above the imports */
+		wasm_uleb (&sec, nfimports + i);
 	}
 	for (i = 0; i < nmembers; ++i) {
 		char nm [24];
-		g_snprintf (nm, sizeof (nm), "e%u", i);
+		if (nmembers == 1) { nm [0] = 'e'; nm [1] = 0; }
+		else g_snprintf (nm, sizeof (nm), "e%u", i);
 		wasm_name (&sec, nm);
 		wasm_u8 (&sec, 0x00);
 		wasm_uleb (&sec, nfimports + nmembers + i);
@@ -772,7 +567,7 @@ wasm_module_append_name_section (WasmBuf *out, const char *module_name, const ch
 }
 
 /*
- * Name section for a BATCHED module (wasm_module_methods_and_entries).
+ * Name section for a module with more than one member.
  *
  * The single-method variant above hardcodes a two-entry map because that module has exactly func0 =
  * method and func1 = entry thunk. A batch has N methods at indices 0..N-1 followed by N entry thunks at

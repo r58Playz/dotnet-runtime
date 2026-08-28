@@ -250,6 +250,9 @@ typedef struct {
 	guint32 tee_off;
 	guint32 tee_end;
 	guint32 tee_idx;
+	/* Relocations recorded in this buffer, or NULL for a buffer that carries none (every buffer used to
+	 * build a SECTION). Only function bodies carry relocs. See WasmRelocs below. */
+	struct _WasmRelocs *relocs;
 } WasmBuf;
 
 void wasm_buf_init  (WasmBuf *b);
@@ -272,6 +275,80 @@ void wasm_f32_const (WasmBuf *b, float v);
 void wasm_f64_const (WasmBuf *b, double v);
 void wasm_memarg    (WasmBuf *b, guint32 align_log2, guint32 offset);
 
+/*
+ * RELOCATIONS -- why a body is not finished when it is emitted.
+ *
+ * Everything a wasm body encodes inline is either position-independent (there are no byte-offset branches
+ * in wasm: `br` takes a label DEPTH, memarg offsets are absolute constants, local indices are function
+ * local) or an INDEX into a module-level space. The index spaces are the whole problem: a body's type
+ * indices and `call` immediates are only meaningful against the module it was framed into. Bake them and
+ * the body can never be re-framed with different neighbours without being compiled again from IL, which is
+ * exactly what made module batching cost a full re-JIT per member.
+ *
+ * So the emitter leaves a HOLE at every such site and records where. A hole is ZERO bytes long: nothing is
+ * written, and serialization copies the runs of bytes between holes and encodes each site fresh against the
+ * final layout. That is what lets a call change FORM as well as index -- `call_indirect` (~15 x86), an
+ * imported `call` (~5) and a module-local `call` (1, and the only one V8 will inline) have different
+ * lengths, so patching an immediate in place could not express the choice. (Contrast gex, which pads every
+ * relocatable index to a fixed 5-byte LEB and patches in place -- sufficient there because it never changes
+ * a call's form, only its index.)
+ *
+ * Serialization is O(bytes + relocs) either way: a memcpy per run plus a few bytes per site.
+ */
+typedef enum {
+	WASM_RELOC_TYPE_U,    /* a type-index immediate, ULEB-encoded */
+	WASM_RELOC_TYPE_S,    /* a type-index immediate, SLEB-encoded (a multi-value block/if blocktype) */
+	WASM_RELOC_INDIRECT,  /* `call_indirect <type> 0` with the index already on the stack */
+	WASM_RELOC_HELPER,    /* a call to a fixed table index: a C runtime helper in dotnet.native.wasm */
+	WASM_RELOC_HELPER_CI, /* a fixed table index the helper-import conversion never covered, so it has
+	                       * always been a constant-index call_indirect: the runtime JIT-icall and the
+	                       * residual throw continuation */
+	WASM_RELOC_AOT,       /* a call to a fixed table index: an AOT method body. All three are encoded
+	                       * identically and differ only in which knob gates them at assembly, which
+	                       * matters because they are wildly different populations: ~25 distinct helpers,
+	                       * hundreds of AOT bodies at ~90k inline-AOT calls per frame, and the
+	                       * never-converted remainder, one of whose indices (403815) carries 32.3% of all
+	                       * constant-index indirect traffic on its own. */
+	WASM_RELOC_CALL,      /* a call to another JITted method, identified by `sym` and its f-slot */
+	WASM_RELOC_SELF,      /* a `call` naming the owning member's own method function; always module-local */
+} WasmRelocKind;
+
+typedef struct {
+	guint32  off;          /* insertion point in the code buffer. The hole occupies NO bytes. */
+	guint16  kind;         /* WasmRelocKind */
+	guint16  tpool;        /* index into the owning member's type block (0 = its own sig, 1 = its thunk's) */
+	guint32  table_index;  /* HELPER: the C function pointer. CALL/SELF: the callee's f-slot. */
+	gpointer sym;          /* CALL: callee identity (a MonoMethod*), for co-location and the ABI check */
+} WasmReloc;
+
+typedef struct _WasmRelocs {
+	WasmReloc *r;
+	guint32    n, cap;
+} WasmRelocs;
+
+/* How one reloc was resolved. `idx` is the function index for IMPORT/LOCAL and unused for INDIRECT. */
+typedef enum { WASM_FORM_INDIRECT, WASM_FORM_IMPORT, WASM_FORM_LOCAL } WasmRelocForm;
+typedef struct { guint8 form; guint32 idx; } WasmRelocFix;
+
+/* Attach a reloc list to a body buffer. Must be called before any wasm_reloc on it. */
+void wasm_buf_init_relocs (WasmBuf *b);
+
+/*
+ * Record a hole at the current end of `b`.
+ *
+ * Also DISARMS the local.tee peephole, and that is load-bearing rather than tidy: a hole is zero bytes, so
+ * without this `tee_end == len` would still hold across it and a `local.set N` / call / `local.get N`
+ * sequence would be rewritten into `local.tee N` -- deleting the call's effect on the stack.
+ */
+void wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, gpointer sym);
+
+/*
+ * Emit `src` into `out` with every hole filled: `fix[k]` resolves `src->relocs->r[k]`, and a type index
+ * `tpool` becomes `ti_base + tpool`. `out` receives instructions only -- no locals declaration, no
+ * trailing `end`, exactly like the buffer that goes into a WasmAsmMember body.
+ */
+void wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_base, WasmBuf *out);
+
 /* A local-declaration group (count locals of a given type). */
 typedef struct {
 	WasmValtype type;
@@ -286,19 +363,6 @@ typedef struct {
 	WasmValtype ret;        /* WASM_VOID for no return */
 } WasmFuncType;
 
-/*
- * Frame a complete module that imports nothing and exports a single function
- * `export_name` with the given signature. `body` holds the function's
- * instruction bytes WITHOUT the locals declaration and WITHOUT the trailing
- * 0x0b end (both are appended here). Result module bytes are appended to `out`.
- */
-void wasm_module_single_func (
-	const char *export_name,
-	const WasmValtype *param_types, guint32 nparams,
-	WasmValtype ret_type,
-	const WasmLocalGroup *locals, guint32 nlocal_groups,
-	const WasmBuf *body,
-	WasmBuf *out);
 
 /*
  * One runtime helper the method body calls DIRECTLY, declared as a wasm function import.
@@ -322,95 +386,53 @@ typedef struct {
 	guint32 type_idx;       /* functype index (T0=method, T1=entry, 2+k = extra_types [k]) */
 } WasmFuncImport;
 
-/*
- * Frame a module with TWO functions and a shared-memory import (`m`.`h`):
- *   func 0 = the method `f` (signature param_types→ret_type, with `locals`/`f_body`);
- *   func 1 = an entry thunk `e` (signature (i32 args_ptr, i32 ret_ptr)→void, `e_body`,
- *            no locals) which is the only export ("e").
- * The thunk reads the method's args from interp stackvals in linear memory and writes the
- * result back, so the interpreter can invoke any signature uniformly via `e(args, ret)`.
- *
- * `extra_types`/`nextra` add callee function types after T0=method, T1=entry (so callee type k
- * is type index 2+k) — referenced by call_indirect in `f_body`. If `import_table` is TRUE the
- * module also imports the indirect function table as `f`.`f` (table 0) for those call_indirects.
- * If `import_eh_tag` is TRUE the module imports the C++ exception tag as `x`.`e` (kind 0x04) with
- * function type index `eh_type_idx` ((i32)->void) — for `catch <x.e>` in `f_body` (inline-AOT-call EH).
- *
- * `fimports`/`nfimports` declare direct-call helper imports (see WasmFuncImport). Function imports take
- * function indices 0..nfimports-1 in the order given, so the module's own two functions shift to
- * nfimports (the method `f`) and nfimports+1 (the entry thunk `e`) — any `call` immediate in `f_body`/`e_body`
- * naming a DEFINED function must already account for that offset, since those immediates are ULEB-encoded
- * inline and cannot be shifted after the fact. Helper `call` immediates need no such adjustment: slot i is
- * function index i regardless of how many slots end up being used, which is what makes it safe to assign
- * them in first-use order while the body is still being emitted.
- */
-void wasm_module_method_and_entry (
-	const WasmValtype *param_types, guint32 nparams,
-	WasmValtype ret_type,
-	const WasmLocalGroup *locals, guint32 nlocal_groups,
-	const WasmBuf *f_body,
-	const WasmBuf *e_body,
-	const WasmFuncType *extra_types, guint32 nextra,
-	gboolean import_table,
-	gboolean import_eh_tag, guint32 eh_type_idx,
-	const WasmFuncImport *fimports, guint32 nfimports,
-	WasmBuf *out);
-
-/*
- * One member of a batched module. Mirrors the arguments wasm_module_method_and_entry takes for a single
- * method, plus `ti_base` — where this member's block starts in the shared type section.
- *
- * `ti_base` is not advisory. Type indices are ULEB-encoded inline in the body at every call_indirect, so
- * they cannot be relocated after emission; the emitter has to have used this exact base while generating
- * `f_body`. wasm_module_methods_and_entries lays the type section out to match and asserts agreement.
- */
-typedef struct {
-	const WasmValtype *param_types;
-	guint32 nparams;
-	WasmValtype ret_type;
-	const WasmLocalGroup *locals;
-	guint32 nlocal_groups;
-	const WasmBuf *f_body;
-	const WasmBuf *e_body;
-	const WasmFuncType *extra_types;
-	guint32 nextra;
-	guint32 ti_base;
-} WasmModuleMember;
-
-/*
- * Frame ONE module holding N methods and their N entry thunks — the island-batching form of
- * wasm_module_method_and_entry. Layout:
- *
- *   types:     member blocks concatenated; member i occupies [ti_base_i .. ti_base_i + 1 + nextra_i],
- *              namely { method_i, entry_i, extras_i... }, so ti_base_i = sum over j<i of (2 + nextra_j).
- *   funcs:     0..N-1   = the methods (exported "f0".."f{N-1}")
- *              N..2N-1  = the entry thunks (exported "e0".."e{N-1}")
- *   imports:   as the single-method form — memory m.h, table f.f if any member calls indirectly,
- *              tag x.e if any member has an in-method landing pad, global s.p.
- *
- * The point of co-locating is that V8 will not inline across a WebAssembly.Module boundary but inlines
- * freely — through `call` AND speculatively through `call_indirect` — within one. Measured at ~3.5-6x
- * per call on accessor-sized callees, and flat out to 500 functions per module (scratchpad/scalerun.mjs).
- *
- * Each thunk calls its own method with `call i`, so the emitter must have written member i's index there
- * rather than the single-method form's constant 0.
- */
-void wasm_module_methods_and_entries (
-	const WasmModuleMember *members, guint32 nmembers,
-	gboolean import_table,
-	gboolean import_eh_tag, guint32 eh_type_idx,
-	const WasmFuncImport *fimports, guint32 nfimports,
-	WasmBuf *out);
-
-/* A u32 ULEB padded to exactly 5 bytes, and an in-place rewrite of one. Lets a value be baked into a body
- * before it is known -- specifically a batched entry thunk's `call <funcidx>`, which is offset by the batch's
- * final function-import count. */
-void wasm_uleb5 (WasmBuf *b, guint32 value);
-void wasm_uleb5_patch (WasmBuf *b, guint32 off, guint32 value);
 
 /* Name section for a batched module: methods at func nfimports..nfimports+n-1, thunks after them. */
 void
 wasm_module_append_name_section_multi (WasmBuf *out, const char *module_name, const char *const *names, guint32 n, guint32 nfimports);
+
+/*
+ * One member of a module framed by wasm_module_assemble.
+ *
+ * `f_body`/`e_body` arrive ALREADY RELOCATED: the caller has resolved every type index and every call
+ * immediate against this module's final layout. That is the whole point -- a member's bytes are produced
+ * once, by one compile, and can then be framed into any module with any other members for the cost of a
+ * memcpy, instead of being re-compiled from IL because their indices were baked against the old layout.
+ *
+ * `types` is this member's type block, in the order it occupies the shared type section:
+ *   types[0] = the method's own signature      (its funcidx's type)
+ *   types[1] = the entry thunk's signature     ((i32,i32)->void)
+ *   types[2..] = callee functypes the bodies reference by call_indirect / multi-value blocktype
+ * so `ntypes >= 2` always. Member i's block starts at ti_base_i = sum of ntypes over j<i, and the caller
+ * must have relocated against that same running sum.
+ */
+typedef struct {
+	const WasmLocalGroup *locals;
+	guint32               nlocal_groups;
+	const WasmBuf        *f_body;
+	const WasmBuf        *e_body;
+	const WasmFuncType   *types;
+	guint32               ntypes;
+} WasmAsmMember;
+
+/*
+ * Frame N members into ONE module -- the only framer there is.
+ *
+ * Layout:
+ *   types:   member blocks back to back, so member i occupies [ti_base_i .. ti_base_i + ntypes_i - 1].
+ *   funcs:   the imports first (function imports take indices 0..nfimports-1 whatever the section order),
+ *            then the N methods, then the N entry thunks -- so member i's method is nfimports + i.
+ *   exports: "f"/"e" at N == 1, "f<i>"/"e<i>" above it, matching the two instantiate paths.
+ *
+ * Nothing is patched afterwards and nothing is asserted about what the caller baked, because the caller
+ * bakes nothing: every index a body needs arrived as a relocation.
+ */
+void wasm_module_assemble (
+	const WasmAsmMember *members, guint32 nmembers,
+	gboolean import_table,
+	gboolean import_eh_tag, guint32 eh_type_idx,
+	const WasmFuncImport *fimports, guint32 nfimports,
+	WasmBuf *out);
 
 /*
  * Frame a module exporting a single function `t` (the interp-entry thunk) with signature

@@ -206,6 +206,16 @@ enum {
 	WJC_LCSE_LOADS_SEEN, WJC_LCSE_ADDS, WJC_LCSE_HITS, WJC_LCSE_EVICT,
 	/* residual calls that entered the callee's own JITted e-slot directly, skipping interp_entry */
 	WJC_ESLOT_RESIDUAL,
+	/* Call-form census, counted at ASSEMBLY: every hole a body left, by the form the assembler chose for
+	 * it. Compile-time counts, not execution counts, and the direct mechanism reading for both the import
+	 * conversion and co-location -- a change meant to remove call_indirect shows up here in one run, where
+	 * the fps A/B that would confirm it costs hours against a ~9% resolution floor.
+	 *   LOCAL     `call <funcidx>`  1 x86, and the only form V8 will inline through
+	 *   IMPORT    `call <import>`   ~5 x86 (three loads from WasmDispatchTableForImports + `call *`)
+	 *   INDIRECT  `i32.const <slot>; call_indirect`  ~15 x86, never inlined
+	 * Re-assembling a member counts it again, deliberately: the census is per module built, so comparing
+	 * it across generations is how a rebatch is shown to have actually retargeted anything. */
+	WJC_CALL_LOCAL, WJC_CALL_IMPORT, WJC_CALL_INDIRECT,
 	WJC_MAX
 };
 
