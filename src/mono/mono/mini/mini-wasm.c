@@ -903,7 +903,7 @@ mono_wasm_jit_get_counter (int idx)
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 67);
+g_static_assert (WJC_MAX == 68);
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -951,8 +951,8 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_REFBASES_EXTRA));
 	printf ("[wasm-jit gcpin] ref_slots=%lld wt_vregs=%lld slots_elided=%lld slot_zero_stores=%lld frame_bytes=%lld\n",
 		WJC_(WJC_REF_SLOTS), WJC_(WJC_REF_WT_VREGS), WJC_(WJC_SLOTS_ELIDED), WJC_(WJC_SLOT_ZERO_STORES), WJC_(WJC_FRAME_BYTES));
-	printf ("[wasm-jit callform] local=%lld import=%lld indirect=%lld (per module assembled, not per execution)\n",
-		WJC_(WJC_CALL_LOCAL), WJC_(WJC_CALL_IMPORT), WJC_(WJC_CALL_INDIRECT));
+	printf ("[wasm-jit callform] local=%lld import=%lld indirect=%lld (per module assembled, not per execution)  admit_deferred=%lld\n",
+		WJC_(WJC_CALL_LOCAL), WJC_(WJC_CALL_IMPORT), WJC_(WJC_CALL_INDIRECT), WJC_(WJC_ADMIT_DEFERRED));
 	printf ("[wasm-jit vtabi] vt_byaddr_methods=%lld vret_methods=%lld\n",
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
 	printf ("[wasm-jit transition] residual_healed=%lld fast_delegate=%lld delegate_ic_hit=%lld (fast counters require PROFILE_FAST=1)\n",
@@ -1183,11 +1183,34 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			 * (there are ~25k JIT'd modules in a session). Non-numeric keys return undefined so that any
 			 * incidental property probe cannot hand back a function. */
 			if (!Module.__wjHelperImports) {
-				var _wjHelperCache = {};
+				/* THE CACHE IS A MEMO OF wasmTable.get AND MUST BE INVALIDATED WHEN THE TABLE CHANGES.
+				 *
+				 * It was safe while only HELPERS were imported: those are C functions in
+				 * dotnet.native.wasm, at table indices fixed for the life of the process, so wrapping
+				 * each once instead of once per module (~25k of them) is pure win.
+				 *
+				 * A METHOD f-slot is not fixed. It holds a placeholder until the callee's module is
+				 * instantiated ON THIS WORKER, and only then becomes the callee's `f`. Any module that
+				 * imported that slot earlier cached the placeholder -- and the entry then never updates,
+				 * so every later importer of that slot on that worker gets a function of the wrong type
+				 * and fails INSTANTIATION with "imported function does not match the expected type".
+				 *
+				 * That is the whole of the direct-import failure, and it was diagnosed twice as something
+				 * else. Round 132 read the residual 40 faults as a cross-worker admission race; Round 139
+				 * read them as unsound imports across dependency CYCLES and concluded the fix was
+				 * co-locating SCCs. The tell was in both write-ups and read as evidence for a cycle: ONE
+				 * callee failing for FOUR separate importers. That is one poisoned cache entry, not four
+				 * bad call sites. Instrumenting the failing admission settled it -- every dependency was
+				 * admitted (state 2) and live on that worker, so the table was right and the reader was
+				 * stale.
+				 *
+				 * So: keep the memo, and delete the entry wherever a slot is written below. */
+				Module.__wjHelperCache = {};
 				Module.__wjHelperImports = new Proxy ({}, { get: function (t, k) {
 					if (typeof k !== "string" || !/^[0-9]+$/.test (k)) return undefined;
-					var f = _wjHelperCache[k];
-					if (f === undefined) { f = wasmTable.get (Number (k)); _wjHelperCache[k] = f; }
+					var c = Module.__wjHelperCache;
+					var f = c[k];
+					if (f === undefined) { f = wasmTable.get (Number (k)); c[k] = f; }
 					return f;
 				} });
 			}
@@ -1199,6 +1222,8 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 				wasmTable.set ($0, inst.exports.e); /* entry thunk: interp entry */
 				wasmTable.set ($1, inst.exports.f); /* scalar method: call_indirect target */
 			}
+			/* The import resolver memoises wasmTable.get; these two entries just changed. */
+			if (Module.__wjHelperCache) { delete Module.__wjHelperCache[$0]; delete Module.__wjHelperCache[$1]; }
 			return 1;
 		} catch (e) {
 			if (op) HEAPF64[op >> 3] = performance.now () - t0;
@@ -1271,11 +1296,34 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 			 *
 			 * Same lazy creation, same per-worker cache, so ordering no longer matters. */
 			if (!Module.__wjHelperImports) {
-				var _wjHelperCache = {};
+				/* THE CACHE IS A MEMO OF wasmTable.get AND MUST BE INVALIDATED WHEN THE TABLE CHANGES.
+				 *
+				 * It was safe while only HELPERS were imported: those are C functions in
+				 * dotnet.native.wasm, at table indices fixed for the life of the process, so wrapping
+				 * each once instead of once per module (~25k of them) is pure win.
+				 *
+				 * A METHOD f-slot is not fixed. It holds a placeholder until the callee's module is
+				 * instantiated ON THIS WORKER, and only then becomes the callee's `f`. Any module that
+				 * imported that slot earlier cached the placeholder -- and the entry then never updates,
+				 * so every later importer of that slot on that worker gets a function of the wrong type
+				 * and fails INSTANTIATION with "imported function does not match the expected type".
+				 *
+				 * That is the whole of the direct-import failure, and it was diagnosed twice as something
+				 * else. Round 132 read the residual 40 faults as a cross-worker admission race; Round 139
+				 * read them as unsound imports across dependency CYCLES and concluded the fix was
+				 * co-locating SCCs. The tell was in both write-ups and read as evidence for a cycle: ONE
+				 * callee failing for FOUR separate importers. That is one poisoned cache entry, not four
+				 * bad call sites. Instrumenting the failing admission settled it -- every dependency was
+				 * admitted (state 2) and live on that worker, so the table was right and the reader was
+				 * stale.
+				 *
+				 * So: keep the memo, and delete the entry wherever a slot is written below. */
+				Module.__wjHelperCache = {};
 				Module.__wjHelperImports = new Proxy ({}, { get: function (t, k) {
 					if (typeof k !== "string" || !/^[0-9]+$/.test (k)) return undefined;
-					var f = _wjHelperCache[k];
-					if (f === undefined) { f = wasmTable.get (Number (k)); _wjHelperCache[k] = f; }
+					var c = Module.__wjHelperCache;
+					var f = c[k];
+					if (f === undefined) { f = wasmTable.get (Number (k)); c[k] = f; }
 					return f;
 				} });
 			}
@@ -1290,6 +1338,11 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 				if (!ef || !ff) throw new Error ("batched module missing export e" + k);
 				wasmTable.set (HEAP32[(es >> 2) + k], ef);
 				wasmTable.set (HEAP32[(fs >> 2) + k], ff);
+				/* Same invalidation as the single-method form: the resolver memoises wasmTable.get. */
+				if (Module.__wjHelperCache) {
+					delete Module.__wjHelperCache[HEAP32[(es >> 2) + k]];
+					delete Module.__wjHelperCache[HEAP32[(fs >> 2) + k]];
+				}
 				k = k + 1;
 			}
 			return 1;
@@ -1362,10 +1415,28 @@ typedef struct {
 	guint8 batch_incompatible;  /* force-compile cannot reproduce this descriptor's captured body */
 	int ndeps;
 	int *deps; /* immutable f-slot dependency list */
+	/* Which of those deps this module reaches by IMPORT rather than by call_indirect, and therefore binds
+	 * at INSTANTIATION rather than at call time. NULL when none, which is the default and the whole tier
+	 * until MONO_WASM_JIT_DIRECT_IMPORT is on.
+	 *
+	 * The distinction is the difference between "should already be admitted" and "MUST already be
+	 * admitted". A call_indirect resolves through the table whenever it runs, so admitting its target
+	 * late is merely slow; an import is resolved once, while this module is being instantiated, and
+	 * admitting its target late is a LinkError that loses the whole method. */
+	guint8 *dep_strict;
 	guint32 *dep_sig;
 	MonoMethod **dep_method; /* callee behind each dep f-slot (diagnostics only) */
 	WjBatchDesc *batch;      /* non-NULL iff this method shares a module with others */
 	guint32 generation;      /* zero for standalone; bumped whenever the slots are rebound */
+	/* The RELOCATABLE body this module was framed from -- instruction bytes plus relocations, before any
+	 * module-dependent index was resolved. Keeping it is what makes co-location cheap: re-framing this
+	 * method together with others is then wj_assemble over the stored bodies, a memcpy pass, instead of
+	 * mono_wasm_force_compile per member. `bytes` above is the FRAMED result and is what workers
+	 * instantiate; this is what it was framed from.
+	 *
+	 * Costs roughly the module minus its framing (median module 780 wire bytes) plus the relocation array,
+	 * retained for the life of the process, against a re-compile that costs the whole mono front end. */
+	struct _WjBody *body;
 } WjRegEntry;
 #define WJ_REG_CHUNK   8192
 #define WJ_REG_NCHUNKS 1024      /* up to 8M JITted methods; the 4KB top-level pointer array never moves */
@@ -1389,7 +1460,7 @@ wj_reg_at (int i)
 }
 
 int
-mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, gboolean no_gc, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps)
+mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, gboolean no_gc, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps, const int *strict_slots, int nstrict)
 {
 	int desc_id = 0;
 	mono_loader_lock ();
@@ -1429,6 +1500,23 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				chunk [n % WJ_REG_CHUNK].dep_method = g_new0 (MonoMethod *, ndeps);
 				if (dep_methods)
 					memcpy (chunk [n % WJ_REG_CHUNK].dep_method, dep_methods, sizeof (MonoMethod *) * ndeps);
+				/* Which deps this module BINDS AT INSTANTIATION. Written HERE, inside the critical section,
+				 * and not by a follow-up call after registration returns -- because the barrier and the
+				 * wj_reg_n bump below are what make this entry visible to other workers, and an entry seen
+				 * with dep_strict still NULL is an entry whose imports admission treats as loose. It would
+				 * then allow the cycle-break, instantiate early, and bind the import against whatever the
+				 * table holds -- a LinkError if the placeholder's type differs, and SILENTLY THE WRONG
+				 * FUNCTION if it does not. Intermittent by construction, which is the worst kind. */
+				if (nstrict > 0 && strict_slots) {
+					int si, sk;
+					chunk [n % WJ_REG_CHUNK].dep_strict = g_new0 (guint8, ndeps);
+					for (si = 0; si < ndeps; ++si)
+						for (sk = 0; sk < nstrict; ++sk)
+							if (deps [si] == strict_slots [sk]) {
+								chunk [n % WJ_REG_CHUNK].dep_strict [si] = 1;
+								break;
+							}
+				}
 			}
 			if (f_slot > 0 && f_slot / WJ_SLOT_CHUNK < WJ_SLOT_NCHUNKS) {
 				int ci2 = f_slot / WJ_SLOT_CHUNK;
@@ -1622,9 +1710,18 @@ wj_desc_for_fslot (int fslot)
 	return wj_fslot_desc_chunks [ci][fslot % WJ_SLOT_CHUNK];
 }
 
+/* How many times one worker will defer a descriptor whose imported dependency was mid-DFS before giving up
+ * and treating it as permanently unadmittable (which is the behaviour there was before imports existed:
+ * the method runs interpreted). Deferrals are cheap -- the walk stops at the first unmet import -- but they
+ * are paid per dispatch, so an unbreakable cycle must not retry forever. */
+#define WJ_ADMIT_DEFER_MAX 16
+
 /* Per-worker admission state. Generated direct calls contain no liveness checks: a root may enter only
  * after this DFS has installed its complete immutable direct-call closure in the worker's table. */
 static __thread guint8 *wj_desc_state;
+/* How many times this worker has DEFERRED admitting a descriptor because one of its imported
+ * dependencies was mid-DFS (see WJ_ADMIT_DEFER_MAX). Per worker, like every other admission state. */
+static __thread guint8 *wj_desc_defer;
 static __thread guint32 *wj_desc_generation;
 static __thread int wj_desc_state_cap;
 
@@ -1637,8 +1734,10 @@ wj_desc_state_ensure (int id)
 		int old = wj_desc_state_cap, cap = old ? old : 1024;
 		while (id >= cap) cap *= 2;
 		wj_desc_state = (guint8 *) g_realloc (wj_desc_state, cap);
+		wj_desc_defer = (guint8 *) g_realloc (wj_desc_defer, cap);
 		wj_desc_generation = (guint32 *) g_realloc (wj_desc_generation, sizeof (guint32) * cap);
 		memset (wj_desc_state + old, 0, cap - old);
+		memset (wj_desc_defer + old, 0, cap - old);
 		memset (wj_desc_generation + old, 0, sizeof (guint32) * (cap - old));
 		wj_desc_state_cap = cap;
 	}
@@ -1667,7 +1766,27 @@ mono_wasm_jit_desc_admitted (int desc_id)
 
 /* Validate and admit one descriptor's external direct-call closure. Batch-internal edges encounter
  * siblings pre-marked state=1 by mono_wasm_jit_admit and therefore terminate as ordinary DFS cycles. */
-static gboolean
+/*
+ * Returns 1 admitted, 0 permanently unusable, -1 DEFER: an imported dependency is still mid-DFS.
+ *
+ * The -1 case is the whole reason this returns an int. mono_wasm_jit_admit returns 1 when it finds a
+ * descriptor already `visiting`, which is how it breaks a dependency CYCLE -- correct for a call_indirect
+ * edge, because the table is patched after publication and the call resolves whenever it eventually runs.
+ * It is NOT correct for an IMPORT edge: the import is bound while this module instantiates, so a target
+ * that has not instantiated yet means a LinkError, and the method is lost.
+ *
+ * The instantiation-ordering problem cannot be settled when the module is EMITTED, which is what the
+ * first attempt at this got wrong: the decision is baked at emit time but has to hold at admission time,
+ * which happens later and separately on every worker, and by then the dependency graph has grown (a
+ * re-emit registers a new descriptor into the same f-slot with a new dependency list, so the callee behind
+ * an imported slot can gain an edge back to its importer after the import was baked in).
+ *
+ * So it is settled HERE instead, where the true state is known: if an imported dependency is not admitted,
+ * do not instantiate. Defer, run this method interpreted for now, and let a later dispatch retry -- which
+ * usually succeeds, because the retry may enter the DFS from the other end of the cycle and admit the
+ * callee first. Bounded by WJ_ADMIT_DEFER_MAX so a genuine unbreakable cycle stops paying for the walk.
+ */
+static int
 wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 {
 	int i;
@@ -1698,12 +1817,22 @@ wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 				dep_id, dm ? mono_wasm_jit_get_callee_fslot (dm) : -1,
 				cn ? cn : "?", dn ? dn : "?");
 			g_free (cn); g_free (dn);
-			return FALSE;
+			return 0;
 		}
 		if (!mono_wasm_jit_admit (dep_id))
-			return FALSE;
+			return 0;
+		/* mono_wasm_jit_admit returned 1; for a STRICT dep that is not enough -- it also returns 1 when
+		 * it broke a cycle without instantiating. Only state 2 means the callee's exports are in this
+		 * worker's table, which is what an import needs. */
+		if (re->dep_strict && re->dep_strict [i] &&
+		    !(dep_id < wj_desc_state_cap && wj_desc_state [dep_id] == 2)) {
+			if (watch)
+				printf ("WASM_JIT_ADMIT_DEFER desc=%d dep=%d f=%d (imported, not admitted yet)\n",
+					desc_id, dep_id, re->deps [i]);
+			return -1;
+		}
 	}
-	return TRUE;
+	return 1;
 }
 
 int
@@ -1800,11 +1929,18 @@ mono_wasm_jit_admit (int desc_id)
 		for (i = 0; i < batch->n; ++i) {
 			int sibling = batch->desc [i];
 			WjRegEntry *sre = wj_reg_at (sibling - 1);
-			if (!wj_admit_dependencies (sre, sibling, watch && sibling == desc_id))
+			int r = wj_admit_dependencies (sre, sibling, watch && sibling == desc_id);
+			if (r < 0)
+				goto defer;
+			if (!r)
 				goto fail;
 		}
-	} else if (!wj_admit_dependencies (re, desc_id, watch)) {
-		goto fail;
+	} else {
+		int r = wj_admit_dependencies (re, desc_id, watch);
+		if (r < 0)
+			goto defer;
+		if (!r)
+			goto fail;
 	}
 	/* The compiling worker already installed this descriptor; other workers instantiate it once here.
 	 * A batch member brings up the ENTIRE module (its exports are e<i>/f<i>, so there is no way to
@@ -1821,6 +1957,24 @@ mono_wasm_jit_admit (int desc_id)
 			}
 		} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len, eb, (int) sizeof (eb), &ms)) {
 			printf ("WASM_JIT_ADMIT_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
+			/* A LinkError here should be impossible for an imported dependency: the strict-dep check
+			 * above refuses to instantiate until every one of them is admitted on THIS worker. Dump what
+			 * it actually saw, because the difference between "the dep was not marked strict", "it was
+			 * marked and reported admitted", and "the slot is not in the dependency list at all" needs
+			 * three different fixes and the message above distinguishes none of them. */
+			{
+				int k;
+				printf ("WASM_JIT_ADMIT_FAIL_DEPS desc=%d ndeps=%d strict=%s [", desc_id, re->ndeps,
+					re->dep_strict ? "yes" : "NONE");
+				for (k = 0; k < re->ndeps; ++k)
+					printf ("%s%d%s/state%d/live%d", k ? " " : "", re->deps [k],
+						(re->dep_strict && re->dep_strict [k]) ? "S" : "",
+						wj_desc_for_fslot (re->deps [k]) > 0 &&
+						wj_desc_for_fslot (re->deps [k]) < wj_desc_state_cap
+							? wj_desc_state [wj_desc_for_fslot (re->deps [k])] : -1,
+						mono_wasm_jit_slot_live (re->deps [k]));
+				printf ("]\n");
+			}
 			goto fail;
 		}
 		/* Path tag only; the total is counted inside instantiate_*_local. This is THE per-worker path --
@@ -1875,7 +2029,36 @@ mono_wasm_jit_admit (int desc_id)
 		mono_jiterp_wasm_jit_patch_interp_entry (mono_interp_get_imethod (re->logical_method));
 #endif
 	if (watch) printf ("WASM_JIT_ADMIT_OK desc=%d e_live=%d f_live=%d\n", desc_id, mono_wasm_jit_slot_live (re->e), mono_wasm_jit_slot_live (re->f));
+	wj_desc_defer [desc_id] = 0;   /* it got in; forget any earlier deferrals */
 	return 1;
+defer:
+	/* NOT a failure: an imported dependency is mid-DFS on this worker, so instantiating now would bind an
+	 * import against a slot that still holds the guarded interp-entry trampoline. Roll back to UNVISITED
+	 * so the next dispatch tries again -- from a different entry point, which is usually the other end of
+	 * the cycle and admits the callee first. Until then this method runs interpreted, which is exactly
+	 * where it would have ended up anyway, minus the LinkError.
+	 *
+	 * Bounded, because a genuinely unbreakable cycle would otherwise pay for the DFS at every dispatch
+	 * forever. After WJ_ADMIT_DEFER_MAX attempts it becomes an ordinary permanent failure, i.e. the
+	 * pre-import behaviour. */
+	if (batch) {
+		for (i = 0; i < batch->n; ++i) {
+			int sibling = batch->desc [i];
+			if (sibling > 0 && sibling < wj_desc_state_cap &&
+			    wj_desc_generation [sibling] == batch->generation && wj_desc_state [sibling] == 1)
+				wj_desc_state [sibling] = 0;
+		}
+	}
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_count (WJC_ADMIT_DEFERRED);
+	if (wj_desc_defer [desc_id] < WJ_ADMIT_DEFER_MAX) {
+		wj_desc_defer [desc_id]++;
+		wj_desc_state [desc_id] = 0;
+		return 0;
+	}
+	printf ("WASM_JIT_ADMIT_DEFER_GIVEUP desc=%d e=%d f=%d after %d attempts (imported dependency never admitted)\n",
+		desc_id, re->e, re->f, WJ_ADMIT_DEFER_MAX);
+	/* fall through to the permanent path */
 fail:
 	if (batch) {
 		for (i = 0; i < batch->n; ++i) {
@@ -4309,8 +4492,66 @@ wj_emit_fast_count (WasmBuf *body, int idx)
  *   call <local funcidx>               `call rel32`                              1 x86, and the ONLY
  *                                                                                form V8 will inline
  */
+/*
+ * Everything one method contributes to a module, with nothing about the module baked in. This is the unit
+ * that gets stored (WjRegEntry.body) and re-framed.
+ */
+typedef struct _WjBody {
+	MonoMethod    *method;
+	WasmValtype    param_types [WASM_FUNCTYPE_MAX_PARAMS];
+	guint32        nparams;
+	WasmValtype    ret_type;
+	WasmLocalGroup groups [4];
+	WasmBuf        f_body;        /* instruction bytes + relocations; owned */
+	WasmBuf        e_body;
+	WasmFuncType  *extra_types;   /* owned, nextra entries */
+	guint32        nextra;
+	guint8         uses_calls;
+	guint8         uses_eh_tag;
+	int            eh_tpool;
+} WjBody;
+
+static void
+wj_body_free (WjBody *b)
+{
+	if (!b)
+		return;
+	wasm_buf_free (&b->f_body);
+	wasm_buf_free (&b->e_body);
+	g_free (b->extra_types);
+	g_free (b);
+}
+
+/* Take ownership of the two body buffers (the caller's are left zeroed) and copy the small side tables. */
+static WjBody *
+wj_body_take (MonoMethod *method, WasmBuf *f, WasmBuf *e,
+              const WasmValtype *params, guint32 nparams, WasmValtype ret,
+              const WasmLocalGroup *groups, const WasmFuncType *extras, guint32 nextra,
+              gboolean uses_calls, gboolean uses_eh_tag, int eh_tpool)
+{
+	WjBody *b = g_new0 (WjBody, 1);
+	g_assert (nparams <= WASM_FUNCTYPE_MAX_PARAMS);
+	b->method = method;
+	memcpy (b->param_types, params, sizeof (WasmValtype) * nparams);
+	b->nparams = nparams;
+	b->ret_type = ret;
+	memcpy (b->groups, groups, sizeof (WasmLocalGroup) * 4);
+	b->f_body = *f; memset (f, 0, sizeof (*f));
+	b->e_body = *e; memset (e, 0, sizeof (*e));
+	if (nextra) {
+		b->extra_types = (WasmFuncType *) g_malloc (sizeof (WasmFuncType) * (gsize) nextra);
+		memcpy (b->extra_types, extras, sizeof (WasmFuncType) * (gsize) nextra);
+	}
+	b->nextra = nextra;
+	b->uses_calls = uses_calls ? 1 : 0;
+	b->uses_eh_tag = uses_eh_tag ? 1 : 0;
+	b->eh_tpool = eh_tpool;
+	return b;
+}
+
 typedef struct {
 	MonoMethod           *method;         /* for the name section and for co-location matching */
+	int                   f_slot;         /* this member's own f-slot: the target of the cycle test */
 	WasmBuf              *f_body;         /* code with holes; not modified */
 	WasmBuf              *e_body;
 	/* The member's type block is (its own signature, its thunk's signature, its callee types). The first
@@ -4332,17 +4573,8 @@ typedef struct {
 	guint8 helper_imports;   /* MONO_WASM_JIT_HELPER_IMPORTS: a C helper may become an import */
 	guint8 aot_imports;      /* MONO_WASM_JIT_AOT_IMPORTS: an AOT body may become an import */
 	guint8 ci_imports;       /* MONO_WASM_JIT_CI_IMPORTS: the never-converted constant-index sites too */
-	/* MONO_WASM_JIT_DIRECT_IMPORT: a JITted callee may become an import.
-	 *
-	 * SOUND ONLY WHEN THE MEMBER SET IS SCC-CLOSED, which is why the caller has to assert it rather than
-	 * the knob alone deciding. An import binds wasmTable.get(fslot) at INSTANTIATION, and the
-	 * callee-before-caller ordering that makes that safe (wj_result_add_direct_dep + mono_wasm_jit_admit)
-	 * holds only for a DAG: on a CYCLE the DFS must break somewhere and the loser instantiates while its
-	 * partner's slot still holds the guarded interp-entry trampoline -- a real function of a different
-	 * type, hence "imported function does not match the expected type". Round 139 measured that as 14
-	 * LinkErrors and a crash, 2/2 arms, with the failing imports being adjacent (e,f) pairs, i.e.
-	 * co-registered members of one SCC. Co-locating the cycle removes the ordering problem entirely
-	 * because an intra-module edge is a `call <funcidx>` that binds nothing. */
+	/* MONO_WASM_JIT_DIRECT_IMPORT: a JITted callee may become an import. Soundness is decided PER EDGE by
+	 * wj_asm_method_importable, not by this flag -- see wj_asm_reaches for the cycle argument. */
 	guint8 method_imports;
 	guint8 local_calls;      /* resolve a co-located callee to `call <funcidx>` */
 	guint8 names;            /* MONO_WASM_JIT_NAMES: append the name section */
@@ -4351,6 +4583,27 @@ typedef struct {
 
 /* Per-member census of what the forms came out as; feeds the WJC_ counters and the tier dumps. */
 typedef struct { int nlocal, nimport, nindirect; } WjAsmStats;
+
+/* The f-slots one member reached by IMPORT, i.e. the deps it binds at INSTANTIATION rather than at call
+ * time. The registry needs them (WjRegEntry.dep_strict) so admission can refuse to instantiate before they
+ * are installed instead of discovering it as a LinkError. Caller-provided, assembler-filled, caller-freed. */
+typedef struct { int *slot; int n, cap; } WjAsmImports;
+
+/* Where wj_assemble reports which deps a lone method binds at instantiation, so the registry can mark them
+ * strict (WjRegEntry.dep_strict). Thread-local for the same reason wj_batch is: one compile at a time. */
+static __thread WjAsmImports wj_self_imports;
+
+static void
+wj_asm_imports_add (WjAsmImports *ai, int fslot)
+{
+	if (!ai)
+		return;
+	if (ai->n == ai->cap) {
+		ai->cap = ai->cap ? ai->cap * 2 : 8;
+		ai->slot = (int *) g_realloc (ai->slot, sizeof (int) * (gsize) ai->cap);
+	}
+	ai->slot [ai->n++] = fslot;
+}
 
 /* Intern one function import. Slot i IS function index i -- function imports are the only kind-0x00
  * imports -- which is what lets a body name a slot long before the final count is known.
@@ -4373,6 +4626,134 @@ wj_asm_intern_import (WasmFuncImport *himp, int *nhimp, int cap, guint32 table_i
 	return (*nhimp)++;
 }
 
+/* --- a BEST-EFFORT filter on import edges, not the guarantee ---------------------------------------
+ *
+ * READ THIS FIRST: what makes imports safe is the admission-time check in wj_admit_dependencies, not this.
+ * The first version of this work put the whole guarantee here and it does not work, because the question
+ * "will the callee be instantiated before me" cannot be answered when the module is EMITTED. The answer has
+ * to hold at ADMISSION, which happens later and separately on every worker, and by then the graph has
+ * grown: a re-emit registers a new descriptor into the same f-slot with a new dependency list, so the
+ * callee behind an imported slot can gain an edge back to its importer after the import was already baked
+ * in. Measured: with only this check in place, direct_import still produced LinkErrors with the Round 139
+ * fingerprint intact -- one callee failing for four separate importers.
+ *
+ * It is kept because it is cheap and it is RIGHT about the cycles that are already visible, which is most
+ * of them (SCC members are co-registered, so they see each other), and every edge it refuses is a method
+ * that does not have to be deferred and retried at run time. It is a filter. Do not add to it in the
+ * belief that enough of it would make admission's check unnecessary.
+ *
+ * An import binds wasmTable.get(fslot) at INSTANTIATION, so the callee's module has to be instantiated on
+ * this worker before the caller's is. mono_wasm_jit_admit guarantees that by admitting a descriptor's
+ * direct-dependency closure first -- but it is a DFS, and on a CYCLE it must stop somewhere: whichever
+ * member it reaches while an ancestor is still `visiting` returns without instantiating, so the ancestor
+ * instantiates FIRST. If that ancestor imported it, the import resolves against a slot still holding the
+ * guarded interp-entry trampoline, a real function of a different type -- which is exactly why Round 139
+ * saw "imported function does not match the expected type" rather than "is not a function", 14 LinkErrors
+ * over 9 slots and a crash before titleReady in 2/2 arms.
+ *
+ * The rule that fixes it, per EDGE rather than per module:
+ *
+ *     A -> B may be an import IFF B cannot reach A.
+ *
+ * Why that is sufficient, against the admission DFS as written: when the DFS is about to instantiate u it
+ * has already called mono_wasm_jit_admit on every dep of u. For an IMPORT dep v that call either returned
+ * with v instantiated, or returned early on `wj_desc_state [v] == 1` -- v is an ancestor still on the DFS
+ * stack, which means a path v -> ... -> u exists, which means v reaches u, which the rule forbids. So the
+ * early return cannot happen on an import edge and v is always installed before u needs it. An edge inside
+ * a cycle simply stays a call_indirect, which is immune because the table is patched after publication
+ * instead of bound at instantiation.
+ *
+ * Note that the DFS can be ENTERED at either end of a cycle, so "which one loses the race" is not fixed --
+ * which is why the test has to be on mutual reachability and not on anything about ordering.
+ *
+ * Note what this does NOT need: co-location. R139 concluded the fix was "emit an entire cycle into a single
+ * module", which is true but needs the whole batching machinery; refusing the cycle edges is sound on its
+ * own and costs only those edges.
+ *
+ * The graph walked here is the same one admission walks -- WjRegEntry.deps, f-slots -- so the two agree by
+ * construction. A dep whose callee is not registered cannot be imported anyway (the ABI check below
+ * rejects it), so an unresolvable f-slot ends the walk rather than widening it.
+ *
+ * The TARGET is identified by f-slot rather than by descriptor, because at the moment a lone method is
+ * framed it HAS an f-slot (reserved before emission, which is what lets its callees bake it) but is not
+ * registered yet and so has no descriptor at all. Matching on the slot is also what the admission walk
+ * itself matches on.
+ */
+#define WJ_REACH_MAX 512   /* descriptors visited before giving up; giving up means REACHABLE, i.e. no import */
+
+#ifdef HOST_BROWSER
+
+static __thread guint32 *wj_reach_stamp;   /* per registry index; == wj_reach_gen means "seen this walk" */
+static __thread int     *wj_reach_stack;
+static __thread int      wj_reach_cap;
+static __thread guint32  wj_reach_gen;
+
+/* Can `from_desc` reach the method occupying `target_fslot`? Conservative: TRUE on any doubt. */
+static gboolean
+wj_asm_reaches (int from_desc, int target_fslot)
+{
+	int sp = 0, visited = 0, n = wj_reg_n;
+
+	if (from_desc <= 0)
+		return TRUE;      /* the callee is not registered; nothing to walk, so assume the worst */
+	if (target_fslot <= 0) {
+		/* The caller has no f-slot yet: it is a first emit whose pair is allocated after framing. A slot
+		 * that does not exist cannot appear in any registry entry's dependency list, so nothing can reach
+		 * it and it cannot be in a cycle. (A method that DOES already own or have reserved a slot -- a
+		 * re-emit, a self-recursion reservation, an SCC batch reservation, or a pair parked by an aborted
+		 * batch -- passes that slot in, precisely because those can have in-edges.) */
+		return FALSE;
+	}
+	if (n > wj_reach_cap) {
+		int ncap = wj_reach_cap ? wj_reach_cap : 1024;
+		while (ncap < n) ncap *= 2;
+		wj_reach_stamp = (guint32 *) g_realloc (wj_reach_stamp, sizeof (guint32) * (gsize) ncap);
+		memset (wj_reach_stamp + wj_reach_cap, 0, sizeof (guint32) * (gsize) (ncap - wj_reach_cap));
+		wj_reach_stack = (int *) g_realloc (wj_reach_stack, sizeof (int) * (gsize) ncap);
+		wj_reach_cap = ncap;
+	}
+	/* Stamped rather than cleared: clearing a 24k-entry array per call site would cost more than the walk. */
+	if (++wj_reach_gen == 0) {
+		memset (wj_reach_stamp, 0, sizeof (guint32) * (gsize) wj_reach_cap);
+		wj_reach_gen = 1;
+	}
+	wj_reach_stack [sp++] = from_desc;
+	wj_reach_stamp [from_desc - 1] = wj_reach_gen;
+	while (sp > 0) {
+		WjRegEntry *re = wj_reg_at (wj_reach_stack [--sp] - 1);
+		int i;
+		if (!re)
+			continue;
+		if (++visited > WJ_REACH_MAX)
+			return TRUE;   /* too big to settle: assume the worst and leave the edge indirect */
+		for (i = 0; i < re->ndeps; ++i) {
+			int d;
+			if (re->deps [i] == target_fslot)
+				return TRUE;
+			d = wj_desc_for_fslot (re->deps [i]);
+			if (d <= 0 || d > wj_reg_n)
+				continue;
+			if (wj_reach_stamp [d - 1] == wj_reach_gen)
+				continue;
+			wj_reach_stamp [d - 1] = wj_reach_gen;
+			if (sp < wj_reach_cap)
+				wj_reach_stack [sp++] = d;
+			else
+				return TRUE;
+		}
+	}
+	return FALSE;
+}
+#else
+/* The offline cross-compiler has no registry to walk and imports nothing anyway. */
+static gboolean
+wj_asm_reaches (int from_desc, int target_fslot)
+{
+	(void) from_desc; (void) target_fslot;
+	return TRUE;
+}
+#endif
+
 /*
  * May this JITted callee be reached through an import?
  *
@@ -4391,23 +4772,64 @@ wj_asm_intern_import (WasmFuncImport *himp, int *nhimp, int cap, guint32 table_i
  *    calling it for every direct callee rather than a handful of profile-predicted ones is what made a
  *    rare survivable worker assertion look like a deterministic boot failure.
  *
+ *    AND THE COMPARISON MUST BE STRUCTURAL, not on the f_sig_id hash. wj_functype_hash is FNV-32 over
+ *    (nparams, params, ret), and enumerating every functype this backend can produce -- up to 8 params
+ *    over {i32,i64,f32,f64} with a void-or-scalar return, 436,905 of them -- gives **8 COLLIDING PAIRS**.
+ *    A collision here is not a missed optimisation, it is a LinkError: the import is declared with the
+ *    caller's type, the slot holds a function of the other type, and instantiation refuses the whole
+ *    module. MEASURED: with the hash comparison, 13 admissions failed per boot with
+ *    "imported function does not match the expected type" while the instrumentation showed every
+ *    dependency admitted (state 2) and live on that worker -- i.e. nothing to do with ordering, which is
+ *    what the first two attempts at this were chasing.
+ *
+ *    The exact type comes from the callee's retained relocatable body, whose (param_types, nparams,
+ *    ret_type) IS its `f` signature -- the same triple the encoder writes as its type[0]. No descriptor,
+ *    no body, or a rebound batch generation that dropped it: refuse, because an unverifiable ABI is
+ *    exactly the case that costs the whole method.
+ *
+ *    (The pre-existing dep_sig check in wj_admit_dependencies has the same collision exposure and is
+ *    left alone: there a false match produces a call-time signature trap rather than a lost module, and
+ *    making it exact would mean storing a functype per dependency -- 128 per method, ~230 MB tier-wide.)
+ *
  * 2. A slot with no descriptor is a parked reservation -- a jiterpreter placeholder, not a function of
  *    this type -- so it can never be imported.
+ *
+ * 3. The callee must not be able to reach the CALLER, or the two are in a cycle and binding at
+ *    instantiation cannot be ordered. See wj_asm_reaches; this is the Round 139 crash.
+ *
+ * 4. And it must not BE the caller. Self-recursion's f-slot is reserved before this module exists, so at
+ *    its own instantiation wasmTable.get(self) is either empty -- a LinkError losing the whole method to
+ *    the interpreter -- or still the guarded interp-entry trampoline, which would leave the recursion
+ *    permanently interpreted. (The right fix for self-recursion is a module-local `call`, which is what
+ *    WjAsmPolicy.local_calls does when it is on; it is not an import.)
  */
 static gboolean
-wj_asm_method_importable (const WasmReloc *r, const WasmFuncType *sig)
+wj_asm_method_importable (const WasmReloc *r, const WasmFuncType *sig, int self_fslot)
 {
 #ifdef HOST_BROWSER
 	int desc = wj_desc_for_fslot ((int) r->table_index);
 	WjRegEntry *re = desc > 0 ? wj_reg_at (desc - 1) : NULL;
 
-	if (!re || !re->f_sig_id)
+	WasmFuncType callee;
+
+	if ((int) r->table_index == self_fslot)
 		return FALSE;
-	return re->f_sig_id == wj_functype_hash (sig);
+	if (!re || !re->f_sig_id || !re->body)
+		return FALSE;
+	if (re->f_sig_id != wj_functype_hash (sig))
+		return FALSE;   /* cheap pre-filter; a match here proves nothing on its own (see above) */
+	memset (&callee, 0, sizeof (callee));
+	g_assert (re->body->nparams <= WASM_FUNCTYPE_MAX_PARAMS);
+	memcpy (callee.params, re->body->param_types, sizeof (WasmValtype) * re->body->nparams);
+	callee.nparams = re->body->nparams;
+	callee.ret = re->body->ret_type;
+	if (!functype_eq (&callee, sig))
+		return FALSE;
+	return !wj_asm_reaches (desc, self_fslot);
 #else
 	/* The offline cross-compiler has no registry, no function table and no instantiation, so nothing is
 	 * importable and the dump stays a self-contained module. */
-	(void) r; (void) sig;
+	(void) r; (void) sig; (void) self_fslot;
 	return FALSE;
 #endif
 }
@@ -4432,7 +4854,8 @@ wj_asm_member_of (const WjAsmMember *m, int n, MonoMethod *callee)
 static void
 wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int self_index,
                      const WjAsmMember *mem, int n, const WasmFuncType *self_types,
-                     const WjAsmPolicy *pol, WasmFuncImport *himp, int *nhimp, WjAsmStats *st)
+                     const WjAsmPolicy *pol, WasmFuncImport *himp, int *nhimp, WjAsmStats *st,
+                     WjAsmImports *ai)
 {
 	const WasmRelocs *rl = b->relocs;
 	guint32 k;
@@ -4479,7 +4902,8 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 				st->nlocal++;
 				continue;
 			}
-			if (pol->method_imports && wj_asm_method_importable (r, &self_types [r->tpool]))
+			if (pol->method_imports &&
+			    wj_asm_method_importable (r, &self_types [r->tpool], mem [self_index].f_slot))
 				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti);
 			break;
 		}
@@ -4487,6 +4911,8 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			fix [k].form = WASM_FORM_IMPORT;
 			fix [k].idx = (guint32) slot;
 			st->nimport++;
+			if (r->kind == WASM_RELOC_CALL)
+				wj_asm_imports_add (ai, (int) r->table_index);
 		} else {
 			st->nindirect++;
 		}
@@ -4496,17 +4922,17 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 /*
  * The knob set, read once per assembly.
  *
- * `imports_sound` is the caller's assertion that this member set is SCC-closed, and it gates method
- * imports on top of the knob -- see WjAsmPolicy.method_imports for why that is a correctness condition and
- * not a tuning one. `local_calls` says a co-located callee may become `call <funcidx>`; it is off for a
- * lone method so that a self-recursive call keeps the shape it has always had, and on for a real batch,
- * which is where co-location is the entire point.
+ * `local_calls` says a co-located callee may become `call <funcidx>`; it is off for a lone method so that
+ * a self-recursive call keeps the shape it has always had, and on for a real batch, which is where
+ * co-location is the entire point. Whether a JITted callee may be IMPORTED is not a policy question at all
+ * -- it is decided per edge by wj_asm_method_importable, because soundness depends on that specific
+ * caller/callee pair and not on the module.
  *
  * Under the offline cross-compiler there is no function table and no instantiation, so nothing may become
  * an import: the dump has to be a self-contained module the encoder can be validated against.
  */
 static void
-wj_asm_policy_init (WjAsmPolicy *pol, gboolean imports_sound, gboolean local_calls)
+wj_asm_policy_init (WjAsmPolicy *pol, gboolean local_calls)
 {
 	extern int mono_wasm_jit_helper_imports, mono_wasm_jit_aot_imports, mono_wasm_jit_direct_import;
 	extern int mono_wasm_jit_ci_imports, mono_wasm_jit_max_himp, mono_wasm_jit_names;
@@ -4519,7 +4945,7 @@ wj_asm_policy_init (WjAsmPolicy *pol, gboolean imports_sound, gboolean local_cal
 	pol->helper_imports = mono_wasm_jit_helper_imports ? 1 : 0;
 	pol->aot_imports = mono_wasm_jit_aot_imports ? 1 : 0;
 	pol->ci_imports = mono_wasm_jit_ci_imports ? 1 : 0;
-	pol->method_imports = (imports_sound && mono_wasm_jit_direct_import) ? 1 : 0;
+	pol->method_imports = mono_wasm_jit_direct_import ? 1 : 0;
 #endif
 }
 
@@ -4530,7 +4956,8 @@ wj_asm_policy_init (WjAsmPolicy *pol, gboolean imports_sound, gboolean local_cal
  * slots is not a failure, it just leaves those sites as call_indirect.
  */
 static gboolean
-wj_assemble (const WjAsmMember *mem, int n, const WjAsmPolicy *pol, WasmBuf *out, WjAsmStats *out_st)
+wj_assemble (const WjAsmMember *mem, int n, const WjAsmPolicy *pol, WasmBuf *out, WjAsmStats *out_st,
+             WjAsmImports *out_imp)
 {
 	static const WasmValtype entry_params [2] = { WASM_I32, WASM_I32 };
 	WasmFuncImport *himp;
@@ -4589,8 +5016,10 @@ wj_assemble (const WjAsmMember *mem, int n, const WjAsmPolicy *pol, WasmBuf *out
 		const WasmRelocs *fr = mem [i].f_body->relocs, *er = mem [i].e_body->relocs;
 		fixes [2 * i] = g_new0 (WasmRelocFix, fr && fr->n ? fr->n : 1);
 		fixes [2 * i + 1] = g_new0 (WasmRelocFix, er && er->n ? er->n : 1);
-		wj_asm_resolve_body (mem [i].f_body, fixes [2 * i], ti_base [i], i, mem, n, types [i], pol, himp, &nhimp, &st);
-		wj_asm_resolve_body (mem [i].e_body, fixes [2 * i + 1], ti_base [i], i, mem, n, types [i], pol, himp, &nhimp, &st);
+		wj_asm_resolve_body (mem [i].f_body, fixes [2 * i], ti_base [i], i, mem, n, types [i], pol, himp, &nhimp, &st,
+		                     out_imp ? &out_imp [i] : NULL);
+		wj_asm_resolve_body (mem [i].e_body, fixes [2 * i + 1], ti_base [i], i, mem, n, types [i], pol, himp, &nhimp, &st,
+		                     out_imp ? &out_imp [i] : NULL);
 	}
 
 	/* Pass 2 -- imports are counted, so a member index becomes a function index, and the bodies can be
@@ -4717,6 +5146,9 @@ typedef struct {
  * under wj_compiling, so a single thread-local is enough. */
 static __thread WjBatch *wj_batch;
 
+/* Where wj_assemble reports which deps a BATCH member binds at instantiation; see wj_self_imports. */
+static __thread WjAsmImports wj_batch_imports [WJ_BATCH_MAX];
+
 int mono_wasm_jit_batch_begin (void);
 void mono_wasm_jit_batch_end (void);
 int mono_wasm_jit_batch_count (void);
@@ -4729,6 +5161,7 @@ mono_wasm_jit_batch_begin (void)
 	if (wj_batch)
 		return 0;
 	wj_batch = g_new0 (WjBatch, 1);
+	memset (wj_batch_imports, 0, sizeof (wj_batch_imports));
 	wj_batch->cur = -1;
 	wj_batch_profile_suppressed = TRUE;
 	return 1;
@@ -4754,6 +5187,8 @@ mono_wasm_jit_batch_end (void)
 	if (!wj_batch)
 		return;
 	for (i = 0; i < wj_batch->n; i++) {
+		g_free (wj_batch_imports [i].slot);
+		memset (&wj_batch_imports [i], 0, sizeof (wj_batch_imports [i]));
 		wasm_buf_free (&wj_batch->m [i].f_body);
 		wasm_buf_free (&wj_batch->m [i].e_body);
 		g_free (wj_batch->m [i].extra_types);
@@ -4823,6 +5258,7 @@ mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_b
 			return 0;
 		}
 		members [i].method = bm->method;
+		members [i].f_slot = f_slots [i];
 		members [i].f_body = &bm->f_body;
 		members [i].e_body = &bm->e_body;
 		members [i].param_types = bm->param_types;
@@ -4843,14 +5279,12 @@ mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_b
 	 * they are relocations now, and the assembler resolves them from the membership it is handed.
 	 *
 	 * `local_calls` is on: co-locating members so their calls to each other become `call <funcidx>` is the
-	 * entire reason a batch exists. `imports_sound` is FALSE here -- this driver batches whatever set it
-	 * was given, which is not necessarily SCC-closed, and importing a cycle partner's f-slot is the Round
-	 * 139 crash. */
+	 * entire reason a batch exists. */
 	{
 		WjAsmPolicy pol;
-		wj_asm_policy_init (&pol, FALSE, TRUE);
+		wj_asm_policy_init (&pol, TRUE);
 		wasm_buf_init (&out);
-		wj_assemble (members, n, &pol, &out, NULL);
+		wj_assemble (members, n, &pol, &out, NULL, wj_batch_imports);
 	}
 	g_free (members);
 	cached = g_malloc ((gsize) out.len);
@@ -5063,6 +5497,20 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			re->dep_sig = new_dep_sig;
 			re->dep_method = new_dep_method;
 			re->ndeps = bm->ndeps;
+			/* The new generation's imports are a different set, and a stale dep_strict would be indexed
+			 * against the old dependency array. Re-derive from what this assembly reported, BEFORE the
+			 * barrier below publishes the generation -- same visibility rule as mono_wasm_jit_register. */
+			re->dep_strict = NULL;
+			if (bm && new_deps && wj_batch_imports [i].n > 0) {
+				int si, sk;
+				re->dep_strict = g_new0 (guint8, bm->ndeps);
+				for (si = 0; si < bm->ndeps; ++si)
+					for (sk = 0; sk < wj_batch_imports [i].n; ++sk)
+						if (new_deps [si] == wj_batch_imports [i].slot [sk]) {
+							re->dep_strict [si] = 1;
+							break;
+						}
+			}
 		}
 		mono_memory_barrier ();
 		re->generation = bd->generation;
@@ -5269,6 +5717,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int nwparams;                      /* wasm param count of func f = nargs + (hidden vret ? 1 : 0). ALL local-index math is based on this, not nargs: wasm locals are numbered after the params */
 	gboolean self_has_byaddr = FALSE;  /* stats: method takes >=1 by-addr vtype arg */
 	WasmBuf body, out;
+	WjBody *wj_stored_body = NULL;   /* the relocatable body, handed to the registry on successful registration */
 	MonoBasicBlock *bb;
 	MonoInst *ins;
 	int i, cnt [4] = { 0, 0, 0, 0 }, base [4], run [4] = { 0, 0, 0, 0 };
@@ -10989,7 +11438,24 @@ vcall_cold_miss_emit:
 			WjAsmMember am;
 			WjAsmPolicy pol;
 			memset (&am, 0, sizeof (am));
+			memset (&wj_self_imports, 0, sizeof (wj_self_imports));
 			am.method = cfg->method;
+			/* The target of the cycle test. Zero when this method has neither a live slot nor a
+			 * reservation, which means its pair is allocated below, after framing -- see wj_asm_reaches
+			 * for why a slot that does not exist yet is safe rather than unknown.
+			 *
+			 * HOST_BROWSER only, and not merely because there is nothing to import offline: both of these
+			 * live in the interpreter (transform.c), which mono-aot-cross does not link. csyn.sh compiles
+			 * this file for both targets and still cannot see that -- it is a LINK error, and it is the
+			 * one class of breakage a per-file check cannot catch. */
+#ifdef HOST_BROWSER
+			{ extern int mono_wasm_jit_self_reserved (MonoMethod *m, int *e_out, int *f_out);
+			  extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+			  int se = 0, sf = 0;
+			  if (!mono_wasm_jit_self_reserved (cfg->method, &se, &sf))
+				sf = mono_wasm_jit_get_callee_fslot (cfg->method);
+			  am.f_slot = sf > 0 ? sf : 0; }
+#endif
 			am.f_body = &body;
 			am.e_body = &ethunk;
 			am.param_types = param_types;
@@ -11002,10 +11468,16 @@ vcall_cold_miss_emit:
 			am.uses_calls = uses_calls ? 1 : 0;
 			am.uses_eh_tag = uses_eh_tag ? 1 : 0;
 			am.eh_tpool = eh_type_idx;
-			wj_asm_policy_init (&pol, FALSE /* not SCC-closed: a lone method knows nothing about cycles */,
-			                    FALSE /* keep self-recursion indirect, as it has always been */);
+			wj_asm_policy_init (&pol, FALSE /* keep self-recursion indirect, as it has always been */);
 			wasm_buf_init (&out);
-			wj_assemble (&am, 1, &pol, &out, NULL);
+			wj_assemble (&am, 1, &pol, &out, NULL, &wj_self_imports);
+			/* Keep the relocatable body. Framing consumed nothing -- the buffers still hold instruction
+			 * bytes and relocations, unresolved -- so this method can later be re-framed alongside others
+			 * without being compiled again. Attached to the registry on success below; freed at `done`
+			 * if registration never happens. */
+			wj_stored_body = wj_body_take (cfg->method, &body, &ethunk, param_types, (guint32) nwparams,
+			                               ret_vt, groups, extra_types, (guint32) nextra,
+			                               uses_calls, uses_eh_tag, eh_type_idx);
 		}
 		wasm_buf_free (&ethunk);
 	}
@@ -11075,17 +11547,20 @@ vcall_cold_miss_emit:
 					if (self_has_byaddr) mono_wasm_jit_count (WJC_VT_BYADDR_METHODS);
 					if (self_ci.vret_byaddr) mono_wasm_jit_count (WJC_VRET_METHODS);
 				}
-				{ extern int mono_wasm_jit_register (MonoMethod *, int, int, void *, int, guint32, gboolean, const int *, const guint32 *, MonoMethod *const *, int);
+				{ extern int mono_wasm_jit_register (MonoMethod *, int, int, void *, int, guint32, gboolean, const int *, const guint32 *, MonoMethod *const *, int, const int *, int);
 				  /* the fingerprint is the self-sig WasmCallInfo's — the same descriptor call sites hash
 				   * into dep_sig, so caller/callee can never disagree structurally */
 				  cfg->wasm_jit_result.f_sig_id = self_ci.f_sig_id;
 				  cfg->wasm_jit_result.desc_id = mono_wasm_jit_register (cfg->method, e_slot, f_slot, cached, (int) out.len,
 					cfg->wasm_jit_result.f_sig_id, method_nogc, cfg->wasm_jit_result.direct_deps,
-					cfg->wasm_jit_result.direct_dep_sig, cfg->wasm_jit_result.direct_dep_method, cfg->wasm_jit_result.ndirect_deps); }
+					cfg->wasm_jit_result.direct_dep_sig, cfg->wasm_jit_result.direct_dep_method, cfg->wasm_jit_result.ndirect_deps,
+					wj_self_imports.slot, wj_self_imports.n); }
 				if (cfg->wasm_jit_result.desc_id <= 0) {
 					g_free (cached);
 					cached = NULL;
 				} else {
+					{ WjRegEntry *sre = wj_reg_at (cfg->wasm_jit_result.desc_id - 1);
+					  if (sre) { sre->body = wj_stored_body; wj_stored_body = NULL; } }
 					if (mono_wasm_jit_verbose >= 1) {
 						printf ("WASM_JIT_REGISTERED %s desc=%d e_slot=%d f_slot=%d len=%u deps=%d [", mname, cfg->wasm_jit_result.desc_id, e_slot, f_slot, (unsigned) out.len, cfg->wasm_jit_result.ndirect_deps);
 						for (i = 0; i < cfg->wasm_jit_result.ndirect_deps; ++i)
@@ -11122,6 +11597,10 @@ vcall_cold_miss_emit:
 	wasm_buf_free (&out);
 
 done:
+	g_free (wj_self_imports.slot);
+	memset (&wj_self_imports, 0, sizeof (wj_self_imports));
+	wj_body_free (wj_stored_body);   /* NULL once the registry has taken it */
+	wj_stored_body = NULL;
 	wasm_buf_free (&body);
 #ifdef HOST_BROWSER
 	/* This frame claimed a member slot but did not reach the capture (it bailed): release the claim so
