@@ -216,6 +216,11 @@ enum {
 	 * Re-assembling a member counts it again, deliberately: the census is per module built, so comparing
 	 * it across generations is how a rebatch is shown to have actually retargeted anything. */
 	WJC_CALL_LOCAL, WJC_CALL_IMPORT, WJC_CALL_INDIRECT,
+	/* Admissions deferred because an IMPORTED dependency was still mid-DFS on this worker, so binding it
+	 * would have been a LinkError. Not a failure: the method runs interpreted and a later dispatch retries.
+	 * Read it against WJC_CALL_IMPORT -- a few per thousand imports is the ordering noise the retry exists
+	 * to absorb; a number near the import count means the graph is far more cyclic than assumed. */
+	WJC_ADMIT_DEFERRED,
 	WJC_MAX
 };
 
