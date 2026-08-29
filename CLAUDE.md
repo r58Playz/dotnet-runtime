@@ -70,6 +70,29 @@ newer, so re-check if something surprising turns up).
   against one hoisted load and a constant-offset access for a module-defined one (`:1129-1145`). `s.p`
   (`__stack_pointer`) is the only mutable import, and every framed method reads *and writes* it.
 
+## The prefilled placeholder — the trap that has now bitten twice
+
+`mono_jiterp_allocate_table_entry` hands out slots from a range the jiterpreter **prefills with a real,
+callable wasm function**: `mono_jiterp_placeholder_jit_call`, whose signature is `(i32,i32,i32,i32)->void`
+and whose entire body is `*thrown = 999` (`interp.c:15719`, filled at `jiterpreter-support.ts:2198`).
+
+So **`table[fslot] != null` is not a liveness test**, and neither is "the import resolved". A slot this
+worker has not instantiated holds a function that:
+
+* traps if you `call_indirect` it with any other signature — which is loud, and is what jit138 hit; and
+* **works** if the expected type is that one very common shape — writing 999 through the caller's fourth
+  argument as a pointer and returning. Silent heap corruption, no LinkError, no trap, no diagnostic.
+
+The authoritative test is the per-thread bitmap, `mono_wasm_jit_slot_live()` (or, on the JS side,
+`Module.__wjSlotFn`, the per-worker record of what this worker installed). Both are per-thread because the
+function table is per-thread for dynamic entries — a process-wide bitmap cannot answer this, which is why
+`wj_slot_is_installed` could not be used for it (R132).
+
+This has now produced two separate bugs a session apart: the inline vcall IC (jit138, fixed with the
+`slot_live` gate) and `MONO_WASM_JIT_DIRECT_IMPORT` (R146, fixed by naming method imports `h."m<index>"` so
+the resolver can refuse a slot this worker never installed). **Before binding, calling or trusting anything
+found at an f-slot, ask whether THIS thread put it there.**
+
 ## Where the time actually goes (in-game plateau, ~25 fps / 40 ms)
 
 * **~60%** of the window is code this emitter generates; ~28% AOT image; ~10% native; ~1% V8 builtins.

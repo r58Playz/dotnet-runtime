@@ -384,6 +384,22 @@ typedef struct {
 typedef struct {
 	guint32 table_index;    /* C function pointer value == indirect-function-table index */
 	guint32 type_idx;       /* functype index (T0=method, T1=entry, 2+k = extra_types [k]) */
+	/* TRUE if this is a JITted METHOD's f-slot rather than a C helper or an AOT body, in which case the
+	 * import is named "m<index>" instead of "<index>". The distinction is load-bearing, not cosmetic.
+	 *
+	 * A helper's table index is fixed for the life of the process, so binding it at instantiation is
+	 * always correct. A method f-slot is NOT: until the callee's module is instantiated ON THIS WORKER
+	 * the slot holds the jiterpreter's prefill, mono_jiterp_placeholder_jit_call -- a REAL, CALLABLE
+	 * wasm function of type (i32,i32,i32,i32)->void. So an import of an un-instantiated f-slot does not
+	 * fail to resolve; it binds successfully whenever the caller's expected type is that same very common
+	 * shape, and every call to the callee then lands in the placeholder, whose body is `*thrown = 999` --
+	 * i.e. it writes 999 through the caller's FOURTH ARGUMENT as a pointer and returns.
+	 *
+	 * That is silent heap corruption with no LinkError, no trap and no wrong-type diagnostic, and it is
+	 * what the direct-import boot crash was. The "m" prefix is how the instantiation-side resolver tells
+	 * the two cases apart so it can refuse the second. (The call_indirect path had the same hazard and
+	 * fixed it separately in jit138 with the mono_wasm_jit_slot_live gate; see mini-wasm.c:1106.) */
+	guint8  method;
 } WasmFuncImport;
 
 
