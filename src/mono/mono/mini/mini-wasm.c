@@ -32,7 +32,7 @@ static int mono_wasm_debug_level = 0;
 #include <emscripten.h>
 int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
 gpointer mono_interp_get_imethod (MonoMethod *method); /* interp/interp.c; kept opaque in this emitter */
-gboolean mono_wasm_jit_vprof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
+gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
 	MonoMethod **out_target, guint32 *out_samples); /* interp.c; lock-free pre-JIT receiver profile */
 void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
 void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
@@ -94,7 +94,7 @@ int mono_wasm_jit_thresh = 2000;
 int mono_wasm_jit_over_aot = 0;
 int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiver-arity histogram for the vcall miss population (N-way IC capture curve). Diagnostic — perturbs timing (like PROFILE_FAST); default off */
 /* MONO_WASM_JIT_DEVIRT_PROFILE=1: record the receiver vtable seen at interp virtual call sites.
- * Collection lives in interp.c (wj_vprof_*), observable via mono_wasm_jit_vprof_stat. Defined HERE,
+ * Collection lives in interp.c (wj_prof_*), observable via mono_wasm_jit_prof_stat. Defined HERE,
  * not in interp.c, because mono_wasm_jit_auto_init below references it and this file is linked into
  * both the runtime and the offline cross-compiler (mono-aot-cross), which has no interpreter — same
  * reason as mono_wasm_jit_residual_mode. Costs ~0.7% when on. Default off.
@@ -110,6 +110,21 @@ int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiv
  * call_indirect also gives V8 same-module target feedback; outside batch mode it still replaces a much
  * larger worker-PIC hit path. The profile remains batching's observed virtual call graph too. */
 int mono_wasm_jit_devirt_profile = 0;
+/* MONO_WASM_JIT_STABLE_IC_IDS: give a re-emitted virtual call site the SAME inline-cache id its previous
+ * generation had, instead of bumping a fresh one out of WJ_VCALL_SITE_MAX.
+ *
+ * What it buys: a re-emission inherits the worker-local PIC entries the previous generation warmed, and
+ * stops burning ids. wj_auto_batch_poll records the old behaviour as a defect in its own comments -- "a
+ * failed batch re-emit allocates fresh (initially empty) sites, making retries increasingly expensive" --
+ * and under a continuous re-batcher that is fatal rather than untidy.
+ *
+ * Why it is DEFAULT OFF anyway: the id comes from the call profile's record, which is keyed by callee base
+ * method, while an IC belongs to one CALL SITE. Two sites in one method calling the same base share the
+ * record, so they would share a PIC slot -- at the shipped vcall_ways of 1, a win when they see the same
+ * receiver and a mutual eviction when they do not. 6,345 emissions per boot would take an existing id, so
+ * this is not a rounding error and it is not a refactor. It ships off so the profile unification lands
+ * inert; turn it on with a measurement, not with an argument. */
+int mono_wasm_jit_stable_ic_ids = 0;
 /* MONO_WASM_JIT_DIRECT_IMPORT: let a call to another wasm-JITted method be reached through a declared
  * function IMPORT rather than `i32.const <fslot>; call_indirect <ct> 0`.
  *
@@ -393,6 +408,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
 	{ extern int mono_wasm_jit_devirt_profile; const char *dp = g_getenv ("MONO_WASM_JIT_DEVIRT_PROFILE"); mono_wasm_jit_devirt_profile = (dp && *dp && *dp != '0') ? 1 : 0; }
+	{ extern int mono_wasm_jit_stable_ic_ids; const char *si = g_getenv ("MONO_WASM_JIT_STABLE_IC_IDS"); mono_wasm_jit_stable_ic_ids = (si && *si && *si != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_batch_module; const char *bm = g_getenv ("MONO_WASM_JIT_BATCH_MODULE"); mono_wasm_jit_batch_module = (bm && *bm) ? atoi (bm) : 0; }   /* 1 = batch islands; 2 = single-member batches (bisect); 3 = whole program in one module (upper bound) */
 	{ extern int mono_wasm_jit_batch_all_at; const char *ba = g_getenv ("MONO_WASM_JIT_BATCH_ALL_AT"); mono_wasm_jit_batch_all_at = (ba && *ba) ? atoi (ba) : 250; }
 	{ extern int mono_wasm_jit_batch_settle; const char *bs = g_getenv ("MONO_WASM_JIT_BATCH_SETTLE"); mono_wasm_jit_batch_settle = (bs && *bs && atoi (bs) > 0) ? atoi (bs) : 128; }
@@ -587,7 +603,7 @@ int mono_wasm_jit_inline_ilofs = 0;   /* MEASURED WORSE — see above. Default O
  * Round 110 failure mode (trading a call for a long live range) does not apply. */
 int mono_wasm_jit_inline_zero = 64;   /* max framebytes to zero inline; 0 disables (always memory.fill). */
 /* MONO_WASM_JIT_IC_AUTOSIZE=0 emits MONO_WASM_JIT_VCALL_WAYS ways at every virtual call site. Default 1 =
- * size each site from the interpreter's receiver observations (mono_wasm_jit_vprof_arity), so a site only
+ * size each site from the call profile's receiver observations (mono_wasm_jit_prof_arity), so a site only
  * ever seen monomorphic loses its ways 1..N-1 cold-scan loop entirely. Requires the devirt profile to be on
  * (it is, in the shipping knob set) — with no observations the configured width is used unchanged. */
 int mono_wasm_jit_ic_autosize = 1;
@@ -10633,7 +10649,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						if (!is_delegate_invoke && mono_wasm_jit_devirt_profile &&
 						    (mono_wasm_jit_vcall_slim ||
 						     (terminal_vcall_handoff && terminal_vcall_ins == ins))) {
-							if (mono_wasm_jit_vprof_predict (mono_interp_get_imethod (cfg->method),
+							if (mono_wasm_jit_prof_predict (mono_interp_get_imethod (cfg->method),
 							    call->method, &pred_vt, &pred_target, NULL)) {
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
@@ -10800,7 +10816,7 @@ vcall_nullchk_done:
 							 *
 							 * Narrowing is safe in the only direction that matters: the emitted code re-checks the
 							 * cached vtable on every call, so an under-sized site costs IC misses, never a wrong
-							 * target. mono_wasm_jit_vprof_arity returns 0 unless the site is warm (>= 8 samples)
+							 * target. mono_wasm_jit_prof_arity returns 0 unless the site is warm (>= 8 samples)
 							 * and its receiver set did not overflow, so "no data" and "too many types" both keep
 							 * the configured width.
 							 *
@@ -10809,7 +10825,7 @@ vcall_nullchk_done:
 							 * to agree. A narrow site simply leaves its upper slots unused.
 							 *
 							 * Delegate.Invoke sites are sized from the same number, fed by a separate recorder in
-							 * MINT_CALL_DELEGATE (wj_vprof_record_delegate) that counts distinct delegate TARGETS
+							 * MINT_CALL_DELEGATE (wj_prof_record_delegate) that counts distinct delegate TARGETS
 							 * rather than receiver vtables, because that is what the delegate IC's ways
 							 * discriminate on. That is the population that matters for MethodHandle stubs: a
 							 * MethodHandle invoke is a delegate invoke, so those stubs carry the unrolled
@@ -10817,11 +10833,11 @@ vcall_nullchk_done:
 							int ic_ways = mono_wasm_jit_vcall_ways;
 #ifdef HOST_BROWSER
 							if (mono_wasm_jit_ic_autosize && ic_ways > 1) {
-								extern guint32 mono_wasm_jit_vprof_arity (gpointer caller, MonoMethod *base);
-								guint32 ar = mono_wasm_jit_vprof_arity (mono_interp_get_imethod (cfg->method), call->method);
-								/* arity + 1, not arity. The profile only observes this site while the caller is
-								 * still INTERPRETED, so it cannot see receivers that first appear after the
-								 * method is compiled -- and the counters say that is exactly what happens: the
+								extern guint32 mono_wasm_jit_prof_arity (gpointer caller, MonoMethod *base);
+								guint32 ar = mono_wasm_jit_prof_arity (mono_interp_get_imethod (cfg->method), call->method);
+								/* arity + 1, not arity. The profile now also observes this site AFTER the caller is
+								 * compiled (the IC-miss path feeds it), but the width is fixed at THIS emit, so it
+								 * still cannot see receivers that first appear later -- and the counters say that is exactly what happens: the
 								 * vcall IC miss rate is 9.0% inside the in-game window against 2.83% run
 								 * cumulative, i.e. misses concentrate after compilation. One spare way absorbs
 								 * the common "one new type shows up later" case; a miss costs a trip through

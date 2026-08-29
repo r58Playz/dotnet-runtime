@@ -93,6 +93,28 @@ This has now produced two separate bugs a session apart: the inline vcall IC (ji
 the resolver can refuse a slot this worker never installed). **Before binding, calling or trusting anything
 found at an f-slot, ask whether THIS thread put it there.**
 
+## There is ONE call profile — do not add a second
+
+`InterpMethod.wasm_jit_profile` -> `WjCallProfile` (interp.c) is the single record of what a method's
+virtual and delegate call sites dispatch to. It is written by exactly one function, `wj_prof_record`, from
+three observation points — the interpreter's virtual dispatch, its delegate dispatch, and the JITted code's
+IC MISS (`wj_vcall_pic_publish`) — and read by emit-time devirt prediction, IC sizing, and the batch
+planner. **78.8% of its observations come from the JIT's IC miss** (R148), i.e. from the half that used to
+be invisible to the emitter, so a reader that skips it is skipping most of the data.
+
+Two things nearby are NOT profiles and must not be merged into it:
+
+* **`wj_vcall_pic` / `wj_delegate_pic`** are per-thread DISPATCH STATE, and per-thread because f-slot
+  installation is per-thread. Only the MISS path feeds the profile; keep the hit path a pure TLS load.
+* **`wj_entry_edges`** counts interp->JIT TRANSITIONS keyed (caller, callee) and caches method names at
+  record time so the main-thread JS dump never takes a lock. Folding it in would spend the profile's 12
+  bounded site slots on a different question and change which sites survive eviction — i.e. change codegen.
+
+And one trap, already paid for: **a stable inline-cache id is not the same granularity as a profile
+record.** The record is keyed by callee base method (IL offsets are stale after `generate_compacted_code`);
+an IC belongs to one call site. Reusing the record's id makes two sites in one method that call the same
+base share a PIC slot — 6,345 emissions per boot. That is `MONO_WASM_JIT_STABLE_IC_IDS`, default 0.
+
 ## Where the time actually goes (in-game plateau, ~25 fps / 40 ms)
 
 * **~60%** of the window is code this emitter generates; ~28% AOT image; ~10% native; ~1% V8 builtins.
