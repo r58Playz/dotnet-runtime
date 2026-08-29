@@ -157,6 +157,29 @@ int mono_wasm_jit_ci_imports = 0;
  * narrows a misbehaving import to a family of callees WITHOUT a rebuild, which at ~25 minutes a build is
  * the difference between bisecting in an afternoon and bisecting in a week. */
 const char *mono_wasm_jit_no_import = NULL;
+/* MONO_WASM_JIT_MAX_METHOD_IMPORTS=<n>: at most n METHOD imports per module (helpers and AOT bodies are
+ * neither counted nor capped). -1 = unlimited.
+ *
+ * A dose lever, for telling "one specific bad callee" apart from "something systemic about method
+ * imports". If the failure rate is flat in n until the culprit is excluded, it is one callee; if it scales
+ * with n, it is not. That distinction is otherwise unreachable at a 50% base rate without tens of boots
+ * per arm. */
+int mono_wasm_jit_max_method_imports = -1;
+/* Caller-side levers, the counterpart to MONO_WASM_JIT_NO_IMPORT (which selects on the CALLEE).
+ *
+ *   MONO_WASM_JIT_NO_IMPORT_IN=<substr>   no method imports in a module whose method name matches
+ *   MONO_WASM_JIT_ONLY_IMPORT_IN=<substr> method imports ONLY in a module whose method name matches
+ *
+ * The second is the one that matters. Excluding a suspect and watching a 50%-of-boots failure not happen
+ * is weak evidence however many boots it gets; importing in NOTHING BUT the suspect and watching the
+ * failure happen is strong. Bisecting by exclusion alone is what produced the discarded R143 chain. */
+const char *mono_wasm_jit_no_import_in = NULL;
+const char *mono_wasm_jit_only_import_in = NULL;
+/* MONO_WASM_JIT_IMPORT_WRAPPERS=1: allow wrapper and dynamic methods to be reached by import. Default 0,
+ * which is the exclusion the original direct-import gate had. Present so the exclusion can be A/B'd rather
+ * than believed -- see wj_asm_method_importable for why a dynamic method's f-slot is not a stable binding
+ * target. */
+int mono_wasm_jit_import_wrappers = 0;
 int mono_wasm_jit_direct_import = 0;
 /* MONO_WASM_JIT_DEVIRT_IMPORT is GONE, and deliberately not replaced.
  *
@@ -301,6 +324,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_vcall_shared_miss_enabled; const char *sm = g_getenv ("MONO_WASM_JIT_VCALL_SHARED_MISS"); mono_wasm_jit_vcall_shared_miss_enabled = (sm && *sm) ? (*sm != '0') : 1; }
 	{ extern int mono_wasm_jit_vcall_slim; const char *sl = g_getenv ("MONO_WASM_JIT_VCALL_SLIM"); mono_wasm_jit_vcall_slim = (sl && *sl) ? (*sl != '0') : 1; }
 	{ extern const char *mono_wasm_jit_no_import; const char *ni = g_getenv ("MONO_WASM_JIT_NO_IMPORT"); mono_wasm_jit_no_import = (ni && *ni) ? ni : NULL; }
+	{ extern int mono_wasm_jit_max_method_imports; const char *mm = g_getenv ("MONO_WASM_JIT_MAX_METHOD_IMPORTS"); mono_wasm_jit_max_method_imports = (mm && *mm) ? atoi (mm) : -1; }
+	{ extern const char *mono_wasm_jit_no_import_in; const char *nii = g_getenv ("MONO_WASM_JIT_NO_IMPORT_IN"); mono_wasm_jit_no_import_in = (nii && *nii) ? nii : NULL; }
+	{ extern const char *mono_wasm_jit_only_import_in; const char *oii = g_getenv ("MONO_WASM_JIT_ONLY_IMPORT_IN"); mono_wasm_jit_only_import_in = (oii && *oii) ? oii : NULL; }
+	{ extern int mono_wasm_jit_import_wrappers; const char *iw = g_getenv ("MONO_WASM_JIT_IMPORT_WRAPPERS"); mono_wasm_jit_import_wrappers = (iw && *iw && *iw != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_ci_imports; const char *ic = g_getenv ("MONO_WASM_JIT_CI_IMPORTS"); mono_wasm_jit_ci_imports = (ic && *ic) ? (*ic != '0') : 0; } /* the two never-converted constant-index call sites via declared imports */
 	{ extern int mono_wasm_jit_direct_import; const char *dd = g_getenv ("MONO_WASM_JIT_DIRECT_IMPORT"); mono_wasm_jit_direct_import = (dd && *dd) ? (*dd != '0') : 0; } /* a JITted callee via a declared import instead of constant-index call_indirect; needs an SCC-closed module */
 	{ extern int mono_wasm_jit_structured_cfg; const char *sc = g_getenv ("MONO_WASM_JIT_STRUCTURED_CFG"); mono_wasm_jit_structured_cfg = (sc && *sc) ? (*sc != '0') : 1; }
@@ -1213,9 +1240,24 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 				 * wasmTable.get calls spread over minutes.
 				 *
 				 * Two rounds of diagnosis blamed dependency cycles for what this was. See R142. */
+				Module.__wjSlotFn = new Map ();
+				Module.__wjSlotChanged = 0;
 				Module.__wjHelperImports = new Proxy ({}, { get: function (t, k) {
 					if (typeof k !== "string" || !/^[0-9]+$/.test (k)) return undefined;
-					return wasmTable.get (Number (k));
+					var i = Number (k);
+					var f = wasmTable.get (i);
+					/* DETECTOR, not a guard. Every slot this worker installed is remembered; if the table
+					 * no longer holds what we put there, some OTHER writer has been at it, and an import
+					 * bound here would silently be the wrong function. That is the one remaining shape of
+					 * the direct-import failure that cannot be seen from C, because the other writers of
+					 * this table are in TypeScript. Deterministic per run, unlike the 50%-of-boots crash
+					 * it is chasing. */
+					if (Module.__wjSlotFn && Module.__wjSlotFn.has (i) && Module.__wjSlotFn.get (i) !== f) {
+						Module.__wjSlotChanged = (Module.__wjSlotChanged | 0) + 1;
+						if (Module.__wjSlotChanged <= 20)
+							console.log ("WASM_JIT_IMPORT_SLOT_CHANGED slot=" + i + " n=" + Module.__wjSlotChanged);
+					}
+					return f;
 				} });
 			}
 			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8, v: $9, n: $10, d: $11, m: $12, b: $13 }, h: Module.__wjHelperImports });
@@ -1225,6 +1267,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			} else {
 				wasmTable.set ($0, inst.exports.e); /* entry thunk: interp entry */
 				wasmTable.set ($1, inst.exports.f); /* scalar method: call_indirect target */
+				if (Module.__wjSlotFn) { Module.__wjSlotFn.set ($0, inst.exports.e); Module.__wjSlotFn.set ($1, inst.exports.f); }
 			}
 			return 1;
 		} catch (e) {
@@ -1322,9 +1365,24 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 				 * wasmTable.get calls spread over minutes.
 				 *
 				 * Two rounds of diagnosis blamed dependency cycles for what this was. See R142. */
+				Module.__wjSlotFn = new Map ();
+				Module.__wjSlotChanged = 0;
 				Module.__wjHelperImports = new Proxy ({}, { get: function (t, k) {
 					if (typeof k !== "string" || !/^[0-9]+$/.test (k)) return undefined;
-					return wasmTable.get (Number (k));
+					var i = Number (k);
+					var f = wasmTable.get (i);
+					/* DETECTOR, not a guard. Every slot this worker installed is remembered; if the table
+					 * no longer holds what we put there, some OTHER writer has been at it, and an import
+					 * bound here would silently be the wrong function. That is the one remaining shape of
+					 * the direct-import failure that cannot be seen from C, because the other writers of
+					 * this table are in TypeScript. Deterministic per run, unlike the 50%-of-boots crash
+					 * it is chasing. */
+					if (Module.__wjSlotFn && Module.__wjSlotFn.has (i) && Module.__wjSlotFn.get (i) !== f) {
+						Module.__wjSlotChanged = (Module.__wjSlotChanged | 0) + 1;
+						if (Module.__wjSlotChanged <= 20)
+							console.log ("WASM_JIT_IMPORT_SLOT_CHANGED slot=" + i + " n=" + Module.__wjSlotChanged);
+					}
+					return f;
 				} });
 			}
 			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14 }, h: Module.__wjHelperImports });
@@ -1338,6 +1396,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 				if (!ef || !ff) throw new Error ("batched module missing export e" + k);
 				wasmTable.set (HEAP32[(es >> 2) + k], ef);
 				wasmTable.set (HEAP32[(fs >> 2) + k], ff);
+				if (Module.__wjSlotFn) { Module.__wjSlotFn.set (HEAP32[(es >> 2) + k], ef); Module.__wjSlotFn.set (HEAP32[(fs >> 2) + k], ff); }
 				k = k + 1;
 			}
 			return 1;
@@ -4591,11 +4650,12 @@ typedef struct {
 	guint8 method_imports;
 	guint8 local_calls;      /* resolve a co-located callee to `call <funcidx>` */
 	guint8 names;            /* MONO_WASM_JIT_NAMES: append the name section */
-	int    max_fimports;     /* mono_wasm_jit_max_himp */
+	int    max_fimports;         /* mono_wasm_jit_max_himp */
+	int    max_method_imports;   /* MONO_WASM_JIT_MAX_METHOD_IMPORTS; -1 = unlimited */
 } WjAsmPolicy;
 
 /* Per-member census of what the forms came out as; feeds the WJC_ counters and the tier dumps. */
-typedef struct { int nlocal, nimport, nindirect; } WjAsmStats;
+typedef struct { int nlocal, nimport, nindirect, nimport_method; } WjAsmStats;
 
 /* The f-slots one member reached by IMPORT, i.e. the deps it binds at INSTANTIATION rather than at call
  * time. The registry needs them (WjRegEntry.dep_strict) so admission can refuse to instantiate before they
@@ -4819,10 +4879,9 @@ wj_asm_reaches (int from_desc, int target_fslot)
 /* TRUE if `name` contains any comma-separated segment of MONO_WASM_JIT_NO_IMPORT. Substring rather than
  * exact match, so a whole family bisects in one arm (`NativeImage`, `class_1058`, `close`). */
 static gboolean
-wj_no_import_name (const char *name)
+wj_name_matches (const char *t, const char *name)
 {
-	extern const char *mono_wasm_jit_no_import;
-	const char *t = mono_wasm_jit_no_import, *p;
+	const char *p;
 	char seg [128];
 
 	if (!t || !name)
@@ -4844,6 +4903,34 @@ wj_no_import_name (const char *name)
 }
 
 static gboolean
+wj_no_import_name (const char *name)
+{
+	extern const char *mono_wasm_jit_no_import;
+	return wj_name_matches (mono_wasm_jit_no_import, name);
+}
+
+/* Does this MEMBER get to make method imports at all? Evaluated once per member, not per call site. */
+static gboolean
+wj_asm_member_may_import (MonoMethod *m)
+{
+	extern const char *mono_wasm_jit_no_import_in, *mono_wasm_jit_only_import_in;
+	const char *cn;
+
+	if (!mono_wasm_jit_no_import_in && !mono_wasm_jit_only_import_in)
+		return TRUE;
+	if (!m)
+		return mono_wasm_jit_only_import_in == NULL;
+	cn = m_class_get_name (m->klass);
+	if (mono_wasm_jit_no_import_in &&
+	    (wj_name_matches (mono_wasm_jit_no_import_in, m->name) || wj_name_matches (mono_wasm_jit_no_import_in, cn)))
+		return FALSE;
+	if (mono_wasm_jit_only_import_in &&
+	    !(wj_name_matches (mono_wasm_jit_only_import_in, m->name) || wj_name_matches (mono_wasm_jit_only_import_in, cn)))
+		return FALSE;
+	return TRUE;
+}
+
+static gboolean
 wj_asm_method_importable (const WasmReloc *r, const WasmFuncType *sig, int self_fslot)
 {
 #ifdef HOST_BROWSER
@@ -4858,9 +4945,30 @@ wj_asm_method_importable (const WasmReloc *r, const WasmFuncType *sig, int self_
 		return FALSE;
 	{
 		extern const char *mono_wasm_jit_no_import;
+		extern int mono_wasm_jit_import_wrappers;
 		MonoMethod *cm = (MonoMethod *) r->sym;
 		if (G_UNLIKELY (mono_wasm_jit_no_import != NULL) && cm &&
 		    (wj_no_import_name (cm->name) || wj_no_import_name (m_class_get_name (cm->klass))))
+			return FALSE;
+		/* NEVER IMPORT A WRAPPER OR A DYNAMIC METHOD, unless MONO_WASM_JIT_IMPORT_WRAPPERS says otherwise.
+		 *
+		 * This exclusion was in the original emit-time gate and was lost when the decision moved into the
+		 * assembler -- the old code read
+		 *     call_method->wrapper_type == MONO_WRAPPER_NONE && !call_method->dynamic
+		 * and this reinstates it.
+		 *
+		 * It matters here far more than it looks. IKVM manufactures dynamic methods continuously --
+		 * __<>lazyrecompiled_*, __<>DynamicBinder__*, __<>MHC* -- and they are a large share of the tier
+		 * (4,512 MHC stubs and 2,032 DynamicBinders in one whole-tier dump). A DynamicMethod can be
+		 * collected, and its f-slot returned to the allocator and handed to something else. call_indirect
+		 * survives that: it reads the table when it runs, so it follows the slot's current occupant. An
+		 * import does not -- it bound once, at instantiation, and keeps calling whatever was there then.
+		 *
+		 * That is also why the R144 slot-change detector could not see it: the detector remembers the last
+		 * value THIS worker installed, so a legitimate re-install of a recycled slot updates the memory and
+		 * compares equal. It detects a foreign writer, not a change of owner. */
+		if (cm && !mono_wasm_jit_import_wrappers &&
+		    (cm->wrapper_type != MONO_WRAPPER_NONE || cm->dynamic))
 			return FALSE;
 	}
 	if (re->f_sig_id != wj_functype_hash (sig))
@@ -4905,6 +5013,7 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
                      WjAsmImports *ai)
 {
 	const WasmRelocs *rl = b->relocs;
+	gboolean may_import = wj_asm_member_may_import (mem [self_index].method);
 	guint32 k;
 
 	for (k = 0; rl && k < rl->n; ++k) {
@@ -4942,6 +5051,14 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti);
 			break;
 		case WASM_RELOC_CALL:
+			if (!may_import) {
+				st->nindirect++;
+				continue;
+			}
+			if (pol->max_method_imports >= 0 && st->nimport_method >= pol->max_method_imports) {
+				st->nindirect++;
+				continue;
+			}
 			member = pol->local_calls ? wj_asm_member_of (mem, n, (MonoMethod *) r->sym) : -1;
 			if (member >= 0) {
 				fix [k].form = WASM_FORM_LOCAL;
@@ -4958,8 +5075,10 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			fix [k].form = WASM_FORM_IMPORT;
 			fix [k].idx = (guint32) slot;
 			st->nimport++;
-			if (r->kind == WASM_RELOC_CALL)
+			if (r->kind == WASM_RELOC_CALL) {
+				st->nimport_method++;
 				wj_asm_imports_add (ai, (int) r->table_index);
+			}
 		} else {
 			st->nindirect++;
 		}
@@ -4983,9 +5102,11 @@ wj_asm_policy_init (WjAsmPolicy *pol, gboolean local_calls)
 {
 	extern int mono_wasm_jit_helper_imports, mono_wasm_jit_aot_imports, mono_wasm_jit_direct_import;
 	extern int mono_wasm_jit_ci_imports, mono_wasm_jit_max_himp, mono_wasm_jit_names;
+	extern int mono_wasm_jit_max_method_imports;
 
 	memset (pol, 0, sizeof (*pol));
 	pol->max_fimports = mono_wasm_jit_max_himp;
+	pol->max_method_imports = mono_wasm_jit_max_method_imports;
 	pol->names = mono_wasm_jit_names ? 1 : 0;
 	pol->local_calls = local_calls ? 1 : 0;
 #ifdef HOST_BROWSER
