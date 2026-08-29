@@ -189,10 +189,15 @@ struct InterpMethod {
 	 * method count — which is exactly the axis module batching increases. */
 	gint32 wasm_jit_self_resv_eslot;
 	gint32 wasm_jit_self_resv_fslot;
-	/* Speculative-devirtualization profile (MONO_WASM_JIT_DEVIRT_PROFILE): WjVProf*, lazily allocated.
-	 * Records the receiver vtable observed at this method's virtual call sites WHILE IT RUNS
-	 * INTERPRETED, so the wasm JIT has a target to speculate on at its FIRST compile — the JIT's own
-	 * vcall IC only fills in after the method is already JITted, which is too late to shape its code.
+	/* THE CALL PROFILE (MONO_WASM_JIT_DEVIRT_PROFILE): WjCallProfile*, lazily allocated. See the long
+	 * comment above WjProfSite in interp.c.
+	 *
+	 * Records what this method's virtual and delegate call sites dispatch to. Written by the interpreter
+	 * WHILE THIS METHOD RUNS INTERPRETED, so the wasm JIT has a target to speculate on at its FIRST
+	 * compile — its own vcall IC only fills in after the method is already JITted, which is too late to
+	 * shape its code — AND, once it is JITted, by that IC's miss path, so a re-emission can see what the
+	 * compiled code learned. It also carries the STABLE per-site inline-cache id, which is what lets a
+	 * re-emitted site keep the worker-local PIC entries the previous generation warmed.
 	 *
 	 * Keyed by CALLEE BASE METHOD, not by call site. Interp code offsets are not usable as a key:
 	 * generate_compacted_code lays out a fresh buffer after interp_optimize_code, so any offset taken
@@ -201,7 +206,7 @@ struct InterpMethod {
 	 * hand at the dispatch point and needs no encoding change. Two sites in one method calling the same
 	 * base method therefore share an entry; that only costs precision, never correctness, because the
 	 * emitted code guards on the vtable and falls back on a miss. */
-	gpointer wasm_jit_vprof;
+	gpointer wasm_jit_profile;
 	unsigned int param_count;
 	unsigned int hasthis; // boolean
 	MonoProfilerCallInstrumentationFlags prof_flags;
@@ -361,7 +366,7 @@ InterpMethod *
 mono_interp_get_imethod (MonoMethod *method);
 
 gboolean
-mono_wasm_jit_vprof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
+mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
 	MonoMethod **out_target, guint32 *out_samples);
 
 void

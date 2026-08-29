@@ -66,7 +66,7 @@ get_tier_up_imethod (InterpMethod *imethod)
 		 * method's call sites, not one tier's bytecode, and the whole point is to still have them when
 		 * the wasm JIT compiles later. Losing them here would reset the evidence exactly when a method
 		 * gets hot enough to matter. */
-		new_imethod->wasm_jit_vprof = old_imethod->wasm_jit_vprof;
+		new_imethod->wasm_jit_profile = old_imethod->wasm_jit_profile;
 		mono_internal_hash_table_remove (&jit_mm->interp_code_hash, method);
 		mono_internal_hash_table_insert (&jit_mm->interp_code_hash, method, new_imethod);
 	}
