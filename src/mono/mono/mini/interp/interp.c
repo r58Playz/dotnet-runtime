@@ -1924,6 +1924,7 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 {
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 	extern gboolean mono_wasm_jit_method_denied (MonoMethod *m);
+	extern int mono_wasm_jit_colocate_deps_now (int desc_id);
 	MonoWasmJitResult r;
 	memset (&r, 0, sizeof (r));
 	if (out)
@@ -1993,6 +1994,12 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 		im->wasm_jit_slot = r.e_slot;
 		jit_mm_unlock (jit_mm);
 		wj_waiter_drain (logical_method);   /* event-driven wake: re-queue any methods parked waiting on this callee */
+		/* CO-LOCATION, after publication and never before it. The method is already invocable at this
+		 * point and stays invocable whatever happens next: a re-frame that fails leaves every member on
+		 * the standalone module it already has. That ordering is the whole difference from every batching
+		 * arm measured here, all of which DEFERRED publication until the group was built and paid +36% on
+		 * boot for it. */
+		mono_wasm_jit_colocate_deps_now (r.desc_id);
 		return WASM_JIT_COMPILE_JITTED;
 	}
 	if (r.retriable) {
@@ -2218,78 +2225,58 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 	ok = FALSE;   /* iteration cap hit without closing */
 out:
 	if (ok) {
-		/* --- island module batching (MONO_WASM_JIT_BATCH_MODULE) ------------------------------------
+		/* --- SCC CO-LOCATION, ALWAYS ON ---------------------------------------------------------
 		 *
-		 * Every member has compiled into its own module and registered, but is not yet invocable. Re-emit
-		 * them all into ONE module now and repoint the registry at it: V8 cannot inline across a module
-		 * boundary, so co-locating is what turns each intra-island call from ~1.5ns into the ~0.25ns
-		 * inline floor (scratchpad/callbench.mjs).
+		 * Every member has compiled into its own module and registered but is not yet invocable. Re-frame
+		 * them all into ONE module now and repoint the registry at it. V8 cannot inline across a module
+		 * boundary under any circumstances (an imported function has wire_byte_size_ == 0, so its
+		 * InliningTree score is 0 -- inlining-tree.h:79-85), so co-location is what turns each intra-cycle
+		 * call from a ~15-instruction call_indirect dispatch into a single `call rel32` that V8 may also
+		 * inline through.
 		 *
-		 * This is deliberately a SECOND PASS rather than a rework of phase 1 above. Phase 1's fixpoint
-		 * decides a member compiled by testing results[i].e_slot > 0, and a batch-captured member has no
-		 * e_slot — it is neither instantiated nor registered — so making phase 1 batch-aware means
-		 * restructuring the convergence logic. Doing it here costs one extra emit per member and leaves
-		 * that logic untouched, which is the right trade until the win is confirmed.
+		 * This used to be gated behind MONO_WASM_JIT_BATCH_MODULE >= 2 and worked by running
+		 * mono_wasm_force_compile once per member -- a whole mini_method_compile each -- because a member's
+		 * emitted bytes baked module-dependent indices. That per-member re-compile is the +36% boot present
+		 * in every batching arm ever measured here, and it is why all four of them lost. It is gone: the
+		 * members' relocatable bodies are on their registry entries and mono_wasm_jit_rebatch frames them
+		 * with a memcpy pass. There is no capture phase either, so the whole
+		 * batch_begin/force_compile/divergence-check/batch_finish/batch_end protocol -- and the
+		 * "batch_count() == k+1 && batch_member_method(k) == expected" check that guarded it -- goes with it.
 		 *
-		 * On any failure we simply keep the standalone modules already registered — they are valid and
-		 * installed, so a failed batch costs compile time, never correctness. */
-		extern int mono_wasm_jit_batch_module;
-		if (mono_wasm_jit_batch_module >= 2) {
-			extern int mono_wasm_jit_batch_begin (void);
-			extern void mono_wasm_jit_batch_end (void);
-			extern int mono_wasm_jit_batch_count (void);
-			extern MonoMethod *mono_wasm_jit_batch_member_method (int i);
-			extern int mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_bytes, int *out_len, char *errbuf, int errcap);
-			extern int mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_slots, int n, void *bytes, int len);
-			int e_slots [WJ_SCC_MAX], f_slots [WJ_SCC_MAX], descs [WJ_SCC_MAX], idx [WJ_SCC_MAX];
-			int bn = 0;
+		 * On any failure the members keep the standalone modules they already have; they are valid and
+		 * installed, so a failed re-frame costs time, never correctness.
+		 *
+		 * MONO_WASM_JIT_SCC_COLOCATE=0 turns it off IN THE SAME BINARY, which is the only kind of A/B this
+		 * workload's ~5% noise floor supports for a change this size. */
+		extern int mono_wasm_jit_scc_colocate;
+		if (mono_wasm_jit_scc_colocate) {
+			extern int mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len);
+			int descs [WJ_SCC_MAX], idx [WJ_SCC_MAX];
+			int bn = 0, k;
 
-			/* Only members THIS batch compiled: one that was already live (phase 0 marked it done) has no
+			/* Only members THIS call compiled: one that was already live (phase 0 marked it done) has no
 			 * result and belongs to whatever module it came from. */
 			for (i = 0; i < n; i++) {
 				if (results [i].e_slot <= 0 || results [i].desc_id <= 0)
 					continue;
 				idx [bn] = i;
-				e_slots [bn] = results [i].e_slot;
-				f_slots [bn] = results [i].f_slot;
 				descs [bn] = results [i].desc_id;
 				bn++;
 			}
-			if (bn > 0 && mono_wasm_jit_batch_begin ()) {
-				gboolean bok = TRUE;
-				int k;
-				for (k = 0; k < bn; k++) {
-					MonoWasmJitResult rb;
-					memset (&rb, 0, sizeof (rb));
-					mono_wasm_force_compile (members [idx [k]], &rb);
-					/* The emitter appends exactly one member per successful capture; anything else means
-					 * it bailed on the re-emit (or substituted a different method), so abandon the batch. */
-					if (mono_wasm_jit_batch_count () != k + 1 ||
-					    mono_wasm_jit_batch_member_method (k) != members [idx [k]]) { bok = FALSE; break; }
-				}
-				if (bok) {
-					void *bbytes = NULL;
-					int blen = 0;
-					char berr [192];
-					berr [0] = 0;
-					if (mono_wasm_jit_batch_finish (e_slots, f_slots, &bbytes, &blen, berr, (int) sizeof (berr)) == bn &&
-					    mono_wasm_jit_batch_bind (descs, e_slots, f_slots, bn, bbytes, blen)) {
-						/* Publish the shared blob rather than the discarded standalone modules. */
-						for (k = 0; k < bn; k++) {
-							results [idx [k]].bytes = bbytes;
-							results [idx [k]].bytes_len = blen;
-						}
-						if (mono_wasm_jit_verbose >= 1)
-							printf ("WASM_JIT_BATCH members=%d bytes=%d\n", bn, blen);
-					} else {
-						g_free (bbytes);
-						if (mono_wasm_jit_verbose >= 1)
-							printf ("WASM_JIT_BATCH_FAIL members=%d : %s (keeping standalone modules)\n", bn, berr);
+			if (bn > 1) {
+				void *bbytes = NULL;
+				int blen = 0;
+				if (mono_wasm_jit_rebatch (descs, bn, &bbytes, &blen)) {
+					/* Publish the shared blob rather than the discarded standalone modules. */
+					for (k = 0; k < bn; k++) {
+						results [idx [k]].bytes = bbytes;
+						results [idx [k]].bytes_len = blen;
 					}
+					if (mono_wasm_jit_verbose >= 1)
+						printf ("WASM_JIT_SCC_COLOCATED members=%d bytes=%d\n", bn, blen);
 				} else if (mono_wasm_jit_verbose >= 1) {
-					printf ("WASM_JIT_BATCH_ABANDON members=%d (re-emit diverged; keeping standalone modules)\n", bn);
+					printf ("WASM_JIT_SCC_COLOCATE_FAIL members=%d (keeping standalone modules)\n", bn);
 				}
-				mono_wasm_jit_batch_end ();
 			}
 		}
 		/* Publish all. Every member is registered now, so once invocable a baked cross-cycle call_indirect
@@ -5372,11 +5359,12 @@ interp_entry (InterpEntryData *data)
 	{
 		gint32 wj_eslot = rmethod->wasm_jit_slot;
 		if (G_UNLIKELY (wj_eslot > 0) && !rmethod->is_invoke) {
-			extern int mono_wasm_jit_admit (int desc_id);
+			extern int mono_wasm_jit_admit_live (int desc_id);
 			/* Bring THIS thread's function table up to date, then confirm the slot actually instantiated
 			 * here (sync can fail on a worker under memory pressure while the compiling thread succeeded;
-			 * call_indirect-ing a mismatched placeholder would trap). If not live, fall through to interpret. */
-			if (G_LIKELY (mono_wasm_jit_admit (rmethod->wasm_jit_desc))) {
+			 * call_indirect-ing a mismatched placeholder would trap). If not live, fall through to interpret.
+			 * _live, not plain admit: admit() also returns 1 when it BREAKS A CYCLE without instantiating. */
+			if (G_LIKELY (mono_wasm_jit_admit_live (rmethod->wasm_jit_desc))) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 				mono_wasm_jit_invoke_caught (method, wj_eslot, frame.stack, frame.stack);
 				wj_did_jit_call = TRUE;
@@ -5954,8 +5942,10 @@ mono_wasm_jit_late_fslot (InterpMethod *imethod)
 	while (imethod->optimized_imethod)
 		imethod = imethod->optimized_imethod;
 	if (imethod->wasm_jit_fslot > 0) {
-		extern int mono_wasm_jit_admit (int desc_id);
-		if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
+		/* _live: admit() alone also succeeds on a cycle break, which instantiates nothing. Handing back an
+		 * f-slot this thread never installed hands back the jiterpreter placeholder. */
+		extern int mono_wasm_jit_admit_live (int desc_id);
+		if (mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
 			if (G_UNLIKELY (mono_wasm_jit_stats))
 				mono_wasm_jit_count (WJC_RESIDUAL_HEALED);
 			return imethod->wasm_jit_fslot;
@@ -6165,13 +6155,16 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		 *
 		 * Gated on a SCALAR signature for the same reason the delegate recipe is: a by-value vtype or byref
 		 * param means the slot holds an address rather than the value, and the e-thunk expects values. Gated
-		 * on mono_wasm_jit_admit so the slot is known instantiated on THIS worker — call_indirect-ing a
-		 * placeholder is a signature-mismatch trap that kills the thread, not a recoverable miss. */
+		 * on mono_wasm_jit_admit_live so the slot is known instantiated on THIS worker — call_indirect-ing a
+		 * placeholder is a signature-mismatch trap that kills the thread, not a recoverable miss. Plain
+		 * admit() is NOT that guarantee: it also returns 1 when it breaks a dependency cycle without
+		 * instantiating anything. */
 		if (mono_wasm_jit_eslot_residual && imethod->wasm_jit_slot > 0 && !imethod->is_invoke) {
+			extern int mono_wasm_jit_admit_live (int desc_id);
 			gboolean scalar = mono_mint_type (sig->ret) != MINT_TYPE_VT;
 			for (i = 0; scalar && i < (int) sig->param_count; ++i)
 				scalar = !m_type_is_byref (sig->params [i]) && mono_mint_type (sig->params [i]) != MINT_TYPE_VT;
-			if (scalar && mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
+			if (scalar && mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_RESIDUAL); mono_wasm_jit_count (WJC_ESLOT_RESIDUAL); }
 				/* Clear the 8-byte result slot for the same reason the interp_entry path does: a sub-word
@@ -6560,8 +6553,8 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		/* Function tables are per-thread. The cached InterpMethod identity is process-wide, but its e-slot
 		 * must still be admitted on this worker before call_delegate can enter it. */
 		if (imethod->wasm_jit_slot > 0) {
-			extern int mono_wasm_jit_admit (int desc_id);
-			if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
+			extern int mono_wasm_jit_admit_live (int desc_id);
+			if (mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
 				eslot = imethod->wasm_jit_slot;
 				fslot = imethod->wasm_jit_fslot;
 			}
@@ -6637,8 +6630,8 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	if (imethod->wasm_jit_slot <= 0)
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_slot > 0) {
-		extern int mono_wasm_jit_admit (int desc_id);
-		if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
+		extern int mono_wasm_jit_admit_live (int desc_id);
+		if (mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
 			eslot = imethod->wasm_jit_slot;
 			fslot = imethod->wasm_jit_fslot;
 		}
@@ -6705,6 +6698,15 @@ mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 	 * inline stackval layout, whereas a wasm-JIT residual stores by-address value types as pointers to
 	 * caller copies. Let call_interp marshal those complex signatures, after which interp_entry can still
 	 * redirect the real target to this same e-slot. */
+	{
+		/* The recipe's eslot was live when it was published, and the liveness bitmap is never cleared, so
+		 * this is belt-and-braces rather than a second guard -- but it is one load, it is local to the
+		 * call rather than to whoever wrote the recipe, and it is the check a future writer cannot forget.
+		 * A slot that is not live here holds the jiterpreter prefill, whose type is not the thunk's. */
+		extern int mono_wasm_jit_slot_live (int slot);
+		if (eslot > 0 && !mono_wasm_jit_slot_live (eslot))
+			eslot = 0;
+	}
 	if (eslot > 0 && scalar) {
 		extern void mono_wasm_jit_invoke_caught (MonoMethod *, gint32, gpointer, gpointer);
 		memset (scratch + WJ_SCRATCH_RET_OFF, 0, 8);
@@ -6940,12 +6942,18 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	if (imethod->wasm_jit_fslot <= 0)
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_fslot > 0) {
-		extern int mono_wasm_jit_admit (int desc_id);
+		extern int mono_wasm_jit_admit_live (int desc_id);
 		/* Only return the f-slot if THIS thread actually instantiated that module. sync_thread can fail to
 		 * instantiate on a worker (OOM/CompileError under pressure) while it succeeded on the compiling
 		 * thread; the slot then holds a jiterpreter placeholder and call_indirect-ing it traps the worker.
-		 * Fall through to the interp residual (call_interp) instead. */
-		if (mono_wasm_jit_admit (imethod->wasm_jit_desc)) {
+		 * Fall through to the interp residual (call_interp) instead.
+		 *
+		 * _live rather than plain admit, which is what this comment always MEANT: admit() also returns 1
+		 * when the DFS finds the descriptor already `visiting` and breaks a cycle -- without instantiating
+		 * anything. Worse here than at an e-slot, because wj_vcall_pic_publish below CACHES the result in
+		 * the per-thread PIC, and because a placeholder whose type happens to match is not a trap at all:
+		 * mono_jiterp_placeholder_jit_call's body writes 999 through its fourth argument and returns. */
+		if (mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
 			/* Publish only after this worker admitted the target. Therefore a generated PIC hit can use
 			 * the cached fslot without a second liveness test or an InterpMethod load. */
 			wj_vcall_pic_publish (ic, vt, target, imethod->wasm_jit_fslot);
@@ -10039,10 +10047,10 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
 	{ \
 		wasm_jit_maybe_compile (cmethod); \
 		if (G_UNLIKELY (cmethod->wasm_jit_slot > 0)) { \
-			extern int mono_wasm_jit_admit (int desc_id); \
+			extern int mono_wasm_jit_admit_live (int desc_id); \
 			extern void mono_wasm_jit_invoke_caught (MonoMethod *, gint32, gpointer, gpointer); \
 			extern int mono_wasm_jit_entry_promote; \
-			if (G_UNLIKELY (!mono_wasm_jit_admit (cmethod->wasm_jit_desc))) \
+			if (G_UNLIKELY (!mono_wasm_jit_admit_live (cmethod->wasm_jit_desc))) \
 				goto fallback_label; \
 			{ \
 				MonoLMFExt wj_ext; \
@@ -15501,8 +15509,11 @@ mono_jiterp_interp_entry (void *res)
 			wasm_jit_maybe_compile (wj_rm);
 		}
 		if (G_UNLIKELY (wj_rm->wasm_jit_slot > 0) && !wj_rm->is_invoke) {
-			extern int mono_wasm_jit_admit (int desc_id);
-			if (G_LIKELY (mono_wasm_jit_admit (wj_rm->wasm_jit_desc))) {
+			/* _live, not plain admit. This site is the worst place to accept admit()'s cycle-break "yes":
+			 * it does not merely enter the e-slot once, it sets wasm_jit_entry_fast_ok and repoints the
+			 * MonoFtnDesc every AOT caller holds at a guard-free adapter for that slot -- permanently. */
+			extern int mono_wasm_jit_admit_live (int desc_id);
+			if (G_LIKELY (mono_wasm_jit_admit_live (wj_rm->wasm_jit_desc))) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 				/* MONO_WASM_JIT_AOT_ENTRY: everything this function did to get here — the header copy,
 				 * InterpFrame setup, get_arg_offset_fast, the GC-unsafe transition, the LMF push above,

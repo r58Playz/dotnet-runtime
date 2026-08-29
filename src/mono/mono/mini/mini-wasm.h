@@ -221,6 +221,12 @@ enum {
 	 * Read it against WJC_CALL_IMPORT -- a few per thousand imports is the ordering noise the retry exists
 	 * to absorb; a number near the import count means the graph is far more cyclic than assumed. */
 	WJC_ADMIT_DEFERRED,
+	/* Members re-framed into a shared module by mono_wasm_jit_colocate_deps_now, counted per GROUP FORMED
+	 * (a group of 4 adds 4). Read it against WJC_REGISTERED for the fraction of the tier that is co-located,
+	 * and against WJC_CALL_LOCAL for whether co-location actually retargeted any call. Those two can move
+	 * apart: grouping a caller with a callee it turns out not to call directly costs a re-frame and buys
+	 * nothing, and that is exactly the case a greedy first-come partition can produce. */
+	WJC_COLOCATED_MEMBERS,
 	WJC_MAX
 };
 
