@@ -182,6 +182,63 @@ int mono_wasm_jit_max_method_imports = -1;
  * Worth the knob rather than a scratch build because the base failure rate is ~50%: any arm needs 4-5 boots,
  * and a rebuild is ~25 minutes. Default 0. */
 int mono_wasm_jit_import_dead = 0;
+/* MONO_WASM_JIT_SCC_COLOCATE: frame a compiled dependency CYCLE's members into one module. DEFAULT ON.
+ *
+ * A cycle is the one grouping that is a correctness question and not a performance one. Its members call
+ * each other by construction, and an import binds at instantiation, so a cyclic import pair cannot be
+ * ordered -- one of them must instantiate while the other's f-slot is still a placeholder. Co-locating the
+ * cycle turns every intra-cycle edge into a module-local `call <funcidx>`, which needs no ordering at all,
+ * and is also the only call form V8 will inline through.
+ *
+ * On by default because the objection to batching was never module overhead -- 29.4 us + 15.4 ns/byte,
+ * so co-location REDUCES total instantiate cost -- it was that producing a batched member cost a full
+ * mono_wasm_force_compile. With relocatable bodies it costs a memcpy, and that objection is gone. Kept as
+ * a knob so the arm can be flipped inside one binary, which at this workload's ~5% floor is the only
+ * comparison worth making. */
+int mono_wasm_jit_scc_colocate = 1;
+/* MONO_WASM_JIT_COLOCATE_DEPS: when a method publishes, re-frame it together with the direct callees it
+ * can still be grouped with. DEFAULT ON.
+ *
+ * SCC co-location above is a correctness mechanism and its reach is a rounding error on this workload --
+ * MEASURED at 7 modules / 24 members per boot against a ~24,000-method tier. Cycles are rare; ordinary
+ * caller->callee edges are not. This is the trigger that actually reaches the tier, and it is deliberately
+ * the simplest one that is workload-agnostic and continuous: no quiescence test, no global graph walk, no
+ * candidate array, no plan-once. A method groups with its own callees at the moment it publishes, using
+ * information it already holds (re->deps), and that is all.
+ *
+ * It is greedy and first-come: a callee already sharing a module is skipped, so each method is pulled in at
+ * most once and the partition never has to be revised. That is its weakness as well as its cheapness -- a
+ * cold caller can spend a hot callee, and nothing here consults a profile or V8's tiering budget. The
+ * weight-driven planner that would fix that is a much larger piece of work; this is the version whose
+ * MECHANISM can be read in one boot instead of an fps matrix.
+ *
+ * What makes it affordable at all is that re-framing no longer compiles anything: the members' relocatable
+ * bodies are on their registry entries and wj_assemble is a memcpy pass. Every batching arm ever measured
+ * here lost on the per-member mono_wasm_force_compile, not on module count (29.4 us + 15.4 ns/byte).
+ *
+ * DEFAULT 0, AND THAT IS A MEASUREMENT, NOT CAUTION. The reach is real -- one boot co-located 6,521 members
+ * (70.8% of everything registered by then) and turned 6,364 call sites into `call <funcidx>` -- but the
+ * build does not survive it: 6 boots in 6 die with a wasm "function signature mismatch" at
+ * wasm_jit_ethunk_cb, the interp -> JIT entry, deterministically. Two hypotheses are already dead:
+ * MONO_WASM_JIT_COLOCATE_MAX=2 crashes too (so it is not group size), and WASM_JIT_REBATCH_STALE never
+ * fires (so it is not a superseded descriptor's slots). Framing two ALREADY-PUBLISHED methods into one
+ * module is enough to trigger it, and MONO_WASM_JIT_COLOCATE_LOCAL_CALLS is the next split.
+ * Turn this on when a boot arm is clean, not before. */
+int mono_wasm_jit_colocate_deps = 0;
+int mono_wasm_jit_colocate_max = 16;      /* MONO_WASM_JIT_COLOCATE_MAX: members per group, self included */
+/* MONO_WASM_JIT_COLOCATE_BYTES: total member wire bytes. Not a V8 inlining limit -- kMaxInlinedCount (60)
+ * bounds inlining INTO one function and must not be reused as a per-module cap -- just a bound on how much
+ * one publish re-serialises. */
+int mono_wasm_jit_colocate_bytes = 32768;
+/* MONO_WASM_JIT_COLOCATE_LOCAL_CALLS=0: frame the members into one module exactly as co-location does --
+ * same membership, same module, same slots, same rebind, same admission -- but resolve every call to
+ * `call_indirect` instead of `call <funcidx>`. The module differs from the co-located one only in the
+ * immediates at the intra-group call sites.
+ *
+ * The same differential as MONO_WASM_JIT_IMPORT_DEAD, for the same reason: it splits "sharing a module,
+ * a WebAssembly.Instance, a generation bump and a rebind" from "changing the form of a call". One of those
+ * two is what breaks; guessing which cost two build-deploy cycles on the import side. Default 1. */
+int mono_wasm_jit_colocate_local_calls = 1;
 /* MONO_WASM_JIT_DUMP_IMPORTS=1: print one line per METHOD import actually converted, naming both ends.
  *
  * The bisect levers that select on NAMES (NO_IMPORT / ONLY_IMPORT_IN) are only as good as the guess behind
@@ -351,6 +408,12 @@ mono_wasm_jit_auto_init (void)
 	{ extern const char *mono_wasm_jit_no_import; const char *ni = g_getenv ("MONO_WASM_JIT_NO_IMPORT"); mono_wasm_jit_no_import = (ni && *ni) ? ni : NULL; }
 	{ extern int mono_wasm_jit_max_method_imports; const char *mm = g_getenv ("MONO_WASM_JIT_MAX_METHOD_IMPORTS"); mono_wasm_jit_max_method_imports = (mm && *mm) ? atoi (mm) : -1; }
 	{ extern int mono_wasm_jit_import_dead; const char *id = g_getenv ("MONO_WASM_JIT_IMPORT_DEAD"); mono_wasm_jit_import_dead = (id && *id) ? (*id != '0') : 0; } /* declare+bind the imports but keep calling through the table -- the (a)/(b) split, see the knob comment */
+	{ extern int mono_wasm_jit_scc_colocate; const char *sc = g_getenv ("MONO_WASM_JIT_SCC_COLOCATE"); mono_wasm_jit_scc_colocate = (sc && *sc) ? (*sc != '0') : 1; }
+	{ extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
+	  const char *cd = g_getenv ("MONO_WASM_JIT_COLOCATE_DEPS"); mono_wasm_jit_colocate_deps = (cd && *cd) ? (*cd != '0') : 0;
+	  const char *cm = g_getenv ("MONO_WASM_JIT_COLOCATE_MAX"); if (cm && *cm) { int v = atoi (cm); if (v >= 2 && v <= 512) mono_wasm_jit_colocate_max = v; }
+	  const char *cb = g_getenv ("MONO_WASM_JIT_COLOCATE_BYTES"); if (cb && *cb) { int v = atoi (cb); if (v > 0) mono_wasm_jit_colocate_bytes = v; } }
+	{ extern int mono_wasm_jit_colocate_local_calls; const char *cl = g_getenv ("MONO_WASM_JIT_COLOCATE_LOCAL_CALLS"); mono_wasm_jit_colocate_local_calls = (cl && *cl) ? (*cl != '0') : 1; }
 	{ extern int mono_wasm_jit_dump_imports; const char *di = g_getenv ("MONO_WASM_JIT_DUMP_IMPORTS"); mono_wasm_jit_dump_imports = (di && *di) ? (*di != '0') : 0; }
 	{ extern const char *mono_wasm_jit_no_import_in; const char *nii = g_getenv ("MONO_WASM_JIT_NO_IMPORT_IN"); mono_wasm_jit_no_import_in = (nii && *nii) ? nii : NULL; }
 	{ extern const char *mono_wasm_jit_only_import_in; const char *oii = g_getenv ("MONO_WASM_JIT_ONLY_IMPORT_IN"); mono_wasm_jit_only_import_in = (oii && *oii) ? oii : NULL; }
@@ -963,7 +1026,7 @@ mono_wasm_jit_get_counter (int idx)
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 68);
+g_static_assert (WJC_MAX == 69);
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1013,6 +1076,12 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_REF_SLOTS), WJC_(WJC_REF_WT_VREGS), WJC_(WJC_SLOTS_ELIDED), WJC_(WJC_SLOT_ZERO_STORES), WJC_(WJC_FRAME_BYTES));
 	printf ("[wasm-jit callform] local=%lld import=%lld indirect=%lld (per module assembled, not per execution)  admit_deferred=%lld\n",
 		WJC_(WJC_CALL_LOCAL), WJC_(WJC_CALL_IMPORT), WJC_(WJC_CALL_INDIRECT), WJC_(WJC_ADMIT_DEFERRED));
+	/* Read colocated_members against registered for the co-located fraction of the tier, and the local
+	 * count above against indirect for whether the grouping retargeted anything. Both are per module
+	 * ASSEMBLED, so a re-framed member is counted again -- which is the point: it is how a re-frame is
+	 * shown to have changed a call's form rather than just rebuilt the same module. */
+	printf ("[wasm-jit colocate] colocated_members=%lld of registered=%lld\n",
+		WJC_(WJC_COLOCATED_MEMBERS), WJC_(WJC_REGISTERED));
 	printf ("[wasm-jit vtabi] vt_byaddr_methods=%lld vret_methods=%lld\n",
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
 	printf ("[wasm-jit transition] residual_healed=%lld fast_delegate=%lld delegate_ic_hit=%lld (fast counters require PROFILE_FAST=1)\n",
@@ -1910,6 +1979,36 @@ mono_wasm_jit_desc_admitted (int desc_id)
 		mono_wasm_jit_slot_live (re->f);
 }
 
+/*
+ * Admit `desc_id` AND PROVE IT LANDED. Use this, not mono_wasm_jit_admit, before entering an e-slot.
+ *
+ * mono_wasm_jit_admit returns 1 in two quite different situations: the descriptor is admitted (state 2,
+ * exports installed in THIS thread's table), or the DFS found it already `visiting` and broke a cycle --
+ * which returns 1 WITHOUT INSTANTIATING ANYTHING. That second case is correct for a call_indirect edge,
+ * because the table is consulted when the call runs, and wj_admit_dependencies already knows it: it takes
+ * the trouble to re-test `wj_desc_state [imp_id] == 2` after calling admit, for exactly this reason.
+ *
+ * The interp -> JIT entry paths did not. They call the e-slot directly, and an e-slot that this worker
+ * never installed still holds the jiterpreter prefill, mono_jiterp_placeholder_jit_call -- a real function
+ * of type (i32,i32,i32,i32)->void. Calling that as the thunk's (i32,i32)->void is a wasm
+ * "function signature mismatch" trap that kills the worker, and it is reached whenever anything runs
+ * interpreted while an admission DFS is open on this thread (a compile inside admit runs cctors, which
+ * interpret, which can dispatch a delegate...).
+ *
+ * The window was narrow while a descriptor was admitted alone. Co-location widens it by the batch size:
+ * mono_wasm_jit_admit premarks EVERY sibling `visiting` before admitting the union of their closures, so a
+ * batch of N puts N descriptors in the state that makes admit() lie, for the whole of that DFS.
+ *
+ * The comment at the MINT_CALLVIRT_FAST site said "then confirm the slot actually instantiated here"; this
+ * is the function that finally does it.
+ */
+int mono_wasm_jit_admit_live (int desc_id);
+int
+mono_wasm_jit_admit_live (int desc_id)
+{
+	return mono_wasm_jit_admit (desc_id) && mono_wasm_jit_desc_admitted (desc_id);
+}
+
 /* Validate and admit one descriptor's external direct-call closure. Batch-internal edges encounter
  * siblings pre-marked state=1 by mono_wasm_jit_admit and therefore terminate as ordinary DFS cycles. */
 /*
@@ -2354,7 +2453,15 @@ mono_wasm_jit_instantiate_fslot (int fslot)
 				void *bytes = re->bytes; int len = re->len;
 				if (!bytes || len <= 0 || len >= (16 * 1024 * 1024))
 					break;   /* registry entry not fully published / bogus length */
-				mono_wasm_jit_instantiate_local (re->e, re->f, bytes, len, eb, (int) sizeof (eb), &ms);
+				/* A CO-LOCATED member's module exports e<i>/f<i>, not e/f, so instantiate_local cannot
+				 * bring it up -- it would look for an export that does not exist and throw. Route it
+				 * through the batch form, which installs all 2N slots including this one. Harmless while
+				 * batching was off by default; load-bearing the moment any member shares a module. */
+				if (re->batch)
+					mono_wasm_jit_instantiate_batch_local (re->batch->e, re->batch->f, re->batch->n,
+					                                       re->batch->bytes, re->batch->len, eb, (int) sizeof (eb), &ms);
+				else
+					mono_wasm_jit_instantiate_local (re->e, re->f, bytes, len, eb, (int) sizeof (eb), &ms);
 				if (mono_wasm_jit_slot_live (fslot)) {
 					if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
 						wj_census_instantiated++;
@@ -5823,15 +5930,19 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			re->dep_sig = new_dep_sig;
 			re->dep_method = new_dep_method;
 			re->ndeps = bm->ndeps;
-			/* The new generation imports a different set. Republished BEFORE the barrier below publishes
-			 * the generation -- same visibility rule as mono_wasm_jit_register. */
-			re->imports = NULL;
-			re->nimports = 0;
-			if (wj_batch_imports [i].n > 0) {
-				re->imports = g_new (int, wj_batch_imports [i].n);
-				memcpy (re->imports, wj_batch_imports [i].slot, sizeof (int) * (gsize) wj_batch_imports [i].n);
-				re->nimports = wj_batch_imports [i].n;
-			}
+		}
+		/* The new generation imports a different set, and this is true whether or not the members were
+		 * re-emitted: co-locating a callee turns its import into a module-local call and removes it.
+		 * OUTSIDE the `bm` guard for that reason -- mono_wasm_jit_rebatch frames stored bodies with no
+		 * capture at all, and leaving the old import list on the entry would make admission demand
+		 * instantiation of callees this generation no longer binds. Republished BEFORE the barrier below
+		 * publishes the generation -- same visibility rule as mono_wasm_jit_register. */
+		re->imports = NULL;
+		re->nimports = 0;
+		if (wj_batch_imports [i].n > 0) {
+			re->imports = g_new (int, wj_batch_imports [i].n);
+			memcpy (re->imports, wj_batch_imports [i].slot, sizeof (int) * (gsize) wj_batch_imports [i].n);
+			re->nimports = wj_batch_imports [i].n;
 		}
 		mono_memory_barrier ();
 		re->generation = bd->generation;
@@ -5849,6 +5960,214 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	if (!mono_wasm_jit_admit (desc_ids [0]))
 		printf ("WASM_JIT_BATCH_ADMIT_FAIL generation=%u members=%d\n", bd->generation, n);
 	return 1;
+}
+
+/*
+ * CO-LOCATION FROM STORED BODIES -- re-frame n ALREADY-REGISTERED methods into one module.
+ *
+ * This is what the relocatable rewrite was for. Every batching driver in the tree works by re-running
+ * mono_wasm_force_compile once per member (interp.c:2222, :2385, :2489, :2694) because a member's bytes
+ * used to bake module-dependent indices. That per-member re-compile IS the +36% boot that sank every
+ * batching arm ever measured here (-26.6% R61b, -35.7% R96, -13.0% R105, R123); module overhead never was
+ * (29.4 us + 15.4 ns/byte, bytecost.mjs -- co-location REDUCES total instantiate cost).
+ *
+ * Here there is no compile at all: the members' relocatable bodies are on their registry entries, and
+ * framing them together is wj_assemble, a memcpy pass over the instruction bytes with every hole re-encoded
+ * against the new layout. Intra-set calls come out as `call <funcidx>`: one x86 instruction against
+ * call_indirect's ~15, and the only form V8 will ever inline through (R128).
+ *
+ * Preconditions, all checked: every member is registered, holds a retained body, and owns a live slot pair.
+ * The members keep their existing e/f slots -- mono_jiterp_allocate_table_entry is a bump allocator with no
+ * free (R140-E17 records re-emit count as a leak axis), so a re-framing must allocate ZERO table entries.
+ *
+ * Returns 1 on success. On ANY failure nothing is rebound and the members keep the standalone modules they
+ * already have, which are valid and installed -- a failed re-frame costs time, never correctness.
+ */
+int mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len);
+int
+mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len)
+{
+	WjAsmMember *members;
+	WjAsmPolicy pol;
+	WasmBuf out;
+	int *e_slots, *f_slots;
+	void *cached;
+	char eb [192];
+	double ms = 0;
+	int i, ok = 0;
+
+	if (n <= 1 || n > WJ_BATCH_MAX)
+		return 0;
+	for (i = 0; i < n; ++i) {
+		WjRegEntry *re = desc_ids [i] > 0 ? wj_reg_at (desc_ids [i] - 1) : NULL;
+		int j;
+		if (!re || !re->body || re->e <= 0 || re->f <= 0)
+			return 0;
+		/* Splitting a batch generation is not supported: its members share one WebAssembly.Instance and
+		 * cannot be instantiated apart. Re-framing a member out of one would strand its siblings. */
+		if (re->batch)
+			return 0;
+		/* THIS DESCRIPTOR MUST STILL OWN ITS SLOTS. A method that was re-emitted registers a NEW descriptor
+		 * into the SAME reserved e/f pair (mono_wasm_jit_self_reserved keeps the reservation on the imethod
+		 * precisely so a re-emit reuses it), and the f-slot -> descriptor map then names the newer one. The
+		 * older descriptor is still in the registry, still has a body, and still names those slots -- so
+		 * framing it would install ITS exports over the slots the live descriptor owns.
+		 *
+		 * Do not weaken this to a warning. instantiate_batch_local writes the table unconditionally, and a
+		 * slot that ends up holding a function of a different type is a wasm trap at the next call through
+		 * it, reported at whatever unlucky frame gets there first. */
+		if (wj_desc_for_fslot (re->f) != desc_ids [i]) {
+			static int _stale = 0;
+			if (_stale++ < 20)
+				printf ("WASM_JIT_REBATCH_STALE desc=%d f=%d owned_by=%d (superseded descriptor; refusing to frame)\n",
+					desc_ids [i], re->f, wj_desc_for_fslot (re->f));
+			return 0;
+		}
+		/* And no two members may name the same slot, for the same reason: the second export written wins
+		 * and the first member's callers keep calling what is now someone else's body. */
+		for (j = 0; j < i; ++j) {
+			WjRegEntry *pre = wj_reg_at (desc_ids [j] - 1);
+			if (pre && (pre->e == re->e || pre->f == re->f || pre->e == re->f || pre->f == re->e))
+				return 0;
+		}
+	}
+
+	members = g_new0 (WjAsmMember, n);
+	e_slots = g_new0 (int, n);
+	f_slots = g_new0 (int, n);
+	/* The per-member import lists the assembler fills. Normally owned by the batch_begin/batch_end pair;
+	 * there is no capture phase here, so this path owns them and frees them at `done`. */
+	for (i = 0; i < n; ++i) {
+		g_free (wj_batch_imports [i].slot);
+		memset (&wj_batch_imports [i], 0, sizeof (wj_batch_imports [i]));
+	}
+	for (i = 0; i < n; ++i) {
+		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
+		WjBody *b = re->body;
+		e_slots [i] = re->e;
+		f_slots [i] = re->f;
+		members [i].method = b->method;
+		members [i].f_slot = re->f;
+		members [i].f_body = &b->f_body;
+		members [i].e_body = &b->e_body;
+		members [i].param_types = b->param_types;
+		members [i].nparams = b->nparams;
+		members [i].ret_type = b->ret_type;
+		members [i].extra_types = b->extra_types;
+		members [i].nextra = b->nextra;
+		members [i].groups = b->groups;
+		members [i].nlocal_groups = 4;
+		members [i].uses_calls = b->uses_calls;
+		members [i].uses_eh_tag = b->uses_eh_tag;
+		members [i].eh_tpool = b->eh_tpool;
+	}
+
+	{ extern int mono_wasm_jit_colocate_local_calls;
+	  /* local_calls is the POINT of co-locating -- and also the only thing MONO_WASM_JIT_COLOCATE_LOCAL_CALLS=0
+	   * takes away, leaving the module, the slots, the rebind and the admission identical. */
+	  wj_asm_policy_init (&pol, mono_wasm_jit_colocate_local_calls ? TRUE : FALSE); }
+	wasm_buf_init (&out);
+	if (!wj_assemble (members, n, &pol, &out, NULL, wj_batch_imports) || out.len == 0) {
+		wasm_buf_free (&out);
+		goto done;
+	}
+	cached = g_malloc ((gsize) out.len);
+	memcpy (cached, out.data, out.len);
+
+	eb [0] = 0;
+	for (i = 0; i < n; ++i)
+		wj_admit_imports (wj_batch_imports [i].slot, wj_batch_imports [i].n);
+	if (!mono_wasm_jit_instantiate_batch_local (e_slots, f_slots, n, cached, (int) out.len, eb, (int) sizeof (eb), &ms)) {
+		/* The old generation is still in this worker's slots -- instantiate_batch_local installs nothing
+		 * on failure -- so declining here really does leave the members exactly as they were. */
+		printf ("WASM_JIT_REBATCH_FAIL members=%d bytes=%u : %s\n", n, (unsigned) out.len, eb);
+		g_free (cached);
+		wasm_buf_free (&out);
+		goto done;
+	}
+	ok = mono_wasm_jit_batch_bind (desc_ids, e_slots, f_slots, n, cached, (int) out.len);
+	if (!ok) {
+		g_free (cached);
+	} else {
+		/* Hand the shared blob back so the driver can repoint each member's imethod at it. Leaving the
+		 * imethods pointing at their discarded standalone modules is not a dangling read -- batch_bind
+		 * deliberately does not free the old bytes, because another worker may still be walking the
+		 * previous generation -- but it would let the registry-overflow fallback in
+		 * mono_wasm_jit_ensure_fslot reinstall the STANDALONE generation over this one. */
+		if (out_bytes) *out_bytes = cached;
+		if (out_len) *out_len = (int) out.len;
+		if (mono_wasm_jit_verbose >= 2)
+			printf ("WASM_JIT_REBATCH members=%d bytes=%u instantiate=%.2fms\n", n, (unsigned) out.len, ms);
+	}
+	wasm_buf_free (&out);
+done:
+	/* batch_bind has COPIED whatever it needed into each entry's re->imports, so these are ours to drop
+	 * on every path -- including the ones that never reached it. */
+	for (i = 0; i < n; ++i) {
+		g_free (wj_batch_imports [i].slot);
+		memset (&wj_batch_imports [i], 0, sizeof (wj_batch_imports [i]));
+	}
+	g_free (members); g_free (e_slots); g_free (f_slots);
+	return ok;
+}
+
+/*
+ * Group a freshly published method with the direct callees it can still be grouped with.
+ *
+ * This is the trigger that gives co-location reach. It runs once per method, at publish, from information
+ * the entry already holds, and it never revises a decision: a callee that already shares a module is
+ * skipped, so each method joins at most one group and the partition is append-only. No planner, no
+ * quiescence test, no candidate array, no global walk -- the properties that made the previous planner fire
+ * once, on a trigger this workload never satisfies, and reach 14% of the tier.
+ *
+ * Deliberately NOT recursive: only the publishing method's OWN direct callees are considered. Following the
+ * callees' callees would grow a group along whatever edge happened to publish first, which is a partition
+ * decision that wants a profile behind it.
+ *
+ * Returns the number of members grouped (0 if nothing was).
+ */
+int mono_wasm_jit_colocate_deps_now (int desc_id);
+int
+mono_wasm_jit_colocate_deps_now (int desc_id)
+{
+	extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
+	int descs [WJ_BATCH_MAX];
+	WjRegEntry *re;
+	int n = 0, bytes = 0, i, j, cap;
+
+	if (!mono_wasm_jit_colocate_deps || desc_id <= 0)
+		return 0;
+	re = wj_reg_at (desc_id - 1);
+	if (!re || !re->body || re->batch || re->ndeps <= 0 || re->e <= 0 || re->f <= 0)
+		return 0;
+	cap = mono_wasm_jit_colocate_max;
+	if (cap > WJ_BATCH_MAX)
+		cap = WJ_BATCH_MAX;
+	descs [n++] = desc_id;
+	bytes += re->len > 0 ? re->len : 0;
+
+	for (i = 0; i < re->ndeps && n < cap; ++i) {
+		int d = wj_desc_for_fslot (re->deps [i]);
+		WjRegEntry *dre = d > 0 ? wj_reg_at (d - 1) : NULL;
+		if (!dre || !dre->body || dre->batch || dre->e <= 0 || dre->f <= 0)
+			continue;   /* unregistered, bodyless, or already sharing a module with someone else */
+		for (j = 0; j < n; ++j)
+			if (descs [j] == d)
+				break;
+		if (j < n)
+			continue;   /* self, or the same callee reached twice */
+		if (bytes + (dre->len > 0 ? dre->len : 0) > mono_wasm_jit_colocate_bytes)
+			continue;
+		descs [n++] = d;
+		bytes += dre->len > 0 ? dre->len : 0;
+	}
+	if (n < 2)
+		return 0;
+	if (!mono_wasm_jit_rebatch (descs, n, NULL, NULL))
+		return 0;
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_add (WJC_COLOCATED_MEMBERS, n);
+	return n;
 }
 
 /* The MonoMethod captured as member i, so the driver can register the right slot pair against it. */
