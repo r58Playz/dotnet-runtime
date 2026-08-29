@@ -410,10 +410,16 @@ emit_import_section (WasmBuf *out, gboolean import_table, gboolean import_eh_tag
 		wasm_u8 (&sec, i == 0 ? 0x01 : 0x00);  /* only s.p is mutable */
 	}
 	/* Named by table index in decimal; the page's import resolver is a Proxy over wasmTable.get, so any
-	 * table index resolves and no linker export or fixed helper registry is needed. */
+	 * table index resolves and no linker export or fixed helper registry is needed.
+	 *
+	 * A METHOD f-slot is named "m<index>" instead of "<index>". See WasmFuncImport.method: the resolver
+	 * must refuse an f-slot this worker has not instantiated, because that slot holds a CALLABLE
+	 * placeholder rather than nothing, and binding it is silent corruption. A helper index needs no such
+	 * check -- it is a C function fixed for the life of the process -- and paying one on every helper
+	 * import would put a lookup in front of the whole shipped default path for nothing. */
 	for (i = 0; i < nfimports; ++i) {
 		char idxname [16];
-		g_snprintf (idxname, sizeof (idxname), "%u", (unsigned) fimports [i].table_index);
+		g_snprintf (idxname, sizeof (idxname), fimports [i].method ? "m%u" : "%u", (unsigned) fimports [i].table_index);
 		wasm_name (&sec, "h");
 		wasm_name (&sec, idxname);
 		wasm_u8 (&sec, 0x00);                  /* kind: function */

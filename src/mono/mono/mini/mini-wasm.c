@@ -165,6 +165,31 @@ const char *mono_wasm_jit_no_import = NULL;
  * with n, it is not. That distinction is otherwise unreachable at a 50% base rate without tens of boots
  * per arm. */
 int mono_wasm_jit_max_method_imports = -1;
+/* MONO_WASM_JIT_IMPORT_DEAD=1: decide every import EXACTLY as direct_import=1 does -- intern the slot,
+ * declare it in the import section, record it in dep_strict so admission orders instantiation the same way
+ * -- and then emit the OLD `i32.const <fslot>; call_indirect` at the site anyway. The import is declared,
+ * bound at instantiation, and never called.
+ *
+ * This is the differential that splits the direct-import crash in half. Everything direct_import changes
+ * comes in two groups:
+ *   (a) BOOKKEEPING: which deps become strict, what admission defers, what order modules instantiate in,
+ *       how many imports a module declares, and therefore which methods reach the tier at all;
+ *   (b) THE CALL FORM: five bytes at the site, `call <import>` instead of a table dispatch.
+ * IMPORT_DEAD=1 keeps all of (a) and reverts (b). So: crashes with IMPORT_DEAD=1 => the fault is in (a) and
+ * the call form is innocent; clean with IMPORT_DEAD=1 while IMPORT_DEAD=0 crashes => the fault is (b), i.e.
+ * the bound function itself, and the whole of (a) is exonerated in one arm.
+ *
+ * Worth the knob rather than a scratch build because the base failure rate is ~50%: any arm needs 4-5 boots,
+ * and a rebuild is ~25 minutes. Default 0. */
+int mono_wasm_jit_import_dead = 0;
+/* MONO_WASM_JIT_DUMP_IMPORTS=1: print one line per METHOD import actually converted, naming both ends.
+ *
+ * The bisect levers that select on NAMES (NO_IMPORT / ONLY_IMPORT_IN) are only as good as the guess behind
+ * the name, and guessing is what produced the discarded R143 chain -- a null arm that matched nothing came
+ * out 0/3 and looked like a hit. This prints the real edge set instead, so an arm can be chosen from the
+ * conversions that a run ACTUALLY made rather than from a naming hunch. ~21k lines at the shipped cap;
+ * diagnostic only, default 0. */
+int mono_wasm_jit_dump_imports = 0;
 /* Caller-side levers, the counterpart to MONO_WASM_JIT_NO_IMPORT (which selects on the CALLEE).
  *
  *   MONO_WASM_JIT_NO_IMPORT_IN=<substr>   no method imports in a module whose method name matches
@@ -325,6 +350,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_vcall_slim; const char *sl = g_getenv ("MONO_WASM_JIT_VCALL_SLIM"); mono_wasm_jit_vcall_slim = (sl && *sl) ? (*sl != '0') : 1; }
 	{ extern const char *mono_wasm_jit_no_import; const char *ni = g_getenv ("MONO_WASM_JIT_NO_IMPORT"); mono_wasm_jit_no_import = (ni && *ni) ? ni : NULL; }
 	{ extern int mono_wasm_jit_max_method_imports; const char *mm = g_getenv ("MONO_WASM_JIT_MAX_METHOD_IMPORTS"); mono_wasm_jit_max_method_imports = (mm && *mm) ? atoi (mm) : -1; }
+	{ extern int mono_wasm_jit_import_dead; const char *id = g_getenv ("MONO_WASM_JIT_IMPORT_DEAD"); mono_wasm_jit_import_dead = (id && *id) ? (*id != '0') : 0; } /* declare+bind the imports but keep calling through the table -- the (a)/(b) split, see the knob comment */
+	{ extern int mono_wasm_jit_dump_imports; const char *di = g_getenv ("MONO_WASM_JIT_DUMP_IMPORTS"); mono_wasm_jit_dump_imports = (di && *di) ? (*di != '0') : 0; }
 	{ extern const char *mono_wasm_jit_no_import_in; const char *nii = g_getenv ("MONO_WASM_JIT_NO_IMPORT_IN"); mono_wasm_jit_no_import_in = (nii && *nii) ? nii : NULL; }
 	{ extern const char *mono_wasm_jit_only_import_in; const char *oii = g_getenv ("MONO_WASM_JIT_ONLY_IMPORT_IN"); mono_wasm_jit_only_import_in = (oii && *oii) ? oii : NULL; }
 	{ extern int mono_wasm_jit_import_wrappers; const char *iw = g_getenv ("MONO_WASM_JIT_IMPORT_WRAPPERS"); mono_wasm_jit_import_wrappers = (iw && *iw && *iw != '0') ? 1 : 0; }
@@ -1243,7 +1270,39 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 				Module.__wjSlotFn = new Map ();
 				Module.__wjSlotChanged = 0;
 				Module.__wjHelperImports = new Proxy ({}, { get: function (t, k) {
-					if (typeof k !== "string" || !/^[0-9]+$/.test (k)) return undefined;
+					if (typeof k !== "string") return undefined;
+					/* "m<index>" -- a JITted METHOD's f-slot. REFUSE unless THIS worker installed it.
+					 *
+					 * An f-slot this worker has not instantiated is not empty: the jiterpreter prefills
+					 * every JitCall slot with mono_jiterp_placeholder_jit_call, a real callable wasm
+					 * function of type (i32,i32,i32,i32)->void. Handing that back binds the import
+					 * SUCCESSFULLY whenever the caller's expected type is that same very common shape --
+					 * no LinkError, no trap -- and every call to the callee then executes the
+					 * placeholder's body, `*thrown = 999`, which writes 999 through the caller's fourth
+					 * argument as a pointer. Silent heap corruption, permanent for that instance.
+					 *
+					 * Returning undefined instead fails INSTANTIATION, which every caller already
+					 * handles: the method stays interpreted and a later dispatch retries through
+					 * mono_wasm_jit_admit, which orders the callee first. Loud, safe and retriable
+					 * beats silent and wrong.
+					 *
+					 * __wjSlotFn is the right oracle and not merely the convenient one: it records
+					 * exactly the slots THIS worker installed from THIS pair of instantiate paths, which
+					 * is precisely the set for which wasmTable.get returns a real method body. It is a
+					 * per-worker Map because Module is per-worker, so no cross-thread read is involved.
+					 * (The C-side mono_wasm_jit_slot_live bitmap says the same thing; using it here would
+					 * mean a JS->wasm call per import per module per worker for no extra guarantee.) */
+					if (k.charCodeAt (0) === 109) {
+						var mi = Number (k.slice (1));
+						if (!(mi >= 0) || !Module.__wjSlotFn || !Module.__wjSlotFn.has (mi)) {
+							Module.__wjImportRefused = (Module.__wjImportRefused | 0) + 1;
+							if (Module.__wjImportRefused <= 20)
+								console.log ("WASM_JIT_IMPORT_NOT_LIVE slot=" + mi + " n=" + Module.__wjImportRefused);
+							return undefined;
+						}
+						return wasmTable.get (mi);
+					}
+					if (!/^[0-9]+$/.test (k)) return undefined;
 					var i = Number (k);
 					var f = wasmTable.get (i);
 					/* DETECTOR, not a guard. Every slot this worker installed is remembered; if the table
@@ -1368,7 +1427,39 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 				Module.__wjSlotFn = new Map ();
 				Module.__wjSlotChanged = 0;
 				Module.__wjHelperImports = new Proxy ({}, { get: function (t, k) {
-					if (typeof k !== "string" || !/^[0-9]+$/.test (k)) return undefined;
+					if (typeof k !== "string") return undefined;
+					/* "m<index>" -- a JITted METHOD's f-slot. REFUSE unless THIS worker installed it.
+					 *
+					 * An f-slot this worker has not instantiated is not empty: the jiterpreter prefills
+					 * every JitCall slot with mono_jiterp_placeholder_jit_call, a real callable wasm
+					 * function of type (i32,i32,i32,i32)->void. Handing that back binds the import
+					 * SUCCESSFULLY whenever the caller's expected type is that same very common shape --
+					 * no LinkError, no trap -- and every call to the callee then executes the
+					 * placeholder's body, `*thrown = 999`, which writes 999 through the caller's fourth
+					 * argument as a pointer. Silent heap corruption, permanent for that instance.
+					 *
+					 * Returning undefined instead fails INSTANTIATION, which every caller already
+					 * handles: the method stays interpreted and a later dispatch retries through
+					 * mono_wasm_jit_admit, which orders the callee first. Loud, safe and retriable
+					 * beats silent and wrong.
+					 *
+					 * __wjSlotFn is the right oracle and not merely the convenient one: it records
+					 * exactly the slots THIS worker installed from THIS pair of instantiate paths, which
+					 * is precisely the set for which wasmTable.get returns a real method body. It is a
+					 * per-worker Map because Module is per-worker, so no cross-thread read is involved.
+					 * (The C-side mono_wasm_jit_slot_live bitmap says the same thing; using it here would
+					 * mean a JS->wasm call per import per module per worker for no extra guarantee.) */
+					if (k.charCodeAt (0) === 109) {
+						var mi = Number (k.slice (1));
+						if (!(mi >= 0) || !Module.__wjSlotFn || !Module.__wjSlotFn.has (mi)) {
+							Module.__wjImportRefused = (Module.__wjImportRefused | 0) + 1;
+							if (Module.__wjImportRefused <= 20)
+								console.log ("WASM_JIT_IMPORT_NOT_LIVE slot=" + mi + " n=" + Module.__wjImportRefused);
+							return undefined;
+						}
+						return wasmTable.get (mi);
+					}
+					if (!/^[0-9]+$/.test (k)) return undefined;
 					var i = Number (k);
 					var f = wasmTable.get (i);
 					/* DETECTOR, not a guard. Every slot this worker installed is remembered; if the table
@@ -2145,6 +2236,42 @@ fail:
 	return 0;
 }
 
+/*
+ * Bring every METHOD import of a module about to be instantiated LIVE ON THIS THREAD.
+ *
+ * mono_wasm_jit_admit checks this before it instantiates. Three other paths do not, and all three bind
+ * imports just the same:
+ *   - mono_wasm_emit_method, where the COMPILING thread instantiates its own fresh module immediately;
+ *   - mono_wasm_jit_sync_thread, the eager sweep, which walks the registry in REGISTRATION order -- which
+ *     is not dependency order;
+ *   - mono_wasm_jit_instantiate_fslot, the direct-call backstop.
+ * A callee compiled on another worker has never been instantiated here, so its f-slot on this thread still
+ * holds the jiterpreter prefill. The resolver now refuses to bind that (see WasmFuncImport.method), which
+ * makes those paths SAFE -- but refusing loses the whole module to the interpreter, and on the compiling
+ * thread that is the method it just spent a compile on.
+ *
+ * So: admit the callee first, which instantiates it here in dependency order, and the bind succeeds. Best
+ * effort by design -- if a callee cannot be admitted the resolver still refuses, so the failure mode is a
+ * lost module rather than a bound placeholder.
+ *
+ * Lock note: mono_wasm_jit_admit takes no lock of its own, but it reaches mono_interp_get_imethod through
+ * the interp-entry patch, and that takes jit_mm_lock. mono_wasm_jit_sync_thread calls this UNDER the loader
+ * lock. That sweep currently has no callers, so the order is not exercised; check it if it is revived.
+ */
+static void
+wj_admit_imports (const int *slots, int n)
+{
+	int i;
+	for (i = 0; i < n; ++i) {
+		int d;
+		if (mono_wasm_jit_slot_live (slots [i]))
+			continue;
+		d = wj_desc_for_fslot (slots [i]);
+		if (d > 0)
+			mono_wasm_jit_admit (d);
+	}
+}
+
 void
 mono_wasm_jit_sync_thread (void)
 {
@@ -2161,6 +2288,7 @@ mono_wasm_jit_sync_thread (void)
 		 * directly in mono_wasm_emit_method (before registering it), so without this it would redundantly
 		 * re-instantiate its own just-compiled modules over live table slots on its next sync. */
 		if (mono_wasm_jit_slot_live (re->e)) { synced++; continue; }
+		wj_admit_imports (re->imports, re->nimports);   /* registration order is not dependency order */
 		if (re->batch
 		    ? !mono_wasm_jit_instantiate_batch_local (re->batch->e, re->batch->f, re->batch->n,
 		                                               re->batch->bytes, re->batch->len,
@@ -2220,6 +2348,7 @@ mono_wasm_jit_instantiate_fslot (int fslot)
 			WjRegEntry *re = wj_reg_at (i);
 			if (!re || re->f != fslot)
 				continue;
+			wj_admit_imports (re->imports, re->nimports);   /* this path skips admission entirely */
 			for (attempt = 0; attempt < 3 && !mono_wasm_jit_slot_live (fslot); ++attempt) {
 				char eb [192]; eb [0] = 0; double ms = 0;
 				void *bytes = re->bytes; int len = re->len;
@@ -4652,6 +4781,7 @@ typedef struct {
 	guint8 names;            /* MONO_WASM_JIT_NAMES: append the name section */
 	int    max_fimports;         /* mono_wasm_jit_max_himp */
 	int    max_method_imports;   /* MONO_WASM_JIT_MAX_METHOD_IMPORTS; -1 = unlimited */
+	guint8 import_dead;      /* MONO_WASM_JIT_IMPORT_DEAD: intern the import, then emit call_indirect anyway */
 } WjAsmPolicy;
 
 /* Per-member census of what the forms came out as; feeds the WJC_ counters and the tier dumps. */
@@ -4686,7 +4816,8 @@ wj_asm_imports_add (WjAsmImports *ai, int fslot)
  * own copy of that functype and a wasm import names one specific type index. Duplicative but correct, and
  * removing it means deduping the type section, which is a separate change with its own byte-identity cost. */
 static int
-wj_asm_intern_import (WasmFuncImport *himp, int *nhimp, int cap, guint32 table_index, guint32 ti)
+wj_asm_intern_import (WasmFuncImport *himp, int *nhimp, int cap, guint32 table_index, guint32 ti,
+                      gboolean is_method)
 {
 	int i;
 	for (i = 0; i < *nhimp; ++i)
@@ -4696,6 +4827,9 @@ wj_asm_intern_import (WasmFuncImport *himp, int *nhimp, int cap, guint32 table_i
 		return -1;      /* cap reached: the site stays a call_indirect, exactly as before */
 	himp [*nhimp].table_index = table_index;
 	himp [*nhimp].type_idx = ti;
+	/* Not part of the dedup key: a table index is either a JIT f-slot or a C function pointer, never
+	 * both, so it is a function OF the key rather than a component of it. */
+	himp [*nhimp].method = is_method ? 1 : 0;
 	return (*nhimp)++;
 }
 
@@ -5040,15 +5174,15 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			continue;
 		case WASM_RELOC_HELPER:
 			if (pol->helper_imports)
-				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti);
+				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
 			break;
 		case WASM_RELOC_HELPER_CI:
 			if (pol->ci_imports)
-				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti);
+				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
 			break;
 		case WASM_RELOC_AOT:
 			if (pol->aot_imports)
-				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti);
+				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
 			break;
 		case WASM_RELOC_CALL:
 			if (!may_import) {
@@ -5068,7 +5202,7 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			}
 			if (pol->method_imports &&
 			    wj_asm_method_importable (r, &self_types [r->tpool], mem [self_index].f_slot))
-				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti);
+				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, TRUE);
 			break;
 		}
 		if (slot >= 0) {
@@ -5078,6 +5212,23 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			if (r->kind == WASM_RELOC_CALL) {
 				st->nimport_method++;
 				wj_asm_imports_add (ai, (int) r->table_index);
+#ifdef HOST_BROWSER
+				{ extern int mono_wasm_jit_dump_imports;
+				  if (G_UNLIKELY (mono_wasm_jit_dump_imports)) {
+					MonoMethod *cm = (MonoMethod *) r->sym;
+					char *cn = mem [self_index].method ? mono_method_get_full_name (mem [self_index].method) : NULL;
+					char *dn = cm ? mono_method_get_full_name (cm) : NULL;
+					printf ("WASM_JIT_IMPORTED fslot=%d desc=%d caller=%s callee=%s\n",
+						(int) r->table_index, wj_desc_for_fslot ((int) r->table_index),
+						cn ? cn : "?", dn ? dn : "?");
+					g_free (cn); g_free (dn);
+				  } }
+#endif
+				/* IMPORT_DEAD: everything above stays -- the slot is interned, so the import is declared
+				 * and bound at instantiation and the dep is strict -- and only the five bytes at the site
+				 * revert. Deliberately after wj_asm_imports_add, so the two arms differ in nothing else. */
+				if (pol->import_dead)
+					fix [k].form = WASM_FORM_INDIRECT;
 			}
 		} else {
 			st->nindirect++;
@@ -5102,11 +5253,12 @@ wj_asm_policy_init (WjAsmPolicy *pol, gboolean local_calls)
 {
 	extern int mono_wasm_jit_helper_imports, mono_wasm_jit_aot_imports, mono_wasm_jit_direct_import;
 	extern int mono_wasm_jit_ci_imports, mono_wasm_jit_max_himp, mono_wasm_jit_names;
-	extern int mono_wasm_jit_max_method_imports;
+	extern int mono_wasm_jit_max_method_imports, mono_wasm_jit_import_dead;
 
 	memset (pol, 0, sizeof (*pol));
 	pol->max_fimports = mono_wasm_jit_max_himp;
 	pol->max_method_imports = mono_wasm_jit_max_method_imports;
+	pol->import_dead = mono_wasm_jit_import_dead ? 1 : 0;
 	pol->names = mono_wasm_jit_names ? 1 : 0;
 	pol->local_calls = local_calls ? 1 : 0;
 #ifdef HOST_BROWSER
@@ -5460,6 +5612,12 @@ mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_b
 	*out_len = (int) out.len;
 	wasm_buf_free (&out);
 
+	/* Same rule as the standalone path: the members' imports were chosen against the process-wide
+	 * registry, but whether a callee is instantiated is per-thread. Make them live here before binding,
+	 * or the resolver refuses them and the whole batch is lost. */
+	{ int bi;
+	  for (bi = 0; bi < n; ++bi)
+		wj_admit_imports (wj_batch_imports [bi].slot, wj_batch_imports [bi].n); }
 	if (!mono_wasm_jit_instantiate_batch_local (e_slots, f_slots, n, cached, *out_len, errbuf, errcap, &ms)) {
 		g_free (cached);
 		*out_bytes = NULL;
@@ -11700,6 +11858,9 @@ vcall_cold_miss_emit:
 			/* Validate by instantiating once on THIS thread (also populates this thread's table).
 			 * If the module is invalid (a codegen bug for some opcode shape), bail to the interpreter
 			 * here rather than letting another thread trap on a placeholder slot at invoke time. */
+			/* The imports this module is about to bind were chosen against the REGISTRY, which is
+			 * process-wide; whether they are instantiated is per-thread. Make them live here first. */
+			wj_admit_imports (wj_self_imports.slot, wj_self_imports.n);
 			if (mono_wasm_jit_instantiate_local (e_slot, f_slot, cached, (int) out.len, ierr, (int) sizeof (ierr), &wj_inst_ms)) {
 				/* The compile result is written onto cfg->wasm_jit_result (below). It's per-compile, so a
 				 * re-entrant nested compile (cctors / AOT-target init) has its OWN cfg and can't clobber it —
