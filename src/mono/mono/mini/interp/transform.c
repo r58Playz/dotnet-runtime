@@ -10140,6 +10140,48 @@ int
 mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
 {
 	InterpMethod *im = mono_interp_get_imethod (method);
+	/* R170 RE-EMIT PIN, and it is checked FIRST and keyed on the MonoMethod deliberately.
+	 *
+	 * A re-emit must land on the pair the method already owns, or the old slots leak and every caller that
+	 * baked the old f-slot keeps calling a module nothing will ever update again. The first attempt at this
+	 * seeded wasm_jit_self_resv_* on the InterpMethod before calling wasm_jit_compile_publish -- and
+	 * measured WASM_JIT_REEMIT_SLOT_MOVED 20+ times per run, because compile_publish RE-LOOKS-UP the
+	 * InterpMethod under the jit-mm lock after compiling (interp.c: tiering may replace it). The seed was
+	 * on the object the drain held; the emitter read the replacement, found no reservation, and allocated
+	 * fresh slots. Keying on the MonoMethod, which is stable, is what makes the pin survive that. */
+	{
+		extern MonoMethod *mono_wasm_jit_reemit_pin (int *e_out, int *f_out);
+		int pe = 0, pf = 0;
+		MonoMethod *pinned = mono_wasm_jit_reemit_pin (&pe, &pf);
+		if (pinned == method && pe > 0 && pf > 0) {
+			*e_out = pe;
+			*f_out = pf;
+			return 1;
+		}
+		/* A pin is set for a re-emission in flight and THIS is not the method it names. Every re-emit so
+		 * far has landed on a fresh pair (WASM_JIT_REEMIT_SLOT_MOVED x20), so the pin is being missed --
+		 * and three guesses at why have already been wrong. Name both methods rather than infer: the
+		 * leading suspect is mono_wasm_force_compile substituting a wrapper, which would make cfg->method
+		 * a different MonoMethod from the one the drain queued. */
+		/* EXPECTED, and not a miss in any useful sense. Re-emitting A runs cctors and island compiles for
+		 * unrelated methods B, C, D, and each of those asks here for ITS OWN slots while A's pin is set.
+		 * Refusing them is the whole point -- handing them A's pair is the slot theft the original
+		 * collision guard exists to prevent. Observed pairs are plainly unrelated
+		 * (pinned=Utf8JsonReader:get_ValueIsEscaped, asked_for=AllowedBmpCodePointsBitmap:_GetIndexAndOffset),
+		 * and reemitDone == reemitRereg confirms A still gets its own pair. Behind the verbose knob so it
+		 * stops reading as a fault in normal runs. */
+		if (pinned && pinned != method) {
+			extern int mono_wasm_jit_verbose;
+			static int _n = 0;
+			if (mono_wasm_jit_verbose >= 1 && _n++ < 20) {
+				char *pn = mono_method_full_name (pinned, TRUE);
+				char *mn = mono_method_full_name (method, TRUE);
+				printf ("WASM_JIT_REEMIT_PIN_MISS pinned=%s (e=%d f=%d)  asked_for=%s  wrapper_type=%u\n",
+					pn ? pn : "?", pe, pf, mn ? mn : "?", (unsigned) method->wrapper_type);
+				g_free (pn); g_free (mn);
+			}
+		}
+	}
 	if (im && im->wasm_jit_resv_fslot > 0) {
 		*e_out = im->wasm_jit_resv_eslot;
 		*f_out = im->wasm_jit_resv_fslot;

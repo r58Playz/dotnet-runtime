@@ -227,6 +227,202 @@ enum {
 	 * apart: grouping a caller with a callee it turns out not to call directly costs a re-frame and buys
 	 * nothing, and that is exactly the case a greedy first-come partition can produce. */
 	WJC_COLOCATED_MEMBERS,
+	/* DEVIRT PREDICTION CENSUS, counted at EMIT time, one counter per exit of the speculative-devirt
+	 * gate in the vcall lowering. R156 measured coverage at 27.8% of ordinary virtual sites by reading
+	 * the emitted bytes (scratchpad/wj/vcallreach.py) -- that says WHAT the coverage is but not WHY the
+	 * other 72% missed, and the candidate causes imply OPPOSITE fixes: "site never warmed" argues for a
+	 * higher JIT threshold, "site polymorphic" argues that a higher threshold makes it strictly worse
+	 * (a second receiver disqualifies a site permanently, so more warmup can only lose sites), and
+	 * "target not JITted yet" argues for neither. Splitting them needs one run, not an argument.
+	 *   DEVIRT_SITE      ordinary virtual sites reaching the gate
+	 *   DEVIRT_NO_REC    the caller has no profile record for this base at all
+	 *   DEVIRT_COLD      record exists, fewer than 8 observations
+	 *   DEVIRT_POLY      warm, but not perfectly monomorphic (Boyer-Moore margin != total)
+	 *   DEVIRT_POLY_90   the subset of POLY that WOULD pass a >=90%-frequency bar (margin/total >= 0.8).
+	 *                    `margin` is a MARGIN, not an occurrence count, so the winner's share is
+	 *                    (1 + margin/total)/2 and 0.8 is exactly 90%. This sizes the relaxation without
+	 *                    shipping it -- the current bar rejects a 99%-monomorphic site and a 50/50 site
+	 *                    identically, because once margin < total it can never equal total again.
+	 *   DEVIRT_SIG       predicted, but the override's functype does not match the call site's
+	 *   DEVIRT_NO_FSLOT  predicted, but the target owns no admitted f-slot yet
+	 *   DEVIRT_EMITTED   a predicted arm was actually laid down
+	 *   DELEGATE_SITE    Delegate.Invoke sites emitted: the population the gate EXCLUDES outright
+	 *                    (`!is_delegate_invoke` guards both the predict call and the emitted arm, and
+	 *                    the recorder passes target = NULL for a delegate site so its margin stays 0).
+	 * Counted per EMIT ATTEMPT, like WJC_BAILED and unlike WJC_REGISTERED: a method the island driver
+	 * re-emits contributes its sites again, and a method that bails after this point still contributes.
+	 * Read the ratios, not the absolutes -- the absolutes exceed the distinct-site count in the tier.
+	 * FAST_DEVIRT is the matching EXECUTION counter (PROFILE_FAST only). Without it the vcall
+	 * denominator has no term for the predicted arm at all, which is why R155's "79% take the IC" was
+	 * 79% of a pool that structurally could not contain the thing it was compared against. */
+	WJC_DEVIRT_SITE, WJC_DEVIRT_NO_REC, WJC_DEVIRT_COLD, WJC_DEVIRT_POLY, WJC_DEVIRT_POLY_90,
+	WJC_DEVIRT_SIG, WJC_DEVIRT_NO_FSLOT, WJC_DEVIRT_EMITTED, WJC_DELEGATE_SITE, WJC_FAST_DEVIRT,
+	/* MONO_WASM_JIT_DEVIRT_FORCE (default 0). FORCED = a NO_FSLOT site whose predicted target was turned
+	 * into an island blocker instead of being dropped, so the caller re-emits once the callee publishes.
+	 * CAPPED = the same site declined because the method already carried DEVIRT_FORCE_MAX blockers.
+	 *
+	 * Read FORCED against the fall in DEVIRT_NO_FSLOT and the rise in DEVIRT_EMITTED for reach, and
+	 * against WJC_PARKED / WJC_ISLAND_DEPTH_EXCEEDED / WJC_ISLAND_BUDGET_EXHAUSTED for the cost. The cost
+	 * side is the whole reason this is a knob: R153's world-load stall came from methods that could not
+	 * clear their blockers and ran interpreted, and this deliberately creates more blockers. */
+	WJC_DEVIRT_FORCED, WJC_DEVIRT_FORCE_CAPPED,
+	/* MONO_WASM_JIT_COLOCATE_TIGHT_DEPS: dependency entries dropped when a re-framed module's dependency
+	 * set was recomputed from the assembler instead of inherited from the generation each member was
+	 * compiled as. Every entry counted here is a callee that became a module-local `call <funcidx>` and so
+	 * needs no admission -- i.e. this is the size of the admission closure the old code was demanding for
+	 * nothing. Read it against WASM_JIT_BATCH_ADMIT_FAIL and WASM_JIT_ADMIT_DEFER_GIVEUP, which is what
+	 * that surplus closure was costing (1966 and 1540 in one in-world run, against 0 and 3 in the control).
+	 * Summed over members and over re-framings, so it is a volume, not a distinct-edge count. */
+	WJC_TIGHT_DEPS_DROPPED,
+	/* MONO_WASM_JIT_COLOCATE_ROLLBACK: members returned to their standalone modules because the group they
+	 * were bound into could not be admitted. Counted per MEMBER, so read it against COLOCATED_MEMBERS for
+	 * the fraction of co-location attempts that did not stick. Every one of these used to be a method
+	 * permanently denied the JIT tier (wj_desc_state = 3) and therefore interpreted for the rest of the
+	 * run -- 2,078 distinct methods in one measured run, and 812 ms/frame against a 50 ms control. */
+	WJC_COLOCATE_ROLLBACK,
+	/* MONO_WASM_JIT_COLOCATE_SCC: groups NOT formed because dropping a callee would have left a dependency
+	 * cycle spanning two modules, which admission cannot order. Refusing costs only the co-location; the
+	 * members keep working standalone modules. Expect this to be small -- R161 measured 11 such cycles in
+	 * the whole tier. If it is ever large, the partition is cutting through dense regions and wants a real
+	 * SCC pass rather than this pairwise guard. */
+	WJC_COLOCATE_SCC_REFUSED,
+	/* Admission failures split by whether this worker will EVER retry. ADMIT_FAIL_PERM = state 3 (the
+	 * module's bytes failed to compile/link here); ADMIT_FAIL_RETRY = state 0 (an ordering miss: a
+	 * dependency was not live on this worker yet). Before R166 every failure took the PERM path, which
+	 * for a batch condemned all n members at once -- see the `fail:` label in mono_wasm_jit_admit. */
+	WJC_ADMIT_FAIL_PERM, WJC_ADMIT_FAIL_RETRY,
+	/* The fourth arm of the WJC_VFB_THRESH split, and the one whose ABSENCE hid R166 for a full session:
+	 * the target has slot > 0 (it IS JIT-compiled) but mono_wasm_jit_admit_live returned 0, so this worker
+	 * cannot dispatch to it and the call goes to the interpreter. Every other slot state had a counter, so
+	 * this route showed up not as a gap but as VFB_THRESH being 9,243x larger with no explanation.
+	 * VFB_COLD + VFB_PARKED + VFB_RETRY + VFB_NOTLIVE == VFB_THRESH; check that before trusting a share. */
+	WJC_VFB_NOTLIVE,
+	/* mono_wasm_jit_admit_live's failure routes, one counter each. R166's first fix targeted the four
+	 * state-1/state-3 leaks in mono_wasm_jit_admit's `fail:` label and moved VFB_NOTLIVE by 2.6% (109.6M ->
+	 * 106.7M) while ADMIT_FAIL_PERM and ADMIT_FAIL_RETRY both stayed at 0 -- i.e. `fail:` is never reached
+	 * and the leaks were not the path being taken. admit_live is `admit() && desc_admitted()`, and with no
+	 * failure counter firing, admit must be returning 1 while desc_admitted returns 0. These five split
+	 * that conjunction into its actual branches instead of a third guess:
+	 *   AL_ADMIT0  admit() itself said no (without reaching `fail:`)
+	 *   AL_STATE   admit() said yes but the descriptor is not state 2 -- the state-1 cycle-break, which
+	 *              returns 1 from mono_wasm_jit_admit while desc_admitted requires 2
+	 *   AL_GEN     state 2 but wj_desc_generation != re->generation
+	 *   AL_ELIVE / AL_FLIVE  state and generation agree, but the e- or f-slot is not live on THIS worker */
+	WJC_AL_ADMIT0, WJC_AL_STATE, WJC_AL_GEN, WJC_AL_ELIVE, WJC_AL_FLIVE,
+	/* SHADOW COPIES (MONO_WASM_JIT_SHADOW). SHADOW_MEMBERS = private leaf duplicates framed into a
+	 * caller's module; SHADOW_BYTES = the wire cost of them, which is the thing to watch, since a shadow
+	 * is duplicated per CALLER module; SHADOW_REFUSED = call relocations that did not qualify (callee not
+	 * JITted, not a leaf, uses an EH tag, or over MONO_WASM_JIT_SHADOW_BYTES). Judge reach by comparing
+	 * CALL_LOCAL against CALL_INDIRECT, not by SHADOW_MEMBERS: one shadow can convert many sites. */
+	WJC_SHADOW_MEMBERS, WJC_SHADOW_BYTES, WJC_SHADOW_REFUSED,
+	/* WHY a call relocation did not get a shadow. R167 measured 4 shadows against 608 refusals with only
+	 * the single REFUSED bucket, which cannot distinguish the two explanations that lead to opposite
+	 * decisions: NOJIT means the callee has no relocatable body at all (it is AOT / main-module, the R129
+	 * 55%), so no shadow rule can ever reach it and MONO_WASM_JIT_OVER_AOT is the prerequisite; NOTLEAF
+	 * means the callee IS ours and was refused by policy, which R166's working dep-closure admission may
+	 * now make safe to relax. STALE = f-slot -> descriptor mismatch, EH = carries an EH tag, BIG = over
+	 * MONO_WASM_JIT_SHADOW_BYTES, CAP = hit MONO_WASM_JIT_SHADOW_MAX for the module. */
+	WJC_SHADOW_NOJIT, WJC_SHADOW_STALE, WJC_SHADOW_NOTLEAF, WJC_SHADOW_EH, WJC_SHADOW_BIG, WJC_SHADOW_CAP,
+	/* Shadowed modules discarded by wj_verify_module_exports and re-framed plain. Must be 0: a non-zero
+	 * count means the shadow layout is producing modules the instantiate path cannot use, and the
+	 * fallback is the only reason the run is still alive. */
+	WJC_SHADOW_UNFRAMED,
+	/* Shadowed modules re-framed plain because merging the shadows' own dependencies overflowed the
+	 * 128-entry direct-dep cap. Expected non-zero once MONO_WASM_JIT_SHADOW_NONLEAF is on -- that is the
+	 * cap doing its job, not a bug -- but a large count means the non-leaf policy is reaching too far. */
+	WJC_SHADOW_DEPCAP,
+	/* R170 re-emission with a matured profile. QUEUED = methods enqueued; DONE = actually re-emitted;
+	 * REFUSED = skipped at drain time (co-located member, permanently bailed, or slots unpinnable).
+	 * Judge the mechanism by the devirt census moving -- `no_rec` down and `emitted` up -- not by DONE,
+	 * which only says how many attempts were made. */
+	WJC_REEMIT_QUEUED, WJC_REEMIT_DONE, WJC_REEMIT_REFUSED,
+	/* The devirt census SCOPED TO RE-EMITTED BODIES. R170's first attempt read the ordinary census, which
+	 * is cumulative over every emission in the run -- 28 re-emissions against 37,828 sites cannot move it
+	 * whatever they did, so the null result measured the instrument, not the hypothesis. These three count
+	 * only sites offered while a re-emit is in flight, which makes 28 bodies a readable sample. Compare
+	 * REEMIT_EMITTED/REEMIT_SITE against the run-wide emitted share (28.1%) -- if the profile really is
+	 * richer at re-emit time, this ratio is the place it shows up. */
+	WJC_REEMIT_SITE, WJC_REEMIT_NO_REC, WJC_REEMIT_EMITTED,
+	/* Re-emit attempts that lost the global wj_compiling CAS and were put BACK on the queue. Expected
+	 * non-zero and harmless -- compiles are serialized and this drain runs on an ordinary tick. It is
+	 * counted because treating a lost CAS as a verdict is exactly what made the first three experiments
+	 * measure nothing: REEMIT_DONE read 0 while REEMIT_SITE read 24. */
+	WJC_REEMIT_BUSY,
+	/* Registrations that reused an f-slot still owned by an EARLIER descriptor for the SAME method --
+	 * i.e. a re-emit taking back its own pinned pair. A different method hitting that slot is still
+	 * refused loudly (WASM_JIT_FSLOT_COLLISION); this counts only the legitimate case. */
+	WJC_REEMIT_REREGISTER,
+	/* Methods dropped because the 256-entry re-emit queue was full. Non-zero is fine -- re-emission is
+	 * opportunistic -- but a LARGE count means the drain is not keeping up with the trigger, which is a
+	 * reason to raise the threshold rather than the queue. */
+	WJC_REEMIT_QFULL,
+	/* WHY a co-location group was not formed, one counter per exit of
+	 * mono_wasm_jit_colocate_deps_now. Until these existed the function had six distinct rejection
+	 * paths and a single counter on one of them (SCC_REFUSED), so "co-location reaches ~1% of the
+	 * Minecraft tier" was an observation with no attribution behind it -- exactly the bare `continue`
+	 * that no counter is watching.
+	 *
+	 * TRY is the denominator: every call that got past the knob and the desc_id check. The identity to
+	 * assert before quoting any share of it is
+	 *
+	 *   COLOCATE_TRY == COLOCATE_SELF + COLOCATE_SINGLETON + COLOCATE_SCC_REFUSED
+	 *                   + COLOCATE_REBATCH_FAIL + (groups actually formed)
+	 *
+	 * where "groups actually formed" is COLOCATED_MEMBERS counted in GROUPS rather than members, which
+	 * is why COLOCATE_FORMED exists as its own counter rather than being derived from the member total.
+	 *
+	 * The COLOCATE_SELF_* arms are the self-entry preconditions (they reject before any callee is
+	 * examined); the COLOCATE_DEP_* arms are per-CALLEE and so are volumes, not group counts -- one
+	 * refused group can contribute several. DEP_BATCHED is the one to read first: it is the
+	 * append-only partition refusing a callee that some other caller already claimed, i.e. the blocker
+	 * that 2b lifts. */
+	WJC_COLOCATE_TRY, WJC_COLOCATE_FORMED,
+	WJC_COLOCATE_SELF_BATCHED, WJC_COLOCATE_SELF_NO_DEPSET, WJC_COLOCATE_SELF_REFUSED,
+	WJC_COLOCATE_DEP_UNREG, WJC_COLOCATE_DEP_NOBODY, WJC_COLOCATE_DEP_BATCHED,
+	WJC_COLOCATE_DEP_REFUSED, WJC_COLOCATE_DEP_BYTE_CAP, WJC_COLOCATE_MEMBER_CAP,
+	WJC_COLOCATE_SINGLETON, WJC_COLOCATE_REBATCH_FAIL,
+	/* CO-LOCATION REACH AS EXECUTED, split by where the runtime target actually lives. Bumped on the IC
+	 * MISS/publish path -- i.e. once per distinct (site, receiver) pair, not per dispatch -- because that
+	 * is the only place the resolved target and the calling descriptor are both in hand.
+	 *
+	 * Why this and not WJC_CALL_LOCAL: CALL_LOCAL counts relocations the assembler turned into
+	 * `call <funcidx>`, which is the call-FORM half of co-location. R183's differential measured the
+	 * GROUPING half -- same module, same instance, calls still `call_indirect` -- at -7.0% of a -12.8%
+	 * total, i.e. 55% of the win, and CALL_LOCAL is structurally blind to it (R182: CALL_LOCAL was 4.0%
+	 * of calls at 73% reach). A dispatch site gets the grouping half exactly when its target is a
+	 * sibling, because V8's CallIndirectIC records a precise target only while
+	 * `implicitArg == current instance` (builtins/wasm.tq:821-835).
+	 *
+	 *   VIC_TGT_SIBLING   target shares the caller's WjBatchDesc -> V8 can track and inline it
+	 *   VIC_TGT_FOREIGN   target is OURS but in another group -> a reach problem a planner can fix
+	 *   VIC_TGT_NOTOURS   no descriptor on this worker (AOT / main-module) -> needs OVER_AOT, not grouping
+	 *
+	 * The three sum to "publishes with a resolved f-slot". Do not collapse FOREIGN and NOTOURS: that is
+	 * the mistake WJC_SHADOW_REFUSED made before R167 split it, and they lead to opposite decisions.
+	 *
+	 * TWO SELECTION BIASES, and the second one nearly made this a tautology of the shadowNojit kind
+	 * (R169). Read them before quoting the number.
+	 *
+	 * (1) Co-location runs at publish and groups are append-only, so a site whose target joins a group
+	 *     AFTER its last miss stays FOREIGN forever. Biases DOWN.
+	 *
+	 * (2) THIS IS THE MISS PATH, and the sites whose targets are co-locatable are exactly the ones that
+	 *     do not reach it. A virtual target becomes a member of the caller's group only if it is in
+	 *     re->depset, i.e. only if some WASM_RELOC_CALL hole names it -- and for a dispatch site that
+	 *     means a DEVIRT PREDICTED ARM. A site with a predicted arm hits it and never publishes. So this
+	 *     counter samples the population that by construction has no direct edge to its target.
+	 *
+	 * What it therefore DOES answer, and nothing else here answers: of the dispatches that fall through
+	 * the inline cache, how many find their target already co-resident? MEASURED on jbox2d at 73% member
+	 * reach (389 methods, 285 grouped): sibling 3, foreign 2,902,973, notours 0 -- i.e. ~0%. That is a
+	 * real result. The ordinary-virtual MISS pool gets nothing from the current grouping, which is the
+	 * measurement behind building a co-location reader over the call profile.
+	 *
+	 * What it does NOT answer is "how much of the grouping half of R183's -7.0% is reaching dispatch".
+	 * That question is about the predicted arms and the intra-group direct edges, and the instrument for
+	 * it is vcallreach.py's per-arm call-form split over a tier dump -- static, free, and already
+	 * written. Do not substitute this counter for it. */
+	WJC_VIC_TGT_SIBLING, WJC_VIC_TGT_FOREIGN, WJC_VIC_TGT_NOTOURS,
 	WJC_MAX
 };
 

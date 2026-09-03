@@ -444,10 +444,12 @@ emit_import_section (WasmBuf *out, gboolean import_table, gboolean import_eh_tag
  *            block is { method_i, entry_i, extras_i... }, so types[0] and types[1] are load-bearing.
  *   funcs:   0..nfimports-1 imported, then the N methods, then the N entry thunks. Methods precede thunks
  *            so member i's method is funcidx nfimports + i.
- *   exports: N == 1 -> "f"/"e" (the single-method instantiate path); N > 1 -> "f<i>"/"e<i>" (the batch one).
+ *   exports: first `nexport` members only; nexport == 1 -> "f"/"e" (the single-method instantiate path),
+ *            nexport > 1 -> "f<i>"/"e<i>" (the batch one). Members past nexport are shadows: callable
+ *            in-module, exported nowhere.
  */
 void
-wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers,
+wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 nexport,
                       gboolean import_table, gboolean import_eh_tag, guint32 eh_type_idx,
                       const WasmFuncImport *fimports, guint32 nfimports,
                       WasmBuf *out)
@@ -458,6 +460,7 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers,
 	guint32 i, j, base;
 
 	g_assert (nmembers > 0);
+	g_assert (nexport > 0 && nexport <= nmembers);
 
 	wasm_bytes (out, header, 8);
 
@@ -492,18 +495,18 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers,
 
 	/* Export section (7) */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, nmembers * 2);
-	for (i = 0; i < nmembers; ++i) {
+	wasm_uleb (&sec, nexport * 2);
+	for (i = 0; i < nexport; ++i) {
 		char nm [24];
-		if (nmembers == 1) { nm [0] = 'f'; nm [1] = 0; }
+		if (nexport == 1) { nm [0] = 'f'; nm [1] = 0; }
 		else g_snprintf (nm, sizeof (nm), "f%u", i);
 		wasm_name (&sec, nm);
 		wasm_u8 (&sec, 0x00);
 		wasm_uleb (&sec, nfimports + i);
 	}
-	for (i = 0; i < nmembers; ++i) {
+	for (i = 0; i < nexport; ++i) {
 		char nm [24];
-		if (nmembers == 1) { nm [0] = 'e'; nm [1] = 0; }
+		if (nexport == 1) { nm [0] = 'e'; nm [1] = 0; }
 		else g_snprintf (nm, sizeof (nm), "e%u", i);
 		wasm_name (&sec, nm);
 		wasm_u8 (&sec, 0x00);
