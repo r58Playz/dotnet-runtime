@@ -827,6 +827,78 @@ wj_promote_push (MonoMethod *m)
 	wj_promote_tail = t + 1;
 }
 
+/* --- R170: re-emission with a matured call profile ------------------------------------------------------
+ * A method is emitted ONCE, when it crosses its hotness threshold, and the devirt gate reads the call
+ * profile AT THAT MOMENT. The profile is written from three points -- the interpreter's virtual dispatch,
+ * its delegate dispatch, and the JIT's IC MISS -- and 78.8% of all observations come from the miss path,
+ * i.e. AFTER the method was emitted. So codegen sees the coldest profile the method will ever have.
+ *
+ * Measured cost of that (R168/R169, stable across arms): devirt emits a predicted arm for 28.5% of virtual
+ * sites and refuses 32.1% for `no_rec` -- no record at all. A highly monomorphic site misses least, so it
+ * feeds the profile least, while being the site prediction would serve best.
+ *
+ * This queue re-emits such a method ONCE, later, when the profile has filled in. It is a separate ring from
+ * wj_promote_q because that one is for methods NOT yet JITted and skips anything with an f-slot.
+ *
+ * SAFETY. The re-emitted body is the SAME method with the SAME signature, so replacing its table slots is
+ * benign: a call in flight during the swap lands on either the old or the new body and both are correct.
+ * That is what separates this from every slot-rebinding hazard in R160-R166. Two things it must refuse:
+ * a co-located member (re-framing one member of a group strands its siblings -- the constraint
+ * mono_wasm_jit_rebatch already enforces), and a method whose slots it cannot pin, for which see
+ * wj_reemit_pin_slots. */
+#define WJ_REEMIT_Q 256
+/* VOLATILE AND CAS-CLAIMED, unlike wj_promote_q above -- which looks similar and is NOT the same problem.
+ * That queue is mutated under mono_loader_lock; THIS one is enqueued from the interp->JIT invoke path, on
+ * any worker, with no lock available. The first version copied the promote queue's plain read-modify-write
+ * and was a straight data race: two workers read the same tail, both store into that slot, both publish
+ * tail+1 -- one entry lost, and BOTH methods left at state 1. A method marked queued but never actually
+ * queued is stuck at state 1 for the life of the process: the drain never sees it and wj_reemit_enqueue
+ * refuses it (it only enqueues from state 0). That is R166's unrecoverable-state pattern again. */
+static MonoMethod * volatile wj_reemit_q [WJ_REEMIT_Q];
+static volatile gint32 wj_reemit_head, wj_reemit_tail;
+
+/* The pinned pair for the re-emission currently in flight, keyed by MonoMethod because the InterpMethod
+ * can be replaced by tiering mid-compile. Read by mono_wasm_jit_self_reserved (transform.c), which is what
+ * both slot-selection paths consult before allocating. Single-threaded by construction: compiles are
+ * serialized by the wj_compiling CAS, and the drain runs outside any compile. */
+static MonoMethod *wj_reemit_pin_m;
+static int wj_reemit_pin_e, wj_reemit_pin_f;
+
+MonoMethod *
+mono_wasm_jit_reemit_pin (int *e_out, int *f_out)
+{
+	*e_out = wj_reemit_pin_e;
+	*f_out = wj_reemit_pin_f;
+	return wj_reemit_pin_m;
+}
+
+static void
+wj_reemit_enqueue (InterpMethod *im)
+{
+	gint32 t;
+	if (!im || !im->method)
+		return;
+	/* Claim a slot with a CAS before touching anything, so a lost race costs an attempt and never a
+	 * corrupted ring or a method stranded at state 1. */
+	for (;;) {
+		t = wj_reemit_tail;
+		if (t - wj_reemit_head >= WJ_REEMIT_Q) {
+			/* FULL. Mark the method done rather than leaving it at state 0 -- otherwise every subsequent
+			 * interp->JIT transition for it re-enters this function forever, on a path taken millions of
+			 * times per window, for a queue that is not going to accept it. Re-emission is opportunistic;
+			 * dropping one method is free, re-attempting it on the hot path is not. */
+			im->wasm_jit_reemit_state = 2;
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_QFULL);
+			return;
+		}
+		if (mono_atomic_cas_i32 ((volatile gint32 *) &wj_reemit_tail, t + 1, t) == t)
+			break;
+	}
+	im->wasm_jit_reemit_state = 1;
+	wj_reemit_q [t & (WJ_REEMIT_Q - 1)] = im->method;
+	if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_QUEUED);
+}
+
 /* --- Event-driven blocker waiters (residual=0 islands) ---------------------------------------------------
  * Reverse-dependency map: callee MonoMethod* -> the methods PARKED waiting for it to JIT. When a method can't
  * close its island because a DIRECT callee is cold, it registers as a waiter on that callee and parks (slot =
@@ -1213,6 +1285,19 @@ mono_wasm_jit_prof_site_id (gpointer caller_ptr, MonoMethod *base, int kind, vol
 }
 
 /*
+ * Why a prediction was refused, for the emitter's WJC_DEVIRT_* census. Mirrored as plain ints rather
+ * than a shared enum because interp.c and mini-wasm.c have no private header in common (the same reason
+ * mono_wasm_jit_devirt_profile is DEFINED in mini-wasm.c). Keep in step with the WJC_DEVIRT_* block in
+ * mini-wasm.h and with wj_devirt_census in mini-wasm.c.
+ */
+#define WJ_PRED_OK       0
+#define WJ_PRED_NO_REC   1   /* no record for this (caller, base, VIRTUAL) */
+#define WJ_PRED_COLD     2   /* record exists, fewer than 8 observations */
+#define WJ_PRED_POLY     3   /* warm, margin != total, and below the 90%-frequency bar too */
+#define WJ_PRED_POLY_90  4   /* warm, margin != total, but the front-runner is >= 90% of observations */
+#define WJ_PRED_TORN     5   /* lock-free read disagreed with itself; retry would succeed */
+
+/*
  * Return a prediction only for a sufficiently warmed, perfectly monomorphic site.
  *
  * `margin` is a Boyer-Moore margin rather than an occurrence counter, so equality with total is the
@@ -1223,7 +1308,7 @@ mono_wasm_jit_prof_site_id (gpointer caller_ptr, MonoMethod *base, int kind, vol
  */
 gboolean
 mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **out_vt,
-	MonoMethod **out_target, guint32 *out_samples)
+	MonoMethod **out_target, guint32 *out_samples, int *out_why)
 {
 	InterpMethod *caller = (InterpMethod *) caller_ptr;
 	WjProfSite *s;
@@ -1231,6 +1316,8 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 	MonoMethod *target1, *target2;
 	guint32 hits1, hits2, total1, total2;
 
+	if (out_why)
+		*out_why = WJ_PRED_NO_REC;
 	if (!caller || !base || !out_vt || !out_target)
 		return FALSE;
 	s = wj_prof_site (caller, base, WJ_SITE_VIRTUAL, FALSE, NULL);
@@ -1239,10 +1326,27 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 	id1 = s->identity; target1 = s->target; hits1 = s->margin; total1 = s->total;
 	mono_memory_barrier ();
 	id2 = s->identity; target2 = s->target; hits2 = s->margin; total2 = s->total;
-	if (id1 != id2 || target1 != target2 || hits1 != hits2 || total1 != total2)
+	if (id1 != id2 || target1 != target2 || hits1 != hits2 || total1 != total2) {
+		if (out_why) *out_why = WJ_PRED_TORN;
 		return FALSE;
-	if (!id1 || !target1 || total1 < 8 || hits1 != total1)
+	}
+	if (!id1 || !target1 || total1 < 8) {
+		if (out_why) *out_why = WJ_PRED_COLD;
 		return FALSE;
+	}
+	if (hits1 != total1) {
+		/* Not perfectly monomorphic. Record separately whether it WOULD pass a frequency bar: `margin`
+		 * is a Boyer-Moore margin (wins - losses) against `total` (wins + losses), so the front-runner's
+		 * share is (1 + margin/total)/2 and margin/total >= 0.8 is exactly ">= 90% of observations".
+		 * The distinction matters because the current bar treats a 99%-monomorphic site and a 50/50 site
+		 * identically -- and it is one-way: the moment margin < total it can never equal total again,
+		 * since each further observation adds 1 to total and at most 1 to margin. */
+		if (out_why)
+			*out_why = (hits1 * 5 >= total1 * 4) ? WJ_PRED_POLY_90 : WJ_PRED_POLY;
+		return FALSE;
+	}
+	if (out_why)
+		*out_why = WJ_PRED_OK;
 	*out_vt = (MonoVTable *) id1;
 	*out_target = target1;
 	if (out_samples)
@@ -1518,6 +1622,17 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 		WjVcallSite *site = wj_vcall_site (ic);
 		if (G_UNLIKELY (mono_wasm_jit_devirt_profile) && site->caller_im && site->base)
 			wj_prof_record (site->caller_im, site->base, WJ_SITE_VIRTUAL, vt, target, TRUE);
+		/* CO-LOCATION REACH, measured where it actually happens. Same reasoning as the profile record
+		 * above: this is the miss path, so the PIC hit path stays a pure TLS load. See WJC_VIC_TGT_*
+		 * for why WJC_CALL_LOCAL cannot answer this and for the lower-bound caveat. */
+		if (G_UNLIKELY (mono_wasm_jit_stats) && site->caller_im) {
+			extern int mono_wasm_jit_call_is_colocated (int caller_desc, int callee_fslot);
+			switch (mono_wasm_jit_call_is_colocated (site->caller_im->wasm_jit_desc, fslot)) {
+			case 1:  mono_wasm_jit_count (WJC_VIC_TGT_SIBLING); break;
+			case 0:  mono_wasm_jit_count (WJC_VIC_TGT_FOREIGN); break;
+			default: mono_wasm_jit_count (WJC_VIC_TGT_NOTOURS); break;
+			}
+		}
 	}
 	guint64 pair = ((guint64) (guint32) fslot << 32) | (guint32) (gsize) vt;
 	int k, victim = 0;
@@ -1981,7 +2096,11 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 	 * after that thread published fslot + released the lock — the lock serializes compiles but doesn't
 	 * un-stale a guard already passed. Without this re-check that worker recompiles the same method, leaking
 	 * a fresh global table-slot pair and re-emitting identical bytes (the duplicate WASM_JIT_REGISTERED). */
-	if (im->wasm_jit_fslot > 0) {
+	/* `reemit_state == 1` is the ONE way past this gate, and it is set only by wj_reemit_enqueue and
+	 * cleared to 2 by the drain before it gets here -- so a method re-emits at most once. Everything else
+	 * about the gate's reasoning still holds: without it a second worker recompiles the same method and
+	 * leaks a fresh table-slot pair. */
+	if (im->wasm_jit_fslot > 0 && im->wasm_jit_reemit_state != 3) {
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		if (out) {
 			out->desc_id = im->wasm_jit_desc;
@@ -2376,751 +2495,6 @@ out:
 	return WASM_JIT_COMPILE_BLOCKED;
 }
 
-/* --- island module batching, force_island edition ---------------------------------------------------
- *
- * wasm_jit_compile_scc gets a batch for free (it already knows its whole member set), but it only runs
- * on a detected call cycle — measured on jbox2d, that is ZERO times, while 300 methods JIT through
- * force_island. So the batch has to hang off this path to matter.
- *
- * force_island does not know its membership up front either; it discovers it by compiling and pulling
- * blockers. So collect what actually compiled beneath one root and re-emit that set as one module. Same
- * second-pass trade as the SCC version: one extra emit per member, no change to the delicate
- * convergence logic. Unlike the SCC case the members are already PUBLISHED by the time we get here, so
- * this is a swap in place — the batched module is instantiated into the very same e/f slots, which
- * callers have already baked. Semantically identical code, so an in-flight call through the old funcref
- * is harmless (it simply finishes in the old instance). */
-#define WJ_ISLAND_BATCH_MAX 64
-static __thread MonoMethod *wj_island_batch [WJ_ISLAND_BATCH_MAX];
-static __thread int wj_island_batch_n;
-static __thread gboolean wj_island_batch_open;
-
-static void
-wj_island_batch_note (MonoMethod *m)
-{
-	int i;
-	if (!wj_island_batch_open || wj_island_batch_n >= WJ_ISLAND_BATCH_MAX)
-		return;
-	for (i = 0; i < wj_island_batch_n; i++)
-		if (wj_island_batch [i] == m)
-			return;
-	wj_island_batch [wj_island_batch_n++] = m;
-}
-
-/* Re-emit everything collected under this island root into one module and swap it in. Best effort: on
- * any failure the standalone modules stay installed and published, so this can only cost compile time. */
-static void
-wj_island_batch_flush (void)
-{
-	extern int mono_wasm_jit_batch_begin (void);
-	extern void mono_wasm_jit_batch_end (void);
-	extern int mono_wasm_jit_batch_count (void);
-	extern MonoMethod *mono_wasm_jit_batch_member_method (int i);
-	extern int mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_bytes, int *out_len, char *errbuf, int errcap);
-	extern int mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_slots, int n, void *bytes, int len);
-	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
-	extern int mono_wasm_jit_verbose;
-	int e_slots [WJ_ISLAND_BATCH_MAX], f_slots [WJ_ISLAND_BATCH_MAX], descs [WJ_ISLAND_BATCH_MAX];
-	MonoMethod *mm [WJ_ISLAND_BATCH_MAX];
-	int i, bn = 0, total = wj_island_batch_n;
-	gboolean bok = TRUE;
-
-	{
-		extern int mono_wasm_jit_batch_module;
-		if (mono_wasm_jit_batch_module >= 3) {
-			/* Whole-program mode owns the batching; per-island batches would claim these members
-			 * (re->batch set) and the program-wide pass would find nothing left to co-locate. */
-			wj_island_batch_open = FALSE;
-			wj_island_batch_n = 0;
-			return;
-		}
-	}
-	wj_island_batch_open = FALSE;
-	wj_island_batch_n = 0;
-	/* One member is just the status quo with an extra compile — co-location only pays across methods.
-	 * MONO_WASM_JIT_BATCH_MODULE=2 forces single-member batches anyway: it exercises the whole batched
-	 * path (encoder, instantiate-batch, registry bind, slot swap) with no cross-member index interaction,
-	 * which is the bisect for "is the framing wrong, or does one member's indices bleed into another's". */
-	{
-		extern int mono_wasm_jit_batch_module;
-		if (total < 2 && mono_wasm_jit_batch_module != 2)
-			return;
-	}
-
-	for (i = 0; i < total; i++) {
-		InterpMethod *cim = mono_interp_get_imethod (wj_island_batch [i]);
-		if (!cim || cim->wasm_jit_fslot <= 0 || cim->wasm_jit_slot <= 0 || cim->wasm_jit_desc <= 0)
-			continue;   /* never published, or bailed after all */
-		mm [bn] = wj_island_batch [i];
-		e_slots [bn] = cim->wasm_jit_slot;
-		f_slots [bn] = cim->wasm_jit_fslot;
-		descs [bn] = cim->wasm_jit_desc;
-		bn++;
-	}
-	{
-		extern int mono_wasm_jit_batch_module;
-		if (bn < 1 || (bn < 2 && mono_wasm_jit_batch_module != 2))
-			return;
-		/* mode 2: one module per member, so a failure cannot be cross-member contamination. */
-		if (mono_wasm_jit_batch_module == 2)
-			bn = 1;
-	}
-
-	/* mono_wasm_force_compile does NOT take wj_compiling (unlike compile_publish), and a concurrent
-	 * compile on another thread would race the shared emitter state. Skip the batch rather than risk it. */
-	if (mono_atomic_cas_i32 (&wj_compiling, 1, 0) != 0)
-		return;
-	if (!mono_wasm_jit_batch_begin ()) { mono_atomic_store_i32 (&wj_compiling, 0); return; }
-
-	for (i = 0; i < bn; i++) {
-		MonoWasmJitResult rb;
-		memset (&rb, 0, sizeof (rb));
-		mono_wasm_force_compile (mm [i], &rb);
-		/* Exactly one capture per member; anything else means the re-emit bailed or substituted a
-		 * different method, and the member order would no longer match e_slots/f_slots. */
-		if (mono_wasm_jit_batch_count () != i + 1 || mono_wasm_jit_batch_member_method (i) != mm [i]) { bok = FALSE; break; }
-	}
-	if (bok) {
-		void *bbytes = NULL;
-		int blen = 0;
-		char berr [192];
-		berr [0] = 0;
-		if (mono_wasm_jit_batch_finish (e_slots, f_slots, &bbytes, &blen, berr, (int) sizeof (berr)) == bn &&
-		    mono_wasm_jit_batch_bind (descs, e_slots, f_slots, bn, bbytes, blen)) {
-			for (i = 0; i < bn; i++) {
-				InterpMethod *cim = mono_interp_get_imethod (mm [i]);
-				if (cim) { cim->wasm_jit_bytes = bbytes; cim->wasm_jit_bytes_len = blen; }
-			}
-			if (mono_wasm_jit_verbose >= 1)
-				printf ("WASM_JIT_BATCH members=%d bytes=%d\n", bn, blen);
-		} else {
-			g_free (bbytes);
-			if (mono_wasm_jit_verbose >= 1)
-				printf ("WASM_JIT_BATCH_FAIL members=%d : %s (keeping standalone modules)\n", bn, berr);
-		}
-	} else if (mono_wasm_jit_verbose >= 1) {
-		printf ("WASM_JIT_BATCH_ABANDON members=%d (re-emit diverged)\n", bn);
-	}
-	mono_wasm_jit_batch_end ();
-	mono_atomic_store_i32 (&wj_compiling, 0);
-}
-
-/* MONO_WASM_JIT_BATCH_MODULE=3 — whole-program co-location, as an UPPER BOUND experiment.
- *
- * Per-island batching turned out to be partitioned by compile order rather than by call graph: a callee
- * already JITted by an earlier root cannot join a later root's island (force_island returns early on
- * wasm_jit_fslot > 0), so hot edges routinely straddle module boundaries and 14 of 30 batches were just
- * 2 members. That predicts little inlining benefit, and measured as a 4% regression.
- *
- * This mode answers the question that decides whether smarter partitioning is worth building: if EVERY
- * registered method shares one module — so no intra-program call can be cross-module — does co-location
- * pay at all? If yes, partitioning is the whole story. If no, the microbenchmark's 6x does not transfer
- * to this workload and closure discovery is not worth building.
- *
- * Not a shipping path: it re-emits the entire program in one go. */
-static gboolean wj_rebatch_all_done;
-
-static void
-wj_rebatch_all (void)
-{
-	extern int mono_wasm_jit_batch_begin (void);
-	extern void mono_wasm_jit_batch_end (void);
-	extern int mono_wasm_jit_batch_count (void);
-	extern MonoMethod *mono_wasm_jit_batch_member_method (int i);
-	extern int mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots, void **out_bytes, int *out_len, char *errbuf, int errcap);
-	extern int mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_slots, int n, void *bytes, int len);
-	extern int mono_wasm_jit_reg_count (void);
-	extern int mono_wasm_jit_reg_entry (int i, MonoMethod **out_method, int *out_e, int *out_f, int *out_desc);
-	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
-	extern int mono_wasm_jit_verbose;
-	int cap = mono_wasm_jit_reg_count ();
-	MonoMethod **mm;
-	int *e_slots, *f_slots, *descs;
-	int i, bn = 0;
-	gboolean bok = TRUE;
-
-	if (cap <= 1) {
-		if (mono_wasm_jit_verbose >= 1)
-			printf ("WASM_JIT_REBATCH_ALL_SKIP registry empty (cap=%d)\n", cap);
-		return;
-	}
-	if (mono_atomic_cas_i32 (&wj_compiling, 1, 0) != 0) {
-		if (mono_wasm_jit_verbose >= 1)
-			printf ("WASM_JIT_REBATCH_ALL_BUSY (another thread compiling; will retry)\n");
-		return;
-	}
-	wj_rebatch_all_done = TRUE;
-
-	mm = g_new0 (MonoMethod *, cap);
-	e_slots = g_new0 (int, cap);
-	f_slots = g_new0 (int, cap);
-	descs = g_new0 (int, cap);
-	for (i = 0; i < cap; i++) {
-		MonoMethod *m = NULL;
-		int e = 0, f = 0, d = 0;
-		if (!mono_wasm_jit_reg_entry (i, &m, &e, &f, &d))
-			continue;
-		mm [bn] = m; e_slots [bn] = e; f_slots [bn] = f; descs [bn] = d;
-		bn++;
-	}
-	if (bn < 2 || !mono_wasm_jit_batch_begin ()) {
-		if (mono_wasm_jit_verbose >= 1)
-			printf ("WASM_JIT_REBATCH_ALL_SKIP usable=%d of %d registered (need >= 2)\n", bn, cap);
-		g_free (mm); g_free (e_slots); g_free (f_slots); g_free (descs);
-		mono_atomic_store_i32 (&wj_compiling, 0);
-		return;
-	}
-	for (i = 0; i < bn; i++) {
-		MonoWasmJitResult rb;
-		memset (&rb, 0, sizeof (rb));
-		mono_wasm_force_compile (mm [i], &rb);
-		if (mono_wasm_jit_batch_count () != i + 1 || mono_wasm_jit_batch_member_method (i) != mm [i]) {
-			/* Drop the divergent tail rather than abandoning: with hundreds of members one method that
-			 * refuses to re-emit should not cost the whole experiment. */
-			bn = i;
-			bok = bn >= 2;
-			break;
-		}
-	}
-	if (bok) {
-		void *bbytes = NULL;
-		int blen = 0;
-		char berr [192];
-		berr [0] = 0;
-		if (mono_wasm_jit_batch_finish (e_slots, f_slots, &bbytes, &blen, berr, (int) sizeof (berr)) == bn &&
-		    mono_wasm_jit_batch_bind (descs, e_slots, f_slots, bn, bbytes, blen)) {
-			for (i = 0; i < bn; i++) {
-				InterpMethod *cim = mono_interp_get_imethod (mm [i]);
-				if (cim) { cim->wasm_jit_bytes = bbytes; cim->wasm_jit_bytes_len = blen; }
-			}
-			if (mono_wasm_jit_verbose >= 1)
-				printf ("WASM_JIT_REBATCH_ALL members=%d bytes=%d (of %d registered)\n", bn, blen, cap);
-		} else {
-			g_free (bbytes);
-			printf ("WASM_JIT_REBATCH_ALL_FAIL members=%d : %s\n", bn, berr);
-		}
-	} else {
-		printf ("WASM_JIT_REBATCH_ALL_ABANDON (re-emit diverged at member %d)\n", bn);
-	}
-	mono_wasm_jit_batch_end ();
-	g_free (mm); g_free (e_slots); g_free (f_slots); g_free (descs);
-	mono_atomic_store_i32 (&wj_compiling, 0);
-}
-
-/* --- automatic graph batcher ----------------------------------------------------------------------
- *
- * Standalone wasm-JIT modules are the discovery tier: they publish immediately, so tiering latency is
- * unchanged, while their immutable direct-dependency lists plus interpreter/vcall feedback accumulate a
- * call graph independent of force_island's compile order.  Once the graph has stopped gaining methods or
- * target edges for MONO_WASM_JIT_BATCH_SETTLE managed->JIT boundaries, this planner:
- *
- *   1. gives exact direct dependencies a caller-hotness weight;
- *   2. overlays interpreter entry/vcall samples and this worker's JIT PIC target counts;
- *   3. greedily joins the strongest connected components under member/byte caps;
- *   4. re-emits each component with its complete membership predeclared, so intra-batch direct calls can
- *      use `call funcidx` even when the callee appears later in registry order.
- *
- * Each plateau may monotonically merge complete prior components into a larger generation. WjBatchDesc
- * generations make that table patch visible on every worker while old modules remain alive for calls
- * already in flight. Components never split, so a rebatch cannot orphan siblings from an older module. */
-#define WJ_AUTO_BATCH_CANDIDATES 512
-
-typedef struct {
-	MonoMethod *method;
-	MonoMethod *body_method;
-	int reg_index;
-	int bytes;
-	guint32 generation;
-	int parent;
-	int members;
-	int cluster_bytes;
-	/* Inline eligibility, in the planner's own terms. V8 will only inline a callee whose FUNCTION BODY is
-	 * <= wasm_inlining_max_size (500 wire bytes). The planner cannot see body size -- membership has to be
-	 * fixed before anything is emitted -- but the registry retains body_len, the standalone MODULE size,
-	 * and the two are tightly related: measured over 23,330 modules of a whole-tier dump,
-	 *     body ~= 0.987 * module - 419          (the framing overhead is very nearly constant)
-	 * so module <= 932 B predicts body <= 500 B with 97.7% accuracy (0.9% false positives). */
-	guint8 small;        /* predicted to fit under V8's inline cap */
-	int nsmall;          /* on a component ROOT: how many of its members are `small` */
-} WjAutoNode;
-
-typedef struct {
-	guint16 a, b;
-	guint64 weight;
-} WjAutoEdge;
-
-/* Calibrated against a whole-tier dump (23,330 modules): body ~= 0.987 * module - 419, so a standalone
- * module of 932 B predicts a function body of 500 B -- V8's wasm_inlining_max_size. 97.7% accurate, 0.9%
- * false positives. Deliberately the accurate threshold rather than the strictly-safe one (800 B, 100%
- * precision but 92.5% recall): a false positive costs one wasted co-location, a false negative discards a
- * real candidate, and candidates are the scarce thing -- only 22.8% of execution-weighted mass is under
- * the cap at all. */
-#define WJ_INLINE_MODULE_BYTES 932
-/* NOTE: v8's InliningTree::kMaxInlinedCount (60) is deliberately NOT used as a per-module cap here. It
- * bounds how many callees are inlined INTO ONE FUNCTION, not how many inlinable functions a module may
- * hold. Capping a component's inline-eligible members at 60 was measured to cut inline-eligible
- * intra-module calls from 6,126 to 3,919 -- it blocked the growth that was working. */
-
-static int
-wj_auto_find (WjAutoNode *nodes, int n, MonoMethod *m)
-{
-	int i;
-	for (i = 0; i < n; ++i)
-		if (nodes [i].method == m)
-			return i;
-	return -1;
-}
-
-/* "Some observed direct call between these two nodes has a callee under V8's inline cap."
- *
- * Built from the direct-dep edges rather than from the weight table, because the weight table is symmetric
- * and inline eligibility is not: whether co-locating i and j can produce an inlinable call depends on the
- * size of whichever one is CALLED, not on either in isolation. Indexed by ORIGINAL node index, so the merge
- * loop must consult it with the edge's endpoints and not with their current component roots. */
-static gboolean
-wj_auto_pair_inlinable (const guint8 *pair_ok, int n, int i, int j)
-{
-	if (i < 0 || j < 0 || i >= n || j >= n)
-		return FALSE;
-	return pair_ok [(gsize) i * n + j] || pair_ok [(gsize) j * n + i];
-}
-
-static int
-wj_auto_root (WjAutoNode *nodes, int i)
-{
-	int r = i;
-	while (nodes [r].parent != r)
-		r = nodes [r].parent;
-	while (nodes [i].parent != i) {
-		int next = nodes [i].parent;
-		nodes [i].parent = r;
-		i = next;
-	}
-	return r;
-}
-
-static int
-wj_auto_edge_cmp (const void *ap, const void *bp)
-{
-	const WjAutoEdge *a = (const WjAutoEdge *) ap;
-	const WjAutoEdge *b = (const WjAutoEdge *) bp;
-	if (a->weight < b->weight) return 1;
-	if (a->weight > b->weight) return -1;
-	return 0;
-}
-
-static void
-wj_auto_weight (guint64 *weights, int n, int a, int b, guint64 add)
-{
-	guint64 *p;
-	if (a < 0 || b < 0 || a == b || !add)
-		return;
-	if (a > b) { int t = a; a = b; b = t; }
-	p = &weights [(gsize) a * n + b];
-	*p = G_MAXUINT64 - *p < add ? G_MAXUINT64 : *p + add;
-}
-
-/* Emit and bind one already-published component.  Best effort: a divergent re-emit leaves every
- * standalone module installed.  The predeclared set means partial-tail batching is not legal here. */
-static gboolean
-wj_auto_emit_cluster (MonoMethod **mm, MonoMethod **body_mm, int n, gboolean *out_replan)
-{
-	extern int mono_wasm_jit_batch_begin_members (MonoMethod *const *members, int n);
-	extern void mono_wasm_jit_batch_end (void);
-	extern int mono_wasm_jit_batch_count (void);
-	extern MonoMethod *mono_wasm_jit_batch_member_method (int i);
-	extern int mono_wasm_jit_batch_finish (const int *e_slots, const int *f_slots,
-		void **out_bytes, int *out_len, char *errbuf, int errcap);
-	extern int mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots,
-		const int *f_slots, int n, void *bytes, int len);
-	extern int mono_wasm_jit_reg_count (void);
-	extern int mono_wasm_jit_reg_entry (int i, MonoMethod **out_method, int *out_e,
-		int *out_f, int *out_desc);
-	extern int mono_wasm_jit_reg_mark_batch_incompatible (MonoMethod *method);
-	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
-	extern int mono_wasm_jit_verbose;
-	int *e_slots, *f_slots, *descs;
-	int i, cap, found = 0, blen = 0, failed_at = -1;
-	void *bbytes = NULL;
-	char berr [192];
-	gboolean ok = TRUE;
-
-	if (!mm || !body_mm || n < 2)
-		return FALSE;
-	if (out_replan)
-		*out_replan = FALSE;
-	e_slots = g_new0 (int, n);
-	f_slots = g_new0 (int, n);
-	descs = g_new0 (int, n);
-	cap = mono_wasm_jit_reg_count ();
-	for (i = 0; i < n; ++i) {
-		int r;
-		for (r = 0; r < cap; ++r) {
-			MonoMethod *m = NULL;
-			int e = 0, f = 0, d = 0;
-			if (mono_wasm_jit_reg_entry (r, &m, &e, &f, &d) && m == mm [i]) {
-				e_slots [i] = e; f_slots [i] = f; descs [i] = d; found++;
-				break;
-			}
-		}
-	}
-	if (found != n || !mono_wasm_jit_batch_begin_members (body_mm, n)) {
-		ok = FALSE;
-		goto out;
-	}
-	for (i = 0; i < n; ++i) {
-		MonoWasmJitResult rb;
-		memset (&rb, 0, sizeof (rb));
-		mono_wasm_force_compile (mm [i], &rb);
-		if (mono_wasm_jit_batch_count () != i + 1 ||
-		    mono_wasm_jit_batch_member_method (i) != body_mm [i]) {
-			ok = FALSE;
-			failed_at = i;
-			break;
-		}
-	}
-	berr [0] = 0;
-	if (ok && mono_wasm_jit_batch_finish (e_slots, f_slots, &bbytes, &blen,
-	                                      berr, (int) sizeof (berr)) == n &&
-	    mono_wasm_jit_batch_bind (descs, e_slots, f_slots, n, bbytes, blen)) {
-		for (i = 0; i < n; ++i) {
-			InterpMethod *im = mono_interp_get_imethod (mm [i]);
-			if (im) { im->wasm_jit_bytes = bbytes; im->wasm_jit_bytes_len = blen; }
-		}
-		if (mono_wasm_jit_verbose >= 1)
-			printf ("WASM_JIT_AUTO_BATCH members=%d bytes=%d\n", n, blen);
-		bbytes = NULL; /* registry owns it */
-	} else {
-		int quarantined = failed_at >= 0 ?
-			mono_wasm_jit_reg_mark_batch_incompatible (mm [failed_at]) : 0;
-		if (quarantined && out_replan)
-			*out_replan = TRUE;
-		if (mono_wasm_jit_verbose >= 1) {
-			char *failed_name = failed_at >= 0 ? mono_method_get_full_name (body_mm [failed_at]) : NULL;
-			printf ("WASM_JIT_AUTO_BATCH_%s members=%d%s%s%s%s%s\n",
-				ok ? "FAIL" : "ABANDON", n,
-				failed_name ? " at " : "", failed_name ? failed_name : "",
-				quarantined ? " (quarantined)" : "",
-				berr [0] ? " : " : "", berr);
-			g_free (failed_name);
-		}
-		ok = FALSE;
-	}
-	mono_wasm_jit_batch_end ();
-out:
-	g_free (bbytes);
-	g_free (e_slots); g_free (f_slots); g_free (descs);
-	return ok;
-}
-
-/* Build one cumulative snapshot and batch every sufficiently connected component. */
-static int
-wj_auto_batch_plan (gboolean force_pending, gboolean *out_replan)
-{
-	extern int mono_wasm_jit_reg_count (void);
-	extern int mono_wasm_jit_reg_entry (int i, MonoMethod **out_method, int *out_e,
-		int *out_f, int *out_desc);
-	extern int mono_wasm_jit_reg_graph_entry (int i, MonoMethod **out_method, int *out_len,
-		int *out_ndeps, gboolean *out_batched);
-	extern MonoMethod *mono_wasm_jit_reg_graph_dep (int i, int dep);
-	extern guint32 mono_wasm_jit_reg_batch_generation (int i);
-	extern MonoMethod *mono_wasm_jit_reg_body_method (int i);
-	extern int mono_wasm_jit_reg_batch_incompatible (int i);
-	extern int mono_wasm_jit_batch_max, mono_wasm_jit_batch_bytes, mono_wasm_jit_batch_inline;
-	extern int mono_wasm_jit_verbose;
-	WjAutoNode nodes [WJ_AUTO_BATCH_CANDIDATES];
-	guint64 *weights;
-	guint8 *pair_ok;      /* n*n: caller i -> callee j where j is predicted inline-eligible */
-	WjAutoEdge *edges;
-	MonoMethod **members, **body_members;
-	int cap = mono_wasm_jit_reg_count ();
-	int i, j, n = 0, ne = 0, emitted = 0;
-	int skipped_nosmall = 0;
-	guint64 total_weight = 0, internal_weight = 0;
-	gboolean replan = FALSE;
-
-	if (out_replan)
-		*out_replan = FALSE;
-
-	/* Candidate identity/size comes from the immutable registry.  Previously batched methods stay in
-	 * the graph: their generation is pre-unioned below, making an old batch indivisible while allowing
-	 * new edges to merge the complete old component into a larger generation. */
-	for (i = 0; i < cap && n < WJ_AUTO_BATCH_CANDIDATES; ++i) {
-		MonoMethod *m = NULL;
-		int len = 0, ndeps = 0, e = 0, f = 0, d = 0;
-		if (!mono_wasm_jit_reg_graph_entry (i, &m, &len, &ndeps, NULL) ||
-		    !mono_wasm_jit_reg_entry (i, &m, &e, &f, &d) ||
-		    mono_wasm_jit_reg_batch_incompatible (i))
-			continue;
-		nodes [n].method = m;
-		nodes [n].body_method = mono_wasm_jit_reg_body_method (i);
-		if (!nodes [n].body_method)
-			nodes [n].body_method = m;
-		nodes [n].reg_index = i;
-		nodes [n].bytes = len > 0 ? len : 1;
-		nodes [n].generation = mono_wasm_jit_reg_batch_generation (i);
-		nodes [n].parent = n;
-		nodes [n].members = 1;
-		nodes [n].cluster_bytes = nodes [n].bytes;
-		nodes [n].small = mono_wasm_jit_batch_inline && nodes [n].bytes > 0 &&
-			nodes [n].bytes <= WJ_INLINE_MODULE_BYTES;
-		nodes [n].nsmall = nodes [n].small ? 1 : 0;
-		n++;
-	}
-	if (n < 2)
-		return 0;
-	weights = g_new0 (guint64, (gsize) n * n);
-	pair_ok = g_new0 (guint8, (gsize) n * n);
-
-	/* Preserve old ownership before considering new graph edges.  This is both the migration safety
-	 * rule (no sibling remains pointed at an orphaned old batch) and the bottom-up island mechanism:
-	 * components only grow across generations; they never split or reshuffle. */
-	for (i = 0; i < n; ++i) {
-		if (!nodes [i].generation)
-			continue;
-		for (j = i + 1; j < n; ++j) {
-			int a, b;
-			if (nodes [j].generation != nodes [i].generation)
-				continue;
-			a = wj_auto_root (nodes, i);
-			b = wj_auto_root (nodes, j);
-			if (a == b)
-				continue;
-			nodes [b].parent = a;
-			nodes [a].members += nodes [b].members;
-			nodes [a].cluster_bytes += nodes [b].cluster_bytes;
-			nodes [a].nsmall += nodes [b].nsmall;
-		}
-	}
-
-	/* Exact surviving direct-call topology. Caller interp hit count is the best cheap volume prior:
-	 * hot roots retain a large value; bottom-up-only callees still enter through that caller's edge. */
-	for (i = 0; i < n; ++i) {
-		int len = 0, ndeps = 0;
-		InterpMethod *cim = mono_interp_get_imethod (nodes [i].method);
-		guint64 prior = cim && cim->wasm_jit_hits > 0 ? (guint64) cim->wasm_jit_hits : 1;
-		mono_wasm_jit_reg_graph_entry (nodes [i].reg_index, NULL, &len, &ndeps, NULL);
-		for (j = 0; j < ndeps; ++j) {
-			int callee = wj_auto_find (nodes, n, mono_wasm_jit_reg_graph_dep (nodes [i].reg_index, j));
-			wj_auto_weight (weights, n, i, callee, prior);
-			/* This is the only place the CALL DIRECTION is still known, so it is where inline
-			 * eligibility has to be recorded: i calls callee, so what matters is callee's size. */
-			if (callee >= 0 && nodes [callee].small)
-				pair_ok [(gsize) i * n + callee] = 1;
-		}
-	}
-
-	/* Interpreter evidence is cumulative and precedes method-JIT hotness. Entry edges cover direct and
-	 * resolved virtual transitions; per-caller vprof supplies virtual target evidence even before the
-	 * target became a JIT module. */
-	for (i = 0; i < WJ_EDGE_SLOTS; ++i) {
-		WjEntryEdge *e = &wj_entry_edges [i];
-		if (e->state == 2)
-			wj_auto_weight (weights, n, wj_auto_find (nodes, n, e->caller),
-				wj_auto_find (nodes, n, e->callee), (guint64) e->count * 4);
-	}
-	/* ONE read of the call profile, replacing the two that used to be reconciled here with hand-picked
-	 * multipliers (interp vprof x4, worker PIC x8). Those constants existed only because the two counters
-	 * were not commensurable -- one counted interpreter observations before the caller was JITted, the
-	 * other counted per-worker IC inserts after. They are the same counter now, so there is one weight. */
-	for (i = 0; i < n; ++i) {
-		InterpMethod *cim = mono_interp_get_imethod (nodes [i].method);
-		WjCallProfile *p = cim ? (WjCallProfile *) cim->wasm_jit_profile : NULL;
-		guint32 k, pn = p ? p->n : 0;
-		if (pn > WJ_PROF_MAX_SITES) pn = WJ_PROF_MAX_SITES;
-		for (k = 0; k < pn; ++k)
-			wj_auto_weight (weights, n, i, wj_auto_find (nodes, n, p->sites [k].target),
-				(guint64) p->sites [k].total * 4);
-	}
-
-	edges = g_new (WjAutoEdge, (gsize) n * (n - 1) / 2);
-	for (i = 0; i < n; ++i)
-		for (j = i + 1; j < n; ++j)
-			if (weights [(gsize) i * n + j]) {
-				edges [ne].a = (guint16) i;
-				edges [ne].b = (guint16) j;
-				edges [ne].weight = weights [(gsize) i * n + j];
-				total_weight += edges [ne].weight;
-				ne++;
-			}
-	qsort (edges, ne, sizeof (WjAutoEdge), wj_auto_edge_cmp);
-	for (i = 0; i < ne; ++i) {
-		int a = wj_auto_root (nodes, edges [i].a);
-		int b = wj_auto_root (nodes, edges [i].b);
-		if (a == b) {
-			internal_weight += edges [i].weight;
-			continue;
-		}
-		if (nodes [a].members + nodes [b].members > mono_wasm_jit_batch_max ||
-		    nodes [a].cluster_bytes + nodes [b].cluster_bytes > mono_wasm_jit_batch_bytes)
-			continue;
-		if (mono_wasm_jit_batch_inline) {
-			/* Co-locating two methods pays only if it turns a call between them into one V8 will
-			 * INLINE, and that depends on the CALLEE's size alone -- a small caller of a huge callee
-			 * gains nothing. So the test has to be DIRECTIONAL, which the weight table is not: it is
-			 * symmetric and direction is gone by the time this spanning merge runs. `inlinable_pair`
-			 * is therefore built alongside the weights, from the direct-dep edges, and records "some
-			 * observed call between these two has a callee under the cap".
-			 *
-			 * The first version of this gate tested `small` on either endpoint instead, which let
-			 * through every hot edge whose SMALL side was the caller. */
-			if (!wj_auto_pair_inlinable (pair_ok, n, edges [i].a, edges [i].b)) {
-				skipped_nosmall++;
-				continue;
-			}
-			/* NO kMaxInlinedCount CAP HERE, and the first version of this code was wrong to add one.
-			 * kMaxInlinedCount (60) bounds how many callees V8 inlines INTO ONE FUNCTION -- it says
-			 * nothing about how many inlinable functions may coexist in a module. Capping a component's
-			 * inline-eligible member count at 60 therefore blocked exactly the growth that was working:
-			 * measured, it cut inline-eligible intra-module calls from 6,126 (no gate at all) to 3,919.
-			 * The engine limit that does apply per module is the code-space/compile cost, which
-			 * batch_bytes already bounds. */
-		}
-		if (nodes [a].members < nodes [b].members) { int t = a; a = b; b = t; }
-		nodes [b].parent = a;
-		nodes [a].members += nodes [b].members;
-		nodes [a].cluster_bytes += nodes [b].cluster_bytes;
-		nodes [a].nsmall += nodes [b].nsmall;
-		internal_weight += edges [i].weight;
-	}
-
-	members = g_new (MonoMethod *, n);
-	body_members = g_new (MonoMethod *, n);
-	if (mono_wasm_jit_verbose >= 1)
-		{
-			int nsm = 0;
-			for (j = 0; j < n; ++j) if (nodes [j].small) nsm++;
-			printf ("WASM_JIT_AUTO_PLAN candidates=%d small=%d edges=%d edge_cover=%.1f%% caps=%d/%d inline=%d skip_noninlinable=%d\n",
-				n, nsm, ne, total_weight ? 100.0 * (double) internal_weight / (double) total_weight : 0.0,
-				mono_wasm_jit_batch_max, mono_wasm_jit_batch_bytes,
-				mono_wasm_jit_batch_inline, skipped_nosmall);
-		}
-	for (i = 0; i < n; ++i) {
-		int root, nm = 0;
-		int largest_old = 0;
-		guint32 generation = 0;
-		gboolean unchanged = TRUE;
-		if (wj_auto_root (nodes, i) != i || nodes [i].members < 2)
-			continue;
-		root = i;
-		for (j = 0; j < n; ++j) {
-			if (wj_auto_root (nodes, j) == root) {
-				members [nm++] = nodes [j].method;
-				body_members [nm - 1] = nodes [j].body_method;
-				if (!generation)
-					generation = nodes [j].generation;
-				if (!nodes [j].generation || nodes [j].generation != generation)
-					unchanged = FALSE;
-				if (nodes [j].generation) {
-					int k, old_members = 0;
-					for (k = 0; k < n; ++k)
-						if (wj_auto_root (nodes, k) == root &&
-						    nodes [k].generation == nodes [j].generation)
-							old_members++;
-					if (old_members > largest_old)
-						largest_old = old_members;
-				}
-			}
-		}
-		/* The component already has exactly this membership. New call counts cannot make it more
-		 * co-located, so retain its current generation until a topology edge grows the component. */
-		if (unchanged && generation)
-			continue;
-		/* Do not rebuild a mature island for every newly discovered leaf.  Keep accumulating the
-		 * logical component until it has grown by 25%, with a 4..16 member window.  A connection to
-		 * another sizeable old batch counts as growth, so genuinely merging hot paths still happens
-		 * promptly; the cap bounds how long any cross-generation edge remains indirect. */
-		if (largest_old && !force_pending) {
-			int need = largest_old / 4;
-			if (need < 4) need = 4;
-			if (need > 16) need = 16;
-			if (nm - largest_old < need)
-				continue;
-		}
-		if (nm >= 2) {
-			gboolean cluster_replan = FALSE;
-			if (wj_auto_emit_cluster (members, body_members, nm, &cluster_replan))
-				emitted += nm;
-			replan |= cluster_replan;
-		}
-	}
-	g_free (body_members);
-	g_free (members);
-	g_free (edges);
-	g_free (weights);
-	g_free (pair_ok);
-	if (out_replan)
-		*out_replan = replan;
-	return emitted;
-}
-
-/* Cheap quiescence detector. Called after a managed->JIT invocation has returned to the interpreter.
- * It samples process-wide topology every 16 boundaries, resetting when registrations, interp edges, or
- * interpreter vprof sites change. Counts may continue rising without delaying a stable plan.
- *
- * Do not include worker-local PIC identities in this global plateau key. Different workers legitimately
- * observe different target sets, so comparing one shared hash made the key oscillate forever. Worse, a
- * failed batch re-emit allocates fresh (initially empty) sites, making retries increasingly expensive.
- * The planner still consumes the invoking worker's PIC counts when weighting edges; the stable trigger is
- * the interpreter-tier graph, which is exactly the intended pre-JIT discovery source. */
-static void
-wj_auto_batch_poll (void)
-{
-	extern int mono_wasm_jit_batch_module, mono_wasm_jit_batch_settle, mono_wasm_jit_batch_min;
-	extern int mono_wasm_jit_reg_count (void);
-	extern int mono_wasm_jit_verbose;
-	static gint32 ticks, stable;
-	static int last_reg = -1, last_edges = -1;
-	static int planned_reg = -1, planned_edges = -1;
-	static int forced_reg = -1, forced_edges = -1;
-	int reg, edges;
-	gboolean force_pending;
-
-	if (mono_wasm_jit_batch_module != 1 || (++ticks & 15) != 0)
-		return;
-	reg = mono_wasm_jit_reg_count ();
-	edges = mono_atomic_load_i32 (&wj_entry_edge_topology) + wj_prof_sites;
-	if (reg != last_reg || edges != last_edges) {
-		last_reg = reg; last_edges = edges;
-		stable = 0;
-		return;
-	}
-	stable += 16;
-	if (reg < mono_wasm_jit_batch_min || stable < mono_wasm_jit_batch_settle)
-		return;
-	/* A plateau is planned once.  Rising hit counts do not change connected-component membership, and
-	 * repeatedly rescanning an unchanged graph was visible during the benchmark warmup.  One later
-	 * forced pass drains growth held by merge hysteresis after two fully quiet settle windows, early
-	 * enough that V8 can tier the replacement module before the application's steady state. */
-	force_pending = stable >= mono_wasm_jit_batch_settle * 2;
-	if (reg == planned_reg && edges == planned_edges) {
-		if (!force_pending ||
-		    (reg == forced_reg && edges == forced_edges))
-			return;
-	}
-	if (mono_atomic_cas_i32 (&wj_compiling, 1, 0) != 0)
-		return;
-	{
-		gboolean replan = FALSE;
-		int emitted = wj_auto_batch_plan (force_pending, &replan);
-		/* A newly quarantined intrinsic changes candidate topology without changing the registry
-		 * counters used by the plateau key. Leave this snapshot unplanned so the next sampled
-		 * boundary immediately retries the remaining graph exactly once. */
-		if (!replan) {
-			planned_reg = reg;
-			planned_edges = edges;
-			if (force_pending) {
-				forced_reg = reg;
-				forced_edges = edges;
-			}
-		}
-		if (emitted && mono_wasm_jit_verbose >= 1)
-			printf ("WASM_JIT_AUTO_SETTLED reg=%d stable=%d batched=%d edges=%d vtargets=%d\n",
-				reg, stable, emitted, edges, 0);
-		/* Do not spin every boundary when all remaining methods are isolated or a re-emit diverges. */
-		stable = replan ? stable : (emitted ? 0 : mono_wasm_jit_batch_settle / 2);
-	}
-	mono_atomic_store_i32 (&wj_compiling, 0);
-}
 
 /* Eagerly form a JIT island rooted at m: compile it; recursively compile its un-JITted DIRECT callees (the
  * residual=0 islands policy) and re-emit. Self-recursion is handled in the emitter (self-slot reservation).
@@ -3132,19 +2506,10 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 {
 	extern int mono_wasm_jit_island_depth;   /* Lever C: env-tunable recursion depth (default 10) */
 	extern int mono_wasm_jit_residual_perm;
-	extern int mono_wasm_jit_batch_module;
 	InterpMethod *im = mono_interp_get_imethod (m);
 	int tries, spos, pushed = 0, ret = 0;
-	/* Only the outermost frame owns the batch window: everything compiled beneath this root — m plus
-	 * every blocker pulled recursively — is one island and becomes one module. */
-	gboolean batch_root = FALSE;
 	if (im->wasm_jit_fslot > 0) return 1;          /* already JITted */
 	if (im->wasm_jit_slot == -1) return -1;        /* permanently bailed */
-	if (depth == 0 && mono_wasm_jit_batch_module >= 2 && !wj_island_batch_open) {
-		wj_island_batch_open = TRUE;
-		wj_island_batch_n = 0;
-		batch_root = TRUE;
-	}
 	if (depth > mono_wasm_jit_island_depth) { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_DEPTH_EXCEEDED); return 0; }
 	/* Push m so a deeper frame can see a cycle back to it (wj_scc_stack). */
 	spos = wj_scc_n;
@@ -3156,7 +2521,6 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 		(*budget)--;
 		r = wasm_jit_compile_publish (im, &res);
 		if (r == WASM_JIT_COMPILE_BUSY) { ret = r; goto pop; }  /* transient retry: don't park as if a blocker event is pending */
-		if (r == WASM_JIT_COMPILE_JITTED) wj_island_batch_note (m);
 		if (r != WASM_JIT_COMPILE_BLOCKED) { ret = r; goto pop; } /* JITted (1) or permanent (-1) */
 		if (res.nblockers == 0) { ret = WASM_JIT_COMPILE_BUSY; goto pop; } /* no blocker recorded -> transient retry */
 		/* Pull EVERY hot NON-cyclic blocking callee into the island this pass; defer cyclic (ancestor) blockers
@@ -3224,24 +2588,6 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 	ret = 0;
 pop:
 	if (pushed) wj_scc_n = spos;
-	/* Re-emit the island as one module. After the DFS has fully settled, so the member set is final —
-	 * and outside the recursion, so a nested root cannot flush a partial island. */
-	if (batch_root) {
-		wj_island_batch_flush ();
-		/* Mode 3: once enough of the program is compiled, re-emit ALL of it as one module. Threshold
-		 * rather than "every flush" because each pass re-emits the whole program. */
-		if (mono_wasm_jit_batch_module >= 3 && !wj_rebatch_all_done) {
-			extern int mono_wasm_jit_reg_count (void);
-			extern int mono_wasm_jit_batch_all_at;
-			extern int mono_wasm_jit_verbose;
-			static int wj_trig_seen;
-			wj_trig_seen++;
-			if (mono_wasm_jit_verbose >= 1 && (wj_trig_seen <= 3 || (wj_trig_seen % 50) == 0))
-				printf ("WASM_JIT_REBATCH_TRIG reg=%d need=%d\n", mono_wasm_jit_reg_count (), mono_wasm_jit_batch_all_at);
-			if (mono_wasm_jit_reg_count () >= mono_wasm_jit_batch_all_at)
-				wj_rebatch_all ();
-		}
-	}
 	return ret;
 }
 
@@ -3258,6 +2604,145 @@ pop:
  * woken because a blocker they were parked on just JITted). Runs whenever the queue is non-empty (not gated on
  * ENTRY_PROMOTE, so waiter wakes drain even with Lever A off). Force-compiling a method that's currently being
  * interpreted is safe — the live frame keeps interpreting; the f-slot is used on the next entry. */
+/*
+ * Re-emit at most `mono_wasm_jit_promotion_drain` queued methods. Runs from the same safe point as
+ * wasm_jit_drain_promotions -- outside the compile section, on an ordinary interpreter tick -- because
+ * force_compile runs managed code (cctors, class setup) and must not be re-entered from a dispatch path.
+ */
+static void
+wasm_jit_drain_reemits (void)
+{
+	extern int mono_wasm_jit_reemit, mono_wasm_jit_promotion_drain;
+	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
+	extern int mono_wasm_jit_desc_is_batched (int desc_id);
+	int n;
+
+	{
+		/* NOT DURING BOOT. A re-emit that wins the CAS runs a full mini_method_compile, and during boot
+		 * that competes directly with the compiles boot itself needs.
+		 *
+		 * MEASURED (R174 bisect): five arms wedged before the main screen, always with reemit > 0 and
+		 * never with reemit = 0. The arm that kept the trigger and the queue but made the drain
+		 * UNREACHABLE (`reemit_after=999999`) booted clean at 48.19 ms -- so it is the RECOMPILES, not the
+		 * enqueue on the interp->JIT path, and the first gate's default was simply too low: boot registers
+		 * ~9,200 methods (R166) and the gate opened at 4,000, i.e. mid-boot. */
+		extern int mono_wasm_jit_reemit_after, mono_wasm_jit_registry_count (void);
+		if (mono_wasm_jit_registry_count () < mono_wasm_jit_reemit_after)
+			return;
+	}
+	if (mono_wasm_jit_reemit <= 0 || wj_reemit_head == wj_reemit_tail)
+		return;
+	for (n = 0; n < mono_wasm_jit_promotion_drain; ++n) {
+		gint32 h = wj_reemit_head;
+		MonoMethod *pm;
+		InterpMethod *im;
+		MonoWasmJitResult r;
+		int old_e, old_f, rc;
+
+		if (h == wj_reemit_tail)
+			break;
+		pm = wj_reemit_q [h & (WJ_REEMIT_Q - 1)];
+		wj_reemit_head = h + 1;
+		if (!pm)
+			continue;
+		im = mono_interp_get_imethod (pm);
+		if (!im || im->wasm_jit_reemit_state != 1)
+			continue;
+		{
+			/* AND THE METHOD'S OWN PROFILE MUST HAVE MOVED ON. The gate above is about the PROCESS being
+			 * past boot; this one is about THIS METHOD's profile being worth recompiling for.
+			 *
+			 * Descriptor ids are handed out in registration order, so `registry_count - desc` is how many
+			 * methods the tier has taken on since this one was compiled -- a self-scaling proxy for "the
+			 * call profile has learned a lot since codegen last read it", which is the entire premise
+			 * (R169: 78.8% of profile observations arrive after the method was emitted). Re-emitting a
+			 * method whose profile has barely changed spends a full mini_method_compile for nothing. */
+			extern int mono_wasm_jit_reemit_age, mono_wasm_jit_registry_count (void);
+			if (im->wasm_jit_desc > 0 &&
+			    mono_wasm_jit_registry_count () - im->wasm_jit_desc < mono_wasm_jit_reemit_age) {
+				/* NOT STALE ENOUGH YET -- drop it back to state 0 and DO NOT RE-ENQUEUE.
+				 *
+				 * Re-enqueueing here (the first version) pops an item and pushes it straight back:
+				 * head and tail both advance, the queue never drains, and the drain spends its whole
+				 * per-call budget shuffling the same methods. Measured: **35,617,130 enqueues for 4
+				 * completed re-emits**, and the arm ran SLOWER than control (57.35 vs 53.06 ms) purely
+				 * from the queue traffic.
+				 *
+				 * State 0 is self-healing without any of that: the method is still hot, so the next
+				 * interp->JIT entry re-queues it through the ordinary trigger, by which time it may
+				 * actually be stale enough. */
+				im->wasm_jit_reemit_state = 0;
+				continue;
+			}
+		}
+		/* IN FLIGHT, not done: state 3 is what opens the early-out in wasm_jit_compile_publish. Setting
+		 * 2 here (the first version) left the gate shut, so every re-emit returned the existing slots
+		 * without compiling and still counted as done. Set 2 only after the call returns; the "once"
+		 * guarantee survives because wj_reemit_enqueue only ever enqueues from state 0. */
+		im->wasm_jit_reemit_state = 3;
+
+		old_e = im->wasm_jit_slot;
+		old_f = im->wasm_jit_fslot;
+		/* Refuse anything whose slots are not a live, ordinary pair, and anything CO-LOCATED: re-framing
+		 * one member of a group would leave its siblings pointing at a module that no longer exists,
+		 * which is the same constraint mono_wasm_jit_rebatch enforces when it refuses a batched member. */
+		if (old_e <= 0 || old_f <= 0 || mono_wasm_jit_desc_is_batched (im->wasm_jit_desc)) {
+			im->wasm_jit_reemit_state = 2;
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_REFUSED);
+			continue;
+		}
+		/* PIN THE SLOTS. mono_wasm_jit_self_reserved is what the emitter asks for its own e/f, and it is
+		 * populated only when the method needed a slot to bake a self-call. A non-recursive method would
+		 * therefore be handed a FRESH pair here -- leaking the old one and leaving every caller that baked
+		 * the old f-slot calling a now-orphaned module. Seeding the self-reservation from the live slots
+		 * makes re-emission reuse them, which is exactly what that field is documented to be for
+		 * ("held ACROSS re-emits"). */
+		im->wasm_jit_self_resv_eslot = old_e;
+		im->wasm_jit_self_resv_fslot = old_f;
+		/* The pin proper: keyed on the MonoMethod so it survives compile_publish re-looking-up the
+		 * InterpMethod. The self_resv seed above is kept as a belt-and-braces second source. */
+		wj_reemit_pin_m = pm;
+		wj_reemit_pin_e = old_e;
+		wj_reemit_pin_f = old_f;
+
+		memset (&r, 0, sizeof (r));
+		{
+			/* Scope the devirt census to this body. The run-wide census is cumulative over every
+			 * emission and cannot show what a few dozen re-emissions did -- see WJC_REEMIT_SITE. */
+			extern int mono_wasm_jit_in_reemit;
+			mono_wasm_jit_in_reemit = 1;
+			rc = wasm_jit_compile_publish (im, &r);
+			mono_wasm_jit_in_reemit = 0;
+		}
+		wj_reemit_pin_m = NULL;
+		wj_reemit_pin_e = wj_reemit_pin_f = 0;
+		/* A LOST CAS IS NOT A VERDICT. Compiles are serialized by the global wj_compiling flag, and this
+		 * drain runs on an ordinary interpreter tick while other workers compile -- so most attempts lose
+		 * the race and come back BUSY with `r` untouched. The first version marked those done, which is
+		 * why REEMIT_DONE read 0 while REEMIT_SITE read 24: a handful of winners produced the whole
+		 * devirt result and every other method silently gave up its one shot. Put it back on the queue. */
+		if (rc == WASM_JIT_COMPILE_BUSY) {
+			im->wasm_jit_reemit_state = 0;
+			wj_reemit_enqueue (im);
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_BUSY);
+			continue;
+		}
+		im->wasm_jit_reemit_state = 2;           /* done: never again, whatever the outcome below */
+		if (r.f_slot == old_f && r.e_slot == old_e) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_DONE);
+		} else {
+			/* The emitter did not take the pinned pair. Do not try to undo it -- the new descriptor is
+			 * already published and callers baked to old_f still reach the old module, which remains
+			 * installed and valid. Report it rather than pretending it worked. */
+			static int _n = 0;
+			if (_n++ < 20)
+				printf ("WASM_JIT_REEMIT_NO_PUBLISH method=%s old e=%d f=%d new e=%d f=%d (0/0 = the compile refused, not a slot move)\n",
+					mono_method_get_name (pm), old_e, old_f, r.e_slot, r.f_slot);
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_REFUSED);
+		}
+	}
+}
+
 static void
 wasm_jit_drain_promotions (void)
 {
@@ -3307,6 +2792,7 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island, mono_wasm_jit_island_budget;
 	extern int mono_wasm_jit_over_aot;
 	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
+	wasm_jit_drain_reemits ();      /* R170: re-emit hot methods whose profile has since matured */
 	/* Hotness gate. The bump MUST be atomic: wasm_jit_hits lives on the SHARED InterpMethod and is bumped
 	 * from every worker (render/server/pool) in the auto-walk. A plain `++` loses updates AND lets one
 	 * thread's write skip the exact threshold value — which under the old (non-atomic) `== thresh` test
@@ -7040,7 +6526,13 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			case 0:                    mono_wasm_jit_count (WJC_VFB_COLD); break;
 			case WASM_JIT_SLOT_PARKED: mono_wasm_jit_count (WJC_VFB_PARKED); break;
 			case WASM_JIT_SLOT_RETRY:  mono_wasm_jit_count (WJC_VFB_RETRY); break;
-			default: break;
+			/* slot > 0: the target IS compiled, so reaching the residual means mono_wasm_jit_admit_live
+			 * said no on THIS worker -- its module is not instantiated here, or its descriptor is stuck
+			 * mid-DFS (state 1, where admit returns 1 and desc_admitted returns 0). This arm used to be
+			 * `default: break;`, and an uncounted route does not read as a gap: R166's 109.6M of these
+			 * showed up only as VFB_THRESH being 9,243x the control with its three sub-counters summing
+			 * to 1,399. Keep it counted even when it is zero. */
+			default: mono_wasm_jit_count (WJC_VFB_NOTLIVE); break;
 			}
 		}
 	}
@@ -7391,6 +6883,39 @@ wj_shadow_balance_warn_m (const char *method, int leak)
 void
 mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret)
 {
+#ifdef HOST_WASM
+	/* DIAGNOSTIC 2026-08-29 (co-location crash). Every caller is supposed to have proved this slot live on
+	 * THIS worker -- via admit_live()/desc_admitted(), or a bare slot_live() at the recipe site. If that
+	 * were true this branch is dead. It is not: MONO_WASM_JIT_COLOCATE_DEPS=1 traps in wasm_jit_ethunk_cb
+	 * with `function signature mismatch`, which is what calling the jiterpreter prefill
+	 * (i32,i32,i32,i32)->void as the thunk's (i32,i32)->void looks like.
+	 *
+	 * Log and STILL call: the trap follows immediately, but the line lands first and names the method, so
+	 * the unguarded path is identified instead of inferred. Reading has already excluded the mapping
+	 * (f{i}/e{i} export order), a crossed e/f, IMPORT_SLOT_CHANGED (0 in the repro), REBATCH_STALE (0), and
+	 * both bitmaps being process-wide (both are __thread). */
+	{
+		/* KNOB-GATED. mono_wasm_jit_eslot_probe is an EM_ASM call into JS; running it per invoke would
+		 * be a real cost on the hottest interp->JIT path, and once the bug is fixed the bad-case counter
+		 * never advances, so an "only until N bad ones" bound never expires. Default off. */
+		extern int mono_wasm_jit_slot_live (int slot);
+		extern int mono_wasm_jit_eslot_probe (int slot, int *out_len);
+		extern int mono_wasm_jit_eslot_verify;
+		static int _n = 0;
+		if (G_UNLIKELY (mono_wasm_jit_eslot_verify && slot > 0 && _n < 40)) {
+			int live = mono_wasm_jit_slot_live (slot), alen = -1;
+			int probe = mono_wasm_jit_eslot_probe (slot, &alen);
+			if (!live || probe != 1) {
+				_n++;
+				g_printerr ("WASM_JIT_ETHUNK_BAD slot=%d live=%d probe=%d arity=%d method=%s.%s\n",
+					(int) slot, live, probe, alen,
+					method && method->klass ? m_class_get_name (method->klass) : "?",
+					method ? method->name : "?");
+				fflush (stderr);
+			}
+		}
+	}
+#endif
 	/* JIT frames live on the emscripten C stack: snapshot the SP so a caught C++ unwind (whose
 	 * native landing pads may or may not have run for the torn-through JIT frames) can be resynced
 	 * precisely, and a clean return can be balance-checked. */
@@ -10088,9 +9613,17 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
 				mono_wasm_jit_invoke_caught (cmethod->method, (gint32) cmethod->wasm_jit_slot, locals + call_args_offset, locals + return_offset); \
 				interp_pop_lmf (&wj_ext); \
 			} \
-			{ extern int mono_wasm_jit_batch_module; \
-			  if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_INVOKE); mono_atomic_inc_i32 (&cmethod->wasm_jit_invoke_in); } \
-			  if (G_UNLIKELY (mono_wasm_jit_stats || mono_wasm_jit_batch_module == 1)) wj_edge_bump (frame->imethod, cmethod); } \
+			{ extern int mono_wasm_jit_reemit; \
+			  /* R170: this method has now been entered from the interpreter enough times that the call \
+			   * profile has seen far more than it had when the method was emitted. Queue ONE re-emit. \
+			   * Enqueue only -- force_compile runs managed code and must not be re-entered from here. */ \
+			  if (G_UNLIKELY (mono_wasm_jit_reemit > 0) && cmethod->wasm_jit_reemit_state == 0 && \
+			      cmethod->wasm_jit_invoke_in >= mono_wasm_jit_reemit) \
+				wj_reemit_enqueue (cmethod); \
+			  if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_INVOKE); mono_atomic_inc_i32 (&cmethod->wasm_jit_invoke_in); \
+			    /* wj_entry_edges was ALSO gated on BATCH_MODULE==1 for the auto planner, which is gone. \
+			     * Stats alone now, which is the only consumer left (mono_wasm_jit_dump_hot_edges). */ \
+			    wj_edge_bump (frame->imethod, cmethod); } } \
 			/* Lever A: this interp caller keeps entering jitted islands — queue it for upward JIT. */ \
 			{ InterpMethod *wjc = frame->imethod; \
 			  if (G_UNLIKELY (mono_wasm_jit_entry_promote > 0) && wj_slot_hot_retry_eligible (wjc->wasm_jit_slot) && ++wjc->wasm_jit_invoke_out >= mono_wasm_jit_entry_promote) { wjc->wasm_jit_invoke_out = 0; wj_promote_push (wjc->method); } } \
@@ -10098,7 +9631,6 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
 			 * resume-state and the JITted method returned early (a dummy result). Propagate through \
 			 * the interp's EH — the LMF above lets mono_handle_exception skip the JITted native frame. */ \
 			CHECK_RESUME_STATE (context); \
-			wj_auto_batch_poll (); \
 			MINT_IN_BREAK; \
 		} \
 	}

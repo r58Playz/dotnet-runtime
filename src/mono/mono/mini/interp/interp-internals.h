@@ -189,6 +189,21 @@ struct InterpMethod {
 	 * method count — which is exactly the axis module batching increases. */
 	gint32 wasm_jit_self_resv_eslot;
 	gint32 wasm_jit_self_resv_fslot;
+	/* runtime wasm JIT (R170 re-emit): 0 = never considered, 1 = queued for re-emission with a matured
+	 * call profile, 2 = re-emitted once (never again). A method is emitted ONCE, on crossing its hotness
+	 * threshold, using whatever the INTERPRETER happened to observe -- but 78.8% of call-profile
+	 * observations arrive later, through the JIT's IC miss path. Devirt therefore refuses 32.1% of
+	 * virtual sites for `no_rec` at emit time and would predict many of them afterwards.
+	 *
+	 * 0 = never considered, 1 = queued, 3 = IN FLIGHT (this is the state that opens
+	 * wasm_jit_compile_publish's `wasm_jit_fslot > 0` early-out), 2 = done, never again.
+	 *
+	 * The in-flight state exists because the first version set 2 BEFORE calling compile_publish, to get
+	 * the "once" guarantee. The gate opens only for the in-flight state, so it never opened: every
+	 * re-emit took the early-out, returned the existing slots unchanged, and incremented REEMIT_DONE
+	 * having compiled nothing. 31 "re-emissions" per run were no-ops, and the only reason that was
+	 * visible is that WJC_REEMIT_SITE -- the devirt census scoped to re-emitted bodies -- read 0. */
+	guint8 wasm_jit_reemit_state;
 	/* THE CALL PROFILE (MONO_WASM_JIT_DEVIRT_PROFILE): WjCallProfile*, lazily allocated. See the long
 	 * comment above WjProfSite in interp.c.
 	 *
@@ -365,9 +380,11 @@ mono_interp_transform_init (void);
 InterpMethod *
 mono_interp_get_imethod (MonoMethod *method);
 
+/* out_why (optional) receives a WJ_PRED_* code saying why a refusal happened, for the emitter's
+ * WJC_DEVIRT_* census; see the #define block above the definition in interp.c. */
 gboolean
 mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
-	MonoMethod **out_target, guint32 *out_samples);
+	MonoMethod **out_target, guint32 *out_samples, int *out_why);
 
 void
 mono_interp_print_code (InterpMethod *imethod);

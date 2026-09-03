@@ -438,13 +438,19 @@ typedef struct {
  *   types:   member blocks back to back, so member i occupies [ti_base_i .. ti_base_i + ntypes_i - 1].
  *   funcs:   the imports first (function imports take indices 0..nfimports-1 whatever the section order),
  *            then the N methods, then the N entry thunks -- so member i's method is nfimports + i.
- *   exports: "f"/"e" at N == 1, "f<i>"/"e<i>" above it, matching the two instantiate paths.
+ *   exports: the FIRST `nexport` members only -- "f"/"e" at nexport == 1, "f<i>"/"e<i>" above it,
+ *            matching the two instantiate paths. Members at index >= nexport are SHADOWS: private
+ *            duplicates of a callee's body, present so a caller can reach them with `call <funcidx>`
+ *            instead of `call_indirect`. They are defined and callable inside the module and are
+ *            deliberately unreachable from outside it, so they own no table slot and nothing can
+ *            instantiate over them. Keying the naming on `nexport` rather than on `nmembers` is what
+ *            lets a lone method keep its "f"/"e" names while carrying shadows.
  *
  * Nothing is patched afterwards and nothing is asserted about what the caller baked, because the caller
  * bakes nothing: every index a body needs arrived as a relocation.
  */
 void wasm_module_assemble (
-	const WasmAsmMember *members, guint32 nmembers,
+	const WasmAsmMember *members, guint32 nmembers, guint32 nexport,
 	gboolean import_table,
 	gboolean import_eh_tag, guint32 eh_type_idx,
 	const WasmFuncImport *fimports, guint32 nfimports,
