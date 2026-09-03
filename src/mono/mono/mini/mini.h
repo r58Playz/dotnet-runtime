@@ -1184,6 +1184,32 @@ typedef struct
 	gpointer impl_nothis;
 	gboolean need_rgctx_tramp;
 	gboolean is_virtual;
+	/*
+	 * WASM METHOD-JIT delegate recipe, packed (fslot << 3) | shape, or 0 = none yet.
+	 *
+	 * This struct is the right home for it and the delegate OBJECT is not. R187 established that we
+	 * cache delegate dispatch backwards -- per call site, for a property of the callee -- so N sites
+	 * invoking one target keep N entries and warm N times. The property is keyed by (delegate class,
+	 * target method), which is exactly this struct's key (mono_create_delegate_trampoline_info), so one
+	 * entry serves every site. mini_llvmonly_init_delegate already caches the resolved target here for
+	 * the same reason (llvmonly-runtime.c:854-935).
+	 *
+	 * Why not a field on MonoDelegate: that is a managed layout (System/Delegate.Mono.cs, mirrored in
+	 * object-internals.h AND in the hand-maintained cross-compiler tables under mono/offsets/ that
+	 * mono-aot-cross bakes), so growing it risks silently miscompiling every AOT delegate wrapper.
+	 * This struct is runtime-internal and has no managed counterpart, and appending here moves none of
+	 * the three offsets object-offsets.h declares for it.
+	 *
+	 * PACKING. shape is WJ_DELEGATE_* in [1,4] so it needs 3 bits; the f-slot is a jiterpreter function
+	 * table index. Zero means "no recipe", which is why shape 0 (WJ_DELEGATE_NONE) is not a legal
+	 * packed value and a recipe is only ever written for an admitted SCALAR target.
+	 *
+	 * The f-slot NUMBER is process-wide but its INSTALLATION is per worker, so a reader must still
+	 * probe wj_slot_live. That is a bit test against an immutable imported global's array and the bits
+	 * are only ever SET, so it needs no seqlock and no atomics -- which is the whole difference from
+	 * the shared WjDelegateIC this replaces (interp.c:1727-1761).
+	 */
+	gint32 wasm_jit_recipe;
 } MonoDelegateTrampInfo;
 
 /*

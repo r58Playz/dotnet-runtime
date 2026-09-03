@@ -452,6 +452,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_ic_autosize; const char *ia = g_getenv ("MONO_WASM_JIT_IC_AUTOSIZE"); mono_wasm_jit_ic_autosize = (ia && *ia) ? ((*ia != '0') ? 1 : 0) : 1; }
 	{ extern int mono_wasm_jit_eslot_residual; const char *er = g_getenv ("MONO_WASM_JIT_ESLOT_RESIDUAL"); mono_wasm_jit_eslot_residual = (er && *er) ? ((*er != '0') ? 1 : 0) : 1; }
 	{ extern int mono_wasm_jit_delegate_local_pic; const char *dp = g_getenv ("MONO_WASM_JIT_DELEGATE_LOCAL_PIC"); mono_wasm_jit_delegate_local_pic = (dp && *dp) ? ((*dp != '0') ? 1 : 0) : 1; } /* 1 = worker-local delegate recipe PIC (no seqlock, no liveness probe, cached admitted fslot); 0 = the shared WjDelegateIC path. Read at EMIT time, so only the selected arm's prologue and dispatch are emitted -- both arms exist in the EMITTER, which is what makes this a same-binary A/B, but a given module contains only one (see the gates at the f-slot-IC liveness prologue). Do not read this as two dispatch implementations per module. */
+	{ extern int mono_wasm_jit_delegate_obj_pic; const char *dop = g_getenv ("MONO_WASM_JIT_DELEGATE_OBJ_PIC"); mono_wasm_jit_delegate_obj_pic = (dop && *dop && *dop != '0') ? 1 : 0; } /* object-keyed delegate recipe (R187 re-keying); 0 = the per-site worker-local PIC. Read at EMIT time, so a module contains exactly one arm. */
 	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = per-worker instantiated-vs-entered census; adds a load+test to the interp->JIT boundary, so off while timing */
 	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
@@ -673,6 +674,34 @@ int mono_wasm_jit_ic_autosize = 1;
  * largest dispatch class in the profile). Kept as a knob because it is the only honest way to measure
  * it: fps deltas on this box need interleaved arms of the SAME binary. */
 int mono_wasm_jit_delegate_local_pic = 1;
+/* MONO_WASM_JIT_DELEGATE_OBJ_PIC: dispatch a delegate from the OBJECT instead of from the call site.
+ * DEFAULT OFF.
+ *
+ * R187: we cache delegate dispatch backwards. wj_delegate_pic_for_site indexes by site_id and each
+ * entry keys on (source MonoMethod*, receiver_vt, shape) with the admitted f-slot as payload -- i.e. a
+ * property OF THE CALLEE stored in a slot indexed BY THE CALLER. N sites invoking one target keep N
+ * entries and warm N times, site ids are a bounded resource (WJ_VCALL_SITE_MAX), and every dispatch
+ * pays site-id derivation, a capacity check, an entry load, a source compare, a receiver compare and a
+ * ways loop before it can call anything. Delegate dispatch is >=43% of ALL dispatch (R187, measured
+ * with profile_fast: direct 418,401,288 + ic-recipe 398,520,024 of 974,158,019), so that sequence is
+ * the largest single dispatch cost in the tier.
+ *
+ * This arm reads the recipe from MonoDelegateTrampInfo.wasm_jit_recipe, reached in ONE load from
+ * `this` via the delegate's own invoke_info field. The info is keyed by (delegate class, target
+ * method), so one entry serves every call site and warms once. There is no site id, no capacity check,
+ * no key compare, no ways loop, no eviction policy and no per-site memory -- and a per-object cache is
+ * 1-way by construction, which also retires ic_ways autosizing for delegate sites.
+ *
+ * WHAT IT STILL HAS TO DO, and why: the f-slot NUMBER is process-wide but its INSTALLATION is per
+ * worker, so the wj_slot_live bit must be probed. The in-source note at WjLocalDelegatePicEntry
+ * records that an object-keyed form was tried and lost -- but every cost it lists (load imethod, load
+ * imethod->fslot, test it, probe the bitmap, inside a seqlock bracket of two atomic loads) is a cost of
+ * the cache being SHARED, not of it being object-keyed. Monotone state needs no seqlock: the bits are
+ * only ever SET. So this arm probes the bitmap and keeps none of the atomics.
+ *
+ * Kept as a knob because at >=43% of dispatch the sign of a change to this path cannot be argued, and
+ * because both arms in one binary is the only comparison worth making at this workload's ~12% floor. */
+int mono_wasm_jit_delegate_obj_pic = 0;
 /* MONO_WASM_JIT_ESLOT_RESIDUAL: a residual whose callee has no AOT code but IS wasm-JIT compiled enters the
  * callee's e-slot straight from the residual scratch, instead of marshalling into InterpEntryData and letting
  * interp_entry rediscover the same e-slot. Measured target: interp_entry 3.838% + call_interp 2.588% of
@@ -1099,7 +1128,7 @@ mono_wasm_jit_get_counter (int idx)
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 128);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 130);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1195,7 +1224,10 @@ mono_wasm_jit_dump_stats (void)
 		{
 			long long sib = WJC_(WJC_VIC_TGT_SIBLING), fgn = WJC_(WJC_VIC_TGT_FOREIGN),
 				  nto = WJC_(WJC_VIC_TGT_NOTOURS), tot = sib + fgn + nto, ours = sib + fgn;
-			printf ("[wasm-jit colocate-reach] IC-publish targets: sibling=%lld foreign=%lld notours=%lld"
+			printf ("[wasm-jit delegate-obj] recipe published=%lld  no_info=%lld (DELEGATE_OBJ_PIC=%d)"
+			"   -- if no_info dominates the arm is UNREACHABLE, not ineffective\n",
+			WJC_(WJC_DOBJ_PUBLISHED), WJC_(WJC_DOBJ_NO_INFO), mono_wasm_jit_delegate_obj_pic);
+		printf ("[wasm-jit colocate-reach] IC-publish targets: sibling=%lld foreign=%lld notours=%lld"
 				" | %.2f%% of ours co-resident, %.2f%% of all\n",
 				sib, fgn, nto,
 				ours ? 100.0 * (double) sib / (double) ours : 0.0,
@@ -9256,7 +9288,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * address-helper calls per invocation. Each IC hit still loads THROUGH these stable addresses, making
 	 * a later bitmap realloc/capacity growth visible with no stale-pointer window. */
 	if (mono_wasm_jit_vcall_inline_ic && has_vcall) {
-		extern int mono_wasm_jit_delegate_local_pic;
+		extern int mono_wasm_jit_delegate_local_pic, mono_wasm_jit_delegate_obj_pic;
 		/* METHOD-LONG LIVE RANGES ARE NOT FREE -- the LOCALS are.
 		 *
 		 * Be precise about which, because the two suggest opposite work. A wasm local is free: V8's
@@ -9274,7 +9306,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 *   - the cap ADDRESSES are consumed immediately to load their values, so they never need a local at
 		 *     all: global.get; i32.load; local.set value — 2 more reclaimed.
 		 * That is 4 fewer method-long locals in every method containing a virtual call. */
-		if (!mono_wasm_jit_delegate_local_pic) {
+		/* OBJ_PIC needs the bitmap too: its recipe caches an f-slot NUMBER (process-wide) and must still
+		 * establish that THIS worker installed it. That is the one check an object-keyed cache cannot
+		 * inherit from publication, because publication is process-wide and installation is not. */
+		if (!mono_wasm_jit_delegate_local_pic || mono_wasm_jit_delegate_obj_pic) {
 			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 1); /* imported s.l = &wj_slot_live */
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_ptr_idx);
 			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 2); /* imported s.c = &wj_slot_live_cap */
@@ -9289,7 +9324,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			/* The delegate PIC pair, on the same terms. Fetched unconditionally with the rest rather than
 			 * gated on "has a delegate site": the gate would need a second prescan, and two global.get in a
 			 * prologue that already does four are not worth another pass over the IR. */
-			if (mono_wasm_jit_delegate_local_pic) {
+			/* ...and OBJ_PIC needs NEITHER delegate-PIC base, so it reclaims the two method-long locals
+			 * R189 identified as WRITE-ONCE-EARLY spill slots (17.4% of slots carrying 30.1% of all
+			 * reload traffic). Two of Stage 4's four targets, removed by this arm rather than separately. */
+			if (mono_wasm_jit_delegate_local_pic && !mono_wasm_jit_delegate_obj_pic) {
 				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 5); /* imported s.d = &wj_delegate_pic */
 				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dpic_ptr_idx);
 				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 6); /* imported s.m = &wj_delegate_pic_cap */
@@ -11532,6 +11570,8 @@ vcall_nullchk_done:
 							int delegate_target_off = mono_wasm_jit_delegate_field_off (0);
 							int delegate_method_off = mono_wasm_jit_delegate_field_off (1);
 							int delegate_list_off = mono_wasm_jit_delegate_field_off (2);
+							int delegate_info_off = mono_wasm_jit_delegate_field_off (3);
+							int dti_recipe_off = mono_wasm_jit_delegate_field_off (4);
 							extern int mono_wasm_jit_delegate_pic_stride (void);
 							int dpic_stride = mono_wasm_jit_delegate_pic_stride ();
 #else
@@ -11542,12 +11582,17 @@ vcall_nullchk_done:
 							int delegate_ic_stride = 32, dic_seq_off = 0, dic_source_off = 4;
 							int dic_receiver_off = 8, dic_imethod_off = 16, dic_shape_off = 20, dic_scalar_off = 28;
 							int delegate_target_off = 16, delegate_method_off = 20, delegate_list_off = 64;
+							int delegate_info_off = 32, dti_recipe_off = 44;
 							int dpic_stride = 16;
 #endif
 							/* Worker-local delegate PIC field offsets, mirroring WjLocalDelegatePicEntry. The way
 							 * offset folds into the load immediate, so a way costs no base arithmetic at all. */
-							extern int mono_wasm_jit_delegate_local_pic;
-							int dpic_local = mono_wasm_jit_delegate_local_pic;
+							extern int mono_wasm_jit_delegate_local_pic, mono_wasm_jit_delegate_obj_pic;
+							/* OBJ_PIC supersedes the per-site arm rather than layering on it, so force dpic_local
+							 * off: it gates the hoisted prologue, the br depth of the tail and the trailing END,
+							 * and leaving it set would emit an END with no matching BLOCK. */
+							int obj_pic = mono_wasm_jit_delegate_obj_pic;
+							int dpic_local = mono_wasm_jit_delegate_local_pic && !obj_pic;
 							int dpic_rvt_off = 8, dpic_shape_off = 12;
 							int way;
 							/* Inline-cache width for THIS site, from the interpreter's receiver observations, in
@@ -11727,7 +11772,100 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dic_base_idx);
 								}
-								for (way = 0; way < ic_ways; ++way) {
+								/*
+								 * OBJECT-KEYED DELEGATE DISPATCH (MONO_WASM_JIT_DELEGATE_OBJ_PIC, R187).
+								 *
+								 * Self-contained: one BLOCK, no hoisted prologue, no way loop, and its own copy
+								 * of the ABI tail. Deliberately NOT interleaved into the two arms below -- they
+								 * share a guard/tail structure in three interleaved regions, and threading a
+								 * third arm through it would make the knob-off output impossible to prove
+								 * unchanged. As written, `obj_pic` off leaves every byte below untouched, which
+								 * tiershape.py can gate at its 0.15% noise floor.
+								 *
+								 * Sequence, against the ~49 wasm ops / 6 loads the per-site arm cites:
+								 *   this->method      == 0 -> multicast, no single-cast recipe (interp.c:9887
+								 *                       uses exactly this test, so the two agree by construction)
+								 *   this->invoke_info == 0 -> the delegate never went through
+								 *                       interp_init_delegate's llvmonly path
+								 *   info->wasm_jit_recipe == 0 -> no recipe published for this callee yet
+								 *   unpack (fslot << 3) | shape
+								 *   wj_slot_live[fslot] -> did THIS worker install it
+								 * = 3 loads, 3 tests, 4 ALU ops, then the bitmap probe.
+								 */
+								if (obj_pic) {
+									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $delegate_obj_fail */
+									if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate obj method ld"; goto done; }
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_method_off);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate obj info ld"; goto done; }
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_info_off);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) dic_base_idx);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dic_base_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) dti_recipe_off);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									/* shape first: it reads vc_fslot before the shift overwrites it. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+									/* PER-WORKER INSTALLATION. The recipe's f-slot number is process-wide; whether
+									 * this worker put a function there is not, and table[fslot] != null is not the
+									 * test -- the jiterpreter PREFILLS the range with a callable placeholder whose
+									 * (i32,i32,i32,i32)->void body writes 999 through its fourth argument. Same
+									 * bitmap the shared arm probes; monotone, so no seqlock and no atomics. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_op (&body, WASM_OP_I32_LT_U);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_op (&body, WASM_OP_I32_ADD);
+										wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
+										wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);
+									wasm_op (&body, WASM_OP_ELSE);
+										wasm_i32_const (&body, 0);
+									wasm_op (&body, WASM_OP_END);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									wj_emit_fast_count (&body, WJC_DELEGATE_IC_HIT);
+									wj_emit_fast_count (&body, WJC_FAST_DELEGATE);
+									/* Same two-way ABI rewrite as the per-site arms: closed-instance and
+									 * bound-static (shape <= 2) replace the Delegate `this` with the current
+									 * target; open-static and open-instance drop it. */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+									wasm_i32_const (&body, 2 /* WJ_DELEGATE_BOUND_STATIC */);
+									wasm_op (&body, WASM_OP_I32_LE_U);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, rv == WASM_VOID ? 0x40 : (guint8) rv);
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "delegate obj closed this ld"; goto done; }
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_target_off);
+										for (ai = 1; ai < n2; ++ai)
+											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate obj closed arg ld"; goto done; }
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wj_emit_dynamic_call (&body, (guint32) ftdi);
+									wasm_op (&body, WASM_OP_ELSE);
+										for (ai = 1; ai < n2; ++ai)
+											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate obj open arg ld"; goto done; }
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										wj_emit_dynamic_call (&body, (guint32) dftdi);
+									wasm_op (&body, WASM_OP_END);
+									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "delegate obj dreg"; goto done; }
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> $after */
+									wasm_op (&body, WASM_OP_END); /* $delegate_obj_fail */
+								}
+								for (way = 0; !obj_pic && way < ic_ways; ++way) {
 								    if (dpic_local) {
 									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $delegate_way_fail */
 									/* delegate.method == entry.source, and the admitted fslot arrives in the SAME

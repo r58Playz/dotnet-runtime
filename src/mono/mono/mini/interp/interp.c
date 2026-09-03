@@ -1877,6 +1877,13 @@ mono_wasm_jit_delegate_field_off (int field)
 	case 0: return (int) G_STRUCT_OFFSET (MonoDelegate, target);
 	case 1: return (int) G_STRUCT_OFFSET (MonoDelegate, method);
 	case 2: return (int) G_STRUCT_OFFSET (MonoMulticastDelegate, delegates);
+	/* R192/Stage 1, the object-keyed delegate recipe. 3 is the hop from the delegate to its
+	 * (delegate class, target method) tramp info; 4 is the packed (fslot << 3) | shape inside it.
+	 * Queried rather than hardcoded for the same reason 0-2 are: mini-wasm.c's #else offline
+	 * placeholders are already stale (delegate_list_off there is 64 against a real 60), so a
+	 * hardcoded offset in the emitter is a silent wrong-field load rather than a build error. */
+	case 3: return (int) G_STRUCT_OFFSET (MonoDelegate, invoke_info);
+	case 4: return (int) G_STRUCT_OFFSET (MonoDelegateTrampInfo, wasm_jit_recipe);
 	default: g_assert_not_reached (); return 0;
 	}
 }
@@ -4302,6 +4309,24 @@ interp_init_delegate (MonoDelegate *del, MonoDelegateTrampInfo **out_info, MonoE
 			imethod->del_info = mono_create_delegate_trampoline_info (del->object.vtable->klass, method, FALSE);
 			*out_info = imethod->del_info;
 		}
+#ifdef HOST_BROWSER
+		/* PUBLISH the trampoline info on the delegate itself, so the wasm method-JIT's emitted dispatch
+		 * can reach the recipe cached on it (MonoDelegateTrampInfo.wasm_jit_recipe) in one load from
+		 * `this` instead of deriving a site id and probing a per-site array.
+		 *
+		 * This is `invoke_info`'s DOCUMENTED purpose -- object-internals.h annotates the field
+		 * `/* MonoDelegateTrampInfo *\/`, the full-JIT path stores exactly this pointer into it
+		 * (method-to-ir.c:3710) and mono_delegate_trampoline reads it back as exactly this type
+		 * (mini-trampolines.c:1019). Nothing on wasm wrote it before, so that reader saw NULL and fell
+		 * back to its `arg`; giving it the real info can only make it more correct.
+		 *
+		 * Only when the info's key actually matches this delegate: the 1-element del_info cache above
+		 * leaves *out_info NULL when imethod is shared by a SECOND delegate class, and publishing a
+		 * mismatched info would hand generated code a recipe computed for a different Invoke
+		 * signature. NULL simply means "no fast recipe", which the emitted guard already handles. */
+		if (out_info && *out_info)
+			del->invoke_info = *out_info;
+#endif
 	}
 }
 
@@ -6159,6 +6184,32 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar);
 	if (mono_wasm_jit_delegate_local_pic && scalar)
 		wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
+	/*
+	 * OBJECT-REACHABLE RECIPE (R187's re-keying). The same (fslot, shape) the per-site PIC above just
+	 * published, cached once on the (delegate class, target method) tramp info that
+	 * interp_init_delegate hung on del->invoke_info. Generated code then reaches it in two loads from
+	 * `this` with no site id, no capacity check, no key compare and no ways loop.
+	 *
+	 * Conditions are the PIC's, deliberately: only a scalar target has a canonical direct f-thunk ABI,
+	 * and only an admitted f-slot is callable. `shape` is in [1,4] here (a NONE shape returned FALSE
+	 * far above), so the packed word is never 0 for a real recipe and 0 stays free to mean "none".
+	 *
+	 * Idempotent and racy-benign: every writer for a given info computes the same answer from the same
+	 * (klass, method) key, so a concurrent write stores an identical word. It is NOT invalidated, for
+	 * the same reason the PIC is not -- see the invariants at WjLocalDelegatePicEntry.
+	 */
+	if (scalar && fslot > 0 && shape > WJ_DELEGATE_NONE && shape <= WJ_DELEGATE_OPEN_INSTANCE &&
+	    fslot <= (G_MAXINT32 >> 3)) {
+		if (del->invoke_info) {
+			((MonoDelegateTrampInfo *) del->invoke_info)->wasm_jit_recipe = (gint32) ((fslot << 3) | shape);
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_DOBJ_PUBLISHED);
+		} else if (G_UNLIKELY (mono_wasm_jit_stats)) {
+			/* Everything about the recipe was fine and there was nowhere to put it. See WJC_DOBJ_NO_INFO:
+			 * this counts delegates for which object-keyed dispatch is impossible regardless of how good
+			 * the emitted sequence is, so it is the first thing to read on an OBJ_PIC arm. */
+			mono_wasm_jit_count (WJC_DOBJ_NO_INFO);
+		}
+	}
 
 	/* Publish only after every potentially re-entrant operation above. A nested wasm-JIT vcall reuses
 	 * this TLS scratch buffer; writing the complete outer recipe last prevents nested state leakage. */
