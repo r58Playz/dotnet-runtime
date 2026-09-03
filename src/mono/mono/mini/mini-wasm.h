@@ -423,6 +423,19 @@ enum {
 	 * it is vcallreach.py's per-arm call-form split over a tier dump -- static, free, and already
 	 * written. Do not substitute this counter for it. */
 	WJC_VIC_TGT_SIBLING, WJC_VIC_TGT_FOREIGN, WJC_VIC_TGT_NOTOURS,
+	/* MONO_WASM_JIT_DELEGATE_OBJ_PIC reachability, counted on the MISS path in
+	 * wasm_jit_prepare_delegate_call where it is free. The emitted arm can only ever be as good as the
+	 * fraction of delegates whose recipe slot is reachable at all, and "the arm never fired" and "the
+	 * arm fired and did not help" are opposite conclusions that a timing number cannot separate.
+	 *
+	 *   DOBJ_PUBLISHED  a scalar, admitted recipe was written to the tramp info
+	 *   DOBJ_NO_INFO    everything else was in order but del->invoke_info was NULL, i.e. this delegate
+	 *                   never went through interp_init_delegate's llvmonly branch, so no object-keyed
+	 *                   dispatch is possible for it however good the emitted code is
+	 *
+	 * If NO_INFO dominates, the arm is not wrong -- it is unreachable, and the fix is upstream in where
+	 * the tramp info gets published, not in the emitted sequence. */
+	WJC_DOBJ_PUBLISHED, WJC_DOBJ_NO_INFO,
 	WJC_MAX
 };
 
