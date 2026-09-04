@@ -470,6 +470,11 @@ enum {
 	 *
 	 * MERGE_PRECOND + MERGE_CAP + MERGED == the times a batched callee was reached with merging on. */
 	WJC_COLOCATE_MERGE_PRECOND, WJC_COLOCATE_MERGE_CAP,
+	/* MONO_WASM_JIT_PRETIER: times the residual site's pre-spill pretransform drove tiering, i.e. the
+	 * residual callee's missing interpreter call edge, supplied where it is SAFE to supply it.
+	 * Read against RESIDUAL_HEALED: if pretiering works, callees acquire f-slots earlier and the
+	 * late_fslot guard should stop being the thing that discovers them. */
+	WJC_PRETIER_BUMP,
 	WJC_MAX
 };
 

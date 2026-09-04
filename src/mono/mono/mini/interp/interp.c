@@ -5532,6 +5532,40 @@ mono_wasm_jit_pretransform (MonoMethod *method)
 		mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
 		return;
 	}
+	/*
+	 * THE TIERING EDGE FOR RESIDUAL CALLEES (MONO_WASM_JIT_PRETIER).
+	 *
+	 * A residual edge is invisible to auto-tiering: mono_wasm_jit_call_interp does not run
+	 * wasm_jit_maybe_compile because its caller already resolved the callee, so a method reached ONLY
+	 * through residual edges never accumulates hits and never crosses the JIT threshold. That is the
+	 * `profile19: residual_healed=0` failure, and mono_wasm_jit_late_fslot was made to carry the missing
+	 * edge -- which put a helper call, a branch and a dynamic call_indirect on every dispatch of every
+	 * healable site, permanently, in exchange for a job that only has to happen often enough to cross a
+	 * threshold.
+	 *
+	 * Here is the right place for it. This runs at the same residual site, is emitted unconditionally
+	 * (mini-wasm.c, the pretransform helper call), and -- critically -- runs BEFORE the caller spills its
+	 * reference args into the GC-invisible scratch. That is the whole reason the bump cannot live in
+	 * call_interp: by then the refs are raw pointers in a buffer the GC does not scan, and tiering runs
+	 * class cctors, which allocate, which moves them.
+	 *
+	 * Ordered after wasm_jit_prepare_interp_callee (so the imethod is transformed) and BEFORE the
+	 * pretransformed_* publish below, because maybe_compile can re-enter another residual on this thread
+	 * and would otherwise clobber the handoff -- the same "publish after every re-entrant operation"
+	 * rule wasm_jit_prepare_delegate_call follows.
+	 */
+	{
+		extern int mono_wasm_jit_pretier;
+		if (G_UNLIKELY (mono_wasm_jit_pretier) && wj_slot_hot_retry_eligible (imethod->wasm_jit_slot)) {
+			if (G_UNLIKELY (mono_wasm_jit_stats))
+				mono_wasm_jit_count (WJC_PRETIER_BUMP);
+			wasm_jit_maybe_compile (imethod);
+			/* maybe_compile can replace the InterpMethod via tiering; re-read before publishing. */
+			imethod = mono_interp_get_imethod (method);
+			while (imethod->optimized_imethod)
+				imethod = imethod->optimized_imethod;
+		}
+	}
 	wasm_jit_pretransformed_imethod = imethod;
 	mono_memory_barrier ();
 	wasm_jit_pretransformed_method = method;
