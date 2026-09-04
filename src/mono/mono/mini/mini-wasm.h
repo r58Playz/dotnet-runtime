@@ -436,6 +436,26 @@ enum {
 	 * If NO_INFO dominates, the arm is not wrong -- it is unreachable, and the fix is upstream in where
 	 * the tramp info gets published, not in the emitted sequence. */
 	WJC_DOBJ_PUBLISHED, WJC_DOBJ_NO_INFO,
+	/* MERGING existing groups (R193/Stage 2b). MERGED counts pre-existing groups ABSORBED into a new
+	 * request -- the conversion of what R192 measured as 100% of per-callee co-location refusals.
+	 * MERGE_SPLIT counts requests refused by mono_wasm_jit_rebatch because a member's group was only
+	 * PARTIALLY present, which would be a split rather than a merge and is the one thing this must never
+	 * do: the members of a group share one WebAssembly.Instance and cannot be instantiated apart, and
+	 * wj_batch_rollback can only restore an absorbed member if every sibling is there to restore with it.
+	 * Read MERGED against COLOCATE_DEP_BATCHED: the two now split the population that used to be all
+	 * DEP_BATCHED, so DEP_BATCHED falling while MERGED rises is the mechanism working. */
+	WJC_COLOCATE_MERGED, WJC_COLOCATE_MERGE_SPLIT,
+	/* Merges UNDONE, split out of WJC_COLOCATE_ROLLBACK because they are a different and much more
+	 * dangerous event. An ordinary rollback returns members to standalone modules they were already
+	 * running. A MERGE rollback must return each absorbed member to the GROUP it came from -- restoring
+	 * `saved[].batch` rather than clearing it -- because for such a member `saved[].bytes` is that
+	 * group's shared blob, which exports e<i>/f<i> per member and not e/f. Clearing instead of restoring
+	 * leaves the entry claiming a standalone module whose exports do not exist, which is the
+	 * "function signature mismatch" R165 spent a session on.
+	 *
+	 * jbox2d exercised 98 merges with rolled_back=0, so this path is IMPLEMENTED AND UNTESTED. Treat a
+	 * non-zero count here as the first observation of it, not as routine. */
+	WJC_COLOCATE_MERGE_ROLLBACK,
 	WJC_MAX
 };
 

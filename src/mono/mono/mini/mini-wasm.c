@@ -304,6 +304,30 @@ int mono_wasm_jit_reemit_after = 12000;
 int mono_wasm_jit_reemit_age = 2000;
 
 int mono_wasm_jit_colocate_deps = 1;
+/* MONO_WASM_JIT_COLOCATE_MERGE: let a re-frame ABSORB an existing group instead of dropping the edge.
+ * DEFAULT OFF.
+ *
+ * The `if (re->batch) return 0;` in mono_wasm_jit_rebatch is about SPLITTING -- a group's members share
+ * one WebAssembly.Instance and cannot be instantiated apart, so re-framing one member out of a group
+ * strands the rest. Merging splits nothing, and conflating the two is what made the partition
+ * append-only: each method joined at most one group, once, and the decision was never revised.
+ *
+ * R192 measured that as the ONLY constraint that binds. Of 473 per-callee refusals on jbox2d, 473 were
+ * `dre->batch`; the byte cap refused 0 and the member cap fired once in 389 attempts, and the AOT wall
+ * (`unreg`) did not appear at all. Separately 41% of methods (160/389) publish with an empty depset and
+ * never enter the loop -- that is the trigger-timing blocker, which merging does NOT address.
+ *
+ * The gate this exists to settle: every devirt predicted arm registers its target as a direct dep
+ * (wj_result_add_direct_dep, see the arm), so a predicted target IS a co-location candidate today, yet
+ * a fresh tier dump shows 8,807 of 10,314 arms still `call_indirect` against 1,507 already local. If
+ * the partition is what holds them there, merging moves arms out of that 8,807 and `CallLocal` rises
+ * with it. If it does not, the binding constraint is the publish-time trigger and merging is worthless
+ * on its own -- two answers pointing at different work, which is why this is measurable alone.
+ *
+ * OFF by default until that is measured. R166 is the standing warning: a co-location bug left
+ * admit_live at 0 for a worker's lifetime and read as a 1.63x regression with every error counter at
+ * zero, so the vfb and admit_live identities must be checked before any timing is quoted. */
+int mono_wasm_jit_colocate_merge = 0;
 int mono_wasm_jit_colocate_max = 16;      /* MONO_WASM_JIT_COLOCATE_MAX: members per group, self included */
 /* MONO_WASM_JIT_COLOCATE_BYTES: total member wire bytes. Not a V8 inlining limit -- kMaxInlinedCount (60)
  * bounds inlining INTO one function and must not be reused as a per-module cap -- just a bound on how much
@@ -485,6 +509,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_reemit_age; const char *rg = g_getenv ("MONO_WASM_JIT_REEMIT_AGE"); int v = (rg && *rg) ? atoi (rg) : 2000; mono_wasm_jit_reemit_age = (v >= 0) ? v : 2000; }
 	{ extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
 	  const char *cd = g_getenv ("MONO_WASM_JIT_COLOCATE_DEPS"); mono_wasm_jit_colocate_deps = (cd && *cd) ? (*cd != '0') : 1;
+	  { extern int mono_wasm_jit_colocate_merge; const char *cg = g_getenv ("MONO_WASM_JIT_COLOCATE_MERGE"); mono_wasm_jit_colocate_merge = (cg && *cg && *cg != '0') ? 1 : 0; }
 	  const char *cm = g_getenv ("MONO_WASM_JIT_COLOCATE_MAX"); if (cm && *cm) { int v = atoi (cm); if (v >= 2 && v <= 512) mono_wasm_jit_colocate_max = v; }
 	  const char *cb = g_getenv ("MONO_WASM_JIT_COLOCATE_BYTES"); if (cb && *cb) { int v = atoi (cb); if (v > 0) mono_wasm_jit_colocate_bytes = v; } }
 	{ extern int mono_wasm_jit_colocate_local_calls; const char *cl = g_getenv ("MONO_WASM_JIT_COLOCATE_LOCAL_CALLS"); mono_wasm_jit_colocate_local_calls = (cl && *cl) ? (*cl != '0') : 1; }
@@ -1128,7 +1153,7 @@ mono_wasm_jit_get_counter (int idx)
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 130);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 133);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1217,6 +1242,13 @@ mono_wasm_jit_dump_stats (void)
 			WJC_(WJC_COLOCATE_DEP_UNREG), WJC_(WJC_COLOCATE_DEP_NOBODY), WJC_(WJC_COLOCATE_DEP_BATCHED),
 			WJC_(WJC_COLOCATE_DEP_REFUSED), WJC_(WJC_COLOCATE_DEP_BYTE_CAP), WJC_(WJC_COLOCATE_MEMBER_CAP),
 			mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes);
+		printf ("[wasm-jit colocate-merge] groups absorbed=%lld  refused as split=%lld  (read against dep batched=%lld:"
+			" the two split what used to be all batched)\n",
+			WJC_(WJC_COLOCATE_MERGED), WJC_(WJC_COLOCATE_MERGE_SPLIT), WJC_(WJC_COLOCATE_DEP_BATCHED));
+		printf ("[wasm-jit colocate-merge-undo] merges rolled back into their previous group=%lld"
+			" (implemented and UNTESTED while this reads 0; a merge rollback restores saved.batch"
+			" rather than clearing it, see WJC_COLOCATE_MERGE_ROLLBACK)\n",
+			WJC_(WJC_COLOCATE_MERGE_ROLLBACK));
 	}
 		/* Reach as EXECUTED, from the IC miss path. sibling/(sibling+foreign) is how much of our own
 		 * dispatch the grouping half already covers; notours is the AOT wall and is OVER_AOT's problem,
@@ -6399,6 +6431,15 @@ typedef struct {
 	void *bytes; int len;
 	WjDepSet *depset;
 	guint32 generation;
+	/* THE PREVIOUS GROUP, and it is a correctness field, not a diagnostic.
+	 *
+	 * Before merging was allowed this was always NULL and the rollback could hardcode that. It cannot
+	 * once a re-frame may ABSORB an existing group: a member rolled back out of a merged group must go
+	 * back to the group it was in, because `saved.bytes` for such a member is that group's SHARED module
+	 * -- which exports e<i>/f<i> per member, not e/f. Restoring the bytes while clearing `batch` leaves
+	 * the entry claiming a standalone module whose exports do not exist, which mono_wasm_jit_admit turns
+	 * into the "function signature mismatch" R165 spent a session on. */
+	WjBatchDesc *batch;
 } WjRegSaved;
 
 /*
@@ -6438,7 +6479,12 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
 		if (!re)
 			continue;
-		re->batch = NULL;
+		/* Back to whatever group the member was in, which is NULL unless this bind was a MERGE. See
+		 * WjRegSaved.batch: clearing unconditionally would strand an absorbed member on a shared module
+		 * it no longer claims membership of. */
+		if (saved [i].batch && G_UNLIKELY (mono_wasm_jit_stats))
+			mono_wasm_jit_count (WJC_COLOCATE_MERGE_ROLLBACK);
+		re->batch = saved [i].batch;
 		/* ONCE ONLY. Without this the method rejoins the candidate pool and the next publish regroups it,
 		 * fails the same way and rolls back again -- churn that wedges boot. */
 		re->colocate_refused = 1;
@@ -6574,6 +6620,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			saved [i].bytes = re->bytes; saved [i].len = re->len;
 			saved [i].depset = re->depset;
 			saved [i].generation = re->generation;
+			saved [i].batch = re->batch;   /* NULL for a fresh group; the absorbed group on a merge */
 		}
 		re->batch = bd;
 		/* Do NOT publish re->generation here. It is set below, AFTER mono_memory_barrier() and after
@@ -6694,10 +6741,39 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		int j;
 		if (!re || !re->body || re->e <= 0 || re->f <= 0)
 			return 0;
-		/* Splitting a batch generation is not supported: its members share one WebAssembly.Instance and
-		 * cannot be instantiated apart. Re-framing a member out of one would strand its siblings. */
-		if (re->batch)
-			return 0;
+		/*
+		 * SPLITTING a batch generation is not supported -- its members share one WebAssembly.Instance and
+		 * cannot be instantiated apart, so re-framing one member out of a group would strand the rest.
+		 * MERGING splits nothing, and that distinction is what this guard used to conflate.
+		 *
+		 * The append-only partition it produced was measured (R192) as the ONLY thing refusing callees:
+		 * 473 of 473 per-callee refusals were `dre->batch`, with the byte cap at 0 and the member cap
+		 * firing once in 389 attempts. So a hot callee shared by five callers co-located with exactly one
+		 * of them and the decision was never revised.
+		 *
+		 * Accept a batched member iff EVERY sibling of its group is also in this request. Then the group
+		 * is absorbed whole and nothing is stranded: the union's members keep their own e/f slots, the
+		 * new module exports all of them, and instantiate_batch_local installs the lot. It also makes the
+		 * rollback sound -- wj_batch_rollback restores each member to saved[].batch, and every member of
+		 * an absorbed group is present to be restored together.
+		 */
+		if (re->batch) {
+			extern int mono_wasm_jit_colocate_merge;
+			int k, m;
+			if (!mono_wasm_jit_colocate_merge)
+				return 0;   /* merging off: the pre-R193 behaviour, refuse any batched member */
+			for (k = 0; k < re->batch->n; ++k) {
+				for (m = 0; m < n; ++m)
+					if (desc_ids [m] == re->batch->desc [k])
+						break;
+				if (m == n) {
+					/* A sibling is missing: this would be a SPLIT. Refuse the whole request. */
+					if (G_UNLIKELY (mono_wasm_jit_stats))
+						mono_wasm_jit_count (WJC_COLOCATE_MERGE_SPLIT);
+					return 0;
+				}
+			}
+		}
 		/* THIS DESCRIPTOR MUST STILL OWN ITS SLOTS. A method that was re-emitted registers a NEW descriptor
 		 * into the SAME reserved e/f pair (mono_wasm_jit_self_reserved keeps the reservation on the imethod
 		 * precisely so a re-emit reuses it), and the f-slot -> descriptor map then names the newer one. The
@@ -6871,14 +6947,62 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 		} else if (!dre->body) {
 			excluded = TRUE;   /* registered but its relocatable body was not retained */
 			WJ_CO_COUNT (WJC_COLOCATE_DEP_NOBODY);
-		} else if (dre->batch) {
-			/* THE APPEND-ONLY PARTITION, and the blocker with the most reach behind it: this callee is
-			 * already in someone else's group, so the greedy first-come rule spends it there and never
-			 * revises. Read this arm first -- it is what letting a re-frame absorb whole existing groups
-			 * is meant to convert. */
-			excluded = TRUE;
-			WJ_CO_COUNT (WJC_COLOCATE_DEP_BATCHED);
-		} else if (dre->colocate_refused) {
+						} else if (dre->batch) {
+							/*
+							 * MERGE instead of drop. This was the append-only partition, and R192 measured it as the
+							 * ONLY thing refusing callees -- 473 of 473, with the byte cap at 0 and the member cap
+							 * firing once in 389 attempts. A hot callee shared by five callers co-located with exactly
+							 * one of them, permanently.
+							 *
+							 * Absorb the callee's ENTIRE group into the request. Whole-group or not at all:
+							 * mono_wasm_jit_rebatch refuses a partial absorption because that would be a SPLIT, and
+							 * wj_batch_rollback can only restore an absorbed member if every sibling is present to be
+							 * restored with it.
+							 */
+							WjBatchDesc *ob = dre->batch;
+							extern int mono_wasm_jit_colocate_merge;
+							int k, n_before = n, bytes_before = bytes, ok_all = mono_wasm_jit_colocate_merge;
+							/*
+							 * APPEND STRAIGHT INTO `descs` AND ROLL BACK `n` ON FAILURE -- do NOT stage the
+							 * siblings in a second array. The first version of this used
+							 * `int addl [WJ_BATCH_MAX]`, which is 2 KB of C stack on top of the 2 KB `descs`
+							 * already here, in the chain force_island -> compile_publish -> colocate_deps_now ->
+							 * rebatch -> wj_assemble. That overflowed the wasm C stack and presented as
+							 * `RuntimeError: memory access out of bounds` x8 with this function on the stack --
+							 * a Minecraft-only failure, because jbox2d's smaller tier never built groups deep
+							 * enough to reach it (and it passed there, 567 members, checksum clean).
+							 *
+							 * Rolling `n` back is exactly equivalent and costs nothing: nothing downstream reads
+							 * descs[n..] and the entries above n are simply not part of the request.
+							 */
+							for (k = 0; ok_all && k < ob->n; ++k) {
+								int sd = ob->desc [k];
+								WjRegEntry *sre = sd > 0 ? wj_reg_at (sd - 1) : NULL;
+								int j2;
+								/* Pre-check the cheap preconditions rebatch will re-check anyway: forming a
+								 * request rebatch is certain to refuse costs an assemble pass for nothing. */
+								if (!sre || !sre->body || sre->e <= 0 || sre->f <= 0 || sre->colocate_refused) {
+									ok_all = 0; break;
+								}
+								for (j2 = 0; j2 < n; ++j2)
+									if (descs [j2] == sd) break;
+								if (j2 < n)
+									continue;          /* already in the request (incl. ones just appended) */
+								if (n >= cap) { ok_all = 0; break; }
+								descs [n++] = sd;
+								bytes += sre->len > 0 ? sre->len : 0;
+							}
+							if (ok_all && bytes <= mono_wasm_jit_colocate_bytes) {
+								WJ_CO_COUNT (WJC_COLOCATE_MERGED);
+								/* The callee is now in the request as a member of its absorbed group, so no
+								 * edge is left behind and the SCC guard below has nothing to protect. */
+								continue;
+							}
+							n = n_before;
+							bytes = bytes_before;
+							excluded = TRUE;
+							WJ_CO_COUNT (WJC_COLOCATE_DEP_BATCHED);
+						} else if (dre->colocate_refused) {
 			excluded = TRUE;   /* a previous group containing it was rolled back; once-only brake */
 			WJ_CO_COUNT (WJC_COLOCATE_DEP_REFUSED);
 		} else {
