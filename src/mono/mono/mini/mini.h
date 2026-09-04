@@ -1392,6 +1392,23 @@ typedef struct {
 	int          direct_deps [MONO_WASM_JIT_MAX_DIRECT_DEPS];
 	guint32      direct_dep_sig [MONO_WASM_JIT_MAX_DIRECT_DEPS];
 	MonoMethod  *direct_dep_method [MONO_WASM_JIT_MAX_DIRECT_DEPS]; /* callee behind each dep f-slot (diagnostics: names the method when an ABI/registration mismatch is caught at admit) */
+	/* HEALABLE RESIDUAL CALLEES (MONO_WASM_JIT_HEAL_WAIT): callees this body emitted a late-f-slot
+	 * healing block for, i.e. sites paying a helper call + branch + dynamic call_indirect on EVERY
+	 * dispatch (~19.5M/run, R196) to re-discover an f-slot the callee acquires shortly after.
+	 *
+	 * Carried OUT of the compile rather than acted on inside it, for a lock-ordering reason:
+	 * wj_waiter_register takes mono_loader_lock and its own comment requires that to happen OUTSIDE the
+	 * wj_compiling section, which is exactly where the emitter runs. Same reason blockers[] is a
+	 * by-value array read by the publish path rather than a callback from the emitter.
+	 *
+	 * The publish path registers this method as a waiter on each, so the callee's own publish wakes it
+	 * (wj_waiter_drain, already called there) and the re-emitted body takes the ordinary
+	 * `call_fslot > 0` path -- a plain direct call with no guard, no probe and no relocation machinery.
+	 * That is why this needs no new reloc kind: guaranteeing the re-emit makes the healing block
+	 * disappear instead of having to be patched. */
+	int          nheal_callees;
+	guint8       heal_callees_truncated;
+	MonoMethod  *heal_callees [MONO_WASM_JIT_MAX_BLOCKERS];
 } MonoWasmJitResult;
 
 /*

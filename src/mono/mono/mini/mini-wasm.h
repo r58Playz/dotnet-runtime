@@ -475,6 +475,16 @@ enum {
 	 * Read against RESIDUAL_HEALED: if pretiering works, callees acquire f-slots earlier and the
 	 * late_fslot guard should stop being the thing that discovers them. */
 	WJC_PRETIER_BUMP,
+	/* MONO_WASM_JIT_HEAL_WAIT (R196). HEAL_SITES = late-f-slot healing sites recorded at emit, i.e.
+	 * methods registered as waiters on a callee that had no f-slot yet. HEAL_WOKEN = those waiters
+	 * actually re-queued for re-emission because the callee published.
+	 *
+	 * The pair is the reach measurement, and it must be read as a pair: SITES with no WOKEN means the
+	 * callees never JIT (so healing is the right answer after all), while WOKEN approaching SITES means
+	 * the healing block is a transient that re-emission can delete -- 19.5M dispatches/run of helper
+	 * call + branch + dynamic call_indirect (R196). Read WOKEN against REEMIT_DONE too: a wake that
+	 * never completes is R179's failure shape returning. */
+	WJC_HEAL_SITES, WJC_HEAL_WOKEN,
 	WJC_MAX
 };
 

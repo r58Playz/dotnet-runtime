@@ -1465,7 +1465,25 @@ wj_waiter_drain (MonoMethod *callee)
 	mono_loader_unlock ();
 	if (a) {
 		guint j;
-		for (j = 0; j < a->len; ++j) wj_promote_push ((MonoMethod *) a->pdata [j]);
+		for (j = 0; j < a->len; ++j) {
+			MonoMethod *wm = (MonoMethod *) a->pdata [j];
+			InterpMethod *wim = wm ? mono_interp_get_imethod (wm) : NULL;
+			extern int mono_wasm_jit_heal_wait;
+			/* A waiter that is ALREADY JITted cannot be woken through wj_promote_q: the promotion drain
+			 * skips `pim->wasm_jit_fslot > 0` as "already done". Those are the heal waiters -- they
+			 * published successfully with a healing site -- so route them to the RE-EMIT queue, which is
+			 * the path built for recompiling a published method (and whose slot pin is sound; see the
+			 * comment at mono_wasm_jit_self_reserved). Parked waiters keep the promotion path. */
+			if (mono_wasm_jit_heal_wait && wim && wim->wasm_jit_fslot > 0) {
+				if (wim->wasm_jit_reemit_state == 0) {
+					wim->wasm_jit_heal_pending = 1;
+					wj_reemit_enqueue (wim);
+					if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_HEAL_WOKEN);
+				}
+				continue;
+			}
+			wj_promote_push (wm);
+		}
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_add (WJC_WAITER_WOKEN, (gint64) a->len);
 		g_ptr_array_free (a, TRUE);
 	}
@@ -2159,6 +2177,24 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 		mono_memory_barrier ();   /* publish the immutable descriptor and compatibility fields before the slot gate */
 		im->wasm_jit_slot = r.e_slot;
 		jit_mm_unlock (jit_mm);
+		/* HEAL WAITERS (MONO_WASM_JIT_HEAL_WAIT). This body emitted a late-f-slot healing block for each
+		 * of r.heal_callees[]: a helper call, a branch and a dynamic call_indirect on EVERY dispatch,
+		 * standing in for an f-slot the callee usually acquires shortly afterwards (~19.5M healed
+		 * dispatches per run, R196). Register as a waiter on each so the callee's own publish wakes this
+		 * method for re-emission, whose new body takes the ordinary `call_fslot > 0` path and emits a
+		 * plain direct call -- deleting the block rather than patching it.
+		 *
+		 * HERE and not in the emitter: wj_waiter_register takes mono_loader_lock, which must not nest
+		 * inside the wj_compiling compile section. Same reason blockers[] is carried out by value. */
+		{
+			extern int mono_wasm_jit_heal_wait;
+			if (mono_wasm_jit_heal_wait) {
+				int hk;
+				for (hk = 0; hk < r.nheal_callees; ++hk)
+					if (r.heal_callees [hk] && r.heal_callees [hk] != logical_method)
+						wj_waiter_register (r.heal_callees [hk], logical_method);
+			}
+		}
 		wj_waiter_drain (logical_method);   /* event-driven wake: re-queue any methods parked waiting on this callee */
 		/* CO-LOCATION, after publication and never before it. The method is already invocable at this
 		 * point and stays invocable whatever happens next: a re-frame that fails leaves every member on
@@ -2637,8 +2673,14 @@ wasm_jit_drain_reemits (void)
 		if (mono_wasm_jit_registry_count () < mono_wasm_jit_reemit_after)
 			return;
 	}
-	if (mono_wasm_jit_reemit <= 0 || wj_reemit_head == wj_reemit_tail)
-		return;
+	{
+		extern int mono_wasm_jit_heal_wait;
+		/* HEAL_WAIT makes this drain reachable on its own: its entries do not come from the invoke_in
+		 * trigger (which is stats-gated and therefore inert in a timing run) but from a callee
+		 * publishing, so gating the drain on `reemit > 0` would leave them queued forever. */
+		if ((mono_wasm_jit_reemit <= 0 && !mono_wasm_jit_heal_wait) || wj_reemit_head == wj_reemit_tail)
+			return;
+	}
 	for (n = 0; n < mono_wasm_jit_promotion_drain; ++n) {
 		gint32 h = wj_reemit_head;
 		MonoMethod *pm;
@@ -2665,7 +2707,7 @@ wasm_jit_drain_reemits (void)
 			 * (R169: 78.8% of profile observations arrive after the method was emitted). Re-emitting a
 			 * method whose profile has barely changed spends a full mini_method_compile for nothing. */
 			extern int mono_wasm_jit_reemit_age, mono_wasm_jit_registry_count (void);
-			if (im->wasm_jit_desc > 0 &&
+			if (!im->wasm_jit_heal_pending && im->wasm_jit_desc > 0 &&
 			    mono_wasm_jit_registry_count () - im->wasm_jit_desc < mono_wasm_jit_reemit_age) {
 				/* NOT STALE ENOUGH YET -- drop it back to state 0 and DO NOT RE-ENQUEUE.
 				 *
