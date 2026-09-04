@@ -111,6 +111,21 @@ they carry an older tree; if something surprising turns up, re-check rather than
   against one hoisted load and a constant-offset access for a module-defined one (`:1129-1145`). `s.p`
   (`__stack_pointer`) is the only mutable import, and every framed method reads *and writes* it.
 
+* **PROCESS-WIDE IN THE BYTES, PER-WORKER IN ADMISSION.** Modules are compiled ONCE and broadcast
+  (`mono_wasm_jit_broadcast_module`), then instantiated per worker, so V8's code cache only applies while
+  the emitted bytes depend on nothing per-thread. An f-slot NUMBER is process-wide and only its
+  INSTALLATION is per-worker, which is why admission gates entry rather than the emitted code testing
+  anything -- baking a constant f-slot is cache-safe, deriving a form from TLS would make every module
+  unshareable. Same asymmetry capped R193's object-keyed delegate recipe (it had to keep the
+  `wj_slot_live` probe for exactly this reason), so check any new dispatch design against this rule
+  before building it.
+* **Residual healing is also the TIERING EDGE, so it cannot just be deleted (R195).**
+  `mono_wasm_jit_late_fslot` (`interp.c:5468`) calls `wasm_jit_maybe_compile` because
+  `mono_wasm_jit_call_interp` does not, so a callee reached only through an immutable residual edge would
+  never acquire an f-slot at all (`profile19: residual_healed=0` is that failure). Removing the guard
+  removes re-emission's INPUT, not just a branch. Split the two jobs instead: keep the tiering bump off
+  the per-dispatch path, and make the call site a `WASM_RELOC_CALL` hole so a re-frame bakes a constant.
+
 ## The prefilled placeholder — the trap that has now bitten twice
 
 `mono_jiterp_allocate_table_entry` hands out slots from a range the jiterpreter **prefills with a real,
