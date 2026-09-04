@@ -485,6 +485,22 @@ enum {
 	 * call + branch + dynamic call_indirect (R196). Read WOKEN against REEMIT_DONE too: a wake that
 	 * never completes is R179's failure shape returning. */
 	WJC_HEAL_SITES, WJC_HEAL_WOKEN,
+	/* R200: the two uncounted routes that kept a parts-sum identity from closing mechanically.
+	 * SHADOW_SELF is the `callee == self` early return in wj_shadow_candidate -- self-recursion, which must
+	 * never be shadowed, and which was silently absorbed into SHADOW_REFUSED's residual (191 of 25,242).
+	 * ASM_NONAME is a member reaching wj_assemble with name == NULL: harmless to execution but it degrades
+	 * that method's perf symbol to a bare `wasmjit`, i.e. it silently blinds every instrument in
+	 * scratchpad/wj that resolves by name. Must stay 0. */
+	WJC_SHADOW_SELF, WJC_ASM_NONAME,
+	/* R201 shadow selection. CANDCAP = eligible callees beyond WJ_SHADOW_CAND_MAX, i.e. the staging array
+	 * truncated the ranking input. MODCAP = a ranked candidate dropped because the per-module shadow byte
+	 * budget was exhausted (distinct from SHADOW_CAP, the per-module COUNT cap). */
+	WJC_SHADOW_CANDCAP, WJC_SHADOW_MODCAP,
+	/* R201: a ranked candidate that was eligible in pass 1 and is NOT eligible at the point of use --
+	 * i.e. the shared WjBody was retired or replaced by its owning thread in between. Non-zero is normal
+	 * and healthy (it is the race being caught); it reading 0 forever would mean the re-validation is
+	 * dead code, and the fault it prevents is `function signature mismatch`. */
+	WJC_SHADOW_REVALIDATE,
 	WJC_MAX
 };
 
