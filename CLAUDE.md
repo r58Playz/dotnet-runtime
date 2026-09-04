@@ -422,6 +422,14 @@ way that looks like a runtime regression, **check the build command before belie
 The box is an i7-1360P — a 28 W mobile part that throttles 2106 → 1403 MHz *within a single run*. That fact
 invalidated a session's worth of A/B ordering before it was noticed.
 
+* **THE BOX IS AT ~95 C WHENEVER THE GAME IS IN-GAME, PERMANENTLY.** It is an i7-1360P, a 28 W mobile
+  part, and it throttles 2106 -> 1403 MHz. So "let it cool first" is NOT an available remedy and
+  `preflight`'s thermal warning is not actionable -- the only defence against ordering bias is to run
+  BOTH ORDERS. R194 is the demonstration: rounds 1-3 with arm A first gave non-overlapping ranges
+  favouring A, 3/3, which is the standard this project has used since R40; reversing the order in rounds
+  4-6 reversed the result, and the real rule was that **the arm running SECOND was slower in 6 of 6
+  rounds**. A single-order interleave cannot see that. Never quote non-overlapping ranges from one
+  order.
 * **The floor is ~12%, not ~5%** (R149, measured from 359 fault-free runs / 29 repeated identical configs in
   `mc-results.jsonl`): median same-config fpsTail spread is **11.5% on a >=100 s window** and **22.9% on a
   60 s one**; only 3 of 29 groups came in at or under 10%. The old "~5%" was an assumption, and it was

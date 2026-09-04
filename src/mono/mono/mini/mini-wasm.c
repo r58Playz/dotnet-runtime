@@ -6965,7 +6965,16 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
 	extern int mono_wasm_jit_colocate_scc;
 	WjDepSet *rds;
-	int descs [WJ_BATCH_MAX];
+	/* HEAP, not stack, and this is a bug fix rather than tidiness. `descs` only ever holds `cap` entries
+	 * (COLOCATE_MAX, 16 by default), but a WJ_BATCH_MAX-sized automatic is 2 KB of C stack in a function
+	 * that sits at the bottom of
+	 *   drain_reemits -> force_compile -> ... -> compile_publish -> colocate_deps_now -> rebatch -> wj_assemble
+	 * Adding 2 KB beside it (a staging array for the merge closure) overflowed that chain and presented
+	 * as 8x `RuntimeError: memory access out of bounds` (R194). Enabling HEAL_WAIT lengthens the SAME
+	 * chain by the re-emit frames and reproduced it at 12 faults with the array already removed -- so the
+	 * remaining 2 KB is itself the margin. Size the allocation by `cap` and the footprint drops from
+	 * 2048 bytes to 64. */
+	int *descs = NULL;
 	WjRegEntry *re;
 	int n = 0, bytes = 0, i, j, cap;
 
@@ -6994,6 +7003,9 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	cap = mono_wasm_jit_colocate_max;
 	if (cap > WJ_BATCH_MAX)
 		cap = WJ_BATCH_MAX;
+	if (cap < 2)
+		cap = 2;
+	descs = g_new0 (int, cap);
 	descs [n++] = desc_id;
 	bytes += re->len > 0 ? re->len : 0;
 
@@ -7093,6 +7105,7 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 			if (mono_wasm_jit_colocate_scc && d > 0 && wj_asm_reaches (d, re->f)) {
 				if (G_UNLIKELY (mono_wasm_jit_stats))
 					mono_wasm_jit_count (WJC_COLOCATE_SCC_REFUSED);
+				g_free (descs);
 				return 0;
 			}
 			continue;
@@ -7107,16 +7120,19 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 		WJ_CO_COUNT (WJC_COLOCATE_MEMBER_CAP);
 	if (n < 2) {
 		WJ_CO_COUNT (WJC_COLOCATE_SINGLETON);
+		g_free (descs);
 		return 0;
 	}
 	if (!mono_wasm_jit_rebatch (descs, n, NULL, NULL)) {
 		WJ_CO_COUNT (WJC_COLOCATE_REBATCH_FAIL);
+		g_free (descs);
 		return 0;
 	}
 	if (G_UNLIKELY (mono_wasm_jit_stats)) {
 		mono_wasm_jit_add (WJC_COLOCATED_MEMBERS, n);
 		mono_wasm_jit_count (WJC_COLOCATE_FORMED);
 	}
+	g_free (descs);
 	return n;
 }
 
