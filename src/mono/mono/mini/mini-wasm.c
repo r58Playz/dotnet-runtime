@@ -484,6 +484,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_pretier; const char *pt = g_getenv ("MONO_WASM_JIT_PRETIER"); mono_wasm_jit_pretier = (pt && *pt && *pt != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_heal_wait; const char *hw = g_getenv ("MONO_WASM_JIT_HEAL_WAIT"); mono_wasm_jit_heal_wait = (hw && *hw && *hw != '0') ? 1 : 0; }
+	{ extern int mono_wasm_jit_stackprobe; const char *sp2 = g_getenv ("MONO_WASM_JIT_STACKPROBE"); mono_wasm_jit_stackprobe = (sp2 && *sp2 && *sp2 != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
 	{ extern int mono_wasm_jit_devirt_profile; const char *dp = g_getenv ("MONO_WASM_JIT_DEVIRT_PROFILE"); mono_wasm_jit_devirt_profile = (dp && *dp && *dp != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
@@ -833,6 +834,10 @@ int mono_wasm_jit_pretier = 0;
  * event that is already precise. Gating an event-driven trigger on a staleness heuristic is exactly how
  * R179 produced 17,343 enqueues for 3 re-emits. */
 int mono_wasm_jit_heal_wait = 0;
+/* MONO_WASM_JIT_STACKPROBE: record the worst C-stack headroom seen at the compile chain's probe points.
+ * DEFAULT OFF. Diagnostic only -- see wj_stack_probe. Exists because two rounds of shaving stack arrays
+ * on a fault-count correlation established nothing, and one run of this settles it. */
+int mono_wasm_jit_stackprobe = 0;
 /* Defined here (not in the HOST_BROWSER block) because mono_wasm_emit_method references it in BOTH the
  * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (HOST_BROWSER). */
 #ifndef HOST_BROWSER
@@ -1196,6 +1201,12 @@ mono_wasm_jit_get_counter (int idx)
 	return (double) mono_wasm_jit_counters [idx];
 }
 
+/* Stack-headroom probe state; defined here rather than beside wj_stack_probe because
+ * mono_wasm_jit_dump_stats (just below) prints them and comes first in the file. */
+static gint32 wj_stack_min_headroom = G_MAXINT32;  /* worst headroom seen, bytes */
+static gint32 wj_stack_total_seen = 0;             /* base - end on the thread that hit the worst case */
+static gint32 wj_stack_probe_hits = 0;
+
 #define WJC_(i) ((long long) mono_wasm_jit_counters [i])
 
 /* Every counter in the WJC_* enum must appear BOTH here and in the harness mirror (ikvmcraft
@@ -1346,6 +1357,14 @@ mono_wasm_jit_dump_stats (void)
 	(void) mono_wasm_jit_reemit_age;
 	printf ("[wasm-jit vtabi] vt_byaddr_methods=%lld vret_methods=%lld\n",
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
+	{
+		extern int mono_wasm_jit_stackprobe;
+		printf ("[wasm-jit stackprobe] worst C-stack headroom=%d bytes of %d total (%d probes, PROBE=%d)"
+			" -- headroom near 0 proves the compile chain overflows; headroom in the hundreds of KB says"
+			" the OOB faults are NOT a stack problem and two rounds of array-shaving chased the wrong thing\n",
+			wj_stack_min_headroom == G_MAXINT32 ? -1 : wj_stack_min_headroom,
+			wj_stack_total_seen, wj_stack_probe_hits, mono_wasm_jit_stackprobe);
+	}
 	printf ("[wasm-jit heal-wait] healing sites recorded=%lld  waiters woken for re-emit=%lld"
 		" (MONO_WASM_JIT_HEAL_WAIT=%d) -- sites with no wakes means those callees never JIT, so healing"
 		" was right; wakes approaching sites means the block is a transient re-emission can delete."
@@ -3315,6 +3334,44 @@ int mono_wasm_jit_storeguard = 0;
  * the missed-ref / dangling-base detector (the heap-store analog of STOREGUARD, which only guards the
  * shadow-stack/addr-frame stores). DEBUG ONLY (a C call per ref store). Default off. */
 int mono_wasm_jit_objguard = 0;
+
+/*
+ * STACK HEADROOM PROBE (MONO_WASM_JIT_STACKPROBE). Diagnostic; default off.
+ *
+ * Two rounds have now been spent shaving C-stack arrays on the theory that
+ *   drain_reemits -> force_compile -> ... -> compile_publish -> colocate_deps_now -> rebatch -> wj_assemble
+ * overflows: R194 removed a 2 KB staging array after 8x `memory access out of bounds`, and R197 moved
+ * `descs` to the heap (2048 -> 64 bytes) and took the same fault 12 -> 4. Neither confirmed anything.
+ * The theory is not obviously right either -- the wasm C stack is 5 MB on the main thread and 1 MB on
+ * workers ((SIZEOF_VOID_P / 4) * 1024 * 1024, mono-threads-wasm.c), which a few KB of locals should not
+ * exhaust.
+ *
+ * So MEASURE the depth instead of inferring it from a fault count. Records the WORST (smallest)
+ * headroom seen at each probe point, per thread bounds, so one run answers "is this chain near its
+ * limit" or "this is not a stack problem at all". Racy min-tracking is deliberate: a diagnostic that
+ * needs a lock changes the thing it measures.
+ *
+ * `emscripten_stack_get_end()` is the LOW address (the limit) and `_get_base()` the high one -- the
+ * stack grows down -- so headroom is current - end and total is base - end.
+ */
+static inline void
+wj_stack_probe (void)
+{
+	extern int mono_wasm_jit_stackprobe;
+	if (G_LIKELY (!mono_wasm_jit_stackprobe))
+		return;
+	{
+		gsize cur = (gsize) emscripten_stack_get_current ();
+		gsize end = (gsize) emscripten_stack_get_end ();
+		gsize base = (gsize) emscripten_stack_get_base ();
+		gint32 head = (cur > end) ? (gint32) (cur - end) : 0;
+		wj_stack_probe_hits++;
+		if (head < wj_stack_min_headroom) {
+			wj_stack_min_headroom = head;
+			wj_stack_total_seen = (base > end) ? (gint32) (base - end) : 0;
+		}
+	}
+}
 
 /* Current linear-memory size in bytes, clamped so it is usable in 32-bit arithmetic: at 65536 pages
  * (a fully-grown 4GB memory) `pages << 16` overflows 32-bit gsize to 0. */
@@ -6794,6 +6851,7 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 	double ms = 0;
 	int i, ok = 0;
 
+	wj_stack_probe ();
 	if (n <= 1 || n > WJ_BATCH_MAX)
 		return 0;
 	for (i = 0; i < n; ++i) {
@@ -6978,6 +7036,7 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	WjRegEntry *re;
 	int n = 0, bytes = 0, i, j, cap;
 
+	wj_stack_probe ();
 	if (!mono_wasm_jit_colocate_deps || desc_id <= 0)
 		return 0;
 	re = wj_reg_at (desc_id - 1);
