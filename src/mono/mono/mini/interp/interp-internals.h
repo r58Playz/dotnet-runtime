@@ -204,6 +204,13 @@ struct InterpMethod {
 	 * having compiled nothing. 31 "re-emissions" per run were no-ops, and the only reason that was
 	 * visible is that WJC_REEMIT_SITE -- the devirt census scoped to re-emitted bodies -- read 0. */
 	guint8 wasm_jit_reemit_state;
+	/* MONO_WASM_JIT_HEAL_WAIT: this method holds a late-f-slot HEALING site whose callee has now
+	 * published, so re-emitting it replaces that site's helper call + branch + dynamic call_indirect
+	 * with an ordinary direct call. Distinct from reemit_state because it must BYPASS the reemit
+	 * age/after gates: those encode the old trigger's premise ("this method's profile has matured"),
+	 * whereas this trigger is an EVENT (the callee acquired an f-slot) and is already precise. Gating an
+	 * event-driven trigger on a staleness heuristic is how R179 got 17,343 enqueues for 3 re-emits. */
+	guint8 wasm_jit_heal_pending;
 	/* THE CALL PROFILE (MONO_WASM_JIT_DEVIRT_PROFILE): WjCallProfile*, lazily allocated. See the long
 	 * comment above WjProfSite in interp.c.
 	 *

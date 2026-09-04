@@ -483,6 +483,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_guard_keep_slotlive; const char *gk = g_getenv ("MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE"); mono_wasm_jit_guard_keep_slotlive = (gk && *gk && *gk != '0') ? 1 : 0; } /* 1 = keep elision on under STOREGUARD/OBJGUARD (partial guard coverage, real configuration) */
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_pretier; const char *pt = g_getenv ("MONO_WASM_JIT_PRETIER"); mono_wasm_jit_pretier = (pt && *pt && *pt != '0') ? 1 : 0; }
+	{ extern int mono_wasm_jit_heal_wait; const char *hw = g_getenv ("MONO_WASM_JIT_HEAL_WAIT"); mono_wasm_jit_heal_wait = (hw && *hw && *hw != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
 	{ extern int mono_wasm_jit_devirt_profile; const char *dp = g_getenv ("MONO_WASM_JIT_DEVIRT_PROFILE"); mono_wasm_jit_devirt_profile = (dp && *dp && *dp != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
@@ -805,6 +806,33 @@ int mono_wasm_jit_residual_mode = 1;
  * `i32.const <fslot>; call_indirect`) and re-resolves on every later re-framing. A constant keeps the
  * module PROCESS-WIDE and therefore code-cacheable; a TLS-derived form would not. */
 int mono_wasm_jit_pretier = 0;
+/* MONO_WASM_JIT_HEAL_WAIT: register a method as a waiter on every callee it emitted a late-f-slot
+ * HEALING block for, so the callee's own publish wakes it for RE-EMISSION. DEFAULT OFF.
+ *
+ * R196 measured healing as a working direct-call path taken ~19.5M times per run (~64% of the residual
+ * population): the callee already has an f-slot when the site executes, and mono_wasm_jit_late_fslot
+ * re-discovers the same slot on every dispatch at the cost of a helper call -- which R88/R90 established
+ * is the expensive part of a dispatch path here -- plus a branch and a dynamic call_indirect.
+ *
+ * Re-emitting the caller after the callee publishes deletes the whole block: the new body takes the
+ * ordinary `call_fslot > 0` path and emits a plain direct call. So this needs NO relocation machinery
+ * and no new reloc kind -- guaranteeing the re-emit is strictly better than patching a hole, and it
+ * avoids the trap the hole design walks into (a constant baked at emit time is 0, so swapping the probe
+ * for a constant would turn those 19.5M healed direct calls into residual interp calls at any site that
+ * is never re-framed).
+ *
+ * Uses machinery that already exists: wj_waiter_register/wj_waiter_drain is the callee -> waiters
+ * reverse map, drain is already called at publish, and the re-emit queue is the path built for
+ * recompiling a PUBLISHED method. Two adjustments were required. Waiters are recorded via
+ * MonoWasmJitResult.heal_callees rather than registered from the emitter, because wj_waiter_register
+ * takes mono_loader_lock and that must not nest inside the wj_compiling section. And a published waiter
+ * is routed to the re-emit queue instead of wj_promote_q, which skips `fslot > 0` as "already done".
+ *
+ * The re-emit age/after gates are BYPASSED for these entries (InterpMethod.wasm_jit_heal_pending):
+ * they encode the old trigger's premise that the method's profile has matured, while this trigger is an
+ * event that is already precise. Gating an event-driven trigger on a staleness heuristic is exactly how
+ * R179 produced 17,343 enqueues for 3 re-emits. */
+int mono_wasm_jit_heal_wait = 0;
 /* Defined here (not in the HOST_BROWSER block) because mono_wasm_emit_method references it in BOTH the
  * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (HOST_BROWSER). */
 #ifndef HOST_BROWSER
@@ -1174,7 +1202,7 @@ mono_wasm_jit_get_counter (int idx)
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 136);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 138);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1318,6 +1346,11 @@ mono_wasm_jit_dump_stats (void)
 	(void) mono_wasm_jit_reemit_age;
 	printf ("[wasm-jit vtabi] vt_byaddr_methods=%lld vret_methods=%lld\n",
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
+	printf ("[wasm-jit heal-wait] healing sites recorded=%lld  waiters woken for re-emit=%lld"
+		" (MONO_WASM_JIT_HEAL_WAIT=%d) -- sites with no wakes means those callees never JIT, so healing"
+		" was right; wakes approaching sites means the block is a transient re-emission can delete."
+		" Read woken against reemit_done: a wake that never completes is R179's shape returning.\n",
+		WJC_(WJC_HEAL_SITES), WJC_(WJC_HEAL_WOKEN), mono_wasm_jit_heal_wait);
 	printf ("[wasm-jit pretier] residual-site tiering bumps=%lld (MONO_WASM_JIT_PRETIER=%d) -- read against"
 		" residual_healed: pretiering should make the late_fslot guard stop being the discoverer\n",
 		WJC_(WJC_PRETIER_BUMP), mono_wasm_jit_pretier);
@@ -11257,6 +11290,25 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							}
 							uses_calls = TRUE;
 							late_fslot_block = TRUE;
+							/* Record the callee so the PUBLISH path can register this method as a waiter on it
+							 * (lock ordering: wj_waiter_register needs mono_loader_lock outside the compile
+							 * section, and we are inside it). When the callee publishes, this method is
+							 * re-emitted and takes the ordinary call_fslot > 0 path -- the healing block, its
+							 * helper call and its dynamic call_indirect all disappear. Deduped; a full array
+							 * just means some sites keep healing, which is the status quo, not a fault. */
+							{
+								MonoWasmJitResult *hres = &cfg->wasm_jit_result;
+								int hk;
+								for (hk = 0; hk < hres->nheal_callees; ++hk)
+									if (hres->heal_callees [hk] == call_method) break;
+								if (hk == hres->nheal_callees) {
+									if (hres->nheal_callees < MONO_WASM_JIT_MAX_BLOCKERS)
+										hres->heal_callees [hres->nheal_callees++] = call_method;
+									else
+										hres->heal_callees_truncated = 1;
+								}
+								wj_count (WJC_HEAL_SITES);
+							}
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $after_residual */
 							wasm_i32_const (&body, (gint32) (intptr_t) late_im);
 							wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_late_fslot, hti);
