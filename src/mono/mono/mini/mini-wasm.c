@@ -273,6 +273,12 @@ int mono_wasm_jit_shadow_max = 8;     /* MONO_WASM_JIT_SHADOW_MAX: distinct shad
  * (500 bytes, src/flags/flag-definitions.h:2170-2192). Above it the shadow still buys the direct call but
  * no longer buys the inline, while costing a full copy of the body in every caller that takes one. */
 int mono_wasm_jit_shadow_bytes = 500;
+/* MONO_WASM_JIT_SHADOW_MODBYTES: TOTAL shadow bytes duplicated into one module, 0 = unbounded.
+ * SHADOW_BYTES caps one callee; this caps the module. R200 measured the cost side that SHADOW_BYTES
+ * cannot control: raising the per-callee cap 500 -> 2000 took bodies 112,202 -> 168,005 (+50%), which is
+ * real wire size at ~15.4 ns/byte of V8 compile time. A module budget lets a big HOT callee in while
+ * still bounding total duplication, which is the trade the per-callee cap forces you to make globally. */
+int mono_wasm_jit_shadow_modbytes = 0;
 /* MONO_WASM_JIT_SHADOW_NONLEAF: allow shadowing a callee that itself makes calls.
  *
  * The leaf restriction is not arbitrary -- a shadow's unresolved callees become `call_indirect`
@@ -506,6 +512,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_shadow; const char *sh = g_getenv ("MONO_WASM_JIT_SHADOW"); mono_wasm_jit_shadow = (sh && *sh) ? (*sh != '0') : 0; }
 	{ extern int mono_wasm_jit_shadow_max; const char *sm = g_getenv ("MONO_WASM_JIT_SHADOW_MAX"); int v = (sm && *sm) ? atoi (sm) : 8; mono_wasm_jit_shadow_max = (v >= 0 && v <= 64) ? v : 8; }
 	{ extern int mono_wasm_jit_shadow_bytes; const char *sb = g_getenv ("MONO_WASM_JIT_SHADOW_BYTES"); int v = (sb && *sb) ? atoi (sb) : 500; mono_wasm_jit_shadow_bytes = (v >= 0 && v <= 65536) ? v : 500; }
+	{ extern int mono_wasm_jit_shadow_modbytes; const char *sb = g_getenv ("MONO_WASM_JIT_SHADOW_MODBYTES"); int v = (sb && *sb) ? atoi (sb) : 0; mono_wasm_jit_shadow_modbytes = (v >= 0 && v <= 1048576) ? v : 0; }
 	{ extern int mono_wasm_jit_shadow_nonleaf; const char *sn = g_getenv ("MONO_WASM_JIT_SHADOW_NONLEAF"); mono_wasm_jit_shadow_nonleaf = (sn && *sn) ? (*sn != '0') : 0; }
 	{ extern int mono_wasm_jit_reemit; const char *rm = g_getenv ("MONO_WASM_JIT_REEMIT"); int v = (rm && *rm) ? atoi (rm) : 0; mono_wasm_jit_reemit = (v >= 0) ? v : 0; }
 	{ extern int mono_wasm_jit_reemit_after; const char *ra = g_getenv ("MONO_WASM_JIT_REEMIT_AFTER"); int v = (ra && *ra) ? atoi (ra) : 12000; mono_wasm_jit_reemit_after = (v >= 0) ? v : 12000; }
@@ -1213,7 +1220,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 138);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 143);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1370,6 +1377,10 @@ mono_wasm_jit_dump_stats (void)
 		" was right; wakes approaching sites means the block is a transient re-emission can delete."
 		" Read woken against reemit_done: a wake that never completes is R179's shape returning.\n",
 		WJC_(WJC_HEAL_SITES), WJC_(WJC_HEAL_WOKEN), mono_wasm_jit_heal_wait);
+	printf ("[wasm-jit asm-hygiene] shadow_self=%lld asm_noname=%lld -- shadow_self closes SHADOW_REFUSED's\n"
+		"  parts-sum (refused == stale+eh+big+self); asm_noname MUST be 0 or perf symbolisation silently\n"
+		"  degrades to a bare 'wasmjit' for that method and every name-resolving instrument goes blind.\n",
+		WJC_(WJC_SHADOW_SELF), WJC_(WJC_ASM_NONAME));
 	printf ("[wasm-jit pretier] residual-site tiering bumps=%lld (MONO_WASM_JIT_PRETIER=%d) -- read against"
 		" residual_healed: pretiering should make the late_fslot guard stop being the discoverer\n",
 		WJC_(WJC_PRETIER_BUMP), mono_wasm_jit_pretier);
@@ -5619,8 +5630,25 @@ wj_emit_fast_count (WasmBuf *body, int idx)
  * that gets stored (WjRegEntry.body) and re-framed.
  */
 /* Hard ceiling on shadows per module, independent of MONO_WASM_JIT_SHADOW_MAX: the member array is a
- * stack local on the emit path. */
-#define WJ_SHADOW_MAX 16
+ * stack local on the emit path.
+ *
+ * R201 raised this 16 -> 48, and the 16 had been SILENTLY CLAMPING the knob: R200's `shadow_max=32` arm
+ * actually ran at 16 (the caller clamps, `cap > WJ_SHADOW_MAX`), so "raising the count cap bought only
+ * +0.8 points" was a measurement of 8 -> 16 wearing a 32 label. Comment rule #1 in a new place: the knob's
+ * range was stated at its initialiser and enforced here.
+ *
+ * Raising it is only worth anything BECAUSE selection is now ranked. Under encounter order a bigger cap
+ * just admits more of whatever the encoder emitted first; ranked, the extra slots go to the best
+ * sites/bytes candidates. The measured justification: at cap 16 with `shadow_bytes=2000`, ShadowCap
+ * refused 3,628 and ShadowBig 3,654 against 7,243 surviving indirect arms -- i.e. the two caps had become
+ * co-equal and nearly the whole remainder.
+ *
+ * Stack cost is the reason for a ceiling at all: WjAsmMember am[1+N] plus WjAsmDeps sdeps[1+N] plus the
+ * ranking staging array, ~8 KB at N=48 against a measured 143 KB of 8 MB in use (1.7%, the R198 probe). */
+#define WJ_SHADOW_MAX 48
+/* Ranking input bound for wj_collect_shadows' selection pass. Larger than WJ_SHADOW_MAX on purpose:
+ * the point of ranking is to CHOOSE the best WJ_SHADOW_MAX out of more than that many candidates. */
+#define WJ_SHADOW_CAND_MAX 128
 
 typedef struct _WjBody {
 	MonoMethod    *method;
@@ -6019,8 +6047,13 @@ wj_shadow_candidate (MonoMethod *callee, MonoMethod *self)
 	WjBody *b;
 	int fslot, desc;
 
-	if (!callee || callee == self)
+	if (!callee || callee == self) {
+		/* Self-recursion. Counted so wj_collect_shadows' SHADOW_REFUSED tally has a complete parts-sum;
+		 * this is not a policy refusal and no knob can or should reach it. */
+		if (G_UNLIKELY (mono_wasm_jit_stats) && callee)
+			mono_wasm_jit_count (WJC_SHADOW_SELF);
 		return NULL;
+	}
 	fslot = mono_wasm_jit_get_callee_fslot (callee);
 	if (fslot <= 0) {
 		/* No f-slot means no relocatable body: the callee is AOT / main-module code, or has not been
@@ -6060,47 +6093,126 @@ wj_shadow_candidate (MonoMethod *callee, MonoMethod *self)
  * Walk a body's call relocations and append a shadow member for every distinct eligible leaf callee.
  * Returns how many were appended. `out` must have room for `max` entries.
  */
+/* One ranking candidate: an eligible shadow body plus how many sites in the host module it converts. */
+typedef struct {
+	WjBody     *b;
+	MonoMethod *m;
+	int         sites;
+} WjShadowCand;
+
 static int
 wj_collect_shadows (const WasmBuf *body, MonoMethod *self, WjAsmMember *out, int max)
 {
+	extern int mono_wasm_jit_shadow_modbytes;
 	const WasmRelocs *rl = body ? body->relocs : NULL;
-	int n = 0;
+	/* Staging array for the ranking input. 64 x 16 B = 1 KB of frame, and the stack probe measured
+	 * 143 KB of 8 MB in use (1.7%), so this is not the array that has to be heap-allocated. */
+	WjShadowCand cand [WJ_SHADOW_CAND_MAX];
+	WjBody *fresh;
+	int ncand = 0, n = 0, j;
+	gint64 spent = 0;
 	guint32 k;
 
+	/* PASS 1 -- eligible distinct callees, each with the number of sites IN THIS MODULE it would convert. */
 	for (k = 0; rl && k < rl->n; ++k) {
-		if (n >= max) {
-			/* Out of slots for this module. Counted separately so a cap that is merely too low is not
-			 * mistaken for a call graph that has nothing to offer. */
-			if (G_UNLIKELY (mono_wasm_jit_stats) && rl->r [k].kind == WASM_RELOC_CALL)
-				mono_wasm_jit_count (WJC_SHADOW_CAP);
-			continue;
-		}
 		MonoMethod *callee;
 		WjBody *b;
-		int j, dup = 0;
 		if (rl->r [k].kind != WASM_RELOC_CALL)
 			continue;
 		callee = (MonoMethod *) rl->r [k].sym;
-		/* One copy per module however many sites call it -- the duplicate is per MODULE, while the win
-		 * is per SITE, which is the whole reason this beats co-location on reach. */
-		for (j = 0; j < n; ++j)
-			if (out [j].method == callee) { dup = 1; break; }
-		if (dup)
+		/* One copy per module however many sites call it -- the duplicate is per MODULE while the win is
+		 * per SITE, which is both why this beats co-location on reach and why `sites` is the value term. */
+		for (j = 0; j < ncand; ++j)
+			if (cand [j].m == callee) { cand [j].sites++; break; }
+		if (j < ncand)
 			continue;
+		if (ncand >= WJ_SHADOW_CAND_MAX) {
+			/* The RANKING INPUT was truncated, which is a different failure from either cap: the best
+			 * candidate may be the one we never looked at. Must stay small or the ranking is a lie. */
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_CANDCAP);
+			continue;
+		}
 		b = wj_shadow_candidate (callee, self);
 		if (!b) {
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_REFUSED);
 			continue;
 		}
+		cand [ncand].b = b;
+		cand [ncand].m = callee;
+		cand [ncand].sites = 1;
+		++ncand;
+	}
+
+	/* PASS 2 -- SELECTION ORDER, which before R201 was whatever order the encoder emitted relocations in.
+	 * A shadow costs its body ONCE per module and pays back once per SITE, so the greedy that maximises
+	 * conversion per duplicated byte takes sites/bytes descending. Encounter order spends a 16-slot cap on
+	 * the first 16 callees the body happens to mention, which is why R200 read the count cap as
+	 * "nearly non-binding": the cap was not the constraint, the ORDER was. Selection sort, ncand <= 64,
+	 * once per emitted module. Cross-multiply rather than divide -- integer division would tie everything
+	 * with more bytes than sites into one bucket. */
+	while (n < max && n < ncand) {
+		int best = n;
+		for (j = n + 1; j < ncand; ++j) {
+			gint64 lv = (gint64) cand [j].sites * (gint64) cand [best].b->f_body.len;
+			gint64 rv = (gint64) cand [best].sites * (gint64) cand [j].b->f_body.len;
+			if (lv > rv)
+				best = j;
+		}
+		if (best != n) {
+			WjShadowCand t = cand [n];
+			cand [n] = cand [best];
+			cand [best] = t;
+		}
+		if (mono_wasm_jit_shadow_modbytes > 0 &&
+		    spent + (gint64) cand [n].b->f_body.len > (gint64) mono_wasm_jit_shadow_modbytes) {
+			/* Budget test on the SNAPSHOT size is deliberate: it is a cost heuristic, and re-fetching
+			 * here would resolve a body we are about to discard. The framed size below is the fresh one. */
+			/* Budget exhausted. Do NOT break: a later candidate may be small enough to still fit, and
+			 * skipping it would make the budget behave like a cap on the ranked PREFIX rather than on
+			 * bytes. Swap it out of contention by shrinking ncand. */
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_MODCAP);
+			cand [n] = cand [ncand - 1];
+			--ncand;
+			continue;
+		}
+		/* RE-VALIDATE AT THE POINT OF USE. This is not belt-and-braces; it is the whole reason this
+		 * two-pass shape is safe at all.
+		 *
+		 * A WjBody lives in wj_reg and is shared MUTABLE state owned by whichever thread compiled it.
+		 * wj_shadow_candidate's checks -- the desc->body->method identity test above all -- are true
+		 * only at the instant they run. The pre-R201 loop resolved and consumed a candidate in the SAME
+		 * iteration, so that window was a few instructions wide. Ranking necessarily separates the two,
+		 * and the first version of R201 carried 64 raw WjBody pointers across the entire relocation
+		 * walk before framing any of them: measured result was `function signature mismatch` x3 and a
+		 * wedged world load, i.e. a shadow framed from a body that had been retired or replaced.
+		 *
+		 * So pass 1's snapshot decides ORDER ONLY -- a stale size just mis-ranks, which costs nothing --
+		 * and the body actually framed is re-fetched here. FOURTH subsystem to need this: same shape as
+		 * the R199 name-section fault (resolve on one thread, use later on another). The rule is
+		 * RESOLVE AND CONSUME IN THE SAME BREATH, or re-resolve at the point of use. */
+		fresh = wj_shadow_candidate (cand [n].m, self);
+		if (!fresh) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_REVALIDATE);
+			cand [n] = cand [ncand - 1];
+			--ncand;
+			continue;
+		}
 		/* f_slot 0: a shadow owns no slot. It must never be the target of the cycle test, and nothing
 		 * may instantiate over it. */
-		wj_member_from_body (&out [n], b, 0);
+		wj_member_from_body (&out [n], fresh, 0);
+		spent += (gint64) fresh->f_body.len;
 		if (G_UNLIKELY (mono_wasm_jit_stats)) {
 			mono_wasm_jit_count (WJC_SHADOW_MEMBERS);
-			mono_wasm_jit_add (WJC_SHADOW_BYTES, (gint64) b->f_body.len);
+			mono_wasm_jit_add (WJC_SHADOW_BYTES, (gint64) fresh->f_body.len);
 		}
 		++n;
 	}
+	/* Ranked candidates that the COUNT cap left on the table, counted per candidate rather than per
+	 * relocation -- the pre-R201 site bumped this once per reloc past the cap, which double-counted a
+	 * callee with many sites and made the cap look more binding than it was. */
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		for (j = n; j < ncand; ++j)
+			mono_wasm_jit_count (WJC_SHADOW_CAP);
 	return n;
 }
 #endif /* HOST_BROWSER */
@@ -6393,8 +6505,13 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 		 * the signature and lazily resolves parameter types, on a worker, inside the compile section,
 		 * for members other threads compiled. The name was resolved by whoever compiled each member --
 		 * WjBody.name -- and is borrowed, not owned, so nothing is freed below. */
-		for (i = 0; i < n; ++i)
+		for (i = 0; i < n; ++i) {
 			names [i] = (char *) mem [i].name;
+			/* A NULL name is not a fault -- the fallbacks below keep the module valid -- but it costs this
+			 * method its perf symbol, so it must never happen silently. */
+			if (G_UNLIKELY (!names [i] && mono_wasm_jit_stats))
+				mono_wasm_jit_count (WJC_ASM_NONAME);
+		}
 		if (nexport == 1 && n == 1)
 			wasm_module_append_name_section (out, names [0] ? names [0] : "wasmjit",
 			                                 names [0] ? names [0] : "method", (guint32) nhimp);
