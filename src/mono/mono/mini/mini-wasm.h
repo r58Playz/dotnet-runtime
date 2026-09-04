@@ -456,6 +456,20 @@ enum {
 	 * jbox2d exercised 98 merges with rolled_back=0, so this path is IMPLEMENTED AND UNTESTED. Treat a
 	 * non-zero count here as the first observation of it, not as routine. */
 	WJC_COLOCATE_MERGE_ROLLBACK,
+	/* WHY a merge closure was refused, splitting what otherwise all lands in COLOCATE_DEP_BATCHED.
+	 * R194 left 18,558 of these on Minecraft WITH merging on, and they are the arm blocker: an arm's
+	 * target is registered as a direct dep (wj_result_add_direct_dep), so a method that HAS arms
+	 * necessarily has a depset -- which means `no_depset` cannot be what stops its arms co-locating, and
+	 * the surviving DEP_BATCHED volume is. Without this split there is no way to tell a closure refused
+	 * by a sibling's preconditions (fixable in the rules) from one refused by a cap (fixable by a knob),
+	 * and those lead to opposite work.
+	 *
+	 *   MERGE_PRECOND  a sibling of the callee's group failed the per-member preconditions -- not
+	 *                  registered here, no retained body, no slot pair, or previously colocate_refused
+	 *   MERGE_CAP      the closure would exceed COLOCATE_MAX members or COLOCATE_BYTES wire bytes
+	 *
+	 * MERGE_PRECOND + MERGE_CAP + MERGED == the times a batched callee was reached with merging on. */
+	WJC_COLOCATE_MERGE_PRECOND, WJC_COLOCATE_MERGE_CAP,
 	WJC_MAX
 };
 

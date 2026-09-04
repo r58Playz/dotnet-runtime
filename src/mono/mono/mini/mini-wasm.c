@@ -1153,7 +1153,7 @@ mono_wasm_jit_get_counter (int idx)
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 133);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 135);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1249,6 +1249,9 @@ mono_wasm_jit_dump_stats (void)
 			" (implemented and UNTESTED while this reads 0; a merge rollback restores saved.batch"
 			" rather than clearing it, see WJC_COLOCATE_MERGE_ROLLBACK)\n",
 			WJC_(WJC_COLOCATE_MERGE_ROLLBACK));
+		printf ("[wasm-jit colocate-merge-why] closure refused: sibling preconditions=%lld  caps=%lld"
+			"  (+ merged %lld == batched callees reached; precond is fixable in the RULES, caps by a KNOB)\n",
+			WJC_(WJC_COLOCATE_MERGE_PRECOND), WJC_(WJC_COLOCATE_MERGE_CAP), WJC_(WJC_COLOCATE_MERGED));
 	}
 		/* Reach as EXECUTED, from the IC miss path. sibling/(sibling+foreign) is how much of our own
 		 * dispatch the grouping half already covers; notours is the AOT wall and is OVER_AOT's problem,
@@ -6982,16 +6985,18 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 								/* Pre-check the cheap preconditions rebatch will re-check anyway: forming a
 								 * request rebatch is certain to refuse costs an assemble pass for nothing. */
 								if (!sre || !sre->body || sre->e <= 0 || sre->f <= 0 || sre->colocate_refused) {
-									ok_all = 0; break;
+									ok_all = 0; WJ_CO_COUNT (WJC_COLOCATE_MERGE_PRECOND); break;
 								}
 								for (j2 = 0; j2 < n; ++j2)
 									if (descs [j2] == sd) break;
 								if (j2 < n)
 									continue;          /* already in the request (incl. ones just appended) */
-								if (n >= cap) { ok_all = 0; break; }
+								if (n >= cap) { ok_all = 0; WJ_CO_COUNT (WJC_COLOCATE_MERGE_CAP); break; }
 								descs [n++] = sd;
 								bytes += sre->len > 0 ? sre->len : 0;
 							}
+							if (ok_all && bytes > mono_wasm_jit_colocate_bytes)
+								WJ_CO_COUNT (WJC_COLOCATE_MERGE_CAP);
 							if (ok_all && bytes <= mono_wasm_jit_colocate_bytes) {
 								WJ_CO_COUNT (WJC_COLOCATE_MERGED);
 								/* The callee is now in the request as a member of its absorbed group, so no
