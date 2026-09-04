@@ -5624,6 +5624,27 @@ wj_emit_fast_count (WasmBuf *body, int idx)
 
 typedef struct _WjBody {
 	MonoMethod    *method;
+	/* FULL NAME, RESOLVED AT EMIT TIME AND OWNED HERE. Not derived later from `method`, and that is a
+	 * correctness requirement rather than a cache.
+	 *
+	 * `mono_method_get_full_name` is a METADATA operation: it walks the signature through
+	 * mono_signature_get_desc -> mono_type_get_desc and lazily resolves parameter types, which wants the
+	 * loader lock and a coop-safe thread state. Calling it during ASSEMBLY -- on a worker, inside the
+	 * compile section, for members other threads compiled -- faults, and the captured trace is exactly
+	 * those frames under wj_assemble (R199, intermittent `memory access out of bounds` at ~33% of runs;
+	 * co-location merging surfaces it by raising the number of names resolved per assembly).
+	 *
+	 * This is the THIRD subsystem to hit it and the two that got it right did the same thing: see
+	 * `wj_block_name` ("resolved at record time on a coop thread") and `wj_entry_edges` ("caches full
+	 * method names at record time so the main-thread JS dump can read it without taking a lock").
+	 * Resolve on the thread that compiled the method, where the metadata is necessarily live -- the
+	 * emitter already does exactly that for its own diagnostics (`mname`, and the comment there notes
+	 * metadata is stable for the compile lifetime).
+	 *
+	 * Keeping the FULL name rather than a cheap `Klass:name` label is also deliberate: hotinsn.py's
+	 * kind_of() classifies a symbol as OURS only when it looks like a mono full name (a single colon AND
+	 * a space), so a shortened label would silently reclassify the whole tier as `aot`. */
+	char          *name;
 	WasmValtype    param_types [WASM_FUNCTYPE_MAX_PARAMS];
 	guint32        nparams;
 	WasmValtype    ret_type;
@@ -5651,12 +5672,13 @@ wj_body_free (WjBody *b)
 	wasm_buf_free (&b->f_body);
 	wasm_buf_free (&b->e_body);
 	g_free (b->extra_types);
+	g_free (b->name);
 	g_free (b);
 }
 
 /* Take ownership of the two body buffers (the caller's are left zeroed) and copy the small side tables. */
 static WjBody *
-wj_body_take (MonoMethod *method, WasmBuf *f, WasmBuf *e,
+wj_body_take (MonoMethod *method, const char *name, WasmBuf *f, WasmBuf *e,
               const WasmValtype *params, guint32 nparams, WasmValtype ret,
               const WasmLocalGroup *groups, const WasmFuncType *extras, guint32 nextra,
               gboolean uses_calls, gboolean uses_eh_tag, int eh_tpool)
@@ -5664,6 +5686,8 @@ wj_body_take (MonoMethod *method, WasmBuf *f, WasmBuf *e,
 	WjBody *b = g_new0 (WjBody, 1);
 	g_assert (nparams <= WASM_FUNCTYPE_MAX_PARAMS);
 	b->method = method;
+	/* Copied, not borrowed: the caller's string is a compile-scoped local. */
+	b->name = name ? g_strdup (name) : NULL;
 	memcpy (b->param_types, params, sizeof (WasmValtype) * nparams);
 	b->nparams = nparams;
 	b->ret_type = ret;
@@ -5682,7 +5706,11 @@ wj_body_take (MonoMethod *method, WasmBuf *f, WasmBuf *e,
 }
 
 typedef struct {
-	MonoMethod           *method;         /* for the name section and for co-location matching */
+	MonoMethod           *method;         /* for co-location matching (identity only -- never dereferenced here) */
+	/* The member's full name, resolved by whoever COMPILED it and owned by its WjBody. wj_assemble must
+	 * not derive this from `method`: see WjBody.name for why that faults. NULL is tolerated and yields
+	 * the "wasmjit" placeholder. */
+	const char           *name;
 	int                   f_slot;         /* this member's own f-slot: the target of the cycle test */
 	WasmBuf              *f_body;         /* code with holes; not modified */
 	WasmBuf              *e_body;
@@ -5942,6 +5970,7 @@ wj_member_from_body (WjAsmMember *m, WjBody *b, int f_slot)
 {
 	memset (m, 0, sizeof (*m));
 	m->method        = b->method;
+	m->name          = b->name;   /* borrowed; resolved at that body's emit time (see WjBody.name) */
 	m->f_slot        = f_slot;
 	m->f_body        = &b->f_body;
 	m->e_body        = &b->e_body;
@@ -6360,8 +6389,12 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 	if (pol->names) {
 		char **names = g_new0 (char *, n);
 		char modname [256];
+		/* USE THE CACHED NAME. Calling mono_method_get_full_name here is what faults (R199): it walks
+		 * the signature and lazily resolves parameter types, on a worker, inside the compile section,
+		 * for members other threads compiled. The name was resolved by whoever compiled each member --
+		 * WjBody.name -- and is borrowed, not owned, so nothing is freed below. */
 		for (i = 0; i < n; ++i)
-			names [i] = mem [i].method ? mono_method_get_full_name (mem [i].method) : NULL;
+			names [i] = (char *) mem [i].name;
 		if (nexport == 1 && n == 1)
 			wasm_module_append_name_section (out, names [0] ? names [0] : "wasmjit",
 			                                 names [0] ? names [0] : "method", (guint32) nhimp);
@@ -6370,8 +6403,7 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 			wasm_module_append_name_section_multi (out, modname, (const char *const *) names,
 			                                       (guint32) n, (guint32) nhimp);
 		}
-		for (i = 0; i < n; ++i)
-			g_free (names [i]);
+		/* names[] entries are BORROWED from each member's WjBody; only the vector is ours. */
 		g_free (names);
 	}
 
@@ -6931,6 +6963,7 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		e_slots [i] = re->e;
 		f_slots [i] = re->f;
 		members [i].method = b->method;
+		members [i].name = b->name;   /* resolved by whoever compiled this member; see WjBody.name */
 		members [i].f_slot = re->f;
 		members [i].f_body = &b->f_body;
 		members [i].e_body = &b->e_body;
@@ -13222,6 +13255,7 @@ vcall_cold_miss_emit:
 			int nshadow = 0;
 			memset (am, 0, sizeof (am));
 			am [0].method = cfg->method;
+			am [0].name = mname;   /* already resolved above, on this (the compiling) thread */
 			/* The target of the cycle test. Zero when this method has neither a live slot nor a
 			 * reservation, which means its pair is allocated below, after framing -- see wj_asm_reaches
 			 * for why a slot that does not exist yet is safe rather than unknown.
@@ -13335,7 +13369,7 @@ vcall_cold_miss_emit:
 			 * bytes and relocations, unresolved -- so this method can later be re-framed alongside others
 			 * without being compiled again. Attached to the registry on success below; freed at `done`
 			 * if registration never happens. */
-			wj_stored_body = wj_body_take (cfg->method, &body, &ethunk, param_types, (guint32) nwparams,
+			wj_stored_body = wj_body_take (cfg->method, mname, &body, &ethunk, param_types, (guint32) nwparams,
 			                               ret_vt, groups, extra_types, (guint32) nextra,
 			                               uses_calls, uses_eh_tag, eh_type_idx);
 		}

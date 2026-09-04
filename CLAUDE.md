@@ -126,6 +126,20 @@ they carry an older tree; if something surprising turns up, re-check rather than
   removes re-emission's INPUT, not just a branch. Split the two jobs instead: keep the tiering bump off
   the per-dispatch path, and make the call site a `WASM_RELOC_CALL` hole so a re-frame bakes a constant.
 
+* **`wj_assemble`'s NAME SECTION can fault, and it is the source of the intermittent
+  `memory access out of bounds` (R199).** The symbolisation loop (`mini-wasm.c:6360-6363`, gated on
+  `pol->names`, and `MONO_WASM_JIT_NAMES` ships **1**) calls `mono_method_get_full_name` per member,
+  which walks the signature via `mono_signature_get_desc` -> `mono_type_get_desc` and can trigger LAZY
+  signature/type resolution -- on a WORKER thread, concurrently with class setup. The captured trace is
+  exactly those frames under `wj_assemble`. Incidence ~33%, so it looks like a random crash and any
+  intervention needs a POSITIVE CONTROL: a `names=0` arm read clean and so did the `names=1` control,
+  four consecutive runs after two faulting ones. Co-location merging surfaces it without causing it
+  (the loop resolves N names per assembly and merging raises N). **The fix is constrained**: a
+  signature-free label removes the faulting walk, but `hotinsn.py`'s `kind_of()` calls a symbol OURS
+  only if it has BOTH a colon and a space, so a bare `Type:method` label silently reclassifies the whole
+  tier as `aot` -- the same failure shape as `symclass.mjs` reading our tier at 2.80% instead of ~60%.
+  Keep the `<x> <Type>:<method> (<args>)` shape and check `symclass.mjs` too.
+
 ## The prefilled placeholder — the trap that has now bitten twice
 
 `mono_jiterp_allocate_table_entry` hands out slots from a range the jiterpreter **prefills with a real,
