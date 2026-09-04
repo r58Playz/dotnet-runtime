@@ -482,6 +482,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
 	{ extern int mono_wasm_jit_guard_keep_slotlive; const char *gk = g_getenv ("MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE"); mono_wasm_jit_guard_keep_slotlive = (gk && *gk && *gk != '0') ? 1 : 0; } /* 1 = keep elision on under STOREGUARD/OBJGUARD (partial guard coverage, real configuration) */
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
+	{ extern int mono_wasm_jit_pretier; const char *pt = g_getenv ("MONO_WASM_JIT_PRETIER"); mono_wasm_jit_pretier = (pt && *pt && *pt != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
 	{ extern int mono_wasm_jit_devirt_profile; const char *dp = g_getenv ("MONO_WASM_JIT_DEVIRT_PROFILE"); mono_wasm_jit_devirt_profile = (dp && *dp && *dp != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
@@ -784,6 +785,26 @@ mono_wasm_jit_freeze_ring (void)
  *   5 = everything EXCEPT calls with params AND a non-void return
  * Check the bench stats (residual count) to confirm a restricted mode still exercised the residual. */
 int mono_wasm_jit_residual_mode = 1;
+/* MONO_WASM_JIT_PRETIER: drive tiering from the residual site's PRE-SPILL pretransform hook rather than
+ * from mono_wasm_jit_late_fslot. DEFAULT OFF.
+ *
+ * Residual edges are invisible to auto-tiering (call_interp does not run wasm_jit_maybe_compile), so a
+ * callee reached only through them never crosses the threshold -- `profile19: residual_healed=0`. That
+ * was fixed by making late_fslot carry the edge, which bought a helper call + branch + dynamic
+ * call_indirect on EVERY dispatch of every healable site for a job that only has to fire often enough
+ * to cross a threshold once.
+ *
+ * The bump cannot go in call_interp: by then the caller has spilled reference args into the
+ * GC-invisible scratch as raw pointers, and tiering runs class cctors, which allocate, which moves
+ * them. It CAN go in pretransform, which is emitted unconditionally at the same site and runs before
+ * that spill -- the same window prepare_interp_callee and late_fslot already rely on.
+ *
+ * Separating the two jobs is what lets the late_fslot guard be replaced by a RELOCATABLE f-slot hole:
+ * once tiering no longer depends on a per-dispatch probe, the call site can carry a WASM_RELOC_CALL
+ * that the assembler resolves to a constant (module-local `call <funcidx>` when co-located, otherwise
+ * `i32.const <fslot>; call_indirect`) and re-resolves on every later re-framing. A constant keeps the
+ * module PROCESS-WIDE and therefore code-cacheable; a TLS-derived form would not. */
+int mono_wasm_jit_pretier = 0;
 /* Defined here (not in the HOST_BROWSER block) because mono_wasm_emit_method references it in BOTH the
  * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (HOST_BROWSER). */
 #ifndef HOST_BROWSER
@@ -1153,7 +1174,7 @@ mono_wasm_jit_get_counter (int idx)
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 135);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 136);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1297,6 +1318,9 @@ mono_wasm_jit_dump_stats (void)
 	(void) mono_wasm_jit_reemit_age;
 	printf ("[wasm-jit vtabi] vt_byaddr_methods=%lld vret_methods=%lld\n",
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
+	printf ("[wasm-jit pretier] residual-site tiering bumps=%lld (MONO_WASM_JIT_PRETIER=%d) -- read against"
+		" residual_healed: pretiering should make the late_fslot guard stop being the discoverer\n",
+		WJC_(WJC_PRETIER_BUMP), mono_wasm_jit_pretier);
 	printf ("[wasm-jit transition] residual_healed=%lld fast_delegate=%lld delegate_ic_hit=%lld (fast counters require PROFILE_FAST=1)\n",
 		WJC_(WJC_RESIDUAL_HEALED), WJC_(WJC_FAST_DELEGATE), WJC_(WJC_DELEGATE_IC_HIT));
 	/* DEVIRT CENSUS. sites = ordinary virtual sites offered to the prediction gate; delegate_sites = the
