@@ -153,6 +153,31 @@ int mono_wasm_jit_devirt_force_max = 2;
  * The counter-evidence to respect: vcall_ways 4 -> 1 measured **+9.6% fps**, because those ways caught
  * ~1% of traffic -- far below this bar. Consistent with the model, and the reason ARM2_PCT exists
  * rather than emitting arm 2 unconditionally. */
+/* MONO_WASM_JIT_PRED_PCT: predict the first arm on a FREQUENCY bar over per-identity counts instead of
+ * the Boyer-Moore `margin == total` test. 0 = keep the margin bar.
+ *
+ * The margin bar demands a site be **100%% monomorphic** -- it rejects on `margin != total` -- while the
+ * break-even measured off emitted code says an arm pays above **~15%% capture** when the target
+ * co-locates (guard ~3 x86, direct call 1, IC hit ~21). The policy is therefore ~6.7x more conservative
+ * than the economics, and it is IRREVERSIBLE: one differing observation disqualifies a site for the life
+ * of the process, so a 99/1 site is treated exactly like a 50/50 one. That irreversibility is also why
+ * re-emission trades `no_rec` for `poly` instead of for arms (R209).
+ *
+ * Margin's original justification was cost -- two words, no per-type table, cheap on the interp dispatch
+ * path. That is now moot: wj_prof_note_identity already linear-scans ids[] on every observation, so the
+ * per-identity counts R206 added cost one increment on a scan that was happening anyway.
+ *
+ * CLAUDE.md's "relaxing margin == total is DEAD" was measured at a >=90%% bar over SITE COUNTS (477
+ * sites, 1.3%%). Both halves are wrong for this decision: R205 showed `poly` is 7.9%% of sites but 52.1%%
+ * of cumulative IC EXECUTION (6.6x over-weighted), and >=90%% is six times above break-even.
+ *
+ * This also makes DELEGATE sites predictable, which margin structurally cannot: `margin` is left 0 for
+ * them by design (their identity is del->method, not a receiver vtable), so frequency is the only
+ * usable signal there -- and delegates are ~20%% of executed dispatch with no devirt applied at all. */
+/* MONO_WASM_JIT_COLOCATE_HOPS: how many levels of callees a co-location group may grow through.
+ * 1 = the seed's immediate depset only, which is the behaviour that plateaued at 30.1%% arm-local. */
+int mono_wasm_jit_colocate_hops = 1;
+int mono_wasm_jit_pred_pct = 0;
 int mono_wasm_jit_devirt_arm2 = 0;
 /* Minimum share of a site's observations the runner-up must hold, in percent. Default is the measured
  * co-located break-even; raise toward 50 if arm-2 targets are not co-locating. */
@@ -537,6 +562,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
 	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
+	{ extern int mono_wasm_jit_colocate_hops; const char *ch = g_getenv ("MONO_WASM_JIT_COLOCATE_HOPS"); int v = (ch && *ch) ? atoi (ch) : 1; mono_wasm_jit_colocate_hops = (v >= 1 && v <= 8) ? v : 1; }
+	{ extern int mono_wasm_jit_pred_pct; const char *pp = g_getenv ("MONO_WASM_JIT_PRED_PCT"); int v = (pp && *pp) ? atoi (pp) : 0; mono_wasm_jit_pred_pct = (v >= 0 && v <= 100) ? v : 0; }
 	{ extern int mono_wasm_jit_devirt_arm2; const char *a2 = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2"); mono_wasm_jit_devirt_arm2 = (a2 && *a2 && *a2 != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_arm2_pct; const char *ap = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2_PCT"); int v = (ap && *ap) ? atoi (ap) : 15; mono_wasm_jit_devirt_arm2_pct = (v >= 0 && v <= 100) ? v : 15; }
 	{ extern int mono_wasm_jit_stable_ic_ids; const char *si = g_getenv ("MONO_WASM_JIT_STABLE_IC_IDS"); mono_wasm_jit_stable_ic_ids = (si && *si && *si != '0') ? 1 : 0; }
@@ -1264,7 +1291,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 162);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 163);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1448,6 +1475,13 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),
 		WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG), WJC_(WJC_DEVIRT_ARM2_SELF),
 		mono_wasm_jit_devirt_arm2, mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
+	printf ("[wasm-jit colocate-hops] members added past the seed's own depset=%lld"
+		"  (MONO_WASM_JIT_COLOCATE_HOPS=%d)\n"
+		"  Read against colocated_members. Near-zero means the depsets are too THIN at publish time and\n"
+		"  multi-hop cannot be the lever, whatever an offline partition of the finished tier suggests --\n"
+		"  measured offline, seed-and-grow reaches 83.6%% of EXECUTED call weight internal at 16 members\n"
+		"  and 88.8%% at 32, with no duplication, so the gap is the ONLINE algorithm and not the graph.\n",
+		WJC_(WJC_COLOCATE_HOP_ADD), mono_wasm_jit_colocate_hops);
 	printf ("[wasm-jit reemit-ic] enqueued from the IC MISS path=%lld (MONO_WASM_JIT_REEMIT_IC=%d)\n"
 		"  READ THIS AGAINST reemit done/refused BELOW, never alone: R179 was 17,343 enqueues for 3\n"
 		"  re-emits and an earlier version 35,617,130 for 4, and a single counter reads as success in both.\n",
@@ -7430,6 +7464,77 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	 * MONO_WASM_JIT_COLOCATE_MAX binding", and the per-callee volume would confuse that with reach. */
 	if (n >= cap && i < rds->n)
 		WJ_CO_COUNT (WJC_COLOCATE_MEMBER_CAP);
+	/* R211: FRONTIER EXPANSION -- grow the group beyond the seed's IMMEDIATE callees.
+	 *
+	 * Everything above this point considers only `re->depset`: the callees this method itself calls,
+	 * one hop, chosen first-come. That is why co-location plateaued at 30.1% arm-local. It is NOT
+	 * because the call graph resists partitioning -- measured on the tier's own reloc graph, a
+	 * seed-and-grow partition with a frontier reaches **79% of call edges internal at 16 members and
+	 * 84% at 32**, and weighting the edges by EXECUTION (perf call chains, in-game window) makes it
+	 * BETTER, not worse: **85.5% at 16, 89.7% at 32**, with no single callee holding more than 2.1% of
+	 * inbound weight. The hubs that dominate the static picture (a 487-byte __<GetCallerID> copied 232
+	 * times) are cold; by execution the graph is densely clustered, which is the shape a partition wants.
+	 *
+	 * So this walks the deps OF the members already chosen, breadth-first, to MONO_WASM_JIT_COLOCATE_HOPS
+	 * levels, which is what turns "the caller plus whatever it happened to call" into the seed-and-grow
+	 * the simulation measured. Weights are deliberately NOT needed: unweighted seed-and-grow already
+	 * reaches 79% at 16, so no profile, no persisted plan, and nothing that a runtime mod drop-in can
+	 * invalidate -- new methods simply become new nodes for the next publish to grow through.
+	 *
+	 * Deliberately simpler than the seed pass: expansion takes only UNBATCHED, eligible callees. A
+	 * batched one would need the whole-group absorption the merge path above does, and pulling that into
+	 * a breadth-first walk is how a bounded request becomes an unbounded one. */
+	{
+		extern int mono_wasm_jit_colocate_hops;
+		int scanned = 1, hop, end;
+		for (hop = 1; hop < mono_wasm_jit_colocate_hops && n < cap; ++hop) {
+			end = n;
+			if (scanned >= end)
+				break;                       /* nothing new to expand through */
+			for (i = scanned; i < end && n < cap; ++i) {
+				WjRegEntry *mre = wj_reg_at (descs [i] - 1);
+				/* WALK THE RELOCATIONS, NOT THE DEPSET.
+				 *
+				 * The first version of this walk read `mre->depset` and measured **12 members added
+				 * across a whole run** at hops=4, against 42,357 co-located members -- i.e. nothing.
+				 * The reason is that MONO_WASM_JIT_COLOCATE_TIGHT_DEPS ships 1 and DROPS local calls
+				 * from the depset once a group is framed, so a member's depset is empty by the time a
+				 * later expansion reads it. The tree already says so: "the depset is not a planning
+				 * input after the first group".
+				 *
+				 * `body->f_body.relocs` is the list wj_collect_shadows walks: retained, complete, and
+				 * unaffected by that tightening. It is also exactly the edge set the offline partition
+				 * was computed over, which is what makes the 83.6%-at-16 / 88.8%-at-32 figures relevant
+				 * to what this loop can actually reach. */
+				const WasmRelocs *mrl = (mre && mre->body) ? mre->body->f_body.relocs : NULL;
+				guint32 k;
+				for (k = 0; mrl && k < mrl->n && n < cap; ++k) {
+					int d2;
+					if (mrl->r [k].kind != WASM_RELOC_CALL)
+						continue;
+					d2 = wj_desc_for_fslot ((int) mrl->r [k].table_index);   /* CALL: the callee's f-slot */
+					WjRegEntry *d2re = d2 > 0 ? wj_reg_at (d2 - 1) : NULL;
+					int dup = 0;
+					if (!d2re || !d2re->body || d2re->e <= 0 || d2re->f <= 0 ||
+					    d2re->batch || d2re->colocate_refused)
+						continue;
+					for (j = 0; j < n; ++j)
+						if (descs [j] == d2) { dup = 1; break; }
+					if (dup)
+						continue;
+					if (mono_wasm_jit_colocate_bytes > 0 &&
+					    bytes + (d2re->len > 0 ? d2re->len : 0) > mono_wasm_jit_colocate_bytes) {
+						WJ_CO_COUNT (WJC_COLOCATE_DEP_BYTE_CAP);
+						continue;
+					}
+					descs [n++] = d2;
+					bytes += d2re->len > 0 ? d2re->len : 0;
+					WJ_CO_COUNT (WJC_COLOCATE_HOP_ADD);
+				}
+			}
+			scanned = end;
+		}
+	}
 	if (n < 2) {
 		WJ_CO_COUNT (WJC_COLOCATE_SINGLETON);
 		g_free (descs);

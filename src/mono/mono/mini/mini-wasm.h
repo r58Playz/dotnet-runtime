@@ -541,6 +541,10 @@ enum {
 	 * ALWAYS read it against WJC_REEMIT_DONE: R179's failure shape was 17,343 enqueues for 3 re-emits,
 	 * and an earlier version 35,617,130 for 4. One counter alone reads as success in both. */
 	WJC_REEMIT_IC_TRIG,
+	/* R211: members added by the multi-hop frontier expansion rather than by the seed's immediate
+	 * depset. Read against COLOCATED_MEMBERS: if it stays ~0 the walk found nothing past hop 1, which
+	 * means the depsets are too thin at publish time and the expansion is not the lever. */
+	WJC_COLOCATE_HOP_ADD,
 	WJC_MAX
 };
 

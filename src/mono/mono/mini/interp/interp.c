@@ -1419,7 +1419,56 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 		if (out_why) *out_why = WJ_PRED_TORN;
 		return FALSE;
 	}
-	if (!id1 || !target1 || total1 < 8) {
+	if (total1 < 8) {
+		if (out_why) *out_why = WJ_PRED_COLD;
+		return FALSE;
+	}
+	{
+		/* R210: FREQUENCY BAR over per-identity counts, replacing `margin == total` when enabled.
+		 *
+		 * Selects the most frequent identity and accepts it if its share of observations clears
+		 * MONO_WASM_JIT_PRED_PCT. Subsumes the margin path: a perfectly monomorphic site has 100% share
+		 * and passes trivially, while a 90/10 site -- which the margin bar rejects for the life of the
+		 * process, identically to a 50/50 one -- now predicts, and its 10% falls through the guard to the
+		 * IC exactly as a prediction miss always has. Guard ~3 x86 against ~17 saved on a hit, so the
+		 * economics justify a far lower bar than 100%.
+		 *
+		 * Reads ids[]/id_counts[]/id_targets[] under the same lock-free double-read discipline as the
+		 * margin path below: nids and total are re-read after the scan and a disagreement refuses. */
+		extern int mono_wasm_jit_pred_pct;
+		if (mono_wasm_jit_pred_pct > 0) {
+			guint32 k, nids1 = s->nids, best_c = 0, nids2, total2b;
+			gpointer best_id = NULL;
+			MonoMethod *best_t = NULL;
+			for (k = 0; k < nids1 && k < WJ_PROF_WAYS; ++k) {
+				gpointer id = s->ids [k];
+				MonoMethod *t = s->id_targets [k];
+				guint32 c = s->id_counts [k];
+				/* An identity seen only through a sizing-only observation has no resolved target and
+				 * cannot be called; skip rather than guess. */
+				if (!id || !t)
+					continue;
+				if (c > best_c) { best_c = c; best_id = id; best_t = t; }
+			}
+			mono_memory_barrier ();
+			nids2 = s->nids; total2b = s->total;
+			if (nids1 != nids2 || total1 != total2b) {
+				if (out_why) *out_why = WJ_PRED_TORN;
+				return FALSE;
+			}
+			if (!best_id || !best_t || !total1 ||
+			    (guint64) best_c * 100 / total1 < (guint32) mono_wasm_jit_pred_pct) {
+				if (out_why) *out_why = WJ_PRED_POLY;
+				return FALSE;
+			}
+			*out_vt = (MonoVTable *) best_id;
+			*out_target = best_t;
+			if (out_samples) *out_samples = total1;
+			if (out_why) *out_why = WJ_PRED_OK;
+			return TRUE;
+		}
+	}
+	if (!id1 || !target1) {
 		if (out_why) *out_why = WJ_PRED_COLD;
 		return FALSE;
 	}
