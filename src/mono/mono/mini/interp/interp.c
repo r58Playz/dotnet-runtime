@@ -1719,7 +1719,7 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 static void
 wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fslot)
 {
-	extern int mono_wasm_jit_vcall_ways;
+	extern int mono_wasm_jit_vcall_ways, mono_wasm_jit_reemit_ic;
 	WjLocalVcallPicEntry *p = wj_vcall_pic_for_site (ic, TRUE);
 	/* THE MISS PATH IS AN OBSERVATION POINT. This is the half of the call profile the interpreter can
 	 * never supply: post-JIT, per-site, target-resolved, and still updating while the compiled code runs.
@@ -1729,6 +1729,36 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 		WjVcallSite *site = wj_vcall_site (ic);
 		if (G_UNLIKELY (mono_wasm_jit_devirt_profile) && site->caller_im && site->base)
 			wj_prof_record (site->caller_im, site->base, WJ_SITE_VIRTUAL, vt, target, TRUE);
+		/* R208: RE-EMISSION TRIGGER. Enqueue the CALLER once it has missed here enough times.
+		 *
+		 * Why this site and not the interp->JIT entry the old trigger used: that one counts BOUNDARY
+		 * crossings, so it selects methods reached from the interpreter rather than methods hot inside
+		 * compiled code (R179 measured vicMiss 1.00x, exactly as predicted), and its counter is
+		 * stats-gated so it never moved in a shipped configuration. A miss HERE means this method's own
+		 * emitted code hit a site the profile could not predict at emit time and now can.
+		 *
+		 * Enqueue only. The drain does the work: it holds entries until the tier has grown
+		 * (REEMIT_AFTER) and until this method is genuinely stale (REEMIT_AGE), and refuses co-located
+		 * or slot-less methods. Never call force_compile from here -- it runs managed code.
+		 *
+		 * Not stats-gated, deliberately: the whole point is that it must work in the shipped config. The
+		 * cost is one atomic increment on the MISS path only; the PIC hit path is untouched, which is the
+		 * property that made vcall_ways 4->1 worth +9.6%. */
+		if (G_UNLIKELY (mono_wasm_jit_reemit_ic > 0) && site->caller_im &&
+		    site->caller_im->wasm_jit_reemit_state == 0 &&
+		    mono_atomic_inc_i32 (&site->caller_im->wasm_jit_ic_misses) >= mono_wasm_jit_reemit_ic) {
+			/* RESET THE COUNTER AT THE ENQUEUE, or this becomes a re-enqueue storm.
+			 *
+			 * The drain's age gate deliberately drops a not-yet-stale method back to state 0 so the
+			 * ordinary trigger can re-queue it later. Without this reset `ic_misses` is still past the
+			 * threshold at that moment, so the very next miss re-enqueues immediately and forever.
+			 * MEASURED, first version: **1,249,813 enqueues for 232 re-emits** -- the same shape as
+			 * R179's 17,343-for-3 and the 35,617,130-for-4 the drain comment already warned about.
+			 * With the reset the semantics are "at most one enqueue per REEMIT_IC misses". */
+			site->caller_im->wasm_jit_ic_misses = 0;
+			wj_reemit_enqueue (site->caller_im);
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_IC_TRIG);
+		}
 		/* CO-LOCATION REACH, measured where it actually happens. Same reasoning as the profile record
 		 * above: this is the miss path, so the PIC hit path stays a pure TLS load. See WJC_VIC_TGT_*
 		 * for why WJC_CALL_LOCAL cannot answer this and for the lower-bound caveat. */
@@ -2767,7 +2797,12 @@ wasm_jit_drain_reemits (void)
 		/* HEAL_WAIT makes this drain reachable on its own: its entries do not come from the invoke_in
 		 * trigger (which is stats-gated and therefore inert in a timing run) but from a callee
 		 * publishing, so gating the drain on `reemit > 0` would leave them queued forever. */
-		if ((mono_wasm_jit_reemit <= 0 && !mono_wasm_jit_heal_wait) || wj_reemit_head == wj_reemit_tail)
+		/* R208: REEMIT_IC entries reach the queue from the IC miss path, not from the invoke_in trigger,
+		 * so gating the drain on `reemit > 0` alone would leave them queued forever -- the same reason
+		 * heal_wait is listed here. */
+		extern int mono_wasm_jit_reemit_ic;
+		if ((mono_wasm_jit_reemit <= 0 && !mono_wasm_jit_heal_wait && mono_wasm_jit_reemit_ic <= 0) ||
+		    wj_reemit_head == wj_reemit_tail)
 			return;
 	}
 	for (n = 0; n < mono_wasm_jit_promotion_drain; ++n) {

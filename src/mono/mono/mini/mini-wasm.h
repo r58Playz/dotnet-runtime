@@ -537,6 +537,10 @@ enum {
 	 * the build this was measured clean on. (A refactor that moved these tests into a helper measured
 	 * three consecutive failures -- two OOB and one wedge -- so the success path is left alone.) */
 	WJC_ARM_UNJITTABLE,
+	/* R208: re-emission driven by IC misses inside compiled code. TRIG = enqueued by this path.
+	 * ALWAYS read it against WJC_REEMIT_DONE: R179's failure shape was 17,343 enqueues for 3 re-emits,
+	 * and an earlier version 35,617,130 for 4. One counter alone reads as success in both. */
+	WJC_REEMIT_IC_TRIG,
 	WJC_MAX
 };
 

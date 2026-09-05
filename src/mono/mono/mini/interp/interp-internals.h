@@ -170,6 +170,15 @@ struct InterpMethod {
 	guint8 wasm_jit_entry_fast_ok; // runtime wasm JIT (MONO_WASM_JIT_AOT_ENTRY): this method has been admitted at least once, so later entries may try the fast path that skips the InterpFrame/LMF/maybe_compile/admit scaffolding. The fast path still verifies per-thread admission of the descriptor's current generation because automatic rebatching reuses its e/f slots.
 	const char *wasm_jit_fail; // runtime wasm JIT: the emitter's exact fail string (static literal) behind wasm_jit_bail, for the weighted vperm top-N dump (names the specific gate, e.g. "ldaddr of vtype with refs" vs just "ldaddr")
 	gint32 wasm_jit_invoke_in; // runtime wasm JIT diag (Part 3c): times entered interp->JIT (this method was the JITted callee at a MINT_CALL/CALLVIRT). stats only
+	/* R208: IC MISSES observed at sites INSIDE this method's JITted body. This is the re-emission
+	 * trigger that R179 named and never built. Distinct from wasm_jit_invoke_in above in both what it
+	 * counts and when: invoke_in counts interp->JIT BOUNDARY crossings and is incremented only under
+	 * mono_wasm_jit_stats, so the old trigger selected the wrong population AND was inert at stats=0.
+	 * This counts execution INSIDE compiled code, is never stats-gated, and rises exactly for the
+	 * methods whose sites the profile can now predict but could not at emit time -- `no_rec`, which is
+	 * 32.2%% of hot inline-IC volume (R205) and unreachable by any amount of pre-JIT warmup because
+	 * 99.3%% of profile observations arrive after the method was JITted. */
+	gint32 wasm_jit_ic_misses;
 	gint32 wasm_jit_block_n;   // runtime wasm JIT (Part 3a / Lever C): times this (un-JITted) method BLOCKED a caller's island. Always counted (cheap, compile-time): also a stats-independent "hot at the island boundary" signal for the cold gate.
 	gint32 wasm_jit_invoke_out; // runtime wasm JIT (Lever A): times THIS (interp) method invoked a JITted callee. Drives MONO_WASM_JIT_ENTRY_PROMOTE upward island growth.
 	gint32 wasm_jit_resv_eslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished entry-thunk slot while this method's SCC is being batch-compiled (0 = none)
