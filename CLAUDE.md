@@ -314,6 +314,41 @@ candidate only if the site is non-virtual, the target is non-virtual, or the tar
 emits `callvirt` for every non-final Java method. That is why R118 measured bodies +4.4% and **calls per
 method +1.0%**: the inliner reached only the non-virtual remainder and absorbed its callees' call sites.
 
+## The EXECUTED dispatch split, and the hard ceiling on direct calls (R203)
+
+Measured with `profile_fast=1` (costs ~7%; ratios valid, timings void), 90 s in-game window, deltas between
+the window's two counter snapshots. Config: ranked shadows + `colocate_merge` + `devirt_force`.
+
+| route | executed | of ALL dispatch | can it be DIRECT? |
+|---|---|---|---|
+| devirt predicted arm | 1,030,605,081 | **39.2%** | **YES** — `WASM_RELOC_CALL` |
+| IC (inline hit 25.1% + AOT-IC 4.6% + miss 5.0% + helper 0.8%) | 567,690,313 | 21.6% | no |
+| delegate (`fast_delegate`) | 524,858,165 | 20.0% | no |
+| inline AOT direct | 505,946,820 | 19.2% | no |
+| | **2,629,100,379** | | |
+
+**Within the vtable-virtual pool: devirt 64.5% / IC 35.5%, a 1.82:1 ratio.** Note `vcall_resolve_fslot` —
+the IC MISS path and the 2nd hottest symbol in the window — is only **5.0%** of that pool; the inline IC
+HIT is 25.1%, i.e. five times larger.
+
+**THE CEILING ON DIRECT CALLS IS 39.2%, AND IT IS STRUCTURAL.** Only `wj_emit_method_call` emits
+`WASM_RELOC_CALL`, which is the only relocation the assembler can turn into `call <funcidx>`; the IC path
+emits `WASM_RELOC_INDIRECT`, whose own comment reads *"can never become a direct call; only its functype is
+relocated"*. Delegates and inline-AOT calls are likewise indirect by construction. So **however good
+co-location and shadowing get, they cannot take direct dispatch past the devirt arm's share of execution.**
+Currently 25.0% of all dispatch is a real `call rel32` (39.2% x 63.7% arm-local).
+
+**Raising that ceiling means raising devirt COVERAGE, not more shadow tuning** — coverage moves volume out
+of the IC pool and into the arm pool. Coverage is 34.6% of ordinary-virtual sites and the census names the
+blocker: `no_rec` **13,389 (30.5% of sites)** against `no_fslot` 6,115, `poly` 3,739, `cold` 3,531. `no_rec`
+is precisely what re-emission with a matured profile fixed (31.4% -> 9.8%, R170b/R179), which is the one
+mechanism that attacks the ceiling rather than the fill. Even at 100% coverage, delegate (20%) + inline AOT
+(19%) cap direct dispatch near **61%**.
+
+**Do not convert an "arm-local %" into a "% of dispatch" using the 74-85% figure.** That number is the arm's
+share of the VCALL POOL, not of all dispatch; using it as the latter overstates direct dispatch by ~2x (it
+produced a "~54% of dispatch is direct" claim when the measured answer is 25.0%).
+
 ## Where the time actually goes (in-game plateau, ~25 fps / 40 ms)
 
 * **57.03%** of the window is code this emitter generates; 30.83% "AOT image"; ~1.8% V8; 12.14% outside
@@ -505,7 +540,7 @@ invalidated a session's worth of A/B ordering before it was noticed.
   classifier was written from a plausible mental model of the emitted code and never checked against it.
 * **Do not compute a share until every route has a counter.** R155 divided by a vcall pool with no term for
   the devirt predicted arm and concluded the IC was 79% of dispatch; R156 repeated the same error one round
-  later and put delegates at 37-42%. With the arm counted the arm is ~74-85%. **And R187's own rebuttal is HALF RETRACTED (R193): the object-keyed delegate cache does NOT shorten the hit path.** R187 answered the in-source objection at `WjLocalDelegatePicEntry` with "every cost in that sentence is a cost of the cache being SHARED, not of it being object-keyed". True for the seqlock and the atomics; FALSE for the `wj_slot_live` probe. The probe exists because the cached f-slot NUMBER is process-wide while its INSTALLATION is per worker, and R63b's per-site PIC could only skip it because that array was itself per worker. Built and measured: `MONO_WASM_JIT_DELEGATE_OBJ_PIC` moves miss-path publications 88,209,759 -> **1,996** (the per-callee keying works, 44,000x) while the emitted `__<>MHC` stub shrinks **1,311 B -> 1,289 B, i.e. -1.7%** — the probe costs back what the site-id derivation, bounds check and key compare saved. Object-keyed and probe-free need storage that is per-callee AND per-worker; that is a different data structure, not a re-argument. Sized before spending an arm: ~4.8% of delegate dispatches were missing the recipe (`fast_delegate` 418,401,288 vs `delegate_ic_hit` 398,520,024), so the saving is ~0.26% of window — below the ~12% floor, so do NOT spend an fps matrix on it. Ships 0. **The "delegates are ~9%" that used to close this sentence is RETRACTED (R187): measured with `profile_fast=1`, delegate direct 418,401,288 + ic-recipe 398,520,024 = **43.0% of 974,158,019 dispatches**, and that is a LOWER bound because a recipe miss falls through to the vtable IC and is counted in the vcall pool. The in-source note at `WjLocalDelegatePicEntry` said ~36% and was the better number.** An
+  later and put delegates at 37-42%. With the arm counted the arm is ~74-85%. **And R187's own rebuttal is HALF RETRACTED (R193): the object-keyed delegate cache does NOT shorten the hit path.** R187 answered the in-source objection at `WjLocalDelegatePicEntry` with "every cost in that sentence is a cost of the cache being SHARED, not of it being object-keyed". True for the seqlock and the atomics; FALSE for the `wj_slot_live` probe. The probe exists because the cached f-slot NUMBER is process-wide while its INSTALLATION is per worker, and R63b's per-site PIC could only skip it because that array was itself per worker. Built and measured: `MONO_WASM_JIT_DELEGATE_OBJ_PIC` moves miss-path publications 88,209,759 -> **1,996** (the per-callee keying works, 44,000x) while the emitted `__<>MHC` stub shrinks **1,311 B -> 1,289 B, i.e. -1.7%** — the probe costs back what the site-id derivation, bounds check and key compare saved. Object-keyed and probe-free need storage that is per-callee AND per-worker; that is a different data structure, not a re-argument. Sized before spending an arm: ~4.8% of delegate dispatches were missing the recipe (`fast_delegate` 418,401,288 vs `delegate_ic_hit` 398,520,024), so the saving is ~0.26% of window — below the ~12% floor, so do NOT spend an fps matrix on it. Ships 0. **R187's "delegates are 43.0% of dispatch" is itself RETRACTED (R203): it DOUBLE-COUNTS.** `WJC_DELEGATE_IC_HIT` is documented at its own declaration as *"the subset which also bypassed vcall_resolve_fslot"* of `WJC_FAST_DELEGATE`, and the two are bumped back-to-back **unconditionally at the same two sites** (`mini-wasm.c:12273-12274`, `:12423-12424`), so `fast_delegate + delegate_ic_hit` counts the same dispatches twice. Delegates are **~20% of all dispatch**, not 43% — measured R203, and the in-source note at `WjLocalDelegatePicEntry` saying ~36% is also too high. This is the FOURTH round lost to a share computed before its routes were checked, and the first where the bad share was written into this file: **assert the parts are DISJOINT as well as summing to the whole.** An
   uncounted route does not show up as a gap — it shows up as everything else looking bigger. **R166 is the
   third instance and cost a session**: `vfbThresh` read 9,243x the control on a co-location A/B while its
   own three sub-counters summed to 1,399, because the arm for "target IS compiled but is not live on THIS
