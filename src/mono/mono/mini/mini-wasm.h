@@ -532,6 +532,11 @@ enum {
 	 * cannot express; SHAPE = it lowers cleanly and simply differs from the call site's functype, which
 	 * is the only one that would point at generic sharing. */
 	WJC_ARM_ABI_INVALID, WJC_ARM_ABI_BYADDR, WJC_ARM_ABI_SHAPE,
+	/* R207b: the remaining causes the old ARM2_SIG catch-all could be reached by. Bumped in the
+	 * FAILURE branch only, by re-testing the cheap predicates -- the success path is byte-identical to
+	 * the build this was measured clean on. (A refactor that moved these tests into a helper measured
+	 * three consecutive failures -- two OOB and one wedge -- so the success path is left alone.) */
+	WJC_ARM_UNJITTABLE,
 	WJC_MAX
 };
 
