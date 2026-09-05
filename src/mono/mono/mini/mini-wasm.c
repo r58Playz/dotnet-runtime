@@ -176,6 +176,48 @@ int mono_wasm_jit_devirt_force_max = 2;
  * usable signal there -- and delegates are ~20%% of executed dispatch with no devirt applied at all. */
 /* MONO_WASM_JIT_COLOCATE_HOPS: how many levels of callees a co-location group may grow through.
  * 1 = the seed's immediate depset only, which is the behaviour that plateaued at 30.1%% arm-local. */
+/* MONO_WASM_JIT_REPARTITION: registry size at which to run ONE global partition of the tier's call
+ * graph, forming co-location groups wholesale instead of incrementally. 0 = off.
+ *
+ * WHY WHOLESALE. Incremental co-location groups a method with whatever it happened to call at the instant
+ * it published, and every later attempt finds its neighbours already committed -- the append-only
+ * partition. Measured: multi-hop expansion added 15 members across a whole run (R211). But the GRAPH is
+ * not the obstacle. Partitioned globally over the same reloc edges, seed-and-grow reaches **83.6% of
+ * EXECUTED call weight internal at 16 members, 88.8% at 32** (perf call chains, two captures, two
+ * binaries, agreeing within ~2 points), with no hub: the hottest callee holds 2.4% of inbound weight.
+ *
+ * WHY IT SHRINKS THE TIER. Shadows currently do the PRIMARY job, paying a duplicate per (caller, callee)
+ * pair: 32,110 copies = 48.3 MB, **50.4% of the tier**. Under a partition they are only needed for the
+ * edges the partition CUTS, which is ~16% of them: 4,960 copies = 7.2 MB, and the tier goes 95.8 -> 54.7 MB
+ * (-43%) while internal edges rise from ~60% to 84%. Both axes improve, which nothing else here has done.
+ *
+ * COST, and it is real: every re-framed member loses its TurboFan code and its accumulated
+ * CallIndirectIC feedback and re-tiers from Liftoff (~15.4 ns/wire byte). Hence the per-call budget
+ * below -- the work is spread over many interpreter ticks rather than taken as one multi-second stall,
+ * because this workload never quiesces (R147) so there is no idle moment to hide it in.
+ *
+ * Run with MONO_WASM_JIT_COLOCATE_DEPS=0: rebatch refuses an already-batched member (re-framing one would
+ * strand its siblings), so the partitioner must be the only thing forming groups or it inherits exactly
+ * the committed-neighbour problem it exists to avoid. */
+/* MONO_WASM_JIT_REPARTITION_AUTO: percent of emitted bytes that must be SHADOW DUPLICATION before the
+ * repartition is even considered. 0 = off (use the fixed REPARTITION registry threshold instead).
+ *
+ * A fixed registry count is the wrong trigger: the right moment depends on the shape of the program, and
+ * a runtime mod drop-in changes that shape. Duplication share is self-tuning and directly measures the
+ * thing the repartition exists to remove -- shadows currently sit at 50.4% of the tier.
+ *
+ * Crossing it only starts a COST ANALYSIS, never the rebuild: wj_repartition_decide runs the identical
+ * BFS with no re-framing, counts what fraction of call edges the partition WOULD make internal, and
+ * commits only if that clears REPARTITION_MIN_GAIN. The analysis is O(edges) and touches no module; the
+ * re-framing it gates costs every member its TurboFan code and CallIndirectIC feedback, so the asymmetry
+ * is the whole point of deciding first. */
+int mono_wasm_jit_repartition_auto = 0;
+/* Minimum percent of call edges the dry run must make internal for the rebuild to be worth its re-tiering
+ * cost. Offline the same partition reaches 84% at 32 members, so a bar near 60 is conservative. */
+int mono_wasm_jit_repartition_min_gain = 60;
+int mono_wasm_jit_repartition = 0;
+/* Groups formed per call, so the rebuild is spread across ticks instead of one stall. */
+int mono_wasm_jit_repartition_budget = 24;
 int mono_wasm_jit_colocate_hops = 1;
 int mono_wasm_jit_pred_pct = 0;
 int mono_wasm_jit_devirt_arm2 = 0;
@@ -562,6 +604,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
 	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
+	{ extern int mono_wasm_jit_repartition_auto; const char *ra = g_getenv ("MONO_WASM_JIT_REPARTITION_AUTO"); int v = (ra && *ra) ? atoi (ra) : 0; mono_wasm_jit_repartition_auto = (v >= 0 && v <= 100) ? v : 0; }
+	{ extern int mono_wasm_jit_repartition_min_gain; const char *rg = g_getenv ("MONO_WASM_JIT_REPARTITION_MIN_GAIN"); int v = (rg && *rg) ? atoi (rg) : 60; mono_wasm_jit_repartition_min_gain = (v >= 0 && v <= 100) ? v : 60; }
+	{ extern int mono_wasm_jit_repartition; const char *rp = g_getenv ("MONO_WASM_JIT_REPARTITION"); int v = (rp && *rp) ? atoi (rp) : 0; mono_wasm_jit_repartition = (v >= 0) ? v : 0; }
+	{ extern int mono_wasm_jit_repartition_budget; const char *rb = g_getenv ("MONO_WASM_JIT_REPARTITION_BUDGET"); int v = (rb && *rb) ? atoi (rb) : 24; mono_wasm_jit_repartition_budget = (v >= 1 && v <= 4096) ? v : 24; }
 	{ extern int mono_wasm_jit_colocate_hops; const char *ch = g_getenv ("MONO_WASM_JIT_COLOCATE_HOPS"); int v = (ch && *ch) ? atoi (ch) : 1; mono_wasm_jit_colocate_hops = (v >= 1 && v <= 8) ? v : 1; }
 	{ extern int mono_wasm_jit_pred_pct; const char *pp = g_getenv ("MONO_WASM_JIT_PRED_PCT"); int v = (pp && *pp) ? atoi (pp) : 0; mono_wasm_jit_pred_pct = (v >= 0 && v <= 100) ? v : 0; }
 	{ extern int mono_wasm_jit_devirt_arm2; const char *a2 = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2"); mono_wasm_jit_devirt_arm2 = (a2 && *a2 && *a2 != '0') ? 1 : 0; }
@@ -1291,7 +1337,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 163);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 170);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1475,6 +1521,27 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),
 		WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG), WJC_(WJC_DEVIRT_ARM2_SELF),
 		mono_wasm_jit_devirt_arm2, mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
+	printf ("[wasm-jit repartition] groups=%lld members=%lld singleton=%lld fail=%lld"
+		"  (MONO_WASM_JIT_REPARTITION=%d budget=%d)\n"
+		"  One GLOBAL partition of the reloc call graph, formed wholesale. Offline the same edge set\n"
+		"  partitions to 83.6%% of EXECUTED call weight internal at 16 members and 88.8%% at 32, and moves\n"
+		"  shadows from PRIMARY to RESIDUAL: 32,110 copies / 48.3 MB -> ~4,960 / 7.2 MB, tier -43%%.\n"
+		"  Needs COLOCATE_DEPS=0: rebatch refuses an already-batched member, so incremental co-location\n"
+		"  running alongside re-creates the committed-neighbour problem this exists to avoid.\n"
+		"  A high `singleton` share means the graph was not yet reachable when it ran, not that\n"
+		"  partitioning fails -- raise MONO_WASM_JIT_REPARTITION so more of the tier is registered.\n",
+		WJC_(WJC_REPART_GROUP), WJC_(WJC_REPART_MEMBERS), WJC_(WJC_REPART_SINGLETON),
+		WJC_(WJC_REPART_FAIL), mono_wasm_jit_repartition, mono_wasm_jit_repartition_budget);
+	printf ("[wasm-jit repartition-auto] analyses=%lld predicted-internal=%lld%%"
+		"  (AUTO=%d%% of tier duplicated, MIN_GAIN=%d%%)\n"
+		"  Trigger is DUPLICATION SHARE, not a registry count: the right moment depends on program shape\n"
+		"  and a mod drop-in changes it. Crossing the bar buys one O(edges) dry run, never a rebuild.\n"
+		"  analyses=1 with groups=0 means the partition was measured and REFUSED -- a result, not a bug.\n",
+		WJC_(WJC_REPART_ANALYSED), WJC_(WJC_REPART_PREDICTED),
+		mono_wasm_jit_repartition_auto, mono_wasm_jit_repartition_min_gain);
+	printf ("[wasm-jit repartition-edges] call edges the dry run saw=%lld -- ZERO means the graph was not\n"
+		"  reachable when it ran (too few callees registered), NOT that partitioning fails. Those two were\n"
+		"  one bucket in the first version and it read as a refusal.\n", WJC_(WJC_REPART_EDGES));
 	printf ("[wasm-jit colocate-hops] members added past the seed's own depset=%lld"
 		"  (MONO_WASM_JIT_COLOCATE_HOPS=%d)\n"
 		"  Read against colocated_members. Near-zero means the depsets are too THIN at publish time and\n"
@@ -7303,6 +7370,283 @@ done:
  *
  * Returns the number of members grouped (0 if nothing was).
  */
+/* R213c: seed order. Iterating descriptors 1..n ascending makes every node its own seed before any
+ * caller can claim it -- and callees hold LOWER desc ids than their callers by construction, since a
+ * callee must already be JITted for the caller to bake its f-slot. Measured: 20,497 edges seen and
+ * **0% internal**, because every group was a singleton.
+ *
+ * Seeding by OUT-DEGREE descending is what the offline simulation did, and it is what makes seed-and-grow
+ * reach 83.6%/88.8%. A node with many callees is a good cluster centre; a leaf is not. Returns a
+ * malloc'd order array of desc ids, most-connected first. */
+static int *
+wj_repart_seed_order (int n_reg)
+{
+	int *order = g_new0 (int, n_reg + 1);
+	int *deg = g_new0 (int, n_reg + 1);
+	int i, j, n = 0;
+
+	if (!order || !deg) { g_free (order); g_free (deg); return NULL; }
+	for (i = 1; i <= n_reg; ++i) {
+		WjRegEntry *re = wj_reg_at (i - 1);
+		const WasmRelocs *rl = (re && re->body) ? re->body->f_body.relocs : NULL;
+		guint32 k;
+		if (!re || !re->body || re->e <= 0 || re->f <= 0 || re->colocate_refused)
+			continue;
+		for (k = 0; rl && k < rl->n; ++k)
+			if (rl->r [k].kind == WASM_RELOC_CALL)
+				deg [i]++;
+		order [n++] = i;
+	}
+	/* Insertion sort by degree descending. n is the eligible count (~20k) and this runs ONCE per
+	 * analysis, so an O(n^2) sort would be minutes -- use a simple binary-insertion instead. */
+	for (i = 1; i < n; ++i) {
+		int v = order [i], d = deg [v], lo = 0, hi = i;
+		while (lo < hi) {
+			int mid = (lo + hi) / 2;
+			if (deg [order [mid]] >= d) lo = mid + 1; else hi = mid;
+		}
+		for (j = i; j > lo; --j)
+			order [j] = order [j - 1];
+		order [lo] = v;
+	}
+	order [n] = 0;                          /* terminator */
+	g_free (deg);
+	return order;
+}
+
+/* R212: ONE GLOBAL PARTITION of the tier's call graph, formed wholesale.
+ *
+ * Seed-and-grow, breadth-first over WASM_RELOC_CALL edges read from each member's RETAINED body -- not
+ * from `depset`, which COLOCATE_TIGHT_DEPS empties after framing, and which is why the incremental
+ * multi-hop attempt added 15 members in a whole run (R211). `f_body.relocs` is the same edge set the
+ * offline partition was computed over, so what this walks is what was measured.
+ *
+ * `taken` is the partition proper: a method joins exactly one group, and once taken it is never
+ * reconsidered. That is the property that makes this a partition rather than the greedy overlap the
+ * incremental path produces.
+ *
+ * Resumable: it keeps its own cursor and forms at most `budget` groups per call, because the cost of a
+ * re-frame is that every member loses its TurboFan code and CallIndirectIC feedback. Spreading the work
+ * keeps that from landing as one multi-second stall on a workload that never idles.
+ */
+static guint8 *wj_rp_taken;
+static int      wj_rp_cursor, wj_rp_done, wj_rp_cap, wj_rp_verdict;
+static int     *wj_rp_order;
+
+static void
+wj_repartition_step (void)
+{
+	extern int mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
+	extern int mono_wasm_jit_repartition_budget;
+	int cap = mono_wasm_jit_colocate_max, formed = 0, seed;
+	int *grp;
+
+	if (wj_rp_done)
+		return;
+	if (cap > WJ_BATCH_MAX) cap = WJ_BATCH_MAX;
+	if (cap < 2) cap = 2;
+	if (!wj_rp_taken) {
+		wj_rp_cap = wj_reg_n + 1;
+		wj_rp_taken = g_new0 (guint8, wj_rp_cap);
+		if (!wj_rp_taken) { wj_rp_done = 1; return; }
+		wj_rp_cursor = 0;
+	}
+	grp = g_new0 (int, cap);
+	if (!grp) return;
+
+	/* SAME SEED ORDER AS THE ANALYSIS, and for the same reason: ascending desc order makes every node its
+	 * own seed before a caller can claim it, because callees are registered first and hold lower ids.
+	 * Built once and cached across the resumable calls -- rebuilding it per call would be O(n log n) on
+	 * every interp tick. */
+	if (!wj_rp_order) {
+		wj_rp_order = wj_repart_seed_order (wj_reg_n);
+		if (!wj_rp_order) { wj_rp_done = 1; g_free (grp); return; }
+	}
+	for (; (seed = wj_rp_order [wj_rp_cursor]) != 0 && formed < mono_wasm_jit_repartition_budget; ++wj_rp_cursor) {
+		WjRegEntry *sre;
+		int n = 0, bytes = 0, i;
+		if (seed >= wj_rp_cap || wj_rp_taken [seed])
+			continue;
+		sre = wj_reg_at (seed - 1);
+		if (!sre || !sre->body || sre->e <= 0 || sre->f <= 0 || sre->batch || sre->colocate_refused)
+			continue;
+		wj_rp_taken [seed] = 1;
+		grp [n++] = seed;
+		bytes += sre->len > 0 ? sre->len : 0;
+		/* BFS: grp[] is its own queue -- expanding member i appends new members past n. */
+		for (i = 0; i < n && n < cap; ++i) {
+			WjRegEntry *mre = wj_reg_at (grp [i] - 1);
+			const WasmRelocs *rl = (mre && mre->body) ? mre->body->f_body.relocs : NULL;
+			guint32 k;
+			for (k = 0; rl && k < rl->n && n < cap; ++k) {
+				int d;
+				WjRegEntry *dre;
+				if (rl->r [k].kind != WASM_RELOC_CALL)
+					continue;
+				d = wj_desc_for_fslot ((int) rl->r [k].table_index);
+				if (d <= 0 || d >= wj_rp_cap || wj_rp_taken [d])
+					continue;
+				dre = wj_reg_at (d - 1);
+				if (!dre || !dre->body || dre->e <= 0 || dre->f <= 0 || dre->batch || dre->colocate_refused)
+					continue;
+				if (mono_wasm_jit_colocate_bytes > 0 &&
+				    bytes + (dre->len > 0 ? dre->len : 0) > mono_wasm_jit_colocate_bytes)
+					continue;
+				wj_rp_taken [d] = 1;
+				grp [n++] = d;
+				bytes += dre->len > 0 ? dre->len : 0;
+			}
+		}
+		if (n >= 2) {
+			if (mono_wasm_jit_rebatch (grp, n, NULL, NULL)) {
+				if (G_UNLIKELY (mono_wasm_jit_stats)) {
+					mono_wasm_jit_count (WJC_REPART_GROUP);
+					mono_wasm_jit_add (WJC_REPART_MEMBERS, n);
+				}
+			} else if (G_UNLIKELY (mono_wasm_jit_stats)) {
+				mono_wasm_jit_count (WJC_REPART_FAIL);
+			}
+			formed++;
+		} else if (G_UNLIKELY (mono_wasm_jit_stats)) {
+			mono_wasm_jit_count (WJC_REPART_SINGLETON);
+		}
+	}
+	if (seed == 0)
+		wj_rp_done = 1;                 /* walked the whole order */
+	g_free (grp);
+}
+
+/* R213: the COST ANALYSIS. Same BFS as the real pass, no re-framing -- assign every eligible method a
+ * provisional group, then walk the call edges and measure what share the partition would make internal.
+ * Returns that percentage. O(edges), allocates two arrays, mutates nothing. */
+static int
+wj_repartition_decide (void)
+{
+	extern int mono_wasm_jit_colocate_max;
+	int cap = mono_wasm_jit_colocate_max, n_reg = wj_reg_n, seed, gid = 0, oi;
+	int *owner, *grp, *ord;
+	gint64 edges = 0, internal = 0;
+
+	if (cap > WJ_BATCH_MAX) cap = WJ_BATCH_MAX;
+	if (cap < 2) cap = 2;
+	owner = g_new0 (int, n_reg + 1);
+	grp = g_new0 (int, cap);
+	if (!owner || !grp) { g_free (owner); g_free (grp); return -1; }
+
+	ord = wj_repart_seed_order (n_reg);
+	if (!ord) { g_free (owner); g_free (grp); return -1; }
+	for (oi = 0; (seed = ord [oi]) != 0; ++oi) {
+		WjRegEntry *sre = wj_reg_at (seed - 1);
+		int n = 0, i;
+		if (owner [seed])
+			continue;
+		if (!sre || !sre->body || sre->e <= 0 || sre->f <= 0 || sre->colocate_refused)
+			continue;
+		++gid;
+		owner [seed] = gid;
+		grp [n++] = seed;
+		for (i = 0; i < n && n < cap; ++i) {
+			WjRegEntry *mre = wj_reg_at (grp [i] - 1);
+			const WasmRelocs *rl = (mre && mre->body) ? mre->body->f_body.relocs : NULL;
+			guint32 k;
+			for (k = 0; rl && k < rl->n && n < cap; ++k) {
+				int d;
+				WjRegEntry *dre;
+				if (rl->r [k].kind != WASM_RELOC_CALL)
+					continue;
+				d = wj_desc_for_fslot ((int) rl->r [k].table_index);
+				if (d <= 0 || d > n_reg || owner [d])
+					continue;
+				dre = wj_reg_at (d - 1);
+				if (!dre || !dre->body || dre->e <= 0 || dre->f <= 0 || dre->colocate_refused)
+					continue;
+				owner [d] = gid;
+				grp [n++] = d;
+			}
+		}
+	}
+	/* Score it: every CALL edge whose endpoints landed in the same provisional group becomes a
+	 * `call <funcidx>` for free; the rest still need a shadow or stay indirect. */
+	for (seed = 1; seed <= n_reg; ++seed) {
+		WjRegEntry *sre = wj_reg_at (seed - 1);
+		const WasmRelocs *rl = (sre && sre->body) ? sre->body->f_body.relocs : NULL;
+		guint32 k;
+		for (k = 0; rl && k < rl->n; ++k) {
+			int d;
+			if (rl->r [k].kind != WASM_RELOC_CALL)
+				continue;
+			d = wj_desc_for_fslot ((int) rl->r [k].table_index);
+			if (d <= 0 || d > n_reg || !owner [d] || !owner [seed])
+				continue;
+			++edges;
+			if (owner [d] == owner [seed])
+				++internal;
+		}
+	}
+	g_free (owner);
+	g_free (grp);
+	g_free (ord);
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_add (WJC_REPART_EDGES, edges);
+	/* -1 means NO EDGES WERE FOUND, which is a different fact from "0% would be internal" and must not
+	 * collapse into it -- the first says the graph was not reachable yet, the second says partitioning
+	 * does not help. The first version returned -1 for both and logged it as 0%, which is the same
+	 * catch-all mistake as the old ARM2_SIG bucket. */
+	if (edges <= 0)
+		return -1;
+	return (int) (internal * 100 / edges);
+}
+
+void mono_wasm_jit_repartition_tick (void);
+void
+mono_wasm_jit_repartition_tick (void)
+{
+	extern int mono_wasm_jit_repartition, mono_wasm_jit_registry_count (void);
+	extern int mono_wasm_jit_repartition_auto, mono_wasm_jit_repartition_min_gain;
+	if (wj_rp_done)
+		return;
+	if (mono_wasm_jit_repartition_auto > 0) {
+		/* SELF-TUNING PATH. Wait until duplication is actually costing something, then pay for one
+		 * O(edges) analysis and commit only if it clears the bar. wj_rp_verdict: 0 undecided, 1
+		 * approved, 2 rejected -- rejected is FINAL, so a graph that does not partition is measured
+		 * once rather than re-analysed on every tick. */
+		if (wj_rp_verdict == 2)
+			return;
+		if (wj_rp_verdict == 0) {
+			gint64 gen = mono_wasm_jit_counters [WJC_BYTES_GENERATED];
+			gint64 dup = mono_wasm_jit_counters [WJC_SHADOW_BYTES];
+			int pct;
+			if (gen <= 0 || dup * 100 / gen < mono_wasm_jit_repartition_auto)
+				return;                       /* duplication not yet expensive enough to act on */
+			/* AND enough of the tier must exist to partition. Duplication share crosses within the first
+			 * few hundred modules -- shadows start copying immediately -- so the share alone fires while
+			 * almost no callee has a registered descriptor yet and the dry run scores a graph that is not
+			 * there. MEASURED: the first version analysed once, found 0 edges, and refused permanently.
+			 * REPARTITION (the fixed registry threshold) doubles as that floor. */
+			if (mono_wasm_jit_registry_count () < (mono_wasm_jit_repartition > 0 ? mono_wasm_jit_repartition : 8000))
+				return;
+			pct = wj_repartition_decide ();
+			if (G_UNLIKELY (mono_wasm_jit_stats)) {
+				mono_wasm_jit_count (WJC_REPART_ANALYSED);
+				mono_wasm_jit_add (WJC_REPART_PREDICTED, pct < 0 ? 0 : pct);
+			}
+			if (pct < 0)
+				return;                       /* no edges yet -- retry later, do NOT record a verdict */
+			if (pct < mono_wasm_jit_repartition_min_gain) {
+				wj_rp_verdict = 2;            /* measured and not worth the re-tiering; never ask again */
+				return;
+			}
+			wj_rp_verdict = 1;
+		}
+	} else {
+		if (mono_wasm_jit_repartition <= 0)
+			return;
+		if (mono_wasm_jit_registry_count () < mono_wasm_jit_repartition)
+			return;
+	}
+	wj_repartition_step ();
+}
+
 int mono_wasm_jit_colocate_deps_now (int desc_id);
 int
 mono_wasm_jit_colocate_deps_now (int desc_id)

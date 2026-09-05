@@ -545,6 +545,17 @@ enum {
 	 * depset. Read against COLOCATED_MEMBERS: if it stays ~0 the walk found nothing past hop 1, which
 	 * means the depsets are too thin at publish time and the expansion is not the lever. */
 	WJC_COLOCATE_HOP_ADD,
+	/* R212 global repartition. GROUP/MEMBERS are what it formed; SINGLETON is a seed whose BFS found
+	 * no eligible neighbour (high share => the graph is not reachable at this point in the run, not that
+	 * partitioning fails); FAIL is a rebatch refusal. Read MEMBERS against COLOCATED_MEMBERS. */
+	WJC_REPART_GROUP, WJC_REPART_MEMBERS, WJC_REPART_SINGLETON, WJC_REPART_FAIL,
+	/* R213 auto-trigger: ANALYSED counts cost analyses run (should be 0 or 1 -- a rejection is final),
+	 * PREDICTED is the internal-edge percentage it computed. If ANALYSED is 1 and no groups formed, the
+	 * partition was measured and REFUSED, which is a result rather than a failure. */
+	WJC_REPART_ANALYSED, WJC_REPART_PREDICTED,
+	/* R213b: call edges the dry run actually SAW. Zero means the graph was not reachable when it ran,
+	 * which is a different fact from "0% would be internal" and must not be read as a refusal. */
+	WJC_REPART_EDGES,
 	WJC_MAX
 };
 
