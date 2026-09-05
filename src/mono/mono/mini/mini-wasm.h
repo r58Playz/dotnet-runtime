@@ -524,6 +524,14 @@ enum {
 	 * census only reconciles as: sites == emitted + no_rec + cold + poly + sig + no_fslot - poly_arm1.
 	 * Without this the parts-sum silently gains a double-count the moment ARM2 is enabled. */
 	WJC_DEVIRT_POLY_ARM1,
+	/* R207: WHY wj_arm_abi_ok refused. ARM2_SIG was one bucket and measured 1,725 -- about a third of
+	 * candidates -- which is suspicious, since overrides of ONE virtual method should lower to identical
+	 * wasm functypes. Split so the cause is readable instead of guessed at: INVALID = the signature does
+	 * not lower at all (mono_wasm_get_call_info refused it: too many params, an unsupported type);
+	 * BYADDR = it lowers but returns its value through a hidden pointer, which the shared call sequence
+	 * cannot express; SHAPE = it lowers cleanly and simply differs from the call site's functype, which
+	 * is the only one that would point at generic sharing. */
+	WJC_ARM_ABI_INVALID, WJC_ARM_ABI_BYADDR, WJC_ARM_ABI_SHAPE,
 	WJC_MAX
 };
 
