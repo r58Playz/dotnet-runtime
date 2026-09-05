@@ -556,6 +556,9 @@ enum {
 	/* R213b: call edges the dry run actually SAW. Zero means the graph was not reachable when it ran,
 	 * which is a different fact from "0% would be internal" and must not be read as a refusal. */
 	WJC_REPART_EDGES,
+	/* R214: passes re-armed after the tier grew. One pass covers only what existed when it fired
+	 * (5,381 of ~24,000 methods measured), so this is the coverage lever. */
+	WJC_REPART_REARM,
 	WJC_MAX
 };
 

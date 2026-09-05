@@ -211,6 +211,18 @@ int mono_wasm_jit_devirt_force_max = 2;
  * commits only if that clears REPARTITION_MIN_GAIN. The analysis is O(edges) and touches no module; the
  * re-framing it gates costs every member its TurboFan code and CallIndirectIC feedback, so the asymmetry
  * is the whole point of deciding first. */
+/* MONO_WASM_JIT_REPARTITION_AGAIN: re-arm the partition after the registry grows by this many methods.
+ * 0 = one pass only.
+ *
+ * One pass covers only the tier that exists when it fires: measured, 5,381 members of ~24,000 methods,
+ * and it predicts 55% where an offline partition of the FINISHED graph reaches 84%. The gap is not the
+ * algorithm, it is that half the program had not been JITted yet.
+ *
+ * Re-arming keeps `taken[]` -- already-grouped methods are never reconsidered, which preserves the
+ * partition property and matches what rebatch will accept anyway (it refuses an already-batched member,
+ * since re-framing one would strand its siblings). So each pass partitions the NEW arrivals only, which
+ * is cheap and is exactly the increment a runtime mod drop-in produces. */
+int mono_wasm_jit_repartition_again = 0;
 int mono_wasm_jit_repartition_auto = 0;
 /* Minimum percent of call edges the dry run must make internal for the rebuild to be worth its re-tiering
  * cost. Offline the same partition reaches 84% at 32 members, so a bar near 60 is conservative. */
@@ -604,6 +616,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
 	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
+	{ extern int mono_wasm_jit_repartition_again; const char *rg2 = g_getenv ("MONO_WASM_JIT_REPARTITION_AGAIN"); int v = (rg2 && *rg2) ? atoi (rg2) : 0; mono_wasm_jit_repartition_again = (v >= 0) ? v : 0; }
 	{ extern int mono_wasm_jit_repartition_auto; const char *ra = g_getenv ("MONO_WASM_JIT_REPARTITION_AUTO"); int v = (ra && *ra) ? atoi (ra) : 0; mono_wasm_jit_repartition_auto = (v >= 0 && v <= 100) ? v : 0; }
 	{ extern int mono_wasm_jit_repartition_min_gain; const char *rg = g_getenv ("MONO_WASM_JIT_REPARTITION_MIN_GAIN"); int v = (rg && *rg) ? atoi (rg) : 60; mono_wasm_jit_repartition_min_gain = (v >= 0 && v <= 100) ? v : 60; }
 	{ extern int mono_wasm_jit_repartition; const char *rp = g_getenv ("MONO_WASM_JIT_REPARTITION"); int v = (rp && *rp) ? atoi (rp) : 0; mono_wasm_jit_repartition = (v >= 0) ? v : 0; }
@@ -1337,7 +1350,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 170);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 171);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -7432,6 +7445,7 @@ wj_repart_seed_order (int n_reg)
 static guint8 *wj_rp_taken;
 static int      wj_rp_cursor, wj_rp_done, wj_rp_cap, wj_rp_verdict;
 static int     *wj_rp_order;
+static int      wj_rp_last_n;
 
 static void
 wj_repartition_step (void)
@@ -7511,8 +7525,11 @@ wj_repartition_step (void)
 			mono_wasm_jit_count (WJC_REPART_SINGLETON);
 		}
 	}
-	if (seed == 0)
+	if (seed == 0) {
+		extern int mono_wasm_jit_registry_count (void);
 		wj_rp_done = 1;                 /* walked the whole order */
+		wj_rp_last_n = mono_wasm_jit_registry_count ();
+	}
 	g_free (grp);
 }
 
@@ -7597,14 +7614,71 @@ wj_repartition_decide (void)
 	return (int) (internal * 100 / edges);
 }
 
+/* R214b: ONE THREAD AT A TIME, and this is a correctness requirement rather than tidiness.
+ *
+ * The tick is called from an ordinary interp dispatch, so EVERY worker reaches it. All of wj_rp_taken,
+ * wj_rp_cursor, wj_rp_order and wj_rp_done are plain statics: two workers inside the partitioner will
+ * double-claim descriptors, walk a freed order array, and re-frame the same group twice. With a single
+ * pass the window is small enough that it never showed; re-arming keeps re-entering and it surfaced
+ * immediately as **6 `memory access out of bounds` faults and a failed run**.
+ *
+ * The neighbouring compile path solves this with exactly this idiom (`wj_compiling`, interp.c:633), so
+ * take a CAS and bail if another worker holds it -- the work is opportunistic and there is always a next
+ * tick. */
+static volatile gint32 wj_rp_busy;
+static void wj_repartition_tick_locked (void);
+
 void mono_wasm_jit_repartition_tick (void);
 void
 mono_wasm_jit_repartition_tick (void)
 {
 	extern int mono_wasm_jit_repartition, mono_wasm_jit_registry_count (void);
 	extern int mono_wasm_jit_repartition_auto, mono_wasm_jit_repartition_min_gain;
-	if (wj_rp_done)
+	extern int mono_wasm_jit_repartition_again;
+	extern int mono_wasm_jit_repartition, mono_wasm_jit_registry_count (void);
+	/* Cheap unsynchronised reject first: with both knobs off this is two loads on an already-hot path. */
+	if (mono_wasm_jit_repartition <= 0 && mono_wasm_jit_repartition_auto <= 0)
 		return;
+	if (mono_atomic_cas_i32 (&wj_rp_busy, 1, 0) != 0)
+		return;                          /* another worker is in here; next tick will do */
+	wj_repartition_tick_locked ();
+	mono_atomic_store_i32 (&wj_rp_busy, 0);
+}
+
+static void
+wj_repartition_tick_locked (void)
+{
+	extern int mono_wasm_jit_repartition_auto, mono_wasm_jit_repartition_min_gain;
+	extern int mono_wasm_jit_repartition_again;
+	if (wj_rp_done) {
+		/* RE-ARM once enough new methods exist to be worth another pass. `taken` is deliberately kept:
+		 * a method that already has a group is never reconsidered, which is what keeps this a partition
+		 * and is also all rebatch would accept. Only the cursor and the degree order are rebuilt. */
+		if (mono_wasm_jit_repartition_again <= 0)
+			return;
+		if (mono_wasm_jit_registry_count () - wj_rp_last_n < mono_wasm_jit_repartition_again)
+			return;
+		{
+			int need = wj_reg_n + 1;
+			if (need > wj_rp_cap) {
+				guint8 *bigger = g_new0 (guint8, need);
+				if (!bigger)
+					return;
+				memcpy (bigger, wj_rp_taken, wj_rp_cap);
+				g_free (wj_rp_taken);
+				wj_rp_taken = bigger;
+				wj_rp_cap = need;
+			}
+		}
+		g_free (wj_rp_order);
+		wj_rp_order = NULL;
+		wj_rp_cursor = 0;
+		wj_rp_done = 0;
+		wj_rp_last_n = mono_wasm_jit_registry_count ();
+		if (G_UNLIKELY (mono_wasm_jit_stats))
+			mono_wasm_jit_count (WJC_REPART_REARM);
+		/* The verdict stands: the graph's partitionability was already measured. */
+	}
 	if (mono_wasm_jit_repartition_auto > 0) {
 		/* SELF-TUNING PATH. Wait until duplication is actually costing something, then pay for one
 		 * O(edges) analysis and commit only if it clears the bar. wj_rp_verdict: 0 undecided, 1
