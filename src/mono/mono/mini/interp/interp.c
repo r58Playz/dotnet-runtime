@@ -1043,6 +1043,23 @@ typedef struct {
 	 * which must be distinguished from the saturated count so a very polymorphic site gets the full
 	 * width rather than being read as exactly WJ_PROF_WAYS. */
 	gpointer ids [WJ_PROF_WAYS];
+	/* R206 -- what a SECOND guarded arm needs, and neither of these is derivable from the fields above.
+	 *
+	 * `target` is the front-runner's resolved callee ONLY, and `margin` is a Boyer-Moore margin that
+	 * tracks exactly one candidate, so a 2-way scheme has no way to name the runner-up or to size it.
+	 * Both must come from the OBSERVER: resolving a target at emit time via
+	 * mono_class_get_virtual_method deadlocks (see the comment on `target` above -- class init ->
+	 * IKVM classloader -> synchronous cross-thread JS call while holding the compile lock).
+	 *
+	 * id_counts is a true per-identity occurrence count (saturating in guint16), NOT a margin, so the
+	 * emitter can apply the break-even test directly: an extra guarded arm costs its guard on all
+	 * traffic reaching it and saves (ic - direct) on what it captures, so it pays at roughly
+	 * count/total > 14% when the target co-locates and > 38% when it does not.
+	 *
+	 * Cost: 80 B per site, 960 B per profiled caller. It extends THE one profile record rather than
+	 * adding a second, per CLAUDE.md. */
+	MonoMethod *id_targets [WJ_PROF_WAYS];
+	guint16     id_counts [WJ_PROF_WAYS];
 } WjProfSite;
 
 typedef struct {
@@ -1085,17 +1102,27 @@ mono_wasm_jit_prof_stat (int field)
 /* Add `identity` to the site's distinct-identity set. Saturating: past WJ_PROF_WAYS it only sets the
  * overflow flag, so the cost stays bounded no matter how polymorphic the site is. */
 static void
-wj_prof_note_identity (WjProfSite *s, gpointer identity)
+wj_prof_note_identity (WjProfSite *s, gpointer identity, MonoMethod *target)
 {
 	guint32 k;
 
 	for (k = 0; k < s->nids; ++k)
-		if (s->ids [k] == identity)
+		if (s->ids [k] == identity) {
+			/* Saturating: a count that wrapped would invert the ranking, which is worse than one that
+			 * stops growing -- once an identity is this dominant its rank cannot change. */
+			if (s->id_counts [k] < G_MAXUINT16)
+				s->id_counts [k]++;
+			/* A sizing-only observation arrives with target == NULL; do not clobber a resolved one. */
+			if (target && !s->id_targets [k])
+				s->id_targets [k] = target;
 			return;
+		}
 	if (s->nids >= WJ_PROF_WAYS) {
 		s->ids_overflow = 1;
 		return;
 	}
+	s->id_targets [s->nids] = target;
+	s->id_counts [s->nids] = 1;
 	s->ids [s->nids++] = identity;
 }
 
@@ -1206,7 +1233,7 @@ wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointe
 		if (from_jit)
 			wj_prof_jit_samples++;
 		s->total++;
-		wj_prof_note_identity (s, identity);
+		wj_prof_note_identity (s, identity, target);
 		if (!target)
 			return;                       /* sizing-only observation; leave the majority alone */
 		if (s->identity == identity) {
@@ -1282,6 +1309,68 @@ mono_wasm_jit_prof_site_id (gpointer caller_ptr, MonoMethod *base, int kind, vol
 			s->site_id = id;
 		return id;
 	}
+}
+
+/*
+ * R206: the RUNNER-UP receiver at a site, for a second guarded arm.
+ *
+ * Why this is a separate entry point and not a flag on mono_wasm_jit_prof_predict: that function answers
+ * "is this site perfectly monomorphic", which is a one-way, deliberately conservative question keyed on
+ * the Boyer-Moore margin. This one answers "what else does this site see, and how often", which the
+ * margin structurally cannot express -- it tracks exactly ONE candidate. The two use different fields
+ * (`identity`/`margin` vs `ids[]`/`id_counts[]`) and must not be merged.
+ *
+ * `skip` is the receiver an arm was already emitted for (may be NULL when the site was refused
+ * outright, e.g. WJ_PRED_POLY -- then this returns the site's most frequent receiver, which is the
+ * "give a polymorphic site one arm" case).
+ *
+ * Returns the highest-count identity != skip that has a RESOLVED target, and its share of total
+ * observations in *out_pct. The caller applies the break-even test; this function does not embed a
+ * policy. Same lock-free double-read discipline as prof_predict: the recorder never takes a lock, so a
+ * replacement in flight must not pair one receiver's vtable with another receiver's target.
+ */
+gboolean
+mono_wasm_jit_prof_predict_alt (gpointer caller_ptr, MonoMethod *base, MonoVTable *skip,
+	MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct)
+{
+	InterpMethod *caller = (InterpMethod *) caller_ptr;
+	WjProfSite *s;
+	guint32 k, nids1, nids2, total1, total2, best_c = 0;
+	gpointer best_id = NULL;
+	MonoMethod *best_t = NULL;
+
+	if (out_pct)
+		*out_pct = 0;
+	if (!caller || !base || !out_vt || !out_target)
+		return FALSE;
+	s = wj_prof_site (caller, base, WJ_SITE_VIRTUAL, FALSE, NULL);
+	if (!s)
+		return FALSE;
+
+	nids1 = s->nids; total1 = s->total;
+	mono_memory_barrier ();
+	for (k = 0; k < nids1 && k < WJ_PROF_WAYS; ++k) {
+		gpointer id = s->ids [k];
+		MonoMethod *t = s->id_targets [k];
+		guint32 c = s->id_counts [k];
+		if (!id || !t || id == (gpointer) skip)
+			continue;
+		/* A sizing-only observation leaves id_targets NULL, so an identity can be present with no
+		 * target; those are skipped above rather than guessed at. */
+		if (c > best_c) { best_c = c; best_id = id; best_t = t; }
+	}
+	mono_memory_barrier ();
+	nids2 = s->nids; total2 = s->total;
+	/* nids only grows and total only grows; a change means the set moved under us. Refusing is free --
+	 * the site keeps its IC and the next emission sees a settled record. */
+	if (nids1 != nids2 || total1 != total2 || !best_id || !best_t || !total1)
+		return FALSE;
+
+	*out_vt = (MonoVTable *) best_id;
+	*out_target = best_t;
+	if (out_pct)
+		*out_pct = (guint32) ((guint64) best_c * 100 / total1);
+	return TRUE;
 }
 
 /*

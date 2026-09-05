@@ -501,6 +501,29 @@ enum {
 	 * and healthy (it is the race being caught); it reading 0 forever would mean the re-validation is
 	 * dead code, and the fault it prevents is `function signature mismatch`. */
 	WJC_SHADOW_REVALIDATE,
+	/* R205: EXECUTION-WEIGHTED devirt diagnosis. The [wasm-jit devirt] census counts SITES at emit time,
+	 * unweighted, so it cannot say whether the IC's executed volume comes from sites that failed devirt or
+	 * from the SECOND RECEIVER at sites that succeeded -- the predicted arm keeps the IC below it as a
+	 * fallthrough (see the `Adaptive slim` comment at the guard), so both feed WJC_FAST_VIC.
+	 * These tag each emitted IC with the devirt outcome of ITS OWN site, so the runtime volume splits by
+	 * cause. PRED = the site HAS a predicted arm and this is the alternate receiver, which no amount of
+	 * coverage work can remove; the rest are sites coverage could in principle reach.
+	 * Require PROFILE_FAST, like every other FAST_* counter. */
+	WJC_FAST_VIC_PRED, WJC_FAST_VIC_NO_REC, WJC_FAST_VIC_COLD,
+	WJC_FAST_VIC_POLY, WJC_FAST_VIC_NO_FSLOT, WJC_FAST_VIC_OTHER,
+	/* R206 SECOND GUARDED ARM (MONO_WASM_JIT_DEVIRT_ARM2). EMITTED/THIN/NO_ALT/NO_FSLOT/SIG/SELF are
+	 * emit-time and partition every site that reached the arm-2 gate; FAST_DEVIRT2 is the EXECUTED hit
+	 * count and needs PROFILE_FAST. Read FAST_DEVIRT2 against FAST_VIC_PRED from the run BEFORE the arm
+	 * existed: that is the traffic arm 2 was built to capture, so the two should trade off one for one.
+	 * THIN is not a failure -- it is the break-even refusing a site where an arm would LOSE (vcall_ways
+	 * 4->1 was +9.6% fps precisely because those ways caught ~1%). */
+	WJC_DEVIRT_ARM2_EMITTED, WJC_DEVIRT_ARM2_THIN, WJC_DEVIRT_ARM2_NO_ALT,
+	WJC_DEVIRT_ARM2_NO_FSLOT, WJC_DEVIRT_ARM2_SIG, WJC_DEVIRT_ARM2_SELF, WJC_FAST_DEVIRT2,
+	/* R206b: a POLY site that received a FIRST arm. Such a site is counted in BOTH devirt `poly` (bumped
+	 * when the prediction was refused) and `emitted` (bumped when the arm is laid down), so the devirt
+	 * census only reconciles as: sites == emitted + no_rec + cold + poly + sig + no_fslot - poly_arm1.
+	 * Without this the parts-sum silently gains a double-count the moment ARM2 is enabled. */
+	WJC_DEVIRT_POLY_ARM1,
 	WJC_MAX
 };
 

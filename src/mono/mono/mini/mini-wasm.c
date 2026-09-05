@@ -136,6 +136,27 @@ int mono_wasm_jit_devirt_profile = 0;
 int mono_wasm_jit_devirt_force = 0;
 int mono_wasm_jit_devirt_force_min = 64;
 int mono_wasm_jit_devirt_force_max = 2;
+/* MONO_WASM_JIT_DEVIRT_ARM2=1: emit a SECOND guarded arm for the runner-up receiver.
+ *
+ * Sized from measurement, not taste (R205). Executed inline-IC hits split by their own site's devirt
+ * outcome give, on the in-game window: alt-receiver at a site that DID devirt **32.5%**, no_rec 32.2%,
+ * poly 30.7%, cold 4.6%, no_fslot 0.0%. So a third of hot IC traffic is the SECOND object form falling
+ * through arm 1's guard, which no amount of devirt COVERAGE can reach -- only another arm can.
+ *
+ * BREAK-EVEN, from the emitted sequences (R206): an IC hit is ~21 x86 (2 loads, cmp, jne, unpack, then
+ * call_indirect at ~15), a guard is ~3 (load, cmp, jne) and a co-located direct call is 1. An extra arm
+ * pays its guard on ALL traffic reaching it and saves (ic - direct) on what it captures, so it wins at
+ * capture > g/(ic-d) = 3/20 = ~15%. If the target does NOT co-locate the 'direct' call is itself a
+ * call_indirect (~15) and the bar jumps to 3/6 = ~50%. **Co-location is therefore the precondition,
+ * not a bonus.**
+ *
+ * The counter-evidence to respect: vcall_ways 4 -> 1 measured **+9.6% fps**, because those ways caught
+ * ~1% of traffic -- far below this bar. Consistent with the model, and the reason ARM2_PCT exists
+ * rather than emitting arm 2 unconditionally. */
+int mono_wasm_jit_devirt_arm2 = 0;
+/* Minimum share of a site's observations the runner-up must hold, in percent. Default is the measured
+ * co-located break-even; raise toward 50 if arm-2 targets are not co-locating. */
+int mono_wasm_jit_devirt_arm2_pct = 15;
 /* MONO_WASM_JIT_STABLE_IC_IDS: give a re-emitted virtual call site the SAME inline-cache id its previous
  * generation had, instead of bumping a fresh one out of WJ_VCALL_SITE_MAX.
  *
@@ -496,6 +517,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
 	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
+	{ extern int mono_wasm_jit_devirt_arm2; const char *a2 = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2"); mono_wasm_jit_devirt_arm2 = (a2 && *a2 && *a2 != '0') ? 1 : 0; }
+	{ extern int mono_wasm_jit_devirt_arm2_pct; const char *ap = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2_PCT"); int v = (ap && *ap) ? atoi (ap) : 15; mono_wasm_jit_devirt_arm2_pct = (v >= 0 && v <= 100) ? v : 15; }
 	{ extern int mono_wasm_jit_stable_ic_ids; const char *si = g_getenv ("MONO_WASM_JIT_STABLE_IC_IDS"); mono_wasm_jit_stable_ic_ids = (si && *si && *si != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lazy_gcp; const char *lg = g_getenv ("MONO_WASM_JIT_LAZY_GCP"); mono_wasm_jit_lazy_gcp = (lg && *lg) ? atoi (lg) : 1; } /* GC points a method may have and still defer its ref frame; <=0 = unlimited */
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
@@ -1220,7 +1243,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 143);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 157);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1397,6 +1420,22 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_DEVIRT_SITE), WJC_(WJC_DEVIRT_EMITTED), WJC_(WJC_DEVIRT_NO_REC), WJC_(WJC_DEVIRT_COLD),
 		WJC_(WJC_DEVIRT_POLY), WJC_(WJC_DEVIRT_POLY_90), WJC_(WJC_DEVIRT_SIG), WJC_(WJC_DEVIRT_NO_FSLOT),
 		WJC_(WJC_DELEGATE_SITE), WJC_(WJC_FAST_DEVIRT));
+	printf ("[wasm-jit devirt-arm2] emitted=%lld | thin=%lld no_alt=%lld no_fslot=%lld sig=%lld self=%lld"
+		"  (MONO_WASM_JIT_DEVIRT_ARM2=%d pct>=%d)  EXECUTED hits=%lld\n"
+		"  thin is the break-even REFUSING a site, not a failure: an arm below ~15%% capture loses"
+		" (vcall_ways 4->1 was +9.6%% fps at ~1%% capture). Read hits against ic-why alt-receiver.\n",
+		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),
+		WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG), WJC_(WJC_DEVIRT_ARM2_SELF),
+		mono_wasm_jit_devirt_arm2, mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
+	printf ("[wasm-jit devirt-arm2] poly sites given a FIRST arm=%lld -- these are counted in BOTH `poly`"
+		" and `emitted` above, so the census reconciles as sites == emitted + no_rec + cold + poly + sig"
+		" + no_fslot - poly_arm1\n", WJC_(WJC_DEVIRT_POLY_ARM1));
+	printf ("[wasm-jit ic-why] EXECUTED inline-IC hits split by the devirt outcome of their OWN site"
+		" (PROFILE_FAST only; parts MUST sum to fast_vic above):\n"
+		"  alt-receiver at a DEVIRTED site = %lld  <- coverage work can NEVER remove these\n"
+		"  no_rec=%lld cold=%lld poly=%lld no_fslot=%lld other=%lld  <- sites coverage could reach\n",
+		WJC_(WJC_FAST_VIC_PRED), WJC_(WJC_FAST_VIC_NO_REC), WJC_(WJC_FAST_VIC_COLD),
+		WJC_(WJC_FAST_VIC_POLY), WJC_(WJC_FAST_VIC_NO_FSLOT), WJC_(WJC_FAST_VIC_OTHER));
 	printf ("[wasm-jit devirt-force] forced=%lld capped=%lld (MONO_WASM_JIT_DEVIRT_FORCE=%d min=%d max=%d) -- read against no_fslot above and parked=%lld\n",
 		WJC_(WJC_DEVIRT_FORCED), WJC_(WJC_DEVIRT_FORCE_CAPPED),
 		mono_wasm_jit_devirt_force, mono_wasm_jit_devirt_force_min, mono_wasm_jit_devirt_force_max,
@@ -5979,6 +6018,27 @@ wj_asm_reaches (int from_desc, int target_fslot)
 
 /* Which member, if any, holds `callee`? -1 when it is not co-located. Linear because a module holds tens
  * of members, not thousands, and this runs once per call site at framing time. */
+/* R206: may this candidate be dispatched through the call site's functype?
+ *
+ * Both guarded arms and the IC tail share ONE functype index and ONE argument-marshalling sequence, so a
+ * candidate whose lowered signature differs is not substitutable: call_indirect's canonical-type check
+ * turns that into a trap at whatever frame reaches it first, not a missed optimisation. Mirrors the test
+ * the first arm already applies to its own predicted target. */
+static gboolean
+wj_arm_abi_ok (MonoMethod *target, const WasmFuncType *want)
+{
+	MonoMethodSignature *sig;
+	WasmCallInfo ci;
+
+	if (!target || !want)
+		return FALSE;
+	sig = mono_method_signature_internal (target);
+	if (!sig)
+		return FALSE;
+	mono_wasm_get_call_info (sig, &ci);
+	return ci.valid && !ci.vret_byaddr && functype_eq (&ci.ftype, want);
+}
+
 static int
 wj_asm_member_of (const WjAsmMember *m, int n, MonoMethod *callee)
 {
@@ -11731,6 +11791,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						MonoVTable *pred_vt = NULL;
 						MonoMethod *pred_target = NULL;
 						int pred_fslot = 0;
+						/* R205: which devirt outcome this site's IC serves. 0 unknown, 1 no_rec, 2 cold, 3 poly,
+						 * 4 poly_90, 5 sig, 6 no_fslot, 7 the site GOT an arm and this IC is its alternate-receiver
+						 * fallthrough. Set at every devirt exit, consumed at the IC hit tail. */
+						int ic_tag = 0;
+						/* R206: the runner-up arm. Resolved only when arm 1 exists, since its whole purpose is to
+						 * catch what arm 1's guard rejects. */
+						MonoVTable *pred2_vt = NULL;
+						MonoMethod *pred2_target = NULL;
+						int pred2_fslot = 0;
 						gboolean slim_pred = FALSE;
 						gboolean is_delegate_invoke = !strcmp (call->method->name, "Invoke") &&
 							m_class_get_parent (call->method->klass) == mono_defaults.multicastdelegate_class;
@@ -11830,7 +11899,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								mono_wasm_get_call_info (pred_sig, &pred_ci);
 								if (!pred_ci.valid || pred_ci.vret_byaddr ||
 								    !functype_eq (&pred_ci.ftype, &ftd)) {
-									wj_count (WJC_DEVIRT_SIG);
+									wj_count (WJC_DEVIRT_SIG); ic_tag = 5;
 									pred_vt = NULL;
 									pred_target = NULL;
 									pred_fslot = 0;
@@ -11870,7 +11939,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 											}
 											wj_count (WJC_DEVIRT_FORCE_CAPPED);
 										}
-										wj_count (WJC_DEVIRT_NO_FSLOT);
+										wj_count (WJC_DEVIRT_NO_FSLOT); ic_tag = 6;
 										pred_vt = NULL;
 										pred_target = NULL;
 										pred_fslot = 0;
@@ -11893,6 +11962,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								 * monomorphic (a higher threshold makes those strictly WORSE, since a
 								 * second receiver disqualifies a site permanently). They pull in opposite
 								 * directions, so the split decides the fix. */
+								ic_tag = pred_why;
 								switch (pred_why) {
 								case 1 /* WJ_PRED_NO_REC */:  wj_count (WJC_DEVIRT_NO_REC); if (mono_wasm_jit_in_reemit) wj_count (WJC_REEMIT_NO_REC); break;
 								case 2 /* WJ_PRED_COLD */:    wj_count (WJC_DEVIRT_COLD); break;
@@ -12073,6 +12143,136 @@ vcall_nullchk_done:
 									ic_ways = (int) ar;
 							}
 #endif
+							/* R206: resolve the runner-up, if arm 1 exists and the knob is on. Deliberately
+							 * AFTER every devirt exit above, so pred_vt/pred_target are final. The target comes
+							 * from the profile's id_targets[], recorded by the OBSERVER -- resolving it here via
+							 * mono_class_get_virtual_method is the documented deadlock (class init -> IKVM
+							 * classloader -> synchronous cross-thread JS call under the compile lock). */
+#ifdef HOST_BROWSER
+							/* R206b: ARMS AT A POLYMORPHIC SITE.
+							 *
+							 * The first version hung this off a site that ALREADY had arm 1 and measured
+							 * 17,096 gate hits, 100% no_alt, zero arms. That was structural, not a bug:
+							 * arm 1 exists only when prof_predict succeeded, which requires
+							 * `margin == total` -- every observation ever had the SAME receiver -- so such a
+							 * site has exactly one identity in the profile and no runner-up to name. The
+							 * alternate receiver that FastVicPred counts (32.5% of hot IC traffic) appears
+							 * only AFTER emission, and is caught by slim_pred's worker-local PIC way, which
+							 * dispatches it as call_indirect rather than a direct call.
+							 *
+							 * The sites whose receiver set IS known at emit time are the POLY ones -- refused
+							 * precisely because they saw more than one -- and they carry 30.7% of hot IC
+							 * volume. `margin == total` is irreversible, so they are refused an arm for the
+							 * life of the process however concentrated their distribution is. id_counts[]
+							 * (R206) gives the true per-receiver frequency the margin cannot express, so the
+							 * break-even can be applied per receiver. ic_tag 3/4 == WJ_PRED_POLY/POLY_90. */
+							if (mono_wasm_jit_devirt_arm2 && !pred_target && (ic_tag == 3 || ic_tag == 4) &&
+							    !is_delegate_invoke && mono_wasm_jit_devirt_profile) {
+								extern gboolean mono_wasm_jit_prof_predict_alt (gpointer caller, MonoMethod *base,
+									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
+								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
+								gpointer im = mono_interp_get_imethod (cfg->method);
+								MonoVTable *v1 = NULL, *v2 = NULL;
+								MonoMethod *t1 = NULL, *t2 = NULL;
+								guint32 p1 = 0, p2 = 0;
+								int f1, f2;
+								/* Shared admission test. A candidate must have an f-slot, not be this method,
+								 * be jittable, and carry EXACTLY the call's functype -- both arms and the IC
+								 * share one ftdi and one argument sequence, so a divergent signature is a trap
+								 * rather than a miss. */
+								#define WJ_ARM_OK(vt, t, pct, fs) ( \
+									(vt) && (t) && (int) (pct) >= mono_wasm_jit_devirt_arm2_pct && \
+									(t) != cfg->method && !mono_wasm_jit_callee_perm_unjittable (t) && \
+									((fs) = mono_wasm_jit_get_callee_fslot (t)) > 0 && \
+									wj_arm_abi_ok ((t), &ftd))
+								/* NOTE the f-slot test above is not merely "is it compiled": it is what makes the
+								 * direct-dep registration below meaningful, since a dep is keyed by slot. */
+
+								if (mono_wasm_jit_prof_predict_alt (im, call->method, NULL, &v1, &t1, &p1)) {
+									if (WJ_ARM_OK (v1, t1, p1, f1)) {
+										/* REGISTER THE DIRECT DEPENDENCY. Baking an f-slot without this is the
+										 * prefilled-placeholder trap: admission is what brings the target live on
+										 * a worker before this caller runs, and a slot this worker never
+										 * instantiated still holds mono_jiterp_placeholder_jit_call, which traps
+										 * on a mismatched signature and silently corrupts on a matching one.
+										 * Omitting it is what made the first poly-arm build fault x4. */
+										wj_result_add_direct_dep (&cfg->wasm_jit_result, f1,
+											wj_functype_hash (&ftd), t1);
+										if (cfg->wasm_jit_result.direct_deps_truncated) {
+											fail = "too many direct dependencies (poly arm1)";
+											goto done;
+										}
+										pred_vt = v1; pred_target = t1; pred_fslot = f1;
+										wj_count (WJC_DEVIRT_POLY_ARM1);
+										/* and now the runner-up, on the traffic arm 1 leaves behind */
+										if (mono_wasm_jit_prof_predict_alt (im, call->method, v1, &v2, &t2, &p2)) {
+											if (WJ_ARM_OK (v2, t2, p2, f2)) {
+												wj_result_add_direct_dep (&cfg->wasm_jit_result, f2,
+													wj_functype_hash (&ftd), t2);
+												if (cfg->wasm_jit_result.direct_deps_truncated) {
+													fail = "too many direct dependencies (poly arm2)";
+													goto done;
+												}
+												pred2_vt = v2; pred2_target = t2; pred2_fslot = f2;
+												wj_count (WJC_DEVIRT_ARM2_EMITTED);
+											} else if ((int) p2 < mono_wasm_jit_devirt_arm2_pct) {
+												wj_count (WJC_DEVIRT_ARM2_THIN);
+											} else {
+												wj_count (WJC_DEVIRT_ARM2_SIG);
+											}
+										} else {
+											wj_count (WJC_DEVIRT_ARM2_NO_ALT);
+										}
+									} else if ((int) p1 < mono_wasm_jit_devirt_arm2_pct) {
+										wj_count (WJC_DEVIRT_ARM2_THIN);
+									} else {
+										wj_count (WJC_DEVIRT_ARM2_SIG);
+									}
+								} else {
+									wj_count (WJC_DEVIRT_ARM2_NO_ALT);
+								}
+								#undef WJ_ARM_OK
+							}
+#endif /* HOST_BROWSER */
+							if (0 && mono_wasm_jit_devirt_arm2 && pred_fslot > 0 && pred_vt && pred_target &&
+							    !is_delegate_invoke && mono_wasm_jit_devirt_profile) {
+								extern gboolean mono_wasm_jit_prof_predict_alt (gpointer caller, MonoMethod *base,
+									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
+								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+								extern gpointer mono_interp_get_imethod (MonoMethod *method);
+								MonoVTable *a2vt = NULL;
+								MonoMethod *a2t = NULL;
+								guint32 a2pct = 0;
+								if (mono_wasm_jit_prof_predict_alt (mono_interp_get_imethod (cfg->method),
+								    call->method, pred_vt, &a2vt, &a2t, &a2pct)) {
+									if ((int) a2pct < mono_wasm_jit_devirt_arm2_pct) {
+										wj_count (WJC_DEVIRT_ARM2_THIN);   /* below break-even; an arm here LOSES */
+									} else {
+										int f2 = mono_wasm_jit_get_callee_fslot (a2t);
+										if (f2 <= 0) {
+											wj_count (WJC_DEVIRT_ARM2_NO_FSLOT);
+										} else if (a2t == cfg->method) {
+											wj_count (WJC_DEVIRT_ARM2_SELF);
+										} else {
+											/* The ABI must match arm 1's: both arms and the IC share one functype
+											 * index (ftdi) and one argument marshalling sequence. A runner-up whose
+											 * signature differs is not substitutable -- that is a trap, not a miss. */
+											MonoMethodSignature *s2 = mono_method_signature_internal (a2t);
+											WasmCallInfo ci2;
+											mono_wasm_get_call_info (s2, &ci2);
+											if (ci2.valid && !ci2.vret_byaddr && functype_eq (&ci2.ftype, &ftd)) {
+												pred2_vt = a2vt; pred2_target = a2t; pred2_fslot = f2;
+												wj_count (WJC_DEVIRT_ARM2_EMITTED);
+											} else {
+												wj_count (WJC_DEVIRT_ARM2_SIG);
+											}
+										}
+									}
+								} else {
+									wj_count (WJC_DEVIRT_ARM2_NO_ALT);
+								}
+							}
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
 							/* Strict monomorphic guard. A hit bypasses the worker PIC completely. The prediction
 							 * is deliberately speculative: interpreter warmup can see one receiver before the
@@ -12082,6 +12282,7 @@ vcall_nullchk_done:
 							 * direct f-slot dispatch instead of repeatedly entering the shared resolver. */
 							if (pred_fslot > 0 && pred_vt && pred_target && !is_delegate_invoke) {
 								wj_count (WJC_DEVIRT_EMITTED); if (mono_wasm_jit_in_reemit) wj_count (WJC_REEMIT_EMITTED);
+								ic_tag = 7;   /* R205: any IC hit below this guard is the ALTERNATE receiver */
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_miss */
 									if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt this ld"; goto done; }
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
@@ -12103,6 +12304,26 @@ vcall_nullchk_done:
 									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "devirt dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred_miss */
+							}
+							/* R206: SECOND guarded arm, structurally identical to the first. Its guard is only
+							 * reached when arm 1's missed, which is exactly the traffic the break-even is
+							 * computed over. Same ftdi, same argument sequence, same single WASM_RELOC_CALL hole,
+							 * so it is co-locatable and shadowable on the same terms as arm 1 -- which it must be,
+							 * because at ~50% break-even a non-co-located arm 2 loses. */
+							if (pred2_fslot > 0 && pred2_vt && pred2_target) {
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred2_miss */
+									if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt2 this ld"; goto done; }
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_i32_const (&body, (gint32) (intptr_t) pred2_vt);
+									wasm_op (&body, WASM_OP_I32_NE);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									wj_emit_fast_count (&body, WJC_FAST_DEVIRT2);
+									for (ai = 0; ai < n2; ++ai)
+										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "devirt2 arg ld"; goto done; }
+									wj_emit_method_call (&body, pred2_target, pred2_fslot, (guint32) ftdi);
+									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "devirt2 dreg"; goto done; }
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
+								wasm_op (&body, WASM_OP_END); /* $pred2_miss */
 							}
 							if (slim_pred) {
 								/* One compact worker-local alternate PIC entry. The first prediction miss reaches
@@ -12574,6 +12795,16 @@ vcall_nullchk_done:
 							 * vregs -- nothing is carried across the block boundary, so both blocks stay void),
 							 * then call_indirect the f-slot the winning guard resolved. */
 							wj_emit_fast_count (&body, WJC_FAST_VIC);   /* profile: inline f-slot IC hit (JIT->JIT) */
+							/* R205: and again, tagged with THIS SITE's devirt outcome, so the IC's executed volume
+							 * splits by cause. Sums to WJC_FAST_VIC by construction -- check that before quoting it. */
+							switch (ic_tag) {
+							case 7:  wj_emit_fast_count (&body, WJC_FAST_VIC_PRED); break;
+							case 1:  wj_emit_fast_count (&body, WJC_FAST_VIC_NO_REC); break;
+							case 2:  wj_emit_fast_count (&body, WJC_FAST_VIC_COLD); break;
+							case 3: case 4: wj_emit_fast_count (&body, WJC_FAST_VIC_POLY); break;
+							case 6:  wj_emit_fast_count (&body, WJC_FAST_VIC_NO_FSLOT); break;
+							default: wj_emit_fast_count (&body, WJC_FAST_VIC_OTHER); break;
+							}
 							for (ai = 0; ai < n2; ++ai)
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "ic fast arg ld"; goto done; }
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
