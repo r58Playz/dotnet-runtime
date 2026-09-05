@@ -314,6 +314,43 @@ candidate only if the site is non-virtual, the target is non-virtual, or the tar
 emits `callvirt` for every non-final Java method. That is why R118 measured bodies +4.4% and **calls per
 method +1.0%**: the inliner reached only the non-virtual remainder and absorbed its callees' call sites.
 
+## THE DEVIRT CENSUS IS PER-SITE AND UNWEIGHTED — never plan from it alone (R205)
+
+`[wasm-jit devirt]` counts SITES at emit time. A site executed a billion times counts the same as one
+executed twice, so the bucket that looks biggest is routinely not the one carrying the traffic. The
+execution-weighted split (each emitted IC tagged with the devirt outcome of its OWN site; parts sum to
+`fast_vic` to 0.0009%):
+
+| cause | IN-GAME WINDOW | cumulative | % of SITES | over/under-weight |
+|---|---|---|---|---|
+| **alt-receiver at a site that DID devirt** | **32.5%** | 17.7% | n/a | — |
+| `no_rec` | 32.2% | 24.5% | 28.1% | x0.87 |
+| `poly` | 30.7% | **52.1%** | 7.9% | **x6.59** |
+| `cold` | 4.6% | 5.4% | 9.0% | x0.60 |
+| `no_fslot` | **0.0%** | 0.3% | 3.1% | **x0.11** |
+
+**`no_fslot` is 0.0% of hot IC execution** (2,052 hits in a 90 s window). R204 cut it 69% via
+`MONO_WASM_JIT_THRESHOLD` 500->2000 and `DEVIRT_FORCE_MIN` 64->8, and that is worth **nothing on the
+plateau** — it is a boot/worldgen effect. Both knobs may still be right for boot; neither is a frame-rate
+lever. Do not repeat this: weight a devirt bucket by execution before spending on it.
+
+**"`no_rec` is cold branches that never execute" is WRONG** — those sites take 34M hits per window. The
+reconciliation is the standing measurement that **99.3% of profile observations arrive AFTER the method was
+JITted**: raising the JIT threshold adds PRE-JIT interp observations, which is the wrong channel entirely,
+while the record does exist later from the IC's own misses. So **re-emission can convert `no_rec` and the
+threshold structurally cannot**, which is also why R170b saw `no_rec` 31.2% -> 0.0% on re-emitted bodies.
+
+**Where the hot IC volume is:** polymorphic dispatch **63.2%** (alt-receiver 32.5% + poly 30.7%),
+re-emission **32.2%**, everything else 4.6%.
+
+**Cost model for a guarded arm, counted off emitted code (R206).** Arm hit = `i32.load; i32.ne; br_if` then
+`call <funcidx>` = **~3 x86 + 1**. IC hit = 2 loads + cmp + jne + unpack + `call_indirect` = **~21 x86**.
+An extra arm pays its guard on ALL traffic reaching it and saves (ic - direct) on what it captures, so it
+wins above **capture > g/(ic-d) = 3/20 ≈ 15%** — and above **~50%** if the target does NOT co-locate,
+because then the "direct" call is itself a `call_indirect`. **Co-location is the precondition for another
+arm, not a bonus.** This model is consistent with the one hard datapoint: `vcall_ways` 4 -> 1 was
+**+9.6% fps** with those ways capturing ~1%, far below the bar.
+
 ## The EXECUTED dispatch split, and the hard ceiling on direct calls (R203)
 
 Measured with `profile_fast=1` (costs ~7%; ratios valid, timings void), 90 s in-game window, deltas between
@@ -516,6 +553,16 @@ invalidated a session's worth of A/B ordering before it was noticed.
 * **Prefer a within-binary knob A/B to a cross-binary comparison.** A cross-binary reading at this spread
   cannot support a 4% claim however tidy the mechanism sounds; that exact mistake produced the retracted
   `MAX_HIMP` result, and the knob test that overturned it cost 30 minutes.
+* **THE NETWORK STALL IS DEFUSED -- `IKVM_DEFUSE_RANKED_AUTH=1`, now the harness DEFAULT (R205).**
+  MCSR Ranked's account validation never reaches a terminal socket status under this net bridge, so the
+  modded main screen never finishes and the run stalls waiting for `inworld`. That is the
+  "STALLED: no log output at all for 90s" signature, and it voided THREE arms in one session (~8 min
+  each). The switch lives on the C# side -- `ikvmcraft/loader/Transforms/Bench/DefuseRankedAuth.cs`,
+  read at `loader/IkvmWasm.cs:172` -- and reaches the runtime because `index.ts` passes any
+  `MONO_|IKVM_|DOTNET_`-prefixed knob straight through as an env var. `lib/mcdrive.mjs`'s `buildUrl` now
+  sets it unless the caller passes `IKVM_DEFUSE_RANKED_AUTH=0`. It is BENCHMARK-ONLY and it CHANGES WHAT
+  THE GAME DOES, so it goes through the URL like every other knob and stays visible in each run's
+  recorded command line rather than being hidden in the launcher.
 * **The 2026-09-01 boot stalls are a NETWORK hang, and they are real hangs.** Every captured one ends on the
   same three app lines — `Update Status: AUTHENTICATING`, `tcpws [object URL]`, then net.ts `closing → closed
   → "really closed undefined"` — and the app emits NOTHING afterwards. **When testing whether a hung run
@@ -561,6 +608,19 @@ invalidated a session's worth of A/B ordering before it was noticed.
   `MONO_WASM_JIT_VERIFY_DEPS`, default 0, so it returns 0 either way. More generally: "every error counter
   is zero" is a statement about the counters you have, not about the run. Two of R166's four bugs were a
   bare `continue` and a `return 0`, which no counter anywhere was watching.
+* **BACKGROUND COMMANDS ARE KILLED WHEN THE TURN ENDS — measurements must be DETACHED (R206).**
+  Verified against the harness binary (`/opt/claude-code/bin/claude`, a compiled Bun executable; its
+  embedded JS strings are greppable): `killShellTasksForAgent: killing orphaned shell task <id>
+  (agent <id> exiting)`, and the design note *"the command is stopped when your turn ends, so its
+  result reaches you only while you are still working"*. It is bound to AGENT/TURN LIFETIME, not to a
+  duration or memory limit — a 45-minute build+deploy+A/B chain survived because the turn never
+  yielded, while every idle watcher died at a turn boundary. Ruled out as knobs:
+  `CLAUDE_CODE_IDLE_THRESHOLD_MINUTES` (idle NOTIFICATIONS), `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS`
+  (auto-backgrounding a long FOREGROUND bash), `CLAUDE_SUBAGENT_BG_SHELL_MAX_MS` (subagent-scoped).
+  **The pattern that works:** `setsid nohup <work> ... & disown` writing a sentinel file, plus a
+  background watcher started inside a live turn and re-armed at the top of the next one. Three
+  `deploy.sh` runs were killed mid-`publishing loader` before this was understood, each leaving
+  `frontend/public/_framework` MISSING and the app unloadable — so DETACH the deploy in particular.
 * **A leftover compiler daemon will silently tax one arm.** The runtime build's `VBCSCompiler` starts under
   the REPO-LOCAL `./.dotnet/dotnet` with its own pipe name, so a `dotnet build-server shutdown` issued by the
   system SDK does not reach it; one was caught at 101% CPU for 11:50. `preflight` refuses to measure while one
