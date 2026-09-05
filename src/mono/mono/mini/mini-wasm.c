@@ -1243,7 +1243,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 157);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 160);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1427,6 +1427,10 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),
 		WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG), WJC_(WJC_DEVIRT_ARM2_SELF),
 		mono_wasm_jit_devirt_arm2, mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
+	printf ("[wasm-jit arm-abi] candidates refused by shape: invalid=%lld byaddr=%lld shape=%lld"
+		" -- `shape` is the only one that would mean overrides of one method lower differently"
+		" (generic sharing); the other two are signatures the shared call sequence cannot express.\n",
+		WJC_(WJC_ARM_ABI_INVALID), WJC_(WJC_ARM_ABI_BYADDR), WJC_(WJC_ARM_ABI_SHAPE));
 	printf ("[wasm-jit devirt-arm2] poly sites given a FIRST arm=%lld -- these are counted in BOTH `poly`"
 		" and `emitted` above, so the census reconciles as sites == emitted + no_rec + cold + poly + sig"
 		" + no_fslot - poly_arm1\n", WJC_(WJC_DEVIRT_POLY_ARM1));
@@ -6036,7 +6040,19 @@ wj_arm_abi_ok (MonoMethod *target, const WasmFuncType *want)
 	if (!sig)
 		return FALSE;
 	mono_wasm_get_call_info (sig, &ci);
-	return ci.valid && !ci.vret_byaddr && functype_eq (&ci.ftype, want);
+	if (!ci.valid) {
+		wj_count (WJC_ARM_ABI_INVALID);
+		return FALSE;
+	}
+	if (ci.vret_byaddr) {
+		wj_count (WJC_ARM_ABI_BYADDR);
+		return FALSE;
+	}
+	if (!functype_eq (&ci.ftype, want)) {
+		wj_count (WJC_ARM_ABI_SHAPE);
+		return FALSE;
+	}
+	return TRUE;
 }
 
 static int

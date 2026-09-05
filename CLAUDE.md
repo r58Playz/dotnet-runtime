@@ -343,6 +343,14 @@ threshold structurally cannot**, which is also why R170b saw `no_rec` 31.2% -> 0
 **Where the hot IC volume is:** polymorphic dispatch **63.2%** (alt-receiver 32.5% + poly 30.7%),
 re-emission **32.2%**, everything else 4.6%.
 
+**A SECOND GUARDED ARM AT POLY SITES SHIPS BEHIND `MONO_WASM_JIT_DEVIRT_ARM2` (default 0), and it works
+(R206).** `margin == total` is irreversible, so a site that ever saw a second receiver is refused an arm
+for the life of the process -- a 90/10 site identically to a 50/50 one. Giving such sites up to two arms,
+chosen by the per-identity counts added to `WjProfSite`, measures **+18.7% direct-call sites** (local arms
+per 1k modules 461.2 -> 547.4, n=2/n=3, **non-overlapping ranges**), `fast_devirt2` 9.1M in-window hits,
+and poly's share of IC hits **29.0% -> 12.1%**. `ARM2_PCT` (default 15) refuses sites below the break-even
+-- 546 of them -- which is what keeps this from repeating the `vcall_ways` regression. Not yet timed.
+
 **Cost model for a guarded arm, counted off emitted code (R206).** Arm hit = `i32.load; i32.ne; br_if` then
 `call <funcidx>` = **~3 x86 + 1**. IC hit = 2 loads + cmp + jne + unpack + `call_indirect` = **~21 x86**.
 An extra arm pays its guard on ALL traffic reaching it and saves (ic - direct) on what it captures, so it
