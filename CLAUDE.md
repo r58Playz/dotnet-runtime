@@ -562,6 +562,14 @@ invalidated a session's worth of A/B ordering before it was noticed.
   4-6 reversed the result, and the real rule was that **the arm running SECOND was slower in 6 of 6
   rounds**. A single-order interleave cannot see that. Never quote non-overlapping ranges from one
   order.
+* **COUNT ABSOLUTE LOCAL ARMS, NOT arm-local% (R214).** Every mechanism in the direct-call path changes
+  the NUMBER of arms, so the fraction moves with its own denominator and reads as an effect. Matched
+  pair on `colocate_deps`: OFF looks better at 74.6% vs 58.3% arm-local, but ON produces **13,697 local
+  arms against 12,041** -- 13.7% MORE direct calls -- because it also produces 23,490 arms against
+  16,141. Same trap retired three separate conclusions in one session: a "1,046 net-negative arms"
+  claim, a "repartition cut duplication 50.4%->39.6%" claim, and "incremental co-location is
+  net-harmful". A larger tier is also usually MORE METHODS COMPILED, not bloat -- check the module
+  count before reading MB as waste.
 * **The floor is ~12%, not ~5%** (R149, measured from 359 fault-free runs / 29 repeated identical configs in
   `mc-results.jsonl`): median same-config fpsTail spread is **11.5% on a >=100 s window** and **22.9% on a
   60 s one**; only 3 of 29 groups came in at or under 10%. The old "~5%" was an assumption, and it was
