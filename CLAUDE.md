@@ -343,6 +343,20 @@ threshold structurally cannot**, which is also why R170b saw `no_rec` 31.2% -> 0
 **Where the hot IC volume is:** polymorphic dispatch **63.2%** (alt-receiver 32.5% + poly 30.7%),
 re-emission **32.2%**, everything else 4.6%.
 
+**RE-EMISSION AND THE SECOND ARM COMPOSE, AND NEITHER PAYS ALONE (R209).** `MONO_WASM_JIT_REEMIT_IC`
+(default 0) triggers re-emission from the IC MISS path -- the selector R179 named and never built, since
+its own trigger counted interp->JIT BOUNDARY crossings and was stats-gated. Within-run, comparing
+re-emitted bodies against the same run's census: **arm2 OFF, coverage 28.2% vs 39.0% run-wide (-10.8
+pts); arm2 ON, 62.9% vs 43.5% (+19.4 pts)**. Re-emission matures the profile so `no_rec` falls, but
+`margin == total` is IRREVERSIBLE, so the extra observation converts `no_rec` into `poly` -- a pure loss
+unless something consumes polymorphic sites. Arm 2 is that consumer (`poly_arm1` 2,051 -> 2,187,
+`arm2_emitted` 1,284 -> 1,378). This is why every earlier re-emission arm read flat even when it worked.
+**The wedge that blocked it was a torn read at the interp->JIT entry gate**, which checked `admit_live`
+on the DESCRIPTOR and then called a separately-read `wasm_jit_slot`; re-emission republishes both, so a
+thread could enter a slot it never instantiated and hit the prefilled placeholder -- `function signature
+mismatch` in `wasm_jit_ethunk_cb`. Snapshot the slot and verify it with `mono_wasm_jit_slot_live`. That
+is also the mechanism behind R174's five wedged arms.
+
 **A SECOND GUARDED ARM AT POLY SITES SHIPS BEHIND `MONO_WASM_JIT_DEVIRT_ARM2` (default 0), and it works
 (R206).** `margin == total` is irreversible, so a site that ever saw a second receiver is refused an arm
 for the life of the process -- a 90/10 site identically to a 50/50 one. Giving such sites up to two arms,
