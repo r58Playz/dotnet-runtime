@@ -1243,7 +1243,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 160);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 161);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1427,9 +1427,11 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),
 		WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG), WJC_(WJC_DEVIRT_ARM2_SELF),
 		mono_wasm_jit_devirt_arm2, mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
-	printf ("[wasm-jit arm-abi] candidates refused by shape: invalid=%lld byaddr=%lld shape=%lld"
+	printf ("[wasm-jit arm-abi] arm-candidate refusals: unjittable=%lld no_fslot=%lld sig=%lld"
+		" | abi invalid=%lld byaddr=%lld shape=%lld"
 		" -- `shape` is the only one that would mean overrides of one method lower differently"
 		" (generic sharing); the other two are signatures the shared call sequence cannot express.\n",
+		WJC_(WJC_ARM_UNJITTABLE), WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG),
 		WJC_(WJC_ARM_ABI_INVALID), WJC_(WJC_ARM_ABI_BYADDR), WJC_(WJC_ARM_ABI_SHAPE));
 	printf ("[wasm-jit devirt-arm2] poly sites given a FIRST arm=%lld -- these are counted in BOTH `poly`"
 		" and `emitted` above, so the census reconciles as sites == emitted + no_rec + cold + poly + sig"
@@ -12232,18 +12234,38 @@ vcall_nullchk_done:
 												}
 												pred2_vt = v2; pred2_target = t2; pred2_fslot = f2;
 												wj_count (WJC_DEVIRT_ARM2_EMITTED);
-											} else if ((int) p2 < mono_wasm_jit_devirt_arm2_pct) {
-												wj_count (WJC_DEVIRT_ARM2_THIN);
 											} else {
-												wj_count (WJC_DEVIRT_ARM2_SIG);
+												if (!v2 || !t2) wj_count (WJC_DEVIRT_ARM2_NO_ALT);
+												else if ((int) p2 < mono_wasm_jit_devirt_arm2_pct) wj_count (WJC_DEVIRT_ARM2_THIN);
+												else if (t2 == cfg->method) wj_count (WJC_DEVIRT_ARM2_SELF);
+												else if (mono_wasm_jit_callee_perm_unjittable (t2)) wj_count (WJC_ARM_UNJITTABLE);
+												else wj_count (WJC_DEVIRT_ARM2_NO_FSLOT);   /* by elimination -- see below */
 											}
 										} else {
 											wj_count (WJC_DEVIRT_ARM2_NO_ALT);
 										}
-									} else if ((int) p1 < mono_wasm_jit_devirt_arm2_pct) {
-										wj_count (WJC_DEVIRT_ARM2_THIN);
 									} else {
-										wj_count (WJC_DEVIRT_ARM2_SIG);
+										/* ATTRIBUTE the refusal by re-testing the same predicates -- but only the
+										 * PURE ones. Nothing on the success path changes.
+										 *
+										 * The final bucket is no_fslot BY ELIMINATION, not by test: the build that
+										 * added the ABI split measured invalid=0 byaddr=0 shape=0, so anything
+										 * reaching the ABI check passes it, and the only remaining way to fail the
+										 * macro is `get_callee_fslot <= 0`.
+										 *
+										 * Do NOT call get_callee_fslot here to test it directly. It routes through
+										 * mono_interp_get_imethod, which CREATES an InterpMethod if absent -- a
+										 * metadata operation under the jit-mm lock, on a worker, inside the compile
+										 * section, for callees that are being REFUSED and would otherwise not get
+										 * one at this moment. Two builds that did call it (once inside a helper,
+										 * once here) produced four consecutive failures: two `memory access out of
+										 * bounds`, one wedge, and one wedge with `function signature mismatch` x4.
+										 * The predicates kept below -- pointer compares and a flag read -- are pure. */
+										if (!v1 || !t1) wj_count (WJC_DEVIRT_ARM2_NO_ALT);
+										else if ((int) p1 < mono_wasm_jit_devirt_arm2_pct) wj_count (WJC_DEVIRT_ARM2_THIN);
+										else if (t1 == cfg->method) wj_count (WJC_DEVIRT_ARM2_SELF);
+										else if (mono_wasm_jit_callee_perm_unjittable (t1)) wj_count (WJC_ARM_UNJITTABLE);
+										else wj_count (WJC_DEVIRT_ARM2_NO_FSLOT);   /* by elimination -- see below */
 									}
 								} else {
 									wj_count (WJC_DEVIRT_ARM2_NO_ALT);
