@@ -9851,17 +9851,35 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
 #define WASM_JIT_TRY_INVOKE(fallback_label) \
 	{ \
 		wasm_jit_maybe_compile (cmethod); \
-		if (G_UNLIKELY (cmethod->wasm_jit_slot > 0)) { \
+		gint32 wj_eslot = cmethod->wasm_jit_slot; \
+		if (G_UNLIKELY (wj_eslot > 0)) { \
 			extern int mono_wasm_jit_admit_live (int desc_id); \
+			extern int mono_wasm_jit_slot_live (int slot); \
 			extern void mono_wasm_jit_invoke_caught (MonoMethod *, gint32, gpointer, gpointer); \
 			extern int mono_wasm_jit_entry_promote; \
 			if (G_UNLIKELY (!mono_wasm_jit_admit_live (cmethod->wasm_jit_desc))) \
+				goto fallback_label; \
+			/* R209: SNAPSHOT THE SLOT, THEN VERIFY THAT SLOT -- not just the descriptor. \
+			 * \
+			 * This gate used to read wasm_jit_slot twice and wasm_jit_desc once, three separate reads of \
+			 * fields RE-EMISSION rewrites concurrently. A thread could pass admit_live for the OLD \
+			 * descriptor it had admitted and then call a NEWLY published slot it never instantiated -- \
+			 * whose table entry is still mono_jiterp_placeholder_jit_call, (i32,i32,i32,i32)->void, \
+			 * called here as (i32,i32)->void. That is a `function signature mismatch` trap in \
+			 * wasm_jit_ethunk_cb, which is what wedged every REEMIT arm at volume (R208) and, \
+			 * unexplained, the five arms of R174. \
+			 * \
+			 * The interp_entry path at the e-thunk call already carries this exact check and calls it \
+			 * belt-and-braces because the liveness bitmap is never cleared. That reasoning holds only \
+			 * while a method's slot never CHANGES; re-emission is exactly the case where it does. \
+			 * Costs one load on the interp->JIT boundary (~2.4M/window), not on dispatch (~974M). */ \
+			if (G_UNLIKELY (!mono_wasm_jit_slot_live (wj_eslot))) \
 				goto fallback_label; \
 			{ \
 				MonoLMFExt wj_ext; \
 				frame->state.ip = ip; \
 				interp_push_lmf (&wj_ext, frame); \
-				mono_wasm_jit_invoke_caught (cmethod->method, (gint32) cmethod->wasm_jit_slot, locals + call_args_offset, locals + return_offset); \
+				mono_wasm_jit_invoke_caught (cmethod->method, wj_eslot, locals + call_args_offset, locals + return_offset); \
 				interp_pop_lmf (&wj_ext); \
 			} \
 			{ extern int mono_wasm_jit_reemit; \
