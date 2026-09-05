@@ -324,6 +324,26 @@ int mono_wasm_jit_in_reemit = 0;
  * DEFAULT 12000, not 4000: boot registers ~9,200 methods (R166), so 4,000 opened the gate MID-BOOT and
  * five arms wedged before the main screen. The R174 bisect pinned it -- an arm with the drain made
  * unreachable booted clean, so the cost is the recompiles rather than the trigger. */
+/* MONO_WASM_JIT_REEMIT_IC: re-emit a method after this many IC MISSES at sites inside its own
+ * compiled body. 0 = off.
+ *
+ * This is R179's named successor. R179 closed re-emission on POPULATION, not machinery: its trigger
+ * read `wasm_jit_invoke_in`, which counts interp->JIT BOUNDARY crossings, so it selected methods that
+ * cross the boundary rather than methods hot INSIDE JIT code -- `vicMiss` measured 1.00x, predicted in
+ * advance. That field is also incremented only under MONO_WASM_JIT_STATS, so the trigger was inert in
+ * every shipped configuration.
+ *
+ * The IC miss path is the right selector: it runs inside compiled code at execution frequency, carries
+ * 78.8%% of all profile observations (R148), and has the CALLER in hand. A method accumulating misses
+ * there is precisely one whose sites the profile can now predict but could not at emit time -- the
+ * `no_rec` bucket, 32.2%% of hot inline-IC volume (R205), which NO amount of pre-JIT warmup reaches
+ * because 99.3%% of observations arrive after the method was JITted (so the JIT THRESHOLD provably
+ * cannot fix it, R204).
+ *
+ * Count enqueues against completions before believing anything: R179's shape was 17,343 enqueues for 3
+ * re-emits, and an earlier version managed 35,617,130 enqueues for 4. A single counter reads as success
+ * in both. */
+int mono_wasm_jit_reemit_ic = 0;
 int mono_wasm_jit_reemit_after = 12000;
 /* MONO_WASM_JIT_REEMIT_AGE: how many methods the tier must have registered SINCE this one before it is
  * worth recompiling. Descriptor ids are handed out in registration order, so this is a self-scaling proxy
@@ -538,6 +558,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_shadow_modbytes; const char *sb = g_getenv ("MONO_WASM_JIT_SHADOW_MODBYTES"); int v = (sb && *sb) ? atoi (sb) : 0; mono_wasm_jit_shadow_modbytes = (v >= 0 && v <= 1048576) ? v : 0; }
 	{ extern int mono_wasm_jit_shadow_nonleaf; const char *sn = g_getenv ("MONO_WASM_JIT_SHADOW_NONLEAF"); mono_wasm_jit_shadow_nonleaf = (sn && *sn) ? (*sn != '0') : 0; }
 	{ extern int mono_wasm_jit_reemit; const char *rm = g_getenv ("MONO_WASM_JIT_REEMIT"); int v = (rm && *rm) ? atoi (rm) : 0; mono_wasm_jit_reemit = (v >= 0) ? v : 0; }
+	{ extern int mono_wasm_jit_reemit_ic; const char *ri = g_getenv ("MONO_WASM_JIT_REEMIT_IC"); int v = (ri && *ri) ? atoi (ri) : 0; mono_wasm_jit_reemit_ic = (v >= 0) ? v : 0; }
 	{ extern int mono_wasm_jit_reemit_after; const char *ra = g_getenv ("MONO_WASM_JIT_REEMIT_AFTER"); int v = (ra && *ra) ? atoi (ra) : 12000; mono_wasm_jit_reemit_after = (v >= 0) ? v : 12000; }
 	{ extern int mono_wasm_jit_reemit_age; const char *rg = g_getenv ("MONO_WASM_JIT_REEMIT_AGE"); int v = (rg && *rg) ? atoi (rg) : 2000; mono_wasm_jit_reemit_age = (v >= 0) ? v : 2000; }
 	{ extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
@@ -1243,7 +1264,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 161);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 162);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1427,6 +1448,10 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),
 		WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG), WJC_(WJC_DEVIRT_ARM2_SELF),
 		mono_wasm_jit_devirt_arm2, mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
+	printf ("[wasm-jit reemit-ic] enqueued from the IC MISS path=%lld (MONO_WASM_JIT_REEMIT_IC=%d)\n"
+		"  READ THIS AGAINST reemit done/refused BELOW, never alone: R179 was 17,343 enqueues for 3\n"
+		"  re-emits and an earlier version 35,617,130 for 4, and a single counter reads as success in both.\n",
+		WJC_(WJC_REEMIT_IC_TRIG), mono_wasm_jit_reemit_ic);
 	printf ("[wasm-jit arm-abi] arm-candidate refusals: unjittable=%lld no_fslot=%lld sig=%lld"
 		" | abi invalid=%lld byaddr=%lld shape=%lld"
 		" -- `shape` is the only one that would mean overrides of one method lower differently"
