@@ -2824,6 +2824,12 @@ static void
 wasm_jit_drain_reemits (void)
 {
 	extern int mono_wasm_jit_reemit, mono_wasm_jit_promotion_drain;
+	/* R212: advance the global repartition here too. Same reasoning as the drains it sits beside -- this
+	 * runs on an ordinary interp dispatch of a jittable callee (~53k/s), never on the JIT dispatch path,
+	 * and it does a bounded amount of work per call so the re-framing cost is spread rather than taken
+	 * as one stall. Self-gated: it returns immediately unless REPARTITION is set and the registry has
+	 * grown past it. */
+	{ extern void mono_wasm_jit_repartition_tick (void); mono_wasm_jit_repartition_tick (); }
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 	extern int mono_wasm_jit_desc_is_batched (int desc_id);
 	int n;
