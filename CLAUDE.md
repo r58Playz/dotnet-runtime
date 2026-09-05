@@ -616,19 +616,31 @@ invalidated a session's worth of A/B ordering before it was noticed.
   `MONO_WASM_JIT_VERIFY_DEPS`, default 0, so it returns 0 either way. More generally: "every error counter
   is zero" is a statement about the counters you have, not about the run. Two of R166's four bugs were a
   bare `continue` and a `return 0`, which no counter anywhere was watching.
-* **BACKGROUND COMMANDS ARE KILLED WHEN THE TURN ENDS — measurements must be DETACHED (R206).**
-  Verified against the harness binary (`/opt/claude-code/bin/claude`, a compiled Bun executable; its
-  embedded JS strings are greppable): `killShellTasksForAgent: killing orphaned shell task <id>
-  (agent <id> exiting)`, and the design note *"the command is stopped when your turn ends, so its
-  result reaches you only while you are still working"*. It is bound to AGENT/TURN LIFETIME, not to a
-  duration or memory limit — a 45-minute build+deploy+A/B chain survived because the turn never
-  yielded, while every idle watcher died at a turn boundary. Ruled out as knobs:
-  `CLAUDE_CODE_IDLE_THRESHOLD_MINUTES` (idle NOTIFICATIONS), `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS`
-  (auto-backgrounding a long FOREGROUND bash), `CLAUDE_SUBAGENT_BG_SHELL_MAX_MS` (subagent-scoped).
-  **The pattern that works:** `setsid nohup <work> ... & disown` writing a sentinel file, plus a
-  background watcher started inside a live turn and re-armed at the top of the next one. Three
-  `deploy.sh` runs were killed mid-`publishing loader` before this was understood, each leaving
-  `frontend/public/_framework` MISSING and the app unloadable — so DETACH the deploy in particular.
+* **BACKGROUND TASKS ARE KILLED WHEN THEIR OWNING AGENT EXITS UNLESS IT IS ASYNC — run measurements in
+  their own cgroup (R207).** Read from the harness source (`~/Documents/puter/nodejs/claude-code/dist/agent/`
+  and `extract-agent/agent.extracted/`, v2.1.250 vs installed 2.1.259 — same shape in both), not guessed.
+  `runAgent`'s cleanup ends with `{name:"shellTasks", keepaliveGated:true, run:()=>killShellTasksForAgent(agentId)}`,
+  which kills every running `local_bash` with that `agentId` (log line: *"killing orphaned shell task <id>
+  (agent <id> exiting)"*), and stages are skipped only when
+
+      keepalive = isAsync && completedNormally && !aborted && (otherTasks || hasBackgroundedShell)
+
+  **`isAsync` is a required conjunct**: having a backgrounded shell is NOT enough. If the owning agent is
+  not async, the gated stages run and the task dies. The kill is `task.shellCommand.kill()` on the handle,
+  which is why **`setsid` + `disown` does NOT protect the work** (still a descendant of the spawned pid at
+  kill time) while a transient scope does — the spawned process is just the `systemd-run` client, and the
+  real work lives in a cgroup the handle has no reference to.
+  **THE FIX:** `systemd-run --user --scope --quiet --unit=<name> -- bash -c '<work>; echo $? > <sentinel>'`
+  then poll the sentinel. Verified: a run launched this way survived many turn boundaries that had killed
+  every previous attempt.
+  **Symptom:** the run's browser AND its node driver vanish together, the sentinel is never written, and
+  there is NO stall message — nothing failed, it was killed. Do NOT diagnose it as an app or JIT fault.
+  **Three wrong explanations were asserted here before the source was read**, and all are retracted: a
+  duration limit (a 45-min chain had already survived); memory pressure / kernel OOM (the `dmesg` was
+  `warn_alloc` for an unrelated `upowerd` order-4 allocation — a WARNING, no `Killed process` line); and
+  "~30 minutes of user inactivity" (a SELECTION EFFECT — during idle stretches the tasks launched happened
+  to be short watchers, and killed tasks in fact have a median lifetime of 1.5 min, some under 30 s, which
+  no idle threshold can explain). When a harness behaviour is in question, READ THE HARNESS.
 * **A leftover compiler daemon will silently tax one arm.** The runtime build's `VBCSCompiler` starts under
   the REPO-LOCAL `./.dotnet/dotnet` with its own pipe name, so a `dotnet build-server shutdown` issued by the
   system SDK does not reach it; one was caught at 101% CPU for 11:50. `preflight` refuses to measure while one
