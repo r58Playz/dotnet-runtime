@@ -1408,6 +1408,21 @@ typedef struct {
 	MonoMethodHeader *header;
 	MonoMemPool     *mempool;
 	MonoWasmJitResult wasm_jit_result; /* runtime wasm-JIT emit result (cfg-scoped, replaces relay TLs) */
+	/* This method's InterpMethod, resolved ONCE at the top of mini_method_compile when compile_wasm is
+	 * set, so nothing downstream has to call mono_interp_get_imethod per call site. It is the key every
+	 * call-profile lookup takes (mono_wasm_jit_prof_predict and friends), and the emitter was taking it
+	 * five separate times per site.
+	 *
+	 * Resolving it ONCE also keeps it away from the hazard the emitter documents at its arm-2 refusal
+	 * split: mono_interp_get_imethod CREATES an InterpMethod if absent, which is a metadata operation
+	 * under the jit-mm lock, on a worker, inside the compile section -- two builds that called it per
+	 * site produced four consecutive failures (two `memory access out of bounds`, one wedge, one wedge
+	 * with `function signature mismatch` x4). For cfg->method specifically the object must already
+	 * exist, since its InterpMethod is what triggered this compile; the danger is CALLEES, which this
+	 * field never resolves.
+	 *
+	 * gpointer, not InterpMethod *: mini.h is included by files that do not see interp-internals.h. */
+	gpointer         wasm_jit_caller_imethod;
 	MonoInst       **varinfo;
 	MonoMethodVar   *vars;
 	MonoInst        *ret;

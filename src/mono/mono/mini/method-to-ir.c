@@ -83,6 +83,23 @@
 #include "mini-runtime.h"
 #include "llvmonly-runtime.h"
 #include "mono/utils/mono-tls-inline.h"
+#ifdef HOST_BROWSER
+#include "mini-wasm.h"
+/* Guarded devirtualized inlining. Declared here rather than in a header because this is the only
+ * consumer outside the wasm emitter, and mono_wasm_jit_prof_predict deliberately takes the caller's
+ * InterpMethod as an opaque gpointer so mini/ files need not see interp-internals.h. */
+extern int mono_wasm_jit_guarded_inline;
+extern int mono_wasm_jit_guarded_inline_size;
+extern int mono_wasm_jit_stats;
+extern void mono_wasm_jit_count (int idx);
+extern gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
+	MonoMethod **out_target, guint32 *out_samples, int *out_why);
+/* Stats-gated, so a timing run pays two loads and a predictable branch per virtual site and nothing
+ * else. Every bump sits where the ACTION happens, never where it is decided -- R215 spent a round on
+ * DelegateDevirtArm reading 750 with FastDelegateDevirt at 0 because the two lived in different
+ * branches. GI_ADMITTED == GI_EMITTED + GI_REFUSED_LATE is the identity to assert. */
+#define wj_gi_count(C) do { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (C); } while (0)
+#endif
 
 MONO_DISABLE_WARNING(4127) /* conditional expression is constant */
 
@@ -7322,6 +7339,14 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 		gboolean push_res = TRUE;
 		gboolean skip_ret = FALSE;
 		gboolean tailcall_remove_ret = FALSE;
+#ifdef HOST_BROWSER
+		/* Guarded devirtualized inlining (MONO_WASM_JIT_GUARDED_INLINE): the diamond opened at the
+		 * inline gate and closed at call_end. Per-opcode, like every other flag here, so a nested
+		 * site cannot inherit a stale one. */
+		gboolean gi_active = FALSE, gi_late_refused = FALSE;
+		MonoBasicBlock *gi_fallback_bb = NULL, *gi_end_bb = NULL;
+		MonoInst *gi_ret_var = NULL;
+#endif
 
 		// FIXME split 500 lines load/store field into separate file/function.
 
@@ -8194,6 +8219,182 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				CHECK_TYPELOAD (cmethod->klass);
 			}
 
+#ifdef HOST_BROWSER
+			/*
+			 * GUARDED DEVIRTUALIZED INLINING (MONO_WASM_JIT_GUARDED_INLINE).
+			 *
+			 * WHY THIS EXISTS. There is no inliner in this pipeline for virtual calls at all, and both
+			 * gates are structural:
+			 *
+			 *  - V8 can never inline anything the wasm JIT emits. InliningTree candidates come from a
+			 *    module's own call sites and an imported function has wire_byte_size_ == 0, so score()
+			 *    is 0 (v8 src/wasm/inlining-tree.h:79-85). One method per module => every call is an
+			 *    import or an indirect => permanently not inlinable.
+			 *  - mono's own inliner refuses every callvirt: the gate just below admits a site only if it
+			 *    is non-virtual, the target is non-virtual, or the target is FINAL -- and IKVM emits
+			 *    callvirt for every non-final Java method.
+			 *
+			 * So the only inlining that happens today is the non-virtual remainder, and R118 measured
+			 * exactly what that reaches: bodies +4.4%, calls per method +1.0%. It absorbs callees'
+			 * bodies INCLUDING their call sites and removes nothing.
+			 *
+			 * What the missing pass is worth, measured on two other runtimes rather than argued:
+			 * HotSpot -XX:-Inline is 1.205x stock, and MaxInlineSize=20 (mono's limit) is 1.132x, so
+			 * 13.2 of those 20.5 points need a limit above 20. TeaVM ablated: devirt off +19.3%,
+			 * inlining off +13.0%, and with BOTH off its emitted call_indirect count goes 35 -> 791 --
+			 * the two passes are mutually redundant, so neither may be measured alone and called "the
+			 * value of devirtualization".
+			 *
+			 * WE ALREADY HAVE THE PREDICTION HALF. Devirt prediction ships, and the predicted arm carries
+			 * 39.2% of all executed dispatch with 25.0% of dispatch already a real `call rel32` (R203).
+			 * What was missing is that a predicted arm emits a CALL rather than an inlined body.
+			 *
+			 * SOUNDNESS is the guard, and it is the same guard the emitter's arm already relies on: if
+			 * the receiver's vtable is not the predicted one, control falls to an ordinary callvirt.
+			 * Nothing depends on the prediction being right, so this needs no CHA, no class-hierarchy
+			 * invalidation and no deoptimisation -- which is the whole reason it is buildable here at
+			 * all (wasm has no OSR-out and no way to enumerate a frame's locals from outside the module,
+			 * so an UNGUARDED devirtualization could never be invalidated for an in-flight activation).
+			 *
+			 * Baking the vtable pointer as a constant is cache-safe: a MonoVTable is process-wide, and
+			 * the emitter's own predicted arm already bakes it. Modules are compiled once and broadcast,
+			 * so what must never be baked is PER-THREAD state, which this is not.
+			 *
+			 * A SEPARATE size limit, not INLINE_LENGTH_LIMIT. R118 closed raising the GLOBAL limit on
+			 * mechanism (+3.5-4.4% bodies, calls/method UP 1.0%, saturating by 60), and this reaches a
+			 * population that limit could not: virtual sites, which the gate below refuses outright.
+			 *
+			 * KNOWN LIMIT ON DELIVERY, stated so it is not rediscovered as a surprise: 99.3% of call
+			 * profile observations arrive AFTER the method is JITted, so a site's first compile usually
+			 * reads `no_rec` and this arm never fires there. `no_rec` is 13,389 sites, 30.5% of all
+			 * sites and 32.2% of hot IC execution. Re-emission was its only collector and is deleted;
+			 * guarded CHA as a PREDICTION SOURCE is the candidate to replace it, and is sound for
+			 * exactly the reason above -- the guard stays, so CHA being wrong costs a fallthrough.
+			 */
+			/*
+			 * THE CENSUS RUNS WITH THE KNOB OFF, the emission does not. Everything down to the
+			 * signature check is a PURE read -- a profile lookup and two pointer compares -- so
+			 * MONO_WASM_JIT_STATS=1 alone sizes the addressable population and its refusal split
+			 * without emitting a byte or touching metadata. That is the difference between "measure the
+			 * mechanism, then decide" and spending a 9-minute build plus a 12-minute deploy to find out
+			 * that `no_rec` refuses 90% of the sites.
+			 *
+			 * mono_method_check_inlining and the header fetch are deliberately BELOW the knob: both
+			 * resolve metadata, and this repo's standing rule is that a metadata operation is never
+			 * safe to ADD to a worker-side compile section however innocuous it looks. The inliner two
+			 * blocks down already calls check_inlining on this compile path, so running it under the
+			 * knob is no new exposure; running it for sites we have decided not to inline would be.
+			 */
+			if (cfg->compile_wasm && !gi_active &&
+			    (mono_wasm_jit_guarded_inline || G_UNLIKELY (mono_wasm_jit_stats)) &&
+			    (cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual &&
+			    virtual_ && cmethod && (cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) &&
+			    !MONO_METHOD_IS_FINAL (cmethod) && fsig->hasthis && !cfg->gshared &&
+			    cfg->wasm_jit_caller_imethod && !delegate_invoke) {
+				MonoVTable *gi_vt = NULL;
+				MonoMethod *gi_target = NULL;
+				guint32 gi_samples = 0;
+				int gi_why = 0;
+
+				wj_gi_count (WJC_GI_SITE);
+				if (!mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod, cmethod,
+				                                 &gi_vt, &gi_target, &gi_samples, &gi_why)) {
+					wj_gi_count (WJC_GI_REFUSED_PROF);
+				} else if (gi_target == cfg->method) {
+					/* Self-recursion: inline_method would recurse into the method being compiled. */
+					wj_gi_count (WJC_GI_REFUSED_SELF);
+				} else if (!mono_metadata_signature_equal (mono_method_signature_internal (gi_target), fsig)) {
+					/* The inlined body is substituted into THIS call's argument list, so the override's
+					 * signature has to be the site's -- full equality, not an arity check: a covariant
+					 * return or a differently-lowered parameter would silently mistype the merge var. */
+					wj_gi_count (WJC_GI_REFUSED_SIG);
+				} else if (!mono_wasm_jit_guarded_inline) {
+					/* Census only: the population is sized, and nothing below this point runs. */
+					wj_gi_count (WJC_GI_CANDIDATE);
+				} else if (!mono_method_check_inlining (cfg, gi_target)) {
+					/* THE COUNTER TO READ FIRST. mono_method_check_inlining rejects ANY method with a
+					 * try/catch clause and Java is EH-dense, so this may be the whole story -- read it
+					 * before sweeping the size limit or blaming the profile. */
+					wj_gi_count (WJC_GI_REFUSED_CLAUSES);
+				} else {
+					MonoInst *gi_this = sp [0];
+					MonoInst *gi_hot;
+					MonoInst **gi_sp = (MonoInst **) g_alloca (sizeof (MonoInst *) * (gsize) (n > 0 ? n : 1));
+					MonoMethodHeader *gi_hdr;
+					int gi_vtreg, gi_costs;
+					gboolean gi_empty = FALSE;
+
+					/* SIZE GATE, and it is separate from INLINE_LENGTH_LIMIT on purpose -- see the knob.
+					 * mono_method_check_inlining above already loaded and cached this header, so the
+					 * fetch is free here; taking `error` and cleaning it keeps a failed load from
+					 * leaking a set error into the rest of the opcode. */
+					error_init_reuse (error);
+					gi_hdr = mono_method_get_header_internal (gi_target, error);
+					if (!gi_hdr || (int) gi_hdr->code_size > mono_wasm_jit_guarded_inline_size) {
+						if (!is_ok (error))
+							mono_error_cleanup (error);
+						error_init_reuse (error);
+						wj_gi_count (WJC_GI_REFUSED_SIZE);
+						goto gi_done;
+					}
+
+					wj_gi_count (WJC_GI_ADMITTED);
+
+					NEW_BBLOCK (cfg, gi_fallback_bb);
+					NEW_BBLOCK (cfg, gi_end_bb);
+					/* Merge the two arms through a LOCAL, not a raw vreg move: the return may be a
+					 * vtype, a long or a float, and a temp store/load handles every one of those the
+					 * same way the rest of this file's diamonds do. */
+					if (!MONO_TYPE_IS_VOID (fsig->ret))
+						gi_ret_var = mono_compile_create_var (cfg, fsig->ret, OP_LOCAL);
+
+					/* `this` is dereferenced here whether or not the guard matches, which is exactly
+					 * what the ordinary callvirt does one step later -- so this introduces no new null
+					 * deref. MONO_EMIT_NEW_LOAD_MEMBASE_FAULT marks it as the faulting access. */
+					gi_vtreg = alloc_preg (cfg);
+					MONO_EMIT_NEW_LOAD_MEMBASE_FAULT (cfg, gi_vtreg, gi_this->dreg,
+					                                  MONO_STRUCT_OFFSET (MonoObject, vtable));
+					/* COMPARE_IMM against the baked vtable, the same form the non-AOT array-store check
+					 * uses -- one fewer register than materialising a PCONST, and this is a runtime JIT
+					 * so compile_aot is never set on this path. */
+					MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi_vt);
+					MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi_fallback_bb);
+
+					/* HOT ARM. inline_method consumes its `sp` and writes the result back through it,
+					 * so it gets a COPY -- the fallback below needs the original argument list intact. */
+					memcpy (gi_sp, sp, sizeof (MonoInst *) * (gsize) n);
+					gi_costs = inline_method (cfg, gi_target, fsig, gi_sp, ip, cfg->real_offset,
+					                          FALSE, &gi_empty);
+					if (!gi_costs) {
+						/* Refused after the guard was emitted. There is no undo, so make the hot arm an
+						 * unconditional branch to the fallback: correct, and mono_optimize_branches
+						 * folds the empty block away. Counted, because "admitted" and "emitted" being
+						 * different populations is exactly the accounting failure R215 cost a round to. */
+						wj_gi_count (WJC_GI_REFUSED_LATE);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_fallback_bb);
+						gi_ret_var = NULL;
+						gi_active = TRUE;
+						gi_late_refused = TRUE;
+					} else {
+						cfg->real_offset += 5;
+						inline_costs += gi_costs;
+						if (gi_ret_var) {
+							MonoInst *gi_store;
+							gi_hot = *gi_sp;
+							EMIT_NEW_TEMPSTORE (cfg, gi_store, gi_ret_var->inst_c0, gi_hot);
+						}
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_end_bb);
+						gi_active = TRUE;
+						wj_gi_count (WJC_GI_EMITTED);
+					}
+					/* Everything the ordinary call emission does below now lands in the fallback. */
+					MONO_START_BB (cfg, gi_fallback_bb);
+gi_done:
+					;
+				}
+			}
+#endif /* HOST_BROWSER */
+
 			/* Inlining */
 			if ((cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual &&
 				(!virtual_ || !(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) || MONO_METHOD_IS_FINAL (cmethod)) &&
@@ -8712,6 +8913,29 @@ call_end:
 			if (common_call) // FIXME goto call_end && !common_call often skips tailcall processing.
 				ins = mini_emit_method_call_full (cfg, cmethod, fsig, tailcall, sp, virtual_ ? sp [0] : NULL,
 												  imt_arg, vtable_arg);
+
+#ifdef HOST_BROWSER
+			/* CLOSE THE GUARDED-INLINE DIAMOND. Everything since MONO_START_BB (gi_fallback_bb) above
+			 * emitted the fallback arm -- the ordinary callvirt -- so join it with the inlined hot arm
+			 * here and hand the merged value on as `ins`, which is what push_res consumes. */
+			if (gi_active) {
+				if (gi_ret_var && ins) {
+					MonoInst *gi_store;
+					EMIT_NEW_TEMPSTORE (cfg, gi_store, gi_ret_var->inst_c0, ins);
+				}
+				MONO_START_BB (cfg, gi_end_bb);
+				if (gi_ret_var)
+					EMIT_NEW_TEMPLOAD (cfg, ins, gi_ret_var->inst_c0);
+				/* A late refusal left the hot arm as a bare branch into this same fallback, so there is
+				 * nothing to merge and `ins` is already the only value. */
+				(void) gi_late_refused;
+				gi_active = FALSE;
+				gi_late_refused = FALSE;
+				gi_ret_var = NULL;
+				gi_fallback_bb = NULL;
+				gi_end_bb = NULL;
+			}
+#endif
 
 			/*
 			 * Handle devirt of some A.B.C calls by replacing the result of A.B with a OP_TYPED_OBJREF instruction, so the .C

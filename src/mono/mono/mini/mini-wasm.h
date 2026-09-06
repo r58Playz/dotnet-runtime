@@ -491,6 +491,29 @@ enum {
 	 * call_interp exits out of call_delegate. NORECIPE is the `invoke` fallthrough (no usable recipe at
 	 * all); the other two are the `target` fallthrough with a recipe in hand. */
 	WJC_DELEGATE_SLOW_NORECIPE, WJC_DELEGATE_SLOW_NOESLOT, WJC_DELEGATE_SLOW_NONSCALAR,
+	/* GUARDED DEVIRTUALIZED INLINING (method-to-ir.c, MONO_WASM_JIT_GUARDED_INLINE). There is no
+	 * inliner in this pipeline for virtual calls at all -- V8 cannot inline across modules and mono's
+	 * own gate refuses every callvirt -- so this is the population that pass would reach.
+	 *
+	 * SITE      a virtual site offered to the gate (the denominator; everything below is out of this)
+	 * CANDIDATE passed every PURE check with the knob OFF -- i.e. the size of the population before any
+	 *           metadata is touched. This is the number to read first, from a plain STATS run, because
+	 *           it costs no build: SITE minus PROF/SELF/SIG is what the pass could ever reach.
+	 * ADMITTED  passed every check, so the guard and the hot arm were emitted
+	 * EMITTED   inline_method actually produced a body
+	 * REFUSED_LATE  inline_method refused AFTER the guard was emitted, so the hot arm is a bare branch
+	 *
+	 * ASSERT: ADMITTED == EMITTED + REFUSED_LATE. Anything else means "decided" and "happened" are
+	 * different populations, which is the accounting failure R215 cost a round to.
+	 *
+	 * READ REFUSED_CLAUSES FIRST. mono_method_check_inlining rejects ANY method carrying a try/catch,
+	 * and Java is EH-dense, so that bucket may be the whole story -- checking it costs nothing and
+	 * comes before sweeping the size limit or blaming the profile. REFUSED_PROF is the `no_rec`
+	 * population arriving here: 99.3% of profile observations land after the method is JITted, so a
+	 * first compile usually has no record for a site at all. */
+	WJC_GI_SITE, WJC_GI_CANDIDATE, WJC_GI_ADMITTED, WJC_GI_EMITTED,
+	WJC_GI_REFUSED_PROF, WJC_GI_REFUSED_CLAUSES, WJC_GI_REFUSED_SIZE,
+	WJC_GI_REFUSED_SIG, WJC_GI_REFUSED_SELF, WJC_GI_REFUSED_LATE,
 	WJC_MAX
 };
 

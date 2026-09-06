@@ -3466,6 +3466,13 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 			/* Forced (auto-JIT / virtual-miss) vs name-targeted bring-up: the in-emitter raw-indirect bail
 			 * (mini-wasm.c) only fires on the forced path. Per-compile, so a nested compile starts clean. */
 			cfg->wasm_jit_forced = (flags & JIT_FLAG_WASM_FORCE) ? 1 : 0;
+			/* The call profile's key, resolved once here rather than per call site downstream. Safe for
+			 * cfg->method (its InterpMethod is what triggered this compile, so it already exists) in a way
+			 * it is NOT for callees -- see the field's comment in mini.h. */
+			{
+				extern gpointer mono_interp_get_imethod (MonoMethod *method);
+				cfg->wasm_jit_caller_imethod = mono_interp_get_imethod (cfg->method);
+			}
 			cfg->compile_llvm = FALSE;
 			try_llvm = FALSE;
 			/* CRITICAL: force EXPLICIT null checks. explicit_null_checks was decided above (from

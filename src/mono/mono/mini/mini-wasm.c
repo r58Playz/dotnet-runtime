@@ -173,6 +173,30 @@ int mono_wasm_jit_devirt_force_max = 2;
  * mono_get_frame_info reads il_state->il_offset for stack-trace LINE NUMBERS -- that is what rules out
  * the cheaper clause-canonical variant, and it does not apply here. DEFAULT 0 until A/B'd. */
 int mono_wasm_jit_ilofs_global = 0;
+/* MONO_WASM_JIT_GUARDED_INLINE: at a virtual call site the profile can predict, emit an INLINED body
+ * behind the same vtable guard the emitter's predicted arm already uses, instead of a call. See the
+ * long argument at the site in method-to-ir.c.
+ *
+ * DEFAULT 0, and it must stay 0 until R118's second bug is closed. That bug is still open:
+ * MONO_INLINELIMIT=60 produced 4 intermittent `memory access out of bounds` traps with a captured
+ * stack in a JITted __<>MHC1 stub during worldgen, at roughly 1 run in 2. Growing inlined bodies is
+ * precisely what provoked it, and this grows them in a population that limit never reached. Fix it
+ * before shipping, not after -- and note one clean run proves nothing at that incidence, so the gate
+ * is >=4 full boot->world->in-game runs at each size limit.
+ *
+ * Knob-off output must be BYTE-IDENTICAL, not merely close: tiershape.py at 0.00%, not its 0.15% noise
+ * floor. This is a gate-only change when off, so anything else means the disjunct is firing when it
+ * should not. */
+int mono_wasm_jit_guarded_inline = 0;
+/* MONO_WASM_JIT_GUARDED_INLINE_SIZE: IL byte cap for a guarded inline candidate, SEPARATE from
+ * INLINE_LENGTH_LIMIT (20) on purpose. R118 closed raising the GLOBAL limit on mechanism -- bodies
+ * +3.5-4.4%, saturating by 60, and calls per method going UP 1.0%, because the caller absorbs the
+ * callee's own call sites while the callee stays separately JITted -- but that measured the
+ * NON-VIRTUAL remainder, which is the only population mono's inliner can reach. This cap governs
+ * virtual sites, which that gate refuses outright, so R118's result does not bound it. Sweep 60 then
+ * 100; V8's own wasm inlining cap is 500 WIRE bytes, which is a different unit and a different
+ * pipeline stage. */
+int mono_wasm_jit_guarded_inline_size = 60;
 /* MONO_WASM_JIT_ISLAND_NDATA's knob is deleted; the ABI parameter it gated is KEPT and now always
  * applies. It zeroes only the args+locals an EH method can actually address when pushing its il_state
  * island, instead of the full WJ_ISLAND_DATA (256) slots -- ~1040 bytes of memset per EH-method entry.
@@ -538,6 +562,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
 	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
+	{ extern int mono_wasm_jit_guarded_inline; const char *gi = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE"); mono_wasm_jit_guarded_inline = (gi && *gi && *gi != '0') ? 1 : 0; }
+	{ extern int mono_wasm_jit_guarded_inline_size; const char *gs = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE_SIZE"); int v = (gs && *gs) ? atoi (gs) : 60; mono_wasm_jit_guarded_inline_size = (v >= 0 && v <= 4096) ? v : 60; }
 	{ extern int mono_wasm_jit_ilofs_global; const char *ig = g_getenv ("MONO_WASM_JIT_ILOFS_GLOBAL"); mono_wasm_jit_ilofs_global = (ig && *ig && *ig != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_delegate_devirt; const char *dd = g_getenv ("MONO_WASM_JIT_DELEGATE_DEVIRT"); int v = (dd && *dd) ? atoi (dd) : 0; mono_wasm_jit_delegate_devirt = (v >= 0 && v <= 100) ? v : 0; }
 	{ extern int mono_wasm_jit_pred_pct; const char *pp = g_getenv ("MONO_WASM_JIT_PRED_PCT"); int v = (pp && *pp) ? atoi (pp) : 0; mono_wasm_jit_pred_pct = (v >= 0 && v <= 100) ? v : 0; }
@@ -1223,7 +1249,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 144);   /* -COLOCATE_HOP_ADD, -DOBJ_{PUBLISHED,NO_INFO}: COLOCATE_HOPS and DELEGATE_OBJ_PIC deleted */
+g_static_assert (WJC_MAX == 154);   /* -COLOCATE_HOP_ADD, -DOBJ_{PUBLISHED,NO_INFO}: COLOCATE_HOPS and DELEGATE_OBJ_PIC deleted */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1436,6 +1462,21 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_PARKED));
 	/* LCSE reach. hits/loads_seen is the elimination RATE; evict>0 says the load table is the binding
 	 * constraint (raise WJ_LCSE_LOADS) rather than the kill policy. Requires MONO_WASM_JIT_LCSE=1. */
+	printf ("[wasm-jit guarded-inline] sites=%lld candidates=%lld admitted=%lld emitted=%lld"
+		"  | refused: prof=%lld clauses=%lld size=%lld sig=%lld self=%lld late=%lld"
+		"  (MONO_WASM_JIT_GUARDED_INLINE=%d SIZE=%d)\n"
+		"  ASSERT admitted == emitted + late. `candidates` is measured with the knob OFF, so a plain\n"
+		"  STATS run sizes the whole addressable population for free -- read it before spending a build.\n"
+		"  There is NO inliner in this pipeline for virtual calls:\n"
+		"  V8 cannot inline across modules (imports score 0) and mono's own gate refuses every callvirt,\n"
+		"  so `sites` is the whole population that pass would reach. READ `clauses` FIRST --\n"
+		"  mono_method_check_inlining rejects ANY method with a try/catch and Java is EH-dense, so it may\n"
+		"  be the entire story. `prof` is no_rec arriving here: 99.3%% of profile observations land AFTER\n"
+		"  the method is JITted, so a first compile usually has no record for the site at all.\n",
+		WJC_(WJC_GI_SITE), WJC_(WJC_GI_CANDIDATE), WJC_(WJC_GI_ADMITTED), WJC_(WJC_GI_EMITTED),
+		WJC_(WJC_GI_REFUSED_PROF), WJC_(WJC_GI_REFUSED_CLAUSES), WJC_(WJC_GI_REFUSED_SIZE),
+		WJC_(WJC_GI_REFUSED_SIG), WJC_(WJC_GI_REFUSED_SELF), WJC_(WJC_GI_REFUSED_LATE),
+		mono_wasm_jit_guarded_inline, mono_wasm_jit_guarded_inline_size);
 	printf ("[wasm-jit lcse] loads_seen=%lld adds=%lld hits=%lld evict=%lld\n",
 		WJC_(WJC_LCSE_LOADS_SEEN), WJC_(WJC_LCSE_ADDS), WJC_(WJC_LCSE_HITS), WJC_(WJC_LCSE_EVICT));
 	fflush (stdout);
@@ -11641,7 +11682,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
 							MonoMethod *dt = NULL;
 							guint32 dpct = 0;
-							gboolean dgot = mono_wasm_jit_prof_predict_delegate (mono_interp_get_imethod (cfg->method),
+							gboolean dgot = mono_wasm_jit_prof_predict_delegate (cfg->wasm_jit_caller_imethod,
 								call->method, &dt, &dpct);
 							if (!dgot)
 								wj_count (WJC_DELEGATE_DEVIRT_NOREC);   /* no usable record -- NOT "thin" */
@@ -11692,7 +11733,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						     (terminal_vcall_handoff && terminal_vcall_ins == ins))) {
 							int pred_why = 0;
 							guint32 pred_samples = 0;
-							if (mono_wasm_jit_prof_predict (mono_interp_get_imethod (cfg->method),
+							if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod,
 							    call->method, &pred_vt, &pred_target, &pred_samples, &pred_why)) {
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
@@ -11926,7 +11967,7 @@ vcall_nullchk_done:
 #ifdef HOST_BROWSER
 							if (mono_wasm_jit_ic_autosize && ic_ways > 1) {
 								extern guint32 mono_wasm_jit_prof_arity (gpointer caller, MonoMethod *base);
-								guint32 ar = mono_wasm_jit_prof_arity (mono_interp_get_imethod (cfg->method), call->method);
+								guint32 ar = mono_wasm_jit_prof_arity (cfg->wasm_jit_caller_imethod, call->method);
 								/* arity + 1, not arity. The profile now also observes this site AFTER the caller is
 								 * compiled (the IC-miss path feeds it), but the width is fixed at THIS emit, so it
 								 * still cannot see receivers that first appear later -- and the counters say that is exactly what happens: the
@@ -11976,7 +12017,7 @@ vcall_nullchk_done:
 									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
-								gpointer im = mono_interp_get_imethod (cfg->method);
+								gpointer im = cfg->wasm_jit_caller_imethod;
 								MonoVTable *v1 = NULL, *v2 = NULL;
 								MonoMethod *t1 = NULL, *t2 = NULL;
 								guint32 p1 = 0, p2 = 0;
@@ -12075,11 +12116,10 @@ vcall_nullchk_done:
 								extern gboolean mono_wasm_jit_prof_predict_alt (gpointer caller, MonoMethod *base,
 									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
-								extern gpointer mono_interp_get_imethod (MonoMethod *method);
 								MonoVTable *a2vt = NULL;
 								MonoMethod *a2t = NULL;
 								guint32 a2pct = 0;
-								if (mono_wasm_jit_prof_predict_alt (mono_interp_get_imethod (cfg->method),
+								if (mono_wasm_jit_prof_predict_alt (cfg->wasm_jit_caller_imethod,
 								    call->method, pred_vt, &a2vt, &a2t, &a2pct)) {
 									if ((int) a2pct < mono_wasm_jit_devirt_arm2_pct) {
 										wj_count (WJC_DEVIRT_ARM2_THIN);   /* below break-even; an arm here LOSES */
