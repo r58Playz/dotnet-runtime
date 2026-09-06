@@ -554,10 +554,10 @@ mono_jiterp_get_interp_entry_data (void)
 EMSCRIPTEN_KEEPALIVE int
 mono_jiterp_wasm_jit_entry_ok (InterpMethod *rmethod)
 {
-	extern int mono_wasm_jit_aot_entry;
-	/* Also the kill switch: trampolines are generated once and cached, so gating here means a run with
-	 * MONO_WASM_JIT_AOT_ENTRY=0 emits no fast path at all and is a clean A/B baseline. */
-	return mono_wasm_jit_aot_entry && rmethod && !rmethod->is_invoke && !rmethod->needs_thread_attach;
+	/* MONO_WASM_JIT_AOT_ENTRY gated this and shipped 1. Trampolines are generated once and cached, so
+	 * this was also the kill switch -- a run with it off emitted no fast path at all, which made it a
+	 * clean A/B baseline. Settled; unconditional. */
+	return rmethod && !rmethod->is_invoke && !rmethod->needs_thread_attach;
 }
 
 /* Per-call guard used by a generated interp-entry wrapper until admission installs its guard-free
