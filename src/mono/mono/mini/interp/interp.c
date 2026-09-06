@@ -6436,32 +6436,15 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar);
 	if (mono_wasm_jit_delegate_local_pic && scalar)
 		wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
-	/*
-	 * OBJECT-REACHABLE RECIPE (R187's re-keying). The same (fslot, shape) the per-site PIC above just
-	 * published, cached once on the (delegate class, target method) tramp info that
-	 * interp_init_delegate hung on del->invoke_info. Generated code then reaches it in two loads from
-	 * `this` with no site id, no capacity check, no key compare and no ways loop.
-	 *
-	 * Conditions are the PIC's, deliberately: only a scalar target has a canonical direct f-thunk ABI,
-	 * and only an admitted f-slot is callable. `shape` is in [1,4] here (a NONE shape returned FALSE
-	 * far above), so the packed word is never 0 for a real recipe and 0 stays free to mean "none".
-	 *
-	 * Idempotent and racy-benign: every writer for a given info computes the same answer from the same
-	 * (klass, method) key, so a concurrent write stores an identical word. It is NOT invalidated, for
-	 * the same reason the PIC is not -- see the invariants at WjLocalDelegatePicEntry.
-	 */
-	if (scalar && fslot > 0 && shape > WJ_DELEGATE_NONE && shape <= WJ_DELEGATE_OPEN_INSTANCE &&
-	    fslot <= (G_MAXINT32 >> 3)) {
-		if (del->invoke_info) {
-			((MonoDelegateTrampInfo *) del->invoke_info)->wasm_jit_recipe = (gint32) ((fslot << 3) | shape);
-			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_DOBJ_PUBLISHED);
-		} else if (G_UNLIKELY (mono_wasm_jit_stats)) {
-			/* Everything about the recipe was fine and there was nowhere to put it. See WJC_DOBJ_NO_INFO:
-			 * this counts delegates for which object-keyed dispatch is impossible regardless of how good
-			 * the emitted sequence is, so it is the first thing to read on an OBJ_PIC arm. */
-			mono_wasm_jit_count (WJC_DOBJ_NO_INFO);
-		}
-	}
+	/* R187's OBJECT-REACHABLE RECIPE published here: the same (fslot, shape) the per-site PIC above
+	 * writes, cached once on the (delegate class, target method) tramp info that interp_init_delegate
+	 * hangs on del->invoke_info, so generated code could reach it in two loads from `this` with no site
+	 * id, no capacity check, no key compare and no ways loop. Deleted with MONO_WASM_JIT_DELEGATE_OBJ_PIC
+	 * -- see the note at that knob for why the keying worked 44,000x and the emitted stub still got
+	 * bigger, and for why the wj_slot_live probe it could not drop is a structural consequence of
+	 * "modules are compiled once and broadcast, but INSTANTIATED PER WORKER". MonoDelegateTrampInfo
+	 * .wasm_jit_recipe and its offset accessor stay: they cost nothing and are the field an object-keyed
+	 * design would use again, if one is ever built on per-callee AND per-worker storage. */
 
 	/* Publish only after every potentially re-entrant operation above. A nested wasm-JIT vcall reuses
 	 * this TLS scratch buffer; writing the complete outer recipe last prevents nested state leakage. */
@@ -7490,7 +7473,6 @@ mono_wasm_jit_enter_island (MonoMethod *method, int ndata)
 	WjIsland *is;
 	MonoMethodILState *il;
 	gsize zbytes;
-	extern int mono_wasm_jit_island_ndata;
 	is = wj_island_at (wj_island_sp++);
 	il = (MonoMethodILState *) is->st;
 	/* ZERO ONLY WHAT THIS METHOD CAN USE. `st` is sized for WJ_ISLAND_DATA (256) args+locals, so the old
@@ -7508,8 +7490,12 @@ mono_wasm_jit_enter_island (MonoMethod *method, int ndata)
 	 *
 	 * The header zeroing is retained but is itself redundant: `method` and `il_offset` are both assigned
 	 * immediately below. Kept so `ext`/`data` alignment padding stays deterministic.
-	 * Knob-gated so the ABI (the extra parameter) is unconditional while the behaviour is A/B-able. */
-	if (ndata < 0 || ndata > WJ_ISLAND_DATA || !mono_wasm_jit_island_ndata)
+	 *
+	 * MONO_WASM_JIT_ISLAND_NDATA gated this and is gone. It was worth ~0.1 M instr/frame, roughly 0.05%
+	 * of the client render thread -- real, and below what this box can resolve, so the A/B the knob
+	 * existed for could never have been answered. The ABI parameter stays and the better arm is now
+	 * unconditional; the range test below still covers an out-of-range count. */
+	if (ndata < 0 || ndata > WJ_ISLAND_DATA)
 		zbytes = sizeof (is->st);
 	else
 		zbytes = sizeof (MonoMethodILState) + (gsize) ndata * sizeof (gpointer);

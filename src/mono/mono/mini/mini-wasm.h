@@ -381,19 +381,6 @@ enum {
 	 * it is vcallreach.py's per-arm call-form split over a tier dump -- static, free, and already
 	 * written. Do not substitute this counter for it. */
 	WJC_VIC_TGT_SIBLING, WJC_VIC_TGT_FOREIGN, WJC_VIC_TGT_NOTOURS,
-	/* MONO_WASM_JIT_DELEGATE_OBJ_PIC reachability, counted on the MISS path in
-	 * wasm_jit_prepare_delegate_call where it is free. The emitted arm can only ever be as good as the
-	 * fraction of delegates whose recipe slot is reachable at all, and "the arm never fired" and "the
-	 * arm fired and did not help" are opposite conclusions that a timing number cannot separate.
-	 *
-	 *   DOBJ_PUBLISHED  a scalar, admitted recipe was written to the tramp info
-	 *   DOBJ_NO_INFO    everything else was in order but del->invoke_info was NULL, i.e. this delegate
-	 *                   never went through interp_init_delegate's llvmonly branch, so no object-keyed
-	 *                   dispatch is possible for it however good the emitted code is
-	 *
-	 * If NO_INFO dominates, the arm is not wrong -- it is unreachable, and the fix is upstream in where
-	 * the tramp info gets published, not in the emitted sequence. */
-	WJC_DOBJ_PUBLISHED, WJC_DOBJ_NO_INFO,
 	/* MERGING existing groups (R193/Stage 2b). MERGED counts pre-existing groups ABSORBED into a new
 	 * request -- the conversion of what R192 measured as 100% of per-callee co-location refusals.
 	 * MERGE_SPLIT counts requests refused by mono_wasm_jit_rebatch because a member's group was only
@@ -478,10 +465,6 @@ enum {
 	 * the build this was measured clean on. (A refactor that moved these tests into a helper measured
 	 * three consecutive failures -- two OOB and one wedge -- so the success path is left alone.) */
 	WJC_ARM_UNJITTABLE,
-	/* R211: members added by the multi-hop frontier expansion rather than by the seed's immediate
-	 * depset. Read against COLOCATED_MEMBERS: if it stays ~0 the walk found nothing past hop 1, which
-	 * means the depsets are too thin at publish time and the expansion is not the lever. */
-	WJC_COLOCATE_HOP_ADD,
 	/* R215 delegate devirt. ARM = a delegate site given a guarded direct arm; THIN = its dominant
 	 * target held less than DELEGATE_DEVIRT%% of observations; REFUSED = no f-slot or a divergent
 	 * functype. FAST_DELEGATE_DEVIRT is the EXECUTED hit count and needs PROFILE_FAST -- read it against
