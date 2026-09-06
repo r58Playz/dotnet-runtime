@@ -331,31 +331,11 @@ enum {
 	 * 128-entry direct-dep cap. Expected non-zero once MONO_WASM_JIT_SHADOW_NONLEAF is on -- that is the
 	 * cap doing its job, not a bug -- but a large count means the non-leaf policy is reaching too far. */
 	WJC_SHADOW_DEPCAP,
-	/* R170 re-emission with a matured profile. QUEUED = methods enqueued; DONE = actually re-emitted;
-	 * REFUSED = skipped at drain time (co-located member, permanently bailed, or slots unpinnable).
-	 * Judge the mechanism by the devirt census moving -- `no_rec` down and `emitted` up -- not by DONE,
-	 * which only says how many attempts were made. */
-	WJC_REEMIT_QUEUED, WJC_REEMIT_DONE, WJC_REEMIT_REFUSED,
-	/* The devirt census SCOPED TO RE-EMITTED BODIES. R170's first attempt read the ordinary census, which
-	 * is cumulative over every emission in the run -- 28 re-emissions against 37,828 sites cannot move it
-	 * whatever they did, so the null result measured the instrument, not the hypothesis. These three count
-	 * only sites offered while a re-emit is in flight, which makes 28 bodies a readable sample. Compare
-	 * REEMIT_EMITTED/REEMIT_SITE against the run-wide emitted share (28.1%) -- if the profile really is
-	 * richer at re-emit time, this ratio is the place it shows up. */
-	WJC_REEMIT_SITE, WJC_REEMIT_NO_REC, WJC_REEMIT_EMITTED,
-	/* Re-emit attempts that lost the global wj_compiling CAS and were put BACK on the queue. Expected
-	 * non-zero and harmless -- compiles are serialized and this drain runs on an ordinary tick. It is
-	 * counted because treating a lost CAS as a verdict is exactly what made the first three experiments
-	 * measure nothing: REEMIT_DONE read 0 while REEMIT_SITE read 24. */
-	WJC_REEMIT_BUSY,
-	/* Registrations that reused an f-slot still owned by an EARLIER descriptor for the SAME method --
-	 * i.e. a re-emit taking back its own pinned pair. A different method hitting that slot is still
-	 * refused loudly (WASM_JIT_FSLOT_COLLISION); this counts only the legitimate case. */
-	WJC_REEMIT_REREGISTER,
-	/* Methods dropped because the 256-entry re-emit queue was full. Non-zero is fine -- re-emission is
-	 * opportunistic -- but a LARGE count means the drain is not keeping up with the trigger, which is a
-	 * reason to raise the threshold rather than the queue. */
-	WJC_REEMIT_QFULL,
+	/* Registrations that reused an f-slot still owned by an EARLIER descriptor for the SAME method. A
+	 * different method hitting that slot is refused loudly (WASM_JIT_FSLOT_COLLISION); this counts only
+	 * the legitimate case. Re-emission taking back its own pinned pair was the original producer and is
+	 * gone; rebatch/repartition re-framing is what reaches it now. */
+	WJC_FSLOT_REREGISTER,
 	/* WHY a co-location group was not formed, one counter per exit of
 	 * mono_wasm_jit_colocate_deps_now. Until these existed the function had six distinct rejection
 	 * paths and a single counter on one of them (SCC_REFUSED), so "co-location reaches ~1% of the
@@ -470,21 +450,13 @@ enum {
 	 *
 	 * MERGE_PRECOND + MERGE_CAP + MERGED == the times a batched callee was reached with merging on. */
 	WJC_COLOCATE_MERGE_PRECOND, WJC_COLOCATE_MERGE_CAP,
-	/* MONO_WASM_JIT_PRETIER: times the residual site's pre-spill pretransform drove tiering, i.e. the
-	 * residual callee's missing interpreter call edge, supplied where it is SAFE to supply it.
-	 * Read against RESIDUAL_HEALED: if pretiering works, callees acquire f-slots earlier and the
-	 * late_fslot guard should stop being the thing that discovers them. */
-	WJC_PRETIER_BUMP,
-	/* MONO_WASM_JIT_HEAL_WAIT (R196). HEAL_SITES = late-f-slot healing sites recorded at emit, i.e.
-	 * methods registered as waiters on a callee that had no f-slot yet. HEAL_WOKEN = those waiters
-	 * actually re-queued for re-emission because the callee published.
-	 *
-	 * The pair is the reach measurement, and it must be read as a pair: SITES with no WOKEN means the
-	 * callees never JIT (so healing is the right answer after all), while WOKEN approaching SITES means
-	 * the healing block is a transient that re-emission can delete -- 19.5M dispatches/run of helper
-	 * call + branch + dynamic call_indirect (R196). Read WOKEN against REEMIT_DONE too: a wake that
-	 * never completes is R179's failure shape returning. */
-	WJC_HEAL_SITES, WJC_HEAL_WOKEN,
+	/* Late-f-slot healing sites recorded at emit: sites paying a helper call, a branch and a dynamic
+	 * call_indirect on EVERY dispatch (~19.5M/run, R196) to re-discover an f-slot the callee usually
+	 * acquires shortly afterwards. MONO_WASM_JIT_HEAL_WAIT paired this with HEAL_WOKEN and woke the
+	 * method for re-emission, which deleted the block; both went with re-emission (the mechanism fired,
+	 * 90 of 107 sites woken, and the effect was nil at a 0.057%% ceiling). The census stays because it
+	 * sizes the pool a RELOCATABLE f-slot hole would address, which is what R195 argues for instead. */
+	WJC_HEAL_SITES,
 	/* R200: the two uncounted routes that kept a parts-sum identity from closing mechanically.
 	 * SHADOW_SELF is the `callee == self` early return in wj_shadow_candidate -- self-recursion, which must
 	 * never be shadowed, and which was silently absorbed into SHADOW_REFUSED's residual (191 of 25,242).
@@ -537,10 +509,6 @@ enum {
 	 * the build this was measured clean on. (A refactor that moved these tests into a helper measured
 	 * three consecutive failures -- two OOB and one wedge -- so the success path is left alone.) */
 	WJC_ARM_UNJITTABLE,
-	/* R208: re-emission driven by IC misses inside compiled code. TRIG = enqueued by this path.
-	 * ALWAYS read it against WJC_REEMIT_DONE: R179's failure shape was 17,343 enqueues for 3 re-emits,
-	 * and an earlier version 35,617,130 for 4. One counter alone reads as success in both. */
-	WJC_REEMIT_IC_TRIG,
 	/* R211: members added by the multi-hop frontier expansion rather than by the seed's immediate
 	 * depset. Read against COLOCATED_MEMBERS: if it stays ~0 the walk found nothing past hop 1, which
 	 * means the depsets are too thin at publish time and the expansion is not the lever. */
@@ -575,15 +543,6 @@ enum {
 	 * signature the shared call sequence cannot express, which is permanent. Measured 4,360 merged.
 	 * REFUSED is kept and still counts their sum, so old readings stay comparable. */
 	WJC_DELEGATE_DEVIRT_NO_FSLOT, WJC_DELEGATE_DEVIRT_SIG,
-	/* Split of REEMIT_REFUSED at its FIRST site (interp.c, the pre-compile eligibility gate), which
-	 * merged three causes behind one `continue` -- and is a DIFFERENT site from the NO_PUBLISH printf,
-	 * which is why that printf logged 0 while the counter read 466. BATCHED is the co-location/
-	 * re-emission conflict (re-framing one member strands its siblings). */
-	WJC_REEMIT_NO_ESLOT, WJC_REEMIT_NO_FSLOT, WJC_REEMIT_BATCHED,
-	/* 2026-09-06: make the drain FULLY ACCOUNTED. done+refused+busy covered 5,819 of 56,667 pops; the
-	 * rest vanished at two gates with no counter. DISTINCT is the denominator every per-attempt reemit
-	 * counter was missing. Assert: SKIP_STATE + SKIP_AGE + BUSY + DONE + REFUSED == pops. */
-	WJC_REEMIT_DISTINCT, WJC_REEMIT_SKIP_STATE, WJC_REEMIT_SKIP_AGE,
 	/* WHY a delegate dispatch fell off the direct e-thunk and into the full interp marshal. 97% of
 	 * mono_wasm_jit_call_interp's cost arrives from mono_wasm_jit_call_delegate, and the whole
 	 * interp-boundary complex (call_interp plus everything it re-derives) is ~5.7-6.1% of the client

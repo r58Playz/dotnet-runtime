@@ -170,15 +170,9 @@ struct InterpMethod {
 	guint8 wasm_jit_entry_fast_ok; // runtime wasm JIT (MONO_WASM_JIT_AOT_ENTRY): this method has been admitted at least once, so later entries may try the fast path that skips the InterpFrame/LMF/maybe_compile/admit scaffolding. The fast path still verifies per-thread admission of the descriptor's current generation because automatic rebatching reuses its e/f slots.
 	const char *wasm_jit_fail; // runtime wasm JIT: the emitter's exact fail string (static literal) behind wasm_jit_bail, for the weighted vperm top-N dump (names the specific gate, e.g. "ldaddr of vtype with refs" vs just "ldaddr")
 	gint32 wasm_jit_invoke_in; // runtime wasm JIT diag (Part 3c): times entered interp->JIT (this method was the JITted callee at a MINT_CALL/CALLVIRT). stats only
-	/* R208: IC MISSES observed at sites INSIDE this method's JITted body. This is the re-emission
-	 * trigger that R179 named and never built. Distinct from wasm_jit_invoke_in above in both what it
-	 * counts and when: invoke_in counts interp->JIT BOUNDARY crossings and is incremented only under
-	 * mono_wasm_jit_stats, so the old trigger selected the wrong population AND was inert at stats=0.
-	 * This counts execution INSIDE compiled code, is never stats-gated, and rises exactly for the
-	 * methods whose sites the profile can now predict but could not at emit time -- `no_rec`, which is
-	 * 32.2%% of hot inline-IC volume (R205) and unreachable by any amount of pre-JIT warmup because
-	 * 99.3%% of profile observations arrive after the method was JITted. */
-	gint32 wasm_jit_ic_misses;
+	/* R208's per-method IC-MISS count lived here (wasm_jit_ic_misses): the re-emission trigger that
+	 * selected methods hot INSIDE compiled code rather than at the interp->JIT boundary, which is what
+	 * made it the right selector and R179's `invoke_in` the wrong one. Gone with re-emission. */
 	gint32 wasm_jit_block_n;   // runtime wasm JIT (Part 3a / Lever C): times this (un-JITted) method BLOCKED a caller's island. Always counted (cheap, compile-time): also a stats-independent "hot at the island boundary" signal for the cold gate.
 	gint32 wasm_jit_invoke_out; // runtime wasm JIT (Lever A): times THIS (interp) method invoked a JITted callee. Drives MONO_WASM_JIT_ENTRY_PROMOTE upward island growth.
 	gint32 wasm_jit_resv_eslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished entry-thunk slot while this method's SCC is being batch-compiled (0 = none)
@@ -198,35 +192,11 @@ struct InterpMethod {
 	 * method count — which is exactly the axis module batching increases. */
 	gint32 wasm_jit_self_resv_eslot;
 	gint32 wasm_jit_self_resv_fslot;
-	/* runtime wasm JIT (R170 re-emit): 0 = never considered, 1 = queued for re-emission with a matured
-	 * call profile, 2 = re-emitted once (never again). A method is emitted ONCE, on crossing its hotness
-	 * threshold, using whatever the INTERPRETER happened to observe -- but 78.8% of call-profile
-	 * observations arrive later, through the JIT's IC miss path. Devirt therefore refuses 32.1% of
-	 * virtual sites for `no_rec` at emit time and would predict many of them afterwards.
-	 *
-	 * 0 = never considered, 1 = queued, 3 = IN FLIGHT (this is the state that opens
-	 * wasm_jit_compile_publish's `wasm_jit_fslot > 0` early-out), 2 = done, never again.
-	 *
-	 * The in-flight state exists because the first version set 2 BEFORE calling compile_publish, to get
-	 * the "once" guarantee. The gate opens only for the in-flight state, so it never opened: every
-	 * re-emit took the early-out, returned the existing slots unchanged, and incremented REEMIT_DONE
-	 * having compiled nothing. 31 "re-emissions" per run were no-ops, and the only reason that was
-	 * visible is that WJC_REEMIT_SITE -- the devirt census scoped to re-emitted bodies -- read 0. */
-	guint8 wasm_jit_reemit_state;
-	/* MONO_WASM_JIT_HEAL_WAIT: this method holds a late-f-slot HEALING site whose callee has now
-	 * published, so re-emitting it replaces that site's helper call + branch + dynamic call_indirect
-	 * with an ordinary direct call. Distinct from reemit_state because it must BYPASS the reemit
-	 * age/after gates: those encode the old trigger's premise ("this method's profile has matured"),
-	 * whereas this trigger is an EVENT (the callee acquired an f-slot) and is already precise. Gating an
-	 * event-driven trigger on a staleness heuristic is how R179 got 17,343 enqueues for 3 re-emits. */
-	guint8 wasm_jit_heal_pending;
-	/* Has this method EVER been enqueued for re-emission? Distinct-method accounting, because every other
-	 * reemit counter is PER ATTEMPT and the drain re-enqueues on a lost compile CAS -- so `busy` and
-	 * `queued` are inflated by the same few methods cycling, and no ratio built from them means anything
-	 * (2026-09-06: `busy` 23,452 against `done` 207 was read as a 0.9% CAS win rate; it is not).
-	 * `done` and `refused` are already distinct (both set state 2, which is terminal); this supplies the
-	 * denominator they were missing. Sits in the padding after the two guint8s above -- costs nothing. */
-	guint8 wasm_jit_reemit_seen;
+	/* Three re-emission state bytes lived here -- reemit_state (0 never considered / 1 queued / 3 in
+	 * flight / 2 done-never-again), heal_pending (a HEAL_WAIT wake, which had to BYPASS the age gate
+	 * because it is an EVENT rather than a staleness heuristic) and reemit_seen (the distinct-method
+	 * denominator every per-attempt reemit counter lacked). All gone with re-emission; the two guint8s
+	 * they shared padding with are unaffected. */
 	/* SIGNATURE-SHAPE CACHE for the residual/delegate interp boundary. Both per-crossing loops in
 	 * mono_wasm_jit_call_interp are pure functions of MonoMethodSignature*, which is fixed for the
 	 * callee, and they were being re-derived on EVERY crossing -- ~8,500 times per frame.
