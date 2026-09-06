@@ -715,7 +715,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_structured_cfg; const char *sc = g_getenv ("MONO_WASM_JIT_STRUCTURED_CFG"); mono_wasm_jit_structured_cfg = (sc && *sc) ? (*sc != '0') : 1; }
 	{ extern int mono_wasm_jit_over_aot; const char *oa = g_getenv ("MONO_WASM_JIT_OVER_AOT"); mono_wasm_jit_over_aot = (oa && *oa && *oa != '0') ? 1 : 0; } /* experimental second compiler tier for hot AOT bodies; safe fallback remains the AOT entry */
 	{ extern int mono_wasm_jit_island; const char *il = g_getenv ("MONO_WASM_JIT_ISLAND"); mono_wasm_jit_island = (il && *il && *il == '0') ? 0 : 1; } /* 0 = no eager island formation (bottom-up retry only) */
-	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia) ? (*ia != '0') : 1; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). 1 = on, default 0 = off. */
+	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia) ? (*ia != '0') : 1; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). Default at the initialiser. */
 	{ extern int mono_wasm_jit_ldaddr_vtype; const char *lv = g_getenv ("MONO_WASM_JIT_LDADDR_VTYPE"); mono_wasm_jit_ldaddr_vtype = (lv && *lv) ? (*lv != '0') : 1; } /* OP_LDADDR of NON-SCALAR ref-free local via a full-size addr-frame slot. Exonerated re: corruption; kept gated for repro parity. */
 	{ extern int mono_wasm_jit_vtype_scalar_ref; const char *vr = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR_REF"); mono_wasm_jit_vtype_scalar_ref = (vr && *vr) ? (*vr != '0') : 1; } /* ref-etype scalar-vtype arg via a GC-scanned ref-shadow slot; GC-critical. */
 	{ extern int mono_wasm_jit_vtype_scalar; const char *vs = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR"); mono_wasm_jit_vtype_scalar = (vs && *vs) ? (*vs != '0') : 1; } /* pass a BYVAL ref-free scalar-vtype call arg as its single-field etype scalar (LLVMArgWasmVtypeAsScalar ABI). Needs LDADDR_VTYPE. */
@@ -761,8 +761,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_missedref; const char *mr = g_getenv ("MONO_WASM_JIT_MISSEDREF"); mono_wasm_jit_missedref = (mr && *mr && *mr != '0') ? 1 : 0; } /* DIAG: names a missed ref. For every method, log any NONREF-classified i32 vreg used as a MEMBASE load/store base or virtual-call receiver (a stale one of these is the wild-deref corruptor), with its defining opcode -> pins which wj_opcode_is_nonref case is wrong. Bounded. default off */
 	{ extern int mono_wasm_jit_refverify; const char *rv = g_getenv ("MONO_WASM_JIT_REFVERIFY"); mono_wasm_jit_refverify = (rv && *rv) ? atoi (rv) : 0; } /* 1=log, 2=assert classification-vs-structural-marking violations; default off */
 	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi) ? (*vi != '0') : 1;
-	} /* inline vcall IC fast path: 0=off (default), 1=on. Now MT-SAFE on threaded builds — the buggy
-	   * ref.is_null liveness (placeholder sig mismatch, jit138) is replaced by a per-thread slot_live gate. */
+	} /* inline vcall IC fast path. Default at the initialiser. */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
@@ -1202,7 +1201,11 @@ int mono_wasm_jit_vcall_aot_ic = 1;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-
  * authoritative per-thread bitmap via one cheap mono_wasm_jit_slot_live() call (wasm exposes no funcref
  * equality / funcref->i32 to compare the slot against the placeholder inline). Still one C boundary per hit
  * vs two + resolve for the helper; a full pure-wasm gate would need __tls_base imported to read the bitmap. */
-int mono_wasm_jit_vcall_inline_ic = 1;
+int mono_wasm_jit_vcall_inline_ic = 1; /* MONO_WASM_JIT_VCALL_INLINE_IC: inline vcall IC fast path. Default ON,
+                                        * and it carries 25.1% of all executed dispatch (R203) -- five times
+                                        * vcall_resolve_fslot's 5.0% miss share. MT-SAFE on threaded builds: the
+                                        * buggy ref.is_null liveness test (placeholder signature mismatch, jit138)
+                                        * is replaced by a per-thread slot_live gate. */
 
 static gboolean
 wj_method_raise_exempt (MonoCompile *cfg)
@@ -2668,47 +2671,14 @@ wj_desc_state_ensure (int id)
 	}
 }
 
-static void
-wj_note_bad_method (const char *site, int desc_id, MonoMethod *m)
-{
-	static int n = 0;
-	if (n++ < 20) {
-		printf ("WASM_JIT_BAD_LOGICAL_METHOD site=%s desc=%d method=%p (skipped interp-entry patch)\n",
-			site, desc_id, (void *) m);
-		fflush (stdout);
-	}
-}
-
-/* Is this plausibly a MonoMethod we may dereference?
- *
- * The registry keeps a raw MonoMethod* per descriptor for the process lifetime, and the patch/unpatch
- * calls hand it to mono_interp_get_imethod, which dereferences it (jit_mm_for_method,
- * mono_method_signature_internal). One boot in four dies exactly there with `memory access out of bounds`
- * on a worker (R151) -- so that pointer is not always dereferenceable by the time admission runs, and IKVM
- * generates dynamic types continuously while the registry holds no reference to them.
- *
- * Patching the interp entry is an OPTIMIZATION -- it lets later entries skip the InterpFrame/LMF
- * scaffolding -- so declining it is always safe: the method keeps its guarded entry path. That is what
- * makes a range check the right shape of guard here; it can only cost speed, never correctness, and it
- * turns a worker-killing trap into a logged skip. It is NOT a use-after-free detector: a freed pointer
- * that still lands in range passes. */
-static inline gsize wj_memsz (void);              /* both defined below, near the store guards */
-static inline gboolean wj_probe_ok (gsize a, gsize memsz);
-
-static gboolean
-wj_method_ptr_ok (MonoMethod *m)
-{
-#ifdef HOST_BROWSER
-	gsize memsz = wj_memsz ();
-	if (!wj_probe_ok ((gsize) m, memsz))
-		return FALSE;
-	if (!wj_probe_ok ((gsize) m->klass, memsz))
-		return FALSE;
-	return TRUE;
-#else
-	return m != NULL;
-#endif
-}
+/* R151's boot-crash guard (`wj_method_ptr_ok` + `wj_note_bad_method`, WASM_JIT_BAD_LOGICAL_METHOD)
+ * lived here and WAS NEVER SPLICED INTO A CALL PATH -- no caller anywhere in src/, so it printed nothing
+ * and refused nothing for its entire life. It was written for the "one boot in four dies in
+ * mono_interp_get_imethod on a worker" fault: the registry keeps a raw MonoMethod* per descriptor for
+ * the process lifetime while IKVM generates dynamic types continuously, so that pointer is not always
+ * dereferenceable by the time admission runs. Deleted rather than wired up, because a range check cannot
+ * see a freed pointer that still lands in range and the fault has not recurred; recording it here so the
+ * next reader knows that crash mode is UNPROTECTED, not guarded. */
 
 int mono_wasm_jit_admit (int desc_id);
 
@@ -12494,10 +12464,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					}
 					/* DIAG (WASM_JIT_BADREF_ARG caller attribution): bake THIS (calling) method at scratch+224 so
 					 * call_interp's bad-ref check can name the type-confusion SOURCE, not just the callee. Written
-					 * immediately before the call (after the spills) so a nested residual can't leave a stale value. */
-					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-					wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
-					wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224 /* WJ_SCRATCH_CALLER_OFF */);
+					 * immediately before the call (after the spills) so a nested residual can't leave a stale value.
+					 * EMITTED ONLY UNDER OBJGUARD -- its sole consumer is the bad-ref block in call_interp, which is
+					 * gated on the same knob. This store shipped unconditionally in every residual site of every
+					 * module for the duration of the type-confusion hunt. */
+					if (G_UNLIKELY (mono_wasm_jit_objguard)) {
+						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+						wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+						wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224 /* WJ_SCRATCH_CALLER_OFF */);
+					}
 					/* mono_wasm_jit_call_interp(method, $scratch): bake call_method (the synchronized wrapper for a
 					 * synchronized callee) so the interp runs it WITH the monitor; plain callees pass through. */
 					wasm_i32_const (&body, (gint32) (intptr_t) call_method);
@@ -14136,14 +14111,18 @@ vcall_cold_miss_emit:
 								wasm_op (&body, WASM_OP_END);
 							}
 							/* DIAG (WASM_JIT_BADREF_ARG caller attribution): bake THIS (calling) method at scratch+224
-							 * (mirrors the direct residual site; 224 is past ret(192)/target(200)/fslot(208)/aot(212,216)). */
-							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+							 * (mirrors the direct residual site; 224 is past ret(192)/target(200)/fslot(208)/aot(212,216)).
+							 * EMITTED ONLY UNDER OBJGUARD, like its twin above and like its reader in call_interp.
+							 * The knob itself is HOST_BROWSER-only (it has no meaning in mono-aot-cross, which never
+							 * runs this tier), so the cross build simply never emits the store -- where it previously
+							 * emitted a 0x7ff8 placeholder that nothing has ever read. */
 #ifdef HOST_BROWSER
-							wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
-#else
-							wasm_i32_const (&body, 0x7ff8);
+							if (G_UNLIKELY (mono_wasm_jit_objguard)) {
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+								wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+								wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224 /* WJ_SCRATCH_CALLER_OFF */);
+							}
 #endif
-							wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224 /* WJ_SCRATCH_CALLER_OFF */);
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 200);            /* target MonoMethod* */
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);            /* scratch buffer */
