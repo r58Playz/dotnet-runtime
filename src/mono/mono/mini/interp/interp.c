@@ -896,7 +896,16 @@ wj_reemit_enqueue (InterpMethod *im)
 	}
 	im->wasm_jit_reemit_state = 1;
 	wj_reemit_q [t & (WJ_REEMIT_Q - 1)] = im->method;
-	if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_QUEUED);
+	if (G_UNLIKELY (mono_wasm_jit_stats)) {
+		mono_wasm_jit_count (WJC_REEMIT_QUEUED);
+		/* DISTINCT methods, which is the denominator QUEUED is not: the drain re-enqueues on a lost
+		 * compile CAS, so QUEUED counts cycles of the same few methods. Read DONE and REFUSED (both
+		 * terminal, hence already distinct) against THIS. */
+		if (!im->wasm_jit_reemit_seen) {
+			im->wasm_jit_reemit_seen = 1;
+			mono_wasm_jit_count (WJC_REEMIT_DISTINCT);
+		}
+	}
 }
 
 /* --- Event-driven blocker waiters (residual=0 islands) ---------------------------------------------------
@@ -1149,15 +1158,17 @@ wj_prof_block (InterpMethod *caller)
 }
 
 /* Find this caller's record for (base, kind), appending one if there is room. NULL when the caller has
- * no profile block or has run out of site slots (counted as an eviction). `added` reports which. */
+ * no profile block or has run out of site slots (counted as an eviction).
+ *
+ * This used to report via an `added` out-parameter whether it appended. Nothing needs it: the only
+ * consumer was wj_prof_record's first-observation test, and `added` implies total == 0 there, so the
+ * `total` test alone is equivalent. See wj_prof_record_at. */
 static WjProfSite *
-wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean create, gboolean *added)
+wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean create)
 {
 	WjCallProfile *p;
 	guint32 i, n;
 
-	if (added)
-		*added = FALSE;
 	if (!caller || !base)
 		return NULL;
 	p = create ? wj_prof_block (caller) : (WjCallProfile *) caller->wasm_jit_profile;
@@ -1187,8 +1198,6 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
 	 * identity and prof_arity rejects nids == 0. */
 	mono_memory_barrier ();
 	p->n = i + 1;
-	if (added)
-		*added = TRUE;
 	return &p->sites [i];
 }
 
@@ -1206,26 +1215,27 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
  * guards on the identity regardless. Taking a lock here would cost more than the profile is worth.
  */
 static void
-wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointer identity,
-                MonoMethod *target, gboolean from_jit)
+wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod *target,
+                   gboolean from_jit)
 {
-	WjProfSite *s;
-	gboolean added = FALSE;
-
-	if (!caller || !base || !identity)
-		return;
-	/* A delegate site never accumulates a majority margin (see WjProfSite.margin), so it must saturate
-	 * on `total` instead or it would record forever. */
-	s = wj_prof_site (caller, base, kind, TRUE, &added);
-	if (!s)
-		return;
-	/* `total == 0` is FIRST OBSERVATION, and that is not the same test as `added`: the site-id allocator
-	 * also creates records, so a slot can exist with no observation in it. Taking the update path there
-	 * would adopt the front-runner WITHOUT crediting it (the eviction branch deliberately leaves the
-	 * margin at zero, so that a site which has ever been polymorphic can never again claim
+	/* `total == 0` is FIRST OBSERVATION. It used to be spelled `!added && s->total != 0`, and the
+	 * `added` conjunct was redundant: wj_prof_site appends into a zeroed block, so a site it reports as
+	 * added always has total == 0 and the two tests can never disagree. Dropping it is what lets the
+	 * lookup be hoisted out of this function and memoised by the caller.
+	 *
+	 * The test is on `total` rather than on "did this call create the record" because the site-id
+	 * allocator also creates records, so a slot can exist with no observation in it. Taking the update
+	 * path there would adopt the front-runner WITHOUT crediting it (the eviction branch deliberately
+	 * leaves the margin at zero, so that a site which has ever been polymorphic can never again claim
 	 * margin == total), and the site could then never be predicted however monomorphic it turned out to
-	 * be. Keyed on `total` instead, the invariant is the same one the pre-unification recorder had. */
-	if (!added && s->total != 0) {
+	 * be. Keyed on `total`, the invariant is the same one the pre-unification recorder had. */
+	if (s->total != 0) {
+		/* A delegate site never accumulates a majority margin (see WjProfSite.margin), so it must
+		 * saturate on `total` instead or it would record forever.
+		 *
+		 * FIRST, deliberately: at the plateau nearly every observation lands on a site that decided long
+		 * ago, and with the record memoised at the call site this early-out is the whole cost of the
+		 * profile -- two loads and a compare, no barrier and no scan. */
 		guint32 seen = (kind == WJ_SITE_DELEGATE || !target) ? s->total : s->margin;
 		if (seen >= WJ_PROF_SATURATE)
 			return;                       /* decided; stop paying for this site */
@@ -1257,6 +1267,23 @@ wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointe
 	s->ids [0] = identity;
 	s->nids = 1;
 	s->ids_overflow = 0;
+}
+
+/* Resolve this caller's record for (base, kind) and record into it. The observation points that hold a
+ * durable per-site structure (the JITted code's IC miss) should memoise the record and call
+ * wj_prof_record_at directly instead; this form re-scans the caller's site table every call. */
+static void
+wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointer identity,
+                MonoMethod *target, gboolean from_jit)
+{
+	WjProfSite *s;
+
+	if (!caller || !base || !identity)
+		return;
+	s = wj_prof_site (caller, base, kind, TRUE);
+	if (!s)
+		return;
+	wj_prof_record_at (s, kind, identity, target, from_jit);
 }
 
 /*
@@ -1298,7 +1325,7 @@ mono_wasm_jit_prof_site_id (gpointer caller_ptr, MonoMethod *base, int kind, vol
 
 	if (!mono_wasm_jit_stable_ic_ids)
 		return (guint32) mono_atomic_inc_i32 (counter) - 1;
-	s = wj_prof_site (caller, base, (WjSiteKind) kind, TRUE, NULL);
+	s = wj_prof_site (caller, base, (WjSiteKind) kind, TRUE);
 	if (s && s->site_id) {
 		wj_prof_ids_reused++;
 		return s->site_id;
@@ -1343,7 +1370,7 @@ mono_wasm_jit_prof_predict_alt (gpointer caller_ptr, MonoMethod *base, MonoVTabl
 		*out_pct = 0;
 	if (!caller || !base || !out_vt || !out_target)
 		return FALSE;
-	s = wj_prof_site (caller, base, WJ_SITE_VIRTUAL, FALSE, NULL);
+	s = wj_prof_site (caller, base, WJ_SITE_VIRTUAL, FALSE);
 	if (!s)
 		return FALSE;
 
@@ -1368,6 +1395,53 @@ mono_wasm_jit_prof_predict_alt (gpointer caller_ptr, MonoMethod *base, MonoVTabl
 
 	*out_vt = (MonoVTable *) best_id;
 	*out_target = best_t;
+	if (out_pct)
+		*out_pct = (guint32) ((guint64) best_c * 100 / total1);
+	return TRUE;
+}
+
+/*
+ * R215b: the dominant target at a DELEGATE site.
+ *
+ * Delegates need their own reader, and the reason is structural rather than cosmetic. For a delegate site
+ * the IDENTITY IS THE TARGET -- `wj_prof_record` is called with `del->method` as the identity and NULL as
+ * the target, because the `target` field means "the resolved override" and a delegate has no vtable
+ * receiver to resolve. So mono_wasm_jit_prof_predict_alt, which requires id_targets[k] to be non-NULL,
+ * can never succeed at a delegate site: MEASURED, 7,582 delegate sites and 0 armed.
+ *
+ * `margin` is likewise 0 by design here (a majority vote over receivers is meaningless when the identity
+ * is a method), so frequency over id_counts is the only workable signal -- which is what this reads.
+ */
+gboolean
+mono_wasm_jit_prof_predict_delegate (gpointer caller_ptr, MonoMethod *base,
+	MonoMethod **out_target, guint32 *out_pct)
+{
+	InterpMethod *caller = (InterpMethod *) caller_ptr;
+	WjProfSite *s;
+	guint32 k, nids1, total1, nids2, total2, best_c = 0;
+	gpointer best_id = NULL;
+
+	if (out_pct)
+		*out_pct = 0;
+	if (!caller || !base || !out_target)
+		return FALSE;
+	s = wj_prof_site (caller, base, WJ_SITE_DELEGATE, FALSE);
+	if (!s)
+		return FALSE;
+	nids1 = s->nids; total1 = s->total;
+	mono_memory_barrier ();
+	for (k = 0; k < nids1 && k < WJ_PROF_WAYS; ++k) {
+		gpointer id = s->ids [k];
+		guint32 c = s->id_counts [k];
+		if (!id)
+			continue;
+		if (c > best_c) { best_c = c; best_id = id; }
+	}
+	mono_memory_barrier ();
+	nids2 = s->nids; total2 = s->total;
+	if (nids1 != nids2 || total1 != total2 || !best_id || !total1)
+		return FALSE;
+	*out_target = (MonoMethod *) best_id;      /* identity IS the target here */
 	if (out_pct)
 		*out_pct = (guint32) ((guint64) best_c * 100 / total1);
 	return TRUE;
@@ -1409,7 +1483,7 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 		*out_why = WJ_PRED_NO_REC;
 	if (!caller || !base || !out_vt || !out_target)
 		return FALSE;
-	s = wj_prof_site (caller, base, WJ_SITE_VIRTUAL, FALSE, NULL);
+	s = wj_prof_site (caller, base, WJ_SITE_VIRTUAL, FALSE);
 	if (!s)
 		return FALSE;
 	id1 = s->identity; target1 = s->target; hits1 = s->margin; total1 = s->total;
@@ -1517,7 +1591,7 @@ mono_wasm_jit_prof_arity (gpointer caller_ptr, MonoMethod *base)
 	if (!caller || !base)
 		return 0;
 	for (k = 0; k < 2; ++k) {
-		WjProfSite *s = wj_prof_site (caller, base, (WjSiteKind) k, FALSE, NULL);
+		WjProfSite *s = wj_prof_site (caller, base, (WjSiteKind) k, FALSE);
 		guint32 n1, n2, total1, total2, ovf1, ovf2;
 		if (!s)
 			continue;
@@ -1704,10 +1778,32 @@ typedef struct {
 	 * a fresh counter bump, so the worker-local PIC entries a previous generation warmed are still this
 	 * site's. See WjProfSite.site_id. */
 	guint32 site_id;
-	/* Keep the resolver IC which immediately follows this header naturally 8-byte aligned. On
-	 * wasm32 the two pointers below are 4 bytes each, so without this explicit word the header was
-	 * 12 bytes and every i64.atomic access in vcall_resolve_fslot trapped as unaligned. */
-	guint32 reserved;
+	/* This site's profile record, memoised on first use by the IC-miss observation point.
+	 *
+	 * Occupies the explicit padding word that used to sit here (and still keeps the resolver IC which
+	 * follows this header naturally 8-byte aligned: on wasm32 the pointers below are 4 bytes each, so
+	 * without a fourth word the header was 12 bytes and every i64.atomic access in vcall_resolve_fslot
+	 * trapped as unaligned). Zero bytes added.
+	 *
+	 * WHY MEMOISING IS SAFE HERE, given "resolve and consume in the same breath". That rule is about
+	 * things whose IDENTITY can change under you -- a WjBody another thread retires, a name that lazily
+	 * resolves metadata. Neither applies: (caller_im, base, WJ_SITE_VIRTUAL) is FIXED for a call site,
+	 * and the record it names never moves. The WjCallProfile is allocated once from caller->method's
+	 * mempool and published by a CAS whose loser re-reads the winner, so it is never replaced; sites live
+	 * in a fixed WJ_PROF_MAX_SITES array, appended in place, never reordered and never recycled (a full
+	 * table refuses new sites, it does not evict old ones). So the address is stable for the life of the
+	 * InterpMethod -- which this struct already depends on outliving it, via caller_im.
+	 *
+	 * WHY IT IS WORTH A FIELD: this is the IC MISS path, 78.8% of all profile observations (R148), and
+	 * wj_prof_record's first act is a memory barrier plus a linear scan of up to WJ_PROF_MAX_SITES
+	 * (base, kind) pairs -- paid on every miss, including the overwhelmingly common one at a site that
+	 * saturated long ago and will return without recording anything. Caching the record lets the
+	 * saturation test come first and reduces the steady-state cost to a load and a compare.
+	 *
+	 * Benign under races: concurrent first-misses resolve the same (base, kind) and store the same
+	 * pointer, and a NULL result (no profile block, or the caller's site table is full) is simply left
+	 * uncached and retried. */
+	WjProfSite *prof;
 	/* The caller's InterpMethod rather than its MonoMethod, so the IC-miss path can feed the call
 	 * profile without a locking mono_interp_get_imethod. Resolved once, at emit time, where taking the
 	 * jit_mm lock is safe. */
@@ -1776,8 +1872,19 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 	 * instruction, which is the property R114 was protecting when vcall_ways 4->1 won +9.6% on the tail. */
 	{
 		WjVcallSite *site = wj_vcall_site (ic);
-		if (G_UNLIKELY (mono_wasm_jit_devirt_profile) && site->caller_im && site->base)
-			wj_prof_record (site->caller_im, site->base, WJ_SITE_VIRTUAL, vt, target, TRUE);
+		if (G_UNLIKELY (mono_wasm_jit_devirt_profile) && vt && site->caller_im && site->base) {
+			/* Memoised: (caller_im, base, WJ_SITE_VIRTUAL) is fixed for this site, so the record it
+			 * names is too. See WjVcallSite.prof for why that pointer is safe to hold, and for what the
+			 * lookup costs on a path that takes 78.8% of all observations. */
+			WjProfSite *ps = site->prof;
+			if (G_UNLIKELY (!ps)) {
+				ps = wj_prof_site (site->caller_im, site->base, WJ_SITE_VIRTUAL, TRUE);
+				if (ps)
+					site->prof = ps;
+			}
+			if (ps)
+				wj_prof_record_at (ps, WJ_SITE_VIRTUAL, vt, target, TRUE);
+		}
 		/* R208: RE-EMISSION TRIGGER. Enqueue the CALLER once it has missed here enough times.
 		 *
 		 * Why this site and not the interp->JIT entry the old trigger used: that one counts BOUNDARY
@@ -2874,6 +2981,9 @@ wasm_jit_drain_reemits (void)
 		if (!pm)
 			continue;
 		im = mono_interp_get_imethod (pm);
+		if (!im || im->wasm_jit_reemit_state != 1) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_SKIP_STATE);
+		}
 		if (!im || im->wasm_jit_reemit_state != 1)
 			continue;
 		{
@@ -2900,6 +3010,7 @@ wasm_jit_drain_reemits (void)
 				 * interp->JIT entry re-queues it through the ordinary trigger, by which time it may
 				 * actually be stale enough. */
 				im->wasm_jit_reemit_state = 0;
+				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_SKIP_AGE);
 				continue;
 			}
 		}
@@ -2916,7 +3027,17 @@ wasm_jit_drain_reemits (void)
 		 * which is the same constraint mono_wasm_jit_rebatch enforces when it refuses a batched member. */
 		if (old_e <= 0 || old_f <= 0 || mono_wasm_jit_desc_is_batched (im->wasm_jit_desc)) {
 			im->wasm_jit_reemit_state = 2;
-			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_REEMIT_REFUSED);
+			/* SPLIT, because these three lead to different fixes and merging them made the counter
+			 * unplannable -- and because this is a DIFFERENT site from the NO_PUBLISH printf below, which
+			 * is why that printf logged 0 while REFUSED read 466. BATCHED is the co-location conflict:
+			 * COLOCATE_DEPS ships 1 and targets the same hot set the IC-miss trigger selects, so it may
+			 * be refusing most of re-emission's candidates. REFUSED stays as the sum. */
+			if (G_UNLIKELY (mono_wasm_jit_stats)) {
+				mono_wasm_jit_count (WJC_REEMIT_REFUSED);
+				if (old_e <= 0)      mono_wasm_jit_count (WJC_REEMIT_NO_ESLOT);
+				else if (old_f <= 0) mono_wasm_jit_count (WJC_REEMIT_NO_FSLOT);
+				else                 mono_wasm_jit_count (WJC_REEMIT_BATCHED);
+			}
 			continue;
 		}
 		/* PIN THE SLOTS. mono_wasm_jit_self_reserved is what the emitter asks for its own e/f, and it is
@@ -7337,6 +7458,17 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
  * the wasm-JIT il_state and defer the actual catch to the wasm landing pad (no interp resume). */
 __thread MonoMethodILState *mono_wasm_jit_cur_island_il_state = NULL;
 
+/* Address of the per-thread current-island il_state slot, for the emitter's INLINE per-bb IL-offset
+ * store (imported global s.i). Same shape and same reason as mono_wasm_jit_slot_live_ptr_addr: the
+ * ADDRESS of a __thread variable is fixed for the thread's life, so a module compiled once and
+ * broadcast process-wide can still reach per-thread state -- the import is resolved per worker at
+ * INSTANTIATION, which is what makes this legal where baking a constant would not be. */
+MonoMethodILState **
+mono_wasm_jit_cur_island_il_state_addr (void)
+{
+	return &mono_wasm_jit_cur_island_il_state;
+}
+
 /* --- AOT-style in-method EH: per-thread "island" stack ------------------------------------------------
  * A JITted EH method's PROLOGUE calls mono_wasm_jit_enter_island(method) to push an IL_STATE LMFExt that
  * makes the method visible to mono's exception pass-1 (so pass-1 finds ITS catch as the nearest handler,
@@ -7459,13 +7591,35 @@ mono_wasm_jit_continue_unwind (void)
 /* Returns the MonoMethodILState this activation pushed, so a JITted prologue can keep it in a wasm local and
  * store its il_offset inline at each basic block instead of calling mono_wasm_jit_set_il_offset per bb. */
 gpointer
-mono_wasm_jit_enter_island (MonoMethod *method)
+mono_wasm_jit_enter_island (MonoMethod *method, int ndata)
 {
 	WjIsland *is;
 	MonoMethodILState *il;
+	gsize zbytes;
+	extern int mono_wasm_jit_island_ndata;
 	is = wj_island_at (wj_island_sp++);
 	il = (MonoMethodILState *) is->st;
-	memset (is->st, 0, sizeof (is->st));   /* zero method + il_offset + data[] (GC-scanned, kept NULL) */
+	/* ZERO ONLY WHAT THIS METHOD CAN USE. `st` is sized for WJ_ISLAND_DATA (256) args+locals, so the old
+	 * unconditional `sizeof (is->st)` memset cleared ~1040 bytes on EVERY EH-method entry -- ~260 i32
+	 * stores for a method that typically has ~10 args+locals, on an EH-dense Java workload. Measured
+	 * 0.83-0.92 M instr/frame in enter_island on the client render thread.
+	 *
+	 * Sound because nothing reads past `ndata`: every consumer indexes `il_state->data [findex]` at a
+	 * SIGNATURE-DERIVED index (interp.c's il_state entry path) and NULL-checks each read, so entries
+	 * beyond the method's own args+locals are unreachable. And they are not GC roots -- island chunks are
+	 * plain g_malloc0 (`wj_island_at`), never mono_gc_register_root'ed, and no GC path handles
+	 * MONO_LMFEXT_IL_STATE -- so stale bytes past `ndata` cannot be scanned either. (Frames ARE recycled
+	 * via wj_island_sp, so a shallow method can inherit a deeper one's tail; that is exactly the case the
+	 * two properties above make harmless.)
+	 *
+	 * The header zeroing is retained but is itself redundant: `method` and `il_offset` are both assigned
+	 * immediately below. Kept so `ext`/`data` alignment padding stays deterministic.
+	 * Knob-gated so the ABI (the extra parameter) is unconditional while the behaviour is A/B-able. */
+	if (ndata < 0 || ndata > WJ_ISLAND_DATA || !mono_wasm_jit_island_ndata)
+		zbytes = sizeof (is->st);
+	else
+		zbytes = sizeof (MonoMethodILState) + (gsize) ndata * sizeof (gpointer);
+	memset (is->st, 0, zbytes);
 	il->method = method;
 	il->il_offset = -1;
 	memset (&is->ext, 0, sizeof (is->ext));

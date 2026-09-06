@@ -220,6 +220,13 @@ struct InterpMethod {
 	 * whereas this trigger is an EVENT (the callee acquired an f-slot) and is already precise. Gating an
 	 * event-driven trigger on a staleness heuristic is how R179 got 17,343 enqueues for 3 re-emits. */
 	guint8 wasm_jit_heal_pending;
+	/* Has this method EVER been enqueued for re-emission? Distinct-method accounting, because every other
+	 * reemit counter is PER ATTEMPT and the drain re-enqueues on a lost compile CAS -- so `busy` and
+	 * `queued` are inflated by the same few methods cycling, and no ratio built from them means anything
+	 * (2026-09-06: `busy` 23,452 against `done` 207 was read as a 0.9% CAS win rate; it is not).
+	 * `done` and `refused` are already distinct (both set state 2, which is terminal); this supplies the
+	 * denominator they were missing. Sits in the padding after the two guint8s above -- costs nothing. */
+	guint8 wasm_jit_reemit_seen;
 	/* THE CALL PROFILE (MONO_WASM_JIT_DEVIRT_PROFILE): WjCallProfile*, lazily allocated. See the long
 	 * comment above WjProfSite in interp.c.
 	 *
