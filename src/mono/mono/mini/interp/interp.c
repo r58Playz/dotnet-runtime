@@ -1309,34 +1309,21 @@ wj_prof_record_delegate (InterpMethod *caller, MonoDelegate *del)
 	wj_prof_record (caller, invoke, WJ_SITE_DELEGATE, del->method, NULL, FALSE);
 }
 
-/*
- * The STABLE inline-cache identity for one emitted call site, allocated on first emission and reused by
- * every later one. See WjProfSite.site_id: this is what stops a re-emission from discarding the
- * worker-local PIC entries its predecessor warmed, and from burning another id out of WJ_VCALL_SITE_MAX.
+/* A fresh inline-cache site id, one per emitted site.
  *
- * Falls back to a fresh id when the caller has no profile block or its site table is full -- correct, just
- * not reusable, which is exactly the old behaviour for every site.
- */
+ * MONO_WASM_JIT_STABLE_IC_IDS used to make this reuse the CALL PROFILE's record id instead, so a
+ * re-emitted method kept its predecessor's warmed worker-local PIC entries. It is deleted, and the
+ * reason is a granularity trap worth keeping: a profile record is keyed by callee BASE METHOD (IL
+ * offsets are stale after generate_compacted_code), while an IC belongs to one CALL SITE. Two sites in
+ * one method calling the same base would share a PIC slot -- at the shipped vcall_ways of 1, a mutual
+ * eviction whenever they see different receivers -- and 6,345 emissions per boot would have taken an
+ * existing id, so it was neither a rounding error nor a refactor. A STABLE INLINE-CACHE ID IS NOT THE
+ * SAME GRANULARITY AS A PROFILE RECORD. */
 guint32
 mono_wasm_jit_prof_site_id (gpointer caller_ptr, MonoMethod *base, int kind, volatile gint32 *counter)
 {
-	extern int mono_wasm_jit_stable_ic_ids;
-	InterpMethod *caller = (InterpMethod *) caller_ptr;
-	WjProfSite *s;
-
-	if (!mono_wasm_jit_stable_ic_ids)
-		return (guint32) mono_atomic_inc_i32 (counter) - 1;
-	s = wj_prof_site (caller, base, (WjSiteKind) kind, TRUE);
-	if (s && s->site_id) {
-		wj_prof_ids_reused++;
-		return s->site_id;
-	}
-	{
-		guint32 id = (guint32) mono_atomic_inc_i32 (counter) - 1;
-		if (s)
-			s->site_id = id;
-		return id;
-	}
+	(void) caller_ptr; (void) base; (void) kind;
+	return (guint32) mono_atomic_inc_i32 (counter) - 1;
 }
 
 /*
@@ -2942,7 +2929,6 @@ static void
 wasm_jit_maybe_compile (InterpMethod *cmethod)
 {
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island, mono_wasm_jit_island_budget;
-	extern int mono_wasm_jit_over_aot;
 	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
 	/* Hotness gate. The bump MUST be atomic: wasm_jit_hits lives on the SHARED InterpMethod and is bumped
 	 * from every worker (render/server/pool) in the auto-walk. A plain `++` loses updates AND lets one
@@ -2958,12 +2944,14 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 	 * again, so it still re-fires exactly once per cycle. */
 	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) && mono_atomic_inc_i32 (&cmethod->wasm_jit_hits) == mono_wasm_jit_thresh) {
 		int r;
-		/* Normal policy: don't whole-method-JIT a method that already has AOT code. The OVER_AOT experiment
-		 * deliberately lets the same hotness/island machinery compile it again with the runtime wasm
-		 * emitter. code_type remains IMETHOD_CODE_COMPILED, so any emit/admission failure still reaches
-		 * the original AOT body through do_jit_call; only a successfully published slot redirects it. */
-		if (!mono_wasm_jit_over_aot &&
-		    mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
+		/* Don't whole-method-JIT a method that already has AOT code. MONO_WASM_JIT_OVER_AOT gated this,
+		 * letting the same hotness/island machinery compile it again with the runtime wasm emitter and
+		 * keeping code_type IMETHOD_CODE_COMPILED so any emit/admission failure still reached the AOT
+		 * body -- which is what made it safer than trimming the AOT set, where an emitter-refused method
+		 * drops to the INTERPRETER instead. Deleted because it STALLED AT BOOT, i.e. it was never usable.
+		 * The pool it aimed at is real (12.63% of the in-game window is AOT-compiled MANAGED code) and is
+		 * described where the knob was, in mini-wasm.c. */
+		if (mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
 			cmethod->wasm_jit_slot = -1;
 			return;
 		}
@@ -7198,27 +7186,11 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 	 * the unguarded path is identified instead of inferred. Reading has already excluded the mapping
 	 * (f{i}/e{i} export order), a crossed e/f, IMPORT_SLOT_CHANGED (0 in the repro), REBATCH_STALE (0), and
 	 * both bitmaps being process-wide (both are __thread). */
-	{
-		/* KNOB-GATED. mono_wasm_jit_eslot_probe is an EM_ASM call into JS; running it per invoke would
-		 * be a real cost on the hottest interp->JIT path, and once the bug is fixed the bad-case counter
-		 * never advances, so an "only until N bad ones" bound never expires. Default off. */
-		extern int mono_wasm_jit_slot_live (int slot);
-		extern int mono_wasm_jit_eslot_probe (int slot, int *out_len);
-		extern int mono_wasm_jit_eslot_verify;
-		static int _n = 0;
-		if (G_UNLIKELY (mono_wasm_jit_eslot_verify && slot > 0 && _n < 40)) {
-			int live = mono_wasm_jit_slot_live (slot), alen = -1;
-			int probe = mono_wasm_jit_eslot_probe (slot, &alen);
-			if (!live || probe != 1) {
-				_n++;
-				g_printerr ("WASM_JIT_ETHUNK_BAD slot=%d live=%d probe=%d arity=%d method=%s.%s\n",
-					(int) slot, live, probe, alen,
-					method && method->klass ? m_class_get_name (method->klass) : "?",
-					method ? method->name : "?");
-				fflush (stderr);
-			}
-		}
-	}
+	/* MONO_WASM_JIT_ESLOT_VERIFY's per-invoke probe stood here: read the table slot back from JS and
+	 * check it is thunk-shaped (arity 2, not the jiterpreter prefill's 4), an EM_ASM per interp->JIT
+	 * entry. It was the bring-up instrument for the prefilled-placeholder trap, and that trap now has a
+	 * real guard -- mono_wasm_jit_slot_live, the per-thread bitmap, checked at this gate and at every
+	 * f-slot bake. Deleted with the knob. */
 #endif
 	/* JIT frames live on the emscripten C stack: snapshot the SP so a caught C++ unwind (whose
 	 * native landing pads may or may not have run for the torn-through JIT frames) can be resynced
@@ -10577,23 +10549,12 @@ interp_call:
 		MINT_IN_CASE(MINT_JIT_CALL) {
 			InterpMethod *rmethod = (InterpMethod*)frame->imethod->data_items [ip [3]];
 #if HOST_BROWSER
-			/* transform.c replaces a statically-bound call with MINT_JIT_CALL when an AOT body exists.
-			 * That opcode used to bypass wasm_jit_maybe_compile, so merely relaxing the AOT eligibility
-			 * gate could only tier virtual or external-entry AOT methods. In OVER_AOT mode feed direct
-			 * calls through the same hotness/dispatch block as MINT_CALL. Advancing ip first gives the
-			 * JITted-call exception path the same resume address as the original do_jit_call below.
-			 * If compilation or admission fails, jit_call_aot executes that untouched AOT path. */
-			{
-				extern int mono_wasm_jit_over_aot;
-				if (G_UNLIKELY (mono_wasm_jit_over_aot)) {
-					cmethod = rmethod;
-					return_offset = ip [1];
-					call_args_offset = ip [2];
-					ip += 4;
-					WASM_JIT_TRY_INVOKE (jit_call_aot);
-					goto jit_call_aot;
-				}
-			}
+			/* MONO_WASM_JIT_OVER_AOT redirected MINT_JIT_CALL through the ordinary hotness/dispatch
+			 * block here, because transform.c replaces a statically-bound call with MINT_JIT_CALL when an
+			 * AOT body exists and that opcode bypassed wasm_jit_maybe_compile -- so merely relaxing the
+			 * AOT eligibility gate could only ever tier virtual or external-entry AOT methods. Deleted
+			 * with the knob (it stalled at boot). If that pool is picked up again, this redirect is half
+			 * the mechanism and the gate in wasm_jit_maybe_compile is the other half. */
 #endif
 			error_init_reuse (error);
 			/* for calls, have ip pointing at the start of next instruction */
