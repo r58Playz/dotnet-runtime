@@ -213,60 +213,6 @@ int mono_wasm_jit_island_ndata = 0;
  * usable signal there -- and delegates are ~20%% of executed dispatch with no devirt applied at all. */
 /* MONO_WASM_JIT_COLOCATE_HOPS: how many levels of callees a co-location group may grow through.
  * 1 = the seed's immediate depset only, which is the behaviour that plateaued at 30.1%% arm-local. */
-/* MONO_WASM_JIT_REPARTITION: registry size at which to run ONE global partition of the tier's call
- * graph, forming co-location groups wholesale instead of incrementally. 0 = off.
- *
- * WHY WHOLESALE. Incremental co-location groups a method with whatever it happened to call at the instant
- * it published, and every later attempt finds its neighbours already committed -- the append-only
- * partition. Measured: multi-hop expansion added 15 members across a whole run (R211). But the GRAPH is
- * not the obstacle. Partitioned globally over the same reloc edges, seed-and-grow reaches **83.6% of
- * EXECUTED call weight internal at 16 members, 88.8% at 32** (perf call chains, two captures, two
- * binaries, agreeing within ~2 points), with no hub: the hottest callee holds 2.4% of inbound weight.
- *
- * WHY IT SHRINKS THE TIER. Shadows currently do the PRIMARY job, paying a duplicate per (caller, callee)
- * pair: 32,110 copies = 48.3 MB, **50.4% of the tier**. Under a partition they are only needed for the
- * edges the partition CUTS, which is ~16% of them: 4,960 copies = 7.2 MB, and the tier goes 95.8 -> 54.7 MB
- * (-43%) while internal edges rise from ~60% to 84%. Both axes improve, which nothing else here has done.
- *
- * COST, and it is real: every re-framed member loses its TurboFan code and its accumulated
- * CallIndirectIC feedback and re-tiers from Liftoff (~15.4 ns/wire byte). Hence the per-call budget
- * below -- the work is spread over many interpreter ticks rather than taken as one multi-second stall,
- * because this workload never quiesces (R147) so there is no idle moment to hide it in.
- *
- * Run with MONO_WASM_JIT_COLOCATE_DEPS=0: rebatch refuses an already-batched member (re-framing one would
- * strand its siblings), so the partitioner must be the only thing forming groups or it inherits exactly
- * the committed-neighbour problem it exists to avoid. */
-/* MONO_WASM_JIT_REPARTITION_AUTO: percent of emitted bytes that must be SHADOW DUPLICATION before the
- * repartition is even considered. 0 = off (use the fixed REPARTITION registry threshold instead).
- *
- * A fixed registry count is the wrong trigger: the right moment depends on the shape of the program, and
- * a runtime mod drop-in changes that shape. Duplication share is self-tuning and directly measures the
- * thing the repartition exists to remove -- shadows currently sit at 50.4% of the tier.
- *
- * Crossing it only starts a COST ANALYSIS, never the rebuild: wj_repartition_decide runs the identical
- * BFS with no re-framing, counts what fraction of call edges the partition WOULD make internal, and
- * commits only if that clears REPARTITION_MIN_GAIN. The analysis is O(edges) and touches no module; the
- * re-framing it gates costs every member its TurboFan code and CallIndirectIC feedback, so the asymmetry
- * is the whole point of deciding first. */
-/* MONO_WASM_JIT_REPARTITION_AGAIN: re-arm the partition after the registry grows by this many methods.
- * 0 = one pass only.
- *
- * One pass covers only the tier that exists when it fires: measured, 5,381 members of ~24,000 methods,
- * and it predicts 55% where an offline partition of the FINISHED graph reaches 84%. The gap is not the
- * algorithm, it is that half the program had not been JITted yet.
- *
- * Re-arming keeps `taken[]` -- already-grouped methods are never reconsidered, which preserves the
- * partition property and matches what rebatch will accept anyway (it refuses an already-batched member,
- * since re-framing one would strand its siblings). So each pass partitions the NEW arrivals only, which
- * is cheap and is exactly the increment a runtime mod drop-in produces. */
-int mono_wasm_jit_repartition_again = 0;
-int mono_wasm_jit_repartition_auto = 0;
-/* Minimum percent of call edges the dry run must make internal for the rebuild to be worth its re-tiering
- * cost. Offline the same partition reaches 84% at 32 members, so a bar near 60 is conservative. */
-int mono_wasm_jit_repartition_min_gain = 60;
-int mono_wasm_jit_repartition = 0;
-/* Groups formed per call, so the rebuild is spread across ticks instead of one stall. */
-int mono_wasm_jit_repartition_budget = 24;
 int mono_wasm_jit_colocate_hops = 1;
 /* MONO_WASM_JIT_DELEGATE_DEVIRT: minimum percent of a delegate site's observations the dominant target
  * must hold before it gets a guarded DIRECT arm. 0 = off.
@@ -406,38 +352,50 @@ int mono_wasm_jit_scc_colocate = 1;
 int mono_wasm_jit_eslot_verify = 0;   /* MONO_WASM_JIT_ESLOT_VERIFY: before each interp->JIT entry, read the
                                        * table slot from JS and check it is thunk-shaped (arity 2, not the
                                        * jiterpreter prefill's 4). Diagnostic only -- an EM_ASM per invoke. */
-/* MONO_WASM_JIT_SHADOW: frame a private, unexported duplicate of each eligible LEAF callee into the
- * caller's module, so its call sites become `call <funcidx>`. See wj_collect_shadows for why leaf-only is
- * a correctness constraint and not caution.
+/* SHADOW COPIES ARE DELETED -- five knobs (SHADOW, SHADOW_MAX, SHADOW_BYTES, SHADOW_MODBYTES,
+ * SHADOW_NONLEAF), wj_shadow_candidate, wj_collect_shadows, wj_verify_module_exports, the ranking
+ * pass, the per-module byte budget and eleven counters.
  *
- * DEFAULT 0 until it has been measured. Unlike co-location this one costs WIRE BYTES per caller -- the
- * duplicate is per module -- so the counters to read first are SHADOW_BYTES against BYTES_GENERATED, and
- * CALL_LOCAL against CALL_INDIRECT. Co-location converted 163 sites tier-wide (R166); the reason to expect
- * more here is that a shadow is not claimed exclusively by one caller, so the same leaf can convert sites
- * in every module that calls it. */
-int mono_wasm_jit_shadow = 0;
-int mono_wasm_jit_shadow_max = 8;     /* MONO_WASM_JIT_SHADOW_MAX: distinct shadows per module */
-/* MONO_WASM_JIT_SHADOW_BYTES: per-shadow wire-size cap, defaulting to V8's own wasm_inlining_max_size
- * (500 bytes, src/flags/flag-definitions.h:2170-2192). Above it the shadow still buys the direct call but
- * no longer buys the inline, while costing a full copy of the body in every caller that takes one. */
-int mono_wasm_jit_shadow_bytes = 500;
-/* MONO_WASM_JIT_SHADOW_MODBYTES: TOTAL shadow bytes duplicated into one module, 0 = unbounded.
- * SHADOW_BYTES caps one callee; this caps the module. R200 measured the cost side that SHADOW_BYTES
- * cannot control: raising the per-callee cap 500 -> 2000 took bodies 112,202 -> 168,005 (+50%), which is
- * real wire size at ~15.4 ns/byte of V8 compile time. A module budget lets a big HOT callee in while
- * still bounding total duplication, which is the trade the per-callee cap forces you to make globally. */
-int mono_wasm_jit_shadow_modbytes = 0;
-/* MONO_WASM_JIT_SHADOW_NONLEAF: allow shadowing a callee that itself makes calls.
+ * The mechanism WORKED and is well understood. A shadow is a private, unexported DUPLICATE of a
+ * callee's body placed in the caller's module: the callee keeps its own standalone module and slots,
+ * every caller may hold its own copy, and wj_asm_member_of then resolves the call to `call <funcidx>`
+ * -- one `call rel32` instead of a ~15-instruction call_indirect, and the only call form V8 will
+ * inline through. It is also the ONLY mechanism that bypasses a partition, which is why it beat
+ * co-location by 21 points where doubling COLOCATE_MAX was worth 1.5 (R195/R200: co-location is a
+ * partition, so a hot callee shared by five callers co-locates with exactly one of them).
  *
- * The leaf restriction is not arbitrary -- a shadow's unresolved callees become `call_indirect`
- * dependencies OF THE HOST MODULE, which admission must bring live before the host may publish. What makes
- * relaxing it possible is that those deps are now MERGED into the host's direct-dep list after framing, so
- * admission sees them; and R166 made dep-closure admission actually work, which it did not before.
+ * It goes on COST against an unmeasurable benefit.
  *
- * Why it is worth the risk: R167 measured 449 of 449 shadow refusals as `notleaf` and ZERO as `nojit`. The
- * leaf rule is not a small filter, it is the entire constraint -- acceptance ran ~0.4%, so a 60 s window
- * often created no shadows at all and the feature could not be evaluated either way. */
-int mono_wasm_jit_shadow_nonleaf = 0;
+ * THE PRICE, matched pair, one binary, one session (tier-p1ctl vs tier-p1sh):
+ *
+ *      shipped, no shadows   27,011 modules   56.69 MB   76,528 functions   2.83 funcs/module
+ *      shadow=1 nonleaf=1    27,508 modules   73.96 MB  124,031 functions   4.51
+ *                              +1.8%           +30.5%      +62.1%
+ *
+ * Module count FLAT while bytes and functions explode -- which is the check R214 demands, and it says
+ * this is DUPLICATION rather than more methods compiled, so the bytes are pure cost. +17.3 MB of wasm
+ * for V8 to compile and hold, on a tier already at 3.15x native L1i misses and 4.96x native iTLB
+ * misses per million instructions.
+ *
+ * THE BENEFIT WAS NEVER TIMED, in ~35 rounds. R200 says so outright ("No timing. Every number here is
+ * a static call-form census"); R202 repeats it. Every shadow result is vcallreach.py counting call
+ * FORMS. The timing measurement has now been taken -- a matched perf arm on the plateau protocol --
+ * and it cannot be separated from a monotonic global drift at n=1: every symbol including BOTH
+ * negative controls and the client-thread total fell in run order, and the trailing control came back
+ * ABOVE the leading one. A mechanism whose effect is below that floor is not worth +30.5% bytes.
+ *
+ * And the pool it targets is bounded four independent ways: branch mispredicts are 0.59x native's;
+ * doubling module-local direct calls moved the prologue band 0.28 points; converting EVERY call to
+ * direct is worth ~13% of frame (R171) and only 39.2% of dispatch can ever be direct (R203); and the
+ * one shadow-family arm that WAS timed -- co-location's merge -- read parity over 12 runs in both
+ * orders (R194).
+ *
+ * wasm_module_assemble's `nexport` parameter and enctest t4 are KEPT deliberately. `nexport` is two
+ * lines in the encoder, t4 is the only gate that reaches `nexport < nmembers`, and per-class module
+ * grouping (the strongest remaining architectural lead) wants exactly that shape for cold siblings.
+ * Deleting a tested encoder capability to save a parameter, then re-deriving the layout and rewriting
+ * the gate, is the churn "a gate that cannot reach the case a change introduces is not evidence"
+ * exists to prevent. Nothing in the emitter produces that layout today. */
 /* RE-EMISSION IS DELETED -- its four knobs (REEMIT, REEMIT_IC, REEMIT_AFTER, REEMIT_AGE), its
  * `in_reemit` census flag, its ring, drain and pin lived here and in interp.c. See the long note where
  * the ring used to be (interp.c) for the control-bracketed arm that closed it and for what it costs:
@@ -633,11 +591,6 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_force_alt; const char *fa = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_ALT"); mono_wasm_jit_devirt_force_alt = (fa && *fa && *fa != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_ilofs_global; const char *ig = g_getenv ("MONO_WASM_JIT_ILOFS_GLOBAL"); mono_wasm_jit_ilofs_global = (ig && *ig && *ig != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_island_ndata; const char *nd = g_getenv ("MONO_WASM_JIT_ISLAND_NDATA"); mono_wasm_jit_island_ndata = (nd && *nd && *nd != '0') ? 1 : 0; }
-	{ extern int mono_wasm_jit_repartition_again; const char *rg2 = g_getenv ("MONO_WASM_JIT_REPARTITION_AGAIN"); int v = (rg2 && *rg2) ? atoi (rg2) : 0; mono_wasm_jit_repartition_again = (v >= 0) ? v : 0; }
-	{ extern int mono_wasm_jit_repartition_auto; const char *ra = g_getenv ("MONO_WASM_JIT_REPARTITION_AUTO"); int v = (ra && *ra) ? atoi (ra) : 0; mono_wasm_jit_repartition_auto = (v >= 0 && v <= 100) ? v : 0; }
-	{ extern int mono_wasm_jit_repartition_min_gain; const char *rg = g_getenv ("MONO_WASM_JIT_REPARTITION_MIN_GAIN"); int v = (rg && *rg) ? atoi (rg) : 60; mono_wasm_jit_repartition_min_gain = (v >= 0 && v <= 100) ? v : 60; }
-	{ extern int mono_wasm_jit_repartition; const char *rp = g_getenv ("MONO_WASM_JIT_REPARTITION"); int v = (rp && *rp) ? atoi (rp) : 0; mono_wasm_jit_repartition = (v >= 0) ? v : 0; }
-	{ extern int mono_wasm_jit_repartition_budget; const char *rb = g_getenv ("MONO_WASM_JIT_REPARTITION_BUDGET"); int v = (rb && *rb) ? atoi (rb) : 24; mono_wasm_jit_repartition_budget = (v >= 1 && v <= 4096) ? v : 24; }
 	{ extern int mono_wasm_jit_colocate_hops; const char *ch = g_getenv ("MONO_WASM_JIT_COLOCATE_HOPS"); int v = (ch && *ch) ? atoi (ch) : 1; mono_wasm_jit_colocate_hops = (v >= 1 && v <= 8) ? v : 1; }
 	{ extern int mono_wasm_jit_delegate_devirt; const char *dd = g_getenv ("MONO_WASM_JIT_DELEGATE_DEVIRT"); int v = (dd && *dd) ? atoi (dd) : 0; mono_wasm_jit_delegate_devirt = (v >= 0 && v <= 100) ? v : 0; }
 	{ extern int mono_wasm_jit_pred_pct; const char *pp = g_getenv ("MONO_WASM_JIT_PRED_PCT"); int v = (pp && *pp) ? atoi (pp) : 0; mono_wasm_jit_pred_pct = (v >= 0 && v <= 100) ? v : 0; }
@@ -656,11 +609,6 @@ mono_wasm_jit_auto_init (void)
 	 * Every co-location measurement taken before this fix was on that arm. Expected to become non-binding
 	 * once COLOCATE_TIGHT_DEPS lands: a correct dep list is what made cross-group edges want to be imports. */
 	{ extern int mono_wasm_jit_eslot_verify; const char *ev = g_getenv ("MONO_WASM_JIT_ESLOT_VERIFY"); mono_wasm_jit_eslot_verify = (ev && *ev) ? (*ev != '0') : 0; }
-	{ extern int mono_wasm_jit_shadow; const char *sh = g_getenv ("MONO_WASM_JIT_SHADOW"); mono_wasm_jit_shadow = (sh && *sh) ? (*sh != '0') : 0; }
-	{ extern int mono_wasm_jit_shadow_max; const char *sm = g_getenv ("MONO_WASM_JIT_SHADOW_MAX"); int v = (sm && *sm) ? atoi (sm) : 8; mono_wasm_jit_shadow_max = (v >= 0 && v <= 64) ? v : 8; }
-	{ extern int mono_wasm_jit_shadow_bytes; const char *sb = g_getenv ("MONO_WASM_JIT_SHADOW_BYTES"); int v = (sb && *sb) ? atoi (sb) : 500; mono_wasm_jit_shadow_bytes = (v >= 0 && v <= 65536) ? v : 500; }
-	{ extern int mono_wasm_jit_shadow_modbytes; const char *sb = g_getenv ("MONO_WASM_JIT_SHADOW_MODBYTES"); int v = (sb && *sb) ? atoi (sb) : 0; mono_wasm_jit_shadow_modbytes = (v >= 0 && v <= 1048576) ? v : 0; }
-	{ extern int mono_wasm_jit_shadow_nonleaf; const char *sn = g_getenv ("MONO_WASM_JIT_SHADOW_NONLEAF"); mono_wasm_jit_shadow_nonleaf = (sn && *sn) ? (*sn != '0') : 0; }
 	{ extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
 	  const char *cd = g_getenv ("MONO_WASM_JIT_COLOCATE_DEPS"); mono_wasm_jit_colocate_deps = (cd && *cd) ? (*cd != '0') : 1;
 	  { extern int mono_wasm_jit_colocate_merge; const char *cg = g_getenv ("MONO_WASM_JIT_COLOCATE_MERGE"); mono_wasm_jit_colocate_merge = (cg && *cg && *cg != '0') ? 1 : 0; }
@@ -1348,7 +1296,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 170);   /* re-emission subsystem deleted: -13 REEMIT_*, -PRETIER_BUMP, -HEAL_WOKEN; +3 DELEGATE_SLOW_* */
+g_static_assert (WJC_MAX == 147);   /* shadows and global repartition deleted: -15 SHADOW_*, -8 REPART_* */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1483,12 +1431,6 @@ mono_wasm_jit_dump_stats (void)
 	/* R167_SHADOW. members = private leaf duplicates framed in; bytes = their wire cost, which is paid
 	 * per CALLER module; refused = call relocations that did not qualify. The reach question is
 	 * call_local vs call_indirect above, not this count. */
-	printf ("[wasm-jit shadow] members=%lld bytes=%lld refused=%lld | nojit=%lld stale=%lld notleaf=%lld eh=%lld big=%lld cap=%lld unframed=%lld depcap=%lld (SHADOW=%d MAX=%d BYTES=%d NONLEAF=%d)\n",
-		WJC_(WJC_SHADOW_MEMBERS), WJC_(WJC_SHADOW_BYTES), WJC_(WJC_SHADOW_REFUSED),
-		WJC_(WJC_SHADOW_NOJIT), WJC_(WJC_SHADOW_STALE), WJC_(WJC_SHADOW_NOTLEAF),
-		WJC_(WJC_SHADOW_EH), WJC_(WJC_SHADOW_BIG), WJC_(WJC_SHADOW_CAP), WJC_(WJC_SHADOW_UNFRAMED), WJC_(WJC_SHADOW_DEPCAP),
-		mono_wasm_jit_shadow, mono_wasm_jit_shadow_max, mono_wasm_jit_shadow_bytes,
-		mono_wasm_jit_shadow_nonleaf);
 	printf ("[wasm-jit vtabi] vt_byaddr_methods=%lld vret_methods=%lld\n",
 		WJC_(WJC_VT_BYADDR_METHODS), WJC_(WJC_VRET_METHODS));
 	{
@@ -1506,10 +1448,9 @@ mono_wasm_jit_dump_stats (void)
 	 * effect nil at a 0.057%% ceiling). The census stays: it sizes the pool a relocatable f-slot hole
 	 * would address, which is what R195 argues for instead. */
 	printf ("[wasm-jit heal] late-f-slot healing sites emitted=%lld\n", WJC_(WJC_HEAL_SITES));
-	printf ("[wasm-jit asm-hygiene] shadow_self=%lld asm_noname=%lld -- shadow_self closes SHADOW_REFUSED's\n"
-		"  parts-sum (refused == stale+eh+big+self); asm_noname MUST be 0 or perf symbolisation silently\n"
-		"  degrades to a bare 'wasmjit' for that method and every name-resolving instrument goes blind.\n",
-		WJC_(WJC_SHADOW_SELF), WJC_(WJC_ASM_NONAME));
+	printf ("[wasm-jit asm-hygiene] asm_noname=%lld -- MUST be 0, or perf symbolisation silently degrades\n"
+		"  to a bare 'wasmjit' for that method and every name-resolving instrument goes blind.\n",
+		WJC_(WJC_ASM_NONAME));
 	printf ("[wasm-jit transition] residual_healed=%lld fast_delegate=%lld delegate_ic_hit=%lld (fast counters require PROFILE_FAST=1)\n",
 		WJC_(WJC_RESIDUAL_HEALED), WJC_(WJC_FAST_DELEGATE), WJC_(WJC_DELEGATE_IC_HIT));
 	/* WHY a delegate dispatch missed the direct e-thunk. call_delegate is 97% of call_interp's traffic
@@ -1556,27 +1497,6 @@ mono_wasm_jit_dump_stats (void)
 		"  read 7,582 while hiding a reader that could never succeed at a delegate site (it required\n"
 		"  id_targets, always NULL there because the identity IS the target). Fourth such bucket found in\n"
 		"  one session: a counter reachable two ways is not a diagnosis.\n", WJC_(WJC_DELEGATE_DEVIRT_NOREC));
-	printf ("[wasm-jit repartition] groups=%lld members=%lld singleton=%lld fail=%lld"
-		"  (MONO_WASM_JIT_REPARTITION=%d budget=%d)\n"
-		"  One GLOBAL partition of the reloc call graph, formed wholesale. Offline the same edge set\n"
-		"  partitions to 83.6%% of EXECUTED call weight internal at 16 members and 88.8%% at 32, and moves\n"
-		"  shadows from PRIMARY to RESIDUAL: 32,110 copies / 48.3 MB -> ~4,960 / 7.2 MB, tier -43%%.\n"
-		"  Needs COLOCATE_DEPS=0: rebatch refuses an already-batched member, so incremental co-location\n"
-		"  running alongside re-creates the committed-neighbour problem this exists to avoid.\n"
-		"  A high `singleton` share means the graph was not yet reachable when it ran, not that\n"
-		"  partitioning fails -- raise MONO_WASM_JIT_REPARTITION so more of the tier is registered.\n",
-		WJC_(WJC_REPART_GROUP), WJC_(WJC_REPART_MEMBERS), WJC_(WJC_REPART_SINGLETON),
-		WJC_(WJC_REPART_FAIL), mono_wasm_jit_repartition, mono_wasm_jit_repartition_budget);
-	printf ("[wasm-jit repartition-auto] analyses=%lld predicted-internal=%lld%%"
-		"  (AUTO=%d%% of tier duplicated, MIN_GAIN=%d%%)\n"
-		"  Trigger is DUPLICATION SHARE, not a registry count: the right moment depends on program shape\n"
-		"  and a mod drop-in changes it. Crossing the bar buys one O(edges) dry run, never a rebuild.\n"
-		"  analyses=1 with groups=0 means the partition was measured and REFUSED -- a result, not a bug.\n",
-		WJC_(WJC_REPART_ANALYSED), WJC_(WJC_REPART_PREDICTED),
-		mono_wasm_jit_repartition_auto, mono_wasm_jit_repartition_min_gain);
-	printf ("[wasm-jit repartition-edges] call edges the dry run saw=%lld -- ZERO means the graph was not\n"
-		"  reachable when it ran (too few callees registered), NOT that partitioning fails. Those two were\n"
-		"  one bucket in the first version and it read as a refusal.\n", WJC_(WJC_REPART_EDGES));
 	printf ("[wasm-jit colocate-hops] members added past the seed's own depset=%lld"
 		"  (MONO_WASM_JIT_COLOCATE_HOPS=%d)\n"
 		"  Read against colocated_members. Near-zero means the depsets are too THIN at publish time and\n"
@@ -2322,7 +2242,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				return 0;
 			}
 			/* A method re-registering onto the f-slot it already owns. Re-emission was the original producer of
-	 * this and is gone; rebatch/repartition re-framing is what reaches it now. */
+	 * this and is gone; rebatch re-framing is what reaches it now. */
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_FSLOT_REREGISTER);
 		}
 		if (ci < WJ_REG_NCHUNKS) {
@@ -5849,27 +5769,6 @@ wj_emit_fast_count (WasmBuf *body, int idx)
  * Everything one method contributes to a module, with nothing about the module baked in. This is the unit
  * that gets stored (WjRegEntry.body) and re-framed.
  */
-/* Hard ceiling on shadows per module, independent of MONO_WASM_JIT_SHADOW_MAX: the member array is a
- * stack local on the emit path.
- *
- * R201 raised this 16 -> 48, and the 16 had been SILENTLY CLAMPING the knob: R200's `shadow_max=32` arm
- * actually ran at 16 (the caller clamps, `cap > WJ_SHADOW_MAX`), so "raising the count cap bought only
- * +0.8 points" was a measurement of 8 -> 16 wearing a 32 label. Comment rule #1 in a new place: the knob's
- * range was stated at its initialiser and enforced here.
- *
- * Raising it is only worth anything BECAUSE selection is now ranked. Under encounter order a bigger cap
- * just admits more of whatever the encoder emitted first; ranked, the extra slots go to the best
- * sites/bytes candidates. The measured justification: at cap 16 with `shadow_bytes=2000`, ShadowCap
- * refused 3,628 and ShadowBig 3,654 against 7,243 surviving indirect arms -- i.e. the two caps had become
- * co-equal and nearly the whole remainder.
- *
- * Stack cost is the reason for a ceiling at all: WjAsmMember am[1+N] plus WjAsmDeps sdeps[1+N] plus the
- * ranking staging array, ~8 KB at N=48 against a measured 143 KB of 8 MB in use (1.7%, the R198 probe). */
-#define WJ_SHADOW_MAX 48
-/* Ranking input bound for wj_collect_shadows' selection pass. Larger than WJ_SHADOW_MAX on purpose:
- * the point of ranking is to CHOOSE the best WJ_SHADOW_MAX out of more than that many candidates. */
-#define WJ_SHADOW_CAND_MAX 128
-
 typedef struct _WjBody {
 	MonoMethod    *method;
 	/* FULL NAME, RESOLVED AT EMIT TIME AND OWNED HERE. Not derived later from `method`, and that is a
@@ -5984,11 +5883,6 @@ typedef struct {
 	/* MONO_WASM_JIT_DIRECT_IMPORT: a JITted callee may become an import. Soundness is decided PER EDGE by
 	 * wj_asm_method_importable, not by this flag -- see wj_asm_reaches for the cycle argument. */
 	guint8 local_calls;      /* resolve a co-located callee to `call <funcidx>` */
-	/* SHADOWS. Resolve a call to a member that is present ONLY as a private duplicate -- see
-	 * wj_collect_shadows. Separate from local_calls because the two answer different questions: a shadow
-	 * is never the self member, so this must NOT change how a self-recursive call is emitted (which
-	 * local_calls = FALSE has always kept indirect for a lone method). */
-	guint8 shadow_calls;
 	guint8 names;            /* MONO_WASM_JIT_NAMES: append the name section */
 	int    max_fimports;         /* mono_wasm_jit_max_himp */
 } WjAsmPolicy;
@@ -6269,266 +6163,19 @@ wj_member_from_body (WjAsmMember *m, WjBody *b, int f_slot)
 	m->eh_tpool      = b->eh_tpool;
 }
 
-#ifdef HOST_BROWSER
-/*
- * SHADOW COPIES -- the reach mechanism co-location does not have.
+/* wj_shadow_candidate, WjShadowCand and wj_collect_shadows lived here -- the eligibility test, the
+ * sites/bytes ranking pass (R201: a shadow costs its body once per module and repays once per SITE, so
+ * ranking beat encounter order at 63.7% vs 62.2% arm-local with 2.8% FEWER bodies) and the per-module
+ * byte budget. Deleted with the feature; see the note at the knobs for the +30.5% wire bytes / +62.1%
+ * functions it cost and for the fact that its benefit was never once timed in ~35 rounds.
  *
- * Co-location moves a callee INTO the caller's module, so a callee belongs to exactly one group and the
- * first caller to publish claims it. That is why R166 measured 163 converted call sites against a tier of
- * roughly 500k: the mechanism is bounded by methods, not by call sites.
- *
- * A shadow is a private, unexported DUPLICATE of the callee's body placed in the caller's module. It owns
- * no table slot, is exported nowhere, and cannot be instantiated over -- so the callee keeps its own
- * standalone module and its own slots, and every caller may hold its own copy. wj_asm_member_of then
- * resolves the call to `call <funcidx>`: one x86 `call rel32` instead of a ~15-instruction call_indirect
- * dispatch, and the only call form V8 will inline through.
- *
- * LEAF ONLY, and that restriction is load-bearing rather than conservative. A shadow's body carries its own
- * relocations, and any callee it does not resolve module-locally becomes a `call_indirect` dependency OF THE
- * HOST MODULE -- which admission must then bring live before the host can publish. Shadowing a non-leaf
- * would drag its whole callee closure into the host's admission set, which is precisely the constraint that
- * made co-location hard. `uses_calls == 0` is already computed per body, so leaf-ness is a flag rather than
- * an analysis.
- *
- * The size cap defaults to V8's own inlining limit: above it a shadow still buys the direct call but no
- * longer buys the inline, while costing a full duplicate of the body in every caller that takes one.
- */
-static WjBody *
-wj_shadow_candidate (MonoMethod *callee, MonoMethod *self)
-{
-	extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
-	extern int mono_wasm_jit_shadow_bytes;
-	WjRegEntry *re;
-	WjBody *b;
-	int fslot, desc;
-
-	if (!callee || callee == self) {
-		/* Self-recursion. Counted so wj_collect_shadows' SHADOW_REFUSED tally has a complete parts-sum;
-		 * this is not a policy refusal and no knob can or should reach it. */
-		if (G_UNLIKELY (mono_wasm_jit_stats) && callee)
-			mono_wasm_jit_count (WJC_SHADOW_SELF);
-		return NULL;
-	}
-	fslot = mono_wasm_jit_get_callee_fslot (callee);
-	if (fslot <= 0) {
-		/* No f-slot means no relocatable body: the callee is AOT / main-module code, or has not been
-		 * JITted yet. NO shadow policy can reach this bucket -- only shrinking the AOT set can. */
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_NOJIT);
-		return NULL;
-	}
-	desc = wj_desc_for_fslot (fslot);
-	re = (desc > 0 && desc <= wj_reg_n) ? wj_reg_at (desc - 1) : NULL;
-	if (!re || !re->body || re->body->method != callee) {
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_STALE);
-		return NULL;                     /* stale f-slot -> descriptor mapping; not our callee */
-	}
-	b = re->body;
-	if (b->uses_calls) {
-		extern int mono_wasm_jit_shadow_nonleaf;
-		/* Refused by POLICY, not by physics: this callee is ours and has a body. Under
-		 * MONO_WASM_JIT_SHADOW_NONLEAF the shadow is taken anyway and its surviving indirect callees are
-		 * merged into the HOST's direct-dep list after framing, so admission orders them. Still counted,
-		 * so the accepted-vs-refused split stays readable with the knob on. */
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_NOTLEAF);
-		if (!mono_wasm_jit_shadow_nonleaf)
-			return NULL;
-	}
-	if (b->uses_eh_tag) {
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_EH);
-		return NULL;                     /* an EH tag is a module-level import the host may not share */
-	}
-	if ((int) b->f_body.len > mono_wasm_jit_shadow_bytes) {
-		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_BIG);
-		return NULL;
-	}
-	return b;
-}
-
-/*
- * Walk a body's call relocations and append a shadow member for every distinct eligible leaf callee.
- * Returns how many were appended. `out` must have room for `max` entries.
- */
-/* One ranking candidate: an eligible shadow body plus how many sites in the host module it converts. */
-typedef struct {
-	WjBody     *b;
-	MonoMethod *m;
-	int         sites;
-} WjShadowCand;
-
-static int
-wj_collect_shadows (const WasmBuf *body, MonoMethod *self, WjAsmMember *out, int max)
-{
-	extern int mono_wasm_jit_shadow_modbytes;
-	const WasmRelocs *rl = body ? body->relocs : NULL;
-	/* Staging array for the ranking input. 64 x 16 B = 1 KB of frame, and the stack probe measured
-	 * 143 KB of 8 MB in use (1.7%), so this is not the array that has to be heap-allocated. */
-	WjShadowCand cand [WJ_SHADOW_CAND_MAX];
-	WjBody *fresh;
-	int ncand = 0, n = 0, j;
-	gint64 spent = 0;
-	guint32 k;
-
-	/* PASS 1 -- eligible distinct callees, each with the number of sites IN THIS MODULE it would convert. */
-	for (k = 0; rl && k < rl->n; ++k) {
-		MonoMethod *callee;
-		WjBody *b;
-		if (rl->r [k].kind != WASM_RELOC_CALL)
-			continue;
-		callee = (MonoMethod *) rl->r [k].sym;
-		/* One copy per module however many sites call it -- the duplicate is per MODULE while the win is
-		 * per SITE, which is both why this beats co-location on reach and why `sites` is the value term. */
-		for (j = 0; j < ncand; ++j)
-			if (cand [j].m == callee) { cand [j].sites++; break; }
-		if (j < ncand)
-			continue;
-		if (ncand >= WJ_SHADOW_CAND_MAX) {
-			/* The RANKING INPUT was truncated, which is a different failure from either cap: the best
-			 * candidate may be the one we never looked at. Must stay small or the ranking is a lie. */
-			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_CANDCAP);
-			continue;
-		}
-		b = wj_shadow_candidate (callee, self);
-		if (!b) {
-			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_REFUSED);
-			continue;
-		}
-		cand [ncand].b = b;
-		cand [ncand].m = callee;
-		cand [ncand].sites = 1;
-		++ncand;
-	}
-
-	/* PASS 2 -- SELECTION ORDER, which before R201 was whatever order the encoder emitted relocations in.
-	 * A shadow costs its body ONCE per module and pays back once per SITE, so the greedy that maximises
-	 * conversion per duplicated byte takes sites/bytes descending. Encounter order spends a 16-slot cap on
-	 * the first 16 callees the body happens to mention, which is why R200 read the count cap as
-	 * "nearly non-binding": the cap was not the constraint, the ORDER was. Selection sort, ncand <= 64,
-	 * once per emitted module. Cross-multiply rather than divide -- integer division would tie everything
-	 * with more bytes than sites into one bucket. */
-	while (n < max && n < ncand) {
-		int best = n;
-		for (j = n + 1; j < ncand; ++j) {
-			gint64 lv = (gint64) cand [j].sites * (gint64) cand [best].b->f_body.len;
-			gint64 rv = (gint64) cand [best].sites * (gint64) cand [j].b->f_body.len;
-			if (lv > rv)
-				best = j;
-		}
-		if (best != n) {
-			WjShadowCand t = cand [n];
-			cand [n] = cand [best];
-			cand [best] = t;
-		}
-		if (mono_wasm_jit_shadow_modbytes > 0 &&
-		    spent + (gint64) cand [n].b->f_body.len > (gint64) mono_wasm_jit_shadow_modbytes) {
-			/* Budget test on the SNAPSHOT size is deliberate: it is a cost heuristic, and re-fetching
-			 * here would resolve a body we are about to discard. The framed size below is the fresh one. */
-			/* Budget exhausted. Do NOT break: a later candidate may be small enough to still fit, and
-			 * skipping it would make the budget behave like a cap on the ranked PREFIX rather than on
-			 * bytes. Swap it out of contention by shrinking ncand. */
-			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_MODCAP);
-			cand [n] = cand [ncand - 1];
-			--ncand;
-			continue;
-		}
-		/* RE-VALIDATE AT THE POINT OF USE. This is not belt-and-braces; it is the whole reason this
-		 * two-pass shape is safe at all.
-		 *
-		 * A WjBody lives in wj_reg and is shared MUTABLE state owned by whichever thread compiled it.
-		 * wj_shadow_candidate's checks -- the desc->body->method identity test above all -- are true
-		 * only at the instant they run. The pre-R201 loop resolved and consumed a candidate in the SAME
-		 * iteration, so that window was a few instructions wide. Ranking necessarily separates the two,
-		 * and the first version of R201 carried 64 raw WjBody pointers across the entire relocation
-		 * walk before framing any of them: measured result was `function signature mismatch` x3 and a
-		 * wedged world load, i.e. a shadow framed from a body that had been retired or replaced.
-		 *
-		 * So pass 1's snapshot decides ORDER ONLY -- a stale size just mis-ranks, which costs nothing --
-		 * and the body actually framed is re-fetched here. FOURTH subsystem to need this: same shape as
-		 * the R199 name-section fault (resolve on one thread, use later on another). The rule is
-		 * RESOLVE AND CONSUME IN THE SAME BREATH, or re-resolve at the point of use. */
-		fresh = wj_shadow_candidate (cand [n].m, self);
-		if (!fresh) {
-			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_REVALIDATE);
-			cand [n] = cand [ncand - 1];
-			--ncand;
-			continue;
-		}
-		/* f_slot 0: a shadow owns no slot. It must never be the target of the cycle test, and nothing
-		 * may instantiate over it. */
-		wj_member_from_body (&out [n], fresh, 0);
-		spent += (gint64) fresh->f_body.len;
-		if (G_UNLIKELY (mono_wasm_jit_stats)) {
-			mono_wasm_jit_count (WJC_SHADOW_MEMBERS);
-			mono_wasm_jit_add (WJC_SHADOW_BYTES, (gint64) fresh->f_body.len);
-		}
-		++n;
-	}
-	/* Ranked candidates that the COUNT cap left on the table, counted per candidate rather than per
-	 * relocation -- the pre-R201 site bumped this once per reloc past the cap, which double-counted a
-	 * callee with many sites and made the cap look more binding than it was. */
-	if (G_UNLIKELY (mono_wasm_jit_stats))
-		for (j = n; j < ncand; ++j)
-			mono_wasm_jit_count (WJC_SHADOW_CAP);
-	return n;
-}
-#endif /* HOST_BROWSER */
-
-/*
- * Decode a freshly framed module's export section and confirm it names what the instantiate path will ask
- * for. Runs only when the module carries shadows, which is the only layout `nexport < nmembers` produces.
- *
- * WHY IN C, AT EMIT TIME. R167's shadow arm failed with
- *   TypeError: WebAssembly.Table.set(): function-typed object must be null or a WebAssembly function
- * 959,405 times -- `inst.exports.e` undefined -- and the message names a table slot, not a method, so it
- * cannot say WHICH module is malformed. enctest's t4 gate proves the layout is right for SYNTHETIC members,
- * so the fault is in the real ones; that gap is exactly what an emit-time check over real bytes closes.
- * Returns TRUE if the module looks instantiable.
- */
-static gboolean
-wj_verify_module_exports (const WasmBuf *out, int nexport, const char *mname, int nshadow)
-{
-	guint32 off = 8, want = (guint32) nexport * 2, seen = 0;
-	int have_f = 0, have_e = 0;
-
-	if (!out || out->len < 8)
-		return FALSE;
-	while (off < out->len) {
-		guint32 id, len, end, sh, b;
-		id = out->data [off++];
-		len = 0; sh = 0;
-		do { b = out->data [off++]; len |= (b & 0x7f) << sh; sh += 7; } while ((b & 0x80) && off < out->len);
-		end = off + len;
-		if (end > out->len)
-			break;
-		if (id == 7) {
-			guint32 cnt = 0, k;
-			sh = 0;
-			do { b = out->data [off++]; cnt |= (b & 0x7f) << sh; sh += 7; } while ((b & 0x80) && off < end);
-			seen = cnt;
-			for (k = 0; k < cnt && off < end; ++k) {
-				guint32 nlen = 0;
-				sh = 0;
-				do { b = out->data [off++]; nlen |= (b & 0x7f) << sh; sh += 7; } while ((b & 0x80) && off < end);
-				if (nlen == 1 && off < end) {
-					if (out->data [off] == 'f') have_f = 1;
-					else if (out->data [off] == 'e') have_e = 1;
-				}
-				off += nlen;
-				off++;                                  /* kind byte */
-				sh = 0;
-				do { b = out->data [off++]; sh += 7; } while ((b & 0x80) && off < end);
-			}
-		}
-		off = end;
-	}
-	if (seen != want || (nexport == 1 && (!have_f || !have_e))) {
-		static int _n = 0;
-		if (_n++ < 20)
-			printf ("WASM_JIT_SHADOW_BAD_MODULE method=%s nshadow=%d nexport=%d len=%u exports=%u want=%u have_f=%d have_e=%d\n",
-				mname ? mname : "?", nshadow, nexport, out->len, seen, want, have_f, have_e);
-		return FALSE;
-	}
-	return TRUE;
-}
+ * wj_verify_module_exports went with them. It scanned the assembled module's export section to prove a
+ * shadowed module really carried the exports the instantiate path asks for, and re-framed plain if it
+ * did not -- a floor added after R167 shipped shadows without one and a single malformed module retried
+ * instantiation 959,405 times (Table.set of an undefined export), hanging the run at 0.02 fps. Shadows
+ * were the only producer of `nexport < nmembers`, so nothing reaches that layout now. If per-class
+ * grouping reintroduces unexported members, bring this check back WITH them: "an optimisation whose
+ * failure is catastrophic rather than merely absent needs a floor under it" is the durable part. */
 
 /* Resolve one body's holes. Called twice per member (method body, then entry thunk) in exactly the order
  * the emitter produced them, because import slots are assigned on first use and that order is what makes a
@@ -6592,10 +6239,9 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			 * and so must be ordered; call_indirect reads the table when it runs and need not be. The
 			 * strict import list was the only source of the deferral path, and the deferral path was the
 			 * only way a method could be permanently denied the JIT tier (R160-R162). */
-			member = (pol->local_calls || pol->shadow_calls) ? wj_asm_member_of (mem, n, (MonoMethod *) r->sym) : -1;
+			member = pol->local_calls ? wj_asm_member_of (mem, n, (MonoMethod *) r->sym) : -1;
 			/* Self-recursion keeps the form it has always had unless co-location explicitly asked for
-			 * module-local calls. Shadows never include the self member, so shadow_calls alone must not
-			 * silently convert a self-call and change every recursive method's codegen. */
+			 * module-local calls. */
 			if (member == self_index && !pol->local_calls)
 				member = -1;
 			if (member >= 0) {
@@ -7421,343 +7067,31 @@ done:
  *
  * Returns the number of members grouped (0 if nothing was).
  */
-/* R213c: seed order. Iterating descriptors 1..n ascending makes every node its own seed before any
- * caller can claim it -- and callees hold LOWER desc ids than their callers by construction, since a
- * callee must already be JITted for the caller to bake its f-slot. Measured: 20,497 edges seen and
- * **0% internal**, because every group was a singleton.
+/* GLOBAL REPARTITION IS DELETED -- wj_repart_seed_order, wj_repartition_step, wj_repartition_decide,
+ * wj_repartition_tick_locked, mono_wasm_jit_repartition_tick, their state, five knobs (REPARTITION,
+ * _AUTO, _AGAIN, _MIN_GAIN, _BUDGET) and seven counters.
  *
- * Seeding by OUT-DEGREE descending is what the offline simulation did, and it is what makes seed-and-grow
- * reach 83.6%/88.8%. A node with many callees is a good cluster centre; a leaf is not. Returns a
- * malloc'd order array of desc ids, most-connected first. */
-static int *
-wj_repart_seed_order (int n_reg)
-{
-	int *order = g_new0 (int, n_reg + 1);
-	int *deg = g_new0 (int, n_reg + 1);
-	int i, j, n = 0;
-
-	if (!order || !deg) { g_free (order); g_free (deg); return NULL; }
-	for (i = 1; i <= n_reg; ++i) {
-		WjRegEntry *re = wj_reg_at (i - 1);
-		const WasmRelocs *rl = (re && re->body) ? re->body->f_body.relocs : NULL;
-		guint32 k;
-		if (!re || !re->body || re->e <= 0 || re->f <= 0 || re->colocate_refused)
-			continue;
-		for (k = 0; rl && k < rl->n; ++k)
-			if (rl->r [k].kind == WASM_RELOC_CALL)
-				deg [i]++;
-		order [n++] = i;
-	}
-	/* Insertion sort by degree descending. n is the eligible count (~20k) and this runs ONCE per
-	 * analysis, so an O(n^2) sort would be minutes -- use a simple binary-insertion instead. */
-	for (i = 1; i < n; ++i) {
-		int v = order [i], d = deg [v], lo = 0, hi = i;
-		while (lo < hi) {
-			int mid = (lo + hi) / 2;
-			if (deg [order [mid]] >= d) lo = mid + 1; else hi = mid;
-		}
-		for (j = i; j > lo; --j)
-			order [j] = order [j - 1];
-		order [lo] = v;
-	}
-	order [n] = 0;                          /* terminator */
-	g_free (deg);
-	return order;
-}
-
-/* R212: ONE GLOBAL PARTITION of the tier's call graph, formed wholesale.
+ * The IDEA was right and stays on the record: the online, incremental co-location below is a greedy
+ * first-come partition, and measured on the tier's own reloc call graph a wholesale seed-and-grow
+ * partition reaches 83.6% of EXECUTED call weight internal at 16 members and 88.8% at 32 -- weighting
+ * edges by execution makes it BETTER, not worse (85.5% / 89.7%), because the hubs that dominate the
+ * static picture are cold. Seeding by OUT-DEGREE descending is what makes that work; seeding by
+ * ascending descriptor id gives 0% internal, since callees hold lower ids than their callers by
+ * construction and every group comes out a singleton.
  *
- * Seed-and-grow, breadth-first over WASM_RELOC_CALL edges read from each member's RETAINED body -- not
- * from `depset`, which COLOCATE_TIGHT_DEPS empties after framing, and which is why the incremental
- * multi-hop attempt added 15 members in a whole run (R211). `f_body.relocs` is the same edge set the
- * offline partition was computed over, so what this walks is what was measured.
+ * What closed it (R214) is not the partition quality but the DELIVERY: repeatedly re-framing a LIVE
+ * tier is unsafe under the current admission model. It produced an out-of-bounds trap and then
+ * `function signature mismatch` x4. It also required COLOCATE_DEPS=0 -- rebatch refuses an
+ * already-batched member, so incremental co-location running alongside recreates the committed-
+ * neighbour problem this existed to avoid -- and that combination wedged 2 of 2 attempts.
  *
- * `taken` is the partition proper: a method joins exactly one group, and once taken it is never
- * reconsidered. That is the property that makes this a partition rather than the greedy overlap the
- * incremental path produces.
- *
- * Resumable: it keeps its own cursor and forms at most `budget` groups per call, because the cost of a
- * re-frame is that every member loses its TurboFan code and CallIndirectIC feedback. Spreading the work
- * keeps that from landing as one multi-second stall on a workload that never idles.
- */
-static guint8 *wj_rp_taken;
-static int      wj_rp_cursor, wj_rp_done, wj_rp_cap, wj_rp_verdict;
-static int     *wj_rp_order;
-static int      wj_rp_last_n;
-
-static void
-wj_repartition_step (void)
-{
-	extern int mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
-	extern int mono_wasm_jit_repartition_budget;
-	int cap = mono_wasm_jit_colocate_max, formed = 0, seed;
-	int *grp;
-
-	if (wj_rp_done)
-		return;
-	if (cap > WJ_BATCH_MAX) cap = WJ_BATCH_MAX;
-	if (cap < 2) cap = 2;
-	if (!wj_rp_taken) {
-		wj_rp_cap = wj_reg_n + 1;
-		wj_rp_taken = g_new0 (guint8, wj_rp_cap);
-		if (!wj_rp_taken) { wj_rp_done = 1; return; }
-		wj_rp_cursor = 0;
-	}
-	grp = g_new0 (int, cap);
-	if (!grp) return;
-
-	/* SAME SEED ORDER AS THE ANALYSIS, and for the same reason: ascending desc order makes every node its
-	 * own seed before a caller can claim it, because callees are registered first and hold lower ids.
-	 * Built once and cached across the resumable calls -- rebuilding it per call would be O(n log n) on
-	 * every interp tick. */
-	if (!wj_rp_order) {
-		wj_rp_order = wj_repart_seed_order (wj_reg_n);
-		if (!wj_rp_order) { wj_rp_done = 1; g_free (grp); return; }
-	}
-	for (; (seed = wj_rp_order [wj_rp_cursor]) != 0 && formed < mono_wasm_jit_repartition_budget; ++wj_rp_cursor) {
-		WjRegEntry *sre;
-		int n = 0, bytes = 0, i;
-		if (seed >= wj_rp_cap || wj_rp_taken [seed])
-			continue;
-		sre = wj_reg_at (seed - 1);
-		if (!sre || !sre->body || sre->e <= 0 || sre->f <= 0 || sre->batch || sre->colocate_refused)
-			continue;
-		wj_rp_taken [seed] = 1;
-		grp [n++] = seed;
-		bytes += sre->len > 0 ? sre->len : 0;
-		/* BFS: grp[] is its own queue -- expanding member i appends new members past n. */
-		for (i = 0; i < n && n < cap; ++i) {
-			WjRegEntry *mre = wj_reg_at (grp [i] - 1);
-			const WasmRelocs *rl = (mre && mre->body) ? mre->body->f_body.relocs : NULL;
-			guint32 k;
-			for (k = 0; rl && k < rl->n && n < cap; ++k) {
-				int d;
-				WjRegEntry *dre;
-				if (rl->r [k].kind != WASM_RELOC_CALL)
-					continue;
-				d = wj_desc_for_fslot ((int) rl->r [k].table_index);
-				if (d <= 0 || d >= wj_rp_cap || wj_rp_taken [d])
-					continue;
-				dre = wj_reg_at (d - 1);
-				if (!dre || !dre->body || dre->e <= 0 || dre->f <= 0 || dre->batch || dre->colocate_refused)
-					continue;
-				if (mono_wasm_jit_colocate_bytes > 0 &&
-				    bytes + (dre->len > 0 ? dre->len : 0) > mono_wasm_jit_colocate_bytes)
-					continue;
-				wj_rp_taken [d] = 1;
-				grp [n++] = d;
-				bytes += dre->len > 0 ? dre->len : 0;
-			}
-		}
-		if (n >= 2) {
-			if (mono_wasm_jit_rebatch (grp, n, NULL, NULL)) {
-				if (G_UNLIKELY (mono_wasm_jit_stats)) {
-					mono_wasm_jit_count (WJC_REPART_GROUP);
-					mono_wasm_jit_add (WJC_REPART_MEMBERS, n);
-				}
-			} else if (G_UNLIKELY (mono_wasm_jit_stats)) {
-				mono_wasm_jit_count (WJC_REPART_FAIL);
-			}
-			formed++;
-		} else if (G_UNLIKELY (mono_wasm_jit_stats)) {
-			mono_wasm_jit_count (WJC_REPART_SINGLETON);
-		}
-	}
-	if (seed == 0) {
-		extern int mono_wasm_jit_registry_count (void);
-		wj_rp_done = 1;                 /* walked the whole order */
-		wj_rp_last_n = mono_wasm_jit_registry_count ();
-	}
-	g_free (grp);
-}
-
-/* R213: the COST ANALYSIS. Same BFS as the real pass, no re-framing -- assign every eligible method a
- * provisional group, then walk the call edges and measure what share the partition would make internal.
- * Returns that percentage. O(edges), allocates two arrays, mutates nothing. */
-static int
-wj_repartition_decide (void)
-{
-	extern int mono_wasm_jit_colocate_max;
-	int cap = mono_wasm_jit_colocate_max, n_reg = wj_reg_n, seed, gid = 0, oi;
-	int *owner, *grp, *ord;
-	gint64 edges = 0, internal = 0;
-
-	if (cap > WJ_BATCH_MAX) cap = WJ_BATCH_MAX;
-	if (cap < 2) cap = 2;
-	owner = g_new0 (int, n_reg + 1);
-	grp = g_new0 (int, cap);
-	if (!owner || !grp) { g_free (owner); g_free (grp); return -1; }
-
-	ord = wj_repart_seed_order (n_reg);
-	if (!ord) { g_free (owner); g_free (grp); return -1; }
-	for (oi = 0; (seed = ord [oi]) != 0; ++oi) {
-		WjRegEntry *sre = wj_reg_at (seed - 1);
-		int n = 0, i;
-		if (owner [seed])
-			continue;
-		if (!sre || !sre->body || sre->e <= 0 || sre->f <= 0 || sre->colocate_refused)
-			continue;
-		++gid;
-		owner [seed] = gid;
-		grp [n++] = seed;
-		for (i = 0; i < n && n < cap; ++i) {
-			WjRegEntry *mre = wj_reg_at (grp [i] - 1);
-			const WasmRelocs *rl = (mre && mre->body) ? mre->body->f_body.relocs : NULL;
-			guint32 k;
-			for (k = 0; rl && k < rl->n && n < cap; ++k) {
-				int d;
-				WjRegEntry *dre;
-				if (rl->r [k].kind != WASM_RELOC_CALL)
-					continue;
-				d = wj_desc_for_fslot ((int) rl->r [k].table_index);
-				if (d <= 0 || d > n_reg || owner [d])
-					continue;
-				dre = wj_reg_at (d - 1);
-				if (!dre || !dre->body || dre->e <= 0 || dre->f <= 0 || dre->colocate_refused)
-					continue;
-				owner [d] = gid;
-				grp [n++] = d;
-			}
-		}
-	}
-	/* Score it: every CALL edge whose endpoints landed in the same provisional group becomes a
-	 * `call <funcidx>` for free; the rest still need a shadow or stay indirect. */
-	for (seed = 1; seed <= n_reg; ++seed) {
-		WjRegEntry *sre = wj_reg_at (seed - 1);
-		const WasmRelocs *rl = (sre && sre->body) ? sre->body->f_body.relocs : NULL;
-		guint32 k;
-		for (k = 0; rl && k < rl->n; ++k) {
-			int d;
-			if (rl->r [k].kind != WASM_RELOC_CALL)
-				continue;
-			d = wj_desc_for_fslot ((int) rl->r [k].table_index);
-			if (d <= 0 || d > n_reg || !owner [d] || !owner [seed])
-				continue;
-			++edges;
-			if (owner [d] == owner [seed])
-				++internal;
-		}
-	}
-	g_free (owner);
-	g_free (grp);
-	g_free (ord);
-	if (G_UNLIKELY (mono_wasm_jit_stats))
-		mono_wasm_jit_add (WJC_REPART_EDGES, edges);
-	/* -1 means NO EDGES WERE FOUND, which is a different fact from "0% would be internal" and must not
-	 * collapse into it -- the first says the graph was not reachable yet, the second says partitioning
-	 * does not help. The first version returned -1 for both and logged it as 0%, which is the same
-	 * catch-all mistake as the old ARM2_SIG bucket. */
-	if (edges <= 0)
-		return -1;
-	return (int) (internal * 100 / edges);
-}
-
-/* R214b: ONE THREAD AT A TIME, and this is a correctness requirement rather than tidiness.
- *
- * The tick is called from an ordinary interp dispatch, so EVERY worker reaches it. All of wj_rp_taken,
- * wj_rp_cursor, wj_rp_order and wj_rp_done are plain statics: two workers inside the partitioner will
- * double-claim descriptors, walk a freed order array, and re-frame the same group twice. With a single
- * pass the window is small enough that it never showed; re-arming keeps re-entering and it surfaced
- * immediately as **6 `memory access out of bounds` faults and a failed run**.
- *
- * The neighbouring compile path solves this with exactly this idiom (`wj_compiling`, interp.c:633), so
- * take a CAS and bail if another worker holds it -- the work is opportunistic and there is always a next
- * tick. */
-static volatile gint32 wj_rp_busy;
-static void wj_repartition_tick_locked (void);
-
-void mono_wasm_jit_repartition_tick (void);
-void
-mono_wasm_jit_repartition_tick (void)
-{
-	extern int mono_wasm_jit_repartition, mono_wasm_jit_registry_count (void);
-	extern int mono_wasm_jit_repartition_auto, mono_wasm_jit_repartition_min_gain;
-	extern int mono_wasm_jit_repartition_again;
-	extern int mono_wasm_jit_repartition, mono_wasm_jit_registry_count (void);
-	/* Cheap unsynchronised reject first: with both knobs off this is two loads on an already-hot path. */
-	if (mono_wasm_jit_repartition <= 0 && mono_wasm_jit_repartition_auto <= 0)
-		return;
-	if (mono_atomic_cas_i32 (&wj_rp_busy, 1, 0) != 0)
-		return;                          /* another worker is in here; next tick will do */
-	wj_repartition_tick_locked ();
-	mono_atomic_store_i32 (&wj_rp_busy, 0);
-}
-
-static void
-wj_repartition_tick_locked (void)
-{
-	extern int mono_wasm_jit_repartition_auto, mono_wasm_jit_repartition_min_gain;
-	extern int mono_wasm_jit_repartition_again;
-	if (wj_rp_done) {
-		/* RE-ARM once enough new methods exist to be worth another pass. `taken` is deliberately kept:
-		 * a method that already has a group is never reconsidered, which is what keeps this a partition
-		 * and is also all rebatch would accept. Only the cursor and the degree order are rebuilt. */
-		if (mono_wasm_jit_repartition_again <= 0)
-			return;
-		if (mono_wasm_jit_registry_count () - wj_rp_last_n < mono_wasm_jit_repartition_again)
-			return;
-		{
-			int need = wj_reg_n + 1;
-			if (need > wj_rp_cap) {
-				guint8 *bigger = g_new0 (guint8, need);
-				if (!bigger)
-					return;
-				memcpy (bigger, wj_rp_taken, wj_rp_cap);
-				g_free (wj_rp_taken);
-				wj_rp_taken = bigger;
-				wj_rp_cap = need;
-			}
-		}
-		g_free (wj_rp_order);
-		wj_rp_order = NULL;
-		wj_rp_cursor = 0;
-		wj_rp_done = 0;
-		wj_rp_last_n = mono_wasm_jit_registry_count ();
-		if (G_UNLIKELY (mono_wasm_jit_stats))
-			mono_wasm_jit_count (WJC_REPART_REARM);
-		/* The verdict stands: the graph's partitionability was already measured. */
-	}
-	if (mono_wasm_jit_repartition_auto > 0) {
-		/* SELF-TUNING PATH. Wait until duplication is actually costing something, then pay for one
-		 * O(edges) analysis and commit only if it clears the bar. wj_rp_verdict: 0 undecided, 1
-		 * approved, 2 rejected -- rejected is FINAL, so a graph that does not partition is measured
-		 * once rather than re-analysed on every tick. */
-		if (wj_rp_verdict == 2)
-			return;
-		if (wj_rp_verdict == 0) {
-			gint64 gen = mono_wasm_jit_counters [WJC_BYTES_GENERATED];
-			gint64 dup = mono_wasm_jit_counters [WJC_SHADOW_BYTES];
-			int pct;
-			if (gen <= 0 || dup * 100 / gen < mono_wasm_jit_repartition_auto)
-				return;                       /* duplication not yet expensive enough to act on */
-			/* AND enough of the tier must exist to partition. Duplication share crosses within the first
-			 * few hundred modules -- shadows start copying immediately -- so the share alone fires while
-			 * almost no callee has a registered descriptor yet and the dry run scores a graph that is not
-			 * there. MEASURED: the first version analysed once, found 0 edges, and refused permanently.
-			 * REPARTITION (the fixed registry threshold) doubles as that floor. */
-			if (mono_wasm_jit_registry_count () < (mono_wasm_jit_repartition > 0 ? mono_wasm_jit_repartition : 8000))
-				return;
-			pct = wj_repartition_decide ();
-			if (G_UNLIKELY (mono_wasm_jit_stats)) {
-				mono_wasm_jit_count (WJC_REPART_ANALYSED);
-				mono_wasm_jit_add (WJC_REPART_PREDICTED, pct < 0 ? 0 : pct);
-			}
-			if (pct < 0)
-				return;                       /* no edges yet -- retry later, do NOT record a verdict */
-			if (pct < mono_wasm_jit_repartition_min_gain) {
-				wj_rp_verdict = 2;            /* measured and not worth the re-tiering; never ask again */
-				return;
-			}
-			wj_rp_verdict = 1;
-		}
-	} else {
-		if (mono_wasm_jit_repartition <= 0)
-			return;
-		if (mono_wasm_jit_registry_count () < mono_wasm_jit_repartition)
-			return;
-	}
-	wj_repartition_step ();
-}
+ * The lead this becomes is per-CLASS grouping, which gets the partition without the re-framing: 47.7%
+ * of executed intra-tier call edges are intra-class (reproduced to 0.25% across two captures), a
+ * member cap of 16 keeps 98.8% of that weight, only ~315 classes carry any of it, and class membership
+ * is INTRINSIC -- every method belongs to exactly one class, known at emit time, so the partition
+ * conflict R195 identified ("a hot callee shared by five callers can co-locate with only one") does not
+ * arise. Cap 8 buys 96.8% of the weight for 1.24 MB of cold siblings, 2.2% of the tier. Do that by
+ * changing the co-location KEY, not by re-framing what is already live. */
 
 int mono_wasm_jit_colocate_deps_now (int desc_id);
 int
@@ -14499,13 +13833,11 @@ vcall_cold_miss_emit:
 			 * slots are assigned as the holes are walked -- method body first, then entry thunk, in
 			 * emission order -- which is exactly the order the pre-relocation emitter assigned them in,
 			 * so the bytes are unchanged. */
-			/* am [0] is the method; am [1..] are SHADOWS -- private duplicates of leaf callees, framed
-			 * so their call sites become `call <funcidx>`. They are exported nowhere (nexport stays 1,
-			 * so this module still exports "f"/"e" and the single-method instantiate path is unchanged)
-			 * and they own no slot, so nothing can instantiate over them. */
-			WjAsmMember am [1 + WJ_SHADOW_MAX];
+			/* am [0] is the method. am [1..] used to be SHADOWS -- private unexported duplicates of
+			 * callees, framed so their call sites became `call <funcidx>`. See the note where
+			 * wj_collect_shadows was for why they went. */
+			WjAsmMember am [1];
 			WjAsmPolicy pol;
-			int nshadow = 0;
 			memset (am, 0, sizeof (am));
 			am [0].method = cfg->method;
 			am [0].name = mname;   /* already resolved above, on this (the compiling) thread */
@@ -14538,86 +13870,12 @@ vcall_cold_miss_emit:
 			am [0].uses_eh_tag = uses_eh_tag ? 1 : 0;
 			am [0].eh_tpool = eh_type_idx;
 			wj_asm_policy_init (&pol, FALSE /* keep self-recursion indirect, as it has always been */);
-#ifdef HOST_BROWSER
-			{
-				extern int mono_wasm_jit_shadow, mono_wasm_jit_shadow_max;
-				int cap = mono_wasm_jit_shadow_max;
-				if (cap > WJ_SHADOW_MAX) cap = WJ_SHADOW_MAX;
-				if (mono_wasm_jit_shadow && uses_calls && cap > 0) {
-					nshadow = wj_collect_shadows (&body, cfg->method, &am [1], cap);
-					if (nshadow > 0)
-						pol.shadow_calls = 1;
-				}
-			}
-#endif
 			wasm_buf_init (&out);
 			/* out_deps NULL: a lone method's dependency set is the emit-time one from
 			 * wj_result_add_direct_dep, which also gates emission on direct_deps_truncated. Only a
 			 * re-framing needs the assembler to recompute it, because only a re-framing changes which
 			 * calls became module-local. */
-			/* out_deps for the SHADOW members. A shadow's surviving `call_indirect` targets are
-			 * dependencies of THIS module -- generated indirect calls carry no liveness check -- so they
-			 * must reach the host's direct-dep list before registration, which is the only thing
-			 * admission reads. The assembler already computes exactly this per member (fslot, signature
-			 * hash, callee), so let it, rather than re-deriving type pools from the stored body.
-			 *
-			 * Member 0's deps are deliberately NOT merged: a lone method's own dep set is the emit-time
-			 * one from wj_result_add_direct_dep and is already complete. */
-#ifdef HOST_BROWSER
-			WjAsmDeps sdeps [1 + WJ_SHADOW_MAX];
-			int saved_ndeps = cfg->wasm_jit_result.ndirect_deps;
-			guint8 saved_trunc = cfg->wasm_jit_result.direct_deps_truncated;
-			memset (sdeps, 0, sizeof (sdeps));
-			wj_assemble (am, 1 + nshadow, 1 /* only the method is exported */, &pol, &out,
-			             NULL, nshadow > 0 ? sdeps : NULL);
-#else
-			wj_assemble (am, 1 + nshadow, 1 /* only the method is exported */, &pol, &out, NULL, NULL);
-#endif
-#ifdef HOST_BROWSER
-			if (nshadow > 0) {
-				int si, sk;
-				for (si = 1; si <= nshadow; ++si)
-					for (sk = 0; sk < sdeps [si].n; ++sk)
-						wj_result_add_direct_dep (&cfg->wasm_jit_result, sdeps [si].slot [sk],
-						                          sdeps [si].sig [sk], sdeps [si].method [sk]);
-				/* Overflowing the 128-dep cap sets direct_deps_truncated, and NOTHING downstream of here
-				 * re-checks it -- the emission-time gates are long past. Registering a truncated dep list
-				 * would publish a module whose call_indirect targets admission never brought live, which
-				 * is the exact class of bug R165/R166 spent two sessions on. So treat it like a bad
-				 * module: restore the dep list and re-frame plain. */
-				if (cfg->wasm_jit_result.direct_deps_truncated && !saved_trunc) {
-					cfg->wasm_jit_result.ndirect_deps = saved_ndeps;
-					cfg->wasm_jit_result.direct_deps_truncated = saved_trunc;
-					if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_DEPCAP);
-					wasm_buf_free (&out);
-					wasm_buf_init (&out);
-					nshadow = 0;
-					pol.shadow_calls = 0;
-					wj_assemble (am, 1, 1, &pol, &out, NULL, NULL);
-				}
-			}
-			for (i = 0; i < 1 + WJ_SHADOW_MAX; ++i) {
-				g_free (sdeps [i].slot); g_free (sdeps [i].sig); g_free (sdeps [i].method);
-			}
-#endif
-#ifdef HOST_BROWSER
-			/* SHADOWS FAIL SAFE. A shadowed module that does not carry the exports the instantiate path
-			 * asks for is discarded and re-framed without them: framing is a memcpy pass over bodies we
-			 * already hold, so the retry is nearly free, and the method keeps a module that works.
-			 *
-			 * R167 shipped shadows without this and one malformed module retried instantiation 959,405
-			 * times (Table.set of an undefined export), which hung the run at 0.02 fps -- a failure mode
-			 * far worse than simply not optimising that method. An optimisation whose failure is
-			 * catastrophic rather than merely absent needs a floor under it. */
-			if (nshadow > 0 && !wj_verify_module_exports (&out, 1, mname, nshadow)) {
-				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SHADOW_UNFRAMED);
-				wasm_buf_free (&out);
-				wasm_buf_init (&out);
-				nshadow = 0;
-				pol.shadow_calls = 0;
-				wj_assemble (am, 1, 1, &pol, &out, NULL, NULL);
-			}
-#endif
+			wj_assemble (am, 1, 1, &pol, &out, NULL, NULL);
 			/* Keep the relocatable body. Framing consumed nothing -- the buffers still hold instruction
 			 * bytes and relocations, unresolved -- so this method can later be re-framed alongside others
 			 * without being compiled again. Attached to the registry on success below; freed at `done`

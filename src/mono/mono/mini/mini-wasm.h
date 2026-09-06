@@ -309,32 +309,10 @@ enum {
 	 *   AL_GEN     state 2 but wj_desc_generation != re->generation
 	 *   AL_ELIVE / AL_FLIVE  state and generation agree, but the e- or f-slot is not live on THIS worker */
 	WJC_AL_ADMIT0, WJC_AL_STATE, WJC_AL_GEN, WJC_AL_ELIVE, WJC_AL_FLIVE,
-	/* SHADOW COPIES (MONO_WASM_JIT_SHADOW). SHADOW_MEMBERS = private leaf duplicates framed into a
-	 * caller's module; SHADOW_BYTES = the wire cost of them, which is the thing to watch, since a shadow
-	 * is duplicated per CALLER module; SHADOW_REFUSED = call relocations that did not qualify (callee not
-	 * JITted, not a leaf, uses an EH tag, or over MONO_WASM_JIT_SHADOW_BYTES). Judge reach by comparing
-	 * CALL_LOCAL against CALL_INDIRECT, not by SHADOW_MEMBERS: one shadow can convert many sites. */
-	WJC_SHADOW_MEMBERS, WJC_SHADOW_BYTES, WJC_SHADOW_REFUSED,
-	/* WHY a call relocation did not get a shadow. R167 measured 4 shadows against 608 refusals with only
-	 * the single REFUSED bucket, which cannot distinguish the two explanations that lead to opposite
-	 * decisions: NOJIT means the callee has no relocatable body at all (it is AOT / main-module, the R129
-	 * 55%), so no shadow rule can ever reach it and MONO_WASM_JIT_OVER_AOT is the prerequisite; NOTLEAF
-	 * means the callee IS ours and was refused by policy, which R166's working dep-closure admission may
-	 * now make safe to relax. STALE = f-slot -> descriptor mismatch, EH = carries an EH tag, BIG = over
-	 * MONO_WASM_JIT_SHADOW_BYTES, CAP = hit MONO_WASM_JIT_SHADOW_MAX for the module. */
-	WJC_SHADOW_NOJIT, WJC_SHADOW_STALE, WJC_SHADOW_NOTLEAF, WJC_SHADOW_EH, WJC_SHADOW_BIG, WJC_SHADOW_CAP,
-	/* Shadowed modules discarded by wj_verify_module_exports and re-framed plain. Must be 0: a non-zero
-	 * count means the shadow layout is producing modules the instantiate path cannot use, and the
-	 * fallback is the only reason the run is still alive. */
-	WJC_SHADOW_UNFRAMED,
-	/* Shadowed modules re-framed plain because merging the shadows' own dependencies overflowed the
-	 * 128-entry direct-dep cap. Expected non-zero once MONO_WASM_JIT_SHADOW_NONLEAF is on -- that is the
-	 * cap doing its job, not a bug -- but a large count means the non-leaf policy is reaching too far. */
-	WJC_SHADOW_DEPCAP,
 	/* Registrations that reused an f-slot still owned by an EARLIER descriptor for the SAME method. A
 	 * different method hitting that slot is refused loudly (WASM_JIT_FSLOT_COLLISION); this counts only
 	 * the legitimate case. Re-emission taking back its own pinned pair was the original producer and is
-	 * gone; rebatch/repartition re-framing is what reaches it now. */
+	 * gone; rebatch re-framing is what reaches it now. */
 	WJC_FSLOT_REREGISTER,
 	/* WHY a co-location group was not formed, one counter per exit of
 	 * mono_wasm_jit_colocate_deps_now. Until these existed the function had six distinct rejection
@@ -463,16 +441,7 @@ enum {
 	 * ASM_NONAME is a member reaching wj_assemble with name == NULL: harmless to execution but it degrades
 	 * that method's perf symbol to a bare `wasmjit`, i.e. it silently blinds every instrument in
 	 * scratchpad/wj that resolves by name. Must stay 0. */
-	WJC_SHADOW_SELF, WJC_ASM_NONAME,
-	/* R201 shadow selection. CANDCAP = eligible callees beyond WJ_SHADOW_CAND_MAX, i.e. the staging array
-	 * truncated the ranking input. MODCAP = a ranked candidate dropped because the per-module shadow byte
-	 * budget was exhausted (distinct from SHADOW_CAP, the per-module COUNT cap). */
-	WJC_SHADOW_CANDCAP, WJC_SHADOW_MODCAP,
-	/* R201: a ranked candidate that was eligible in pass 1 and is NOT eligible at the point of use --
-	 * i.e. the shared WjBody was retired or replaced by its owning thread in between. Non-zero is normal
-	 * and healthy (it is the race being caught); it reading 0 forever would mean the re-validation is
-	 * dead code, and the fault it prevents is `function signature mismatch`. */
-	WJC_SHADOW_REVALIDATE,
+	WJC_ASM_NONAME,
 	/* R205: EXECUTION-WEIGHTED devirt diagnosis. The [wasm-jit devirt] census counts SITES at emit time,
 	 * unweighted, so it cannot say whether the IC's executed volume comes from sites that failed devirt or
 	 * from the SECOND RECEIVER at sites that succeeded -- the predicted arm keeps the IC below it as a
@@ -513,20 +482,6 @@ enum {
 	 * depset. Read against COLOCATED_MEMBERS: if it stays ~0 the walk found nothing past hop 1, which
 	 * means the depsets are too thin at publish time and the expansion is not the lever. */
 	WJC_COLOCATE_HOP_ADD,
-	/* R212 global repartition. GROUP/MEMBERS are what it formed; SINGLETON is a seed whose BFS found
-	 * no eligible neighbour (high share => the graph is not reachable at this point in the run, not that
-	 * partitioning fails); FAIL is a rebatch refusal. Read MEMBERS against COLOCATED_MEMBERS. */
-	WJC_REPART_GROUP, WJC_REPART_MEMBERS, WJC_REPART_SINGLETON, WJC_REPART_FAIL,
-	/* R213 auto-trigger: ANALYSED counts cost analyses run (should be 0 or 1 -- a rejection is final),
-	 * PREDICTED is the internal-edge percentage it computed. If ANALYSED is 1 and no groups formed, the
-	 * partition was measured and REFUSED, which is a result rather than a failure. */
-	WJC_REPART_ANALYSED, WJC_REPART_PREDICTED,
-	/* R213b: call edges the dry run actually SAW. Zero means the graph was not reachable when it ran,
-	 * which is a different fact from "0% would be internal" and must not be read as a refusal. */
-	WJC_REPART_EDGES,
-	/* R214: passes re-armed after the tier grew. One pass covers only what existed when it fired
-	 * (5,381 of ~24,000 methods measured), so this is the coverage lever. */
-	WJC_REPART_REARM,
 	/* R215 delegate devirt. ARM = a delegate site given a guarded direct arm; THIN = its dominant
 	 * target held less than DELEGATE_DEVIRT%% of observations; REFUSED = no f-slot or a divergent
 	 * functype. FAST_DELEGATE_DEVIRT is the EXECUTED hit count and needs PROFILE_FAST -- read it against

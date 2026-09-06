@@ -2895,17 +2895,6 @@ pop:
  * woken because a blocker they were parked on just JITted). Runs whenever the queue is non-empty (not gated on
  * ENTRY_PROMOTE, so waiter wakes drain even with Lever A off). Force-compiling a method that's currently being
  * interpreted is safe — the live frame keeps interpreting; the f-slot is used on the next entry. */
-/* R212's global repartition advanced from wasm_jit_drain_reemits, which no longer exists. Kept on the
- * same safe point and for the same reasons: an ordinary interp dispatch of a jittable callee (~53k/s),
- * never the JIT dispatch path, bounded work per call so re-framing is spread rather than taken as a
- * stall. Self-gated -- returns immediately unless REPARTITION is set and the registry has grown past it. */
-static void
-wasm_jit_repartition_drain (void)
-{
-	extern void mono_wasm_jit_repartition_tick (void);
-	mono_wasm_jit_repartition_tick ();
-}
-
 static void
 wasm_jit_drain_promotions (void)
 {
@@ -2955,7 +2944,6 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island, mono_wasm_jit_island_budget;
 	extern int mono_wasm_jit_over_aot;
 	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
-	wasm_jit_repartition_drain ();  /* R212: bounded global re-grouping, self-gated on REPARTITION */
 	/* Hotness gate. The bump MUST be atomic: wasm_jit_hits lives on the SHARED InterpMethod and is bumped
 	 * from every worker (render/server/pool) in the auto-walk. A plain `++` loses updates AND lets one
 	 * thread's write skip the exact threshold value — which under the old (non-atomic) `== thresh` test
