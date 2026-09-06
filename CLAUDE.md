@@ -89,6 +89,18 @@ they carry an older tree; if something surprising turns up, re-check rather than
   by-construction guarantees (unwound frames fall below SP; wasm-EH landing pads restore SP; JSPI
   keeps frames in the scanned region). THREADING a frame pointer as a call parameter keeps all three
   and cuts `s.p` traffic ~409x (974M dispatches vs 2.4M interp->JIT transitions per window).
+  **BUT THREADING IS NOT FREE, AND THAT ASSUMPTION IS NOW REFUTED (R218).** Built as
+  `MONO_WASM_JIT_THREAD_SP` and measured on jbox2d, 6 rounds in BOTH orders, all checksum
+  `-1419038276309998642`, `registered=389` / `invalid=0` / `residual` identical on both arms so the tier
+  is fully alive: median **1.2485 -> 1.7375 ms/step, +39.2%, non-overlapping ranges 6/6**. The plan's
+  reasoning was *"params are `local.get`, which V8 lowers to zero instructions, so the cost is wire size
+  only"* -- and that conflates two different things. `local.get` of an EXISTING local is free; ADDING A
+  PARAMETER is an argument materialisation at every call site plus one more live incoming value in every
+  callee, on a tier already at 32.21% register pressure and 28.1 locals/function. **Price a calling-
+  convention change at the CALL SITES, never as a local-op count.** The `s.p` pool it competes with is
+  4.4-5.3% of window TOTAL, and threading alone removes only 1 of its 3 ops, so the chunk (which removes
+  the other 2) has to beat a cost of this order before any of it pays. Ships **0**. Do not re-derive the
+  409x ratio as if it were the whole argument: the ratio is real and the cost term was simply missing.
   **THE WIN IS THE CHUNK, NOT THE THREADING, and threading is what makes the chunk legal (R192).** The
   conservative scan is NOT bounded by `__stack_pointer`: `sgen-stw.c:73-91` takes the address of a local
   in sgen's own frame, `:118-124` takes `wasm_sp` for suspended threads, and `mini-gc.c:1136-1139` then
@@ -176,6 +188,17 @@ worker has not instantiated holds a function that:
 * traps if you `call_indirect` it with any other signature — which is loud, and is what jit138 hit; and
 * **works** if the expected type is that one very common shape — writing 999 through the caller's fourth
   argument as a pointer and returning. Silent heap corruption, no LinkError, no trap, no diagnostic.
+
+**And the converse invariant, which is load-bearing (R216):** an f-slot only ever holds a JIT `f` from a
+module this emitter produced. Nothing else is ever installed there — AOT bodies are reached through their
+own table indices and their own `at`/`at_ne` functypes, never through an f-slot. That is what lets a caller
+bake a functype for an f-slot call with no runtime kind test, and it is what makes an ABI change like
+`MONO_WASM_JIT_THREAD_SP`'s trailing parameter safe to apply to every f-slot functype at once. There was
+one *potential* second occupant: `wasm_module_interp_thunk` framed a module exporting `t`, a scalar-ABI
+stand-in that drove an un-JITted callee through the interpreter, installed by an `e_slot < 0` arm in
+`mono_wasm_jit_instantiate_local`. It was never wired up — nothing in the tree ever called the framer, so
+the arm could not fire and the invariant held by accident. Both are now DELETED rather than left for the
+next reader to reason around.
 
 The authoritative test is the per-thread bitmap, `mono_wasm_jit_slot_live()` (or, on the JS side,
 `Module.__wjSlotFn`, the per-worker record of what this worker installed). Both are per-thread because the
@@ -650,11 +673,25 @@ invalidated a session's worth of A/B ordering before it was noticed.
   **`isAsync` is a required conjunct**: having a backgrounded shell is NOT enough. If the owning agent is
   not async, the gated stages run and the task dies. The kill is `task.shellCommand.kill()` on the handle,
   which is why **`setsid` + `disown` does NOT protect the work** (still a descendant of the spawned pid at
-  kill time) while a transient scope does — the spawned process is just the `systemd-run` client, and the
+  kill time) while a transient unit does — the spawned process is just the `systemd-run` client, and the
   real work lives in a cgroup the handle has no reference to.
-  **THE FIX:** `systemd-run --user --scope --quiet --unit=<name> -- bash -c '<work>; echo $? > <sentinel>'`
-  then poll the sentinel. Verified: a run launched this way survived many turn boundaries that had killed
+  **THE FIX:** `systemd-run --user --quiet --unit=<name> -- bash -c '<work>; echo $? > <sentinel>'`
+  then poll the sentinel.
+  **AND DO NOT RELY ON A BACKGROUNDED WATCHER FOR NOTIFICATION (2026-09-06).** A `run_in_background`
+  bash watcher (`until [ -f <sentinel> ]; do sleep N; done`) is killed after roughly five minutes --
+  observed twice in one session on ~6-minute measurement runs -- while the systemd unit it was watching
+  kept running to completion both times. So the watcher is a convenience, never the mechanism: put the
+  WORK in the unit, and use a recurring `/loop` tick (or a direct sentinel check) as the actual backstop.
+  A killed watcher looks exactly like a killed job if you only read the notification. Verified: a run launched this way survived many turn boundaries that had killed
   every previous attempt.
+  **USE A TRANSIENT SERVICE, NOT `--scope`, AND THIS NOTE USED TO SAY `--scope` (2026-09-05).** A scope
+  runs the work in the CALLING process's session and keeps it a child of the invoking shell, so it dies
+  with that shell exactly like `setsid`+`disown` does — only the cgroup differs, and the cgroup is not
+  what the harness kills. `systemd-run` without `--scope` starts a transient *service*: systemd forks it
+  from PID 1, so it has no ancestor the harness holds a handle to. The mono inline-limit ladder in the
+  2026-09-05 session was truncated at 27 of 40 rows this way, and the failure looks identical to the one
+  above (output stops mid-run, no error, sentinel never written) — which is why it was misread as the app
+  crashing. Drop `--scope` from any invocation copied out of this file before that date.
   **Symptom:** the run's browser AND its node driver vanish together, the sentinel is never written, and
   there is NO stall message — nothing failed, it was killed. Do NOT diagnose it as an app or JIT fault.
   **Three wrong explanations were asserted here before the source was read**, and all are retracted: a
@@ -663,6 +700,21 @@ invalidated a session's worth of A/B ordering before it was noticed.
   "~30 minutes of user inactivity" (a SELECTION EFFECT — during idle stretches the tasks launched happened
   to be short watchers, and killed tasks in fact have a median lifetime of 1.5 min, some under 30 s, which
   no idle threshold can explain). When a harness behaviour is in question, READ THE HARNESS.
+* **NEVER EDIT A SOURCE FILE WHILE A BUILD OF IT IS IN FLIGHT (R216).** The build reads each file at a
+  moment you do not control, so a file edited during it makes the resulting binary's contents *unknowable*
+  and every number taken on that binary unusable. R216 lost a delegate-devirt arm this way: the run came
+  back `ok=false wall=666.8s` against a 458.8s control -- a 1.45x regression that could not be attributed,
+  because `mini-wasm.c.o` is stamped mid-way through the edits. The edits were all behind a default-off
+  knob and were *very probably* inert, which is exactly the trap: "probably inert" is not provenance. A
+  build is ~9 min and a deploy ~12 min; treat that whole window as read-only and queue the edits.
+* **A counter that names an action must be bumped where the action HAPPENS, not where it is decided
+  (R215).** Delegate devirt read `DelegateDevirtArm 750` with `FastDelegateDevirt 0` for a whole run: the
+  resolution block that chose a target ran unconditionally, while the code that emitted the arm sat inside
+  `if (obj_pic)` -- a knob that ships **0**. So "armed" and "emitted" were different populations and every
+  counter read exactly as designed. This is the same family as "do not compute a share until every route
+  has a counter", with a new shape: the counter was in the right place and the CODE was in a dead branch.
+  If the decision and the action live in different functions or different `if` arms, count both and assert
+  they are equal.
 * **A leftover compiler daemon will silently tax one arm.** The runtime build's `VBCSCompiler` starts under
   the REPO-LOCAL `./.dotnet/dotnet` with its own pipe name, so a `dotnet build-server shutdown` issued by the
   system SDK does not reach it; one was caught at 101% CPU for 11:50. `preflight` refuses to measure while one
@@ -679,6 +731,93 @@ invalidated a session's worth of A/B ordering before it was noticed.
   argv contains the plain word `VBCSCompiler`. **Find candidates by command line, then keep only those whose
   `comm` is the expected executable, and never kill self.** That is what `killdaemons.sh` does; prefer
   `pgrep` + explicit `kill <pid>` over `pkill` everywhere else.
+
+## 2026-09-06 session: five things that change how to measure and what to attack
+
+**FPS IS UNUSABLE ON THIS BOX AND COMPOSITION SHARES ARE NOT.** Two control runs of an IDENTICAL config,
+same binary, same chromium: `vcall_resolve_fslot` 4.723% / 4.683% (**0.8%**), `InstanceCheck` 2.642 /
+2.658 (0.6%), `admit*` 1.343 / 1.365 (1.6%) -- against **fps 15.10 / 18.03 (19.4%)**. Client-thread
+instruction SHARES are ~20x more reproducible than frame rate. R149's 11.5% floor is optimistic at
+120 s. Quote shares; treat any fps delta under ~20% as nothing. Read them with
+`perfraw.py <dir> --phase ingame --marker realize_glenv --tsv out.tsv`.
+
+**AND EVERY BARE IN-GAME WINDOW MEASURES THE RAMP: `--warm-ms` DEFAULTS TO 0** in both `mcperf.mjs`
+(line 74, under a comment that says "profile the PLATEAU, not the ~180s ramp") and `mcbench.mjs`.
+Work per frame falls ~40% inside the FIRST QUARTER of a 120 s "plateau" window (730 -> 410 M/frame) and
+is flat to ~7% after. The reported mean is therefore set by how much transient it contains, which
+depends on boot+worldgen duration -- 68-96 s across one evening. Any historical fps A/B taken without
+`--warm-ms` was reading ramp position.
+
+**THE RAMP IS NOT JIT WARMUP -- IT IS WORK WE ARE TOO SLOW TO CLEAR.** Measured Q1 vs Q4, per frame:
+mono JIT compile **~0 -> ~0**, V8 compile 2.0 -> 0.4, V8 Liftoff share 0.60% -> 0.19%. Both compilers
+are DONE before the window opens. What actually drains: **MethodHandle/invokedynamic linking 103.5 ->
+47.2 M/frame**, chunk/world (Sodium mesh, chunk gen, lighting) 67.2 -> 27.7, IC miss 33.4 -> 21.1.
+Native pays the identical transient -- lazy `invokedynamic` linking and post-join meshing are Java
+semantics -- and clears it in seconds because each unit costs ~4-5x less. **Ramp length is a symptom of
+the 4-5x gap, not a separate warmup problem.** (Classifier warning: a case-insensitive regex for
+"compile" matches the `-turbofan` SUFFIX on every symbol and reports 88% of the window. Strip
+`-\d+-(turbofan|liftoff)$` before matching -- fifth classifier bug of this shape.)
+
+**DELEGATE DEVIRT WORKS, AND R215's "INERT" NOTE IS SUPERSEDED.** R215 was right that emission sat in a
+dead `if (obj_pic)` branch (`mini-wasm.c:13347`); there is now a SECOND site at `:13544` inside
+`for (way = 0; !obj_pic; ...)` which IS live in the shipped config, plus `prof_predict_delegate` (the
+alt-reader required `id_targets[]`, always NULL at a delegate site -- 7,582 sites, 0 armed).
+`MONO_WASM_JIT_DELEGATE_DEVIRT=15` measured **−6.6% of client-thread instructions/frame, n=2, with a
+flat negative control**: `__<>MHC` stubs 12.84 -> 11.20 M/frame (−12.8%), `InstanceCheck` 5.97 -> 4.62
+(−22.7%), chromium DSO flat. `thin=35` of 7,556 sites, so delegate sites are overwhelmingly
+SINGLE-TARGET and the capture bar is not worth sweeping.
+**STRUCTURALLY: the MethodHandle pool and the TYPE-CHECK pool are NOT independent.** A delegate arm
+bypasses the `__<>DynamicBinder__` adapter and R109 established that adapter's castclass IS the type
+check, so type checks are DOWNSTREAM of delegate dispatch. Do not budget them as separate wins.
+
+**RE-EMISSION IS THROUGHPUT-BOUND, NOT POPULATION-BOUND -- a DIFFERENT closure from R179's.** R179
+closed it because the trigger selected interp->JIT boundary crossings; R208's IC-miss trigger fixed
+that. What binds now, in order, and the order is not what it looks like: **drain reach** (56,667 queued
+vs ~5,800 ever gated) > **compile-lock contention** (`busy=5,134` against `done=189`) > **co-location**
+(`batched=496`). Re-emitted bodies do reach 54.7% devirt coverage against 28.1% run-wide, but they are
+2.25% of sites, so run-wide coverage moves ~+0.6 pts. Fixing the co-location conflict alone -- the
+obvious-looking fix -- moves the THIRD-largest limit.
+**`MONO_WASM_JIT_COLOCATE_DEPS=0` + re-emission WEDGES**: 2 of 2 attempts (void window, then hung at
+world load). Do not re-run it to test the co-location conflict -- the split counter answers it for free.
+
+**RETRACTED 2026-09-06: "process-wide modules cannot reach `__thread` state".** I closed the monitor
+inline-CAS lever on this and generalised it into an architectural rule. **It is wrong.** Modules are
+compiled once but INSTANTIATED PER WORKER, so an IMPORTED GLOBAL is resolved per worker and a
+`global.get` yields per-thread data with the bytes still identical process-wide. The emitter ALREADY
+does this seven times (`wasm-encoder.c:352-358`): `s.l`/`s.c` = `&wj_slot_live`/`_cap`, `s.v`/`s.n` =
+`&wj_vcall_pic`/`_cap`, `s.d`/`s.m` = `&wj_delegate_pic`/`_cap`, and `s.b` = this worker's scratch base
+-- whose own comment states the exact win I called impossible: "replacing a `mono_wasm_jit_scratch()`
+helper CALL on every residual and every vcall cold miss".
+The real constraint is only that a per-thread address cannot be baked as a CONSTANT in the shared bytes.
+Importing it is fine and is the established pattern. Cost is one `global.get` of an immutable import
+(~1 load), not the 4 extra loads a MUTABLE import costs -- only `s.p` is mutable.
+**Adding a ninth global is not free**: the index space is a hard-coded 0..7 contract with the emitter,
+and the import COUNT literal in `emit_import_section` falling out of step once produced "section was
+shorter than expected size", `registered` 0 from boot, and cost a whole session.
+
+**Monitors: every lock is INFLATED, and the cause is `monitor.c:1013`** -- an object whose IDENTITY HASH
+has ever been taken can never use the thin lock again, because mono's flat lock stores the owner IN the
+lock word and cannot coexist with a stored hash. Java takes identity hashes constantly, so most objects
+inflate permanently. HotSpot does not pay this: its stack lock DISPLACES the header. But the recoverable
+part is NOT mutex traffic -- `mono_monitor_try_enter_inflated` already has an uncontended CAS fast path
+(`monitor.c:820-833`), so the ~3.2% is CALL OVERHEAD around one CAS. Synchronized wrappers ARE JITted
+(they do not set `save_lmf`; only the native/icall/pinvoke wrappers do), so an inline CAS has somewhere
+to attach. Unbuilt, unsized, ceiling ~1.5-2%.
+
+**Two more merged counters, same disease as the vfbThresh/delegate-share family.** Both are now split.
+`WJC_DELEGATE_DEVIRT_REFUSED` merged an ORDERING artifact with a PERMANENT one: measured
+**no_fslot=3387 / sig=966**, so 78% is fixable and the addressable population is 5.5x what is armed.
+`WJC_REEMIT_REFUSED`'s first site (`interp.c`, the pre-compile gate) merged three causes AND is a
+DIFFERENT site from the `WASM_JIT_REEMIT_NO_PUBLISH` printf -- which is why that printf logged 0 while
+the counter read 466. Measured **batched=496, no_eslot=0, no_fslot=0**. A plausible guess that
+`old_f <= 0` dominated was wrong by exactly 496 to 0.
+
+**`perfraw.py` could not read the primary metric at all, and now can.** Fixed-period captures
+(`MCPERF_PERIOD`, i.e. `perf record -c N`) carry sample_type `0x10027` -- no PERIOD field -- and the
+reader hard-exited; PERIOD's absence shifts `nr`/callchain back 8 bytes. Also added `--tid N` /
+`--marker SYM` to restrict every number to one thread. **And `perf` silently mis-attaches**: one capture
+produced a 0.3 MB / 3,967-symbol map and 133 samples where a good run has ~206 MB / ~2.0M, and it reads
+as a valid low-overhead run (its fps was the highest of the night). Gate on the symbol-map size.
 
 ## The instruments
 

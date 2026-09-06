@@ -559,6 +559,31 @@ enum {
 	/* R214: passes re-armed after the tier grew. One pass covers only what existed when it fired
 	 * (5,381 of ~24,000 methods measured), so this is the coverage lever. */
 	WJC_REPART_REARM,
+	/* R215 delegate devirt. ARM = a delegate site given a guarded direct arm; THIN = its dominant
+	 * target held less than DELEGATE_DEVIRT%% of observations; REFUSED = no f-slot or a divergent
+	 * functype. FAST_DELEGATE_DEVIRT is the EXECUTED hit count and needs PROFILE_FAST -- read it against
+	 * FAST_DELEGATE, which is the whole delegate pool it is carving out of. */
+	WJC_DELEGATE_DEVIRT_ARM, WJC_DELEGATE_DEVIRT_THIN, WJC_DELEGATE_DEVIRT_REFUSED,
+	WJC_FAST_DELEGATE_DEVIRT,
+	/* R215b: no usable delegate record at all -- split out of THIN, which was a catch-all covering both
+	 * "below the bar" and "the reader could not work here". That conflation hid a reader that could
+	 * NEVER succeed (it required id_targets, always NULL at a delegate site) behind a plausible 7,582. */
+	WJC_DELEGATE_DEVIRT_NOREC,
+	/* Split of DELEGATE_DEVIRT_REFUSED, which merged two refusals that lead to OPPOSITE decisions and so
+	 * could not be planned from: NO_FSLOT is a pure ORDERING artifact (the profile was right, the target
+	 * simply had not compiled yet) and is what DEVIRT_FORCE's blocker exists to fix; SIG is a lowered
+	 * signature the shared call sequence cannot express, which is permanent. Measured 4,360 merged.
+	 * REFUSED is kept and still counts their sum, so old readings stay comparable. */
+	WJC_DELEGATE_DEVIRT_NO_FSLOT, WJC_DELEGATE_DEVIRT_SIG,
+	/* Split of REEMIT_REFUSED at its FIRST site (interp.c, the pre-compile eligibility gate), which
+	 * merged three causes behind one `continue` -- and is a DIFFERENT site from the NO_PUBLISH printf,
+	 * which is why that printf logged 0 while the counter read 466. BATCHED is the co-location/
+	 * re-emission conflict (re-framing one member strands its siblings). */
+	WJC_REEMIT_NO_ESLOT, WJC_REEMIT_NO_FSLOT, WJC_REEMIT_BATCHED,
+	/* 2026-09-06: make the drain FULLY ACCOUNTED. done+refused+busy covered 5,819 of 56,667 pops; the
+	 * rest vanished at two gates with no counter. DISTINCT is the denominator every per-attempt reemit
+	 * counter was missing. Assert: SKIP_STATE + SKIP_AGE + BUSY + DONE + REFUSED == pops. */
+	WJC_REEMIT_DISTINCT, WJC_REEMIT_SKIP_STATE, WJC_REEMIT_SKIP_AGE,
 	WJC_MAX
 };
 

@@ -456,21 +456,6 @@ void wasm_module_assemble (
 	const WasmFuncImport *fimports, guint32 nfimports,
 	WasmBuf *out);
 
-/*
- * Frame a module exporting a single function `t` (the interp-entry thunk) with signature
- * param_types->ret_type, importing shared memory (`m`.`h`) and the indirect function table (`f`.`f`).
- * Beyond the thunk's own type T0, two callee function types are predefined for the body's
- * call_indirects: T1 = ()->i32 (mono_wasm_jit_scratch) and T2 = (i32,i32)->i32
- * (mono_wasm_jit_call_interp). The body marshals the scalar args into the per-thread scratch buffer,
- * drives the target through the interpreter, and loads back the result — so the thunk is a drop-in
- * call_indirect target with the same scalar ABI as a JITted method's `f`, for un-JITted callees.
- */
-void wasm_module_interp_thunk (
-	const WasmValtype *param_types, guint32 nparams,
-	WasmValtype ret_type,
-	const WasmLocalGroup *locals, guint32 nlocal_groups,
-	const WasmBuf *body,
-	WasmBuf *out);
 
 /*
  * Append a custom "name" section (id 0) to an already-framed module so V8 prints real method

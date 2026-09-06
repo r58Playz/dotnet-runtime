@@ -356,7 +356,14 @@ emit_functype (WasmBuf *sec, const WasmValtype *params, guint32 nparams, WasmVal
  *   7 s.b  the VALUE of this worker's residual scratch base (wj_scratch is a __thread ARRAY, so its
  *          address is constant for the thread's life and can be consumed directly, replacing a
  *          mono_wasm_jit_scratch() helper CALL on every residual and every vcall cold miss)
- * Every module declares all eight whether or not it uses them, because the emitter's indices are absolute.
+ *   8 s.i  &mono_wasm_jit_cur_island_il_state (a __thread POINTER, so its ADDRESS is constant for the
+ *          thread's life). Same trick as s.b one line up, applied to the per-bb IL-offset store in
+ *          eh_on methods: `global.get 8; i32.load; i32.const off; i32.store` replaces a
+ *          mono_wasm_jit_set_il_offset helper CALL per basic block.
+ *          NOT the same as MONO_WASM_JIT_INLINE_ILOFS, which measured 9.8% WORSE: that variant kept the
+ *          il_state pointer in a wasm LOCAL, live across every call in the body. This re-derives it from
+ *          the global at each store, so nothing is live between them.
+ * Every module declares all NINE whether or not it uses them, because the emitter's indices are absolute.
  *
  * Function imports come LAST in this section but FIRST in the function index space -- wasm gives imported
  * functions indices 0..nfimports-1 regardless of section order -- which is why every defined-function
@@ -366,12 +373,15 @@ static void
 emit_import_section (WasmBuf *out, gboolean import_table, gboolean import_eh_tag, guint32 eh_type_idx,
                      const WasmFuncImport *fimports, guint32 nfimports)
 {
-	static const char *const gnames [8] = { "p", "l", "c", "v", "n", "d", "m", "b" };
+	static const char *const gnames [] = { "p", "l", "c", "v", "n", "d", "m", "b", "i" };
 	WasmBuf sec;
 	guint32 i;
 
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, (guint32) (1 /* m.h */ + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + 8 /* s.* */ + nfimports));
+	/* DERIVED from gnames, not a hand-maintained literal: when the two fell out of step every module was
+	 * rejected with "section was shorter than expected size", `registered` sat at 0 from boot, and it cost
+	 * a whole measurement session to find. Adding a global now needs one edit, not two. */
+	wasm_uleb (&sec, (guint32) (1 /* m.h */ + (import_table ? 1 : 0) + (import_eh_tag ? 1 : 0) + (sizeof (gnames) / sizeof (gnames [0])) + nfimports));
 
 	/* Shared heap m.h. The limits flag must match the runtime heap's SHARED-ness exactly: a threads build
 	 * has a shared memory (0x03 = shared+max), a single-threaded build an unshared one (0x01 = max only);
@@ -402,7 +412,7 @@ emit_import_section (WasmBuf *out, gboolean import_table, gboolean import_eh_tag
 		wasm_u8 (&sec, 0x00);                  /* attribute: exception */
 		wasm_uleb (&sec, eh_type_idx);         /* functype (i32)->void */
 	}
-	for (i = 0; i < 8; ++i) {
+	for (i = 0; i < (sizeof (gnames) / sizeof (gnames [0])); ++i) {
 		wasm_name (&sec, "s");
 		wasm_name (&sec, gnames [i]);
 		wasm_u8 (&sec, 0x03);                  /* kind: global */
@@ -629,86 +639,5 @@ wasm_module_append_name_section_multi (WasmBuf *out, const char *module_name, co
 	wasm_buf_free (&sub);
 
 	emit_section (out, 0, &sec);
-	wasm_buf_free (&sec);
-}
-
-void
-wasm_module_interp_thunk (
-	const WasmValtype *param_types, guint32 nparams,
-	WasmValtype ret_type,
-	const WasmLocalGroup *locals, guint32 nlocal_groups,
-	const WasmBuf *body,
-	WasmBuf *out)
-{
-	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-	WasmBuf sec;
-	guint32 i;
-
-	wasm_bytes (out, header, 8);
-
-	/* Type section (1): T0 = thunk (params->ret), T1 = ()->i32 (mono_wasm_jit_scratch),
-	 * T2 = (i32,i32)->i32 (mono_wasm_jit_call_interp). The body's two call_indirects use T1/T2. */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 3);
-	wasm_u8 (&sec, 0x60);
-	wasm_uleb (&sec, nparams);
-	for (i = 0; i < nparams; ++i)
-		wasm_u8 (&sec, (guint8) param_types [i]);
-	if (ret_type == WASM_VOID) {
-		wasm_uleb (&sec, 0);
-	} else {
-		wasm_uleb (&sec, 1);
-		wasm_u8 (&sec, (guint8) ret_type);
-	}
-	wasm_u8 (&sec, 0x60); wasm_uleb (&sec, 0); wasm_uleb (&sec, 1); wasm_u8 (&sec, (guint8) WASM_I32);                                  /* T1 ()->i32 */
-	wasm_u8 (&sec, 0x60); wasm_uleb (&sec, 2); wasm_u8 (&sec, (guint8) WASM_I32); wasm_u8 (&sec, (guint8) WASM_I32);
-	wasm_uleb (&sec, 1); wasm_u8 (&sec, (guint8) WASM_I32);                                                                            /* T2 (i32,i32)->i32 */
-	emit_section (out, 1, &sec);
-	wasm_buf_free (&sec);
-
-	/* Import section (2): shared memory m.h + indirect function table f.f (table 0) */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 2);
-	wasm_name (&sec, "m");
-	wasm_name (&sec, "h");
-	wasm_u8 (&sec, 0x02);   /* memory */
-	/* SHARED-ness must match the runtime heap (see the method-module import section above) */
-#ifdef DISABLE_THREADS
-	wasm_u8 (&sec, 0x01);   /* limits: max, unshared */
-#else
-	wasm_u8 (&sec, 0x03);   /* limits: shared + max */
-#endif
-	wasm_uleb (&sec, 256);
-	wasm_uleb (&sec, 65535);
-	wasm_name (&sec, "f");
-	wasm_name (&sec, "f");
-	wasm_u8 (&sec, 0x01);                  /* table */
-	wasm_u8 (&sec, (guint8) WASM_FUNCREF);
-	wasm_u8 (&sec, 0x00);
-	wasm_uleb (&sec, 0);
-	emit_section (out, 2, &sec);
-	wasm_buf_free (&sec);
-
-	/* Function section (3): one function of type 0 */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 1);
-	wasm_uleb (&sec, 0);
-	emit_section (out, 3, &sec);
-	wasm_buf_free (&sec);
-
-	/* Export section (7): the thunk `t` (func index 0; no func imports precede it) */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 1);
-	wasm_name (&sec, "t");
-	wasm_u8 (&sec, 0x00);
-	wasm_uleb (&sec, 0);
-	emit_section (out, 7, &sec);
-	wasm_buf_free (&sec);
-
-	/* Code section (10): the thunk body */
-	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 1);
-	emit_code_entry (&sec, locals, nlocal_groups, body);
-	emit_section (out, 10, &sec);
 	wasm_buf_free (&sec);
 }
