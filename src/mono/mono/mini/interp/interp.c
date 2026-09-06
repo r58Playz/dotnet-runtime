@@ -5073,7 +5073,13 @@ typedef struct {
  *   228 direct-delegate target e-slot (0 when residual marshalling is required)
  *   232 hidden-vret destination pointer (WJ_SCRATCH_VRET_OFF)
  *   236 direct-delegate target logical slot count;  240 target uses the scalar e-thunk ABI
- *   244 direct-delegate target f-slot; 248 closed/bound delegate target object */
+ *   244 direct-delegate target f-slot; 248 closed/bound delegate target object
+ *   252 direct-delegate target InterpMethod* -- C-SIDE ONLY, no emitted code reads or writes it.
+ *       prepare_delegate_call has already resolved this (mono_interp_get_imethod, or the delegate IC's
+ *       forwarded entry); handing it to call_interp saves that hash lookup on the delegate path, which
+ *       is 97% of call_interp's traffic and where the pretransform memo structurally cannot hit.
+ *       mono_interp_get_imethod measures 0.480%/0.513% of the client render thread with 88.8% of it
+ *       under call_interp. Published last with the rest of the recipe and consume-cleared with it. */
 
 /* TRUE iff this interp_entry invocation is the IMMEDIATE entry made by the wasm-JIT outbound residual
  * (mono_wasm_jit_call_interp): only that caller passes data->res == this thread's scratch result slot,
@@ -5682,6 +5688,61 @@ wj_arg_slot_holds_pointer (MonoType *t)
 	return m_type_is_byref (t) || mono_wasm_jit_arg_is_byaddr (t);
 }
 
+/* Signature-shape cache: see the long note on InterpMethod.wasm_jit_ptrarg_mask.
+ *
+ * DERIVED FROM wj_arg_slot_holds_pointer and mono_mint_type, never a re-statement of them, because a
+ * desync between the emitter's spill convention and this classification is a silent double deref rather
+ * than a crash. Computed on the first crossing; every later crossing reads two fields. */
+#define WJ_ARGSHAPE_COMPUTED 1u   /* this InterpMethod's shape has been derived */
+#define WJ_ARGSHAPE_SCALAR   2u   /* scalar return AND no byref/VT param: the e-slot residual's gate */
+#define WJ_ARGSHAPE_WIDE     4u   /* >32 params: ptrarg_mask cannot address them, use the predicate */
+
+static guint8
+wj_argshape_compute (InterpMethod *imethod, MonoMethodSignature *sig)
+{
+	guint8 shape = WJ_ARGSHAPE_COMPUTED;
+	guint32 mask = 0;
+	int i, np = (int) sig->param_count;
+	gboolean scalar = mono_mint_type (sig->ret) != MINT_TYPE_VT;
+	if (np > 32)
+		shape |= WJ_ARGSHAPE_WIDE;
+	for (i = 0; i < np; ++i) {
+		MonoType *t = sig->params [i];
+		if (scalar && (m_type_is_byref (t) || mono_mint_type (t) == MINT_TYPE_VT))
+			scalar = FALSE;
+		if (i < 32 && wj_arg_slot_holds_pointer (t))
+			mask |= 1u << i;
+	}
+	if (scalar)
+		shape |= WJ_ARGSHAPE_SCALAR;
+	imethod->wasm_jit_ptrarg_mask = mask;
+	/* Publish the mask BEFORE the COMPUTED bit: a concurrent reader that sees COMPUTED must see the
+	 * mask that goes with it. Racing computations are otherwise benign -- the shape is a pure function
+	 * of the signature, so two threads derive the identical answer. */
+	mono_memory_barrier ();
+	imethod->wasm_jit_argshape = shape;
+	return shape;
+}
+
+static inline guint8
+wj_argshape (InterpMethod *imethod, MonoMethodSignature *sig)
+{
+	guint8 shape = imethod->wasm_jit_argshape;
+	if (G_UNLIKELY (!(shape & WJ_ARGSHAPE_COMPUTED)))
+		shape = wj_argshape_compute (imethod, sig);
+	return shape;
+}
+
+/* TRUE iff arg `i`'s scratch slot holds a POINTER rather than the value, from the cache. Falls back to
+ * the predicate itself for the >32-param tail, which the mask cannot address. */
+static inline gboolean
+wj_argshape_ptr (guint8 shape, guint32 mask, MonoMethodSignature *sig, int i)
+{
+	if (G_UNLIKELY ((shape & WJ_ARGSHAPE_WIDE) && i >= 32))
+		return wj_arg_slot_holds_pointer (sig->params [i]);
+	return (mask & (1u << i)) != 0;
+}
+
 gpointer
 mono_wasm_jit_scratch (void)
 {
@@ -5759,13 +5820,15 @@ wasm_jit_aot_call_lean (InterpMethod *imethod, MonoMethodSignature *sig, guint8 
 		sp->data.p = *(gpointer*)(buf + 0);
 		idx = 1;
 	}
+	guint8 shape = wj_argshape (imethod, sig);
+	guint32 ptrmask = imethod->wasm_jit_ptrarg_mask;
 	for (i = 0; i < (int) sig->param_count; ++i) {
 		int arg_offset = get_arg_offset_fast (imethod, NULL, idx + i);
 		stackval *sval = STACK_ADD_ALIGNED_BYTES (sp, arg_offset);
 		guint8 *slot = buf + (idx + i) * 8;
 		if (m_type_is_byref (sig->params [i]))
 			sval->data.p = *(gpointer*)slot;
-		else if (wj_arg_slot_holds_pointer (sig->params [i]))
+		else if (wj_argshape_ptr (shape, ptrmask, sig, i))
 			/* by-addr vtype: the slot holds the ADDRESS of the caller's call-site copy (GC-scanned
 			 * C-stack frame); copy the VALUE onto the interp stack from there */
 			stackval_from_data (sig->params [i], sval, *(gpointer*)slot, FALSE);
@@ -5993,8 +6056,21 @@ mono_wasm_jit_pretransform (MonoMethod *method)
  * else 0. This is the residual's exception path: real code throws (null checks, class init, ...), and
  * without it the JITted caller would read the stale scratch slot as a garbage object -> OOB.
  */
+static int wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imethod);
+
 int
 mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
+{
+	return wj_call_interp_inner (method, buf, NULL);
+}
+
+/* `known_imethod`, when non-NULL, is an InterpMethod the CALLER has already resolved for exactly this
+ * `method` and is handing over inside one crossing -- not a cache. Only the delegate path passes it (see
+ * scratch+252). It is dropped the moment the SYNCHRONIZED_INNER substitution below changes `method`,
+ * because then it describes a different method; that is the same hazard the pretransform memo's identity
+ * check exists for. */
+static int
+wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imethod)
 {
 	ERROR_DECL (error);
 	if (G_UNLIKELY (!method)) {
@@ -6018,19 +6094,24 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 				wrapped = mono_class_inflate_generic_method_checked (wrapped, mono_method_get_context (method), inflate_error);
 				if (!is_ok (inflate_error)) { mono_error_cleanup (inflate_error); wrapped = NULL; }
 			}
-			if (wrapped)
+			if (wrapped) {
 				method = wrapped;
+				known_imethod = NULL;   /* it described the wrapper, not the wrapped method */
+			}
 		}
 	}
 	/* The direct residual's immediately preceding pretransform already paid this hash lookup.
 	 * Reuse it when the target identity still matches.  Synchronized-inner substitution changes
 	 * `method`, and vcall fallback has no pretransform handoff, so both retain the old safe path. */
-	InterpMethod *imethod = method == wasm_jit_pretransformed_method
+	InterpMethod *imethod = known_imethod ? known_imethod
+		: method == wasm_jit_pretransformed_method
 		? wasm_jit_pretransformed_imethod
 		: mono_interp_get_imethod (method);
 	MonoMethodSignature *sig = mono_method_signature_internal (method);
 	InterpEntryData data;
 	int idx = 0, i;
+	guint8 shape;
+	guint32 ptrmask;
 
 #ifdef HOST_BROWSER
 	/* DIAG (type-confusion source): a JITted caller spilled its args into `buf` before this residual call.
@@ -6101,6 +6182,16 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		mono_wasm_jit_throw ((MonoObject *) mono_error_convert_to_exception (error));
 		return 1;
 	}
+	/* Per-method signature shape, derived once and read on every later crossing. Both loops below were
+	 * pure functions of `sig` recomputed ~8,500 times a frame; see InterpMethod.wasm_jit_ptrarg_mask.
+	 *
+	 * Derived from `imethod`, i.e. AFTER the SYNCHRONIZED_INNER substitution above, so it describes the
+	 * same method `sig` does. Derived AFTER wasm_jit_prepare_interp_callee for a second reason: the
+	 * classification runs mini_get_underlying_type / mono_class_from_mono_type_internal over the params,
+	 * and that is where the two loops it replaces already sat. Hoisting it above the warmup would reach
+	 * an unloadable param type BEFORE the gate that turns that into a catchable managed exception. */
+	shape = wj_argshape (imethod, sig);
+	ptrmask = imethod->wasm_jit_ptrarg_mask;
 	/* INLINE AOT FASTPATH: if the callee has AOT code, run it natively via do_jit_call directly,
 	 * skipping interp_entry's InterpEntryData marshalling. Covers BOTH the direct-call residual and the
 	 * vcall-fallback (which funnels here after resolve). Cached on code_type like the interp MINT_JIT_CALL.
@@ -6146,9 +6237,7 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		 * instantiating anything. */
 		if (mono_wasm_jit_eslot_residual && imethod->wasm_jit_slot > 0 && !imethod->is_invoke) {
 			extern int mono_wasm_jit_admit_live (int desc_id);
-			gboolean scalar = mono_mint_type (sig->ret) != MINT_TYPE_VT;
-			for (i = 0; scalar && i < (int) sig->param_count; ++i)
-				scalar = !m_type_is_byref (sig->params [i]) && mono_mint_type (sig->params [i]) != MINT_TYPE_VT;
+			gboolean scalar = (shape & WJ_ARGSHAPE_SCALAR) != 0;
 			if (scalar && mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_RESIDUAL); mono_wasm_jit_count (WJC_ESLOT_RESIDUAL); }
@@ -6182,8 +6271,9 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 		 * A BY-ADDR VTYPE param (mono_wasm_jit_arg_is_byaddr — the emitter's classification twin) also
 		 * spilled an ADDRESS: the caller's call-site copy in its GC-scanned C-stack frame. Deref it too —
 		 * interp_entry's stackval_from_data wants a pointer to the VALUE, which that copy is.
-		 * Both cases are wj_arg_slot_holds_pointer, shared with wasm_jit_aot_call_lean. */
-		data.args [i] = wj_arg_slot_holds_pointer (sig->params [i]) ? *(gpointer *) slot : slot;
+		 * Both cases are wj_arg_slot_holds_pointer, shared with wasm_jit_aot_call_lean -- read here out
+		 * of the per-method shape cache rather than re-derived per crossing. */
+		data.args [i] = wj_argshape_ptr (shape, ptrmask, sig, i) ? *(gpointer *) slot : slot;
 	}
 	data.res = buf + WJ_SCRATCH_RET_OFF;
 	/* hidden-vret destination: capture ONCE, now — a nested residual inside the callee reuses this
@@ -6557,6 +6647,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		*(gint32 *) (scratch + 240) = scalar ? 1 : 0;
 		*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
 		*(MonoObject **) (scratch + 248) = del->target;
+		*(InterpMethod **) (scratch + 252) = imethod;
 		*(gint32 *) (scratch + 220) = shape; /* publish scratch recipe last */
 		return TRUE;
 	}
@@ -6665,6 +6756,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	*(gint32 *) (scratch + 240) = scalar ? 1 : 0;
 	*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
 	*(MonoObject **) (scratch + 248) = del->target;
+	*(InterpMethod **) (scratch + 252) = imethod;
 	*(gint32 *) (scratch + 220) = shape;
 	return TRUE;
 }
@@ -6681,6 +6773,7 @@ mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 	int eslot = *(gint32 *) (scratch + 228);
 	int slots = *(gint32 *) (scratch + 236);
 	gboolean scalar = *(gint32 *) (scratch + 240) != 0;
+	InterpMethod *timethod = *(InterpMethod **) (scratch + 252);
 
 	/* CONSUME-CLEAR the recipe now that its fields are captured in locals. A recipe is only ever
 	 * live between prepare_delegate_call's publish and this read (pure wasm spill code in between);
@@ -6690,10 +6783,16 @@ mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 	 * read the nested call's stale shape at +220 and dispatch the wrong target with its own args —
 	 * the same nested-clobber class as the scratch+200 re-store in resolve_fslot / vcall_aot_target. */
 	*(gint32 *) (scratch + 220) = WJ_DELEGATE_NONE;
+	*(InterpMethod **) (scratch + 252) = NULL;
 
 	if (!del || !target || shape <= WJ_DELEGATE_NONE || shape > WJ_DELEGATE_OPEN_INSTANCE ||
 	    slots < 0 || slots > WJ_SCRATCH_ARG_SLOTS)
-		return mono_wasm_jit_call_interp (invoke, scratch);
+		/* NOTE the callee here is `invoke`, not `target`: the recipe was rejected, so the resolved
+		 * InterpMethod does not describe the method being entered and must not be handed over. */
+		{
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_DELEGATE_SLOW_NORECIPE);
+			return mono_wasm_jit_call_interp (invoke, scratch);
+		}
 
 	if (shape == WJ_DELEGATE_CLOSED_INSTANCE || shape == WJ_DELEGATE_BOUND_STATIC) {
 		/* Both shapes preserve the original slot count: delegate `this` becomes the closed/bound
@@ -6726,7 +6825,16 @@ mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 		return get_context ()->has_resume_state ? 1 : 0;
 	}
 
-	return mono_wasm_jit_call_interp (target, scratch);
+	/* Which conjunct of the `eslot > 0 && scalar` gate above failed. Bumped HERE, where the fallback is
+	 * actually taken, so "decided" and "happened" cannot be different populations (R215). */
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_count (eslot > 0 ? WJC_DELEGATE_SLOW_NONSCALAR : WJC_DELEGATE_SLOW_NOESLOT);
+	/* Hand over the InterpMethod prepare_delegate_call already resolved for `target`. This is a handover
+	 * inside one crossing, NOT a cache: it is published with the recipe, consume-cleared above, and the
+	 * only code between the two is the caller's wasm spill sequence -- the same window scratch+204's
+	 * `target` (which this path already dereferences) lives in. If that window ever widens, this slot
+	 * moves with the rest of the recipe rather than being treated as durable state. */
+	return wj_call_interp_inner (target, scratch, timethod);
 }
 
 int
@@ -6750,6 +6858,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	*(gint32 *) (scratch + 240) = 0;
 	*(gint32 *) (scratch + 244) = 0;
 	*(MonoObject **) (scratch + 248) = NULL;
+	*(InterpMethod **) (scratch + 252) = NULL;
 	if (G_UNLIKELY (!this_obj)) {
 		*(MonoMethod **) (scratch + 200) = NULL;
 		extern void mono_wasm_jit_throw (MonoObject *exc);

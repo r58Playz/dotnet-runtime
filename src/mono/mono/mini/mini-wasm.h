@@ -584,6 +584,16 @@ enum {
 	 * rest vanished at two gates with no counter. DISTINCT is the denominator every per-attempt reemit
 	 * counter was missing. Assert: SKIP_STATE + SKIP_AGE + BUSY + DONE + REFUSED == pops. */
 	WJC_REEMIT_DISTINCT, WJC_REEMIT_SKIP_STATE, WJC_REEMIT_SKIP_AGE,
+	/* WHY a delegate dispatch fell off the direct e-thunk and into the full interp marshal. 97% of
+	 * mono_wasm_jit_call_interp's cost arrives from mono_wasm_jit_call_delegate, and the whole
+	 * interp-boundary complex (call_interp plus everything it re-derives) is ~5.7-6.1% of the client
+	 * render thread -- but the fast path is gated on `eslot > 0 && scalar` and NOBODY KNOWS WHICH
+	 * CONJUNCT FAILS. These three are bumped at the point the fallback is TAKEN, not where it is decided
+	 * (R215: DelegateDevirtArm read 750 with FastDelegateDevirt 0 because the deciding block and the
+	 * emitting block were different populations). Assert: NORECIPE + NOESLOT + NONSCALAR == the
+	 * call_interp exits out of call_delegate. NORECIPE is the `invoke` fallthrough (no usable recipe at
+	 * all); the other two are the `target` fallthrough with a recipe in hand. */
+	WJC_DELEGATE_SLOW_NORECIPE, WJC_DELEGATE_SLOW_NOESLOT, WJC_DELEGATE_SLOW_NONSCALAR,
 	WJC_MAX
 };
 

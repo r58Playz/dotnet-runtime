@@ -1434,7 +1434,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 184);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split */
+g_static_assert (WJC_MAX == 187);   /* R166: +ADMIT_FAIL_{PERM,RETRY}, +VFB_NOTLIVE, +AL_*; R167: +SHADOW_*; +COLOCATE_* refusal split; +DELEGATE_SLOW_* */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1610,6 +1610,17 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_PRETIER_BUMP), mono_wasm_jit_pretier);
 	printf ("[wasm-jit transition] residual_healed=%lld fast_delegate=%lld delegate_ic_hit=%lld (fast counters require PROFILE_FAST=1)\n",
 		WJC_(WJC_RESIDUAL_HEALED), WJC_(WJC_FAST_DELEGATE), WJC_(WJC_DELEGATE_IC_HIT));
+	/* WHY a delegate dispatch missed the direct e-thunk. call_delegate is 97% of call_interp's traffic
+	 * and the whole interp-boundary complex is ~5.7-6.1% of the client render thread, but its fast path
+	 * is `eslot > 0 && scalar` and which conjunct fails has never been measured. Bumped where the
+	 * fallback is TAKEN. norecipe = no usable recipe at all (enters `invoke`); noeslot = recipe in hand
+	 * but the target's entry thunk is not admitted on this worker; nonscalar = admitted but the
+	 * signature has a by-value vtype or byref, which the e-thunk ABI cannot express. Those three answer
+	 * OPPOSITE questions -- noeslot is an admission/ordering problem, nonscalar is an ABI one. */
+	printf ("[wasm-jit delegate-slow] norecipe=%lld noeslot=%lld nonscalar=%lld"
+		"  (sum == the call_interp exits out of call_delegate)\n",
+		WJC_(WJC_DELEGATE_SLOW_NORECIPE), WJC_(WJC_DELEGATE_SLOW_NOESLOT),
+		WJC_(WJC_DELEGATE_SLOW_NONSCALAR));
 	/* DEVIRT CENSUS. sites = ordinary virtual sites offered to the prediction gate; delegate_sites = the
 	 * population it refuses outright. The four refusal reasons pull in OPPOSITE directions on the "raise
 	 * the JIT threshold so the interpreter records more" question: no_rec + cold argue for more warmup,
