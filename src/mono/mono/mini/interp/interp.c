@@ -777,11 +777,44 @@ wj_vperm_note (InterpMethod *im)
  * not say whether it is a few hot methods or a long tail, nor WHY each callee is un-JITted. This resolves
  * it to named methods with their bail reason, which is what makes the interp-routing item actionable at
  * all. Bumped only under MONO_WASM_JIT_STATS, so it costs nothing in a timing run. */
+/* RETRY-STATE ATTRIBUTION. `vfb_thresh` is 90% `retry` (slot -3, the compile-lock back-off): measured
+ * 9,410,099 of 10,476,605 in one window. That is an EVENT count, and an event count cannot distinguish
+ * A FEW METHODS LIVELOCKING from MANY CYCLING NORMALLY -- which need opposite fixes, and which is the
+ * same "no denominator" hole that produced three wrong re-emission explanations before
+ * WJC_REEMIT_DISTINCT settled it. Same shape as wj_iroute_* below: hash by InterpMethod, cache the name
+ * at record time so the main-thread dump takes no lock. */
+#define WJ_RETRY_SLOTS 1024
+static InterpMethod *wj_retry_im [WJ_RETRY_SLOTS];
+static gint64 wj_retry_w [WJ_RETRY_SLOTS];
+static char *wj_retry_name [WJ_RETRY_SLOTS];
+static volatile gint32 wj_retry_state [WJ_RETRY_SLOTS];
+
 #define WJ_IROUTE_SLOTS 2048
 static InterpMethod *wj_iroute_im [WJ_IROUTE_SLOTS];
 static gint64 wj_iroute_w [WJ_IROUTE_SLOTS];
 static char *wj_iroute_name [WJ_IROUTE_SLOTS];
 static volatile gint32 wj_iroute_state [WJ_IROUTE_SLOTS];
+
+static void
+wj_retry_note (InterpMethod *im)
+{
+	gsize h = ((gsize) im >> 4) & (WJ_RETRY_SLOTS - 1);
+	int i;
+	for (i = 0; i < WJ_EDGE_PROBE; ++i) {
+		int idx = (h + i) & (WJ_RETRY_SLOTS - 1);
+		if (wj_retry_state [idx] == 2 && wj_retry_im [idx] == im) { mono_atomic_inc_i64 (&wj_retry_w [idx]); return; }
+		if (wj_retry_state [idx] == 0 && mono_atomic_cas_i32 (&wj_retry_state [idx], 1, 0) == 0) {
+			char *name = mono_method_get_full_name (im->method);
+			wj_retry_w [idx] = 1;
+			wj_retry_name [idx] = name;
+			wj_retry_im [idx] = im;
+			mono_atomic_xchg_i32 (&wj_retry_state [idx], 2);
+			return;
+		}
+		if (wj_retry_state [idx] == 1)
+			return;
+	}
+}
 
 static void
 wj_iroute_note (InterpMethod *im)
@@ -2328,6 +2361,31 @@ mono_wasm_jit_dump_blockers (int topn)
 	 * ran interpreted — orders of magnitude more than a JIT-to-JIT dispatch. Read the bail column first: a
 	 * `not-yet-jitted` population is a THRESHOLD/admission problem, while named permanent gates are emitter
 	 * work, and the two need opposite responses. */
+	/* RETRY-state top-N. `vfb_thresh` is ~90% slot -3, and the event count alone cannot say whether that
+	 * is a handful of methods livelocking on the compile CAS or a healthy population cycling through a
+	 * 64-call back-off. Read the DISTINCT row count against the total: few rows with huge counts = a
+	 * livelock worth fixing; many rows with small counts = normal churn and the pool is structural. */
+	printf ("[wasm-jit retry top] slot=-3 (compile-BUSY back-off) callees by executed fallback count:\n");
+	{
+		gint64 lastw = G_MAXINT64; int shown2 = 0, distinct = 0, k2; gint64 sumw = 0;
+		for (k2 = 0; k2 < WJ_RETRY_SLOTS; ++k2)
+			if (wj_retry_state [k2] == 2) { distinct++; sumw += wj_retry_w [k2]; }
+		while (shown2 < topn) {
+			int best = -1, k; gint64 bestw = 0;
+			for (k = 0; k < WJ_RETRY_SLOTS; ++k) {
+				gint64 w;
+				if (wj_retry_state [k] != 2) continue;
+				w = wj_retry_w [k];
+				if (w > bestw && w < lastw) { bestw = w; best = k; }
+			}
+			if (best < 0) break;
+			printf ("  %10lld  slot=%d  %s\n", (long long) bestw, wj_retry_im [best]->wasm_jit_slot,
+				wj_retry_name [best] ? wj_retry_name [best] : "?");
+			lastw = bestw; shown2++;
+		}
+		printf ("  -- %d distinct methods, %lld total fallbacks (table holds %d)\n",
+			distinct, (long long) sumw, WJ_RETRY_SLOTS);
+	}
 	printf ("[wasm-jit iroute top] interp-routed residual callees by executed count:\n");
 	{
 		gint64 lastw = G_MAXINT64; int lastk = -1;
@@ -6952,7 +7010,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			switch (imethod->wasm_jit_slot) {
 			case 0:                    mono_wasm_jit_count (WJC_VFB_COLD); break;
 			case WASM_JIT_SLOT_PARKED: mono_wasm_jit_count (WJC_VFB_PARKED); break;
-			case WASM_JIT_SLOT_RETRY:  mono_wasm_jit_count (WJC_VFB_RETRY); break;
+			case WASM_JIT_SLOT_RETRY:  mono_wasm_jit_count (WJC_VFB_RETRY); wj_retry_note (imethod); break;
 			/* slot > 0: the target IS compiled, so reaching the residual means mono_wasm_jit_admit_live
 			 * said no on THIS worker -- its module is not instantiated here, or its descriptor is stuck
 			 * mid-DFS (state 1, where admit returns 1 and desc_admitted returns 0). This arm used to be
