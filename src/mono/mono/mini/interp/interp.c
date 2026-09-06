@@ -6037,8 +6037,19 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 	 * Using the callee SIGNATURE (so no 1A over-marking false positive), check every by-value REFERENCE arg
 	 * (and `this`): its spilled value must be NULL or a plausible heap pointer. A non-pointer there — e.g. the
 	 * -10 (0xfffffff6) that reached a (Biome[]) cast in Villager pathfinding — means the JIT put an int into a
-	 * reference slot. Log (rate-limited) the callee + arg index so the SOURCE method is named; non-fatal. */
-	{
+	 * reference slot. Log (rate-limited) the callee + arg index so the SOURCE method is named; non-fatal.
+	 *
+	 * GATED ON OBJGUARD, and it shipped UNGATED (`#ifdef HOST_BROWSER` only) for the whole type-confusion
+	 * hunt. Measured cost of that: MONO_TYPE_IS_REFERENCE is `mono_type_is_reference(t)`, a real CALL
+	 * (metadata.h), and it read 0.197%/0.287% of the client render thread with 98.6% of it arriving under
+	 * mono_wasm_jit_call_interp -- i.e. the diagnostic was directly visible in the in-game census, on a
+	 * path taken ~8,500 times per frame. OBJGUARD rather than STATS because this is the interp-boundary
+	 * half of exactly what OBJGUARD does on the emitted-store side ("validate the base is a live heap
+	 * object, DEBUG ONLY"), and because a STATS run is a counter census that must not also change codegen
+	 * -- the caller-attribution store this block reads (mini-wasm.c, scratch+224) is emitted under the
+	 * same knob, so knob-off removes the store from every residual and delegate site as well. */
+	extern int mono_wasm_jit_objguard;
+	if (G_UNLIKELY (mono_wasm_jit_objguard)) {
 		gsize _memsz = wj_memsz ();
 		int _vidx = sig->hasthis ? 1 : 0;
 		/* Caller attribution: every JITted residual/vcall-fallback site bakes ITS OWN MonoMethod* at
@@ -9744,8 +9755,13 @@ mono_interp_isinst (MonoObject* object, MonoClass* klass)
 	 * stack the resulting wasm trap silently kills the worker (the GC then stalls trying to suspend it),
 	 * giving a context-free crash. Validate object + vtable + klass via RAW word reads (no struct deref, so
 	 * no OOB) BEFORE mono_object_class. On garbage, log (rate-limited, greppable) and return FALSE instead
-	 * of dereferencing — the run continues so we can see how often / with what target type it happens. */
-	if (G_UNLIKELY (object != NULL)) {
+	 * of dereferencing — the run continues so we can see how often / with what target type it happens.
+	 *
+	 * GATED ON OBJGUARD (it shipped ungated). Three raw word reads + two wj_probe_ok range checks on every
+	 * mono_interp_isinst is not free on a Java workload, and this is the same class of check OBJGUARD
+	 * already owns. Knob-off restores the plain mono_object_class deref, i.e. the upstream behaviour. */
+	extern int mono_wasm_jit_objguard;
+	if (G_UNLIKELY (mono_wasm_jit_objguard && object != NULL)) {
 		gsize o = (gsize) object;
 		gsize memsz = wj_memsz ();
 		gboolean bad = !wj_probe_ok (o, memsz);
