@@ -227,6 +227,41 @@ struct InterpMethod {
 	 * `done` and `refused` are already distinct (both set state 2, which is terminal); this supplies the
 	 * denominator they were missing. Sits in the padding after the two guint8s above -- costs nothing. */
 	guint8 wasm_jit_reemit_seen;
+	/* SIGNATURE-SHAPE CACHE for the residual/delegate interp boundary. Both per-crossing loops in
+	 * mono_wasm_jit_call_interp are pure functions of MonoMethodSignature*, which is fixed for the
+	 * callee, and they were being re-derived on EVERY crossing -- ~8,500 times per frame.
+	 *
+	 * Measured cost of re-deriving them, client render thread, in-game plateau, two independent captures
+	 * (b5ctl / b2ctl), each symbol with its immediate caller resolved from the perf call chains:
+	 *
+	 *     mini_is_gsharedvt_type            0.813% / 0.700%   (99.6% under mini_is_gsharedvt_variable_type)
+	 *     wj_byaddr_vtype                   0.772% / 0.858%   (99.4% under mono_wasm_jit_arg_is_byaddr)
+	 *     mono_mint_type                    0.721% / 0.691%   (97.2% under mono_wasm_jit_call_interp)
+	 *     mini_type_get_underlying_type     0.538% / 0.570%   (98.9% under wj_byaddr_vtype)
+	 *     mono_wasm_jit_arg_is_byaddr       0.272% / 0.318%   (92.1% under mono_wasm_jit_call_interp)
+	 *     mini_is_gsharedvt_variable_type   0.059%
+	 *                                       ------------------
+	 *                                       3.175% / 3.137%   of the fps-setting thread
+	 *
+	 * `ptrarg_mask` bit i = wj_arg_slot_holds_pointer (sig->params[i]); `argshape` carries COMPUTED,
+	 * SCALAR (the e-slot residual's eligibility test) and WIDE (>32 params -- fall back to the loop, so
+	 * nothing regresses on a wide signature). Both are DERIVED FROM the predicate rather than being a
+	 * second copy of it: the header on wj_arg_slot_holds_pointer is explicit that a desync there is a
+	 * silent DOUBLE DEREF, not a crash.
+	 *
+	 * Keyed on the InterpMethod, which is resolved AFTER call_interp's SYNCHRONIZED_INNER substitution,
+	 * so the cache and the `sig` it describes are the same method by construction -- attaching it to the
+	 * incoming MonoMethod would have described the wrapper's signature instead.
+	 *
+	 * Safe against the flags it depends on: VTYPE_BYADDR and VRET are documented "read ONCE
+	 * (process-lifetime): f_sig_id fingerprints must not split mid-process", so the classification cannot
+	 * change under the cache. Concurrent computation is benign (pure function, every thread computes the
+	 * same answer); the store order below publishes the mask before the COMPUTED bit.
+	 *
+	 * The emitter's own uses of the predicate (mini-wasm.c) are untouched -- there it runs once per
+	 * method at emit time and costs nothing. Only the per-crossing C-side consumers read this. */
+	guint32 wasm_jit_ptrarg_mask;
+	guint8 wasm_jit_argshape;
 	/* THE CALL PROFILE (MONO_WASM_JIT_DEVIRT_PROFILE): WjCallProfile*, lazily allocated. See the long
 	 * comment above WjProfSite in interp.c.
 	 *
