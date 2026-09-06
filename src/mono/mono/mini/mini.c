@@ -3204,8 +3204,17 @@ mini_get_rgctx_access_for_method (MonoMethod *method)
  * wasm_jit_extra_opt:
  *
  *   MINI optimization flags to OR onto WASM_JIT_OPT_BASE at the compile_wasm fork below. Read once from
- * MONO_WASM_JIT_OPT; default 0 = base only (-O0 bodies: no inlining, so every accessor stays a real
- * call — the call-bound profile).
+ * MONO_WASM_JIT_OPT.
+ *
+ *   THE DEFAULT IS NOW THE SHIPPED SET, and the previous default of 0 was actively misleading. It
+ * produced -O0 bodies -- no inlining, so every accessor stayed a real call -- while the product has
+ * always passed
+ *     opt: "inline,consprop,copyprop,deadce,branch,cfold,loop,alias-analysis,ssa,abcrem"
+ * from ikvmcraft's index.ts. So SSA, propagation, DEADCE, ABCREM, alias analysis and the inliner all
+ * ship ON, and any measurement taken without that list measured a configuration nobody runs. Worse, the
+ * consumer spells the knob `opt`, so grepping the app for MONO_WASM_JIT_OPT finds nothing -- that cost
+ * two wrong conclusions in one session. Baking the shipped set in removes the trap; the env var still
+ * overrides it for a deliberate A/B.
  *
  *   ACCEPTS a comma-separated opt-name list ("inline", "inline,deadce"), "all", or a raw numeric mask.
  * '-name' clears a flag. Unknown names warn and are ignored (never exit(), unlike the driver parser).
@@ -3238,9 +3247,14 @@ wasm_jit_extra_opt (void)
 		return cached;
 	inited = TRUE;
 
+	/* The shipped set, as a name list rather than a mask so it stays readable and so it goes through the
+	 * same parser (and the same WASM_JIT_OPT_DENY clearing) as an override. Diffed against mono's own
+	 * DEFAULT_OPTIMIZATIONS (driver.c:115-132) this ADDS ssa/abcrem/float32 and omits only PEEPHOLE,
+	 * which V8's own peepholes subsume -- so the tier's x1.85 backend gap is output quality, not a
+	 * pass-configuration gap. */
 	p = g_getenv ("MONO_WASM_JIT_OPT");
 	if (!p || !*p)
-		return (cached = 0);
+		p = "inline,consprop,copyprop,deadce,branch,cfold,loop,alias-analysis,ssa,abcrem";
 
 	if (*p >= '0' && *p <= '9') {
 		/* raw mask: hex (0x..) or decimal. Hand-rolled — eglib here doesn't declare g_ascii_strtoull. */

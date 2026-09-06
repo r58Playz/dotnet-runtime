@@ -81,12 +81,17 @@ void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-i
  * MonoWasmJitResult in mini.h) and mono_wasm_force_compile copies it out after the compile returns.
  * Per-compile => re-entrancy-safe by construction (a nested cctor/AOT-init compile has its own cfg),
  * so the old "publish the success gate last behind a barrier" dance is gone. */
-int mono_wasm_jit_island = 1;   /* eager transitive island-JIT; MONO_WASM_JIT_ISLAND=0 = old bottom-up retry only */
 /* Automatic hotness trigger (Phase 5): when mono_wasm_jit_auto>0, the interp (MINT_CALL) counts
  * calls to each callee and force-compiles it to wasm once its hit count reaches mono_wasm_jit_thresh,
  * instead of requiring the method to be named in MONO_WASM_JIT_METHOD. -1 = uninitialized. */
-int mono_wasm_jit_auto = -1;
-int mono_wasm_jit_thresh = 2000;
+int mono_wasm_jit_auto = 1;
+/* MONO_WASM_JIT_AUTO KEEPS ITS KNOB, deliberately, where the other settled booleans lost theirs: it is
+ * the single switch that turns the whole JIT tier off, which makes it the first bisect step for any
+ * "is this the wasm JIT?" question. Its DEFAULT was 0 (via -1 meaning uninitialised), which meant the
+ * tier did not exist unless the app turned it on -- so the runtime's own default described a product
+ * nobody ships. Now 1. */
+int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* auto-JIT hotness threshold. 2000 was the pre-Minecraft value; 500 is what the product runs. R204 cut `no_fslot` 69%% by moving it, and that is worth NOTHING on the plateau -- it is a boot/worldgen effect, because 99.3%% of profile observations arrive AFTER a method is JITted. Right for boot, not a frame-rate lever. */
 /* MONO_WASM_JIT_OVER_AOT is deleted. It let the runtime wasm method-JIT compete with an
  * already-available AOT body (the interpreter kept code_type=COMPILED, so a failed emission,
  * publication or per-thread admission fell back to the AOT entry -- which is what made it safer than a
@@ -105,23 +110,6 @@ int mono_wasm_jit_thresh = 2000;
  * ineligible at their hotness threshold" rule and keep the AOT body as fallback -- and the thing to fix
  * first is the boot stall, not the policy. */
 int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiver-arity histogram for the vcall miss population (N-way IC capture curve). Diagnostic — perturbs timing (like PROFILE_FAST); default off */
-/* MONO_WASM_JIT_DEVIRT_PROFILE=1: record the receiver vtable seen at interp virtual call sites.
- * Collection lives in interp.c (wj_prof_*), observable via mono_wasm_jit_prof_stat. Defined HERE,
- * not in interp.c, because mono_wasm_jit_auto_init below references it and this file is linked into
- * both the runtime and the offline cross-compiler (mono-aot-cross), which has no interpreter — same
- * reason as mono_wasm_jit_residual_mode. Costs ~0.7% when on. Default off.
- *
- * The first broad consumer added a guarded direct-call diamond in front of the complete PIC/AOT
- * lowering at every profiled callvirt. That duplicated both paths and measured as a 1.5x regression.
- * The adaptive slim consumer below is materially different: for a perfectly-monomorphic site whose
- * target already has an admitted f-slot, it emits only one checked target plus the signature-shared
- * cold miss. There is no duplicated PIC/AOT diamond. Terminal forwarding calls additionally retain
- * bottom-up island blocking so their predicted target can be published before re-emission.
- *
- * The guard is still necessary for correctness if feedback becomes stale. In batch mode its stable
- * call_indirect also gives V8 same-module target feedback; outside batch mode it still replaces a much
- * larger worker-PIC hit path. The profile remains batching's observed virtual call graph too. */
-int mono_wasm_jit_devirt_profile = 0;
 /* MONO_WASM_JIT_DEVIRT_FORCE — when the call profile predicts a target but that target owns no admitted
  * f-slot yet, make it an ISLAND BLOCKER and re-emit after it publishes, instead of silently dropping the
  * prediction and leaving the site on the inline cache.
@@ -155,24 +143,6 @@ int mono_wasm_jit_devirt_force_max = 2;
  * i.e. worse. The blocker mechanism it reuses is what R153's world-load stall came from: methods that
  * cannot clear their blockers run interpreted, so the cost lands in the island/parked counters rather
  * than anywhere it was being read. DEVIRT_FORCE itself, which is measured good, is untouched. */
-/* MONO_WASM_JIT_ILOFS_GLOBAL — store the per-bb IL offset INLINE through imported global s.i
- * (&mono_wasm_jit_cur_island_il_state) instead of calling mono_wasm_jit_set_il_offset per basic block.
- *
- * `set_il_offset` measured 1.38-1.45 M instr/frame on the client render thread -- HALF the whole
- * EH-island pool (2.82/2.86 M/frame, the most reproducible pool measured: 1.4% spread across two runs).
- * It is a helper CALL per bb in every eh_on method, and Java is EH-dense.
- *
- * WHY THIS IS NOT MONO_WASM_JIT_INLINE_ILOFS, which measured 9.8% WORSE: that variant kept the il_state
- * pointer in a wasm LOCAL, so it stayed live across every call in the body and cost register pressure on
- * a tier already at 32.21%. This re-derives the pointer from the imported global at each store --
- * `global.get; i32.load; i32.const; i32.store`, four ops, nothing live between stores.
- *
- * The pointer needs no null check for the same reason the INLINE_ILOFS path did not: an eh_on method's
- * prologue pushed the island, and leave_island only runs on the way out, so it is non-NULL for the whole
- * body. Precision is UNCHANGED (the exact per-bb offset is still stored), which matters because
- * mono_get_frame_info reads il_state->il_offset for stack-trace LINE NUMBERS -- that is what rules out
- * the cheaper clause-canonical variant, and it does not apply here. DEFAULT 0 until A/B'd. */
-int mono_wasm_jit_ilofs_global = 0;
 /* MONO_WASM_JIT_GUARDED_INLINE: at a virtual call site the profile can predict, emit an INLINED body
  * behind the same vtable guard the emitter's predicted arm already uses, instead of a call. See the
  * long argument at the site in method-to-ir.c.
@@ -260,9 +230,9 @@ int mono_wasm_jit_guarded_inline_size = 60;
  * identity is del->method. Per-identity COUNTS (R206) are the signal that works here, and the break-even
  * is the same as any other arm: guard ~3 x86 against an IC hit at ~21, so it pays above ~15%% capture when
  * the target co-locates. */
-int mono_wasm_jit_delegate_devirt = 0;
+int mono_wasm_jit_delegate_devirt = 15;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* minimum %% of a delegate site's observations its dominant target must hold before it gets a guarded direct arm. MEASURED: -6.6%% of client-thread instructions/frame at n=2 with a flat negative control (__<>MHC stubs -12.8%%, InstanceCheck -22.7%%). thin=35 of 7,556 sites, so delegate sites are overwhelmingly SINGLE-TARGET and the bar is not worth sweeping. */
 int mono_wasm_jit_pred_pct = 0;
-int mono_wasm_jit_devirt_arm2 = 0;
 /* Minimum share of a site's observations the runner-up must hold, in percent. Default is the measured
  * co-located break-even; raise toward 50 if arm-2 targets are not co-locating. */
 int mono_wasm_jit_devirt_arm2_pct = 15;
@@ -313,20 +283,6 @@ int mono_wasm_jit_devirt_arm2_pct = 15;
  * SURVIVES. Only a module-local `call <funcidx>` becomes a real `call rel32`, and it is also the only
  * form V8 can inline through. That is why DIRECT_IMPORT converted 100%% of predicted arms (6,892/6,909)
  * and moved nothing measurable, and it is the argument for CO-LOCATION over import conversion. */
-/* MONO_WASM_JIT_SCC_COLOCATE: frame a compiled dependency CYCLE's members into one module. DEFAULT ON.
- *
- * A cycle is the one grouping that is a correctness question and not a performance one. Its members call
- * each other by construction, and an import binds at instantiation, so a cyclic import pair cannot be
- * ordered -- one of them must instantiate while the other's f-slot is still a placeholder. Co-locating the
- * cycle turns every intra-cycle edge into a module-local `call <funcidx>`, which needs no ordering at all,
- * and is also the only call form V8 will inline through.
- *
- * On by default because the objection to batching was never module overhead -- 29.4 us + 15.4 ns/byte,
- * so co-location REDUCES total instantiate cost -- it was that producing a batched member cost a full
- * mono_wasm_force_compile. With relocatable bodies it costs a memcpy, and that objection is gone. Kept as
- * a knob so the arm can be flipped inside one binary, which at this workload's ~5% floor is the only
- * comparison worth making. */
-int mono_wasm_jit_scc_colocate = 1;
 /* MONO_WASM_JIT_ESLOT_VERIFY is deleted. Before each interp->JIT entry it read the table slot back from
  * JS and checked it was thunk-shaped (arity 2, not the jiterpreter prefill's 4) -- an EM_ASM per invoke.
  * It was the bring-up instrument for the prefilled-placeholder trap, and that trap now has a real guard:
@@ -381,7 +337,6 @@ int mono_wasm_jit_scc_colocate = 1;
  * `no_rec` (13,389 sites, 32.2% of hot IC execution) now has no collector, and guarded CHA is the
  * candidate to become one. */
 
-int mono_wasm_jit_colocate_deps = 1;
 /* MONO_WASM_JIT_COLOCATE_MERGE: let a re-frame ABSORB an existing group instead of dropping the edge.
  * DEFAULT OFF.
  *
@@ -411,15 +366,6 @@ int mono_wasm_jit_colocate_max = 16;      /* MONO_WASM_JIT_COLOCATE_MAX: members
  * bounds inlining INTO one function and must not be reused as a per-module cap -- just a bound on how much
  * one publish re-serialises. */
 int mono_wasm_jit_colocate_bytes = 32768;
-/* MONO_WASM_JIT_COLOCATE_LOCAL_CALLS=0: frame the members into one module exactly as co-location does --
- * same membership, same module, same slots, same rebind, same admission -- but resolve every call to
- * `call_indirect` instead of `call <funcidx>`. The module differs from the co-located one only in the
- * immediates at the intra-group call sites.
- *
- * The same differential as MONO_WASM_JIT_IMPORT_DEAD, for the same reason: it splits "sharing a module,
- * a WebAssembly.Instance, a generation bump and a rebind" from "changing the form of a call". One of those
- * two is what breaks; guessing which cost two build-deploy cycles on the import side. Default 1. */
-int mono_wasm_jit_colocate_local_calls = 1;
 /* MONO_WASM_JIT_COLOCATE_TIGHT_DEPS: publish the dependency set the ASSEMBLER derived for the module a
  * re-framing actually installs, instead of leaving whatever set the members were compiled as.
  *
@@ -438,15 +384,6 @@ int mono_wasm_jit_dump_dep_graph_knob = 0;
 /* MONO_WASM_JIT_VERIFY_DEPS: probe every dep f-slot for the jiterpreter placeholder just before a
  * descriptor goes live. Diagnostic only; see the block in mono_wasm_jit_admit. */
 int mono_wasm_jit_verify_deps = 0;
-/* MONO_WASM_JIT_COLOCATE_ROLLBACK: undo a group bind whose admission failed instead of condemning its
- * members. See wj_batch_rollback -- this is what makes co-location a tier-2 optimisation rather than a
- * commitment, and its absence is why the feature measured 812 ms/frame against a 50 ms control (R160). */
-int mono_wasm_jit_colocate_rollback = 1;
-/* MONO_WASM_JIT_COLOCATE_SCC: refuse to form a group that would leave a dependency cycle spanning two
- * modules. An intra-module cycle needs no ordering; a cross-module one cannot be ordered at all, and an
- * import edge inside one defers forever. MEASURED (R161): the whole tier holds only 11 such cycles, 205
- * methods, largest 32 -- so this is a correctness guard with a small footprint, not a reach lever. */
-int mono_wasm_jit_colocate_scc = 1;
 /* MONO_WASM_JIT_DEVIRT_IMPORT is GONE, and deliberately not replaced.
  *
  * It used to import the target of a predicted-devirt HIT specifically, as a separate lever from the
@@ -501,9 +438,7 @@ int mono_wasm_jit_colocate_scc = 1;
  * which is where this idea would have to move to be worth anything. Condition 3 is still not encoded at all:
  * it needs a POST-JIT per-method execution count, and wasm_jit_hits stops at the JIT threshold and is then
  * reset, so it cannot see the ~37k returns that decide tier-up. */
-/* MONO_WASM_JIT_LAZY_GCP: how many effective GC points a method may have and still defer its GC ref frame
- * until the first one is reached. 1 = the historical behaviour and the MEASURED BEST; <= 0 = no limit.
- * See the gate for the A/B: relaxing it costs 19.3% p50 and triples world generation. */
+
 int mono_wasm_jit_lazy_gcp = 1;
 int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC. Clamped [1,8].
  * DEFAULT 1, and that is measured, not conservative: on the plateau instrument (Minecraft, 2026-08, no-walk,
@@ -517,9 +452,6 @@ int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inl
  * AOT-IC site, and an outlined call on a dispatch path costs more here than the code it saves. Measured vs 4
  * (Minecraft plateau, 2026-08, 2 rounds): p90 -12.8%, mean frame -12.0%, fps +13.6%. Costs boot: classload
  * +5.0%, resources +7.1% -- fewer ways means more misses while receivers are still being discovered. */
-int mono_wasm_jit_vcall_shared_miss_enabled = 1; /* MONO_WASM_JIT_VCALL_SHARED_MISS: one signature-neutral cold miss stub using a lazy GC-pinned worker frame */
-int mono_wasm_jit_vcall_slim = 1; /* MONO_WASM_JIT_VCALL_SLIM: replace a perfectly-monomorphic profiled site's whole PIC/AOT diamond with one guarded admitted f-slot call + the shared cold miss. */
-int mono_wasm_jit_structured_cfg = 1; /* MONO_WASM_JIT_STRUCTURED_CFG: elide the dispatch br_table for verified forward CFGs and single-entry natural loops; irregular/nested shapes retain the universal dispatcher. */
 
 /* NB: compiled into BOTH the browser runtime and mono-aot-cross (no longer HOST_BROWSER-gated) so the
  * OFFLINE cross-compiler dump path (mini.c COMPILE_WASM fork) reads MONO_WASM_JIT_VERBOSE/DUMP_IR/STATS +
@@ -546,73 +478,40 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_verbose; const char *vb = g_getenv ("MONO_WASM_JIT_VERBOSE"); mono_wasm_jit_verbose = (vb && *vb) ? atoi (vb) : 0; }
 	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm && *nm != '0') ? 1 : 0; }
-	{ extern int mono_wasm_jit_helper_imports; const char *hi = g_getenv ("MONO_WASM_JIT_HELPER_IMPORTS"); mono_wasm_jit_helper_imports = (hi && *hi) ? ((*hi != '0') ? 1 : 0) : 1; }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
-	{ extern int mono_wasm_jit_aot_imports; const char *ai2 = g_getenv ("MONO_WASM_JIT_AOT_IMPORTS"); mono_wasm_jit_aot_imports = (ai2 && *ai2) ? ((*ai2 != '0') ? 1 : 0) : 1; } /* inline-AOT direct call as a function import rather than a constant-index call_indirect */
-	{ extern int mono_wasm_jit_ic_autosize; const char *ia = g_getenv ("MONO_WASM_JIT_IC_AUTOSIZE"); mono_wasm_jit_ic_autosize = (ia && *ia) ? ((*ia != '0') ? 1 : 0) : 1; }
-	{ extern int mono_wasm_jit_eslot_residual; const char *er = g_getenv ("MONO_WASM_JIT_ESLOT_RESIDUAL"); mono_wasm_jit_eslot_residual = (er && *er) ? ((*er != '0') ? 1 : 0) : 1; }
-	{ extern int mono_wasm_jit_delegate_local_pic; const char *dp = g_getenv ("MONO_WASM_JIT_DELEGATE_LOCAL_PIC"); mono_wasm_jit_delegate_local_pic = (dp && *dp) ? ((*dp != '0') ? 1 : 0) : 1; } /* 1 = worker-local delegate recipe PIC (no seqlock, no liveness probe, cached admitted fslot); 0 = the shared WjDelegateIC path. Read at EMIT time, so only the selected arm's prologue and dispatch are emitted -- both arms exist in the EMITTER, which is what makes this a same-binary A/B, but a given module contains only one (see the gates at the f-slot-IC liveness prologue). Do not read this as two dispatch implementations per module. */
 	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = per-worker instantiated-vs-entered census; adds a load+test to the interp->JIT boundary, so off while timing */
 	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
 	{ extern int mono_wasm_jit_guard_keep_slotlive; const char *gk = g_getenv ("MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE"); mono_wasm_jit_guard_keep_slotlive = (gk && *gk && *gk != '0') ? 1 : 0; } /* 1 = keep elision on under STOREGUARD/OBJGUARD (partial guard coverage, real configuration) */
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : 1; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
-	{ extern int mono_wasm_jit_devirt_profile; const char *dp = g_getenv ("MONO_WASM_JIT_DEVIRT_PROFILE"); mono_wasm_jit_devirt_profile = (dp && *dp && *dp != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
 	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
 	{ extern int mono_wasm_jit_guarded_inline; const char *gi = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE"); mono_wasm_jit_guarded_inline = (gi && *gi && *gi != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_guarded_inline_size; const char *gs = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE_SIZE"); int v = (gs && *gs) ? atoi (gs) : 60; mono_wasm_jit_guarded_inline_size = (v >= 0 && v <= 4096) ? v : 60; }
-	{ extern int mono_wasm_jit_ilofs_global; const char *ig = g_getenv ("MONO_WASM_JIT_ILOFS_GLOBAL"); mono_wasm_jit_ilofs_global = (ig && *ig && *ig != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_delegate_devirt; const char *dd = g_getenv ("MONO_WASM_JIT_DELEGATE_DEVIRT"); int v = (dd && *dd) ? atoi (dd) : 0; mono_wasm_jit_delegate_devirt = (v >= 0 && v <= 100) ? v : 0; }
 	{ extern int mono_wasm_jit_pred_pct; const char *pp = g_getenv ("MONO_WASM_JIT_PRED_PCT"); int v = (pp && *pp) ? atoi (pp) : 0; mono_wasm_jit_pred_pct = (v >= 0 && v <= 100) ? v : 0; }
-	{ extern int mono_wasm_jit_devirt_arm2; const char *a2 = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2"); mono_wasm_jit_devirt_arm2 = (a2 && *a2 && *a2 != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_arm2_pct; const char *ap = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2_PCT"); int v = (ap && *ap) ? atoi (ap) : 15; mono_wasm_jit_devirt_arm2_pct = (v >= 0 && v <= 100) ? v : 15; }
 	{ extern int mono_wasm_jit_lazy_gcp; const char *lg = g_getenv ("MONO_WASM_JIT_LAZY_GCP"); mono_wasm_jit_lazy_gcp = (lg && *lg) ? atoi (lg) : 1; } /* GC points a method may have and still defer its ref frame; <=0 = unlimited */
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
 	{ extern int mono_wasm_jit_vcall_aot_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_AOT_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_aot_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline AOT-vcall IC; clamp [1,8]; 1 = legacy first-wins */
-	{ extern int mono_wasm_jit_vcall_shared_miss_enabled; const char *sm = g_getenv ("MONO_WASM_JIT_VCALL_SHARED_MISS"); mono_wasm_jit_vcall_shared_miss_enabled = (sm && *sm) ? (*sm != '0') : 1; }
-	{ extern int mono_wasm_jit_vcall_slim; const char *sl = g_getenv ("MONO_WASM_JIT_VCALL_SLIM"); mono_wasm_jit_vcall_slim = (sl && *sl) ? (*sl != '0') : 1; }
-	{ extern int mono_wasm_jit_scc_colocate; const char *sc = g_getenv ("MONO_WASM_JIT_SCC_COLOCATE"); mono_wasm_jit_scc_colocate = (sc && *sc) ? (*sc != '0') : 1; }
 	/* Default 1, matching the initialiser. It read `: 0` here while the initialiser said 1 and the comment
 	 * block above it said "DEFAULT ON, and 0 is MEASURED WORSE" -- and auto_init runs once and overwrites,
 	 * so the EFFECTIVE default was 0: the arm R153 measured as reintroducing `function signature mismatch`.
 	 * Every co-location measurement taken before this fix was on that arm. Expected to become non-binding
 	 * once COLOCATE_TIGHT_DEPS lands: a correct dep list is what made cross-group edges want to be imports. */
-	{ extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
-	  const char *cd = g_getenv ("MONO_WASM_JIT_COLOCATE_DEPS"); mono_wasm_jit_colocate_deps = (cd && *cd) ? (*cd != '0') : 1;
+	{ extern int mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
 	  { extern int mono_wasm_jit_colocate_merge; const char *cg = g_getenv ("MONO_WASM_JIT_COLOCATE_MERGE"); mono_wasm_jit_colocate_merge = (cg && *cg && *cg != '0') ? 1 : 0; }
 	  const char *cm = g_getenv ("MONO_WASM_JIT_COLOCATE_MAX"); if (cm && *cm) { int v = atoi (cm); if (v >= 2 && v <= 512) mono_wasm_jit_colocate_max = v; }
 	  const char *cb = g_getenv ("MONO_WASM_JIT_COLOCATE_BYTES"); if (cb && *cb) { int v = atoi (cb); if (v > 0) mono_wasm_jit_colocate_bytes = v; } }
-	{ extern int mono_wasm_jit_colocate_local_calls; const char *cl = g_getenv ("MONO_WASM_JIT_COLOCATE_LOCAL_CALLS"); mono_wasm_jit_colocate_local_calls = (cl && *cl) ? (*cl != '0') : 1; }
 	{ extern int mono_wasm_jit_colocate_tight_deps; const char *td = g_getenv ("MONO_WASM_JIT_COLOCATE_TIGHT_DEPS"); mono_wasm_jit_colocate_tight_deps = (td && *td) ? (*td != '0') : 1; }
 	{ extern int mono_wasm_jit_dump_dep_graph_knob; const char *dg = g_getenv ("MONO_WASM_JIT_DUMP_DEP_GRAPH"); mono_wasm_jit_dump_dep_graph_knob = (dg && *dg) ? (*dg != '0') : 0; }
 	{ extern int mono_wasm_jit_verify_deps; const char *vd = g_getenv ("MONO_WASM_JIT_VERIFY_DEPS"); mono_wasm_jit_verify_deps = (vd && *vd) ? (*vd != '0') : 0; }
-	{ extern int mono_wasm_jit_colocate_rollback; const char *cr = g_getenv ("MONO_WASM_JIT_COLOCATE_ROLLBACK"); mono_wasm_jit_colocate_rollback = (cr && *cr) ? (*cr != '0') : 1; }
-	{ extern int mono_wasm_jit_colocate_scc; const char *cs = g_getenv ("MONO_WASM_JIT_COLOCATE_SCC"); mono_wasm_jit_colocate_scc = (cs && *cs) ? (*cs != '0') : 1; }
-	{ extern int mono_wasm_jit_structured_cfg; const char *sc = g_getenv ("MONO_WASM_JIT_STRUCTURED_CFG"); mono_wasm_jit_structured_cfg = (sc && *sc) ? (*sc != '0') : 1; }
-	{ extern int mono_wasm_jit_island; const char *il = g_getenv ("MONO_WASM_JIT_ISLAND"); mono_wasm_jit_island = (il && *il && *il == '0') ? 0 : 1; } /* 0 = no eager island formation (bottom-up retry only) */
-	{ extern int mono_wasm_jit_inline_aot; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_AOT"); mono_wasm_jit_inline_aot = (ia && *ia) ? (*ia != '0') : 1; } /* emit the inline direct same-ABI AOT call instead of the residual. Build 1 = no wasm-EH (non-throwing callees only). Default at the initialiser. */
-	{ extern int mono_wasm_jit_ldaddr_vtype; const char *lv = g_getenv ("MONO_WASM_JIT_LDADDR_VTYPE"); mono_wasm_jit_ldaddr_vtype = (lv && *lv) ? (*lv != '0') : 1; } /* OP_LDADDR of NON-SCALAR ref-free local via a full-size addr-frame slot. Exonerated re: corruption; kept gated for repro parity. */
-	{ extern int mono_wasm_jit_vtype_scalar_ref; const char *vr = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR_REF"); mono_wasm_jit_vtype_scalar_ref = (vr && *vr) ? (*vr != '0') : 1; } /* ref-etype scalar-vtype arg via a GC-scanned ref-shadow slot; GC-critical. */
-	{ extern int mono_wasm_jit_vtype_scalar; const char *vs = g_getenv ("MONO_WASM_JIT_VTYPE_SCALAR"); mono_wasm_jit_vtype_scalar = (vs && *vs) ? (*vs != '0') : 1; } /* pass a BYVAL ref-free scalar-vtype call arg as its single-field etype scalar (LLVMArgWasmVtypeAsScalar ABI). Needs LDADDR_VTYPE. */
-	{ extern int mono_wasm_jit_vtype_byaddr; const char *vb = g_getenv ("MONO_WASM_JIT_VTYPE_BYADDR"); mono_wasm_jit_vtype_byaddr = (vb && *vb) ? (*vb != '0') : 1; } /* multi-field/large vtype args as i32 pointer to a caller-owned C-stack copy (ArgValuetypeAddrOnStack). Default ON. Read ONCE (process-lifetime): f_sig_id fingerprints must not split mid-process. */
-	{ extern int mono_wasm_jit_vret; const char *vr2 = g_getenv ("MONO_WASM_JIT_VRET"); mono_wasm_jit_vret = (vr2 && *vr2) ? (*vr2 != '0') : 1; } /* vtype returns via hidden vret pointer (trailing i32 param internally). Default ON. Same process-lifetime rule. */
-	{ extern int mono_wasm_jit_byref; const char *br = g_getenv ("MONO_WASM_JIT_BYREF"); mono_wasm_jit_byref = (br && *br) ? (*br != '0') : 1; } /* lower calls whose callee sig has byref args/ret through the residual + vcall fallback instead of bailing the caller (-7). Default ON; =0 reverts to the pre-hardening bails for A/B. */
-	{ extern int mono_wasm_jit_ldaddr_vtype_ref; const char *lr = g_getenv ("MONO_WASM_JIT_LDADDR_VTYPE_REF"); mono_wasm_jit_ldaddr_vtype_ref = (lr && *lr) ? (*lr != '0') : 1; } /* ref-bearing non-scalar vtype locals in the (conservatively scanned) addr frame. Default ON. */
-	{ extern int mono_wasm_jit_ref_wt; const char *wt = g_getenv ("MONO_WASM_JIT_REF_WT"); mono_wasm_jit_ref_wt = (wt && *wt) ? (*wt != '0') : 0; } /* write-through ref vregs: wasm local is the value home, the frame slot is a def-mirrored pin (the LLVM-AOT gc_pin model); reads stop touching memory. Default OFF until soak. */
-	{ extern int mono_wasm_jit_slotlive; const char *sl = g_getenv ("MONO_WASM_JIT_SLOTLIVE"); mono_wasm_jit_slotlive = (sl && *sl) ? (*sl != '0') : 0; } /* GC-point liveness slot elision: an isref vreg whose whole def->use range crosses no GC point keeps NO frame slot (stays a fast wasm local the GC never needs to see). Cuts pin pressure + frame size. Default OFF until soak. */
-	{ extern int mono_wasm_jit_slotzero; const char *sz = g_getenv ("MONO_WASM_JIT_SLOTZERO"); mono_wasm_jit_slotzero = (sz && *sz) ? (*sz != '0') : 0; } /* dead-slot zeroing: null a single-bb ref slot at its last use so dead objects stop pinning (long-lived JSPI frames otherwise pin them until frame pop). Requires REF_WT+SLOTLIVE. Default OFF until soak. */
-	{ extern int mono_wasm_jit_nce; const char *nc = g_getenv ("MONO_WASM_JIT_NCE"); int n = (nc && *nc) ? atoi (nc) : 1; mono_wasm_jit_nce = n < 0 ? 0 : (n > 2 ? 2 : n); } /* 0=off; 1=safe bb-local NCE; 2=experimental dominator propagation. */
-	{ extern int mono_wasm_jit_lcse; const char *lc = g_getenv ("MONO_WASM_JIT_LCSE"); mono_wasm_jit_lcse = (lc && *lc && *lc != '0') ? 1 : 0; } /* extended-bb redundant heap-load elimination. Default OFF pending an A/B; reach measured 0.69% (54/7830 loads) on jbox2d — correct but nearly inert, see WjLcse. */
-	{ extern int mono_wasm_jit_coalesce; const char *cs = g_getenv ("MONO_WASM_JIT_COALESCE"); mono_wasm_jit_coalesce = (cs && *cs && *cs != '0') ? 1 : 0; } /* share one wasm local between vregs with disjoint live ranges. Default OFF until A/B'd. */
-	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); mono_wasm_jit_aot_entry = (ae && *ae && *ae != '0') ? 1 : 0; } /* fast path in the jiterpreter native->interp entry for already-JITted methods. */
-	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); mono_wasm_jit_raise_nogc = (rn && *rn && *rn != '0') ? 1 : 0; } /* 0=off, 1=liveness-only exemption. The old level 2 (also exempt the PUBLISHED consumers) was measured unsound and is deleted. See wj_ins_is_gcpoint -- and note its verdicts must be read in order. */
+	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); int v = (rn && *rn) ? atoi (rn) : 0; mono_wasm_jit_raise_nogc = (v >= 0 && v <= 2) ? v : 0; } /* 0=off, 1=liveness-only exemption (shipped, UNVERIFIED), 2=POSITIVE CONTROL ONLY (level 1 minus the gen_skipped_raises guard = the codegen measured 4/4 dead). See wj_ins_is_gcpoint -- its verdicts must be read in order. */
 	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
 	/* Island heuristic levers (Part 5), all default off. */
 	{ extern int mono_wasm_jit_entry_promote; const char *ep = g_getenv ("MONO_WASM_JIT_ENTRY_PROMOTE"); mono_wasm_jit_entry_promote = (ep && *ep) ? atoi (ep) : 0; }      /* Lever A: 0=off */
-	{ extern int mono_wasm_jit_residual_perm; const char *rp = g_getenv ("MONO_WASM_JIT_RESIDUAL_PERM"); mono_wasm_jit_residual_perm = (rp && *rp && *rp != '0') ? 1 : 0; } /* Lever B: 0=off */
 	{ extern int mono_wasm_jit_residual_cold; const char *rc = g_getenv ("MONO_WASM_JIT_RESIDUAL_COLD"); mono_wasm_jit_residual_cold = (rc && *rc && *rc != '0') ? 1 : 0; } /* Lever B': cold-leaf residual, 0=off */
 	{ extern int mono_wasm_jit_profile_fast; const char *pf = g_getenv ("MONO_WASM_JIT_PROFILE_FAST"); mono_wasm_jit_profile_fast = (pf && *pf && *pf != '0') ? 1 : 0; } /* emit fast-path volume counters, 0=off */
 	{ extern int mono_wasm_jit_island_depth; const char *id = g_getenv ("MONO_WASM_JIT_ISLAND_DEPTH"); mono_wasm_jit_island_depth = (id && *id && atoi (id) > 0) ? atoi (id) : 10; }   /* Lever C: default 10 */
@@ -623,9 +522,6 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_promoted_cold_div; const char *pc = g_getenv ("MONO_WASM_JIT_PROMOTED_COLD_DIV"); mono_wasm_jit_promoted_cold_div = (pc && *pc && atoi (pc) > 0) ? atoi (pc) : 16; }
 	{ extern int mono_wasm_jit_promoted_root_uncold_depth; const char *pu = g_getenv ("MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH"); mono_wasm_jit_promoted_root_uncold_depth = (pu && *pu && atoi (pu) >= 0) ? atoi (pu) : 1; }
 	{ extern int mono_wasm_jit_block_force; const char *bf = g_getenv ("MONO_WASM_JIT_BLOCK_FORCE"); mono_wasm_jit_block_force = (bf && *bf) ? atoi (bf) : 4; }
-	{ extern int mono_wasm_jit_hot_root; const char *hr = g_getenv ("MONO_WASM_JIT_HOT_ROOT"); mono_wasm_jit_hot_root = (hr && *hr && *hr != '0') ? 1 : 0; } /* own-threshold island = promoted root, 0=off */
-	{ extern int mono_wasm_jit_vcall_aot; const char *va = g_getenv ("MONO_WASM_JIT_VCALL_AOT"); mono_wasm_jit_vcall_aot = (va && *va) ? (*va != '0') : 1; } /* fast AOT-vcall dispatch: 0=off (residual) */
-	{ extern int mono_wasm_jit_vcall_aot_ic; const char *vc = g_getenv ("MONO_WASM_JIT_VCALL_AOT_IC"); mono_wasm_jit_vcall_aot_ic = (vc && *vc) ? (*vc != '0') : 1; } /* per-call-site AOT-vcall IC; needs VCALL_INLINE_IC+VCALL_AOT. */
 #ifdef HOST_BROWSER
 	/* These three are DEBUG store/GC guards whose globals + runtime-check emission are HOST_BROWSER-only
 	 * (they insert per-store checks that only do anything when the JITted code actually RUNS). The offline
@@ -636,8 +532,6 @@ mono_wasm_jit_auto_init (void)
 #endif
 	{ extern int mono_wasm_jit_missedref; const char *mr = g_getenv ("MONO_WASM_JIT_MISSEDREF"); mono_wasm_jit_missedref = (mr && *mr && *mr != '0') ? 1 : 0; } /* DIAG: names a missed ref. For every method, log any NONREF-classified i32 vreg used as a MEMBASE load/store base or virtual-call receiver (a stale one of these is the wild-deref corruptor), with its defining opcode -> pins which wj_opcode_is_nonref case is wrong. Bounded. default off */
 	{ extern int mono_wasm_jit_refverify; const char *rv = g_getenv ("MONO_WASM_JIT_REFVERIFY"); mono_wasm_jit_refverify = (rv && *rv) ? atoi (rv) : 0; } /* 1=log, 2=assert classification-vs-structural-marking violations; default off */
-	{ extern int mono_wasm_jit_vcall_inline_ic; const char *vi = g_getenv ("MONO_WASM_JIT_VCALL_INLINE_IC"); mono_wasm_jit_vcall_inline_ic = (vi && *vi) ? (*vi != '0') : 1;
-	} /* inline vcall IC fast path. Default at the initialiser. */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
@@ -678,34 +572,13 @@ mono_wasm_jit_add (int idx, gint64 v)
  * registered+invalid, 2 +bail, 3 +emit-enter. Default 0 so a stats run no longer floods stdout. */
 int mono_wasm_jit_verbose = 0;
 const char *mono_wasm_jit_watch = NULL;
-int mono_wasm_jit_names = 0;   /* MONO_WASM_JIT_NAMES=1 emits a wasm name section per JITted module so traps self-symbolicate */
-/* MONO_WASM_JIT_HELPER_IMPORTS=0 keeps runtime-helper calls as `i32.const <table index>; call_indirect`.
- * Default 1 = declare each called helper as a wasm function import and emit a direct `call`, which drops the
- * bounds check, signature check and table-index arithmetic V8 emits for every call_indirect (it does not fold
- * a constant index into a direct call — a 54-byte-IL MethodHandle stub had 21 call_indirect in its wasm and
- * exactly 21 `call *` in its x86). Kept as a knob because it changes the module's import list and function
- * index space, which is exactly the kind of change worth being able to switch off in one run. */
-int mono_wasm_jit_helper_imports = 1;
-/* MONO_WASM_JIT_AOT_IMPORTS: give the INLINE-AOT direct call the same treatment HELPER_IMPORTS gives runtime
- * helpers — declare the callee's table index as a wasm function import and emit a plain `call`, instead of
- * `i32.const <index>; call_indirect <ti> 0`.
- *
- * Why it was left out: the helper-import path was built for the ~25 fixed runtime helpers, and the inline-AOT
- * site (the `aot_addr` call below) was written before it existed. But it is the SAME shape — a constant table
- * index and a functype the emitter already computed — and the reason HELPER_IMPORTS exists applies verbatim:
- * V8 does not fold a constant call_indirect index into a direct call, so every one of these pays a bounds
- * check, a signature check and index arithmetic. The site is hot: WJC_FAST_INLINE_AOT read 943,008,975 over a
- * single session (~90k inline-AOT calls per frame).
- *
- * Expected size is honest and small — a few instructions on ~90k calls/frame is order 1-2% of a 38 ms frame,
- * which is BELOW this harness's run-to-run spread. It is shipped on mechanism (V8 provably emits the checks;
- * see the HELPER_IMPORTS comment's x86 verification) rather than on a measured delta, and kept as a knob so
- * it can be bisected out if it ever correlates with a fault.
- *
- * Failure mode differs from call_indirect and is worth knowing: a wrong functype traps at CALL time today,
- * but as an import it fails INSTANTIATION, so the whole method silently falls back to the interpreter and
- * shows up as fewer `registered` methods + a WJC_INVALID bump rather than as a crash. */
-int mono_wasm_jit_aot_imports = 1;
+int mono_wasm_jit_names = 1;
+/* MONO_WASM_JIT_NAMES KEEPS ITS KNOB and gets default 1. It appends a wasm name section per JITted
+ * module, which is what makes every profile symbolised and every trap self-symbolicating -- without it
+ * perf reads the whole tier as a bare `wasmjit`. It stays switchable because the symbolisation loop is
+ * the source of R199's intermittent `memory access out of bounds` (mono_method_get_full_name walking a
+ * signature lazily, on a worker, inside the compile section), so `names=0` is the bisect arm for that
+ * fault. The name is now cached at EMIT time, which is the fix; the knob is the fallback. */
 /* The helper-import cap is now WJ_MAX_HELPER_IMPORTS-bounded and fixed at 192.
  *
  * MONO_WASM_JIT_MAX_HIMP is deleted as NON-BINDING, and the way that was established is the useful
@@ -751,20 +624,6 @@ int mono_wasm_jit_aot_imports = 1;
  * Note this creates NO new live value — refbase is already live and already the fill's first operand — so the
  * Round 110 failure mode (trading a call for a long live range) does not apply. */
 int mono_wasm_jit_inline_zero = 64;   /* max framebytes to zero inline; 0 disables (always memory.fill). */
-/* MONO_WASM_JIT_IC_AUTOSIZE=0 emits MONO_WASM_JIT_VCALL_WAYS ways at every virtual call site. Default 1 =
- * size each site from the call profile's receiver observations (mono_wasm_jit_prof_arity), so a site only
- * ever seen monomorphic loses its ways 1..N-1 cold-scan loop entirely. Requires the devirt profile to be on
- * (it is, in the shipping knob set) — with no observations the configured width is used unchanged. */
-int mono_wasm_jit_ic_autosize = 1;
-/* MONO_WASM_JIT_DELEGATE_LOCAL_PIC: dispatch Delegate.Invoke through the WORKER-LOCAL recipe PIC
- * (WjLocalDelegatePicEntry) instead of the process-wide WjDelegateIC. The shared entry cannot cache a
- * function-table slot — dynamic table entries are per worker — so it caches an InterpMethod, and every
- * hit paid for that: load imethod, load imethod->fslot, test it, then probe the TLS liveness bitmap,
- * inside a seqlock bracket of two atomic loads. Worker-local caches the admitted fslot directly and has
- * a single writer, so all of that disappears (~79 -> ~49 wasm ops, 9 -> 6 loads, 3 -> 0 atomics on the
- * largest dispatch class in the profile). Kept as a knob because it is the only honest way to measure
- * it: fps deltas on this box need interleaved arms of the SAME binary. */
-int mono_wasm_jit_delegate_local_pic = 1;
 /* MONO_WASM_JIT_DELEGATE_OBJ_PIC is deleted -- the losing arm of a settled two-path choice, with
  * DELEGATE_LOCAL_PIC keeping the field.
  *
@@ -824,11 +683,6 @@ int mono_wasm_jit_delegate_local_pic = 1;
  * with its own generated call_indirect and has no way to read a wasm global, so it must either be given
  * an imported global or be refused the direct-forward path -- which is a confound to name, not a free
  * change. */
-/* MONO_WASM_JIT_ESLOT_RESIDUAL: a residual whose callee has no AOT code but IS wasm-JIT compiled enters the
- * callee's e-slot straight from the residual scratch, instead of marshalling into InterpEntryData and letting
- * interp_entry rediscover the same e-slot. Measured target: interp_entry 3.838% + call_interp 2.588% of
- * in-game samples, both ~1/3 register-spill traffic around their own internal calls. */
-int mono_wasm_jit_eslot_residual = 1;
 /* MONO_WASM_JIT_ENTRYCENSUS=1; the census state and reader live in the HOST_BROWSER section below, but
  * this flag must be defined OUT here: mono_wasm_jit_auto_init reads it and mini-wasm.c is linked into
  * mono-aot-cross as well as the runtime, so a browser-only definition is an undefined symbol at the
@@ -880,7 +734,11 @@ mono_wasm_jit_freeze_ring (void)
  *   4 = only STATIC calls (no `this`)   (skips this marshalling; params/return allowed)
  *   5 = everything EXCEPT calls with params AND a non-void return
  * Check the bench stats (residual count) to confirm a restricted mode still exercised the residual. */
-int mono_wasm_jit_residual_mode = 1;
+int mono_wasm_jit_residual_mode = 0;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* 0 = do NOT residual-route an un-JITted callee: block on it and grow an island instead, so the
+ * caller and callee end up compiled together. 1 (the old default) routed every such call through the
+ * interp boundary at ~1,360 instructions of pure marshalling per crossing. RESIDUAL_PERM keeps the
+ * one case that must still route: a PERMANENTLY un-JITtable callee, which can never clear. */
 /* MONO_WASM_JIT_STACKPROBE: record the worst C-stack headroom seen at the compile chain's probe points.
  * DEFAULT OFF. Diagnostic only -- see wj_stack_probe. Exists because two rounds of shaving stack arrays
  * on a fault-count correlation established nothing, and one run of this settles it. */
@@ -897,75 +755,7 @@ int mono_wasm_jit_stackprobe = 0;
 void mono_wasm_jit_check_store (guint8 *addr, int kind);
 void mono_wasm_jit_check_store (guint8 *addr, int kind) { (void) addr; (void) kind; }
 #endif
-int mono_wasm_jit_inline_aot = 1;     /* MONO_WASM_JIT_INLINE_AOT=1: emit the inline direct same-ABI AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry/frame/LMF) instead of the residual, for AOT'd callees. Build 1 = no wasm-EH yet (test non-throwing callees). Default ON, and hot: ~90k inline-AOT calls per frame. */
-int mono_wasm_jit_ldaddr_vtype = 1;   /* MONO_WASM_JIT_LDADDR_VTYPE: extend OP_LDADDR to NON-SCALAR ref-free valuetype locals via a full-size addr-frame slot. Default ON (exonerated: jit17 corrupted with it OFF; kept gated for binary/repro parity). */
-int mono_wasm_jit_vtype_scalar_ref = 1; /* MONO_WASM_JIT_VTYPE_SCALAR_REF: extend VTYPE_SCALAR to a scalar-vtype whose SINGLE field is a managed REFERENCE (e.g. RuntimeTypeHandle{RuntimeType}). Backed by a GC-SCANNED ref-shadow-stack slot (not the un-scanned addr frame): OP_LDADDR yields refbase+slot*4 so the field store/load track the ref as a conservative pinning root, and the store's inline card-barrier marks a HARMLESS card (wasm32 has no overlapping cards — the 8MB table covers the whole 32-bit space, so a non-heap mark is in-bounds and never scanned). GC-CRITICAL: validate in-browser with STOREGUARD/OBJGUARD. */
-int mono_wasm_jit_vtype_scalar = 1;   /* MONO_WASM_JIT_VTYPE_SCALAR: pass a BYVAL scalar-vtype call arg (mini_wasm_is_scalar_vtype: struct <=8 bytes, one field) as its single-field SCALAR — the ABI the AOT callee was compiled with (LLVMArgWasmVtypeAsScalar). The vtype value is addr-frame-backed (LDADDR_VTYPE), so we load its field (offset 0) from the addr-frame slot and pass that. Ref-free etype only; the ref-etype variant is gated separately (VTYPE_SCALAR_REF, GC-scanned ref-shadow slot). Requires LDADDR_VTYPE. */
-int mono_wasm_jit_vtype_byaddr = 1;   /* MONO_WASM_JIT_VTYPE_BYADDR: multi-field/large value-type args as an i32 pointer to a caller-owned copy (native ArgValuetypeAddrOnStack). The copy lives in the caller's C-stack frame — conservatively GC-scanned, so ref-bearing structs (IKVM MHA`8) pin their referents exactly like AOT'd structs in C locals. Classification is process-lifetime-constant (read once here) so f_sig_id fingerprints can't split across an in-process flag flip. */
-int mono_wasm_jit_vret = 1;           /* MONO_WASM_JIT_VRET: value-type returns via a hidden vret pointer — internally a TRAILING i32 param (the native AOT ABI puts vret FIRST; the inline-AOT call path reorders). Same process-lifetime rule as VTYPE_BYADDR. */
-int mono_wasm_jit_byref = 1;          /* MONO_WASM_JIT_BYREF: lower a call whose CALLEE SIGNATURE has byref (ref/out/Span) args or a byref return through the interp residual and the vcall fallback, instead of bailing the WHOLE caller (bail -7, permanent). Previously gated "until byref marshalling is hardened"; it now is:
-                                       *   ARGS were already correct — the residual spills the byref VALUE (the pointer) and the C side derefs that slot (wj_arg_slot_holds_pointer, shared by mono_wasm_jit_call_interp + wasm_jit_aot_call_lean), matching interp_entry's asymmetric arg convention (byref = the pointer, by-value = a pointer TO the value).
-                                       *   RETURNS needed one fix: stackval_to_data_sign_ext switched on type->type without a byref guard, so `ref sbyte/byte/short/ushort` got the sign/zero-extended LOW BYTE(S) OF THE POINTER (live via wasm_jit_aot_call_lean, which passes the raw sig->ret). Fixed unconditionally in interp.c.
-                                       * The emitter needed nothing: byref is WJ_ARG_SCALAR/i32 in mono_wasm_get_call_info, and every sub-word ret normalizer keys off mini_get_underlying_type, which erases byref to MONO_TYPE_I. GC: byref args/returns are already pinned (see the arg_is_ref / def_nonref seeds below) and the interp stack is scanned conservatively, so an interior pointer pins its target.
-                                       * =0 restores the four pre-hardening bails for A/B bisection. Declared unconditionally (NOT under HOST_BROWSER): the vcall gate compiles in the cross build too. */
-int mono_wasm_jit_ldaddr_vtype_ref = 1; /* MONO_WASM_JIT_LDADDR_VTYPE_REF: allow REF-BEARING non-scalar vtype locals in the addr frame (full-size slot). The addr slots moved into the conservatively-scanned C-stack frame (see the frame doc above wasm_ld) — embedded refs over-pin, same guarantee AOT structs-in-C-locals rely on; the old "GC-unsafe frame" bail predates that move. */
 int mono_wasm_jit_missedref = 0;      /* MONO_WASM_JIT_MISSEDREF: diagnostic — log NONREF-classified vregs used as MEMBASE bases / call receivers + their defining opcode, to name an isref-inference gap. Default off. */
-int mono_wasm_jit_ref_wt = 0;         /* MONO_WASM_JIT_REF_WT: write-through ref vregs — the wasm LOCAL is the value home (fast reads), and every def ALSO stores to the frame slot so the conservative scan pins the referent (exactly LLVM AOT's gc_pin volatile-store model, mini-llvm.c emit_gc_pin). Sound because a pinned object never moves, so the cached local can't go stale — the same invariant AOT locals and JSPI-frozen locals rely on. Slot-HOMED exceptions: addrslot==-2 sentinels (their slot address escapes via OP_LDADDR, callees write through it). Default OFF until soak; flip to 1 after the test matrix passes. */
-int mono_wasm_jit_aot_entry = 0;      /* MONO_WASM_JIT_AOT_ENTRY: fast path in mono_jiterp_interp_entry (interp.c) for a method that is
-                                       * already JITted and admitted. The jiterpreter trampoline has by then already marshalled the args into
-                                       * the interp stack in exactly the layout the entry thunk reads, so the InterpFrame zeroing, LMF push/pop,
-                                       * maybe_compile and admission DFS around the call are all scaffolding for an interpreter run that will not
-                                       * happen. perf annotate shows that function is FLAT across ~74 instructions with no hotspot, i.e. the whole
-                                       * preamble IS the cost, so it can only be removed by not entering it. Worth ~3.4% on jbox2d; the symbol
-                                       * drops 5.99% -> 4.19% of steady-state time. Gated per-thread on mono_wasm_jit_slot_live. */
-int mono_wasm_jit_coalesce = 0;       /* MONO_WASM_JIT_COALESCE: share one wasm local between vregs whose live ranges are disjoint,
-                                       * computed from a real backward liveness dataflow (mention ranges are unsound across a back edge).
-                                       * li[] is otherwise one local per vreg with NO reuse: AABB:combine declares 58 where teavm needs 5.
-                                       * Caveat worth keeping in mind before attributing any win to this: TurboFan converts wasm locals to
-                                       * SSA, so its register pressure follows live-range OVERLAP, which renaming does not change. Default OFF. */
-int mono_wasm_jit_lcse = 0;           /* MONO_WASM_JIT_LCSE: extended-basic-block redundant heap-load elimination.
-                                       * mono has NO general CSE/GVN (optflags-def.h: SSAPRE is marked obsolete, ALIAS_ANALYSIS
-                                       * is locals-only), so every reload javac emitted survives into the wasm. Measured on
-                                       * AABB:combine, identical Java source: we emit 39 heap loads where teavm emits 14, and
-                                       * TurboFan does NOT clean them up -- its compiled output has 67 memory loads, so all 39
-                                       * are real. The dominant shape is javac's `a < b ? a : b` (jbox2d's MathUtils.min/max),
-                                       * which reloads BOTH operands in BOTH arms after the compare already loaded them.
-                                       * Measure reach with MONO_WASM_JIT_STATS=1 and read [wasm-jit lcse]:
-                                       * hits/loads_seen, NOT adds/hits. Default OFF until A/B'd. */
-int mono_wasm_jit_slotlive = 0;       /* MONO_WASM_JIT_SLOTLIVE: GC-point liveness slot elision — an isref vreg gets a frame slot ONLY if a GC can actually observe it there: it is live across a GC-capable instruction (wj_ins_is_gcpoint) or spans basic blocks. A ref defined and fully consumed between two GC points is invisible to the collector (cooperative suspend: this thread only scans at safepoints/calls), so it can stay in an unscanned wasm local. Main pin-pressure lever: most deref-backstop bases and immediately-consumed call results lose their slots. Disabled when STOREGUARD/OBJGUARD are on (they key ref-ness off refslot, so elision would change guard semantics). Default OFF until soak. */
-int mono_wasm_jit_slotzero = 0;       /* MONO_WASM_JIT_SLOTZERO: dead-slot zeroing — zero a SINGLE-BB slotted ref vreg's frame slot at its last use (only when a GC point follows in the bb), so the dead object stops pinning. Critical for long-lived frames (a JSPI-suspended main loop otherwise pins its stale refs for the app lifetime). Single-bb scope makes death provable without dataflow (a vreg live into any EH handler is multi-bb by definition). Requires REF_WT (reads come from the local, so the slot can be zeroed BEFORE the killing instruction — stack-neutral, no terminator special cases) and SLOTLIVE (which computes the last-use walk). Default OFF until soak. */
-/* MONO_WASM_JIT_NCE: null-check elimination. cfg->explicit_null_checks is forced on for this
- * backend (mini.c, at the compile_wasm fork) because wasm linear-memory address 0 is a perfectly valid
- * address and cannot fault, so EVERY dereference carries its own COMPARE_IMM+COND_EXC pair. Nothing in
- * the mini pipeline removes them: abcremoval's null-check rule only CONSUMES facts produced by
- * OP_NOT_NULL, and ir-emit.h emits OP_NOT_NULL under COMPILE_LLVM only. Measured on the jbox2d bench,
- * with the consumer's full opt set on: 40 of 40 call_indirect in AABB:combine are null-check throw
- * helpers, and 7781 of 16417 (47%) program-wide.
- *
- * Mode 1 is deliberately the cheap one -- a per-bb bitmap of vregs already proven non-null,
- * killed at any redefinition -- because that is what the dominant pattern needs: a chain of
- * dereferences off one receiver (a.lowerBound.x, a.lowerBound.y, ...) re-tests the same vreg within a
- * single basic block. It also removes the emitter's OWN vcall receiver check, which duplicates the
- * IR-level check method_to_ir already emitted for the same receiver.
- *
- * Soundness rests on seeing every write to a tracked vreg. Every value-producing store in the emitter
- * goes through wasm_st(ins->dreg) (plus the one cfg->ret->dreg in OP_SETRET, killed explicitly), and
- * address-taken vregs -- whose home is memory a callee can write through -- are never tracked at all.
- * Mode 2 additionally propagates never-written facts down Mono's dominator tree, restricted to methods
- * with no EH clauses. The dominator relation does not model implicit exception transfers, so a fact
- * established on a null check's normal continuation can be false inside a catch/finally entered from
- * before that check ran; a clause-free method has no such transfer, which makes the propagation sound
- * without any dataflow reasoning (same argument, same property, as the RAISE_NOGC gate below).
- *
- * Mode 1 remains the default. Mode 2's measured value on the jbox2d workload is ~0, from an interleaved
- * A/B of mode 1 against mode 2 on this branch: 0.721/0.744 vs 0.733/0.738 ms/step, i.e. inside run-to-run
- * spread and slightly worse if anything, checksum identical throughout. Note this contradicts the reach
- * argument above (AABB:combine's eight repeated parameter checks are real, and mode 2 does remove them) --
- * removing those null checks simply does not move wall clock here, because the bodies are not
- * null-check-bound once the entry tier is working. The pass is kept because the clause-free gate makes it
- * correct and it may pay off on other EH-free numeric code, but do not enable it without re-measuring.
- * =0 is the kill switch. */
-int mono_wasm_jit_nce = 1;
 /* MONO_WASM_JIT_RAISE_NOGC: treat raising instructions as non-GC-points in clause-free methods, so
  * SLOTLIVE stops forcing every live ref into the GC frame just because a null check sits between its
  * def and its use. See the argument in wj_ins_is_gcpoint. A LEVEL, not a boolean:
@@ -976,51 +766,44 @@ int mono_wasm_jit_nce = 1;
  *       OTHER code — a claim a raise falsifies, since the raise allocates. Strictly more honest than
  *       level 2, and MEASURED STILL BROKEN (4/4 dead under a 4 MB nursery). That is how we know the
  *       frame-local half of the argument is the unsound one, not the published half.
- * Level 2 (exempt the PUBLISHED consumers too) was measured unsound and is deleted.
+ *   2 -- LEVEL 1 WITHOUT THE gen_skipped_raises GUARD, i.e. the exact codegen that measured 4/4 dead
+ *        boots under a 4 MB nursery. THIS IS A POSITIVE CONTROL AND NOTHING ELSE. It is unsound by
+ *        construction, it is never a shipping candidate, and it exists because a clean result from
+ *        level 1 is worthless unless the same harness, the same build and the same session can still
+ *        produce the failure on demand -- this bug is intermittent and timing-sensitive enough that
+ *        "it stopped failing" is otherwise unfalsifiable.
  *
- * Default OFF (silent-corruption risk class) -- BUT THE PRODUCT SHIPS 1, AND THAT IS UNVERIFIED. The
- * fix for the failure this knob is documented to have caused landed after the failure was measured and
- * has never been re-soaked. See the ordering note in wj_ins_is_gcpoint and run the 4 MB-nursery soak
- * before treating 1 as safe. */
+ *        (The OLD level 2 -- "exempt the PUBLISHED consumers too" -- is gone. It was also unsound, but
+ *        it is the WRONG control now: the gen_skipped_raises fix may well have repaired it too, and a
+ *        positive control that has itself been fixed proves nothing. This one is defined as the absence
+ *        of the fix under test, so it cannot silently become clean.)
+ *
+ * Default OFF (silent-corruption risk class) -- AND THE PRODUCT SHIPS 1. See the ordering note in
+ * wj_ins_is_gcpoint: the fix for the failure this knob is documented to have caused landed AFTER that
+ * failure was measured, so `1` is unverified rather than known-good until the matrix in
+ * scratchpad/mcsr/gcstress.sh is run. */
 int mono_wasm_jit_raise_nogc = 0;
 int mono_wasm_jit_refverify = 0;      /* MONO_WASM_JIT_REFVERIFY (0/1/2): after the isref fixpoint, cross-check classification against the structural vreg_is_ref/vreg_is_mp marking — 1 logs violations (a marked vreg classified nonref = lost seed = would-be silent corruption), 2 asserts. Debug only, default off. */
 const char *mono_wasm_jit_dump_ir = NULL;  /* MONO_WASM_JIT_DUMP_IR=<substr>: dump clauses + bb regions + opcode stream for clause-bearing methods whose full name contains <substr> (EH-lowering ground truth, e.g. "indigo"). */
 /* Island heuristic levers (Part 5), all default-OFF so the baseline is unchanged and each can be A/B'd. */
-int mono_wasm_jit_entry_promote = 0;   /* Lever A: MONO_WASM_JIT_ENTRY_PROMOTE=N — after a hot interp caller invokes JITted callees N times, force-JIT the caller (grow the island UPWARD). 0 = off. */
-int mono_wasm_jit_residual_perm = 0;   /* Lever B: MONO_WASM_JIT_RESIDUAL_PERM=1 — under residual=0, residual-route ONLY a permanently-un-JITtable blocker instead of bailing the whole caller. 0 = off. */
+int mono_wasm_jit_entry_promote = 96;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* Lever A: interp->JIT crossings before the CALLER is queued for upward island growth. 0 disabled it entirely. */   /* Lever A: MONO_WASM_JIT_ENTRY_PROMOTE=N — after a hot interp caller invokes JITted callees N times, force-JIT the caller (grow the island UPWARD). 0 = off. */
 int mono_wasm_jit_residual_cold = 0;   /* Lever B': MONO_WASM_JIT_RESIDUAL_COLD=1 — under residual=0, residual-route a blocker the island cold-gate would refuse to pull in (still counting hits, below thresh/cold_div, not block-promoted): a cold branch (IKVM __<GetInstance> lambda factory, one-shot init, error path) reached rarely from a hot caller. Lets the hot method JIT while paying ~1 transition per cold call, NOT a per-iteration storm; hot/parked callees still bail so the island force-JITs them. 0 = off. NOTE: jit34 showed this misclassifies hot-via-JITted-caller callees as cold -> 2M residuals/frame -> 1.5fps. Keep OFF until residuals self-heal to the callee's f-slot. */
 int mono_wasm_jit_profile_fast = 0;    /* MONO_WASM_JIT_PROFILE_FAST=1 — emit inline volume counters into the fast dispatch paths (INLINE_AOT direct, inline f-slot IC hit, inline AOT-IC hit) which otherwise call no counting helper. Adds hot-path overhead, so OFF by default (only for a dedicated cost-attribution run). Feeds WJC_FAST_*. */
-int mono_wasm_jit_island_depth = 10;   /* Lever C: MONO_WASM_JIT_ISLAND_DEPTH — max island DFS depth (was a fixed 10). */
-int mono_wasm_jit_island_budget = 64;  /* Lever C: MONO_WASM_JIT_ISLAND_BUDGET — max force-compiles per island attempt (was a fixed 64). */
-int mono_wasm_jit_block_promote = 16;  /* Lever C: MONO_WASM_JIT_BLOCK_PROMOTE — pull a cold callee into an island once it has BLOCKED >= N island attempts (block_n), even if its own hit count is low (it's hot via JITted callers). 0 = disable (cold gate is hits-only). The bench showed top blockers ~100, so the old thresh/4 (=500) never fired — 16 catches the hot ctors. */
+int mono_wasm_jit_island_depth = 24;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* max island DFS depth. */   /* Lever C: MONO_WASM_JIT_ISLAND_DEPTH — max island DFS depth (was a fixed 10). */
+int mono_wasm_jit_island_budget = 192;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* max force-compiles per island attempt. */  /* Lever C: MONO_WASM_JIT_ISLAND_BUDGET — max force-compiles per island attempt (was a fixed 64). */
+int mono_wasm_jit_block_promote = 4;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* blocked-callee count that promotes a root. */  /* Lever C: MONO_WASM_JIT_BLOCK_PROMOTE — pull a cold callee into an island once it has BLOCKED >= N island attempts (block_n), even if its own hit count is low (it's hot via JITted callers). 0 = disable (cold gate is hits-only). The bench showed top blockers ~100, so the old thresh/4 (=500) never fired — 16 catches the hot ctors. */
 int mono_wasm_jit_promotion_drain = 8; /* MONO_WASM_JIT_PROMOTION_DRAIN — max queued promotions (Lever A callers, block-promote callees, and woken waiters) drained per safe point. */
-int mono_wasm_jit_island_cold_div = 4; /* MONO_WASM_JIT_ISLAND_COLD_DIV — normal cold gate divisor for eager island callees; thresh/div is the minimum retained hit count. */
+int mono_wasm_jit_island_cold_div = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* cold gate divisor for island members. */ /* MONO_WASM_JIT_ISLAND_COLD_DIV — normal cold gate divisor for eager island callees; thresh/div is the minimum retained hit count. */
 int mono_wasm_jit_promoted_cold_div = 16; /* MONO_WASM_JIT_PROMOTED_COLD_DIV — looser cold gate divisor when force-JITing an upward-promoted caller. */
-int mono_wasm_jit_promoted_root_uncold_depth = 1; /* MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH — for promoted roots, skip the cold gate entirely through this DFS depth. */
-int mono_wasm_jit_block_force = 4; /* MONO_WASM_JIT_BLOCK_FORCE — queue a blocking callee for direct promotion once it has blocked this many island attempts. 0 disables. */
-int mono_wasm_jit_hot_root = 0; /* MONO_WASM_JIT_HOT_ROOT=1 — a method crossing its OWN auto-JIT threshold is proven hot (>=thresh calls), so build its island as a PROMOTED ROOT (relax the cold gate through PROMOTED_ROOT_UNCOLD_DEPTH) instead of the strict cold gate. Pulls the hot method's private callees (reached only via it -> ~0 interp hits -> the blind spot that makes it PARK forever) into the island so it actually JITs. Depth-limited + budget-bounded so it doesn't drag in the whole cold subtree. jit35: 94.6% of below-threshold vcall fallbacks were PARKED hot methods. Default OFF (A/B). */
-/* MONO_WASM_JIT_VCALL_AOT=1: when a JITted method's virtual call resolves to an AOT-backed override (the
- * vcall_resolve_fslot f-slot miss — the dominant steady-state residual, ~98% "aot-backed" in the bench),
- * call_indirect the override's AOT body DIRECTLY (this+args+rgctx, same native ABI the inline-AOT direct
- * call uses) instead of routing through the residual (mono_wasm_jit_call_interp -> wasm_jit_aot_call_lean
- * -> do_jit_call: double arg-marshalling + an LMF frame). Default 0; mirrors INLINE_AOT's EH handling
- * (resume-state try/catch, or bare under CPPEH). Off-by-default so the validated residual path is unchanged. */
-int mono_wasm_jit_vcall_aot = 1;
-int mono_wasm_jit_vcall_aot_ic = 1;   /* MONO_WASM_JIT_VCALL_AOT_IC=1: per-call-site inline cache for AOT-backed virtual targets — skip scratch()+resolve_fslot()+aot_target() (3 C calls/vcall) on a monomorphic hit, call_indirect the cached AOT body directly. Needs VCALL_INLINE_IC + VCALL_AOT. Hottest-path + MT — validate in-browser after any change. */
-/* MONO_WASM_JIT_VCALL_INLINE_IC: the inline monomorphic vcall IC fast-path (call_indirect the cached
- * f-slot in wasm, skipping the scratch() + resolve_fslot C helpers on a hit — the profiled #1 game-thread
- * cost, vcall_resolve_fslot ~17%). DEFAULT OFF; =1 enables. NOW MT-SAFE on threaded builds: the original
- * "table[fslot] != null" liveness check was wrong (the per-thread table grows with a NON-null jiterpreter
- * placeholder, mono_jiterp_placeholder_jit_call (i32,i32,i32,i32)->void, so it passed for un-instantiated
- * slots -> call_indirect signature-mismatch trap, jit138). Fixed: the inline path now gates on the
- * authoritative per-thread bitmap via one cheap mono_wasm_jit_slot_live() call (wasm exposes no funcref
- * equality / funcref->i32 to compare the slot against the placeholder inline). Still one C boundary per hit
- * vs two + resolve for the helper; a full pure-wasm gate would need __tls_base imported to read the bitmap. */
-int mono_wasm_jit_vcall_inline_ic = 1; /* MONO_WASM_JIT_VCALL_INLINE_IC: inline vcall IC fast path. Default ON,
-                                        * and it carries 25.1% of all executed dispatch (R203) -- five times
-                                        * vcall_resolve_fslot's 5.0% miss share. MT-SAFE on threaded builds: the
-                                        * buggy ref.is_null liveness test (placeholder signature mismatch, jit138)
-                                        * is replaced by a per-thread slot_live gate. */
+int mono_wasm_jit_promoted_root_uncold_depth = 8;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* how deep a promoted root relaxes the cold gate. */ /* MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH — for promoted roots, skip the cold gate entirely through this DFS depth. */
+int mono_wasm_jit_block_force = 5;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+/* blocked-callee count that forces an island. */ /* MONO_WASM_JIT_BLOCK_FORCE — queue a blocking callee for direct promotion once it has blocked this many island attempts. 0 disables. */
 
 static gboolean
 wj_method_raise_exempt (MonoCompile *cfg)
@@ -1313,10 +1096,10 @@ mono_wasm_jit_dump_stats (void)
 	 * WjBatch/WjBatchMember. Co-location goes through mono_wasm_jit_rebatch over retained relocatable
 	 * bodies, which is what both live callers -- wasm_jit_compile_scc and colocate_deps_now -- already did. */
 	printf ("[wasm-jit batching] one path: relocatable rebatch; no method imports, so admission never defers\n");
-	printf ("[wasm-jit colocate] colocated_members=%lld of registered=%lld tight_deps_dropped=%lld rolled_back=%lld scc_refused=%lld (TIGHT_DEPS=%d ROLLBACK=%d SCC=%d)\n",
+	printf ("[wasm-jit colocate] colocated_members=%lld of registered=%lld tight_deps_dropped=%lld rolled_back=%lld scc_refused=%lld (TIGHT_DEPS=%d)\n",
 		WJC_(WJC_COLOCATED_MEMBERS), WJC_(WJC_REGISTERED), WJC_(WJC_TIGHT_DEPS_DROPPED),
 		WJC_(WJC_COLOCATE_ROLLBACK), WJC_(WJC_COLOCATE_SCC_REFUSED),
-		mono_wasm_jit_colocate_tight_deps, mono_wasm_jit_colocate_rollback, mono_wasm_jit_colocate_scc);
+		mono_wasm_jit_colocate_tight_deps);
 	/* WHY the groups that were not formed were not formed. The parts must sum, so print the identity
 	 * and its residual rather than leaving the reader to add up eleven numbers: a non-zero `unaccounted`
 	 * means a refusal path was added without a counter, which is the failure this split exists to stop.
@@ -1425,7 +1208,7 @@ mono_wasm_jit_dump_stats (void)
 		" (vcall_ways 4->1 was +9.6%% fps at ~1%% capture). Read hits against ic-why alt-receiver.\n",
 		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),
 		WJC_(WJC_DEVIRT_ARM2_NO_FSLOT), WJC_(WJC_DEVIRT_ARM2_SIG), WJC_(WJC_DEVIRT_ARM2_SELF),
-		mono_wasm_jit_devirt_arm2, mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
+		mono_wasm_jit_devirt_arm2_pct, WJC_(WJC_FAST_DEVIRT2));
 	printf ("[wasm-jit delegate-devirt3] armed=%lld thin=%lld refused=%lld (no_fslot=%lld sig=%lld)"
 		" | EXECUTED hits=%lld"
 		"  (MONO_WASM_JIT_DELEGATE_DEVIRT=%d%%)\n"
@@ -4960,8 +4743,6 @@ static gboolean
 wj_ins_is_pinned_vcall_forward (MonoInst *ins)
 {
 	MonoCallInst *call;
-	extern int mono_wasm_jit_vcall_inline_ic;
-	extern int mono_wasm_jit_vcall_shared_miss_enabled;
 
 	switch (ins->opcode) {
 	case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
@@ -4971,8 +4752,11 @@ wj_ins_is_pinned_vcall_forward (MonoInst *ins)
 		return FALSE;
 	}
 	call = (MonoCallInst *) ins;
-	return mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_shared_miss_enabled &&
-		call->method && (call->method->flags & METHOD_ATTRIBUTE_VIRTUAL) &&
+	/* MONO_WASM_JIT_VCALL_INLINE_IC gated this and shipped 1: the inline monomorphic vcall IC fast path,
+	 * which carries 25.1%% of ALL executed dispatch (R203) -- five times vcall_resolve_fslot's 5.0%%
+	 * miss share. MT-safe since the buggy ref.is_null liveness test (placeholder signature mismatch,
+	 * jit138) was replaced by the per-thread slot_live gate. Settled; unconditional. */
+	return call->method && (call->method->flags & METHOD_ATTRIBUTE_VIRTUAL) &&
 		call->signature && call->signature->hasthis && call->call_info;
 }
 
@@ -5028,7 +4812,7 @@ wj_prescan_blockers (MonoCompile *cfg)
 	extern gboolean mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig);
 	extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
 	extern int mono_wasm_jit_callee_too_cold (MonoMethod *m);
-	extern int mono_wasm_jit_residual_perm, mono_wasm_jit_residual_cold;
+	extern int mono_wasm_jit_residual_cold;
 	extern MonoMethod *mono_marshal_get_synchronized_wrapper (MonoMethod *enter_method);
 	MonoBasicBlock *bb;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
@@ -5059,7 +4843,10 @@ wj_prescan_blockers (MonoCompile *cfg)
 				continue;
 			if (mono_interp_jit_call_supported (call_method, csig))    /* AOT-routed residual */
 				continue;
-			if (mono_wasm_jit_residual_perm && mono_wasm_jit_callee_perm_unjittable (call_method))   /* perm-unjittable -> residual */
+			/* MONO_WASM_JIT_RESIDUAL_PERM (Lever B) ships 1: under residual=0, residual-route ONLY a
+			 * permanently-un-JITtable callee rather than treating it as an island blocker. A permanent
+			 * blocker cannot ever be cleared, so parking the caller on it parks it forever. */
+			if (mono_wasm_jit_callee_perm_unjittable (call_method))   /* perm-unjittable -> residual */
 				continue;
 			if (mono_wasm_jit_residual_cold && mono_wasm_jit_callee_too_cold (call_method))          /* cold leaf -> residual, not a hard blocker */
 				continue;
@@ -5095,14 +4882,15 @@ wj_scalar_vtype_valtype (MonoType *t, WasmValtype *out)
 	k = mono_class_from_mono_type_internal (ut);
 	if (!k)
 		return FALSE;
-	{
-		extern int mono_wasm_jit_vtype_scalar, mono_wasm_jit_vtype_scalar_ref;
-		if (m_class_has_references (k) || m_class_has_ref_fields (k)) {
-			if (!(mono_wasm_jit_vtype_scalar_ref && mini_type_is_reference (etype)))
-				return FALSE;   /* ref-etype: only under VTYPE_SCALAR_REF (GC-scanned slot) */
-		} else if (!mono_wasm_jit_vtype_scalar) {
-			return FALSE;   /* ref-free scalar vtype gated on VTYPE_SCALAR */
-		}
+	/* MONO_WASM_JIT_VTYPE_SCALAR and _SCALAR_REF gated these two arms and both shipped 1. The ref-etype
+	 * arm is the GC-critical one: the single reference lives in a GC-SCANNED ref-shadow slot, so
+	 * OP_LDADDR yields refbase+slot*4 and the field store/load track it as a pinning root, and the
+	 * store's inline card barrier marks a HARMLESS card (wasm32 has no overlapping cards -- the 8 MB
+	 * table covers the whole 32-bit space, so a non-heap mark is in-bounds and never scanned). Both
+	 * arms are now unconditional; validate any change here with STOREGUARD/OBJGUARD, not with fps. */
+	if (m_class_has_references (k) || m_class_has_ref_fields (k)) {
+		if (!mini_type_is_reference (etype))
+			return FALSE;   /* a ref-BEARING vtype is scalar only when its single field IS the ref */
 	}
 	ev = wasm_valtype_of_type (etype);
 	if (ev == 0 || ev == WASM_VOID)
@@ -5199,24 +4987,21 @@ wj_byaddr_vtype (MonoType *t, gint32 *vsize, gint32 *valign)
 gboolean
 mono_wasm_jit_arg_is_byaddr (MonoType *t)
 {
-	extern int mono_wasm_jit_vtype_byaddr;
 	gint32 sz, al;
-	return mono_wasm_jit_vtype_byaddr && wj_byaddr_vtype (t, &sz, &al);
+	return wj_byaddr_vtype (t, &sz, &al);
 }
 
 gboolean
 mono_wasm_jit_ret_is_byaddr (MonoType *t)
 {
-	extern int mono_wasm_jit_vret;
 	gint32 sz, al;
-	return mono_wasm_jit_vret && wj_byaddr_vtype (t, &sz, &al);
+	return wj_byaddr_vtype (t, &sz, &al);
 }
 
 
 static void
 mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
 {
-	extern int mono_wasm_jit_vtype_byaddr, mono_wasm_jit_vret;
 	int i;
 	memset (ci, 0, sizeof (*ci));
 	ci->fail_arg = -2;
@@ -5243,7 +5028,7 @@ mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
 				a->kind = WJ_ARG_VTYPE_SCALAR;
 				a->etype = sig->params [i];
 				pv = sv;
-			} else if (mono_wasm_jit_vtype_byaddr && wj_byaddr_vtype (sig->params [i], &a->vsize, &a->valign)) {
+			} else if (wj_byaddr_vtype (sig->params [i], &a->vsize, &a->valign)) {
 				a->kind = WJ_ARG_VTYPE_BYADDR;
 				pv = WASM_I32;
 			} else {
@@ -5279,7 +5064,7 @@ mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
 			} else {
 				/* Multi-field vtype return via a trailing hidden by-address pointer. */
 				ci->vret_byaddr = 1;
-				if (!(mono_wasm_jit_vret && wj_byaddr_vtype (sig->ret, &ci->ret.vsize, &ci->ret.valign))) {
+				if (!wj_byaddr_vtype (sig->ret, &ci->ret.vsize, &ci->ret.valign)) {
 					ci->valid = FALSE;
 					ci->fail_arg = -1;
 					ci->fail_reason = mini_is_gsharedvt_variable_type (mini_get_underlying_type (sig->ret))
@@ -5421,8 +5206,6 @@ mono_wasm_jit_entry_sig (MonoMethod *method, guint8 *kinds, guint8 *vtypes, int 
 static void
 wj_print_bail_sig (const char *site, MonoMethod *callee, MonoMethodSignature *sig, int arg)
 {
-	extern int mono_wasm_jit_vtype_scalar, mono_wasm_jit_vtype_scalar_ref;
-	extern int mono_wasm_jit_vtype_byaddr, mono_wasm_jit_vret, mono_wasm_jit_byref;
 	char *cn = callee ? mono_method_get_full_name (callee) : NULL;
 
 	if (!sig) {
@@ -5456,17 +5239,14 @@ wj_print_bail_sig (const char *site, MonoMethod *callee, MonoMethodSignature *si
 
 		printf (" [sig site=%s callee=%s part=%s index=%d type=%s mono=%d underlying=%d raw_wasm=%d"
 			" struct=%d gsharedvt=%d simd=%d refs=%d scalar_candidate=%d scalar_type=%s scalar_wasm=%d byaddr_candidate=%d"
-			" size=%d align=%u byaddr_size=%d byaddr_align=%d"
-			" flags(vtype_scalar=%d scalar_ref=%d byaddr=%d vret=%d byref=%d)]",
+			" size=%d align=%u byaddr_size=%d byaddr_align=%d]",
 			site ? site : "?", cn ? cn : "<indirect>", arg < 0 ? "ret" : "arg", arg,
 			tn ? tn : "?", (int) type->type, (int) ut->type, (int) raw,
 			klass ? 1 : 0, mini_is_gsharedvt_variable_type (ut) ? 1 : 0,
 			klass && m_class_is_simd_type (klass) ? 1 : 0,
 			klass && (m_class_has_references (klass) || m_class_has_ref_fields (klass)) ? 1 : 0,
 			scalar_candidate ? 1 : 0, sen ? sen : "-", (int) scalar_wasm, byaddr_candidate ? 1 : 0,
-			layout_size, (unsigned) layout_align, (int) byaddr_size, (int) byaddr_align,
-			mono_wasm_jit_vtype_scalar, mono_wasm_jit_vtype_scalar_ref,
-			mono_wasm_jit_vtype_byaddr, mono_wasm_jit_vret, mono_wasm_jit_byref);
+			layout_size, (unsigned) layout_align, (int) byaddr_size, (int) byaddr_align);
 		g_free (sen);
 		g_free (tn);
 	}
@@ -5816,8 +5596,6 @@ typedef struct {
 } WjAsmMember;
 
 typedef struct {
-	guint8 helper_imports;   /* MONO_WASM_JIT_HELPER_IMPORTS: a C helper may become an import */
-	guint8 aot_imports;      /* MONO_WASM_JIT_AOT_IMPORTS: an AOT body may become an import */
 	/* MONO_WASM_JIT_DIRECT_IMPORT: a JITted callee may become an import. Soundness is decided PER EDGE by
 	 * wj_asm_method_importable, not by this flag -- see wj_asm_reaches for the cycle argument. */
 	guint8 local_calls;      /* resolve a co-located callee to `call <funcidx>` */
@@ -6148,14 +5926,18 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			fix [k].idx = (guint32) self_index;
 			continue;
 		case WASM_RELOC_HELPER:
-			if (pol->helper_imports)
-				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
+			/* MONO_WASM_JIT_HELPER_IMPORTS gated this and shipped 1. Its losing arm kept helper calls as
+			 * `i32.const <table index>; call_indirect`, which pays a table bounds check, a canonical-type
+			 * check and index arithmetic a declared import does not -- V8 does NOT fold a constant
+			 * call_indirect index into a direct call. Both forms still end in an indirect branch (R158),
+			 * so this is worth a few instructions per helper call, not a call-form change. Settled. */
+			slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
 			break;
 		case WASM_RELOC_HELPER_CI:
 			break;
 		case WASM_RELOC_AOT:
-			if (pol->aot_imports)
-				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
+			/* MONO_WASM_JIT_AOT_IMPORTS, same story as HELPER above: shipped 1, settled. */
+			slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
 			break;
 		case WASM_RELOC_CALL:
 			/* A JITted callee is either CO-LOCATED -- a module-local `call <funcidx>`, one x86
@@ -6214,7 +5996,6 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 static void
 wj_asm_policy_init (WjAsmPolicy *pol, gboolean local_calls)
 {
-	extern int mono_wasm_jit_helper_imports, mono_wasm_jit_aot_imports;
 	extern int mono_wasm_jit_names;
 
 	memset (pol, 0, sizeof (*pol));
@@ -6222,8 +6003,6 @@ wj_asm_policy_init (WjAsmPolicy *pol, gboolean local_calls)
 	pol->names = mono_wasm_jit_names ? 1 : 0;
 	pol->local_calls = local_calls ? 1 : 0;
 #ifdef HOST_BROWSER
-	pol->helper_imports = mono_wasm_jit_helper_imports ? 1 : 0;
-	pol->aot_imports = mono_wasm_jit_aot_imports ? 1 : 0;
 #endif
 }
 
@@ -6678,7 +6457,7 @@ int
 mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_slots, int n,
                           void *bytes, int len)
 {
-	extern int mono_wasm_jit_colocate_tight_deps, mono_wasm_jit_colocate_rollback;
+	extern int mono_wasm_jit_colocate_tight_deps;
 	WjBatchDesc *bd;
 	WjRegSaved *saved = NULL;
 	int i;
@@ -6692,7 +6471,10 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	/* CO-LOCATION IS AN OPTIMISATION, NOT A COMMITMENT. Snapshot every field this function is about to
 	 * overwrite, so a group that cannot be admitted can be UNDONE and its members left on the standalone
 	 * modules they were running on a moment ago. See wj_batch_rollback. */
-	if (mono_wasm_jit_colocate_rollback)
+	/* MONO_WASM_JIT_COLOCATE_ROLLBACK shipped 1: restore each absorbed member to its PREVIOUS group when
+	 * a merge is undone, rather than clearing it. Not a performance choice -- clearing throws away
+	 * grouping that was already validated. */
+	if (1)
 		saved = g_new0 (WjRegSaved, n);
 	bd = g_new0 (WjBatchDesc, 1);
 	bd->n = n;
@@ -6930,10 +6712,14 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		members [i].eh_tpool = b->eh_tpool;
 	}
 
-	{ extern int mono_wasm_jit_colocate_local_calls;
+	{
 	  /* local_calls is the POINT of co-locating -- and also the only thing MONO_WASM_JIT_COLOCATE_LOCAL_CALLS=0
 	   * takes away, leaving the module, the slots, the rebind and the admission identical. */
-	  wj_asm_policy_init (&pol, mono_wasm_jit_colocate_local_calls ? TRUE : FALSE);
+	  /* MONO_WASM_JIT_COLOCATE_LOCAL_CALLS shipped 1. The entire point of framing members into one
+	   * module is that calls between them become `call <funcidx>`; the losing arm framed them together
+	   * and left the calls indirect, i.e. co-location's cost without its benefit. The policy FIELD
+	   * stays -- the lone-method path passes FALSE deliberately, to keep self-recursion indirect. */
+	  wj_asm_policy_init (&pol, TRUE);
 	  /* CROSS-GROUP EDGES ARE `call_indirect`, and there is no longer a choice about it: method
 	   * imports are gone entirely. An import bound at INSTANTIATION had to be ordered, and ordering
 	   * is what could not be done -- R161 showed every deferral was an import-edge cycle, and R162
@@ -7030,8 +6816,7 @@ int mono_wasm_jit_colocate_deps_now (int desc_id);
 int
 mono_wasm_jit_colocate_deps_now (int desc_id)
 {
-	extern int mono_wasm_jit_colocate_deps, mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
-	extern int mono_wasm_jit_colocate_scc;
+	extern int mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
 	WjDepSet *rds;
 	/* HEAP, not stack, and this is a bug fix rather than tidiness. `descs` only ever holds `cap` entries
 	 * (COLOCATE_MAX, 16 by default), but a WJ_BATCH_MAX-sized automatic is 2 KB of C stack in a function
@@ -7048,7 +6833,12 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	int n = 0, bytes = 0, i, j, cap;
 
 	wj_stack_probe ();
-	if (!mono_wasm_jit_colocate_deps || desc_id <= 0)
+	/* MONO_WASM_JIT_COLOCATE_DEPS ships 1 and has since R166. The objection to batching was never module
+	 * overhead -- 29.4 us + 15.4 ns/byte, so co-location REDUCES total instantiate cost -- it was that
+	 * producing a batched member cost a full mono_wasm_force_compile; with relocatable bodies it costs a
+	 * memcpy. Note its off-arm is also known to WEDGE in combination (2 of 2 attempts), so it was not a
+	 * safe A/B either. */
+	if (desc_id <= 0)
 		return 0;
 	re = wj_reg_at (desc_id - 1);
 	rds = re ? re->depset : NULL;
@@ -7172,7 +6962,12 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 			 *
 			 * wj_asm_reaches walks the same WjRegEntry.deps graph admission walks, so the two agree by
 			 * construction, and it is conservative (TRUE on any doubt, and on exceeding WJ_REACH_MAX). */
-			if (mono_wasm_jit_colocate_scc && d > 0 && wj_asm_reaches (d, re->f)) {
+			/* MONO_WASM_JIT_COLOCATE_SCC shipped 1 and is CORRECTNESS, not performance: dropping a callee
+			 * that can reach back to us strands a cycle ACROSS two modules, and a cross-module cycle is
+			 * the one thing admission cannot order -- an import inside it defers to WJ_ADMIT_DEFER_MAX
+			 * and then fails permanently (R161). Refusing to form the group is strictly better; the
+			 * members keep the standalone modules they already have. */
+			if (d > 0 && wj_asm_reaches (d, re->f)) {
 				if (G_UNLIKELY (mono_wasm_jit_stats))
 					mono_wasm_jit_count (WJC_COLOCATE_SCC_REFUSED);
 				g_free (descs);
@@ -7252,7 +7047,10 @@ wj_structured_cfg_kind (MonoCompile *cfg, int *bbidx, int n, int *out_h, int *ou
 	MonoBasicBlock *bb;
 	int i, h = -1, l = -1;
 
-	if (!mono_wasm_jit_structured_cfg || !cfg || !cfg->header ||
+	/* MONO_WASM_JIT_STRUCTURED_CFG shipped 1: emit real wasm block/loop structure wherever the CFG
+	 * allows it, instead of the `loop { block { local.get $blk; br_table } }` dispatch scaffolding on
+	 * every method. It also subsumes the old NODISPATCH single-bb special case. Settled. */
+	if (!cfg || !cfg->header ||
 	    cfg->header->num_clauses != 0 || n <= 0)
 		return WJ_CFG_DISPATCH;
 
@@ -7785,10 +7583,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* Non-scalar (valuetype) address-taken local. DEFAULT: bail. MONO_WASM_JIT_LDADDR_VTYPE=1
 					 * backs it with a full-size addr-frame slot (field access via OP_LDADDR + MEMBASE);
 					 * vt[vv] stays 0 so a scalar/bulk value access bails. */
-					extern int mono_wasm_jit_ldaddr_vtype;
 					MonoClass *vk;
 					int vsize;
-					if (!mono_wasm_jit_ldaddr_vtype) { fail = "ldaddr of non-scalar local"; fail_op = OP_LDADDR; goto done; }
+					/* MONO_WASM_JIT_LDADDR_VTYPE gated this and shipped 1: OP_LDADDR of a NON-SCALAR
+					 * ref-free valuetype local, via a full-size addr-frame slot. Its off-arm bailed the
+					 * whole method. Exonerated on the corruption question -- jit17 corrupted with it OFF
+					 * -- and kept gated only for repro parity, which is no longer a reason. */
 					vk = mono_class_from_mono_type_internal (var->inst_vtype);
 					if (!vk) { fail = "ldaddr vtype no class"; fail_op = OP_LDADDR; goto done; }
 					vsize = mono_class_value_size (vk, NULL);
@@ -7804,14 +7604,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * on. The prologue zero-fill keeps the GC from ever scanning garbage in the slot.
 						 * (The old unconditional "GC-unsafe frame" bail predated the addr frame's move onto
 						 * the C stack, when it really was an unscanned g_malloc arena.) */
-						extern int mono_wasm_jit_vtype_scalar_ref;
-						extern int mono_wasm_jit_ldaddr_vtype_ref;
 						MonoType *setype = NULL;
-						if (mono_wasm_jit_vtype_scalar_ref && vsize <= 8 && mini_wasm_is_scalar_vtype (var->inst_vtype, &setype) && setype && mini_type_is_reference (setype)) {
+						if (vsize <= 8 && mini_wasm_is_scalar_vtype (var->inst_vtype, &setype) && setype && mini_type_is_reference (setype)) {
 							addrslot [vv] = -2;
 							continue;
 						}
-						if (!mono_wasm_jit_ldaddr_vtype_ref) { fail = "ldaddr of vtype with refs"; fail_op = OP_LDADDR; goto done; }
+						/* MONO_WASM_JIT_LDADDR_VTYPE_REF gated this and shipped 1: REF-BEARING non-scalar
+						 * vtype locals in the addr frame. Its off-arm bailed the whole method. */
 						/* else: fall through to the full-size slot assignment below */
 					}
 					if (vsize <= 0 || vsize > 4096) { fail = "ldaddr vtype size"; fail_op = OP_LDADDR; goto done; }
@@ -7968,7 +7767,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * of it. Widening this needs the intervals of everything live in a try region extended across the
 	 * whole region plus its handlers.
 	 */
-	if (mono_wasm_jit_coalesce && nvreg > 0 && cfg->header->num_clauses == 0) {
+	/* MONO_WASM_JIT_COALESCE ships 1 and is INERT AT RUNTIME by construction -- that is fine, and it is
+	 * the point. V8 lowers local.get/set/tee to zero instructions
+	 * (turboshaft-graph-interface.cc:1030-1043), so sharing one wasm local between vregs with disjoint
+	 * live ranges cannot change execution. It is kept for WIRE SIZE, which decides whether a body clears
+	 * V8's 500-byte inlining cap -- a real effect on a different axis. Do not "re-measure" it against
+	 * fps; the V8 source closes that question. */
+	if (nvreg > 0 && cfg->header->num_clauses == 0) {
 		int words = (nvreg + 31) / 32;
 		int nbb2 = 0, ordn = 0, bbn;
 		MonoBasicBlock *bbl; MonoInst *insl;
@@ -8521,8 +8326,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * The dreg of a MEMBASE store is its base — a USE, not a def (mirroring the REFBASES pass).
 		 * Disabled under STOREGUARD/OBJGUARD so refslot stays a complete ref proxy for the guards. */
 		{
-			extern int mono_wasm_jit_slotlive;
-			gboolean slotlive_on = mono_wasm_jit_slotlive != 0;
+			/* MONO_WASM_JIT_SLOTLIVE ships 1 (GC-point liveness slot elision). It stays disabled under
+			 * STOREGUARD/OBJGUARD below, which is NOT a knob but a semantic requirement: those guards key
+			 * ref-ness off refslot, so eliding a slot would change what they check. */
+			gboolean slotlive_on = TRUE;
 #ifdef HOST_BROWSER
 			{
 				extern int mono_wasm_jit_storeguard, mono_wasm_jit_objguard, mono_wasm_jit_guard_keep_slotlive;
@@ -8608,6 +8415,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* Raises exempted since the current generation began. A forwarded call argument may
 					 * only skip the used-at-a-GC-point clause below while this is zero -- see there. */
 					int gen_skipped_raises = 0;
+					/* RAISE_NOGC=2 is the positive control: same exemption as level 1, but without the
+					 * gen_skipped_raises term in WJ_SL_USE below -- i.e. the codegen that measured 4/4
+					 * dead boots at a 4 MB nursery. Read once here, not per use. */
+					const int sl_fwd_guard = mono_wasm_jit_raise_nogc != 2;
 					MONO_BB_FOR_EACH_INS (bbl, insl) {
 						int srcs [MONO_MAX_SRC_REGS];
 						int nsrc = mono_inst_get_src_registers (insl, srcs);
@@ -8651,7 +8462,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * measured crash (always mini_llvmonly_init_vtable_slot -> resolve_vcall on a filler-class
 		 * receiver) says it does not hold on the PIC miss path. So honour `_fwd` only when no raise was
 		 * skipped in this generation. */ \
-		else if (gcp && (!_fwd || gen_skipped_raises > 0)) needs_slot [_u] = TRUE; \
+		/* sl_fwd_guard is 0 only at RAISE_NOGC=2, the POSITIVE CONTROL, which reproduces the pre-fix
+		 * codegen by dropping exactly this term. Everything else about level 2 is level 1. */ \
+		else if (gcp && (!_fwd || (sl_fwd_guard && gen_skipped_raises > 0))) needs_slot [_u] = TRUE; \
 		last_use_ord [_u] = ord; \
 	} } while (0)
 						for (u = 0; u < nsrc; ++u) {
@@ -8824,8 +8637,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * would dangle the local) and single-bb (multi-bb death needs real liveness — Phase 3b).
 				 * Requires REF_WT: reads come from the local, so the zero store is position-safe. */
 				{
-					extern int mono_wasm_jit_slotzero, mono_wasm_jit_ref_wt;
-					if (mono_wasm_jit_slotzero && mono_wasm_jit_ref_wt && nins > 0) {
+					/* MONO_WASM_JIT_SLOTZERO and REF_WT both ship 1. Their own comments said "Default OFF
+					 * until soak" / "flip to 1 after the test matrix passes" -- the soak evidently happened
+					 * and the default never moved, which left the runtime's documentation of its own safety
+					 * posture wrong about the product. Baked in. */
+					if (nins > 0) {
 						int nzero = 0;
 						sl_kill_next = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
 						sl_kill_head = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nins + 1));
@@ -8871,8 +8687,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * the slot must remain the home. All other slot accesses funnel through wasm_ld/wasm_st (plus
 		 * the prologue arg copy, which already leaves the param local as the arg's home). */
 		{
-			extern int mono_wasm_jit_ref_wt;
-			if (mono_wasm_jit_ref_wt && nrefslots > 0) {
+			if (nrefslots > 0) {
 				guint8 *ref_wt = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
 				int nwt = 0;
 				for (i = 0; i < nvreg; ++i)
@@ -9028,7 +8843,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		if (G_UNLIKELY (cfg->method && mono_wasm_jit_refdiag_name (cfg->method->name))) {
 			MonoBasicBlock *bb2; MonoInst *ins2;
 #define WJ_RF(v) (((v) >= 0 && (v) < nvreg) ? (isref [v] ? ((sl_elide && sl_elide [v]) ? 'r' : 'R') : '-') : '.')
-			{ printf ("WASM_JIT_IR === %s nvreg=%d nrefslots=%d nargs=%d lcseflag=%d ===\n", cfg->method->name, nvreg, nrefslots, nargs, mono_wasm_jit_lcse); }
+			{ printf ("WASM_JIT_IR === %s nvreg=%d nrefslots=%d nargs=%d ===\n", cfg->method->name, nvreg, nrefslots, nargs); }
 			for (bb2 = cfg->bb_entry; bb2; bb2 = bb2->next_bb)
 				MONO_BB_FOR_EACH_INS (bb2, ins2) {
 					char b [256]; int n;
@@ -9235,7 +9050,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * Reset at the top of every bb, so nothing crosses a control-flow edge and no dominance
 	 * information is needed. */
 	guint8 *nn = NULL;
-	if (mono_wasm_jit_nce && nvreg > 0)
+	/* MONO_WASM_JIT_NCE ships 1 (per-bb "already proven non-null" vreg bitmap). Its mode 2 -- dominator
+	 * propagation of never-written facts -- measured worth ~0 and is deleted; mode 1 is unconditional. */
+	if (nvreg > 0)
 		nn = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
 	/* Trackable = a real vreg that lives in a wasm local. Address-taken vregs (addrslot != -1, which
 	 * includes the -2 ref-vtype sentinels) are homed in the addressable-locals frame and their address
@@ -9275,9 +9092,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		extern gboolean mono_wasm_jit_refdiag_name (const char *);
 		if (G_UNLIKELY (cfg->method && mono_wasm_jit_refdiag_name (cfg->method->name)))
 			printf ("WASM_JIT_LCSE %s: flag=%d nvreg=%d sg=%d og=%d\n",
-				cfg->method->name, mono_wasm_jit_lcse, nvreg, lc.storeguard, lc.objguard);
+				cfg->method->name, 1, nvreg, lc.storeguard, lc.objguard);
 	}
-	if (mono_wasm_jit_lcse && nvreg > 0 && !lc.storeguard && !lc.objguard) {
+	/* MONO_WASM_JIT_LCSE ships 1. Its knob is gone but the PASS stays, and the reason is a measurement
+	 * trap worth stating: a static census of the tier dump CANNOT show LCSE inert, because the dump is
+	 * POST-LCSE -- every redundancy it removed is already invisible there. The 0.09%% "EBB redundancy"
+	 * reading is equally consistent with the pass working. What a census CAN bound is the part LCSE
+	 * cannot reach: whole-body (cross-EBB) redundant loads, 6.33%% of loads as an upper bound, which is
+	 * ~0.46%% of the client thread -- and that is why GVN is closed. */
+	if (nvreg > 0 && !lc.storeguard && !lc.objguard) {
 		guint8 *needed = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) (N > 0 ? N : 1));
 		MonoBasicBlock *b3;
 		int nneed = 0;
@@ -9538,8 +9361,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * the cached module is instantiated, so two global.get operations replace the former two C-boundary
 	 * address-helper calls per invocation. Each IC hit still loads THROUGH these stable addresses, making
 	 * a later bitmap realloc/capacity growth visible with no stale-pointer window. */
-	if (mono_wasm_jit_vcall_inline_ic && has_vcall) {
-		extern int mono_wasm_jit_delegate_local_pic;
+	if (has_vcall) {
 		/* METHOD-LONG LIVE RANGES ARE NOT FREE -- the LOCALS are.
 		 *
 		 * Be precise about which, because the two suggest opposite work. A wasm local is free: V8's
@@ -9557,12 +9379,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 *   - the cap ADDRESSES are consumed immediately to load their values, so they never need a local at
 		 *     all: global.get; i32.load; local.set value — 2 more reclaimed.
 		 * That is 4 fewer method-long locals in every method containing a virtual call. */
-		if (!mono_wasm_jit_delegate_local_pic) {
-			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 1); /* imported s.l = &wj_slot_live */
-			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_ptr_idx);
-			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 2); /* imported s.c = &wj_slot_live_cap */
-			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) slotlive_cap_idx);
-		}
+		/* MONO_WASM_JIT_DELEGATE_LOCAL_PIC shipped 1, so the slot-live bitmap pair is no longer fetched
+		 * here at all: only the SHARED WjDelegateIC arm read it, and that arm is gone. Two method-long
+		 * locals reclaimed in every method containing a virtual call -- and method-long locals are the
+		 * thing that costs, not local COUNT (a wasm local is free; a value live across other calls is
+		 * not). R189 measured WRITE-ONCE-EARLY slots at 17.4%% of slots carrying 30.1%% of all reload
+		 * traffic, and these were two of them. */
 		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 3); /* imported s.v = &wj_vcall_pic */
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vpic_ptr_idx);
 		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 4); /* imported s.n = &wj_vcall_pic_cap */
@@ -9572,7 +9394,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			/* The delegate PIC pair, on the same terms. Fetched unconditionally with the rest rather than
 			 * gated on "has a delegate site": the gate would need a second prescan, and two global.get in a
 			 * prologue that already does four are not worth another pass over the IR. */
-			if (mono_wasm_jit_delegate_local_pic) {
+			{
 				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 5); /* imported s.d = &wj_delegate_pic */
 				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dpic_ptr_idx);
 				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 6); /* imported s.m = &wj_delegate_pic_cap */
@@ -9910,8 +9732,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
 			{
 				extern int mono_wasm_jit_il_state_offset_off (void);
-				extern int mono_wasm_jit_ilofs_global;
-				if (mono_wasm_jit_ilofs_global) {
+				/* MONO_WASM_JIT_ILOFS_GLOBAL ships 1 and is MEASURED: the set_il_offset helper symbol went
+				 * 1.38/1.45 -> 0.00 M instr/frame on the client render thread, sibling island helpers
+				 * unchanged and both negative controls flat. Symbol ELIMINATION, not a magnitude estimate.
+				 * It works where INLINE_ILOFS failed, for a specific reason: it `global.get`s the il_state
+				 * pointer at each store site instead of caching it in a method-long local, so it leaves
+				 * NOTHING live across the method's calls. */
+				{
 					/* il_state->il_offset = <offset>, through imported global s.i, no call and nothing
 					 * left live: global.get &cur_island_il_state; load it; push the offset; store. */
 					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); /* s.i = &mono_wasm_jit_cur_island_il_state */
@@ -9919,9 +9746,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_i32_const (&body, eh_table->il_offsets [i]);
 					wasm_op (&body, WASM_OP_I32_STORE);
 					wasm_memarg (&body, 2, (guint32) mono_wasm_jit_il_state_offset_off ());
-				} else {
-					wasm_i32_const (&body, eh_table->il_offsets [i]);
-					wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_set_il_offset, eh_type_idx);
 				}
 			}
 		}
@@ -11135,7 +10959,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					 * Gated by MONO_WASM_JIT_INLINE_AOT (default off). byref args/ret bail to the residual; a
 					 * throwing AOT callee would escape uncaught until Build 2 adds wasm-EH — test non-throwing. */
 					{
-						extern int mono_wasm_jit_inline_aot;
 						extern gboolean mono_wasm_jit_aot_call_target (MonoMethod *m, gpointer *addr, gpointer *rgctx, gboolean *has_extra_arg);
 						gpointer aot_addr = NULL, aot_rgctx = NULL;
 						gboolean aot_has_extra = TRUE;   /* does the raw AOT body carry the trailing rgctx/dummy arg? */
@@ -11154,7 +10977,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * vret-LAST — reordering here isn't wired up, and the residual is vret-correct.
 						 * By-addr ARGS are fine inline: the native ABI passes the same copy address
 						 * positionally (ArgValuetypeAddrOnStack). */
-						gboolean aot_ok = mono_wasm_jit_inline_aot && !m_type_is_byref (csig->ret)
+						/* MONO_WASM_JIT_INLINE_AOT gated this and shipped 1: emit the inline direct same-ABI
+						 * AOT call (call_indirect cinfo->addr with this+args+rgctx, no interp_entry, no
+						 * frame, no LMF) instead of the residual, for AOT'd callees. It is HOT -- ~90k
+						 * inline-AOT calls per frame -- and its off-arm routed every one of them through
+						 * the full residual marshal. Settled. */
+						gboolean aot_ok = !m_type_is_byref (csig->ret)
 							&& !call->rgctx_reg && !call->need_unbox_trampoline && !cci.vret_byaddr;
 						for (k = 0; k < (int) csig->param_count && aot_ok; ++k)
 							if (m_type_is_byref (csig->params [k])) aot_ok = FALSE;
@@ -11242,9 +11070,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								 * close around it), route just this edge through the interp residual instead of
 								 * bailing the whole caller. Keeps a hot island JITted around a cold perm-blocker.
 								 * A not-yet-jitted callee still bails (the island should pull it in bottom-up). */
-								extern int mono_wasm_jit_residual_perm;
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
-								if (!(mono_wasm_jit_residual_perm && mono_wasm_jit_callee_perm_unjittable (call_method))) {
+								if (!mono_wasm_jit_callee_perm_unjittable (call_method)) {
 									/* Lever B' (MONO_WASM_JIT_RESIDUAL_COLD): the blocker is genuinely COLD — the
 									 * island cold-gate would refuse to pull it in (still counting hits, below
 									 * thresh/cold_div, not block-promoted). A cold branch (IKVM __<GetInstance>
@@ -11303,7 +11130,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					 * handled byref (pure wasm pointer pass, no interp_entry).
 					 * =0 restores the bails; the fail strings must keep the substring "byref" and must NOT
 					 * contain "arg type"/"ret type" (tested first) so the -7 classification still holds. */
-					if (!mono_wasm_jit_byref) {
+					/* MONO_WASM_JIT_BYREF gated this bail and shipped 1: lower a call whose CALLEE SIGNATURE
+						 * carries byref (ref/out/Span) args or a byref return. The off-arm bailed the whole
+						 * method, which on this workload is most of Span/Unsafe. */
+						if (0) {
 						if (m_type_is_byref (csig->ret)) {
 							fail = "residual byref ret";
 							fail_sig_site = "residual"; fail_sig_callee = call_method; fail_sig = csig; fail_sig_arg = -1;
@@ -11599,7 +11429,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * virtual site used to lose EVERY fast path, not just the interp fallback, even though
 						 * all the wasm-only ones pass a byref as a plain i32. (mono_wasm_get_call_info classifies
 						 * a byref as WJ_ARG_SCALAR/i32 with valid=TRUE, so it clears the arg-kind filter below.) */
-						if (!mono_wasm_jit_byref) {
+						/* MONO_WASM_JIT_BYREF gated this bail and shipped 1: lower a call whose CALLEE SIGNATURE
+						 * carries byref (ref/out/Span) args or a byref return. The off-arm bailed the whole
+						 * method, which on this workload is most of Span/Unsafe. */
+						if (0) {
 							if (m_type_is_byref (csig->ret)) {
 								fail = "vcall byref ret";
 								fail_sig_site = "vcall"; fail_sig_callee = call->method; fail_sig = csig; fail_sig_arg = -1;
@@ -11672,7 +11505,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * prof_predict_alt, which ranks by id_counts and ignores `margin` -- the only
 						 * reader that can work for a delegate site at all. skip=NULL asks for the top
 						 * identity rather than a runner-up. */
-						if (is_delegate_invoke && mono_wasm_jit_delegate_devirt > 0 && mono_wasm_jit_devirt_profile) {
+						/* MONO_WASM_JIT_DEVIRT_PROFILE ships 1 -- it is what records the receiver vtable seen
+						 * at every virtual and delegate site, i.e. the input every devirt decision reads.
+						 * With it off the emitter has nothing to speculate on at all. */
+						if (is_delegate_invoke && mono_wasm_jit_delegate_devirt > 0) {
 							/* The DELEGATE reader, not prof_predict_alt: that one requires id_targets[k],
 							 * which is always NULL at a delegate site because the recorder passes target=NULL
 							 * (the identity IS the target there). Using it measured 7,582 sites and 0 armed. */
@@ -11728,9 +11564,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						}
 						else
 							wj_count (WJC_DEVIRT_SITE);
-						if (!is_delegate_invoke && mono_wasm_jit_devirt_profile &&
-						    (mono_wasm_jit_vcall_slim ||
-						     (terminal_vcall_handoff && terminal_vcall_ins == ins))) {
+						if (!is_delegate_invoke &&
+						    /* MONO_WASM_JIT_VCALL_SLIM gated this and shipped 1: replace a perfectly
+						     * monomorphic profiled site's whole PIC/AOT diamond with one guarded admitted
+						     * f-slot call plus the shared cold miss. With it off, only the terminal
+						     * vcall handoff site was offered to prediction at all. */
+						    TRUE) {
 							int pred_why = 0;
 							guint32 pred_samples = 0;
 							if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod,
@@ -11795,9 +11634,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 											fail = "too many direct dependencies";
 											goto done;
 										}
-										slim_pred = mono_wasm_jit_vcall_slim &&
-											mono_wasm_jit_vcall_inline_ic &&
-											mono_wasm_jit_vcall_shared_miss_enabled;
+										/* VCALL_SHARED_MISS ships 0 and its arm is deleted, so a slim predicted
+										 * site is now simply always available here. */
+										slim_pred = TRUE;
 									}
 								}
 							} else {
@@ -11833,11 +11672,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						n2 = csig->param_count + 1; /* this + params */
 						/* per-call-site AOT-vcall IC cell (VCALL_AOT_IC): 20B, see mono_wasm_jit_alloc_aot_ic */
 						gpointer aic = NULL;
-						{ extern int mono_wasm_jit_vcall_aot_ic, mono_wasm_jit_vcall_inline_ic, mono_wasm_jit_vcall_aot;
+						{
 						  /* Delegate wrapper selection depends on the instance's target shape, not just its vtable.
 						   * A vtable-keyed AOT IC could therefore reuse a normal wrapper for an open-virtual or bound
 						   * delegate of the same delegate type. Leave those sites on the instance-aware helper path. */
-						  if (!slim_pred && !is_delegate_invoke && mono_wasm_jit_vcall_aot_ic && mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_aot) {
+						  /* MONO_WASM_JIT_VCALL_AOT_IC gated this and shipped 1: a per-call-site inline
+						   * cache for AOT-backed virtual targets, skipping scratch() + resolve on a hit. */
+						  /* MONO_WASM_JIT_VCALL_AOT gated this and shipped 1: when a JITted method's virtual
+						   * call resolves to an AOT-backed override, dispatch it through the AOT body's own
+						   * native ABI instead of the interp residual. Its off-arm sent every such call
+						   * through ~1,360 instructions of marshalling. Settled. */
+						  if (!slim_pred && !is_delegate_invoke) {
 #ifdef HOST_BROWSER
 							extern gpointer mono_wasm_jit_alloc_aot_ic (void); aic = mono_wasm_jit_alloc_aot_ic ();
 #else
@@ -11892,7 +11737,7 @@ vcall_nullchk_done:
 						 * after admitting the target into this worker's function table, a hit needs neither the old
 						 * shared InterpMethod load nor a slot-liveness bitmap test. Way zero remains straight-line;
 						 * the remaining ways use one compact loop and all hits share one typed call tail. */
-						if (mono_wasm_jit_vcall_inline_ic) {
+						{
 #ifdef HOST_BROWSER
 							extern int mono_wasm_jit_imethod_fslot_off (void);
 							int fslot_off = mono_wasm_jit_imethod_fslot_off ();
@@ -11932,12 +11777,15 @@ vcall_nullchk_done:
 #endif
 							/* Worker-local delegate PIC field offsets, mirroring WjLocalDelegatePicEntry. The way
 							 * offset folds into the load immediate, so a way costs no base arithmetic at all. */
-							extern int mono_wasm_jit_delegate_local_pic;
 							/* DELEGATE_OBJ_PIC was the alternative to this arm and is deleted; `obj_pic` is kept
 							 * as a compile-time 0 so the block structure below (its br depths and trailing END)
 							 * stays exactly as measured rather than being re-derived by hand. */
 							const int obj_pic = 0;
-							int dpic_local = mono_wasm_jit_delegate_local_pic;
+							/* MONO_WASM_JIT_DELEGATE_LOCAL_PIC shipped 1 and its shared-IC arm is deleted.
+							 * Kept as a local rather than folded away because it gates the hoisted
+							 * prologue, the br depth of the tail and the trailing END -- the block
+							 * structure below is exactly as measured. */
+							const int dpic_local = 1;
 							int dpic_rvt_off = 8, dpic_shape_off = 12;
 							int way;
 							/* Inline-cache width for THIS site, from the interpreter's receiver observations, in
@@ -11965,7 +11813,13 @@ vcall_nullchk_done:
 							 * VCALL_WAYS-deep chain below and it dominates their emitted size. */
 							int ic_ways = mono_wasm_jit_vcall_ways;
 #ifdef HOST_BROWSER
-							if (mono_wasm_jit_ic_autosize && ic_ways > 1) {
+							/* MONO_WASM_JIT_IC_AUTOSIZE gated this and shipped 1: narrow a site's inline-cache
+							 * width to what the interpreter actually observed there, rather than using the
+							 * global VCALL_WAYS everywhere. The cold-scan loop it removes is a block, a
+							 * loop, bounds arithmetic and a call_indirect emitted into EVERY virtual call
+							 * site, and narrowing is safe in the only direction that matters because the
+							 * emitted code re-checks the receiver. Settled; unconditional. */
+							if (ic_ways > 1) {
 								extern guint32 mono_wasm_jit_prof_arity (gpointer caller, MonoMethod *base);
 								guint32 ar = mono_wasm_jit_prof_arity (cfg->wasm_jit_caller_imethod, call->method);
 								/* arity + 1, not arity. The profile now also observes this site AFTER the caller is
@@ -12011,8 +11865,15 @@ vcall_nullchk_done:
 							 * life of the process however concentrated their distribution is. id_counts[]
 							 * (R206) gives the true per-receiver frequency the margin cannot express, so the
 							 * break-even can be applied per receiver. ic_tag 3/4 == WJ_PRED_POLY/POLY_90. */
-							if (mono_wasm_jit_devirt_arm2 && !pred_target && (ic_tag == 3 || ic_tag == 4) &&
-							    !is_delegate_invoke && mono_wasm_jit_devirt_profile) {
+							/* MONO_WASM_JIT_DEVIRT_ARM2 ships 1 and is measured: +18.7%% direct-call sites (local
+							 * arms per 1k modules 461.2 -> 547.4, non-overlapping ranges), 9.1M in-window
+							 * hits, poly's share of IC hits 29.0%% -> 12.1%%. It exists because
+							 * `margin == total` is IRREVERSIBLE -- a site that ever saw a second receiver is
+							 * refused an arm for the life of the process, a 90/10 site identically to a
+							 * 50/50 one. ARM2_PCT stays a knob: refusing sites below the break-even is what
+							 * keeps this from repeating the vcall_ways regression. */
+							if (!pred_target && (ic_tag == 3 || ic_tag == 4) &&
+							    !is_delegate_invoke) {
 								extern gboolean mono_wasm_jit_prof_predict_alt (gpointer caller, MonoMethod *base,
 									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
@@ -12111,8 +11972,8 @@ vcall_nullchk_done:
 								#undef WJ_ARM_OK
 							}
 #endif /* HOST_BROWSER */
-							if (0 && mono_wasm_jit_devirt_arm2 && pred_fslot > 0 && pred_vt && pred_target &&
-							    !is_delegate_invoke && mono_wasm_jit_devirt_profile) {
+							if (0 && pred_fslot > 0 && pred_vt && pred_target &&
+							    !is_delegate_invoke) {
 								extern gboolean mono_wasm_jit_prof_predict_alt (gpointer caller, MonoMethod *base,
 									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
@@ -12842,8 +12703,24 @@ vcall_nullchk_done:
 							}
 vcall_cold_miss_emit:
 							{
-							extern int mono_wasm_jit_vcall_shared_miss_enabled;
-							if (!mono_wasm_jit_vcall_shared_miss_enabled) {
+							/* MONO_WASM_JIT_VCALL_SHARED_MISS ships **0**, and 0 is the MEASURED-GOOD arm, so this
+							 * is the one two-path knob whose LOSING arm was the runtime default.
+							 *
+							 * The deleted arm outlined the whole cold-miss sequence into one signature-neutral
+							 * helper, `(this, base_method, frame, site_ic, aot_ic) -> threw`, leaving only the
+							 * unavoidable typed stores in each caller. It is a completely reasonable design and
+							 * it lost decisively: -13.2%% p50 / -16.6%% mean frame / +19.9%% fps for turning it
+							 * OFF, 4 interleaved rounds, 14.5 of 16 pairwise on tails (p~0.02), with two of the
+							 * four runs SUSTAINING 30-33 fps. The helper was 2.661%% of in-game samples on its
+							 * own and the win is larger than that, so it is not merely the helper's cost -- it
+							 * is the dispatch SHAPE the outlining forces at every site.
+							 *
+							 * That is the same lesson INLINE_ILOFS taught from the other direction: outlining
+							 * and inlining are not symmetric here. Inlining a helper pays when it removes CODE
+							 * and loses when it lengthens a live range; outlining pays when it removes code
+							 * from a cold path and loses when it forces a call-shaped sequence onto a hot one.
+							 *
+							 * What remains is the per-caller lowering, which is now the only path. */
 							/* Legacy per-caller cold miss lowering, retained for an env-var A/B. */
 							/* $scratch = imported s.b (see the direct-residual site above). HOT now that
 							 * vcall_shared_miss=0 makes per-site cold-miss lowering the active path. */
@@ -12892,8 +12769,7 @@ vcall_cold_miss_emit:
 							 * frame. Wrapped in a $no_aot block: if the helper says "not AOT" we br to $no_aot and fall
 							 * into the (shared, unchanged) residual below; if AOT we call + br past the residual. */
 							{
-								extern int mono_wasm_jit_vcall_aot;
-								if (mono_wasm_jit_vcall_aot) {
+								{
 									extern int mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj, gpointer aic);
 									WasmFuncType at, at_ne, aott; int ati = -1, ati_ne = -1, aotti = -1;
 									if (n2 + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "vcall aot nparams"; goto done; }
@@ -13141,128 +13017,8 @@ vcall_cold_miss_emit:
 								if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall dreg"; goto done; }
 							}
 							wasm_op (&body, WASM_OP_END);   /* end the fslot if/else (slow path) */
-							} else {
-								/* Signature-neutral shared miss ABI:
-								 *   (this, base_method, frame, site_ic, aot_ic) -> threw
-								 * Only the unavoidable typed stores/load remain in this caller. */
-								WasmFuncType smt;
-								WasmFuncType rlt;
-								int smti = -1, rlti = -1;
-								extern int mono_wasm_jit_vcall_shared_miss (MonoObject *, MonoMethod *, guint8 *, gpointer, gpointer);
-								extern gpointer mono_wasm_jit_vcall_miss_frame_acquire (void);
-								extern void mono_wasm_jit_vcall_miss_frame_release (gpointer);
-								memset (&smt, 0, sizeof (smt));
-								for (vk = 0; vk < 5; ++vk) smt.params [vk] = WASM_I32;
-								smt.nparams = 5; smt.ret = WASM_I32;
-								for (vk = 0; vk < nextra; ++vk)
-									if (functype_eq (&extra_types [vk], &smt)) { smti = ti_base + vk; break; }
-								if (smti < 0) {
-									if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
-									extra_types [nextra] = smt; smti = ti_base + nextra++;
-								}
-								memset (&rlt, 0, sizeof (rlt));
-								rlt.params [0] = WASM_I32; rlt.nparams = 1; rlt.ret = WASM_VOID;
-								for (vk = 0; vk < nextra; ++vk)
-									if (functype_eq (&extra_types [vk], &rlt)) { rlti = ti_base + vk; break; }
-								if (rlti < 0) {
-									if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; }
-									extra_types [nextra] = rlt; rlti = ti_base + nextra++;
-								}
-								/* The cold helper can C++/wasm-EH unwind during resolution or target entry.
-								 * Import x.e even for an otherwise EH-free caller so a tiny cleanup catch can
-								 * release the pinned frame and immediately rethrow the original exception. */
-								uses_eh_tag = TRUE;
-								if (eh_type_idx < 0)
-									eh_type_idx = rlti; /* both are (i32)->void */
-								uses_calls = TRUE;
-								/* Acquire a GC-pinned, nesting-safe worker-local frame only on this cold edge.
-								 * Unlike adding 256 bytes to naddrbytes, this has zero prologue/stack cost on hits. */
-#ifdef HOST_BROWSER
-								wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_vcall_miss_frame_acquire, vtsi);
-#else
-								wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff5, (guint32) vtsi);
-#endif
-								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) scratch_idx);
-								for (ai = 0; ai < n2; ++ai) {
-									WasmOpcode sop; guint32 al2;
-									switch (pp [ai]) {
-									case WASM_I64: sop = WASM_OP_I64_STORE; al2 = 3; break;
-									case WASM_F32: sop = WASM_OP_F32_STORE; al2 = 2; break;
-									case WASM_F64: sop = WASM_OP_F64_STORE; al2 = 3; break;
-									default:       sop = WASM_OP_I32_STORE; al2 = 2; break;
-									}
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-									if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "shared vcall arg ld"; goto done; }
-									wasm_op (&body, sop); wasm_memarg (&body, al2, (guint32) (ai * 8));
-								}
-								/* Preserve caller attribution used by the residual diagnostics. */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-#ifdef HOST_BROWSER
-								wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
-#else
-								wasm_i32_const (&body, 0x7ff8);
-#endif
-								wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 224);
-								wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);
-								if (!wasm_ld (&body, &lc, this_vr)) { fail = "shared vcall this ld"; goto done; }
-#ifdef HOST_BROWSER
-								wasm_i32_const (&body, (gint32) (intptr_t) call->method);
-#else
-								wasm_i32_const (&body, 0x7ffd);
-#endif
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-								wasm_i32_const (&body, (gint32) (intptr_t) vic);
-								wasm_i32_const (&body, (gint32) (intptr_t) aic);
-#ifdef HOST_BROWSER
-								wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_vcall_shared_miss, smti);
-#else
-								wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff6, (guint32) smti);
-#endif
-								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx); /* threw */
-								wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0); /* x.e; exception ptr on stack */
-								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-#ifdef HOST_BROWSER
-								wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_vcall_miss_frame_release, rlti);
-#else
-								wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff4, (guint32) rlti);
-#endif
-								wasm_op (&body, WASM_OP_RETHROW); wasm_uleb (&body, 0);
-								wasm_op (&body, WASM_OP_END);
-								/* Transfer a successful return into its GC-tracked destination before clearing
-								 * the conservative frame root. */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
-								wasm_op (&body, WASM_OP_I32_EQZ);
-								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-									if (rv != WASM_VOID) {
-										WasmOpcode lop; guint32 al2;
-										switch (rv) {
-										case WASM_I64: lop = WASM_OP_I64_LOAD; al2 = 3; break;
-										case WASM_F32: lop = WASM_OP_F32_LOAD; al2 = 2; break;
-										case WASM_F64: lop = WASM_OP_F64_LOAD; al2 = 3; break;
-										default:       lop = WASM_OP_I32_LOAD; al2 = 2; break;
-										}
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-										wasm_op (&body, lop); wasm_memarg (&body, al2, 192);
-										if (rv == WASM_I32)
-											wasm_emit_subword_ret_norm (&body, csig->ret);
-										if (!wasm_st (&body, &lc, ins->dreg)) { fail = "shared vcall dreg"; goto done; }
-									}
-								wasm_op (&body, WASM_OP_END);
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
-#ifdef HOST_BROWSER
-								wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_vcall_miss_frame_release, rlti);
-#else
-								wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff4, (guint32) rlti);
-#endif
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
-								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-									/* threw: continue the native unwind; do NOT return and do NOT pop roots first. */
-									EMIT_RESIDUAL_THROW_CONTINUATION ();
-								wasm_op (&body, WASM_OP_END);
 							}
-							}
-							if (mono_wasm_jit_vcall_inline_ic)
+							if (1)
 							wasm_op (&body, WASM_OP_END);   /* end $after (only emitted when the inline-IC fast path is on) */
 						break;
 					}

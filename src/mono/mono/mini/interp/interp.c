@@ -1082,7 +1082,6 @@ typedef struct {
  * BOTH the runtime and the offline cross-compiler (mono-aot-cross) while interp.c is only in the
  * runtime. Defining it here breaks the mono-aot-cross link with an undefined symbol — the same reason
  * mono_wasm_jit_residual_mode lives in mini-wasm.c. */
-extern int mono_wasm_jit_devirt_profile;
 
 /* Collection telemetry, deliberately NOT behind MONO_WASM_JIT_STATS: the whole point is to check that
  * the profile is being populated during a normal (stats-off) run, which is the only kind worth timing.
@@ -1845,7 +1844,7 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 	 * instruction, which is the property R114 was protecting when vcall_ways 4->1 won +9.6% on the tail. */
 	{
 		WjVcallSite *site = wj_vcall_site (ic);
-		if (G_UNLIKELY (mono_wasm_jit_devirt_profile) && vt && site->caller_im && site->base) {
+		if (vt && site->caller_im && site->base) {
 			/* Memoised: (caller_im, base, WJ_SITE_VIRTUAL) is fixed for this site, so the record it
 			 * names is too. See WjVcallSite.prof for why that pointer is safe to hold, and for what the
 			 * lookup costs on a path that takes 78.8% of all observations. */
@@ -2012,8 +2011,6 @@ typedef struct {
 
 g_static_assert (sizeof (WjLocalDelegatePicEntry) == 16);
 
-extern int mono_wasm_jit_delegate_local_pic;   /* MONO_WASM_JIT_DELEGATE_LOCAL_PIC, defined in mini-wasm.c */
-extern int mono_wasm_jit_eslot_residual;        /* MONO_WASM_JIT_ESLOT_RESIDUAL, defined in mini-wasm.c */
 extern int mono_wasm_jit_admit (int desc_id);   /* declared locally at several call sites; needed here too */
 
 static __thread WjLocalDelegatePicEntry *wj_delegate_pic;
@@ -2537,8 +2534,7 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 	extern int mono_jiterp_allocate_table_entry (int type);
 	extern int mono_wasm_jit_verbose;
-	extern int mono_wasm_jit_residual_perm;
-	MonoMethod *members [WJ_SCC_MAX];
+		MonoMethod *members [WJ_SCC_MAX];
 	MonoWasmJitResult results [WJ_SCC_MAX];
 	gboolean done [WJ_SCC_MAX];
 	int n, i, iter;
@@ -2633,7 +2629,7 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 				if (bim->wasm_jit_slot == -1) {
 					/* The next emit can residual-route this permanent leaf.  Count that as
 					 * progress so the member is retried instead of poisoning the SCC. */
-					if (mono_wasm_jit_residual_perm) { progress = TRUE; continue; }
+					if (1) {   /* RESIDUAL_PERM ships 1: a PERMANENT blocker can never clear, so parking on it parks forever */ progress = TRUE; continue; }
 					ok = FALSE; give_up = TRUE; goto out;
 				}
 				for (j = 0; j < n; j++) if (members [j] == bm) { seen = 1; break; }
@@ -2685,8 +2681,14 @@ out:
 		 *
 		 * MONO_WASM_JIT_SCC_COLOCATE=0 turns it off IN THE SAME BINARY, which is the only kind of A/B this
 		 * workload's ~5% noise floor supports for a change this size. */
-		extern int mono_wasm_jit_scc_colocate;
-		if (mono_wasm_jit_scc_colocate) {
+		/* MONO_WASM_JIT_SCC_COLOCATE shipped 1 and is a CORRECTNESS mechanism rather than a lever: a
+		 * dependency CYCLE's members call each other by construction and an import binds at
+		 * instantiation, so a cyclic import pair cannot be ordered -- one of them must instantiate while
+		 * the other's f-slot is still a placeholder. Framing the cycle into one module turns every
+		 * intra-cycle edge into a module-local `call <funcidx>`, which needs no ordering at all. Its
+		 * REACH was never the point and is tiny (7 modules / 24 members per boot on this workload);
+		 * unconditional because the alternative is unsound, not because it is fast. */
+		{
 			extern int mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len);
 			int descs [WJ_SCC_MAX], idx [WJ_SCC_MAX];
 			int bn = 0, k;
@@ -2783,8 +2785,7 @@ static int
 wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_root)
 {
 	extern int mono_wasm_jit_island_depth;   /* Lever C: env-tunable recursion depth (default 10) */
-	extern int mono_wasm_jit_residual_perm;
-	InterpMethod *im = mono_interp_get_imethod (m);
+		InterpMethod *im = mono_interp_get_imethod (m);
 	int tries, spos, pushed = 0, ret = 0;
 	if (im->wasm_jit_fslot > 0) return 1;          /* already JITted */
 	if (im->wasm_jit_slot == -1) return -1;        /* permanently bailed */
@@ -2814,7 +2815,7 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 				/* The emitter supports a residual call to a permanent leaf.  Re-emit m
 				 * now that the callee's terminal state is visible instead of making the
 				 * caller permanently un-JITtable as well. */
-				if (mono_wasm_jit_residual_perm) { pulled++; continue; }
+				if (1) {   /* RESIDUAL_PERM ships 1: a PERMANENT blocker can never clear, so parking on it parks forever */ pulled++; continue; }
 				/* Callee can NEVER wasm-jit (slot==-1). Under residual=0 our island can't close around it: give up
 				 * PERMANENTLY and propagate a transitive-permanent sentinel (bail=-11) so OUR callers stop too. */
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BLOCKED_PERM);
@@ -2842,7 +2843,7 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 					wj_waiter_drain (callee);
 				}
 				/* Retry this method so RESIDUAL_PERM can route only that edge through interp. */
-				if (mono_wasm_jit_residual_perm) { pulled++; continue; }
+				if (1) {   /* RESIDUAL_PERM ships 1: a PERMANENT blocker can never clear, so parking on it parks forever */ pulled++; continue; }
 				im->wasm_jit_bail = -11; ret = -1; goto pop;
 			}
 			if (_r == WASM_JIT_COMPILE_BUSY) { ret = _r; goto pop; }
@@ -2928,7 +2929,7 @@ wasm_jit_drain_promotions (void)
 static void
 wasm_jit_maybe_compile (InterpMethod *cmethod)
 {
-	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island, mono_wasm_jit_island_budget;
+	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island_budget;
 	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
 	/* Hotness gate. The bump MUST be atomic: wasm_jit_hits lives on the SHARED InterpMethod and is bumped
 	 * from every worker (render/server/pool) in the auto-walk. A plain `++` loses updates AND lets one
@@ -2956,12 +2957,15 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 			return;
 		}
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_ATTEMPT);
-		if (mono_wasm_jit_island) {
-			extern int mono_wasm_jit_hot_root;   /* MONO_WASM_JIT_HOT_ROOT: this method just crossed its own thresh (proven hot) -> build its island as a promoted root so the cold gate is relaxed and its private (blind-spot ~0-hit) callees get pulled in instead of parking it forever */
+		/* MONO_WASM_JIT_ISLAND shipped 1: eager transitive island formation. Its off-arm was the old
+		 * bottom-up retry, which cannot bring up a method whose callees are cold -- the population that
+		 * parks forever. Settled; unconditional. */
+		{
 			int budget = mono_wasm_jit_island_budget;   /* Lever C: env-tunable; max force-compiles per island attempt */
-			r = wasm_jit_force_island (cmethod->method, 0, &budget, mono_wasm_jit_hot_root ? TRUE : FALSE);
-		} else {
-			r = wasm_jit_compile_publish (cmethod, NULL);
+			/* MONO_WASM_JIT_HOT_ROOT ships 1: a method that just crossed its OWN threshold is proven hot,
+			 * so build its island as a promoted root -- the cold gate relaxes and its private (blind-spot,
+			 * ~0-hit) callees get pulled in instead of parking it forever. */
+			r = wasm_jit_force_island (cmethod->method, 0, &budget, TRUE);
 		}
 		{ extern int mono_wasm_jit_verbose;
 		  if (G_UNLIKELY (mono_wasm_jit_verbose >= 2)) {
@@ -5939,7 +5943,11 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 		 * placeholder is a signature-mismatch trap that kills the thread, not a recoverable miss. Plain
 		 * admit() is NOT that guarantee: it also returns 1 when it breaks a dependency cycle without
 		 * instantiating anything. */
-		if (mono_wasm_jit_eslot_residual && imethod->wasm_jit_slot > 0 && !imethod->is_invoke) {
+		/* MONO_WASM_JIT_ESLOT_RESIDUAL shipped 1: a residual whose callee has no AOT code but IS
+		 * wasm-JIT compiled enters the callee's e-slot straight from the residual scratch, instead of
+		 * marshalling into InterpEntryData and letting interp_entry rediscover the same e-slot. Its
+		 * target was measured at interp_entry 3.838%% + call_interp 2.588%% of in-game samples. */
+		if (imethod->wasm_jit_slot > 0 && !imethod->is_invoke) {
 			extern int mono_wasm_jit_admit_live (int desc_id);
 			gboolean scalar = (shape & WJ_ARGSHAPE_SCALAR) != 0;
 			if (scalar && mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
@@ -6342,7 +6350,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		 * shared cache can hit on a thread that has never dispatched this site (or whose way was
 		 * evicted). Only an admitted scalar fslot is cacheable, which is what lets the generated hit
 		 * skip both the scalar test and the liveness probe. */
-		if (mono_wasm_jit_delegate_local_pic && scalar)
+		if (scalar)
 			wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
 		*(MonoMethod **) (scratch + 200) = invoke;
 		*(MonoMethod **) (scratch + 204) = target;
@@ -6422,7 +6430,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	for (int i = 0; scalar && i < (int) tsig->param_count; ++i)
 		scalar = !m_type_is_byref (tsig->params [i]) && mono_mint_type (tsig->params [i]) != MINT_TYPE_VT;
 	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar);
-	if (mono_wasm_jit_delegate_local_pic && scalar)
+	if (scalar)
 		wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
 	/* R187's OBJECT-REACHABLE RECIPE published here: the same (fslot, shape) the per-site PIC above
 	 * writes, cached once on the (delegate class, target method) tramp info that interp_init_delegate
@@ -10234,7 +10242,7 @@ main_loop:
 			 * ever sees one target: the emitted IC is empty on the first compile, and wj_prof_record
 			 * runs only from MINT_CALLVIRT_FAST, which never sees delegates. The interpreter runs this
 			 * site before the JIT compiles the caller, and has the delegate in hand right here. */
-			if (G_UNLIKELY (mono_wasm_jit_devirt_profile) && !is_multicast)
+			if (!is_multicast)
 				wj_prof_record_delegate (frame->imethod, del);
 #endif
 
@@ -10413,7 +10421,7 @@ main_loop:
 			/* Speculative-devirt profile: capture the base method BEFORE the resolve overwrites cmethod,
 			 * then record base + receiver + the resolved override once we have it. Recording the
 			 * override matters — re-deriving it at emit time deadlocks (see WjProfSite.target). */
-			MonoMethod *wj_prof_base = G_UNLIKELY (mono_wasm_jit_devirt_profile) ? cmethod->method : NULL;
+			MonoMethod *wj_prof_base = cmethod->method;
 #endif
 			// FIXME push/pop LMF
 			cmethod = get_virtual_method_fast (cmethod, this_arg->vtable, slot);
@@ -15304,13 +15312,16 @@ mono_jiterp_interp_entry (void *res)
 	 * tail below (thread detach, pending unwind, resume state, return marshalling).
 	 */
 	{
-		extern int mono_wasm_jit_aot_entry;
 		extern int mono_wasm_jit_desc_admitted (int desc_id);
 		InterpMethod *fm = header.rmethod;
 		/* wasm_jit_entry_fast_ok is shared historical state, while descriptor admission and the function
 		 * table are per-thread and per-generation. An unsynced or freshly-rebatched worker takes the slow
 		 * path once, admits the current dependency union, and then becomes fast again. */
-		if (G_UNLIKELY (mono_wasm_jit_aot_entry) && fm->wasm_jit_entry_fast_ok && !fm->is_invoke &&
+		/* MONO_WASM_JIT_AOT_ENTRY ships 1: a fast path in the jiterpreter native->interp entry for methods
+		 * already JITted, skipping the InterpFrame/LMF/maybe_compile/admit scaffolding. It still verifies
+		 * per-thread admission of the descriptor's CURRENT generation, which is not optional -- automatic
+		 * rebatching reuses e/f slots. */
+		if (fm->wasm_jit_entry_fast_ok && !fm->is_invoke &&
 		    fm->wasm_jit_slot > 0 && mono_wasm_jit_desc_admitted (fm->wasm_jit_desc)) {
 			extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 			MonoType *ftype;
