@@ -5100,6 +5100,55 @@ wj_byaddr_vtype (MonoType *t, gint32 *vsize, gint32 *valign)
 	return TRUE;
 }
 
+/* Can a delegate target be reached by the EMITTED delegate PIC -- i.e. does its signature lower to a
+ * functype the emitted call site can express?
+ *
+ * THIS IS A DIFFERENT QUESTION FROM `scalar`, AND CONFLATING THEM IS WHY 100% OF DELEGATE SLOW-PATH
+ * DISPATCHES ARE BY-VALUE VTYPE ARGS (9,354,181 per window, measured).
+ *
+ * `scalar` -- `mono_mint_type (t) != MINT_TYPE_VT` per param -- is about the INTERPRETER'S STACKVAL
+ * LAYOUT. It exists because the `e` entry thunk reads its arguments at interp offsets with vtypes
+ * stored INLINE, while the JIT scratch is a flat 8-byte grid holding a vtype's copy ADDRESS; the two
+ * coincide only when every argument is a plain scalar. That is a real constraint ON `e`.
+ *
+ * The EMITTED PIC never touches the interp layout. It calls the target's `f` directly through the call
+ * site's OWN lowered functype (`ftd`/`dftd`, built from mono_wasm_get_call_info over the Invoke
+ * signature), and that lowering already ADMITS WJ_ARG_VTYPE_BYADDR -- a by-value vtype becomes an i32
+ * pointer on both sides, which is exactly what the JIT caller spilled. So the PIC could always have
+ * dispatched these targets; it was refused by a flag describing a constraint it does not have.
+ *
+ * The condition here is therefore the one the CALL actually needs: every argument lowers to one of the
+ * three kinds the emitted site accepts, and the return is not by-address (a site with a by-addr vtype
+ * return fails emission outright -- "vcall ret type" -- which is why the VTRET bucket measured 0).
+ *
+ * Called only when a recipe is CREATED, from wasm_jit_prepare_delegate_call, which is the documented
+ * pre-spill point: the caller's arguments are still live in its GC-scanned shadow frame, so resolving a
+ * signature here is safe in a way it is NOT at the dispatch site. */
+static void mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci);
+
+gboolean
+mono_wasm_jit_delegate_abi_ok (MonoMethod *target)
+{
+	MonoMethodSignature *sig;
+	WasmCallInfo ci;
+	int i;
+
+	if (!target)
+		return FALSE;
+	sig = mono_method_signature_internal (target);
+	if (!sig)
+		return FALSE;
+	mono_wasm_get_call_info (sig, &ci);
+	if (!ci.valid || ci.vret_byaddr)
+		return FALSE;
+	for (i = 0; i < ci.nargs; ++i) {
+		if (ci.args [i].kind != WJ_ARG_SCALAR && ci.args [i].kind != WJ_ARG_VTYPE_SCALAR &&
+		    ci.args [i].kind != WJ_ARG_VTYPE_BYADDR)
+			return FALSE;
+	}
+	return TRUE;
+}
+
 /* C-side twins of the by-addr classification, for the residual marshal (interp.c): call_interp /
  * aot_call_lean must deref EXACTLY the scratch slots the emitter spilled as copy ADDRESSES (a by-addr
  * vtype arg) and write VT returns through the caller pointer at WJ_SCRATCH_VRET_OFF — nothing else.
@@ -12501,10 +12550,21 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) (vpic_site * mono_wasm_jit_vcall_ways * dpic_stride + way * dpic_stride + dpic_shape_off));
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
 									/* fslot = high half of the pair already loaded and validated above. It is
-									 * nonzero, scalar-shaped and live on THIS worker by construction, not by
-									 * inspection: wj_delegate_pic_publish stores only an admitted scalar fslot,
-									 * the array is per-worker, and slot-live bits are never cleared. That is what
-									 * retires the scalar test, the fslot != 0 test and the bitmap probe. */
+									 * nonzero, ABI-EXPRESSIBLE and live on THIS worker by construction, not by
+									 * inspection: wj_delegate_pic_publish stores only an admitted fslot whose
+									 * signature lowers to a functype this site can express, the array is
+									 * per-worker, and slot-live bits are never cleared. That is what retires the
+									 * shape test, the fslot != 0 test and the bitmap probe.
+									 *
+									 * THE INVARIANT USED TO BE "SCALAR" AND THAT WAS THE WRONG ONE. `scalar` is
+									 * about the INTERPRETER's stackval layout, which this path never touches --
+									 * it calls `f` through ftd/dftd, built from mono_wasm_get_call_info over
+									 * this site's own Invoke signature, and that lowering already admits
+									 * WJ_ARG_VTYPE_BYADDR (a by-value vtype becomes an i32 pointer on both
+									 * sides, which is what the caller spilled). Gating on `scalar` sent 100% of
+									 * by-value-vtype delegate dispatches -- 9,354,181 per window -- to the C
+									 * fallback for a constraint belonging to `e`. See
+									 * mono_wasm_jit_delegate_abi_ok. */
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
 									wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U);
 									wasm_op (&body, WASM_OP_I32_WRAP_I64);
