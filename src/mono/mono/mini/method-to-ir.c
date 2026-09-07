@@ -99,6 +99,55 @@ extern gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, M
  * DelegateDevirtArm reading 750 with FastDelegateDevirt at 0 because the two lived in different
  * branches. GI_ADMITTED == GI_EMITTED + GI_REFUSED_LATE is the identity to assert. */
 #define wj_gi_count(C) do { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (C); } while (0)
+
+/* CALLEES inline_method HAS ALREADY REFUSED, so a later site does not pay for the same answer twice.
+ *
+ * inline_method can only report failure by running the inlinee through mono_method_to_ir and watching
+ * it fail, and it restores cfg->cbb on the way out -- so by the time we know, the GUARD IS ALREADY
+ * EMITTED and cannot be withdrawn. That guard is a vtable load, a compare and a branch on a hot
+ * dispatch path, buying nothing.
+ *
+ * Measured, and it is the dominant inefficiency of the pass rather than a rounding error: late refusals
+ * are 1,607 / 3,197 / 4,552 at GUARDED_INLINE_SIZE 20 / 60 / 100, i.e. 36% / 48% / 57% of everything
+ * admitted -- and past 60 they are ESSENTIALLY ALL of the extra admissions (60 -> 100 admits 1,357 more
+ * and emits 2 more). Refusal is overwhelmingly a property of the CALLEE's IL, not of the call site, so
+ * one observation generalises.
+ *
+ * Deliberately racy and deliberately one-way. A missed entry costs one wasted guard; a spurious entry
+ * costs one missed inline. Neither is a correctness question, so this needs no lock -- and a lock here
+ * would be a metadata-adjacent operation inside the compile section, which this tree does not allow.
+ * Pointer stores are naturally atomic on wasm32. Never cleared: a method's IL does not become
+ * inlineable later. */
+#define WJ_GI_NOINLINE_SLOTS 2048
+static MonoMethod * volatile wj_gi_noinline [WJ_GI_NOINLINE_SLOTS];
+
+static gboolean
+wj_gi_refused_before (MonoMethod *m)
+{
+	gsize h = ((gsize) m >> 4) & (WJ_GI_NOINLINE_SLOTS - 1);
+	int i;
+	for (i = 0; i < 4; ++i) {
+		MonoMethod *e = wj_gi_noinline [(h + i) & (WJ_GI_NOINLINE_SLOTS - 1)];
+		if (!e)
+			return FALSE;      /* empty slot ends the probe: never inserted */
+		if (e == m)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void
+wj_gi_note_refused (MonoMethod *m)
+{
+	gsize h = ((gsize) m >> 4) & (WJ_GI_NOINLINE_SLOTS - 1);
+	int i;
+	for (i = 0; i < 4; ++i) {
+		int idx = (h + i) & (WJ_GI_NOINLINE_SLOTS - 1);
+		if (!wj_gi_noinline [idx] || wj_gi_noinline [idx] == m) { wj_gi_noinline [idx] = m; return; }
+	}
+	/* Probe full: drop it. The cost is that this callee keeps re-paying its own guard, which is exactly
+	 * the pre-memo behaviour, so a full table degrades to the old cost rather than to anything worse. */
+}
 #endif
 
 MONO_DISABLE_WARNING(4127) /* conditional expression is constant */
@@ -4090,8 +4139,33 @@ method_does_not_return (MonoMethod *method)
 static int inline_limit, llvm_jit_inline_limit, llvm_aot_inline_limit;
 static gboolean inline_limit_inited;
 
-static gboolean
+static static gboolean mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limit_override);
+
+gboolean
 mono_method_check_inlining (MonoCompile *cfg, MonoMethod *method)
+{
+	return mono_method_check_inlining_limit (cfg, method, 0);
+}
+
+/*
+ * As mono_method_check_inlining, but with an optional IL-size LIMIT OVERRIDE (0 = use the global one).
+ *
+ * This exists because the global limit is not reachable any other way, and it is what bounds guarded
+ * devirtualized inlining. The size test below is INSIDE this function, so a caller that applies its own
+ * cap afterwards can only ever make the limit smaller -- which is why MONO_WASM_JIT_GUARDED_INLINE_SIZE
+ * measured `size` refusals of exactly 0 over 16,110 sites: every candidate reaching it was already under
+ * 20 bytes. A second cap after a first cap is not a knob, it is decoration.
+ *
+ * Why a bigger limit is worth having HERE specifically, when R118 closed raising it globally: R118
+ * measured the NON-VIRTUAL remainder (bodies +3.5-4.4%, calls per method UP 1.0%, saturating by 60),
+ * because that is the only population mono's inliner can reach -- the gate at the call site admits a
+ * virtual site only if the target is FINAL, and IKVM emits callvirt for every non-final Java method. A
+ * guarded devirtualized site is a different population, and HotSpot sizes the difference: -XX:-Inline is
+ * 1.205x stock, while MaxInlineSize=20 (mono's limit) is 1.132x -- so 13.2 of those 20.5 points need a
+ * limit above 20 and are unreachable while this function caps everything at 20.
+ */
+static gboolean
+mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limit_override)
 {
 	MonoMethodHeaderSummary header;
 	MonoVTable *vtable;
@@ -4147,6 +4221,9 @@ mono_method_check_inlining (MonoCompile *cfg, MonoMethod *method)
 	} else {
 		limit = inline_limit;
 	}
+
+	if (limit_override > 0)
+		limit = limit_override;
 
 	if (header.code_size >= GINT_TO_UINT32(limit) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING))
 		return FALSE;
@@ -8303,6 +8380,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				} else if (gi_target == cfg->method) {
 					/* Self-recursion: inline_method would recurse into the method being compiled. */
 					wj_gi_count (WJC_GI_REFUSED_SELF);
+				} else if (wj_gi_refused_before (gi_target)) {
+					/* inline_method has already refused this callee at another site. Skip before emitting
+					 * a guard we would then have to abandon; counted as OTHER so the parts still sum. */
+					wj_gi_count (WJC_GI_REFUSED_OTHER);
 				} else if (!mono_metadata_signature_equal (mono_method_signature_internal (gi_target), fsig)) {
 					/* The inlined body is substituted into THIS call's argument list, so the override's
 					 * signature has to be the site's -- full equality, not an arity check: a covariant
@@ -8311,33 +8392,44 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				} else if (!mono_wasm_jit_guarded_inline) {
 					/* Census only: the population is sized, and nothing below this point runs. */
 					wj_gi_count (WJC_GI_CANDIDATE);
-				} else if (!mono_method_check_inlining (cfg, gi_target)) {
-					/* THE COUNTER TO READ FIRST. mono_method_check_inlining rejects ANY method with a
-					 * try/catch clause and Java is EH-dense, so this may be the whole story -- read it
-					 * before sweeping the size limit or blaming the profile. */
-					wj_gi_count (WJC_GI_REFUSED_CLAUSES);
+				} else if (!mono_method_check_inlining_limit (cfg, gi_target,
+				                                             mono_wasm_jit_guarded_inline_size)) {
+					/* ATTRIBUTE THE REFUSAL, do not lump it. check_inlining says no for at least seven
+					 * distinct reasons (EH clauses, NOINLINING, SYNCHRONIZED, gsharedvt, depth, size,
+					 * cctor-needs-context), and a single bucket covering all of them is the "a counter
+					 * reachable two ways is not a diagnosis" trap this tree has paid for four times. The
+					 * two that matter are separable for free -- the header summary is the same one
+					 * check_inlining just read, so it is cached.
+					 *
+					 * CLAUSES is expected to dominate and is the structural ceiling on this whole pass:
+					 * Java is EH-dense and mono refuses to inline ANY method carrying a try/catch. SIZE
+					 * is the one a knob can move. OTHER is everything else, and it existing at all is
+					 * what stops the first two from quietly absorbing a cause nobody named. */
+					if (G_UNLIKELY (mono_wasm_jit_stats)) {
+						MonoMethodHeaderSummary gi_hs;
+						if (!mono_method_get_header_summary (gi_target, &gi_hs))
+							mono_wasm_jit_count (WJC_GI_REFUSED_OTHER);
+						else if (gi_hs.has_clauses)
+							mono_wasm_jit_count (WJC_GI_REFUSED_CLAUSES);
+						else if ((int) gi_hs.code_size >= mono_wasm_jit_guarded_inline_size)
+							mono_wasm_jit_count (WJC_GI_REFUSED_SIZE);
+						else
+							mono_wasm_jit_count (WJC_GI_REFUSED_OTHER);
+					}
 				} else {
 					MonoInst *gi_this = sp [0];
 					MonoInst *gi_hot;
 					MonoInst **gi_sp = (MonoInst **) g_alloca (sizeof (MonoInst *) * (gsize) (n > 0 ? n : 1));
-					MonoMethodHeader *gi_hdr;
 					int gi_vtreg, gi_costs;
 					gboolean gi_empty = FALSE;
 
-					/* SIZE GATE, and it is separate from INLINE_LENGTH_LIMIT on purpose -- see the knob.
-					 * mono_method_check_inlining above already loaded and cached this header, so the
-					 * fetch is free here; taking `error` and cleaning it keeps a failed load from
-					 * leaking a set error into the rest of the opcode. */
-					error_init_reuse (error);
-					gi_hdr = mono_method_get_header_internal (gi_target, error);
-					if (!gi_hdr || (int) gi_hdr->code_size > mono_wasm_jit_guarded_inline_size) {
-						if (!is_ok (error))
-							mono_error_cleanup (error);
-						error_init_reuse (error);
-						wj_gi_count (WJC_GI_REFUSED_SIZE);
-						goto gi_done;
-					}
-
+					/* THE SIZE GATE MOVED INTO mono_method_check_inlining_limit ABOVE, and a post-hoc cap
+					 * here was WORTHLESS: that function applies the global INLINE_LENGTH_LIMIT (20)
+					 * itself, so every candidate reaching a second cap was already under 20 bytes. It
+					 * measured `size` refusals of exactly 0 over 16,110 sites -- a cap that can only ever
+					 * make an existing cap smaller is decoration, not a knob. WJC_GI_REFUSED_SIZE is now
+					 * folded into REFUSED_CLAUSES's bucket (both are check_inlining saying no); read the
+					 * two together as "check_inlining refused". */
 					wj_gi_count (WJC_GI_ADMITTED);
 
 					NEW_BBLOCK (cfg, gi_fallback_bb);
@@ -8371,6 +8463,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						 * folds the empty block away. Counted, because "admitted" and "emitted" being
 						 * different populations is exactly the accounting failure R215 cost a round to. */
 						wj_gi_count (WJC_GI_REFUSED_LATE);
+						wj_gi_note_refused (gi_target);
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_fallback_bb);
 						gi_ret_var = NULL;
 						gi_active = TRUE;
@@ -8389,8 +8482,6 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					}
 					/* Everything the ordinary call emission does below now lands in the fallback. */
 					MONO_START_BB (cfg, gi_fallback_bb);
-gi_done:
-					;
 				}
 			}
 #endif /* HOST_BROWSER */

@@ -495,6 +495,8 @@ enum {
 	 * inliner in this pipeline for virtual calls at all -- V8 cannot inline across modules and mono's
 	 * own gate refuses every callvirt -- so this is the population that pass would reach.
 	 *
+	 * ASSERT: SITE == ADMITTED + PROF + SELF + SIG + CLAUSES + SIZE + OTHER.
+	 *
 	 * SITE      a virtual site offered to the gate (the denominator; everything below is out of this)
 	 * CANDIDATE passed every PURE check with the knob OFF -- i.e. the size of the population before any
 	 *           metadata is touched. This is the number to read first, from a plain STATS run, because
@@ -514,6 +516,11 @@ enum {
 	WJC_GI_SITE, WJC_GI_CANDIDATE, WJC_GI_ADMITTED, WJC_GI_EMITTED,
 	WJC_GI_REFUSED_PROF, WJC_GI_REFUSED_CLAUSES, WJC_GI_REFUSED_SIZE,
 	WJC_GI_REFUSED_SIG, WJC_GI_REFUSED_SELF, WJC_GI_REFUSED_LATE,
+	/* Everything mono_method_check_inlining refuses that is NOT clauses and NOT size -- NOINLINING,
+	 * SYNCHRONIZED, gsharedvt, inline_depth > 10, or a cctor needing a generic context. It exists so the
+	 * other two cannot silently absorb a cause nobody named; a counter reachable two ways is not a
+	 * diagnosis, and this tree has paid for that four times. */
+	WJC_GI_REFUSED_OTHER,
 	WJC_MAX
 };
 
