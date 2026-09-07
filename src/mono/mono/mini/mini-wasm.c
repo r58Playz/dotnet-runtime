@@ -84,12 +84,23 @@ void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-i
 /* Automatic hotness trigger (Phase 5): when mono_wasm_jit_auto>0, the interp (MINT_CALL) counts
  * calls to each callee and force-compiles it to wasm once its hit count reaches mono_wasm_jit_thresh,
  * instead of requiring the method to be named in MONO_WASM_JIT_METHOD. -1 = uninitialized. */
-int mono_wasm_jit_auto = 1;
-/* MONO_WASM_JIT_AUTO KEEPS ITS KNOB, deliberately, where the other settled booleans lost theirs: it is
- * the single switch that turns the whole JIT tier off, which makes it the first bisect step for any
- * "is this the wasm JIT?" question. Its DEFAULT was 0 (via -1 meaning uninitialised), which meant the
- * tier did not exist unless the app turned it on -- so the runtime's own default described a product
- * nobody ships. Now 1. */
+/* -1 IS A SENTINEL, NOT A VALUE, AND IT MUST STAY ONE. mono_wasm_jit_auto_init's re-entry guard is
+ * `if (mono_wasm_jit_thresh >= 0 && mono_wasm_jit_auto >= 0) return;`, so this variable is what marks
+ * the whole knob block as "not yet read". Initialising it to 1 to express "default on" makes that guard
+ * true on the FIRST call, so auto_init returns immediately and NO MONO_WASM_JIT_* ENV VAR IS EVER READ
+ * -- every knob silently falls back to its static initialiser.
+ *
+ * That is not a hypothetical: it shipped for one build and voided a measurement. The symptom is nasty
+ * because everything still WORKS (the static defaults are the shipped values now, so the tier behaves
+ * correctly) -- what breaks is only the ability to OVERRIDE, so a knob A/B runs three identical arms
+ * and reports whatever noise it saw. It also defeats the standard deployment check: the env-var STRING
+ * is present in the binary, so deploy.sh's marker proof passes, and `[harness] env override: NAME=VAL`
+ * still appears in the log because index.ts prints that for any name. The only sound check is a
+ * BEHAVIOURAL one -- set MONO_WASM_JIT_STATS=1 and confirm a counter is non-zero.
+ *
+ * The default-on decision is expressed at the getenv site instead, which is where every other default
+ * lives anyway. */
+int mono_wasm_jit_auto = -1;
 int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
 /* auto-JIT hotness threshold. 2000 was the pre-Minecraft value; 500 is what the product runs. R204 cut `no_fslot` 69%% by moving it, and that is worth NOTHING on the plateau -- it is a boot/worldgen effect, because 99.3%% of profile observations arrive AFTER a method is JITted. Right for boot, not a frame-rate lever. */
 /* MONO_WASM_JIT_OVER_AOT is deleted. It let the runtime wasm method-JIT compete with an
@@ -534,7 +545,12 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_refverify; const char *rv = g_getenv ("MONO_WASM_JIT_REFVERIFY"); mono_wasm_jit_refverify = (rv && *rv) ? atoi (rv) : 0; } /* 1=log, 2=assert classification-vs-structural-marking violations; default off */
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
-	mono_wasm_jit_auto = (e && *e && *e != '0') ? 1 : 0; /* set last: publishes "initialized" */
+	/* DEFAULT 1. This is the single switch that turns the whole JIT tier off, so it keeps its knob where
+	 * the other settled booleans lost theirs -- it is the first bisect step for any "is this the wasm
+	 * JIT?" question. It used to default OFF, which meant the tier existed only because the app turned
+	 * it on. Set LAST, because writing a non-negative value here is what publishes "initialised" to the
+	 * re-entry guard at the top; see the sentinel note at the initialiser. */
+	mono_wasm_jit_auto = (e && *e) ? ((*e != '0') ? 1 : 0) : 1;
 }
 
 /* The forced-compile routing is now JIT_FLAG_WASM_FORCE (per-compile), copied to cfg->wasm_jit_forced
@@ -3984,6 +4000,20 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	 * apart in this file and were never joined, which is the only reason this ever read as "unverified".
 	 * The predicate now returns FALSE unconditionally (except under the level-2 control), so the
 	 * protection is deliberate rather than accidental and does not depend on a performance knob.
+	 *
+	 * *** AND IT IS NOW MEASURED, NOT ONLY REASONED. *** scratchpad/mcsr/gcstress.sh, n=4 per arm,
+	 * nursery-size=4m, one session, one build, one harness:
+	 *
+	 *     pos   RAISE_NOGC=2 (predicate re-armed, guard off)   3/4 FAILED
+	 *     lvl1  RAISE_NOGC=1 (THE SHIPPED SETTING)             0/4 failed, 4/4 rendered
+	 *     neg   RAISE_NOGC=0 (exemption off entirely)          0/4 failed, 4/4 rendered
+	 *
+	 * The positive control reproduces at 3/4 in the SAME session as the clean arms, which is the whole
+	 * point of it: without that, "it stopped failing" is unfalsifiable on an intermittent bug. The
+	 * shipped setting is indistinguishable from having the exemption off at all. Note the failure now
+	 * surfaces as `Assertion at interp.c:10452, condition code_type == IMETHOD_CODE_*` rather than the
+	 * historical "unexpected GC filler class" -- a different assertion downstream of the same
+	 * corruption, tripping first. Do not treat the old string as the only signature.
 	 *
 	 * The paragraphs below are kept because their MECHANISM is still the right description of the
 	 * hazard, and because level 2 exists to reproduce it on demand.
