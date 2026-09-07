@@ -174,9 +174,26 @@ int mono_wasm_jit_guarded_inline = 0;
  * +3.5-4.4%, saturating by 60, and calls per method going UP 1.0%, because the caller absorbs the
  * callee's own call sites while the callee stays separately JITted -- but that measured the
  * NON-VIRTUAL remainder, which is the only population mono's inliner can reach. This cap governs
- * virtual sites, which that gate refuses outright, so R118's result does not bound it. Sweep 60 then
- * 100; V8's own wasm inlining cap is 500 WIRE bytes, which is a different unit and a different
- * pipeline stage. */
+ * virtual sites, which that gate refuses outright, so R118's result does not bound it.
+ *
+ * SWEPT, AND 60 IS THE KNEE. Whole-run census at 20 / 60 / 100:
+ *
+ *     SIZE   admitted   emitted   size-refused   late-refused
+ *      20      4,451     2,844        4,957         1,607
+ *      60      6,661     3,464        2,633         3,197
+ *     100      8,018     3,466        1,141         4,552
+ *
+ * EMITTED SATURATES AT ~3,465. Going 60 -> 100 admits 1,357 more candidates and inlines TWO more of
+ * them; every other one becomes a late refusal, i.e. a vtable load, a compare and a branch emitted on a
+ * hot dispatch path for nothing. So the cap is not what bounds this pass past 60 -- inline_method's own
+ * willingness is -- and raising it further only buys waste.
+ *
+ * This also retires the size test that used to sit at the call site: mono_method_check_inlining applies
+ * the global limit ITSELF, so a second cap after it could only ever make the limit smaller, and it
+ * measured `size` refusals of exactly 0. The limit is now passed INTO the check.
+ *
+ * (V8's own wasm inlining cap is 500 WIRE bytes -- a different unit, a different pipeline stage, and
+ * unreachable for us anyway while every call is an import.) */
 int mono_wasm_jit_guarded_inline_size = 60;
 /* MONO_WASM_JIT_ISLAND_NDATA's knob is deleted; the ABI parameter it gated is KEPT and now always
  * applies. It zeroes only the args+locals an EH method can actually address when pushing its il_state
@@ -1048,7 +1065,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 154);   /* -COLOCATE_HOP_ADD, -DOBJ_{PUBLISHED,NO_INFO}: COLOCATE_HOPS and DELEGATE_OBJ_PIC deleted */
+g_static_assert (WJC_MAX == 155);   /* -COLOCATE_HOP_ADD, -DOBJ_{PUBLISHED,NO_INFO}: COLOCATE_HOPS and DELEGATE_OBJ_PIC deleted */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1262,9 +1279,10 @@ mono_wasm_jit_dump_stats (void)
 	/* LCSE reach. hits/loads_seen is the elimination RATE; evict>0 says the load table is the binding
 	 * constraint (raise WJ_LCSE_LOADS) rather than the kill policy. Requires MONO_WASM_JIT_LCSE=1. */
 	printf ("[wasm-jit guarded-inline] sites=%lld candidates=%lld admitted=%lld emitted=%lld"
-		"  | refused: prof=%lld clauses=%lld size=%lld sig=%lld self=%lld late=%lld"
+		"  | refused: prof=%lld clauses=%lld size=%lld other=%lld sig=%lld self=%lld late=%lld"
 		"  (MONO_WASM_JIT_GUARDED_INLINE=%d SIZE=%d)\n"
-		"  ASSERT admitted == emitted + late. `candidates` is measured with the knob OFF, so a plain\n"
+		"  ASSERT admitted == emitted + late, AND sites == admitted+prof+self+sig+clauses+size+other.\n"
+		"  `candidates` is measured with the knob OFF, so a plain\n"
 		"  STATS run sizes the whole addressable population for free -- read it before spending a build.\n"
 		"  There is NO inliner in this pipeline for virtual calls:\n"
 		"  V8 cannot inline across modules (imports score 0) and mono's own gate refuses every callvirt,\n"
@@ -1274,6 +1292,7 @@ mono_wasm_jit_dump_stats (void)
 		"  the method is JITted, so a first compile usually has no record for the site at all.\n",
 		WJC_(WJC_GI_SITE), WJC_(WJC_GI_CANDIDATE), WJC_(WJC_GI_ADMITTED), WJC_(WJC_GI_EMITTED),
 		WJC_(WJC_GI_REFUSED_PROF), WJC_(WJC_GI_REFUSED_CLAUSES), WJC_(WJC_GI_REFUSED_SIZE),
+		WJC_(WJC_GI_REFUSED_OTHER),
 		WJC_(WJC_GI_REFUSED_SIG), WJC_(WJC_GI_REFUSED_SELF), WJC_(WJC_GI_REFUSED_LATE),
 		mono_wasm_jit_guarded_inline, mono_wasm_jit_guarded_inline_size);
 	printf ("[wasm-jit lcse] loads_seen=%lld adds=%lld hits=%lld evict=%lld\n",
