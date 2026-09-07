@@ -2172,7 +2172,10 @@ mono_wasm_jit_dump_hot_edges (int topn)
 			if (wj_entry_edges [k].state != 2) continue;
 			w = wj_entry_edges [k].window;
 			if (!w || w > lastw || (w == lastw && k >= lasti)) continue;
-			if (best < 0 || w > bestw || (w == bestw && k > best)) { best = k; bestw = w; }
+			/* SMALLEST k among ties: picking the largest sets lastk past every other tied slot, so
+				 * they are never printed. That silently truncated these top-N tables to one row per
+				 * distinct COUNT VALUE. */
+				if (best < 0 || w > bestw || (w == bestw && k < best)) { best = k; bestw = w; }
 		}
 		if (best < 0) break;
 		{
@@ -2255,7 +2258,10 @@ mono_wasm_jit_dump_blockers (int topn)
 				if (wj_vperm_state [k] != 2) continue;
 				w = wj_vperm_w [k];   /* pure array read — no Mono API / locks on the main thread */
 				if (!w || !wj_vperm_im [k] || w > lastw || (w == lastw && k <= lastk)) continue;
-				if (best < 0 || w > bestw || (w == bestw && k > best)) { best = k; bestw = w; }
+				/* SMALLEST k among ties: picking the largest sets lastk past every other tied slot, so
+				 * they are never printed. That silently truncated these top-N tables to one row per
+				 * distinct COUNT VALUE. */
+				if (best < 0 || w > bestw || (w == bestw && k < best)) { best = k; bestw = w; }
 			}
 			if (best < 0) break;
 			{
@@ -2309,7 +2315,10 @@ mono_wasm_jit_dump_blockers (int topn)
 				if (wj_iroute_state [k] != 2) continue;
 				w = wj_iroute_w [k];
 				if (!w || !wj_iroute_im [k] || w > lastw || (w == lastw && k <= lastk)) continue;
-				if (best < 0 || w > bestw || (w == bestw && k > best)) { best = k; bestw = w; }
+				/* SMALLEST k among ties: picking the largest sets lastk past every other tied slot, so
+				 * they are never printed. That silently truncated these top-N tables to one row per
+				 * distinct COUNT VALUE. */
+				if (best < 0 || w > bestw || (w == bestw && k < best)) { best = k; bestw = w; }
 			}
 			if (best < 0) break;
 			{
