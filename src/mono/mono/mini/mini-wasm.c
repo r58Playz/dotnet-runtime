@@ -4822,6 +4822,14 @@ wj_ins_is_pinned_vcall_forward (MonoInst *ins)
 	 * raise_nogc=1 read as "unverified" for so long. Returning FALSE makes the protection DELIBERATE
 	 * instead of accidental.
 	 *
+	 * BE PRECISE ABOUT WHAT THIS DOES AND DOES NOT DISABLE. `_fwd` in WJ_SL_USE has TWO sources:
+	 *     forward_call = gcp && (wj_direct_admitted_fslot (cfg, insl) > 0 || pinned_vforward)
+	 * Only the second is this predicate. The first -- a DIRECT call to an already-admitted f-slot --
+	 * stays live and is sound: that callee really does take ownership of the root, with no PIC miss in
+	 * between. The measurement separates them explicitly: "gating only the `_fwd` skip in WJ_SL_USE
+	 * changed nothing (3/4 vs 2/4), which is what pins it to THIS consumer". So the claim here is the
+	 * narrow one -- the UNSOUND consumer is off -- not "no argument ever skips its pin".
+	 *
 	 * RAISE_NOGC=2 RE-ARMS IT, and that is the whole point of level 2: it is a POSITIVE CONTROL, not a
 	 * shipping mode. Gating the control HERE rather than only on the gen_skipped_raises term is what
 	 * makes it a control at all -- with this predicate FALSE, that term is never read, so levels 1 and 2
