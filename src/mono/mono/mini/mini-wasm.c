@@ -1071,7 +1071,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 155);   /* -COLOCATE_HOP_ADD, -DOBJ_{PUBLISHED,NO_INFO}: COLOCATE_HOPS and DELEGATE_OBJ_PIC deleted */
+g_static_assert (WJC_MAX == 158);   /* -COLOCATE_HOP_ADD, -DOBJ_{PUBLISHED,NO_INFO}: COLOCATE_HOPS and DELEGATE_OBJ_PIC deleted */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1227,9 +1227,14 @@ mono_wasm_jit_dump_stats (void)
 	 * signature has a by-value vtype or byref, which the e-thunk ABI cannot express. Those three answer
 	 * OPPOSITE questions -- noeslot is an admission/ordering problem, nonscalar is an ABI one. */
 	printf ("[wasm-jit delegate-slow] norecipe=%lld noeslot=%lld nonscalar=%lld"
-		"  (sum == the call_interp exits out of call_delegate)\n",
+		" (vtret=%lld vtarg=%lld byref=%lld)\n"
+		"  norecipe+noeslot+nonscalar == the call_interp exits out of call_delegate;"
+		" vtret+vtarg+byref == nonscalar.\n"
+		"  BYREF is the cheap one: byref params are ALREADY layout-compatible with the e-thunk (one\n"
+		"  stack slot each, pointer on both sides). VTARG/VTRET need real ABI work.\n",
 		WJC_(WJC_DELEGATE_SLOW_NORECIPE), WJC_(WJC_DELEGATE_SLOW_NOESLOT),
-		WJC_(WJC_DELEGATE_SLOW_NONSCALAR));
+		WJC_(WJC_DELEGATE_SLOW_NONSCALAR), WJC_(WJC_DELEGATE_SLOW_VTRET),
+		WJC_(WJC_DELEGATE_SLOW_VTARG), WJC_(WJC_DELEGATE_SLOW_BYREF));
 	/* DEVIRT CENSUS. sites = ordinary virtual sites offered to the prediction gate; delegate_sites = the
 	 * population it refuses outright. The four refusal reasons pull in OPPOSITE directions on the "raise
 	 * the JIT threshold so the interpreter records more" question: no_rec + cold argue for more warmup,

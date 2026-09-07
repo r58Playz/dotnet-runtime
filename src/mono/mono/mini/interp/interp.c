@@ -1723,6 +1723,15 @@ typedef struct {
 	volatile gint32 shape;
 	volatile gint32 slots;
 	volatile gint32 scalar;
+	/* WHY the recipe is not scalar (WJ_DSLOW_*), carried so the fallback can attribute itself WITHOUT
+	 * touching signature metadata -- that point is past the caller's arg spill into the un-scanned
+	 * scratch, where a lazy resolution can allocate and move objects. Diagnostic only.
+	 *
+	 * A SEPARATE FIELD, not bits packed into `scalar`: emitted code reads scalar's offset
+	 * (mono_wasm_jit_delegate_ic_offset case 5) and tests it against zero, so packing a reason there
+	 * would make generated code treat every non-scalar recipe as scalar. Appended, because the offset
+	 * accessor is G_STRUCT_OFFSET-based and only trailing growth is safe. */
+	volatile gint32 slow_reason;
 } WjDelegateIC;
 
 /*
@@ -6210,13 +6219,13 @@ enum {
 
 static gboolean
 wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar)
+	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar, int *slow_reason)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
 	MonoMethod *cached_source, *cached_target;
 	MonoVTable *cached_receiver;
 	InterpMethod *cached_imethod;
-	gint32 cached_shape, cached_slots, cached_scalar;
+	gint32 cached_shape, cached_slots, cached_scalar, cached_reason;
 
 	if (!before || (before & 1))
 		return FALSE;
@@ -6228,6 +6237,7 @@ wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable 
 	cached_shape = cache->shape;
 	cached_slots = cache->slots;
 	cached_scalar = cache->scalar;
+	cached_reason = cache->slow_reason;
 	mono_memory_barrier ();
 	if (before != mono_atomic_load_i32 (&cache->seq) || cached_source != source ||
 	    cached_receiver != receiver_vt || !cached_target || !cached_imethod)
@@ -6237,12 +6247,13 @@ wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable 
 	*shape = cached_shape;
 	*slots = cached_slots;
 	*scalar = cached_scalar != 0;
+	*slow_reason = cached_reason;
 	return TRUE;
 }
 
 static void
 wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar)
+	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
 	if (before & 1)
@@ -6256,18 +6267,19 @@ wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable
 	cache->shape = shape;
 	cache->slots = slots;
 	cache->scalar = scalar ? 1 : 0;
+	cache->slow_reason = slow_reason;
 	mono_memory_barrier ();
 	mono_atomic_xchg_i32 (&cache->seq, before + 2);
 }
 
 static gboolean
 wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar)
+	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar, int *slow_reason)
 {
 	extern int mono_wasm_jit_vcall_ways;
 	for (int i = 0; i < mono_wasm_jit_vcall_ways; ++i) {
 		if (wj_delegate_cache_read_way (&cache [i], source, receiver_vt,
-			target, imethod, shape, slots, scalar))
+			target, imethod, shape, slots, scalar, slow_reason))
 			return TRUE;
 	}
 	return FALSE;
@@ -6275,7 +6287,7 @@ wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *rec
 
 static void
 wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar)
+	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason)
 {
 	extern int mono_wasm_jit_vcall_ways;
 	int victim = -1;
@@ -6296,8 +6308,16 @@ wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *re
 		victim = (int) (hash % (guint) mono_wasm_jit_vcall_ways);
 	}
 	wj_delegate_cache_write_way (&cache [victim], source, receiver_vt,
-		target, imethod, shape, slots, scalar);
+		target, imethod, shape, slots, scalar, slow_reason);
 }
+
+/* Why a delegate recipe is not `scalar`, decided in prepare_delegate_call and carried in the recipe's
+ * +240 word (bit 0 = scalar, bits 1.. = this code). Diagnostic only. */
+#define WJ_DSLOW_VTRET 1   /* value-type RETURN: the 8-byte scratch result slot cannot hold it */
+#define WJ_DSLOW_VTARG 2   /* by-value VALUE-TYPE param: scratch holds the copy's ADDRESS, the e-thunk
+                            * wants the struct INLINE, and an inline struct shifts later arg offsets */
+#define WJ_DSLOW_BYREF 3   /* byref param and nothing worse -- ALREADY layout-compatible (one stack slot
+                            * each, pointer on both sides); excluded only by a conservative predicate */
 
 /* Resolve a single-cast Delegate.Invoke to the delegate's real target while all call arguments are
  * still live in the JIT caller's GC-scanned shadow frame. The generated invoke wrapper is deliberately
@@ -6320,6 +6340,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	int shape = WJ_DELEGATE_NONE;
 	int slots = 0;
 	int eslot = 0, fslot = 0;
+	int slow_reason = WJ_DSLOW_VTARG;
 	gboolean scalar = FALSE;
 	ERROR_DECL (error);
 
@@ -6332,14 +6353,16 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	source = del->method;
 	if (!m_method_is_static (source) && m_method_is_virtual (source) && del->target)
 		receiver_vt = del->target->vtable;
-	if (wj_delegate_cache_read (cache, source, receiver_vt, &target, &imethod, &shape, &slots, &scalar)) {
+	if (wj_delegate_cache_read (cache, source, receiver_vt, &target, &imethod, &shape, &slots, &scalar,
+	                            &slow_reason)) {
 		/* Tiering replaces, rather than mutates, an InterpMethod. Follow the forwarding link so a recipe
 		 * populated before tier-up does not permanently retain the unoptimized method. */
 		InterpMethod *cached_imethod = imethod;
 		while (imethod->optimized_imethod)
 			imethod = imethod->optimized_imethod;
 		if (imethod != cached_imethod)
-			wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar);
+			wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar,
+				slow_reason);
 		/* A recipe can be cached on the target's first invocation, before it crosses the auto-JIT threshold.
 		 * Keep accumulating the same hotness/retry state as the uncached path; otherwise that first recipe
 		 * permanently strands the target in the interpreter (profile13: registered -6%, interp-routed +40%).
@@ -6365,7 +6388,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		*(MonoMethod **) (scratch + 204) = target;
 		*(gint32 *) (scratch + 228) = eslot;
 		*(gint32 *) (scratch + 236) = slots;
-		*(gint32 *) (scratch + 240) = scalar ? 1 : 0;
+		*(gint32 *) (scratch + 240) = scalar ? 1 : (slow_reason << 1);
 		*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
 		*(MonoObject **) (scratch + 248) = del->target;
 		*(InterpMethod **) (scratch + 252) = imethod;
@@ -6438,7 +6461,27 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	scalar = mono_mint_type (tsig->ret) != MINT_TYPE_VT;
 	for (int i = 0; scalar && i < (int) tsig->param_count; ++i)
 		scalar = !m_type_is_byref (tsig->params [i]) && mono_mint_type (tsig->params [i]) != MINT_TYPE_VT;
-	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar);
+	/* WHY it is not scalar, decided HERE and carried in the recipe. This is the only safe place to ask:
+	 * it runs while the caller's arguments are still live in its GC-SCANNED shadow frame, before they
+	 * are spilled into the scratch. Computing it at the fallback site instead -- which is where the
+	 * counter is bumped -- means touching signature metadata AFTER the spill, and lazy resolution there
+	 * can allocate and move objects whose only remaining reference is in the un-scanned scratch. That
+	 * was built and it corrupted the heap: `Assertion ... code_type == IMETHOD_CODE_*` x3 in one run,
+	 * the same signature the RAISE_NOGC positive control produces. A stats-gated diagnostic is still
+	 * code on a hot path, and "it only runs under --stats" is not a safety argument. */
+	if (!scalar) {
+		if (mono_mint_type (tsig->ret) == MINT_TYPE_VT) {
+			slow_reason = WJ_DSLOW_VTRET;
+		} else {
+			int ri; gboolean any_vt = FALSE, any_br = FALSE;
+			for (ri = 0; ri < (int) tsig->param_count; ++ri) {
+				if (mono_mint_type (tsig->params [ri]) == MINT_TYPE_VT) { any_vt = TRUE; break; }
+				if (m_type_is_byref (tsig->params [ri])) any_br = TRUE;
+			}
+			slow_reason = any_vt ? WJ_DSLOW_VTARG : (any_br ? WJ_DSLOW_BYREF : WJ_DSLOW_VTARG);
+		}
+	}
+	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar, slow_reason);
 	if (scalar)
 		wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
 	/* R187's OBJECT-REACHABLE RECIPE published here: the same (fslot, shape) the per-site PIC above
@@ -6457,7 +6500,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	*(MonoMethod **) (scratch + 204) = target;
 	*(gint32 *) (scratch + 228) = eslot;
 	*(gint32 *) (scratch + 236) = slots;
-	*(gint32 *) (scratch + 240) = scalar ? 1 : 0;
+	*(gint32 *) (scratch + 240) = scalar ? 1 : (slow_reason << 1);
 	*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
 	*(MonoObject **) (scratch + 248) = del->target;
 	*(InterpMethod **) (scratch + 252) = imethod;
@@ -6476,7 +6519,8 @@ mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 	int shape = *(gint32 *) (scratch + 220);
 	int eslot = *(gint32 *) (scratch + 228);
 	int slots = *(gint32 *) (scratch + 236);
-	gboolean scalar = *(gint32 *) (scratch + 240) != 0;
+	gint32 scalar_word = *(gint32 *) (scratch + 240);
+	gboolean scalar = (scalar_word & 1) != 0;
 	InterpMethod *timethod = *(InterpMethod **) (scratch + 252);
 
 	/* CONSUME-CLEAR the recipe now that its fields are captured in locals. A recipe is only ever
@@ -6530,9 +6574,40 @@ mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 	}
 
 	/* Which conjunct of the `eslot > 0 && scalar` gate above failed. Bumped HERE, where the fallback is
-	 * actually taken, so "decided" and "happened" cannot be different populations (R215). */
-	if (G_UNLIKELY (mono_wasm_jit_stats))
-		mono_wasm_jit_count (eslot > 0 ? WJC_DELEGATE_SLOW_NONSCALAR : WJC_DELEGATE_SLOW_NOESLOT);
+	 * actually taken, so "decided" and "happened" cannot be different populations (R215).
+	 *
+	 * NONSCALAR IS THREE CAUSES AND THEY NEED OPPOSITE FIXES, so it is split. `scalar` is
+	 * `ret != VT && for each param (!byref && != VT)`, and:
+	 *
+	 *   VTRET  a value-type RETURN. ret_ptr here is the 8-byte scratch result slot, far too small, and
+	 *          the e-thunk's vret convention writes the struct inline at the interp retval slot.
+	 *   VTARG  a by-value VALUE-TYPE param. Two mismatches at once: the JIT scratch holds the ADDRESS of
+	 *          the caller's copy while the e-thunk expects the struct INLINE at args_ptr+off, and an
+	 *          inline struct also shifts every later arg's offset off the flat 8-byte scratch grid.
+	 *   BYREF  a byref (ref/out/Span) param and nothing worse. This one is LAYOUT-COMPATIBLE ALREADY:
+	 *          mono_interp_type_size gives any non-VT type exactly one MINT_STACK_SLOT_SIZE slot, so
+	 *          aoffs[i] == i*8 exactly as the JIT scratch lays it out, and both sides hold the POINTER
+	 *          (wj_arg_slot_holds_pointer's byref arm, interp_entry's byref arm). If this bucket is
+	 *          large it is the cheap fix; if it is small the ABI work is the only lever and this
+	 *          measurement has saved building it.
+	 *
+	 * Stats-gated, so recomputing the reason per fallback costs nothing in a timing run. Disjoint by
+	 * construction (first match wins, in the order the gate itself would fail) and they sum to
+	 * NONSCALAR, which is kept so earlier readings stay comparable. */
+	if (G_UNLIKELY (mono_wasm_jit_stats)) {
+		if (eslot <= 0) {
+			mono_wasm_jit_count (WJC_DELEGATE_SLOW_NOESLOT);
+		} else {
+			/* Reason read out of the recipe -- NO metadata is touched here. See the note where it is
+			 * computed: this point is past the caller's arg spill, so a lazy signature resolution can
+			 * allocate and move objects whose only reference is in the un-scanned scratch. */
+			int why = scalar_word >> 1;
+			mono_wasm_jit_count (WJC_DELEGATE_SLOW_NONSCALAR);
+			mono_wasm_jit_count (why == WJ_DSLOW_VTRET ? WJC_DELEGATE_SLOW_VTRET
+			                   : why == WJ_DSLOW_BYREF ? WJC_DELEGATE_SLOW_BYREF
+			                                           : WJC_DELEGATE_SLOW_VTARG);
+		}
+	}
 	/* Hand over the InterpMethod prepare_delegate_call already resolved for `target`. This is a handover
 	 * inside one crossing, NOT a cache: it is published with the recipe, consume-cleared above, and the
 	 * only code between the two is the caller's wasm spill sequence -- the same window scratch+204's
