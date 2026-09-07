@@ -521,6 +521,13 @@ enum {
 	 * other two cannot silently absorb a cause nobody named; a counter reachable two ways is not a
 	 * diagnosis, and this tree has paid for that four times. */
 	WJC_GI_REFUSED_OTHER,
+	/* Split of WJC_DELEGATE_SLOW_NONSCALAR, which merged three causes needing OPPOSITE fixes. VTRET is a
+	 * value-type return (the 8-byte scratch result slot cannot hold it); VTARG is a by-value value-type
+	 * param (the scratch holds the copy's ADDRESS where the e-thunk wants the struct INLINE, and an
+	 * inline struct shifts every later offset off the flat 8-byte grid); BYREF is a byref param and
+	 * nothing worse -- which is already LAYOUT-COMPATIBLE, since a non-VT type takes exactly one
+	 * MINT_STACK_SLOT_SIZE slot and both sides hold the pointer. Disjoint, and they sum to NONSCALAR. */
+	WJC_DELEGATE_SLOW_VTRET, WJC_DELEGATE_SLOW_VTARG, WJC_DELEGATE_SLOW_BYREF,
 	WJC_MAX
 };
 
