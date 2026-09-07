@@ -1732,6 +1732,11 @@ typedef struct {
 	 * would make generated code treat every non-scalar recipe as scalar. Appended, because the offset
 	 * accessor is G_STRUCT_OFFSET-based and only trailing growth is safe. */
 	volatile gint32 slow_reason;
+	/* Can the EMITTED PIC reach this target (mono_wasm_jit_delegate_abi_ok)? Cached rather than
+	 * recomputed on a cache hit: it is a pure function of the target and computing it walks the
+	 * signature, which is exactly what this cache exists to avoid. Trailing, like slow_reason, because
+	 * emitted code reads earlier fields by G_STRUCT_OFFSET and only growth at the end is safe. */
+	volatile gint32 abi_ok;
 } WjDelegateIC;
 
 /*
@@ -6219,13 +6224,14 @@ enum {
 
 static gboolean
 wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar, int *slow_reason)
+	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar, int *slow_reason,
+	gboolean *abi_ok)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
 	MonoMethod *cached_source, *cached_target;
 	MonoVTable *cached_receiver;
 	InterpMethod *cached_imethod;
-	gint32 cached_shape, cached_slots, cached_scalar, cached_reason;
+	gint32 cached_shape, cached_slots, cached_scalar, cached_reason, cached_abi;
 
 	if (!before || (before & 1))
 		return FALSE;
@@ -6238,6 +6244,7 @@ wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable 
 	cached_slots = cache->slots;
 	cached_scalar = cache->scalar;
 	cached_reason = cache->slow_reason;
+	cached_abi = cache->abi_ok;
 	mono_memory_barrier ();
 	if (before != mono_atomic_load_i32 (&cache->seq) || cached_source != source ||
 	    cached_receiver != receiver_vt || !cached_target || !cached_imethod)
@@ -6248,12 +6255,14 @@ wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable 
 	*slots = cached_slots;
 	*scalar = cached_scalar != 0;
 	*slow_reason = cached_reason;
+	*abi_ok = cached_abi != 0;
 	return TRUE;
 }
 
 static void
 wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason)
+	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason,
+	gboolean abi_ok)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
 	if (before & 1)
@@ -6268,18 +6277,20 @@ wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable
 	cache->slots = slots;
 	cache->scalar = scalar ? 1 : 0;
 	cache->slow_reason = slow_reason;
+	cache->abi_ok = abi_ok ? 1 : 0;
 	mono_memory_barrier ();
 	mono_atomic_xchg_i32 (&cache->seq, before + 2);
 }
 
 static gboolean
 wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar, int *slow_reason)
+	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar, int *slow_reason,
+	gboolean *abi_ok)
 {
 	extern int mono_wasm_jit_vcall_ways;
 	for (int i = 0; i < mono_wasm_jit_vcall_ways; ++i) {
 		if (wj_delegate_cache_read_way (&cache [i], source, receiver_vt,
-			target, imethod, shape, slots, scalar, slow_reason))
+			target, imethod, shape, slots, scalar, slow_reason, abi_ok))
 			return TRUE;
 	}
 	return FALSE;
@@ -6287,7 +6298,8 @@ wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *rec
 
 static void
 wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
-	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason)
+	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason,
+	gboolean abi_ok)
 {
 	extern int mono_wasm_jit_vcall_ways;
 	int victim = -1;
@@ -6308,7 +6320,7 @@ wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *re
 		victim = (int) (hash % (guint) mono_wasm_jit_vcall_ways);
 	}
 	wj_delegate_cache_write_way (&cache [victim], source, receiver_vt,
-		target, imethod, shape, slots, scalar, slow_reason);
+		target, imethod, shape, slots, scalar, slow_reason, abi_ok);
 }
 
 /* Why a delegate recipe is not `scalar`, decided in prepare_delegate_call and carried in the recipe's
@@ -6342,6 +6354,14 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	int eslot = 0, fslot = 0;
 	int slow_reason = WJ_DSLOW_VTARG;
 	gboolean scalar = FALSE;
+	/* TWO DIFFERENT GATES FOR TWO DIFFERENT CONSUMERS, where one flag used to serve both.
+	 *   scalar  -- can the `e` ENTRY THUNK be entered directly from the JIT scratch? That needs the
+	 *              interp stackval layout and the flat 8-byte scratch grid to coincide, which they do
+	 *              only when every argument is a plain scalar.
+	 *   abi_ok  -- can the EMITTED PIC call the target's `f` through the site's own lowered functype?
+	 *              That is a strictly weaker condition, and it is the one the emitted path needs; the
+	 *              PIC never touches the interp layout. See mono_wasm_jit_delegate_abi_ok. */
+	gboolean abi_ok = FALSE;
 	ERROR_DECL (error);
 
 	/* A multicast delegate can still retain a non-NULL `method` (normally the last target), so that
@@ -6354,7 +6374,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	if (!m_method_is_static (source) && m_method_is_virtual (source) && del->target)
 		receiver_vt = del->target->vtable;
 	if (wj_delegate_cache_read (cache, source, receiver_vt, &target, &imethod, &shape, &slots, &scalar,
-	                            &slow_reason)) {
+	                            &slow_reason, &abi_ok)) {
 		/* Tiering replaces, rather than mutates, an InterpMethod. Follow the forwarding link so a recipe
 		 * populated before tier-up does not permanently retain the unoptimized method. */
 		InterpMethod *cached_imethod = imethod;
@@ -6362,7 +6382,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 			imethod = imethod->optimized_imethod;
 		if (imethod != cached_imethod)
 			wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar,
-				slow_reason);
+				slow_reason, abi_ok);
 		/* A recipe can be cached on the target's first invocation, before it crosses the auto-JIT threshold.
 		 * Keep accumulating the same hotness/retry state as the uncached path; otherwise that first recipe
 		 * permanently strands the target in the interpreter (profile13: registered -6%, interp-routed +40%).
@@ -6382,14 +6402,14 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		 * shared cache can hit on a thread that has never dispatched this site (or whose way was
 		 * evicted). Only an admitted scalar fslot is cacheable, which is what lets the generated hit
 		 * skip both the scalar test and the liveness probe. */
-		if (scalar)
+		if (abi_ok)   /* see the note at the other publish site: ABI_OK, not `scalar` */
 			wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
 		*(MonoMethod **) (scratch + 200) = invoke;
 		*(MonoMethod **) (scratch + 204) = target;
 		*(gint32 *) (scratch + 228) = eslot;
 		*(gint32 *) (scratch + 236) = slots;
 		*(gint32 *) (scratch + 240) = scalar ? 1 : (slow_reason << 1);
-		*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
+		*(gint32 *) (scratch + 244) = abi_ok ? fslot : 0;
 		*(MonoObject **) (scratch + 248) = del->target;
 		*(InterpMethod **) (scratch + 252) = imethod;
 		*(gint32 *) (scratch + 220) = shape; /* publish scratch recipe last */
@@ -6456,6 +6476,10 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 			fslot = imethod->wasm_jit_fslot;
 		}
 	}
+	{
+		extern gboolean mono_wasm_jit_delegate_abi_ok (MonoMethod *target);
+		abi_ok = mono_wasm_jit_delegate_abi_ok (target);
+	}
 	tsig = mono_method_signature_internal (target);
 	slots = tsig->param_count + (tsig->hasthis ? 1 : 0);
 	scalar = mono_mint_type (tsig->ret) != MINT_TYPE_VT;
@@ -6481,8 +6505,13 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 			slow_reason = any_vt ? WJ_DSLOW_VTARG : (any_br ? WJ_DSLOW_BYREF : WJ_DSLOW_VTARG);
 		}
 	}
-	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar, slow_reason);
-	if (scalar)
+	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar, slow_reason,
+		abi_ok);
+	/* ABI_OK, not `scalar`. The PIC calls `f` through the site's lowered functype, where a by-value
+	 * vtype is an i32 pointer on both sides -- exactly what the JIT caller spilled. Gating this on the
+	 * interp's stackval layout sent 100% of by-value-vtype delegate dispatches (9.35M per window) to the
+	 * C fallback for a constraint that applies to `e`, not to this path. */
+	if (abi_ok)
 		wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
 	/* R187's OBJECT-REACHABLE RECIPE published here: the same (fslot, shape) the per-site PIC above
 	 * writes, cached once on the (delegate class, target method) tramp info that interp_init_delegate
@@ -6501,7 +6530,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	*(gint32 *) (scratch + 228) = eslot;
 	*(gint32 *) (scratch + 236) = slots;
 	*(gint32 *) (scratch + 240) = scalar ? 1 : (slow_reason << 1);
-	*(gint32 *) (scratch + 244) = scalar ? fslot : 0;
+	*(gint32 *) (scratch + 244) = abi_ok ? fslot : 0;
 	*(MonoObject **) (scratch + 248) = del->target;
 	*(InterpMethod **) (scratch + 252) = imethod;
 	*(gint32 *) (scratch + 220) = shape;
