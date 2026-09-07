@@ -3969,7 +3969,24 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	 * Fixed in WJ_SL_USE by honouring `_fwd` only while no raise has been exempted in the current
 	 * generation; see gen_skipped_raises.
 	 *
-	 * *** THAT FIX HAS NEVER BEEN RE-SOAKED, AND THE PRODUCT SHIPS raise_nogc: 1. ***
+	 * *** AND THE ACTUAL ANSWER IS SIMPLER THAN ANY OF THIS: THE MECHANISM IS ALREADY DISABLED. ***
+	 *
+	 * Every failure above rides on ONE thing -- wj_ins_is_pinned_vcall_forward, which lets a forwarding
+	 * virtual call's argument skip the used-at-a-GC-point clause in WJ_SL_USE. That predicate was gated
+	 * on `mono_wasm_jit_vcall_shared_miss_enabled`, and VCALL_SHARED_MISS SHIPS 0, so the predicate has
+	 * always evaluated FALSE in the product. The measurement for exactly that configuration is recorded
+	 * a few thousand lines below, at the terminal-vcall handoff: "disabling wj_ins_is_pinned_vcall_
+	 * forward outright (SHARED_MISS=0) is clean 0/4 against a 4/4 control".
+	 *
+	 * So raise_nogc=1 is safe in the shipped configuration, it was MEASURED safe, and the product has
+	 * been relying on a side effect of an unrelated PERFORMANCE decision to get there -- VCALL_SHARED_MISS
+	 * ships 0 because turning it off measured -13.2%% p50 / +19.9%% fps. The two facts sat ~3,800 lines
+	 * apart in this file and were never joined, which is the only reason this ever read as "unverified".
+	 * The predicate now returns FALSE unconditionally (except under the level-2 control), so the
+	 * protection is deliberate rather than accidental and does not depend on a performance knob.
+	 *
+	 * The paragraphs below are kept because their MECHANISM is still the right description of the
+	 * hazard, and because level 2 exists to reproduce it on demand.
 	 *
 	 * Read the paragraphs above in ORDER, because their verdicts contradict each other and the last one
 	 * wins: measured broken -> mechanism identified -> mechanism fixed -> NOT RE-MEASURED. Anyone
@@ -4751,11 +4768,40 @@ wj_ins_is_pinned_vcall_forward (MonoInst *ins)
 	default:
 		return FALSE;
 	}
-	call = (MonoCallInst *) ins;
-	/* MONO_WASM_JIT_VCALL_INLINE_IC gated this and shipped 1: the inline monomorphic vcall IC fast path,
-	 * which carries 25.1%% of ALL executed dispatch (R203) -- five times vcall_resolve_fslot's 5.0%%
-	 * miss share. MT-safe since the buggy ref.is_null liveness test (placeholder signature mismatch,
-	 * jit138) was replaced by the per-thread slot_live gate. Settled; unconditional. */
+	/* ALWAYS FALSE IN THE SHIPPED CONFIGURATION, AND THAT IS LOAD-BEARING RATHER THAN VESTIGIAL.
+	 *
+	 * This used to read `mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_shared_miss_enabled && ...`.
+	 * INLINE_IC ships 1, so dropping that conjunct is right -- but VCALL_SHARED_MISS ships **0**, so the
+	 * whole expression has always evaluated FALSE in the product, and dropping THAT conjunct silently
+	 * turns the classification back ON. It is not a no-op: when baking a knob to its shipped value,
+	 * substitute the VALUE, never delete the conjunct. For a knob that ships 0 the guarded code goes
+	 * away -- the guard does not.
+	 *
+	 * WHY IT MUST STAY OFF. This predicate is what lets a forwarding virtual call's argument SKIP the
+	 * used-at-a-GC-point clause in WJ_SL_USE, on the theory that the callee takes ownership of the root.
+	 * That promise does not hold on the PIC MISS path: every observed failure landed in
+	 * mini_llvmonly_init_vtable_slot -> resolve_vcall on a receiver sgen had already turned into a
+	 * nursery filler. It is the mechanism behind the whole MONO_WASM_JIT_RAISE_NOGC saga, and the
+	 * measurement is unambiguous: "disabling wj_ins_is_pinned_vcall_forward outright (SHARED_MISS=0) is
+	 * clean 0/4 against a 4/4 control; gating only the `_fwd` skip in WJ_SL_USE changed nothing (3/4 vs
+	 * 2/4)".
+	 *
+	 * So the product has been safe by a side effect of a PERFORMANCE decision -- VCALL_SHARED_MISS ships
+	 * 0 because turning it off measured -13.2%% p50 / +19.9%% fps, which has nothing to do with the GC.
+	 * Those two facts sat ~3,800 lines apart in this file and were never joined up, which is why
+	 * raise_nogc=1 read as "unverified" for so long. Returning FALSE makes the protection DELIBERATE
+	 * instead of accidental.
+	 *
+	 * RAISE_NOGC=2 RE-ARMS IT, and that is the whole point of level 2: it is a POSITIVE CONTROL, not a
+	 * shipping mode. Gating the control HERE rather than only on the gen_skipped_raises term is what
+	 * makes it a control at all -- with this predicate FALSE, that term is never read, so levels 1 and 2
+	 * would be the same codegen and a clean level-2 run would prove nothing. Level 2 restores the exact
+	 * pre-fix shape: the classification on, and the guard off. */
+	{
+		extern int mono_wasm_jit_raise_nogc;
+		if (mono_wasm_jit_raise_nogc != 2)
+			return FALSE;
+	}
 	return call->method && (call->method->flags & METHOD_ATTRIBUTE_VIRTUAL) &&
 		call->signature && call->signature->hasthis && call->call_info;
 }
@@ -11634,9 +11680,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 											fail = "too many direct dependencies";
 											goto done;
 										}
-										/* VCALL_SHARED_MISS ships 0 and its arm is deleted, so a slim predicted
-										 * site is now simply always available here. */
-										slim_pred = TRUE;
+										/* SAME POLARITY TRAP as wj_ins_is_pinned_vcall_forward above: this read
+										 * `slim_pred = mono_wasm_jit_vcall_shared_miss_enabled`, and that knob
+										 * ships **0**, so a slim predicted site was never selected here. It
+										 * gates the AOT-IC arm below (`!slim_pred && ...`), so flipping it to
+										 * TRUE would silently disable that arm. Substitute the SHIPPED VALUE. */
+										slim_pred = FALSE;
 									}
 								}
 							} else {
