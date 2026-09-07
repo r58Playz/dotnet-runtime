@@ -1295,6 +1295,12 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_GI_REFUSED_OTHER),
 		WJC_(WJC_GI_REFUSED_SIG), WJC_(WJC_GI_REFUSED_SELF), WJC_(WJC_GI_REFUSED_LATE),
 		mono_wasm_jit_guarded_inline, mono_wasm_jit_guarded_inline_size);
+#ifdef HOST_BROWSER
+	/* ALL of them, not a top-N. The tail is 72%% of inlined sites, and a site count is not an execution
+	 * count -- a one-site callee can be white hot -- so a truncated list cannot answer the weighting
+	 * question it exists for. */
+	{ extern void mono_wasm_jit_dump_guarded_inlines (int topn); mono_wasm_jit_dump_guarded_inlines (1024); }
+#endif
 	printf ("[wasm-jit lcse] loads_seen=%lld adds=%lld hits=%lld evict=%lld\n",
 		WJC_(WJC_LCSE_LOADS_SEEN), WJC_(WJC_LCSE_ADDS), WJC_(WJC_LCSE_HITS), WJC_(WJC_LCSE_EVICT));
 	fflush (stdout);

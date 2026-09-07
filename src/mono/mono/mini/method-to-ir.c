@@ -100,6 +100,108 @@ extern gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, M
  * branches. GI_ADMITTED == GI_EMITTED + GI_REFUSED_LATE is the identity to assert. */
 #define wj_gi_count(C) do { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (C); } while (0)
 
+/* WHICH CALLEES WERE ACTUALLY INLINED, and at how many sites.
+ *
+ * This exists to answer the one question the census cannot: `sites` is an UNWEIGHTED site count, and
+ * R205's rule is absolute -- a site executed a billion times counts the same as one executed twice. So
+ * "3,445 inlines emitted" says nothing about whether any of them run.
+ *
+ * The cheap way to weight them is NOT an execution counter. An IR-level counter would have to be
+ * emitted into the inlined body, which perturbs exactly the thing being measured (it lengthens the body
+ * that has to fit under a size limit, and adds a store to a hot path). Instead: record WHICH methods
+ * were inlined, then cross-reference those names against a perf capture's client-thread self-time
+ * census, which is already on disk and costs nothing to re-read. Same method the GVN sizing used.
+ *
+ * NEITHER END MAY RESOLVE A NAME, and getting that wrong cost a run. There are two traps and they
+ * point in opposite directions:
+ *
+ *   - mono_method_get_full_name walks the signature (mono_signature_get_desc -> mono_type_get_desc) and
+ *     can trigger LAZY signature/type resolution. On a WORKER inside the compile section that is R199's
+ *     intermittent `memory access out of bounds`, ~33%% incidence. So not at record time.
+ *   - ...but the main-thread dump must not take a lock either, which is exactly why wj_iroute_note and
+ *     wj_vperm_note cache their names at RECORD time. Resolving in the dump instead produced
+ *     `[MONO] Cannot transition thread ... from STATE_BLOCKING with DO_BLOCKING` and wedged the
+ *     renderer mid-dump -- a coop-GC state error from doing lazy metadata work on the main thread
+ *     while workers compile.
+ *
+ * The way out is to resolve NOTHING. `m->name` and m_class_get_name (m->klass) are direct field reads
+ * on metadata that is already loaded -- the callee's header was just read by check_inlining and
+ * inline_method -- and both strings are owned by the image and stable for the process lifetime. So
+ * store the two pointers and print them. `Class:method` is all the cross-reference needs; perf symbols
+ * for our tier are `<ret> <Type>:<method> (<args>)`, and this matches on the middle field. */
+#define WJ_GI_INLINED_SLOTS 1024
+static MonoMethod * volatile wj_gi_inlined [WJ_GI_INLINED_SLOTS];
+static gint32 wj_gi_inlined_n [WJ_GI_INLINED_SLOTS];
+static const char *wj_gi_inlined_cls [WJ_GI_INLINED_SLOTS];
+static const char *wj_gi_inlined_mth [WJ_GI_INLINED_SLOTS];
+
+static void
+wj_gi_note_inlined (MonoMethod *m)
+{
+	gsize h = ((gsize) m >> 4) & (WJ_GI_INLINED_SLOTS - 1);
+	int i;
+	for (i = 0; i < 6; ++i) {
+		int idx = (h + i) & (WJ_GI_INLINED_SLOTS - 1);
+		if (wj_gi_inlined [idx] == m) { wj_gi_inlined_n [idx]++; return; }
+		if (!wj_gi_inlined [idx]) {
+			/* Field reads only -- see the note above. No signature walk, no lazy resolution, no lock. */
+			wj_gi_inlined_cls [idx] = m->klass ? m_class_get_name (m->klass) : "?";
+			wj_gi_inlined_mth [idx] = m->name ? m->name : "?";
+			wj_gi_inlined_n [idx] = 1;
+			mono_memory_barrier ();      /* publish the strings before the key the reader scans for */
+			wj_gi_inlined [idx] = m;
+			return;
+		}
+	}
+}
+
+/* Top-N inlined callees by SITE COUNT, main thread only. Cross-reference these names against
+ * `perfraw.py <dir> --phase ingame --marker realize_glenv`: if the top of this list is absent from the
+ * top of that one, the pass is inlining cold code and the site count is a vanity metric. */
+void mono_wasm_jit_dump_guarded_inlines (int topn);
+void
+mono_wasm_jit_dump_guarded_inlines (int topn)
+{
+	/* lastw ALONE IS NOT ENOUGH, and getting that wrong made this dump useless on its first run: with a
+	 * strict `w < lastw` bound, every callee TIED on a site count collapses into one printed line, so
+	 * 768 distinct callees printed as 33 -- one per distinct COUNT VALUE.
+	 *
+	 * `lastk` breaks the tie, but ONLY together with picking the SMALLEST k among ties below. The idiom
+	 * in interp.c's iroute/retry/vperm dumps picks the largest and has the same defect: it prints one
+	 * tied entry, sets lastk past all the others, and drops them. Those three are fixed alongside. */
+	gint64 lastw = G_MAXINT64;
+	int lastk = -1;
+	int shown = 0, distinct = 0, k;
+	gint64 total = 0;
+
+	for (k = 0; k < WJ_GI_INLINED_SLOTS; ++k)
+		if (wj_gi_inlined [k]) { distinct++; total += wj_gi_inlined_n [k]; }
+	if (!distinct)
+		return;
+	printf ("[wasm-jit gi-inlined] callees inlined, by SITE count -- weight these against a perf census\n"
+		"  before believing the emitted total: a site count is not an execution count (R205).\n");
+	while (shown < topn) {
+		int best = -1;
+		gint64 bestw = 0;
+		for (k = 0; k < WJ_GI_INLINED_SLOTS; ++k) {
+			gint64 w = wj_gi_inlined [k] ? wj_gi_inlined_n [k] : 0;
+			if (!w || w > lastw || (w == lastw && k <= lastk)) continue;
+			/* SMALLEST k among ties, not largest. With `k > best` the loop selects the LAST tied slot
+			 * and then sets lastk to it, so every other slot at that count is skipped forever -- 768
+			 * callees printed as 33, one per distinct COUNT VALUE. Ascending k is what enumerates them. */
+			if (best < 0 || w > bestw || (w == bestw && k < best)) { bestw = w; best = k; }
+		}
+		if (best < 0)
+			break;
+		printf ("  %8lld  %s:%s\n", (long long) bestw,
+			wj_gi_inlined_cls [best] ? wj_gi_inlined_cls [best] : "?",
+			wj_gi_inlined_mth [best] ? wj_gi_inlined_mth [best] : "?");
+		lastw = bestw; lastk = best; shown++;
+	}
+	printf ("  -- %d distinct callees, %lld inlined sites (table holds %d)\n",
+		distinct, (long long) total, WJ_GI_INLINED_SLOTS);
+}
+
 /* CALLEES inline_method HAS ALREADY REFUSED, so a later site does not pay for the same answer twice.
  *
  * inline_method can only report failure by running the inlinee through mono_method_to_ir and watching
@@ -8479,6 +8581,8 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_end_bb);
 						gi_active = TRUE;
 						wj_gi_count (WJC_GI_EMITTED);
+						if (G_UNLIKELY (mono_wasm_jit_stats))
+							wj_gi_note_inlined (gi_target);
 					}
 					/* Everything the ordinary call emission does below now lands in the fallback. */
 					MONO_START_BB (cfg, gi_fallback_bb);
