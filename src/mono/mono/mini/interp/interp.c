@@ -2850,6 +2850,16 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 				if (min_cyc < 0 || on_stack < min_cyc) min_cyc = on_stack;
 				continue;   /* defer: batch-compile the whole SCC once non-cyclic blockers are resolved */
 			}
+			/* Same reason as the threshold gate: do not pull a relink-pending method into an
+			 * island. This path is why the gate cannot close the race rather than why it can --
+			 * ISLAND_COLD_DIV equals the threshold, so a callee is admitted at a single hit, i.e.
+			 * typically before its own first execution has run the hook that would set the flag.
+			 * Worth keeping for the ones it does catch (measured -6% of refusals), but see the
+			 * relink_pending comment in interp-internals.h before spending anything more here. */
+			if (cim && cim->relink_pending) {
+				wj_waiter_register (callee, m);   /* re-attempt once the replacement lands */
+				continue;
+			}
 			if (wj_blocker_too_cold (cim, depth, promoted_root)) {
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BLOCKED_COLD);
 				wj_waiter_register (callee, m);   /* park m on this cold callee: re-attempt when it JITs */
@@ -2966,7 +2976,11 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 	 * method re-attempts every call — jit75 showed that as 82k island attempts/window for ~500 real compiles.
 	 * `== thresh` (atomic) keeps the exactly-once trigger; the BUSY back-off re-runs the counter up to thresh
 	 * again, so it still re-fires exactly once per cycle. */
-	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) && mono_atomic_inc_i32 (&cmethod->wasm_jit_hits) == mono_wasm_jit_thresh) {
+	/* relink_pending: IKVM has queued this method for an in-place body replacement. Compiling now would
+	 * emit from generation-1 IL and then have to be refused by the swap, because an f-slot other modules
+	 * may already have baked cannot be invalidated. The hits counter still advances, so the method
+	 * re-reaches the threshold once the replacement clears the flag. */
+	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && !cmethod->relink_pending && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) && mono_atomic_inc_i32 (&cmethod->wasm_jit_hits) == mono_wasm_jit_thresh) {
 		int r;
 		/* Don't whole-method-JIT a method that already has AOT code. MONO_WASM_JIT_OVER_AOT gated this,
 		 * letting the same hotness/island machinery compile it again with the runtime wasm emitter and
@@ -13951,9 +13965,14 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 			MINT_IN_BREAK;
 		}
 
+		/* `retired` gates both: a body whose IL has been swapped out (see
+		 * mono_interp_replace_method_body) must not tier up, because tier-up maps a basic-block index
+		 * from this compilation into the registered one, and after a swap those are compilations of
+		 * DIFFERENT IL. The existing else-branch is already the correct behaviour -- just keep
+		 * interpreting -- so the gate costs one bit test on a path that already reads the same word. */
 		MINT_IN_CASE(MINT_TIER_ENTER_METHOD) {
 			frame->imethod->entry_count++;
-			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args)
+			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired)
 				ip = mono_interp_tier_up_frame_enter (frame, context);
 			else
 				ip++;
@@ -13961,7 +13980,7 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 		}
 		MINT_IN_CASE(MINT_TIER_PATCHPOINT) {
 			frame->imethod->entry_count++;
-			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args)
+			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired)
 				ip = mono_interp_tier_up_frame_patchpoint (frame, context, ip [1]);
 			else
 				ip += 2;
