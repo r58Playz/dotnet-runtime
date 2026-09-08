@@ -279,6 +279,25 @@ struct InterpMethod {
 	unsigned int init_locals : 1;
 	unsigned int vararg : 1;
 	unsigned int optimized : 1;
+	/* Set when a body swap (mono_interp_replace_method_body) has retired this compilation: the method's
+	 * IL was replaced and a NEWER InterpMethod is now registered for it. Live frames finish here, so this
+	 * body stays valid -- but it must never tier up, because tier-up migrates a frame between two
+	 * compilations of the SAME IL and these two are compilations of DIFFERENT IL. Doing it anyway asserts
+	 * in lookup_patchpoint_data (gen-1's basic-block index does not exist in gen-2's patchpoint data) and,
+	 * worse, would relocate the frame onto a different stack layout. */
+	unsigned int retired : 1;
+	/* Set while IKVM has queued this method for an in-place body replacement but has not performed it
+	 * yet (batched, so there is a real window). The wasm JIT must not compile the method during that
+	 * window: emitting from generation-1 IL produces code that mono_interp_replace_method_body then has
+	 * to refuse, because an f-slot other modules may have baked cannot be invalidated from there.
+	 *
+	 * THIS BOUGHT ALMOST NOTHING AND THE REASON IS STRUCTURAL -- do not re-derive it. Refusals
+	 * (mono_interp_relink_late) went 736 -> 690, -6%, in one in-game window. The flag is set at the
+	 * relink hook, and the hook IS the method's first execution, so a method force-compiled as a cold
+	 * island callee before it ever ran was already JITted when the mark arrived. Closing the rest means
+	 * marking candidates at CLASS FINISH, before any execution -- which is a different change, and one
+	 * that would have to price leaving every candidate un-JITtable for the window in between. */
+	unsigned int relink_pending : 1;
 	unsigned int needs_thread_attach : 1;
 	// If set, this method is MulticastDelegate.Invoke
 	unsigned int is_invoke : 1;
