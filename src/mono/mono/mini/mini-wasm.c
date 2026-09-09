@@ -1071,7 +1071,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 158);   /* -COLOCATE_HOP_ADD, -DOBJ_{PUBLISHED,NO_INFO}: COLOCATE_HOPS and DELEGATE_OBJ_PIC deleted */
+g_static_assert (WJC_MAX == 162);   /* +ABI_MISMATCH_{UNREG,CHUNK,SIG} (R231: the unguarded name walk that trapped) */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1106,8 +1106,13 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_AOT_ROUTED), WJC_(WJC_INTERP_ROUTED), WJC_(WJC_VCALL_AOT_FAST));
 	/* eslot_residual is the subset of interp_routed that skipped interp_entry entirely: interp_routed counts
 	 * the crossing, this counts the ones that took the short way in. */
-	printf ("[wasm-jit eslot] eslot_residual=%lld (of interp_routed=%lld)\n",
-		WJC_(WJC_ESLOT_RESIDUAL), WJC_(WJC_INTERP_ROUTED));
+	printf ("[wasm-jit eslot] eslot_residual=%lld (of interp_routed=%lld) entry_slot_stale=%lld\n",
+		WJC_(WJC_ESLOT_RESIDUAL), WJC_(WJC_INTERP_ROUTED), WJC_(WJC_ENTRY_SLOT_STALE));
+	/* The three causes wj_admit_dependencies used to collapse into one UNGATED printf whose name walk
+	 * trapped (R231). Non-zero is normal -- the refusal is recoverable and the next dispatch retries;
+	 * what matters is WHICH cause dominates, which is why they are split rather than summed. */
+	printf ("[wasm-jit abimismatch] unregistered=%lld chunk_missing=%lld sig_hash=%lld\n",
+		WJC_(WJC_ABI_MISMATCH_UNREG), WJC_(WJC_ABI_MISMATCH_CHUNK), WJC_(WJC_ABI_MISMATCH_SIG));
 	/* Fast-path VOLUME. These dispatches are pure emitted wasm and call no counting helper, so without
 	 * MONO_WASM_JIT_PROFILE_FAST=1 they are invisible and the counted totals above (invoked / fastvcall /
 	 * residual) understate real dispatch volume — frame cost then can't be attributed. The counters are
@@ -2530,15 +2535,43 @@ wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 			 * >0 and != dep_fslot the callee re-registered under a fresh slot after the caller baked the
 			 * old one; 0/-1 means it never (re)registered. */
 			extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+			extern int mono_wasm_jit_verbose;
 			MonoMethod *dm = ds->method [i];
-			char *cn = re->logical_method ? mono_method_get_full_name (re->logical_method) : NULL;
-			char *dn = dm ? mono_method_get_full_name (dm) : NULL;
-			printf ("WASM_JIT_ABI_MISMATCH desc=%d dep_fslot=%d expected=0x%x actual=0x%x cause=%s dep_desc=%d dep_now_fslot=%d caller=%s dep=%s\n",
-				desc_id, ds->slot [i], ds->sig [i], dep ? dep->f_sig_id : 0,
-				!dep_id ? "fslot-unregistered" : (!dep ? "desc-chunk-missing" : "sig-hash-mismatch"),
-				dep_id, dm ? mono_wasm_jit_get_callee_fslot (dm) : -1,
-				cn ? cn : "?", dn ? dn : "?");
-			g_free (cn); g_free (dn);
+			/* COUNT ALWAYS, NAME ONLY WHEN ASKED -- and this used to be the other way round, which is
+			 * what killed roughly 1 A/B run in 6 (R231).
+			 *
+			 * This refusal is RECOVERABLE and expected: `return 0` just declines to admit and the next
+			 * dispatch retries. So the path is taken deliberately and often. The old code answered it
+			 * with an UNGATED mono_method_get_full_name on BOTH the caller and the dep, plus a
+			 * mono_wasm_jit_get_callee_fslot -- all metadata operations. The name walk goes
+			 * mono_method_get_full_name -> mono_signature_get_desc -> mono_type_get_desc and can trigger
+			 * LAZY type resolution; admission runs LOCK-FREE, on a WORKER, at every dispatch. That is
+			 * exactly R199's fault in a second location, and the captured stack is those frames under
+			 * wj_admit_dependencies rather than under wj_assemble, which is why R199's fix (caching
+			 * WjBody.name at emit time) did not cover it.
+			 *
+			 * Splitting the three causes into counters also un-merges what one printf collapsed, so the
+			 * question "which cause dominates" is now answerable without turning the fault back on. */
+			mono_wasm_jit_counters [!dep_id ? WJC_ABI_MISMATCH_UNREG
+					        : (!dep ? WJC_ABI_MISMATCH_CHUNK : WJC_ABI_MISMATCH_SIG)]++;
+			if (mono_wasm_jit_verbose) {
+				/* Under the loader lock, which is what serialises the lazy resolution these walks can
+				 * trigger -- the same discipline the WASM_JIT_LOGICAL_REBIND site above already follows,
+				 * and the reason that site has never been seen to fault. */
+				char *cn, *dn;
+				int now_fslot;
+				mono_loader_lock ();
+				cn = re->logical_method ? mono_method_get_full_name (re->logical_method) : NULL;
+				dn = dm ? mono_method_get_full_name (dm) : NULL;
+				now_fslot = dm ? mono_wasm_jit_get_callee_fslot (dm) : -1;
+				printf ("WASM_JIT_ABI_MISMATCH desc=%d dep_fslot=%d expected=0x%x actual=0x%x cause=%s dep_desc=%d dep_now_fslot=%d caller=%s dep=%s\n",
+					desc_id, ds->slot [i], ds->sig [i], dep ? dep->f_sig_id : 0,
+					!dep_id ? "fslot-unregistered" : (!dep ? "desc-chunk-missing" : "sig-hash-mismatch"),
+					dep_id, now_fslot,
+					cn ? cn : "?", dn ? dn : "?");
+				g_free (cn); g_free (dn);
+				mono_loader_unlock ();
+			}
 			return 0;
 		}
 		if (!mono_wasm_jit_admit (dep_id))
