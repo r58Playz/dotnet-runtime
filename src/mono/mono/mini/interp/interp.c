@@ -5082,10 +5082,20 @@ interp_entry (InterpEntryData *data)
 			 * here (sync can fail on a worker under memory pressure while the compiling thread succeeded;
 			 * call_indirect-ing a mismatched placeholder would trap). If not live, fall through to interpret.
 			 * _live, not plain admit: admit() also returns 1 when it BREAKS A CYCLE without instantiating. */
+			/* R230: VERIFY THE SNAPSHOTTED SLOT, not just the descriptor. See the R209 note at the
+			 * MINT_CALL gate for the full mechanism -- admit_live can pass for the descriptor this
+			 * thread admitted while `wj_eslot`, read separately above, is a NEWLY published slot this
+			 * thread never instantiated, whose table entry is still the jiterpreter's prefilled
+			 * placeholder. R209 fixed that at one of six callers; this is one of the four it missed. */
+			extern int mono_wasm_jit_slot_live (int slot);
 			if (G_LIKELY (mono_wasm_jit_admit_live (rmethod->wasm_jit_desc))) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
-				mono_wasm_jit_invoke_caught (method, wj_eslot, frame.stack, frame.stack);
-				wj_did_jit_call = TRUE;
+				if (G_UNLIKELY (!mono_wasm_jit_slot_live (wj_eslot))) {
+					if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ENTRY_SLOT_STALE);
+				} else {
+					mono_wasm_jit_invoke_caught (method, wj_eslot, frame.stack, frame.stack);
+					wj_did_jit_call = TRUE;
+				}
 			}
 		}
 	}
@@ -5984,17 +5994,27 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 		 * wasm-JIT compiled enters the callee's e-slot straight from the residual scratch, instead of
 		 * marshalling into InterpEntryData and letting interp_entry rediscover the same e-slot. Its
 		 * target was measured at interp_entry 3.838%% + call_interp 2.588%% of in-game samples. */
-		if (imethod->wasm_jit_slot > 0 && !imethod->is_invoke) {
+		/* R230: ONE read of wasm_jit_slot, then verify THAT value. This site read it twice -- once in
+		 * the guard and again as the argument -- across an admit_live call, so re-emission could
+		 * republish between them and the call would enter a slot the guard never examined. */
+		gint32 wj_res_eslot = imethod->wasm_jit_slot;
+		if (wj_res_eslot > 0 && !imethod->is_invoke) {
 			extern int mono_wasm_jit_admit_live (int desc_id);
+			extern int mono_wasm_jit_slot_live (int slot);
 			gboolean scalar = (shape & WJ_ARGSHAPE_SCALAR) != 0;
-			if (scalar && mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
+			gboolean wj_res_ok = scalar && mono_wasm_jit_admit_live (imethod->wasm_jit_desc);
+			if (wj_res_ok && G_UNLIKELY (!mono_wasm_jit_slot_live (wj_res_eslot))) {
+				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ENTRY_SLOT_STALE);
+				wj_res_ok = FALSE;
+			}
+			if (wj_res_ok) {
 				extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_RESIDUAL); mono_wasm_jit_count (WJC_ESLOT_RESIDUAL); }
 				/* Clear the 8-byte result slot for the same reason the interp_entry path does: a sub-word
 				 * return writes narrowly while the JITted caller reads a full-width i32, so stale high bytes
 				 * from a previous residual would turn a `false` bool into a large nonzero value. */
 				memset (buf + WJ_SCRATCH_RET_OFF, 0, 8);
-				mono_wasm_jit_invoke_caught (method, imethod->wasm_jit_slot, buf, buf + WJ_SCRATCH_RET_OFF);
+				mono_wasm_jit_invoke_caught (method, wj_res_eslot, buf, buf + WJ_SCRATCH_RET_OFF);
 				/* THE RETURN VALUE IS INVERTED FROM WHAT IT LOOKS LIKE: this function returns 1 for THREW
 				 * and 0 for success (see its header comment). Returning 1 here told every JITted caller that
 				 * the callee had thrown, on every bypassed call — which aborted the caller into an interp
@@ -15453,8 +15473,20 @@ mono_jiterp_interp_entry (void *res)
 		 * already JITted, skipping the InterpFrame/LMF/maybe_compile/admit scaffolding. It still verifies
 		 * per-thread admission of the descriptor's CURRENT generation, which is not optional -- automatic
 		 * rebatching reuses e/f slots. */
-		if (fm->wasm_jit_entry_fast_ok && !fm->is_invoke &&
-		    fm->wasm_jit_slot > 0 && mono_wasm_jit_desc_admitted (fm->wasm_jit_desc)) {
+		/* R230: snapshot the slot ONCE and verify THAT value. This site tested `fm->wasm_jit_slot > 0`
+		 * and then passed a SECOND read of the same field to the thunk, with a desc_admitted call in
+		 * between -- and desc_admitted checks the DESCRIPTOR's generation, which says nothing about
+		 * whether this worker instantiated the slot that is there now. See the R209 note at the
+		 * MINT_CALL gate. This is the fast path, so the added cost is one load per interp->JIT entry. */
+		gint32 wj_fast_eslot = fm->wasm_jit_slot;
+		extern int mono_wasm_jit_slot_live (int slot);
+		gboolean wj_fast_ok = fm->wasm_jit_entry_fast_ok && !fm->is_invoke &&
+		    wj_fast_eslot > 0 && mono_wasm_jit_desc_admitted (fm->wasm_jit_desc);
+		if (wj_fast_ok && G_UNLIKELY (!mono_wasm_jit_slot_live (wj_fast_eslot))) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ENTRY_SLOT_STALE);
+			wj_fast_ok = FALSE;
+		}
+		if (wj_fast_ok) {
 			extern void mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret);
 			MonoType *ftype;
 			int fparams_size = get_arg_offset_fast (fm, NULL, header.params_count);
@@ -15463,7 +15495,7 @@ mono_jiterp_interp_entry (void *res)
 			g_assert (header.context->stack_pointer < header.context->stack_end);
 
 			MONO_ENTER_GC_UNSAFE;
-			mono_wasm_jit_invoke_caught (fm->method, (gint32) fm->wasm_jit_slot, sp, sp);
+			mono_wasm_jit_invoke_caught (fm->method, wj_fast_eslot, sp, sp);
 			MONO_EXIT_GC_UNSAFE;
 
 			header.context->stack_pointer = (guchar*)sp;
@@ -15570,8 +15602,19 @@ mono_jiterp_interp_entry (void *res)
 				/* Admission succeeded for the current generation, so later entries may take the fast
 				 * path above. Its generation check sends them back here after a future rebatch. */
 				wj_rm->wasm_jit_entry_fast_ok = 1;
-				mono_wasm_jit_invoke_caught (wj_rm->method, (gint32) wj_rm->wasm_jit_slot, frame.stack, frame.stack);
-				wj_dispatched = TRUE;
+				/* R230: the one caller of six that had NO slot check at all. Admission succeeded above,
+				 * but admission is about the descriptor's generation; the slot can have been
+				 * republished by re-emission since. Snapshot and verify before entering it. */
+				{
+					extern int mono_wasm_jit_slot_live (int slot);
+					gint32 wj_slow_eslot = wj_rm->wasm_jit_slot;
+					if (G_UNLIKELY (wj_slow_eslot <= 0 || !mono_wasm_jit_slot_live (wj_slow_eslot))) {
+						if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ENTRY_SLOT_STALE);
+					} else {
+						mono_wasm_jit_invoke_caught (wj_rm->method, wj_slow_eslot, frame.stack, frame.stack);
+						wj_dispatched = TRUE;
+					}
+				}
 			}
 		}
 		if (!wj_rm->is_invoke)

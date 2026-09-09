@@ -528,6 +528,28 @@ enum {
 	 * nothing worse -- which is already LAYOUT-COMPATIBLE, since a non-VT type takes exactly one
 	 * MINT_STACK_SLOT_SIZE slot and both sides hold the pointer. Disjoint, and they sum to NONSCALAR. */
 	WJC_DELEGATE_SLOW_VTRET, WJC_DELEGATE_SLOW_VTARG, WJC_DELEGATE_SLOW_BYREF,
+	/* R230: interp->JIT entries REFUSED because the snapshotted e-slot was not live on THIS worker,
+	 * after the descriptor check had already passed. This is R209's torn read at the entry gate, and
+	 * NON-ZERO IS THE HEALTHY READING -- it means the guard caught a race that would otherwise have
+	 * call_indirect'd the jiterpreter's prefilled placeholder (mono_jiterp_placeholder_jit_call,
+	 * (i32,i32,i32,i32)->void) through a (i32,i32)->void functype and trapped with
+	 * `function signature mismatch` in wasm_jit_ethunk_cb, killing the worker.
+	 *
+	 * R209 fixed exactly this at ONE of the six callers of mono_wasm_jit_invoke_caught (the MINT_CALL
+	 * gate) and the pattern was never propagated; an audit found four of six missing it, three of which
+	 * also read wasm_jit_slot TWICE. A trap census over 1,027 archived logs put wasm_jit_ethunk_cb in
+	 * 59 of 105 trap stacks with mono_jiterp_placeholder_jit_call the top frame in 4 -- i.e. the
+	 * placeholder is demonstrably being reached. Counted per caller site is not worth six counters; one
+	 * is enough to say whether the guard is live at all. Zero forever would mean it is dead code. */
+	WJC_ENTRY_SLOT_STALE,
+	/* Split of the WASM_JIT_ABI_MISMATCH diagnostic in wj_admit_dependencies, which used to be an
+	 * UNGATED printf that called mono_method_get_full_name TWICE on the admission path -- a metadata
+	 * walk, lock-free, on a worker, at every dispatch. That is R199's fault in a second location and
+	 * it is what actually killed A/B runs (stack: mono_type_get_desc <- mono_signature_get_desc <-
+	 * mono_method_get_full_name <- wj_admit_dependencies). The refusal is RECOVERABLE and expected, so
+	 * the path is taken deliberately and the names were rolled every time. Counted here instead;
+	 * printing now requires MONO_WASM_JIT_VERBOSE and takes the loader lock. */
+	WJC_ABI_MISMATCH_UNREG, WJC_ABI_MISMATCH_CHUNK, WJC_ABI_MISMATCH_SIG,
 	WJC_MAX
 };
 
