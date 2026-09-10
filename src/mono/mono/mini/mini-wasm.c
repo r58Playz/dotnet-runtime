@@ -1071,7 +1071,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 163);   /* +ABI_MISMATCH_IDENT (R234: the 32-bit functype hash is not an equality test) */
+g_static_assert (WJC_MAX == 164);   /* +ADMIT_DEP_NOT_LIVE (R239: admission's contract was never tested at the point of use) */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1114,6 +1114,9 @@ mono_wasm_jit_dump_stats (void)
 	printf ("[wasm-jit abimismatch] unregistered=%lld chunk_missing=%lld sig_hash=%lld identity=%lld\n",
 		WJC_(WJC_ABI_MISMATCH_UNREG), WJC_(WJC_ABI_MISMATCH_CHUNK), WJC_(WJC_ABI_MISMATCH_SIG),
 		WJC_(WJC_ABI_MISMATCH_IDENT));
+	/* Separate line because it is NOT an ABI disagreement: every hash and identity check passed and the
+	 * slot simply was not installed. Non-zero here is the `function signature mismatch` class. */
+	printf ("[wasm-jit admitlive] dep_not_live=%lld\n", WJC_(WJC_ADMIT_DEP_NOT_LIVE));
 	/* Fast-path VOLUME. These dispatches are pure emitted wasm and call no counting helper, so without
 	 * MONO_WASM_JIT_PROFILE_FAST=1 they are invisible and the counted totals above (invoked / fastvcall /
 	 * residual) understate real dispatch volume — frame cost then can't be attributed. The counters are
@@ -2597,6 +2600,20 @@ wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 		}
 		if (!mono_wasm_jit_admit (dep_id))
 			return 0;
+		/* ADMISSION'S CONTRACT, ACTUALLY TESTED (R239). Everything above proves the dep is the right
+		 * METHOD with the right ABI; nothing proved the f-slot the caller baked is INSTALLED ON THIS
+		 * WORKER, which is the whole point of admission -- `generated indirect calls carry no liveness
+		 * check` (see the cycle-break in mono_wasm_jit_admit). If it is not installed, the slot holds
+		 * mono_jiterp_placeholder_jit_call and the emitted call_indirect traps with `function signature
+		 * mismatch` -- which is exactly the surviving trap class, and which every ABI_MISMATCH_* counter
+		 * reads 0 for. Test ds->slot [i], not dep->f: the baked slot is what the generated code calls,
+		 * so if the callee re-registered under a fresh f-slot this catches the stale one too.
+		 * Refusing is the recoverable path the sig-hash arm above already takes -- state 0, and the next
+		 * dispatch retries -- so a transient window costs a deferral rather than a dead world. */
+		if (!mono_wasm_jit_slot_live (ds->slot [i])) {
+			mono_wasm_jit_counters [WJC_ADMIT_DEP_NOT_LIVE]++;
+			return 0;
+		}
 	}
 	return 1;
 }

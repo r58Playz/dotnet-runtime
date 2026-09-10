@@ -554,6 +554,12 @@ enum {
 	 * functype hash said it matched. Non-zero means the hash was letting a mismatched pair through --
 	 * i.e. this counts trap-shaped bugs that used to reach `call_indirect`. See wj_admit_dependencies. */
 	WJC_ABI_MISMATCH_IDENT,
+	/* mono_wasm_jit_admit returned 1 for a dependency and the f-slot the CALLER BAKED is still not
+	 * installed on this worker. Admission exists to make exactly this impossible -- generated
+	 * call_indirect carries no liveness check -- so non-zero means a caller was about to go live over
+	 * a slot holding mono_jiterp_placeholder_jit_call, which traps as `function signature mismatch`.
+	 * This is the first counter on that route; every ABI_MISMATCH_* guard reads 0 when it happens. */
+	WJC_ADMIT_DEP_NOT_LIVE,
 	WJC_MAX
 };
 
