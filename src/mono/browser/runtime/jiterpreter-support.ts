@@ -2159,11 +2159,34 @@ let jiterpreter_tables_allocated = false;
  * WebAssembly.Exception on a pthread.
  */
 function interp_entry_table_size (table: JiterpreterTable, aotTableSize: number) {
-    const argc = (table - JiterpreterTable.InterpEntryStatic0) % 9;
-    if (argc <= 1)
-        return aotTableSize;
+    const k = table - JiterpreterTable.InterpEntryStatic0;
+    const shape = (k / 9) | 0; // 0 static, 1 static_ret, 2 instance, 3 instance_ret
+    const argc = k % 9;
+    // Taper by SHAPE as well as argc. The argc-only taper above gave the full size to all eight argc<=1
+    // tables, but the evidence in the comment says only two of them ever needed it: at a flat 4096 the
+    // ONLY tables to overflow were interp_entry_static_ret_0 and _ret_1. So give those two the configured
+    // size and let the other six take the same >>4 that 34 tables were already proven to fit in.
+    //   65536 base: 2*65536 + 6*4096 + 8*4096 + 20*1024 = 208,896 entries, against 577,536 before.
+    // That is ~5.6 MiB less V8 heap PER WORKER (16 B/entry), ~200 MiB across the pool, and it does not
+    // touch the two shapes that actually overflow.
+    // MEASURED DEMAND, one full run (world load + 45 s in-game), used/capacity per table:
+    //   static_ret_0 4338, static_ret_1 6313, static_ret_2 3161, static_ret_3 1662
+    //   static_1..3 ~1000, instance_ret_0..3 400-1000, everything else < 350
+    // So static_ret really is the hot shape -- but it needs ~6 K, not the 65536 it was given, and
+    // static_ret_2 was at 77% of a 4096 table, which is too tight to leave. Sizes below are ~3-16x the
+    // observed high-water so a heavier world still fits; overflow is graceful (addWasmFunctionPointer
+    // returns 0 and the caller takes the classic interp_entry path) so the failure mode is slower, not
+    // broken.
+    const small = Math.max(1, aotTableSize >>> 4); // 4096 @ 65536
+    if (shape === 1 /* static_ret */) {
+        if (argc <= 1)
+            return Math.max(1, aotTableSize >>> 2); // 16384, vs 4338/6313 observed
+        if (argc <= 3)
+            return Math.max(1, aotTableSize >>> 3); // 8192, vs 3161/1662 observed
+        return Math.max(1, aotTableSize >>> 6);
+    }
     if (argc <= 3)
-        return Math.max(1, aotTableSize >>> 4);
+        return small;
     return Math.max(1, aotTableSize >>> 6);
 }
 
@@ -2177,7 +2200,11 @@ export function jiterpreter_allocate_tables () {
     // argument count, which is where the reservation was actually going. (Supersedes the old FIXME here
     // about merging the tables by argument count: this keeps them separate, so no placeholder needs to
     // inspect the rmethod, and just stops paying full price for the exotic shapes.)
-    const traceTableSize = options.tableSize,
+    // The TRACE table is sized off the same option as jit_call but has nothing like the same demand:
+    // measured 490 used against 131,072 reserved, because with AOT on almost nothing is jiterpreter-
+    // traced. jit_call keeps the full size -- it holds the wasm JIT's per-method entry thunks and
+    // measured 61,115 used. Splitting them is worth ~123 K entries per worker, ~1.9 MiB each.
+    const traceTableSize = Math.max(1, options.tableSize >>> 4),
         // With AOT off, do_jit_call is unused, so the runtime wasm JIT (mono_wasm_emit_method)
         // repurposes the JIT_CALL table for its per-method entry-thunk slots — size it like the
         // trace table so many JITted methods fit (was hard-capped at 1, which only fit one method).
