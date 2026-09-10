@@ -89,6 +89,10 @@ typedef struct {
 
 extern int mono_jiterp_first_trace_fn_ptr;
 
+/* Per-table reservation usage, for sizing the interp-entry tables from measured demand. */
+int mono_jiterp_get_table_used (int type);
+int mono_jiterp_get_table_capacity (int type);
+
 typedef const ptrdiff_t (*JiterpreterThunk) (void *frame, void *pLocals, JiterpreterCallInfo *cinfo, const guint16 *ip);
 typedef void (*WasmJitCallThunk) (void *ret_sp, void *sp, void *ftndesc, gboolean *thrown);
 typedef void (*WasmDoJitCall) (gpointer cb, gpointer arg, gboolean *out_thrown);

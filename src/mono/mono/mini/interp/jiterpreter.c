@@ -1644,6 +1644,44 @@ jiterp_table_name (int type, char *buf, size_t buflen) {
 	return buf;
 }
 
+/*
+ * Per-table high-water usage, so the 36 interp-entry table sizes can be chosen from MEASURED demand
+ * instead of a formula.
+ *
+ * The sizes are a pure reservation: every worker reserves the same ranges and pre-fills each with a
+ * type-correct placeholder, so an over-sized table costs (entries x 16 B) of V8 heap PER WORKER --
+ * 12 B of WasmDispatchTable slot plus ~4 B of WasmTableObject entries reference. At the app's
+ * aot-table-size=65536 that was 577,536 reserved entries per worker, ~8.8 MiB each, ~308 MiB across the
+ * pool (R235 addendum 2). Sizing from demand is the only way to know which of the 36 actually need room.
+ *
+ * `used` can exceed capacity: allocate_table_entry bumps next_index unconditionally and only then
+ * notices it ran past last_index, so a table that overflowed reports demand ABOVE what it could serve.
+ * That is exactly what makes this useful for sizing -- it reports what was WANTED, not what fitted.
+ */
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_get_table_used (int type)
+{
+	JiterpreterTableInfo *table;
+	if ((type < 0) || (type > JITERPRETER_TABLE_LAST))
+		return -1;
+	table = &tables [type];
+	if (table->first_index <= 0)
+		return 0;
+	return table->next_index > table->first_index ? table->next_index - table->first_index : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_get_table_capacity (int type)
+{
+	JiterpreterTableInfo *table;
+	if ((type < 0) || (type > JITERPRETER_TABLE_LAST))
+		return -1;
+	table = &tables [type];
+	if (table->first_index <= 0)
+		return 0;
+	return table->last_index - table->first_index + 1;
+}
+
 EMSCRIPTEN_KEEPALIVE int
 mono_jiterp_allocate_table_entry (int type) {
 	g_assert ((type >= 0) && (type <= JITERPRETER_TABLE_LAST));
