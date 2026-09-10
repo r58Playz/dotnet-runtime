@@ -550,6 +550,10 @@ enum {
 	 * the path is taken deliberately and the names were rolled every time. Counted here instead;
 	 * printing now requires MONO_WASM_JIT_VERBOSE and takes the loader lock. */
 	WJC_ABI_MISMATCH_UNREG, WJC_ABI_MISMATCH_CHUNK, WJC_ABI_MISMATCH_SIG,
+	/* The dep at this f-slot is not the METHOD the caller baked, caught by identity after the 32-bit
+	 * functype hash said it matched. Non-zero means the hash was letting a mismatched pair through --
+	 * i.e. this counts trap-shaped bugs that used to reach `call_indirect`. See wj_admit_dependencies. */
+	WJC_ABI_MISMATCH_IDENT,
 	WJC_MAX
 };
 
