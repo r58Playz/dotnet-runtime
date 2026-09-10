@@ -6794,9 +6794,24 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 		if (saved) {
 			wj_batch_rollback (desc_ids, n, saved, bd);
 			g_free (saved);
-			g_free (bd->e); g_free (bd->f); g_free (bd->desc); g_free (bd);
+			/* DO NOT FREE bd OR ITS ARRAYS -- USE AFTER FREE (2026-09-09). `re->batch = bd` was published
+			 * to every worker above, so a worker already inside mono_wasm_jit_admit is holding
+			 * `batch = re->batch` (:2816) and keeps reading batch->n, batch->desc[], batch->e/f and
+			 * batch->bytes with no lock -- including at the `fail:` cleanup (:3088). wj_batch_rollback
+			 * restores re->batch so no NEW reader can acquire bd, but it cannot recall the readers that
+			 * already did. Freeing here produced `RuntimeError: memory access out of bounds` at :3088
+			 * off a garbage batch->n, on a worker that entered admit from vcall_resolve_fslot -- 2 traps
+			 * in a 5-run batch, 2026-09-09, symbolised against the split DWARF.
+			 * Retaining is the rule the depset arrays already follow ("Old arrays intentionally remain
+			 * allocated: another worker may still be walking the prior generation lock-free") -- the
+			 * batch descriptor was the one allocation that broke it. Bounded: colocate_refused = 1 makes
+			 * rollback once-only per method, and a descriptor is ~48 + 12*n bytes with n <= COLOCATE_MAX. */
 			if (G_UNLIKELY (mono_wasm_jit_stats))
 				mono_wasm_jit_add (WJC_COLOCATE_ROLLBACK, n);
+			/* Also the string deploy.sh proves this build by -- see the rollback printf above. Retention
+			 * is what this round changed, so it is the thing worth being able to count in a log. */
+			if (mono_wasm_jit_verbose >= 2)
+				printf ("WASM_JIT_BATCH_RETAIN members=%d (descriptor and bytes kept; a concurrent admit may still hold them)\n", n);
 			return 0;   /* caller still owns `bytes`; the group never happened */
 		}
 		printf ("WASM_JIT_BATCH_ADMIT_FAIL generation=%u members=%d\n", bd->generation, n);
@@ -6966,7 +6981,13 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 	}
 	ok = mono_wasm_jit_batch_bind (desc_ids, e_slots, f_slots, n, cached, (int) out.len);
 	if (!ok) {
-		g_free (cached);
+		/* NOT `g_free (cached)` -- the same use-after-free as the batch descriptor. batch_bind
+		 * published re->batch = bd with bd->bytes = cached BEFORE it attempted admission, and a
+		 * concurrent mono_wasm_jit_admit reads batch->bytes to instantiate. Freeing the module bytes
+		 * under it is worse than the descriptor case: it instantiates freed memory rather than just
+		 * faulting. The `else` arm below already states this rule for the PREVIOUS generation's bytes;
+		 * the failed generation's bytes need it for the same reason. (The g_free (cached) a few lines
+		 * up is on the pre-bind path, where re->batch was never published, and stays.) */
 	} else {
 		/* Hand the shared blob back so the driver can repoint each member's imethod at it. Leaving the
 		 * imethods pointing at their discarded standalone modules is not a dangling read -- batch_bind
