@@ -725,8 +725,25 @@ static void wj_promote_push (MonoMethod *m);
 static void
 wj_block_note (MonoMethod *callee)
 {
-	InterpMethod *cim = mono_interp_get_imethod (callee);
-	gint32 block_n = mono_atomic_inc_i32 (&cim->wasm_jit_block_n);
+	/* PEEK, NOT GET (2026-09-10). This is bookkeeping about a callee that is BY DEFINITION not
+	 * JITted yet -- exactly the population most likely to have no InterpMethod -- and
+	 * mono_interp_get_imethod CREATES one on a miss: m_method_alloc0 plus signature and type
+	 * resolution, on a worker, inside the compile section. That faulted with `memory access out
+	 * of bounds` through mini_get_underlying_type, 1 run in 14, symbolised to this line against
+	 * the split DWARF. Third site of the same family in one session; see
+	 * mono_wasm_jit_callee_perm_unjittable. No imethod means no block count to bump and nothing
+	 * to promote, so there is nothing to do here. */
+	InterpMethod *cim = mono_interp_peek_imethod (callee);
+	gint32 block_n;
+	if (!cim) {
+		/* Also the string deploy.sh proves this build by: wj_block_note itself is inlined away, so
+		 * its name is not in the wasm name section and cannot serve as a deploy marker. */
+		extern int mono_wasm_jit_verbose;
+		if (mono_wasm_jit_verbose >= 2)
+			printf ("WASM_JIT_BLOCK_NOTE_NO_IMETHOD (callee never prepared; nothing to count)\n");
+		return;
+	}
+	block_n = mono_atomic_inc_i32 (&cim->wasm_jit_block_n);
 	{
 		extern int mono_wasm_jit_block_force;
 		if (mono_wasm_jit_block_force > 0 && cim->wasm_jit_fslot <= 0 && cim->wasm_jit_slot != -1
@@ -2829,7 +2846,19 @@ static int
 wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_root)
 {
 	extern int mono_wasm_jit_island_depth;   /* Lever C: env-tunable recursion depth (default 10) */
-		InterpMethod *im = mono_interp_get_imethod (m);
+		/* NOT mono_interp_peek_imethod, and this was TRIED AND IT WEDGES BOOT (2026-09-10). The lookup
+	 * here looks like the pure read that wj_block_note's was -- it only tests wasm_jit_fslot and
+	 * wasm_jit_slot -- but mono_interp_get_imethod's CREATION is load-bearing: force_island's whole
+	 * job is to bring a blocker up, and a blocker that has no InterpMethod yet needs one made before
+	 * it can be compiled. Peeking and returning 0 ("transient, retry later") instead made islands
+	 * unable to ever close over a never-prepared callee, and boot wedged after javaMain in 3 of 3
+	 * runs -- no fault, no output, mode=null. Same edit applied to wj_waiter_register,
+	 * the callee loop below and wasm_jit_drain_promotions; all four are reverted.
+	 * So the compile-section rule is NOT "never call mono_interp_get_imethod here": it is that a
+	 * predicate whose ANSWER does not depend on creating one must not create one. This site's answer
+	 * does. The mono-internal-hash.c:47 abort it can still raise is UNFIXED and needs a different
+	 * shape -- most likely making the CREATION safe on a worker, not avoiding it. */
+	InterpMethod *im = mono_interp_get_imethod (m);
 	int tries, spos, pushed = 0, ret = 0;
 	if (im->wasm_jit_fslot > 0) return 1;          /* already JITted */
 	if (im->wasm_jit_slot == -1) return -1;        /* permanently bailed */
