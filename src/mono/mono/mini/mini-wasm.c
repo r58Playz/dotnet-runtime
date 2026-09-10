@@ -1071,7 +1071,7 @@ static gint32 wj_stack_probe_hits = 0;
  * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
  * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
  * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 162);   /* +ABI_MISMATCH_{UNREG,CHUNK,SIG} (R231: the unguarded name walk that trapped) */
+g_static_assert (WJC_MAX == 163);   /* +ABI_MISMATCH_IDENT (R234: the 32-bit functype hash is not an equality test) */
 
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
@@ -1111,8 +1111,9 @@ mono_wasm_jit_dump_stats (void)
 	/* The three causes wj_admit_dependencies used to collapse into one UNGATED printf whose name walk
 	 * trapped (R231). Non-zero is normal -- the refusal is recoverable and the next dispatch retries;
 	 * what matters is WHICH cause dominates, which is why they are split rather than summed. */
-	printf ("[wasm-jit abimismatch] unregistered=%lld chunk_missing=%lld sig_hash=%lld\n",
-		WJC_(WJC_ABI_MISMATCH_UNREG), WJC_(WJC_ABI_MISMATCH_CHUNK), WJC_(WJC_ABI_MISMATCH_SIG));
+	printf ("[wasm-jit abimismatch] unregistered=%lld chunk_missing=%lld sig_hash=%lld identity=%lld\n",
+		WJC_(WJC_ABI_MISMATCH_UNREG), WJC_(WJC_ABI_MISMATCH_CHUNK), WJC_(WJC_ABI_MISMATCH_SIG),
+		WJC_(WJC_ABI_MISMATCH_IDENT));
 	/* Fast-path VOLUME. These dispatches are pure emitted wasm and call no counting helper, so without
 	 * MONO_WASM_JIT_PROFILE_FAST=1 they are invisible and the counted totals above (invoked / fastvcall /
 	 * residual) understate real dispatch volume — frame cost then can't be attributed. The counters are
@@ -2525,7 +2526,27 @@ wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 				desc_id, i, ds->slot [i], dep_id,
 				dep_id > 0 && dep_id < wj_desc_state_cap ? wj_desc_state [dep_id] : -1,
 				dep ? mono_wasm_jit_slot_live (dep->e) : 0, dep ? mono_wasm_jit_slot_live (dep->f) : 0);
-		if (!dep_id || !dep || dep->f_sig_id != ds->sig [i]) {
+		/* IDENTITY, NOT JUST THE HASH.
+		 *
+		 * `f_sig_id` is FNV-1a over (nparams, params, ret) -- a 32-BIT value used as an equality test.
+		 * With ~30,000 registered methods the birthday probability of at least one collision in a run is
+		 * 1 - exp(-30000^2 / 2*2^32) ~= 10%, which is the same order as the observed
+		 * `function signature mismatch` trap rate. A collision means the caller's baked expectation and
+		 * whatever actually occupies the f-slot hash EQUAL while their functypes DIFFER, so admission
+		 * passes and the emitted `call_indirect` traps -- with no counter anywhere, because every guard
+		 * agreed.
+		 *
+		 * The depset already carries the method the caller resolved (`wj_depset_new(slots, sigs,
+		 * methods, n)`), and the registry knows what actually registered, so the exact test is available
+		 * for one pointer compare. Accept EITHER of logical/body method: they differ legitimately for
+		 * wrapper shapes (synchronized inner, etc.) and which one a call site resolved to is not
+		 * something to assume here. NULL expectation means the caller did not record one -- older
+		 * depsets -- so fall back to the hash alone rather than refusing everything. */
+		gboolean ident_bad = ds->method [i] && dep &&
+			dep->logical_method != ds->method [i] && dep->body_method != ds->method [i];
+		if (ident_bad)
+			mono_wasm_jit_counters [WJC_ABI_MISMATCH_IDENT]++;
+		if (!dep_id || !dep || dep->f_sig_id != ds->sig [i] || ident_bad) {
 			/* Disambiguate what the old print collapsed into "actual=0x0":
 			 *  cause=fslot-unregistered  — the baked dep f-slot has NO registry entry at all (a slot that
 			 *    was readable at emit time but whose registration never happened / was refused);
