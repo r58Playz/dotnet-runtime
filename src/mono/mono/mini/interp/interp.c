@@ -494,6 +494,27 @@ lookup_imethod (MonoMethod *method)
 	return imethod;
 }
 
+/* LOOKUP ONLY -- never creates, never asserts; see mono_wasm_jit_callee_perm_unjittable.
+ * mono_interp_get_imethod CREATES an InterpMethod on a miss (m_method_alloc0 +
+ * mono_method_signature_internal) and its lookup asserts `table->table != NULL`, so a memory manager
+ * whose interp_code_hash has never been initialised ABORTS THE PROCESS. Both behaviours are wrong for
+ * a predicate asked about an arbitrary callee on a worker inside the wasm JIT's compile section:
+ * "there is no InterpMethod" is the correct answer there, and creating one is a metadata mutation
+ * under the jit-mm lock that the emitter must not perform. */
+InterpMethod *
+mono_interp_peek_imethod (MonoMethod *method)
+{
+	MonoJitMemoryManager *jit_mm = jit_mm_for_method (method);
+	InterpMethod *imethod;
+
+	jit_mm_lock (jit_mm);
+	imethod = jit_mm->interp_code_hash.table
+		? (InterpMethod*) mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, method)
+		: NULL;
+	jit_mm_unlock (jit_mm);
+	return imethod;
+}
+
 InterpMethod*
 mono_interp_get_imethod (MonoMethod *method)
 {
