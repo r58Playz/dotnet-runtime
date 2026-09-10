@@ -427,6 +427,11 @@ mono_interp_transform_init (void);
 InterpMethod *
 mono_interp_get_imethod (MonoMethod *method);
 
+/* LOOKUP ONLY: the InterpMethod if one already exists, else NULL. Never creates, never asserts.
+ * For predicates asked about an arbitrary callee on a worker inside the wasm JIT compile section. */
+InterpMethod *
+mono_interp_peek_imethod (MonoMethod *method);
+
 /* out_why (optional) receives a WJ_PRED_* code saying why a refusal happened, for the emitter's
  * WJC_DEVIRT_* census; see the #define block above the definition in interp.c. */
 gboolean

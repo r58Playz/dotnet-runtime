@@ -10095,7 +10095,8 @@ mono_interp_transform_init (void)
 int
 mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 {
-	InterpMethod *im = mono_interp_get_imethod (method);
+	/* PEEK, not get: this runs on a worker inside the compile section. See mono_interp_peek_imethod. */
+	InterpMethod *im = mono_interp_peek_imethod (method);
 	/* Prefer the published (live) f-slot; else the reserved-but-unpublished slot of an SCC member currently
 	 * being batch-compiled, so mutually-recursive cycle members bake each other's f-slot at emit time. */
 	return im ? (im->wasm_jit_fslot > 0 ? im->wasm_jit_fslot : im->wasm_jit_resv_fslot) : 0;
@@ -10214,7 +10215,14 @@ mono_wasm_jit_reserve_self (MonoMethod *method, int *e_out, int *f_out)
 int
 mono_wasm_jit_callee_perm_unjittable (MonoMethod *method)
 {
-	InterpMethod *im = mono_interp_get_imethod (method);
+	/* PEEK, NOT GET (2026-09-10). mono_interp_get_imethod creates an InterpMethod on a miss and its
+	 * lookup asserts on an uninitialised interp_code_hash, and this predicate is called from
+	 * mono_wasm_emit_method about arbitrary callees on a worker -- which aborted the process at
+	 * mono-internal-hash.c:47 `table->table != NULL', 2 runs in 6, 2026-09-10. That is R152's fault
+	 * returning at a new call site. Note mini-wasm.c:12194-12209 already forbids exactly this for
+	 * get_callee_fslot and then lists THIS function among the "pure" predicates -- it was not pure.
+	 * No imethod means the callee has never been prepared, which is not `slot == -1', so 0 is right. */
+	InterpMethod *im = mono_interp_peek_imethod (method);
 	return (im && im->wasm_jit_slot == -1) ? 1 : 0;
 }
 
@@ -10234,7 +10242,9 @@ int
 mono_wasm_jit_callee_too_cold (MonoMethod *method)
 {
 	extern int mono_wasm_jit_thresh, mono_wasm_jit_block_promote, mono_wasm_jit_island_cold_div;
-	InterpMethod *im = mono_interp_get_imethod (method);
+	/* PEEK, not get -- same compile-section rule as mono_wasm_jit_callee_perm_unjittable. The existing
+	 * `!im -> definitively cold' arm below is already the right answer for a method with no imethod. */
+	InterpMethod *im = mono_interp_peek_imethod (method);
 	int cold_div, cold_thresh;
 	if (!im)
 		return 1;                          /* never executed -> definitively cold (one-shot residual) */
