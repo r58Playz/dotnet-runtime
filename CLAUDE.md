@@ -244,14 +244,53 @@ site is non-virtual, the target is non-virtual, or the target is FINAL — and I
 non-final Java method. Measured effect: bodies +4.4%, calls per method **+1.0%**. "More inlining" and "fewer
 calls" are not the same thing on a one-method-per-module tier.
 
-**Minecraft adds machinery worth x1.34** that a jbox2d kernel cannot exercise: MethodHandle/invokedynamic
-adapters 13.91%, our dispatch/IC/interp-boundary helpers 6.56%, Java type-check machinery 3.82%, class
+**Minecraft adds machinery worth x1.34** that a jbox2d kernel cannot exercise: the unresolved-member
+dispatch pool 13.91%, our dispatch/IC/interp-boundary helpers 6.56%, Java type-check machinery 3.82%, class
 loading/mixins 1.29%. The largest is IKVM's, not ours. 3.36 x 1.34 = **~4.5x explained work-rate gap**.
+(That first pool was originally labelled "MethodHandle/invokedynamic adapters" and **that label is wrong** —
+R225 §4: real `java.lang.invoke` is **0.168%**. It is IKVM's lazy-linking fallback for unloadable types, and
+Java has no `invokedynamic` for fields, which the `__field_NNNN` binders in the profile prove.)
 
-**The client-thread gap is >=11.1x.** Native Minecraft is 320 fps / 3.1 ms against our ~25 fps, but fps is set
-by ONE thread, so compare that thread: ours 88.9% of a core over 120.5 s / 3,081 frames = **34.8 ms**; native
-is GPU-bound at 91% GPU / 18% CPU so its CPU/frame is **< 3.125 ms**. *Native is GPU-limited; we are
-CPU-limited*, which makes a JVM-side fps A/B impossible here — cap `maxFps` and read CPU% instead.
+**The client-thread gap is ~30x in instructions and 18.6x in CPU — MEASURED, not a floor (R240).** The old
+`>=11.1x` was a lower bound only because native was GPU-bound with unknown CPU cost. With `maxFps` capped so
+the GPU is unsaturated, a matched native harness (`scratchpad/wj/nativemc/`) gives:
+
+| | ours | native | ratio |
+|---|---|---|---|
+| client thread, M instr/frame | 165.2 | 5.40 | **~30x** |
+| client thread, CPU ms/frame | 36.6 | 1.97 | 18.6x |
+| **client thread, instruction RATE** | **4.51 G/s** | **2.86 G/s** | **0.63x** |
+
+**We retire instructions FASTER than native and still need ~30x more of them.** IPC, caches, memory stalls
+and "wasm/V8 execute slowly" are excluded as explanations. **Stop quoting `>=11.1x`**; compare the CPU ratio,
+not the instruction ratio, against the 4.5x chain above, since that chain is built from time ratios.
+
+**Composition of our client thread, CURRENT build** (R240): IKVM machinery **32.9%**, our JIT helpers + mono
+runtime + GL + corlib **30.8%**, real Java 26.8%, chromium/libc 9.4%. On methods present in BOTH profiles we
+are 15.7x. `vcall_resolve_fslot` is **5.46 M instr/frame — still 1.0x native's ENTIRE client frame.**
+
+**Deleting ALL machinery on both sides still leaves 11.1x** (165.2 -> 60.0 -> 5.40), so the per-method term
+dominates and grows as machinery is harvested. **Always re-derive these shares on the build you are about to
+change**: the same buckets read 46.5% / 30.1% / 14.3% on the 2026-09-06 `base-client` census, and using those
+stale numbers oversized one lever by 2.8x. Three symbols went to ZERO between those builds (`call_interp`
+4.27 -> 0.00 M/f, `interp_entry` 2.06 -> 0.06, `set_il_offset` 1.69 -> 0.00) and `wj_prof_site` fell 18x.
+
+**HotSpot's own optimizations, measured on this workload (R240), cap whole categories:**
+
+| arm | client M instr/frame | vs stock |
+|---|---|---|
+| stock | 5.40 | 1.00x |
+| `novirt` (`-XX:TypeProfileWidth=0 -XX:-UseTypeProfile`) | 7.39 | **1.37x** |
+| `noinl` (`-XX:-Inline`) | 12.12 | **2.24x** |
+
+**A HotSpot with NO inliner is still 13.6x cheaper than us.** So the whole inlining family is worth at most
+2.24x and devirtualization 1.37x — real, but an order of magnitude short of the gap. R221 §2's 1.205x/1.132x
+were fps through a GPU ceiling and are superseded. **Do not lead a plan with inlining or devirt.**
+
+**Our per-method baseline, not our inlining, is the codegen problem.** Paired x86 (hsdis, R240):
+`class_2818::method_8320` is 64 B of bytecode -> HotSpot C2 928 B, HotSpot **no-inline 256 B**, ours
+**7,936 B with 162 calls, 47 indirect**. Inlining makes HotSpot's code BIGGER (256 -> 928) and faster, so the
+8.5x-vs-stock figure understates it: against a no-inline HotSpot we are **31x**.
 
 **TeaVM's OPTIMIZER is only 33% of its advantage.** Every pass off, TeaVM still runs 1.71x of HotSpot.
 Single-pass, checksum-gated: devirt +19.3%, inlining +13.0%, ScalarReplacement+RepeatedFieldRead +8.3%,
@@ -438,8 +477,18 @@ that looks like a runtime regression, check the build command before believing i
 
 ## Measurement discipline
 
-The box is an i7-1360P — a 28 W mobile part that throttles 2106 -> 1403 MHz *within a single run*, and it sits
-at ~95 C whenever the game is in-game. "Let it cool first" is not an available remedy.
+The box is an i7-1360P. It sits at ~95-98 C whenever the game is in-game, and that is the normal
+operating point of this cooling profile, **not** evidence that a measurement arm was slowed. **The
+"throttles 2106 -> 1403 MHz within a single run" claim is RETRACTED** (R227 addendum 3, re-confirmed
+2026-09-10): measured live during an in-game arm, the busy P-cores hold **3.6-3.7 GHz**. The old figure
+is an ALL-CORE number and this workload is not all-core — only two threads do work (R184), so Dell's
+~45 W BIOS PL1/PL2 spread over 2-3 active cores sustains near-peak clocks. (Do not read the RAPL zones:
+they report 256 W on a 28 W part because they are ineffective here.)
+
+**The rule splits by workload**: treat all-core work (builds, deploys) as power-limited and expect
+throttling; treat 2-3-core measurement arms as running at ~3.7 GHz. preflight's thermal warning is
+therefore uninformative on this box rather than merely unactionable. Ambient desktop load is the
+confound that IS real — preflight refusing an arm for that is worth obeying.
 
 * **fps is unusable on this box; composition SHARES are not.** Two control runs of an IDENTICAL config:
   `vcall_resolve_fslot` 4.723% / 4.683% (**0.8%**), `InstanceCheck` 2.642 / 2.658 (0.6%) — against **fps 15.10 /
@@ -452,7 +501,10 @@ at ~95 C whenever the game is in-game. "Let it cool first" is not an available r
 * **Run BOTH ORDERS.** Rounds 1-3 with arm A first gave non-overlapping ranges favouring A, 3/3 — reversing
   the order reversed the result, and the real rule was that **the arm running SECOND was slower in 6 of 6**.
   A single-order interleave cannot see that. **Never quote non-overlapping ranges from one order.** Use
-  `mcab.mjs --cooldown-ms` (240 s) before every arm; interleaving alone does not cancel the bias.
+  `mcab.mjs --cooldown-ms` before every arm; interleaving alone does not cancel the bias. **The 240 s
+  cooldown is mostly wasted** now that the thermal premise is retracted (~16 min per four-arm matrix);
+  R194's order effect stands as an OBSERVATION but its thermal explanation does not, so keep running
+  both orders and stop discounting single-order results as thermally confounded.
 * **Use plateau windows** (`--warm-ms 180000 --bench-ms 120000 --no-walk`). `--warm-ms` DEFAULTS TO 0, so a
   bare in-game window measures the RAMP: work per frame falls ~40% inside the first quarter of a 120 s
   "plateau" and is flat to ~7% after. Any historical A/B taken without `--warm-ms` was reading ramp position.
@@ -596,7 +648,9 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 | `perfrun.mjs` | Perf capture of one **jbox2d** bench run, producing the `.jitted` file the pattern/size readers take (the kernel-workload counterpart to `mcperf.mjs`) |
 | `seedbuild.mjs` | Rebuild `scratchpad/mcsr/seed` (see Housekeeping) |
 | `serve-coep.mjs` | Minimal static server with COOP/COEP headers |
-| `jvminline.sh`, `jvmfps.py` | HotSpot's inlining worth on the same workload; slice a MangoHud CSV to the bench window |
+| `nativemc/natrun.sh`, `natstat.py` | **The native reference.** Drives native OpenJDK Minecraft on the MATCHED Prism instance (same save, mods sha256-identical) and reports **M instructions/frame** per thread, the same metric as our side. `EXTRA_JAVA=` for ablation arms (`novirt`, `noinl`). Read its README before use: three defects in the old `jvminline.sh` and two Xwayland traps are documented there |
+| `nativemc/join.py`, `split.py` | Per-method join of an async-profiler collapsed profile against our census, on IKVM-preserved Java names; and the bucket split by whether a method exists on native at all |
+| `jvminline.sh`, `jvmfps.py` | **SUPERSEDED by `nativemc/`** — it reports fps (unusable) and its in-world gate polls `wpstateout.txt`, which state-output 1.2.3 never creates, so it can never pass |
 
 ### Capture readers
 
@@ -623,7 +677,7 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 | `wasmtier.mjs` | Snapshots the ENTIRE tier (~24-30k modules) as emitted bytecode over one automated run. Passes `dumps: true`, so **one run yields BOTH the call-form reach and the counter census** — pairing a reach number with a census from a different run is the same confound as a cross-binary reading |
 | `vcallreach.py` | Static virtual-dispatch census over a tier dump: sites split into Delegate.Invoke vs ordinary virtual, how many carry a devirt arm, and **what call form each arm dispatches with**. Self-validating — every body must decode to exactly its declared end, so **report the "undecoded" count**; a non-zero one means the rest is meaningless. This, not `hotinsn`, is the tool for "did a change alter call forms" |
 | `devirtreach.py`, `wjpatterns.py` | Static devirt COVERAGE over a dump; what share of module-local calls could V8 inline |
-| `tiershape.py` | **The refactor gate.** Per-method STRUCTURAL identity between two dumps (opcodes, type/function/local indices, branch depths, run-dependent immediates blanked). **Noise floor is measured: 0.15%** — 18 of 12,291 methods differ between two runs of the same binary, because a callee that JITs in one run and not the other changes its caller |
+| `tiershape.py` | **The refactor gate.** Per-method STRUCTURAL identity between two dumps (opcodes, type/function/local indices, branch depths, run-dependent immediates blanked). **Noise floor is ~0.7%, NOT the 0.15% this table used to claim** — measured 2026-09-11 against a same-binary CONTROL: **158 of 22,816** common methods differ between two runs of ONE binary. The old figure (18 of 12,291) is stale because the tier nearly doubled, and more methods means more callees that JIT in one run and not the other. **ALWAYS run a same-binary control pair alongside the A/B**: at 0.15% a verified-inert refactor reads as a 4x failure (R241 measured 0.63% against a 0.69% control). Also pass `--show` large — it prints ~20 diffs and truncates, and the visible ones are not a representative sample |
 | `tierid.py` | Per-method BYTE identity, as a SET comparison (a method can be emitted more than once per run, so one name maps to a set of hashes and two runs agree when the sets are equal). Complement to `tiershape.py`, not a replacement — a naive byte-identity gate does not work |
 | `tierdiff.py`, `tiergraph.py` | Aggregate shape between two dumps; duplication/fragmentation structure of the tier |
 | `bodysize.py`, `inlinable.py`, `bytecost.mjs`, `depcycles.py` | Per-function wire size and the share under V8's 500 B inline cap; how many sites batching made inlinable; whether module SIZE costs anything or only COUNT; co-location admission cycle sizes |
