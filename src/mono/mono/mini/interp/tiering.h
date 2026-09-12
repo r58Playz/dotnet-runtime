@@ -34,6 +34,8 @@ extern gint32 mono_interp_relink_replaced;
 extern gint32 mono_interp_relink_late;
 extern gint32 mono_interp_relink_untouched;
 extern gint32 mono_interp_relink_rejected;
+extern gint32 mono_interp_relink_bail_cleared;
+extern gint32 mono_interp_relink_refreshed;
 
 const guint16*
 mono_interp_tier_up_frame_enter (InterpFrame *frame, ThreadContext *context);

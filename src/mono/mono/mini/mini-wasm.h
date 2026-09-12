@@ -138,7 +138,7 @@ enum {
 	WJC_REGISTERED, WJC_BAILED, WJC_INVALID,
 	WJC_INVOKE, WJC_RESIDUAL, WJC_FASTVCALL,
 	WJC_AOT_ROUTED, WJC_INTERP_ROUTED,
-	WJC_VIC_HIT, WJC_VIC_MISS, WJC_VFAST_HAD, WJC_VFAST_NEW, WJC_VFB_THRESH, WJC_VFB_PERM, WJC_VSYNC_WORK,
+	WJC_VIC_HIT, WJC_VIC_MISS, WJC_VFAST_HAD, WJC_VFAST_NEW, WJC_VFB_THRESH, WJC_VFB_PERM,
 	WJC_VPERM_EH, WJC_VPERM_LDADDR, WJC_VPERM_LCMP, WJC_VPERM_OTHEROP, WJC_VPERM_OTHER,
 	/* NB: WJC_REF_HWM sat here and was REMOVED, shifting every counter below it down by one. It held the
 	 * high-water depth of the old ref shadow stack (wj_ref_sp - wj_ref_base, against WJ_REFSTACK_SLOTS),
@@ -151,7 +151,7 @@ enum {
 	WJC_BYTES_GENERATED, WJC_ELAPSED_GENERATION, WJC_ELAPSED_INSTANTIATION, WJC_COMPILE_ATTEMPTS,
 	/* island formation outcomes (Part 3b/5) */
 	WJC_ISLAND_ATTEMPT, WJC_ISLAND_COMPLETED, WJC_ISLAND_BUDGET_EXHAUSTED, WJC_ISLAND_DEPTH_EXCEEDED,
-	WJC_ISLAND_BLOCKED_PERM, WJC_ISLAND_BLOCKED_COLD, WJC_PROMOTED_UP, WJC_PROMOTED_DOWN,
+	WJC_ISLAND_BLOCKED_COLD, WJC_PROMOTED_UP, WJC_PROMOTED_DOWN,
 	/* finer split of the perm-unjittable vcall residual (was lumped into WJC_VPERM_OTHER): which override
 	 * shape dominates the steady-state virtual-dispatch boundary cost. SIG=arg/ret type; the rest as named.
 	 * AOT = the override is NOT wasm-jitted because it already has native AOT code (slot==-1, bail==0): the
@@ -216,11 +216,6 @@ enum {
 	 * Re-assembling a member counts it again, deliberately: the census is per module built, so comparing
 	 * it across generations is how a rebatch is shown to have actually retargeted anything. */
 	WJC_CALL_LOCAL, WJC_CALL_IMPORT, WJC_CALL_INDIRECT,
-	/* Admissions deferred because an IMPORTED dependency was still mid-DFS on this worker, so binding it
-	 * would have been a LinkError. Not a failure: the method runs interpreted and a later dispatch retries.
-	 * Read it against WJC_CALL_IMPORT -- a few per thousand imports is the ordering noise the retry exists
-	 * to absorb; a number near the import count means the graph is far more cyclic than assumed. */
-	WJC_ADMIT_DEFERRED,
 	/* Members re-framed into a shared module by mono_wasm_jit_colocate_deps_now, counted per GROUP FORMED
 	 * (a group of 4 adds 4). Read it against WJC_REGISTERED for the fraction of the tier that is co-located,
 	 * and against WJC_CALL_LOCAL for whether co-location actually retargeted any call. Those two can move
@@ -560,6 +555,91 @@ enum {
 	 * a slot holding mono_jiterp_placeholder_jit_call, which traps as `function signature mismatch`.
 	 * This is the first counter on that route; every ABI_MISMATCH_* guard reads 0 when it happens. */
 	WJC_ADMIT_DEP_NOT_LIVE,
+	/* --- R245: every refusal route counted ------------------------------------------------------
+	 *
+	 * WHY THIS BLOCK EXISTS. R244 measured `admitDepNotLive` at 13.6-22.8 MILLION per run against a
+	 * documented safe rate of "hundreds", with `registered` perfectly flat -- 26% of the client thread
+	 * and 39% of the server tick, invisible to every gate the harness has. Diagnosing it was only
+	 * possible because ONE of the refusal routes happened to have a counter. On HEAD that route is just
+	 * ~55% of `alAdmit0`; the rest went through exits with no counter at all, which is the failure shape
+	 * this file keeps warning about: an uncounted route does not show up as a gap, it shows up as
+	 * everything else looking smaller. So: every `return 0` on the admission path gets a counter, and
+	 * every exit of the SCC driver gets one, before anything about them is changed.
+	 */
+	/* The recursive admit of a dependency failed (wj_admit_dependencies' `if (!mono_wasm_jit_admit
+	 * (dep_id)) return 0;`). The dep's own refusal reason is counted at ITS exit, so this is the
+	 * propagation count, not a root cause -- read it as walk depth, not as a fault. */
+	WJC_ADMIT_DEP_ADMIT0,
+	/* mono_wasm_jit_admit's own early refusals, which had no counters at all. BAD_ID = desc_id out of
+	 * range; NO_ENTRY = no registry entry; PERMFAIL = state 3 with permfail >= WJ_PERMFAIL_MAX, i.e. the
+	 * R167 bound doing its job (non-zero here is HEALTHY, it is the alternative to a 959,405-refusal
+	 * hang). STATE3 = state 3 below the bound, still refusing. */
+	WJC_ADMIT_BAD_ID, WJC_ADMIT_NO_ENTRY, WJC_ADMIT_PERMFAIL, WJC_ADMIT_STATE3,
+	/* WJC_ADMIT_DEP_NOT_LIVE split by CAUSE, which is the whole diagnostic value. CYCLE = the dep was
+	 * admitted through mono_wasm_jit_admit's state-1 cycle break, which INSTALLS but never calls
+	 * wj_mark_slot_live -- so the liveness test below it can never pass and the refusal recurs on every
+	 * dispatch for the life of the process. That is R244's regression, and it is what this split exists
+	 * to make visible. PENDING = the ordinary transient case, a dep not yet installed here, which the
+	 * next dispatch genuinely can clear. If CYCLE dominates, the fix is structural, not a retry bound. */
+	WJC_ADMIT_DEP_NOT_LIVE_CYCLE, WJC_ADMIT_DEP_NOT_LIVE_PENDING,
+	/* Blocker list overflowed MONO_WASM_JIT_MAX_BLOCKERS (32) while the SCC member cap is 64, so the
+	 * closure handed to the batcher is INCOMPLETE. It then cannot close, hits !progress, and converts a
+	 * truncation into a permanent verdict for every member. blockers_truncated was written and read by
+	 * nobody before this. */
+	WJC_BLOCKERS_TRUNCATED,
+	/* --- the SCC batcher, which had ZERO counters -------------------------------------------------
+	 * Every outcome was a printf behind mono_wasm_jit_verbose, so its distribution was unobservable in
+	 * a --stats run and the whole-group condemnation below was never quantified. One per real exit. */
+	WJC_SCC_ATTEMPT, WJC_SCC_OK, WJC_SCC_MEMBERS,
+	WJC_SCC_BUSY,          /* lost the wj_compiling CAS; the caller retries                          */
+	WJC_SCC_TABLE,         /* all-or-nothing capacity gate refused (transient)                       */
+	WJC_SCC_BUDGET,        /* island budget exhausted mid-batch (transient)                          */
+	WJC_SCC_ALLOC_FAIL,    /* allocate_table_entry returned 0 (phase 0 or the phase-1 fold)          */
+	WJC_SCC_SEED_PERM,     /* a seed member was already permanently bailed                           */
+	WJC_SCC_TOO_LARGE,     /* closure exceeded WJ_SCC_MAX                                            */
+	WJC_SCC_NO_PROGRESS,   /* a member bailed with no growable blocker                               */
+	WJC_SCC_ITER_CAP,      /* fold loop hit its iteration cap without closing (transient)            */
+	/* MEMBERS MARKED PERMANENTLY BAILED BY A give_up ABORT -- including members that compiled fine.
+	 * The island driver fails the one callee and residual-routes the edge; the SCC condemns the whole
+	 * group. This is R166's "admit condemned whole groups" in a different function, and this counter is
+	 * how the two policies get compared before either is changed. */
+	WJC_SCC_CONDEMNED,
+	/* The compile registered into a DIFFERENT pair than the one reserved for it, so fellow members have
+	 * baked an f-slot that nothing will instantiate. Detected and printed unconditionally before this;
+	 * never counted, so its rate was unknown. */
+	WJC_SCC_RESV_BYPASS,
+	WJC_SCC_COLOCATE_OK, WJC_SCC_COLOCATE_FAIL,
+	/* Islands driven off the promotion queue rather than a threshold crossing. WJC_ISLAND_ATTEMPT /
+	 * _COMPLETED are bumped only from wasm_jit_maybe_compile, so every island the drain started was
+	 * invisible -- and the drain runs on every safe point with a FRESH budget per queue entry. */
+	WJC_ISLAND_DRAIN_ATTEMPT, WJC_ISLAND_DRAIN_COMPLETED,
+	/* R245 Stage 2. How often mono_wasm_jit_admit's DFS hit a back edge and took the cycle break, which
+	 * installs the descriptor's closure and returns 1 WITHOUT publishing liveness -- publishing is the
+	 * ancestor frame's job. Non-zero is normal and expected; it is how a dependency cycle terminates.
+	 *
+	 * It is counted because this path was invisible while it was the single largest cost in the tier: the
+	 * dependency test that follows it demanded LIVENESS, which the cycle break cannot provide by design,
+	 * so every cycle refused forever (72.5 M/run). That test now asks for INSTALLATION, which is what
+	 * generated code actually needs and what this path does provide. Read against ADMIT_DEP_NOT_LIVE:
+	 * cycle breaks should be common, and refusals should no longer follow from them. */
+	WJC_CYCLE_BREAK_INSTALL,
+	/* R245 Stage 2a. SPARED = members an SCC give_up abort did NOT condemn, because their own compile did
+	 * not fail permanently -- the population the old whole-group policy removed from the tier. Read it
+	 * against SCC_CONDEMNED: spared+condemned is every member of every aborted batch.
+	 *
+	 * PARK_NO_WAITER is the one that needs watching. A spared member is parked and PARKED is excluded
+	 * from wj_slot_hot_retry_eligible, so it never retries on its own -- it wakes only when a blocker
+	 * JITs. If it had no blockers to register on, nothing will ever wake it: a silent never-retry. This
+	 * counts exactly that case. NON-ZERO IS A PROBLEM, unlike most counters here. */
+	WJC_SCC_SPARED, WJC_SCC_PARK_NO_WAITER,
+	/* IKVM replaced this method's IL and generation 1 had permanently bailed; the -1 was dropped so the
+	 * emitter judges the NEW body (tiering.c). Non-zero is the healthy reading -- zero means either that
+	 * no swapped method had bailed, or that the swap path never ran at all. */
+	WJC_RELINK_BAIL_CLEARED,
+	/* MONO_WASM_JIT_RELINK_JITTED only: generation 1 was already live, so generation 2 started untried
+	 * with a fresh e/f pair rather than inheriting gen-1's. Zero with the knob on means the swap path
+	 * never reaches an already-JITted method, which would make the knob inert. */
+	WJC_RELINK_REFRESHED,
 	WJC_MAX
 };
 

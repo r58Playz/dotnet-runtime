@@ -963,6 +963,27 @@ wj_promote_push (MonoMethod *m)
 #define WASM_JIT_SLOT_PARKED (-2)
 #define WASM_JIT_SLOT_RETRY  (-3)
 
+/* THIS GATES THE HOTNESS COUNTER ON TABLE STATE, and that coupling is deliberate rather than accidental
+ * -- which is worth stating because it looks like a layering bug and R245 Stage 2c nearly "fixed" it.
+ *
+ * wasm_jit_slot carries two unrelated things: an e-slot table index (>0) and a tiering verdict (0 untried,
+ * -1 permanent, -2 waiter-parked, -3 transient retry). Because maybe_compile's gate is an && chain, a
+ * PARKED method stops accruing hits entirely. Decoupling them so hotness always accrued would re-arm the
+ * threshold for every parked method -- and parking is the ONLY thing stopping a compile storm, since a
+ * parked method is meant to wake from a waiter, not from the hit counter. Stage 2a widened the parked
+ * population (members are now spared rather than condemned), so loosening this would make it worse, not
+ * better.
+ *
+ * The two concrete harms Stage 2c named are fixed by other means: a per-worker instantiate failure no
+ * longer travels as a process-wide permanent bail (mini-wasm.c, WJC_INVALID path -> retriable), and table
+ * exhaustion is gated before allocation in both drivers. What remains is the field being overloaded,
+ * which is a readability problem, not a behavioural one. SPLITTING IT IS STAGE 1 WORK (the typestate): 97
+ * read/write sites across four files on the dispatch hot path, and doing it in the same build as three
+ * behavioural changes would make a wedge un-attributable. Do it with the typestate, alone, gated on
+ * tiershape against a same-binary control -- not opportunistically here.
+ *
+ * Before decoupling, WJC_SCC_PARK_NO_WAITER must read 0: it counts methods parked with nothing to wake
+ * them, which is the case that would genuinely need the hit counter back. */
 static inline gboolean
 wj_slot_hot_retry_eligible (gint32 slot)
 {
@@ -2548,7 +2569,12 @@ wj_blocker_too_cold (InterpMethod *cim, int depth, gboolean promoted_root)
  * in ONE emit cycle per layer rather than one re-emit PER blocking callee. Bounded by depth + a shared
  * compile budget so a pathological call graph can't run away. Returns the compile_publish code for m
  * (1/0/2/-1). */
-#define WASM_JIT_ISLAND_MAX_DEPTH 10
+/* NOT A DEPTH CAP, despite the name. Its one use is the `tries` loop bound in wasm_jit_force_island: how
+ * many times that function will RE-EMIT the same method after pulling blockers in. The actual recursion
+ * depth cap is mono_wasm_jit_island_depth (a knob; default at its initialiser in mini-wasm.c). Renaming it
+ * is a Stage-1 job -- flagged here rather than silently, because reading it as a depth cap makes the
+ * budget arithmetic in this function wrong by a factor of the re-emit count. */
+#define WASM_JIT_ISLAND_MAX_REEMITS 10
 
 /* Per-thread DFS stack of methods currently being force-compiled, used ONLY to recognise a call CYCLE (a
  * blocker that is an ancestor) so we can batch-compile the whole strongly-connected set. This is NOT the old
@@ -2562,10 +2588,24 @@ static __thread int wj_scc_n;
  * one-at-a-time under residual=0 — to emit A (which direct-calls B) B needs an f-slot, and vice versa, so
  * neither can be first. Reserve an e/f-slot pair for EVERY member up-front (published on the imethod, where
  * get_callee_fslot finds it), so each member's emit bakes the others' reserved f-slots. Then register all
- * (bytes land in wj_reg) BEFORE publishing any as invocable — the runtime's per-call ensure_fslot backstop
- * instantiates a specific registered slot on demand, so cross-cycle calls resolve regardless of order once
- * every member is registered; the only hard requirement is that no member is invocable (wasm_jit_slot set)
- * until all are registered. `members` points into wj_scc_stack. Returns compile_publish codes (1/0/2/-1). */
+ * (bytes land in wj_reg) BEFORE publishing any as invocable.
+ *
+ * WHAT MAKES THAT ORDERING SAFE, re-stated (R245). This comment used to credit "the runtime's per-call
+ * ensure_fslot backstop", which instantiated a specific registered slot on demand. THAT FUNCTION HAD NO
+ * CALLERS and has been deleted, so it never resolved anything and the argument it carried was never the
+ * real one. The actual guarantee is admission's and nothing else: a worker may not ENTER a member until
+ * mono_wasm_jit_admit has walked that member's dependency closure and installed every baked f-slot's
+ * module in this worker's table. Registration before publication is what makes that walk able to find
+ * the bytes; publication before registration would let a worker enter a member whose sibling is not yet
+ * in wj_reg, and the walk would have nothing to install.
+ *
+ * So the hard requirement is unchanged -- no member invocable until all are registered -- but it rests on
+ * the admission DFS, which means it inherits that DFS's known hole: the state-1 cycle break installs a
+ * dependency without publishing its liveness, so a caller admitted through it can still find the slot not
+ * live. That is the R244 refusal class, and it is a property of admission, not of this driver.
+ *
+ * `members` is a COPY of the seed segment, not a pointer into wj_scc_stack (see the copy loop below);
+ * the stack is only the cycle-detection scratch. Returns compile_publish codes (1/0/2/-1). */
 /* Retire a batch reservation without losing the slots.
  *
  * wasm_jit_resv_* has to be cleared the moment the batch ends, because mono_wasm_jit_get_callee_fslot hands
@@ -2600,13 +2640,17 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 	gboolean done [WJ_SCC_MAX];
 	int n, i, iter;
 	gboolean ok = TRUE, give_up = FALSE;   /* give_up: abort is terminal (perm dep / too big / stuck) vs transient (budget/table -> retry) */
+	gboolean trunc = FALSE;                /* any member's blocker list was clipped -> the closure was never complete */
 
 	if (n_init <= 0 || n_init > WJ_SCC_MAX)
 		return 0;
+	/* Counted BEFORE the CAS so the identity holds: attempt == ok + busy + table + budget + alloc +
+	 * seed_perm + too_large + no_progress + iter_cap. If it stops holding, an exit is uncounted. */
+	if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_ATTEMPT);
 	/* Serialize the whole batch: force_compile (unlike compile_publish) does NOT take wj_compiling; a nested
 	 * compile on another thread would corrupt the shared resv fields / slot allocation. Non-blocking: retry. */
 	if (mono_atomic_cas_i32 (&wj_compiling, 1, 0) != 0)
-		return WASM_JIT_COMPILE_BUSY;
+		{ if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_BUSY); return WASM_JIT_COMPILE_BUSY; }
 
 	n = n_init;
 	for (i = 0; i < n; i++) { members [i] = seed [i]; done [i] = FALSE; memset (&results [i], 0, sizeof (results [i])); }
@@ -2624,14 +2668,14 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 		}
 		if (need > mono_jiterp_table_remaining (1 /* JITERPRETER_TABLE_JIT_CALL */)) {
 			mono_wasm_jit_note_table_exhausted ();
-			ok = FALSE; goto out;
+			ok = FALSE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_TABLE); goto out;
 		}
 	}
 	/* Phase 0 — reserve a slot pair for every seed member so cross-cycle emits can bake each other's f-slot. */
 	for (i = 0; i < n; i++) {
 		InterpMethod *im = mono_interp_get_imethod (members [i]);
 		if (im->wasm_jit_fslot > 0) { done [i] = TRUE; continue; }
-		if (im->wasm_jit_slot == -1) { ok = FALSE; give_up = TRUE; goto out; }   /* seed member permanently un-JITtable -> can't close */
+		if (im->wasm_jit_slot == -1) { ok = FALSE; give_up = TRUE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_SEED_PERM); goto out; }   /* seed member permanently un-JITtable -> can't close */
 		if (im->wasm_jit_resv_fslot == 0) {
 			int e, f;
 			if (im->wasm_jit_self_resv_fslot > 0) {
@@ -2644,7 +2688,7 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 				if (e <= 0 || f <= 0) {
 					extern void mono_wasm_jit_note_table_exhausted (void);
 					mono_wasm_jit_note_table_exhausted ();
-					ok = FALSE; goto out;
+					ok = FALSE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_ALLOC_FAIL); goto out;
 				}
 			}
 			im->wasm_jit_resv_eslot = e; im->wasm_jit_resv_fslot = f;
@@ -2666,7 +2710,7 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 			all_done = FALSE;
 			im = mono_interp_get_imethod (members [i]);
 			if (im->wasm_jit_fslot > 0) { done [i] = TRUE; progress = TRUE; continue; }
-			if (*budget <= 0) { ok = FALSE; goto out; }
+			if (*budget <= 0) { ok = FALSE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_BUDGET); goto out; }
 			(*budget)--;
 			memset (&results [i], 0, sizeof (results [i]));
 			mono_wasm_force_compile (members [i], &results [i]);
@@ -2676,9 +2720,29 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 				 * registered under a fresh pair, e.g. a method-substitution losing the reservation key) is
 				 * the admit "fslot-unregistered" failure in the making; surface it at the source. */
 				if (im->wasm_jit_resv_fslot > 0 && results [i].f_slot != im->wasm_jit_resv_fslot) {
-					char *mn = mono_method_get_full_name (members [i]);
-					printf ("WASM_JIT_RESV_BYPASS %s reserved f=%d registered f=%d\n", mn, im->wasm_jit_resv_fslot, results [i].f_slot);
-					g_free (mn);
+					/* DETECTION WITHOUT MITIGATION, until R245 Stage 2d. This printed and then published
+					 * anyway. But fellow members have ALREADY BAKED the reserved f-slot as a
+					 * `call_indirect <const>`, and this member just registered under a different one --
+					 * so nothing will ever instantiate the slot they call, and admission refuses them
+					 * forever ("fslot-unregistered"). Publishing a batch known to be internally
+					 * inconsistent is strictly worse than not publishing it.
+					 *
+					 * Abort TRANSIENTLY instead: reservations are parked, the members keep whatever
+					 * standalone modules they already have, and the next attempt re-reserves cleanly.
+					 * give_up stays FALSE because nothing here says these methods cannot be JITted --
+					 * only that this attempt lost the reservation key.
+					 *
+					 * The printf is kept but stats-gated now; it walks mono_method_get_full_name, which
+					 * is a metadata operation on a worker inside the compile section (R199). */
+					if (G_UNLIKELY (mono_wasm_jit_stats)) {
+						char *mn = mono_method_get_full_name (members [i]);
+						mono_wasm_jit_count (WJC_SCC_RESV_BYPASS);
+						printf ("WASM_JIT_RESV_BYPASS %s reserved f=%d registered f=%d (batch aborted)\n",
+							mn, im->wasm_jit_resv_fslot, results [i].f_slot);
+						g_free (mn);
+					}
+					ok = FALSE;
+					goto out;
 				}
 				done [i] = TRUE; progress = TRUE; continue;
 			}
@@ -2688,24 +2752,39 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 				int j, seen = 0;
 				if (bim->wasm_jit_fslot > 0 || bim->wasm_jit_resv_fslot > 0) continue;   /* live or already a member */
 				if (bim->wasm_jit_slot == -1) {
-					/* The next emit can residual-route this permanent leaf.  Count that as
-					 * progress so the member is retried instead of poisoning the SCC. */
-					if (1) {   /* RESIDUAL_PERM ships 1: a PERMANENT blocker can never clear, so parking on it parks forever */ progress = TRUE; continue; }
-					ok = FALSE; give_up = TRUE; goto out;
+					/* The next emit can residual-route this permanent leaf. Count that as
+					 * progress so the member is retried instead of poisoning the SCC.
+					 * RESIDUAL_PERM was a knob and now ships unconditionally: a
+					 * PERMANENT blocker can never clear, so parking on it parks forever. The
+					 * un-taken `give up permanently` arm that used to sit here was dead code
+					 * behind `if (1)`. */
+					progress = TRUE; continue;
 				}
 				for (j = 0; j < n; j++) if (members [j] == bm) { seen = 1; break; }
 				if (seen) continue;
-				if (n >= WJ_SCC_MAX) { ok = FALSE; give_up = TRUE; goto out; }           /* closure too large -> abort (perm) */
+				if (n >= WJ_SCC_MAX) { ok = FALSE; give_up = TRUE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_TOO_LARGE); goto out; }           /* closure too large -> abort (perm) */
 				{ int e, f;
 				  if (bim->wasm_jit_self_resv_fslot > 0) {   /* reclaim a parked pair (see the abort path) */
 					e = bim->wasm_jit_self_resv_eslot; f = bim->wasm_jit_self_resv_fslot;
 				  } else {
+					/* Phase 0 gates the WHOLE seed against mono_jiterp_table_remaining before taking
+					 * anything, with the stated reason that "reserving until the table runs dry leaves
+					 * the batch half-reserved and burns every pair it did take (the allocator has no
+					 * free)". The fold below grows the batch well past that seed and had NO such check,
+					 * so the exact failure phase 0 is built to avoid could still happen here -- one pair
+					 * at a time. Check before taking, not after. (R245 Stage 2a.) */
+					extern int mono_jiterp_table_remaining (int type);
+					if (mono_jiterp_table_remaining (1) < 2) {
+						extern void mono_wasm_jit_note_table_exhausted (void);
+						mono_wasm_jit_note_table_exhausted ();
+						ok = FALSE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_TABLE); goto out;
+					}
 					e = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
 					f = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
 					if (e <= 0 || f <= 0) {
 						extern void mono_wasm_jit_note_table_exhausted (void);
 						mono_wasm_jit_note_table_exhausted ();
-						ok = FALSE; goto out;
+						ok = FALSE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_ALLOC_FAIL); goto out;
 					}
 				  }
 				  bim->wasm_jit_resv_eslot = e; bim->wasm_jit_resv_fslot = f; }
@@ -2713,10 +2792,21 @@ wasm_jit_compile_scc (MonoMethod **seed, int n_init, int *budget)
 				progress = TRUE;
 			}
 		}
+		/* A TRUNCATED BLOCKER LIST MUST NOT PRODUCE A TERMINAL VERDICT (R245 Stage 2a). MAX_BLOCKERS is
+		 * 32 against WJ_SCC_MAX 64, so a member with more distinct blockers than the array holds hands
+		 * this loop a closure it CANNOT close -- it folds what it can see, never reaches a fixpoint, and
+		 * falls into !progress below, which used to condemn every member permanently. That converts "the
+		 * report was clipped" into "these methods can never be JITted". blockers_truncated has been set
+		 * for this since it was written and read by nobody; R245 measured it at 43 per run. */
+		if (!all_done) {
+			int t;
+			for (t = 0; t < n; t++)
+				if (results [t].blockers_truncated) { trunc = TRUE; break; }
+		}
 		if (all_done) goto out;         /* ok stays TRUE */
-		if (!progress) { ok = FALSE; give_up = TRUE; goto out; }   /* stuck: a member bailed with no growable blocker (perm-ish) */
+		if (!progress) { ok = FALSE; give_up = !trunc; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_NO_PROGRESS); goto out; }   /* stuck: a member bailed with no growable blocker (perm-ish) */
 	}
-	ok = FALSE;   /* iteration cap hit without closing */
+	ok = FALSE; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_ITER_CAP);   /* iteration cap hit without closing */
 out:
 	if (ok) {
 		/* --- SCC CO-LOCATION, ALWAYS ON ---------------------------------------------------------
@@ -2772,15 +2862,19 @@ out:
 						results [idx [k]].bytes = bbytes;
 						results [idx [k]].bytes_len = blen;
 					}
+					if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_COLOCATE_OK);
 					if (mono_wasm_jit_verbose >= 1)
 						printf ("WASM_JIT_SCC_COLOCATED members=%d bytes=%d\n", bn, blen);
-				} else if (mono_wasm_jit_verbose >= 1) {
-					printf ("WASM_JIT_SCC_COLOCATE_FAIL members=%d (keeping standalone modules)\n", bn);
+				} else {
+					if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_COLOCATE_FAIL);
+					if (mono_wasm_jit_verbose >= 1)
+						printf ("WASM_JIT_SCC_COLOCATE_FAIL members=%d (keeping standalone modules)\n", bn);
 				}
 			}
 		}
 		/* Publish all. Every member is registered now, so once invocable a baked cross-cycle call_indirect
-		 * resolves via ensure_fslot. Set fslot before the wasm_jit_slot gate (cross-thread visibility). */
+		 * resolves when the caller's admission walk installs this member. Set fslot before the
+		 * wasm_jit_slot gate (cross-thread visibility). */
 		for (i = 0; i < n; i++) {
 			InterpMethod *im;
 			MonoJitMemoryManager *jit_mm = jit_mm_for_method (members [i]);
@@ -2797,6 +2891,7 @@ out:
 			im->wasm_jit_bytes = results [i].bytes;
 			im->wasm_jit_bytes_len = results [i].bytes_len;
 			mono_memory_barrier ();
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_MEMBERS);
 			im->wasm_jit_fslot = results [i].f_slot;
 			im->wasm_jit_desc = results [i].desc_id;
 			mono_memory_barrier ();
@@ -2810,21 +2905,60 @@ out:
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		for (i = 0; i < n; i++)
 			wj_waiter_drain (members [i]);
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_OK);
 		if (mono_wasm_jit_verbose >= 2) printf ("WASM_JIT_SCC_OK members=%d\n", n);
 		return WASM_JIT_COMPILE_JITTED;
 	}
-	/* Abort. Always clear reservations. If the abort is TERMINAL (give_up: a permanently un-JITtable dependency,
-	 * the closure exceeds the size cap, or a member is stuck), mark EVERY member permanent so they stop
-	 * re-attempting — no compile storm — and run in the interpreter, matching the stable pre-batch behaviour for
-	 * un-closeable cycles. If it is TRANSIENT (budget/table/iteration cap), leave them retriable so a later
-	 * attempt with fresh budget can close the cycle. Members already force-compiled into their reserved slots
-	 * stay registered-but-unpublished (a bounded one-time orphan; they never become invocable). */
+	/* Abort. Always clear reservations.
+	 *
+	 * FAIL THE MEMBER, NEVER THE GROUP (R245 Stage 2a). This loop used to mark EVERY member of a give_up
+	 * batch permanently un-JITtable -- `bail = -11; slot = -1` -- including members whose own compile had
+	 * succeeded, or which were never even attempted. The island driver, given the same situation, marks
+	 * only the offending callee and residual-routes that one edge. Two drivers, opposite policies, for
+	 * the same event; and this is R166's "admit condemned whole groups" in a different function.
+	 *
+	 * A member is condemned now only if ITS OWN compile produced a genuinely permanent bail: a non-zero
+	 * bail category that `retriable` does not claim back. A member that was never compiled has a zeroed
+	 * `results` entry and so is spared by construction, which is the case that used to hurt most.
+	 *
+	 * WHAT REPLACES CONDEMNATION AS THE STORM CONTROL is the waiter. A spared member returns retriable,
+	 * the caller parks it (WASM_JIT_SLOT_PARKED), and wj_slot_hot_retry_eligible excludes PARKED -- so it
+	 * stops accruing hotness and does NOT re-attempt on its own. It wakes only when a blocker JITs, which
+	 * is why every spared member with blockers is registered as a waiter on them here. The SCC driver
+	 * registered no waiters at all before this; only the island did.
+	 *
+	 * The residual risk is a member parked with NOTHING to wait on (no blockers recorded -- e.g. the
+	 * closure simply exceeded WJ_SCC_MAX). That is a silent never-retry, the same hazard the island has
+	 * on its budget-exhausted path, so it is COUNTED rather than assumed away: see WJC_SCC_PARK_NO_WAITER.
+	 *
+	 * MEASUREMENT CAVEAT: on the Minecraft workload every SCC failure arm reads 0 and sccCondemned is 0
+	 * (R245), so this path is latent and this change is NOT empirically verified -- it is a correctness
+	 * alignment, and its counters exist so the next run that does hit it says so. */
 	for (i = 0; i < n; i++) {
 		InterpMethod *im = mono_interp_get_imethod (members [i]);
+		gboolean own_perm;
 		wj_park_reservation (im);
-		if (give_up && im->wasm_jit_fslot <= 0) {   /* don't demote one that raced to live elsewhere */
-			im->wasm_jit_bail = -11;
+		if (im->wasm_jit_fslot > 0)
+			continue;                       /* raced to live elsewhere: never demote a live method */
+		own_perm = give_up && results [i].e_slot <= 0 && results [i].bail != 0 && !results [i].retriable;
+		if (own_perm) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_CONDEMNED);
+			im->wasm_jit_bail = (gint16) results [i].bail;
 			im->wasm_jit_slot = -1;
+		} else {
+			int b, woke = 0;
+			for (b = 0; b < results [i].nblockers; b++) {
+				MonoMethod *bm = results [i].blockers [b];
+				if (!bm || bm == members [i])
+					continue;
+				wj_waiter_register (bm, members [i]);
+				woke++;
+			}
+			if (G_UNLIKELY (mono_wasm_jit_stats)) {
+				mono_wasm_jit_count (WJC_SCC_SPARED);
+				if (!woke)
+					mono_wasm_jit_count (WJC_SCC_PARK_NO_WAITER);
+			}
 		}
 	}
 	mono_atomic_store_i32 (&wj_compiling, 0);
@@ -2866,7 +3000,7 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 	/* Push m so a deeper frame can see a cycle back to it (wj_scc_stack). */
 	spos = wj_scc_n;
 	if (wj_scc_n < WJ_SCC_MAX) { wj_scc_stack [wj_scc_n++] = m; pushed = 1; }
-	for (tries = 0; tries <= WASM_JIT_ISLAND_MAX_DEPTH; tries++) {
+	for (tries = 0; tries <= WASM_JIT_ISLAND_MAX_REEMITS; tries++) {
 		MonoWasmJitResult res;
 		int r, i, pulled = 0, min_cyc = -1;
 		if (*budget <= 0) { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BUDGET_EXHAUSTED); ret = 0; goto pop; }
@@ -2885,15 +3019,14 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 			cim = mono_interp_get_imethod (callee);
 			if (cim->wasm_jit_fslot > 0) continue;     /* already JITted (e.g. pulled via an earlier blocker's recursion) */
 			if (cim->wasm_jit_slot == -1) {
-				/* The emitter supports a residual call to a permanent leaf.  Re-emit m
-				 * now that the callee's terminal state is visible instead of making the
-				 * caller permanently un-JITtable as well. */
-				if (1) {   /* RESIDUAL_PERM ships 1: a PERMANENT blocker can never clear, so parking on it parks forever */ pulled++; continue; }
-				/* Callee can NEVER wasm-jit (slot==-1). Under residual=0 our island can't close around it: give up
-				 * PERMANENTLY and propagate a transitive-permanent sentinel (bail=-11) so OUR callers stop too. */
-				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BLOCKED_PERM);
-				im->wasm_jit_bail = -11;
-				ret = -1; goto pop;
+				/* The emitter supports a residual call to a permanent leaf. Re-emit m now that the
+				 * callee's terminal state is visible, instead of making the caller permanently
+				 * un-JITtable as well. RESIDUAL_PERM was a knob and now ships unconditionally.
+				 *
+				 * The arm this replaced -- propagate bail=-11 and mark the CALLER permanent too -- was
+				 * dead code behind `if (1)`, and it held the only bump of WJC_ISLAND_BLOCKED_PERM, which
+				 * is why that counter read 0 forever. Counter deleted with it. */
+				pulled++; continue;
 			}
 			for (j = 0; j < wj_scc_n; j++) if (wj_scc_stack [j] == callee) { on_stack = j; break; }
 			if (on_stack >= 0) {   /* callee is an ANCESTOR on the DFS path -> m..callee close a call cycle (an SCC) */
@@ -2925,9 +3058,10 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 					cim->wasm_jit_slot = -1;
 					wj_waiter_drain (callee);
 				}
-				/* Retry this method so RESIDUAL_PERM can route only that edge through interp. */
-				if (1) {   /* RESIDUAL_PERM ships 1: a PERMANENT blocker can never clear, so parking on it parks forever */ pulled++; continue; }
-				im->wasm_jit_bail = -11; ret = -1; goto pop;
+				/* Retry this method so the residual path can route only that edge through interp.
+				 * The `propagate permanence to the caller` arm below this was dead code behind
+				 * `if (1)`; RESIDUAL_PERM ships unconditionally. */
+				pulled++; continue;
 			}
 			if (_r == WASM_JIT_COMPILE_BUSY) { ret = _r; goto pop; }
 			if (_r > 0) { pulled++; if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_PROMOTED_DOWN); }
@@ -2986,9 +3120,18 @@ wasm_jit_drain_promotions (void)
 		if (pim->wasm_jit_fslot > 0 || pim->wasm_jit_slot == -1) continue;   /* already done / hopeless */
 		budget = mono_wasm_jit_island_budget;
 		{
-			int r = wasm_jit_force_island (pm, 0, &budget, TRUE);
-			int s = pim->wasm_jit_slot;
+			int r;
+			int s;
+			/* WJC_ISLAND_ATTEMPT/_COMPLETED are bumped only by wasm_jit_maybe_compile, so every island the
+			 * drain started was invisible -- and the drain runs on EVERY safe point with a FRESH budget per
+			 * queue entry, i.e. up to promotion_drain x island_budget force-compiles from one safe point.
+			 * Separate counters rather than reusing the threshold pair: these are a different population
+			 * with a different trigger, and merging them would hide which one is doing the work. */
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_DRAIN_ATTEMPT);
+			r = wasm_jit_force_island (pm, 0, &budget, TRUE);
+			s = pim->wasm_jit_slot;
 			if (r == WASM_JIT_COMPILE_JITTED) {
+				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_DRAIN_COMPLETED);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_PROMOTED_UP);
 			} else if (s > 0) {
 				/* Race: another thread published a real e-slot (>0) between our gate check and here. NEVER lower
@@ -6955,7 +7098,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 		wasm_jit_maybe_compile (imethod);
 	if (imethod->wasm_jit_fslot > 0) {
 		extern int mono_wasm_jit_admit_live (int desc_id);
-		/* Only return the f-slot if THIS thread actually instantiated that module. sync_thread can fail to
+		/* Only return the f-slot if THIS thread actually instantiated that module. Admission can fail to
 		 * instantiate on a worker (OOM/CompileError under pressure) while it succeeded on the compiling
 		 * thread; the slot then holds a jiterpreter placeholder and call_indirect-ing it traps the worker.
 		 * Fall through to the interp residual (call_interp) instead.
@@ -6976,7 +7119,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			return imethod->wasm_jit_fslot;
 		}
 	}
-	/* RE-WRITE the resolved target AFTER the (re-entrant) wasm_jit_maybe_compile + mono_wasm_jit_sync_thread
+	/* RE-WRITE the resolved target AFTER the (re-entrant) wasm_jit_maybe_compile + admission walk
 	 * above. Those can drive a NESTED wasm-JIT vcall (the compile/instantiate runs cctors / class setup ->
 	 * managed code), and that nested call reuses THIS per-thread scratch buffer, overwriting scratch+200 with
 	 * its OWN target. The fallback below (vcall_aot_target reads scratch+200 to pick the AOT body; call_interp
@@ -8807,73 +8950,6 @@ mono_wasm_jit_aot_call_target (MonoMethod *method, gpointer *out_addr, gpointer 
 	return TRUE;
 }
 
-/* Called from JITted code immediately before a direct JIT->JIT f-slot call_indirect, to GUARANTEE the
- * callee's module is instantiated in THIS thread's (per-thread) wasm function table. The wasm table is
- * per-thread for dynamic entries; sync_thread is supposed to populate the whole prefix before a method
- * runs, but a self-compiled/island-run caller (or a sync watermark gap) can leave an earlier-registered
- * callee as the jiterpreter placeholder on this worker (mono_jiterp_placeholder_jit_call,
- * (i32,i32,i32,i32)->void) — call_indirect-ing it is a signature-mismatch trap that silently kills the
- * worker. Unlike the invoke/vcall paths (which check slot_live and fall back to the interp), the direct
- * call had no guard. This instantiates the SPECIFIC callee module via its imethod, regardless of the
- * sync watermark (so it is robust even when sync_thread's fast path would skip it), then returns so the
- * caller can proceed with the now-safe direct call_indirect. No-op (one branch) once the slot is live. */
-void
-mono_wasm_jit_ensure_fslot (MonoMethod *callee, int fslot)
-{
-	extern int mono_wasm_jit_slot_live (int slot);
-	extern int mono_wasm_jit_instantiate_fslot (int fslot);
-	extern int mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
-	extern int mono_wasm_jit_verbose;
-	if (G_LIKELY (mono_wasm_jit_slot_live (fslot)))
-		return;
-	/* (1) AUTHORITATIVE: instantiate this specific slot from the module registry (wj_reg). Immune to the racy
-	 * per-imethod fields and to the sync-break ordering — this is the robust common path. */
-	if (mono_wasm_jit_instantiate_fslot (fslot)) {
-		static int _ok = 0;
-		if (mono_wasm_jit_verbose >= 1 && _ok++ < 80) {
-			char *fn = mono_method_get_full_name (callee);
-			printf ("WASM_JIT_ENSURE fslot=%d %s (registry-instantiated before direct call)\n", fslot, fn);
-			g_free (fn);
-		}
-		return;
-	}
-	/* (2) FALLBACK for registry OVERFLOW (WJ_REG_MAX): past the cap, mono_wasm_jit_register drops the entry
-	 * but compile_publish still sets im->wasm_jit_{slot,fslot,bytes,len} — so the method is JITted yet absent
-	 * from wj_reg, and the registry path above misses it. Instantiate from the imethod fields (the only
-	 * source for an overflow method; stable since it was published long before this caller baked fslot). */
-	{
-		InterpMethod *im = mono_interp_get_imethod (callee);
-		if (im && im->wasm_jit_slot > 0) {
-			mono_memory_barrier ();   /* ACQUIRE vs compile_publish's release of slot LAST -> bytes/len coherent */
-			void *bytes = im->wasm_jit_bytes;
-			int len = im->wasm_jit_bytes_len;
-			int fs = im->wasm_jit_fslot;
-			if (bytes && len > 0 && len < (16 * 1024 * 1024) && fs > 0) {
-				char eb [192]; eb [0] = 0; double ms = 0;
-				if (mono_wasm_jit_instantiate_local (im->wasm_jit_slot, fs, bytes, len, eb, (int) sizeof (eb), &ms)
-						&& mono_wasm_jit_slot_live (fslot)) {
-					static int _of = 0;
-					if (mono_wasm_jit_verbose >= 1 && _of++ < 80) {
-						char *fn = mono_method_get_full_name (callee);
-						printf ("WASM_JIT_ENSURE fslot=%d %s (imethod-fallback; not in registry, overflow?)\n", fslot, fn);
-						g_free (fn);
-					}
-					return;
-				}
-			}
-		}
-	}
-	/* (3) genuinely could not make the slot live (OOM/CompileError on this worker, or torn bytes): the direct
-	 * call_indirect that follows WILL trap on the jiterpreter placeholder. Name the method so it is
-	 * diagnosable instead of a bare "function signature mismatch". (Accepted: no per-call interp fallback.) */
-	{ static int _f = 0;
-	  if (_f++ < 80) {
-		char *fn = mono_method_get_full_name (callee);
-		printf ("WASM_JIT_ENSURE_UNRESOLVED fslot=%d %s : slot not live; direct call will trap\n", fslot, fn);
-		g_free (fn);
-	  } }
-}
-
 #endif
 
 static MONO_NEVER_INLINE void
@@ -10112,8 +10188,8 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
  *
  * Falls through when the callee has no published slot (stays interp-resident). Jumps to
  * FALLBACK_LABEL when the slot is published but THIS thread failed to instantiate the module
- * (sync_thread can fail on a worker under memory pressure while it succeeded on the compiling
- * thread; the per-thread slot then holds a jiterpreter placeholder of a different signature and
+ * (admission can fail to instantiate on a worker under memory pressure while it succeeded on the
+ * compiling thread; the per-thread slot then holds a jiterpreter placeholder of a different signature and
  * call_indirect-ing it traps + kills the worker — mono_wasm_jit_admit gates that).
  *
  * Plain braces, NOT do{}while(0): MINT_IN_BREAK is `break` under switch dispatch and must break

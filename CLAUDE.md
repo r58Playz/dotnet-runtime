@@ -121,8 +121,16 @@ DFS is to install a method's complete direct-call closure *before* that method m
 * Proving a dependency is the right method with the right ABI is **not** the same as proving its slot is
   installed on this worker. Both must be checked, and the one that matters at runtime is
   `mono_wasm_jit_slot_live(<the f-slot the caller baked>)`.
-* Refusing admission is **recoverable and normal**: return 0, state 0, and the next dispatch retries. Refusals
-  in the hundreds per run cost nothing measurable as long as `registered` stays flat.
+* Refusing admission is **recoverable and normal**: return 0, state 0, and the next dispatch retries — but
+  **only for a TRANSIENT condition, and the retry rate is not self-limiting.** "Refusals in the hundreds per
+  run cost nothing" was this file's claim and **R244 measured 14-23 MILLION per run**
+  (`admitDepNotLive`, 99.97% of all refusals), costing 26% of the client thread and 39% of the server tick,
+  with `registered` perfectly flat the whole time. A refusal discards the entire DFS walk and the next
+  dispatch redoes it, so **routing a PERMANENT condition into the retry path spins forever.** The specific
+  trap: `mono_wasm_jit_admit(dep)` has already installed the dep at its CURRENT f-slot by the time
+  `mono_wasm_jit_slot_live(ds->slot[i])` tests the slot the CALLER BAKED — if the callee re-registered, that
+  slot can never become live. **Before adding a refusal, decide whether its condition can ever clear, and
+  count it; `registered` staying flat is not evidence of health.**
 
 ### The prefilled placeholder — `table[fslot] != null` is NOT a liveness test
 
@@ -230,14 +238,20 @@ We are **3.36x off HotSpot** and **2.40x TeaVM on the same V8**.
 
 **x1.85 is not a pass-configuration gap.** Diffed against mono's `DEFAULT_OPTIMIZATIONS` we ADD `SSA`,
 `ABCREM`, `FLOAT32`; the only thing mono native has that we could have is `PEEPHOLE`, which V8 subsumes. So
-it is backend OUTPUT quality — shadow GC frame, dispatch machinery, the `s.p` chain, 28.1 locals/function, no
+it is backend OUTPUT quality — shadow GC frame, dispatch machinery, the `s.p` chain, no
 cross-module inlining. **We ARE the middle end**: we emit wasm as the LLVM path does and V8 does register
 allocation, so mono's native-minijit row does not bound us.
 
-**The tier does not run at -O0.** The runtime initialiser returns 0 when `MONO_WASM_JIT_OPT` is unset, but
-**the consumer overrides it**: `ikvmcraft/frontend/src/dotnet/index.ts` sets
-`opt: "inline,consprop,copyprop,deadce,branch,cfold,loop,alias-analysis,ssa,abcrem"`. The knob is spelled
-`opt`, so grepping the consumer for `MONO_WASM_JIT_OPT` finds nothing.
+**The tier does not run at -O0, and the CONSUMER no longer sets this.** The default string is baked into the
+runtime at `mini.c:3258-3259` — `"inline,consprop,copyprop,deadce,branch,cfold,loop,alias-analysis,ssa,abcrem"`
+— parsed by `wasm_jit_extra_opt()` (`mini.c:3241-3306`) and applied at `mini.c:3514` as a REPLACEMENT of
+`cfg->opt`, not a filter. `index.ts`'s `wasm_jit` object is now nearly empty ("the runtime's defaults are the
+product's defaults"); grepping ikvmcraft for `consprop` finds nothing. Two things in that string are inert:
+**`loop` never runs LICM** — `mono_ssa_loop_invariant_code_motion`'s single call site (`mini.c:4095`) is gated
+on `COMPILE_LLVM`, forced FALSE for us — and `alias-analysis` is locals-only (`alias-analysis.c:3`), so it
+does nothing for the heap accesses where our load gap against TeaVM lives. The only real mono flag we could
+enable and do not is `AGGRESSIVE_INLINING`; `PEEPHOLE`/`SCHED`/`LEAF`/`SSAPRE` are unreachable or have zero
+implementation behind them.
 
 **`MONO_OPT_INLINE` does not reach the Java call graph.** `method-to-ir.c:8198` admits a candidate only if the
 site is non-virtual, the target is non-virtual, or the target is FINAL — and IKVM emits `callvirt` for every
@@ -265,9 +279,49 @@ the GPU is unsaturated, a matched native harness (`scratchpad/wj/nativemc/`) giv
 and "wasm/V8 execute slowly" are excluded as explanations. **Stop quoting `>=11.1x`**; compare the CPU ratio,
 not the instruction ratio, against the 4.5x chain above, since that chain is built from time ratios.
 
-**Composition of our client thread, CURRENT build** (R240): IKVM machinery **32.9%**, our JIT helpers + mono
-runtime + GL + corlib **30.8%**, real Java 26.8%, chromium/libc 9.4%. On methods present in BOTH profiles we
-are 15.7x. `vcall_resolve_fslot` is **5.46 M instr/frame — still 1.0x native's ENTIRE client frame.**
+**MEASURE ON THE SERVER TICK, NOT THE CLIENT FRAME (R244).** Native's client frame is only **2.80 of its
+5.17 M/f** of actual Java — the rest is Mesa 0.99, OpenAL 0.48, libm/libc 0.38 — so every "x native" ratio
+computed against 5.17 understates the managed gap. Our client thread is likewise diluted by ~35 M instr/frame
+of GL stack, chromium and V8 that is out of scope. **Native's server tick is 94% real Java** (9.99 of 10.61
+M/tick) and ours carries no GL, no chromium and no `Unsafe` traffic, so it decomposes cleanly.
+**Current SHIPPED build (2026-09-12, `ship-baseline`, R245 admission fix + `IKVM_LAZY_SIG=1` +
+`MONO_WASM_JIT_RELINK_JITTED=1`): whole thread 16.2x = 2.3x machinery x 7.6x codegen** -- 172.0 M/tick,
+real Java 76.35 against native's 9.99. The path there, same instrument and workload: **32.8x** (with the
+R244 admission regression) -> **18.2x** (fixed) -> **16.5x** (`LAZY_SIG`) -> **16.2x** (`RELINK_JITTED`).
+
+**Skipped ticks are the outcome metric to quote alongside it, and they moved further than the ratio did:
+519-527 per 120 s window -> 40.** M instr/tick divides by EXECUTED ticks, so it partly hides a server
+that is failing to keep up; the skip count does not. Where two arms complete the same tick count, compare
+raw G instructions instead -- that is the only fully unconfounded row.
+
+**Re-derive this split on the build you are about to change** -- and pick the server tid EXPLICITLY.
+`nativemc/buckets.py` falls back to the `realize_glenv` marker when `--tid` is omitted, which selects the
+CLIENT thread; dividing client instructions by TICKS silently reports a plausible number for the wrong
+thread. `nativemc/servertid.py` resolves it by which symbols the thread actually ran (both busy threads
+are named `DedicatedWorker`, so ranking by CPU does not identify them). Use
+`nativemc/buckets.py --ticks` and `nativemc/join.py --thread "Server thread"`. Two gotchas: the server tick is
+**not actually 20 Hz for us** (376 of 2,406 ticks skipped in a window; native skips zero), and `join.py` must
+select the ONE tid perf counted — three threads are named `Render thread`.
+
+**THE PER-METHOD GAP IS NOT UNIFORM — it spans 2x to 40x** (R244, server-tick join, 390 matched, 7.2x on
+matched mass): `TickEntryQueue.setTickAtIndex` **2x**, `selectTicks` 10x, `class_3215.method_12121` 26x,
+`class_2945.method_12783` 39x. Near-parity methods EXIST, so "the managed model costs 7x" is a mean over a
+wide distribution, not a tax, and the 30-40x tail has a findable cause. Bound every such row: HotSpot inlines,
+so `ABSENT` means "the cost is not there", not "it never ran", and rows past ~20 rest on single-digit samples.
+
+**Composition of our client thread** (R240, 2026-09-10 build): IKVM machinery **32.9%**, our JIT helpers +
+mono runtime + GL + corlib **30.8%**, real Java 26.8%, chromium/libc 9.4%. On methods present in BOTH profiles
+we are **13.5x — not the 15.7x R240 published**, which was inflated ~20% by the pooled-Render-thread bug
+(R244). Note this census is task-clock and its build already carried R244's admission regression.
+
+**Four pools nothing had named, client thread, 2026-09-07** (R244): `sun.misc.Unsafe` emulation **11.7 M/f**
+(no fast path at all — every `putInt` stackallocs, binary-searches the field table, then reflectively
+read-modify-writes the whole field, inside an exception filter); the GL stack **25.0 M/f vs native's 1.12,
+~22x**, of which 8.64 is the per-GL-call boundary inside the chromium binary (WebGL validation + GPU command
+buffer 41.6%, typed-array views over wasm memory 22.8%, V8<->Blink dispatch 13.5%); monitors **5.0 M/f**; real
+`java.lang.invoke` **3.8 M/f = 2.29%**, counting the whole adapter chain (`MethodHandleUtil/DynamicMethodBuilder`,
+`DMH.`/`BMH.`, `PairwiseConvert`) — R225's 0.168% counted only symbols literally named `java.lang.invoke.*`
+and is a strict subset, not a contradiction.
 
 **Deleting ALL machinery on both sides still leaves 11.1x** (165.2 -> 60.0 -> 5.40), so the per-method term
 dominates and grows as machinery is harvested. **Always re-derive these shares on the build you are about to
@@ -296,7 +350,14 @@ were fps through a GPU ceiling and are superseded. **Do not lead a plan with inl
 Single-pass, checksum-gated: devirt +19.3%, inlining +13.0%, ScalarReplacement+RepeatedFieldRead +8.3%,
 all-off +33.1%. So call lowering dominates among passes (~25% net) but passes are the minority term. The rest
 is architecture: one closed-world module compiled ahead of time, no runtime tiering, no GC shadow frame, no
-interpreter boundary, no IC dispatch, and **4.2 declared locals per function against our 28.1**.
+interpreter boundary, no IC dispatch, and 4.2 declared locals per function against our 28.1. **Do NOT cite
+that last pair as codegen quality (R244):** ~22 of our 28 are a FIXED scaffolding block
+(`mini-wasm.c:8290-8378` — dispatch/IC/delegate/EH/addr slots) declared in every function including a
+one-line setter, whose measured floor is 23 locals. The vreg-derived count is ~6, i.e. ~1.4x TeaVM, and
+locals are a WIRE-SIZE question only. There is also no register allocator in this path at all —
+`mono_local_regalloc`/`mono_linear_scan`/`mono_arch_allocate_vars` are all excluded for `COMPILE_WASM`, so
+V8 allocates and the 39.7% `mov` share answers to call density and to the per-def GC shadow-frame mirror
+(`mini-wasm.c:4716-4756`: 4 wasm ops + a store on every def of every reference), not to our local assignment.
 **Devirt and inlining are MUTUALLY REDUNDANT** — TeaVM's emitted `call_indirect` count is 35 baseline, 33 with
 inlining off, 176 with devirt off, **791 with both off** — so never measure one alone and call it "the value
 of devirtualization". Three passes mono lacks entirely: `Devirtualization` (no CHA), `ScalarReplacement`/
@@ -408,6 +469,9 @@ point of it.
 | local renaming, coalescing, `local.tee`, copy-chain elimination as *runtime* levers | V8 source proves local ops are free; these are wire-size only |
 | helper-import cap | not binding: max 30 declared in any hot module, median 3, cap 192 |
 | `IKVM_LAZY_BODIES=0` | 11.2% WORSE; the shipped setting is already optimal |
+| `MONO_WASM_JIT_RELINK_JITTED=0` (refusing an IKVM body swap once the wasm JIT compiled generation 1) | **NOW SHIPS 1** (R252). The refusal was too strong: gen-1's emitted code stays CORRECT after a swap, so gen 1 is left live at its own f-slot and gen 2 registers into a **FRESH e/f pair** -- nothing republishes a live slot, which is what every wedge in the deleted re-emission subsystem traced to. Worth **-5.2%** server tick (430.7 -> 408.3 G instructions over an identical 2,406 ticks), IKVM `late` 619 -> 37, installs 3,250 -> 3,750. **No cost bucket rose** (`our JIT tier helpers` FELL 15.86 -> 14.83) because the swaps happen during world load: `relinkRefreshed` 574/run, only **4 in-game**. The INTERPRETER half of that refusal stays unconditional -- tier-up across two different ILs asserts in `lookup_patchpoint_data` |
+| carrying a gen-1 PERMANENT bail into gen 2 as a lever | **MEASURES ZERO** (R252). `WJC_RELINK_BAIL_CLEARED` is 0 over a full run: IKVM's relink hook IS the method's first execution, where a method is untried or already live, so the `-1` state is never reached there. The arm is kept and the zero recorded at the site -- without the counter it would read as a shipped fix forever |
+| `IKVM_LAZY_SIG=0` (refusing lazy-body candidates whose signature carries an unloadable) | **NOW SHIPS 1** (R251). Admitting them is worth **-9.5% server tick, -52% skipped ticks, +14.4% ticks completed**, both orders, n=2/arm, non-overlapping. Dispatch pool 47.9 -> 36.4 M/tick, type-check pool 11.6 -> 7.3 (generation 2 emits a plain checkcast where generation 1 needed the dynamic chain). **The 2026-09-10 arm that measured this a WASH is superseded, not contradicted**: it ran on the build carrying the R244 admission regression, so its +3.993 admission / +3.321 interpreter loss was mostly the regression. Residual churn on the fixed build is +0.8 M/tick, 8:1 against the win |
 | `__<>DynamicBinder__` receiver castclass | load-bearing — the adapter's cast *is* the type check; removing it turns a ClassCastException into memory corruption |
 | shrinking `__<>MHC` stubs as a ~6% lever | their `call_indirect` density is cold alternative dispatch routes, one of which runs per invoke |
 | `MONO_WASM_JIT_INLINE_ILOFS=1` | 9.8% worse on p50 at ±1.1% |
@@ -418,8 +482,8 @@ point of it.
 | `MONO_WASM_JIT_THREAD_SP` (threading the frame pointer as a parameter) | **REFUTED, R218.** jbox2d, 6 rounds both orders, checksum-gated, tier fully alive: median **1.2485 -> 1.7375 ms/step, +39.2%**, non-overlapping 6/6. The plan's reasoning — "params are `local.get`, which is free" — conflates two things: `local.get` of an EXISTING local is free; ADDING A PARAMETER is an argument materialisation at every call site plus one more live incoming value in every callee, on a tier already at 32.21% register pressure. **Price a calling-convention change at the CALL SITES, never as a local-op count.** (`s.p` traffic is 4.4-5.3% of window and threading removes only 1 of its 3 ops.) If revisited, the parameter must go TRAILING — a leading param shifts every argument index the prologue pin stores read |
 | `MONO_WASM_JIT_STABLE_IC_IDS` | reusing the profile record's id makes two sites in one method that call the same base share a PIC slot — 6,345 emissions per boot. Ships 0 |
 | `MONO_WASM_JIT_DELEGATE_OBJ_PIC` (object-keyed delegate cache) | **R193: works and is not worth it.** Miss-path publications 88,209,759 -> **1,996** (44,000x) while the emitted stub shrinks **1,311 -> 1,289 B (-1.7%)** — the `wj_slot_live` probe costs back what the site-id derivation saved, and that probe is unavoidable because the cached f-slot NUMBER is process-wide while its INSTALLATION is per worker. Sized before spending an arm: ~4.8% of delegate dispatches were missing the recipe, so the ceiling is ~0.26% of window. Ships 0 |
-| `MONO_WASM_JIT_REEMIT` (re-emission with a matured profile) | **Mechanism sound, population wrong, and now throughput-bound.** Re-emitted bodies reach 54.7% devirt coverage against 28.1% run-wide, but are 2.25% of sites, so run-wide coverage moves ~+0.6 pts. What binds, in order: **drain reach** (56,667 queued vs ~5,800 gated) > **compile-lock contention** (`busy=5,134` vs `done=189`) > co-location conflict (`batched=496`). Note the trigger must not key off `wasm_jit_invoke_in`, which is incremented only under `mono_wasm_jit_stats` — any arm run without `--stats` measures nothing. `MONO_WASM_JIT_COLOCATE_DEPS=0` + re-emission WEDGES (2 of 2). Ships 0 |
-| module batching **as it was originally built** | measured negative four times (-26.6%, -35.7%, -13.0%, regression) for two mechanical reasons, and BOTH are now gone: producing a batched body cost a full `mini_method_compile` per member (bodies are now relocatable and re-framing is a memcpy), and the planner planned a plateau ONCE, on a quiescence this workload never reaches. Do not re-run the OLD arms or re-tune `batch_max`/`batch_bytes` (measured non-binding). **Co-location ships ON** (`MONO_WASM_JIT_COLOCATE_DEPS=1`) |
+| `MONO_WASM_JIT_REEMIT` (re-emission with a matured profile) | **Mechanism sound, population wrong, and now throughput-bound.** Re-emitted bodies reach 54.7% devirt coverage against 28.1% run-wide, but are 2.25% of sites, so run-wide coverage moves ~+0.6 pts. What binds, in order: **drain reach** (56,667 queued vs ~5,800 gated) > **compile-lock contention** (`busy=5,134` vs `done=189`) > co-location conflict (`batched=496`). Note the trigger must not key off `wasm_jit_invoke_in`, which is incremented only under `mono_wasm_jit_stats` — any arm run without `--stats` measures nothing. `MONO_WASM_JIT_COLOCATE_DEPS=0` + re-emission WEDGED (2 of 2) — **but that arm can no longer be run: there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no such variable anywhere in the tree (R245). Co-location is unconditional.** Ships 0 |
+| module batching **as it was originally built** | measured negative four times (-26.6%, -35.7%, -13.0%, regression) for two mechanical reasons, and BOTH are now gone: producing a batched body cost a full `mini_method_compile` per member (bodies are now relocatable and re-framing is a memcpy), and the planner planned a plateau ONCE, on a quiescence this workload never reaches. Do not re-run the OLD arms or re-tune `batch_max`/`batch_bytes` (measured non-binding). **Co-location is UNCONDITIONAL** — R245 verified there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no variable behind it, so the `=1`/`=0` arms this file used to describe are not performable. Same for `MONO_WASM_JIT_SCC_COLOCATE`, which several comments still offer as an in-binary A/B. `COLOCATE_MERGE` and `COLOCATE_MAX` are real |
 | **co-location as a route to "most dispatch is a direct call"** | CLOSED ON STRUCTURE (R195). The reachable set is only the devirt predicted arms — both `WASM_RELOC_CALL` sites are gated on the callee already having an f-slot, so a callee un-JITted at emit time has NO hole and only RE-EMISSION can convert it. Arm-local plateaus ~30% because **co-location is a PARTITION and the arm graph is not partitionable**: if two callers hold arms on the same target, only one can have it co-resident. Proof it is the partition and not tuning: surviving refusals are **100% caps, 0 rules**, and doubling `COLOCATE_MAX` bought **+1.5 points**. `max=64`+`bytes=131072` also CRASHES (undiagnosed); `max=32` is clean. The mechanism that bypasses a partition is DUPLICATION — shadow copies |
 | **SCC co-location as a source of reach** | 7 modules / 24 members per boot against a ~24,000-method tier. Cycles are rare on this workload. Kept as a CORRECTNESS mechanism (an intra-cycle import cannot be ordered), never as a performance lever |
 | shadow copies — cap sweeps (`WJ_SHADOW_MAX`, `MONO_WASM_JIT_SHADOW_BYTES`) | **CLOSED after ranking, R201/R202.** SELECTION ORDER was the real variable: ranking candidates by **sites/bytes descending** gives 63.7% arm-local with 2.8% FEWER bodies than encounter order at identical caps. After that, raising the caps drove `ShadowCap` to 0 and conversion did **not** move — with ranked selection the candidate SUPPLY is exhausted. **A cap closed as "non-binding" is closed only for the population it was measured on** — an earlier sweep saw 169 shadows where the current stack has 23,202, and its closure had to be retracted. Ships `MONO_WASM_JIT_SHADOW=0`; plateau is ~63% arm-local ≈ ~54% of executed dispatch direct, at **+50% bodies**, and the timing cost of that is still unpriced |
@@ -523,7 +587,8 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
   cannot support a 4% claim however tidy the mechanism sounds.
 * **Count ABSOLUTE quantities, not shares of a moving denominator.** Every mechanism in the direct-call path
   changes the NUMBER of arms, so "arm-local %" moves with its own denominator and reads as an effect. A
-  matched pair on `colocate_deps`: OFF looks better at 74.6% vs 58.3% arm-local, but ON produces **13,697
+  matched pair on `colocate_deps` (an arm that **can no longer be run** — R245: the knob does not exist):
+  OFF looked better at 74.6% vs 58.3% arm-local, but ON produced **13,697
   local arms against 12,041** — 13.7% MORE direct calls. The same trap retired three separate conclusions in
   one session. A larger tier is also usually MORE METHODS COMPILED, not bloat — check the module count before
   reading MB as waste. Tier size varies run to run (28,110 vs 30,893 modules), so do not rank two configs on
@@ -648,8 +713,9 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 | `perfrun.mjs` | Perf capture of one **jbox2d** bench run, producing the `.jitted` file the pattern/size readers take (the kernel-workload counterpart to `mcperf.mjs`) |
 | `seedbuild.mjs` | Rebuild `scratchpad/mcsr/seed` (see Housekeeping) |
 | `serve-coep.mjs` | Minimal static server with COOP/COEP headers |
-| `nativemc/natrun.sh`, `natstat.py` | **The native reference.** Drives native OpenJDK Minecraft on the MATCHED Prism instance (same save, mods sha256-identical) and reports **M instructions/frame** per thread, the same metric as our side. `EXTRA_JAVA=` for ablation arms (`novirt`, `noinl`). Read its README before use: three defects in the old `jvminline.sh` and two Xwayland traps are documented there |
-| `nativemc/join.py`, `split.py` | Per-method join of an async-profiler collapsed profile against our census, on IKVM-preserved Java names; and the bucket split by whether a method exists on native at all |
+| `nativemc/natrun.sh`, `natstat.py` | **The native reference.** Drives native OpenJDK Minecraft on the MATCHED Prism instance (same save, mods sha256-identical) and reports **M instructions/frame** per thread, the same metric as our side. `EXTRA_JAVA=` for ablation arms (`novirt`, `noinl`). Read its README before use: three defects in the old `jvminline.sh` and two Xwayland traps are documented there, and `results/HARNESS-DEFECTS-2026-09-11.md` for the five that were live in these tools until R244 |
+| `nativemc/join.py`, `split.py` | Per-method join of an async-profiler collapsed profile against our census, on IKVM-preserved Java names; and the bucket split by whether a method exists on native at all. `--thread "Server thread"` selects the clean instrument. **Both resolve the ONE tid perf counted out of the sibling `perf.txt`** — three threads are named `Render thread` and pooling them deflated every native figure 16.7% (R244) |
+| `nativemc/buckets.py` | **Per-BUCKET instructions/frame (or per tick) for one of our threads, against native's WHOLE frame.** The framing that stops a 7%-of-thread pool reading as small. Refuses to run on a task-clock capture. `--show <bucket>` prints a bucket's symbols — **use it before quoting the table**; it found six classifier misses on its own first run |
 | `jvminline.sh`, `jvmfps.py` | **SUPERSEDED by `nativemc/`** — it reports fps (unusable) and its in-world gate polls `wpstateout.txt`, which state-output 1.2.3 never creates, so it can never pass |
 
 ### Capture readers
