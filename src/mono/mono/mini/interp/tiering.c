@@ -1,4 +1,7 @@
 #include "tiering.h"
+/* For WJC_RELINK_BAIL_CLEARED: the body swap drops generation 1's permanent bail and that has to be
+ * countable from the harness like every other tier decision. */
+#include "../mini-wasm.h"
 #include <mono/utils/mono-threads-api.h>
 
 static mono_mutex_t tiering_mutex;
@@ -152,6 +155,8 @@ gint32 mono_interp_relink_replaced;
 gint32 mono_interp_relink_late;      /* already tiered or already wasm-JITted: refused, not failed */
 gint32 mono_interp_relink_untouched; /* never transformed, so the next call picks up the new header */
 gint32 mono_interp_relink_rejected;  /* shape/signature mismatch -- an IKVM bug if it ever fires */
+gint32 mono_interp_relink_bail_cleared; /* gen-1 had permanently bailed; gen-2 gets a fresh verdict */
+gint32 mono_interp_relink_refreshed;    /* gen-1 was live; gen-2 starts untried with a fresh slot pair */
 
 static void
 patch_imethod_refs (InterpMethod *old_imethod, InterpMethod *new_imethod)
@@ -206,6 +211,9 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 
 	MonoJitMemoryManager *jit_mm = jit_mm_for_method (target);
 	InterpMethod *old_imethod, *new_imethod;
+	/* Set when generation 1 was already live in the tier, so generation 2 must NOT inherit its slots. */
+	gboolean fresh_slots = FALSE;
+	extern int mono_wasm_jit_relink_jitted;
 
 	jit_mm_lock (jit_mm);
 	old_imethod = (InterpMethod *)mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, target);
@@ -217,17 +225,40 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 		return 1;
 	}
 
-	/* REFUSE anything already promoted, and count it. A tiered imethod is reachable through
-	 * optimized_imethod and through patchpoints inside running frames; a wasm-JITted one has emitted
-	 * code and an f-slot that other modules may already have baked as a direct call. Neither is
-	 * something a body swap may invalidate from here, so the method keeps generation 1 -- which is
-	 * exactly today's behaviour for it, hence a refusal and not a regression. */
-	if (old_imethod->optimized || old_imethod->optimized_imethod ||
-	    old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0) {
+	/* REFUSE anything the INTERPRETER has promoted, always. A tiered imethod is reachable through
+	 * optimized_imethod and through patchpoints inside running frames, and tier-up migrates a frame
+	 * between two compilations of the SAME IL -- these would be two compilations of DIFFERENT IL, which
+	 * asserts in lookup_patchpoint_data and relocates the frame onto a different stack layout. There is
+	 * no version of that which is merely slow, so this half is not knob-able. */
+	if (old_imethod->optimized || old_imethod->optimized_imethod) {
 		jit_mm_unlock (jit_mm);
 		mono_atomic_inc_i32 (&mono_interp_relink_late);
 		return 0;
 	}
+
+	/* The WASM-JIT half is a different question, and the answer this used to give was too strong. It
+	 * refused because "an f-slot other modules may have baked as a direct call cannot be invalidated
+	 * from here" -- true, and it does not need to be. Generation 1's emitted code stays CORRECT after
+	 * the swap: it is a compilation of the same Java method, merely one that still goes through the
+	 * dynamic-dispatch helpers. So generation 1 is left installed and live at its own f-slot forever,
+	 * and generation 2 registers into a FRESH e/f pair (mono_wasm_jit_register already supports a
+	 * method re-registering; it refuses only a slot owned by a DIFFERENT method). Callers that baked
+	 * gen-1's f-slot, and callers that co-located gen-1's body, keep reaching gen-1 -- slower, never
+	 * wrong -- until they are themselves re-emitted.
+	 *
+	 * THIS IS THE DISTINCTION THAT KILLED THE OLD RE-EMISSION SUBSYSTEM: its wedges all trace to
+	 * REPUBLISHING a live slot, after which a thread could enter a slot it had never instantiated and
+	 * hit the jiterpreter prefill (`function signature mismatch`). Nothing here republishes.
+	 *
+	 * Cost is two leaked table entries per swapped method -- the allocator has no free -- against
+	 * ~68k spare of a 131,072-entry table, for a population of ~736 per in-game window. */
+	if ((old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0) &&
+	    !mono_wasm_jit_relink_jitted) {
+		jit_mm_unlock (jit_mm);
+		mono_atomic_inc_i32 (&mono_interp_relink_late);
+		return 0;
+	}
+	fresh_slots = (old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0);
 
 	((MonoMethodWrapper *)target)->header = new_header;
 
@@ -250,11 +281,59 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	 * provably 0 here (refused above), but the hotness counter, the call profile and BOTH reservation
 	 * pairs must survive: the function-table allocator has no free, so dropping a parked pair leaks two
 	 * entries per method, silently, for exactly the methods that were about to get hot. */
-	new_imethod->wasm_jit_slot = old_imethod->wasm_jit_slot;
-	new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;
-	new_imethod->wasm_jit_fslot = old_imethod->wasm_jit_fslot;
+	/* A PERMANENT BAIL DOES NOT SURVIVE A BODY SWAP. wasm_jit_slot == -1 is a verdict the emitter
+	 * reached about generation 1's IL, and generation 1's IL is precisely what this function is
+	 * replacing -- so carrying it forward condemns a body the emitter has never seen, permanently
+	 * (interp.c's `if (im->wasm_jit_slot == -1) return -1` is checked on every route into the tier).
+	 * The correlation runs the wrong way to leave alone: a gen-1 body bails on constructs that
+	 * generation 2 exists to REMOVE, so the methods most likely to be carrying -1 are the ones with
+	 * the most to gain from being re-judged.
+	 *
+	 * Only the permanent verdict is dropped, and only here -- get_tier_up_imethod's copy above is a
+	 * compilation of the SAME IL, where the verdict still binds. PARKED/RETRY are kept too: they
+	 * describe the callee graph, not this body's compilability. The hotness counter, the call profile
+	 * and BOTH reservation pairs below are properties of the METHOD rather than of a compilation and
+	 * must survive regardless; the function-table allocator has no free, so dropping a parked pair
+	 * leaks two entries per method.
+	 *
+	 * Safe to reset the pair together: the refusal above guarantees wasm_jit_fslot <= 0 here, and
+	 * wasm_jit_desc is only ever written alongside a successful registration (interp.c:2502, :2896,
+	 * transform.c:10368), which a -1 method by definition never reached.
+	 *
+	 * MEASURED ZERO -- KEPT DELIBERATELY, DO NOT RE-DERIVE. WJC_RELINK_BAIL_CLEARED is 0 over a full
+	 * boot+worldgen+ingame run (2026-09-12), i.e. this arm never executes. The reasoning that predicted
+	 * otherwise -- "gen-1 bails on constructs gen-2 removes, so the -1 population is exactly the one
+	 * with the most to gain" -- is sound about which methods WOULD benefit and wrong about when the swap
+	 * happens: IKVM's relink hook IS the method's first execution, where the method is either untried
+	 * (slot 0) or already live (slot > 0, the fresh_slots arm above). Reaching -1 first needs a
+	 * force-compiled island callee that bailed AND is then swapped, and that intersection is empty here.
+	 * The arm stays because the transition it forbids is wrong if it ever does occur, and it costs one
+	 * compare; the counter stays because a 0 here is the only thing that distinguishes "cannot happen"
+	 * from "silently stopped happening". */
+	if (fresh_slots) {
+		/* Generation 1 is LIVE and stays that way. Handing its e/f pair or its descriptor to generation 2
+		 * is what would turn this into slot republication; leaving them zero makes generation 2 an
+		 * ordinary untried method that will allocate its own pair when it gets hot. */
+		new_imethod->wasm_jit_slot = 0;
+		new_imethod->wasm_jit_bail = 0;
+		new_imethod->wasm_jit_desc = 0;
+		new_imethod->wasm_jit_fslot = 0;
+		mono_atomic_inc_i32 (&mono_interp_relink_refreshed);
+		mono_wasm_jit_count (WJC_RELINK_REFRESHED);
+	} else if (old_imethod->wasm_jit_slot == -1) {
+		new_imethod->wasm_jit_slot = 0;
+		new_imethod->wasm_jit_bail = 0;
+		new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;
+		new_imethod->wasm_jit_fslot = old_imethod->wasm_jit_fslot;
+		mono_atomic_inc_i32 (&mono_interp_relink_bail_cleared);
+		mono_wasm_jit_count (WJC_RELINK_BAIL_CLEARED);
+	} else {
+		new_imethod->wasm_jit_slot = old_imethod->wasm_jit_slot;
+		new_imethod->wasm_jit_bail = old_imethod->wasm_jit_bail;
+		new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;
+		new_imethod->wasm_jit_fslot = old_imethod->wasm_jit_fslot;
+	}
 	new_imethod->wasm_jit_hits = old_imethod->wasm_jit_hits;
-	new_imethod->wasm_jit_bail = old_imethod->wasm_jit_bail;
 	new_imethod->wasm_jit_invoke_in = old_imethod->wasm_jit_invoke_in;
 	new_imethod->wasm_jit_invoke_out = old_imethod->wasm_jit_invoke_out;
 	new_imethod->wasm_jit_block_n = old_imethod->wasm_jit_block_n;
