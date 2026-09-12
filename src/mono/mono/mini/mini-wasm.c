@@ -1076,6 +1076,12 @@ g_static_assert (WJC_MAX == 164);   /* +ADMIT_DEP_NOT_LIVE (R239: admission's co
 EMSCRIPTEN_KEEPALIVE void
 mono_wasm_jit_dump_stats (void)
 {
+	/* BUILD MARKER. deploy.sh proves a fresh runtime is in front of the browser by grepping the SERVED
+	 * bytes for a string constant, and a refactor that adds no string has nothing to prove itself with --
+	 * a static function's name can be inlined away and then never appears in the name section. This line
+	 * exists for that, and it is printed rather than merely declared so it cannot be dropped as unused.
+	 * Bump the tag whenever a runtime change needs to be provably deployed. */
+	printf ("[wasm-jit build] wjbuild-slotliveprobe2\n");
 	printf ("[wasm-jit stats] registered=%lld bailed=%lld invalid=%lld invoked=%lld residual=%lld fastvcall=%lld (counting %s)\n",
 		WJC_(WJC_REGISTERED), WJC_(WJC_BAILED), WJC_(WJC_INVALID),
 		WJC_(WJC_INVOKE), WJC_(WJC_RESIDUAL), WJC_(WJC_FASTVCALL),
@@ -4529,6 +4535,40 @@ wj_emit_aot_call (WasmBuf *b, gpointer addr, guint32 type_idx)
 	wasm_reloc (b, WASM_RELOC_AOT, type_idx, (guint32) (intptr_t) addr, NULL);
 }
 
+/* INLINE f-SLOT LIVENESS PROBE. Pushes i32 1 if THIS worker installed a function at `fslot_idx`, else 0.
+ *
+ * PER-WORKER INSTALLATION. The recipe's f-slot number is process-wide; whether this worker put a function
+ * there is not, and `table[fslot] != null` is NOT the test -- the jiterpreter PREFILLS the range with a
+ * callable placeholder whose (i32,i32,i32,i32)->void body writes 999 through its fourth argument. This
+ * probes the per-thread bitmap instead; it is monotone, so no seqlock and no atomics.
+ *
+ * Extracted because it was emitted IDENTICALLY at two sites (the delegate devirt arm and the delegate PIC
+ * arm) and because it is one of the highest-frequency emitted sequences in the tier (repeats.py, R240
+ * addendum 3). Naming it is the precondition for ever emitting it differently -- per module, or not at all
+ * once a callee is known co-located. */
+static void
+wj_emit_slot_live_probe (WasmBuf *b, int fslot_idx, int cap_idx, int ptr_idx)
+{
+	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) fslot_idx);
+	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) cap_idx);
+	wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, 0);
+	wasm_op (b, WASM_OP_I32_LT_U);
+	wasm_op (b, WASM_OP_IF); wasm_u8 (b, (guint8) WASM_I32);
+		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) ptr_idx);
+		wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, 0);
+		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) fslot_idx);
+		wasm_i32_const (b, 3); wasm_op (b, WASM_OP_I32_SHR_U);
+		wasm_op (b, WASM_OP_I32_ADD);
+		wasm_op (b, WASM_OP_I32_LOAD8_U); wasm_memarg (b, 0, 0);
+		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) fslot_idx);
+		wasm_i32_const (b, 7); wasm_op (b, WASM_OP_I32_AND);
+		wasm_op (b, WASM_OP_I32_SHR_U);
+		wasm_i32_const (b, 1); wasm_op (b, WASM_OP_I32_AND);
+	wasm_op (b, WASM_OP_ELSE);
+		wasm_i32_const (b, 0);
+	wasm_op (b, WASM_OP_END);
+}
+
 /* A multi-value block type, which is a type index too and moves for exactly the same reason. */
 static void
 wj_emit_blocktype (WasmBuf *b, guint32 type_idx)
@@ -6134,6 +6174,17 @@ wj_member_from_body (WjAsmMember *m, WjBody *b, int f_slot)
 /* Resolve one body's holes. Called twice per member (method body, then entry thunk) in exactly the order
  * the emitter produced them, because import slots are assigned on first use and that order is what makes a
  * single-member module byte-identical to what the pre-relocation emitter emitted. */
+/* Of the three FIXED-INDEX reloc kinds, which may become a declared import rather than a constant-index
+ * `call_indirect`? This is the ONLY behavioural difference between them; everything else about the three
+ * is population labelling (a C runtime helper, an AOT body, or the never-converted remainder -- the
+ * runtime JIT-icall and the residual throw continuation). Stated once, here, so the resolve switch does
+ * not carry three near-identical arms that invite exactly the silent merge R121 got caught doing. */
+static gboolean
+wj_reloc_fixed_importable (WasmRelocKind k)
+{
+	return k == WASM_RELOC_HELPER || k == WASM_RELOC_AOT;
+}
+
 static void
 wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int self_index,
                      const WjAsmMember *mem, int n, const WasmFuncType *self_types,
@@ -6166,18 +6217,26 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			fix [k].idx = (guint32) self_index;
 			continue;
 		case WASM_RELOC_HELPER:
-			/* MONO_WASM_JIT_HELPER_IMPORTS gated this and shipped 1. Its losing arm kept helper calls as
-			 * `i32.const <table index>; call_indirect`, which pays a table bounds check, a canonical-type
-			 * check and index arithmetic a declared import does not -- V8 does NOT fold a constant
-			 * call_indirect index into a direct call. Both forms still end in an indirect branch (R158),
-			 * so this is worth a few instructions per helper call, not a call-form change. Settled. */
-			slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
-			break;
-		case WASM_RELOC_HELPER_CI:
-			break;
 		case WASM_RELOC_AOT:
-			/* MONO_WASM_JIT_AOT_IMPORTS, same story as HELPER above: shipped 1, settled. */
-			slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
+		case WASM_RELOC_HELPER_CI:
+			/* ONE FIXED FUNCTION-TABLE INDEX. All three encode identically; they differ in exactly one
+			 * bit -- whether the site may become a declared import -- which wj_reloc_fixed_importable
+			 * answers, plus which population they belong to for the census.
+			 *
+			 * MONO_WASM_JIT_HELPER_IMPORTS and MONO_WASM_JIT_AOT_IMPORTS gated the importable two and
+			 * both shipped 1. The losing arm kept those calls as `i32.const <table index>;
+			 * call_indirect`, which pays a table bounds check, a canonical-type check and index
+			 * arithmetic a declared import does not -- V8 does NOT fold a constant call_indirect index
+			 * into a direct call. Both forms still end in an indirect branch (R158), so this is worth a
+			 * few instructions per call, not a call-form change. Settled.
+			 *
+			 * DO NOT COLLAPSE THE KINDS THEMSELVES. R121 folded HELPER_CI in with HELPER and silently
+			 * converted it; the tier-shape gate caught 14,583 of 22,547 common methods changing
+			 * structure in a refactor that was supposed to change none. The kinds are the population
+			 * labels and the predicate is the behaviour -- keeping them separate is what makes this
+			 * arm's unification provably inert. */
+			if (wj_reloc_fixed_importable ((WasmRelocKind) r->kind))
+				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
 			break;
 		case WASM_RELOC_CALL:
 			/* A JITted callee is either CO-LOCATED -- a module-local `call <funcidx>`, one x86
@@ -12471,24 +12530,7 @@ vcall_nullchk_done:
 									 * test -- the jiterpreter PREFILLS the range with a callable placeholder whose
 									 * (i32,i32,i32,i32)->void body writes 999 through its fourth argument. Same
 									 * bitmap the shared arm probes; monotone, so no seqlock and no atomics. */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
-									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-									wasm_op (&body, WASM_OP_I32_LT_U);
-									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
-										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
-										wasm_op (&body, WASM_OP_I32_ADD);
-										wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
-										wasm_op (&body, WASM_OP_I32_SHR_U);
-										wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);
-									wasm_op (&body, WASM_OP_ELSE);
-										wasm_i32_const (&body, 0);
-									wasm_op (&body, WASM_OP_END);
+									wj_emit_slot_live_probe (&body, vc_fslot_idx, slotlive_cap_idx, slotlive_ptr_idx);
 									wasm_op (&body, WASM_OP_I32_EQZ);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									wj_emit_fast_count (&body, WJC_DELEGATE_IC_HIT);
@@ -12683,24 +12725,7 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_I32_NE);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									/* Per-thread f-slot liveness/admission gate. */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_cap_idx);
-									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-									wasm_op (&body, WASM_OP_I32_LT_U);
-									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) slotlive_ptr_idx);
-										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
-										wasm_op (&body, WASM_OP_I32_ADD);
-										wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
-										wasm_op (&body, WASM_OP_I32_SHR_U);
-										wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);
-									wasm_op (&body, WASM_OP_ELSE);
-										wasm_i32_const (&body, 0);
-									wasm_op (&body, WASM_OP_END);
+									wj_emit_slot_live_probe (&body, vc_fslot_idx, slotlive_cap_idx, slotlive_ptr_idx);
 									wasm_op (&body, WASM_OP_I32_EQZ);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 								    }
