@@ -130,8 +130,16 @@ mono_threads_state_poll_with_info (MonoThreadInfo *info);
  * until the first rendezvous, so a run that never republishes pays that and nothing else. */
 extern void mono_wasm_jit_rendezvous_drain (void);
 #define MONO_WASM_JIT_RENDEZVOUS_DRAIN() mono_wasm_jit_rendezvous_drain ()
+/* The JIT's emitted safepoints do not load mono_polling_required any more. They load a PER-WORKER action
+ * word, so that one load can also carry "you have a code publication to adopt" -- see the note above
+ * mono_wasm_jit_worker_action_addr. The GC bit in that word has to be raised from here, because this is
+ * where the runtime decides a suspend is starting. Ordinary mono-emitted code and the interpreter still
+ * read the flag itself and are untouched. */
+extern void mono_wasm_jit_poll_all_workers (void);
+#define MONO_WASM_JIT_POLL_ALL_WORKERS() mono_wasm_jit_poll_all_workers ()
 #else
 #define MONO_WASM_JIT_RENDEZVOUS_DRAIN() do { } while (0)
+#define MONO_WASM_JIT_POLL_ALL_WORKERS() do { } while (0)
 #endif
 
 void
@@ -777,8 +785,12 @@ mono_threads_coop_init (void)
 void
 mono_threads_coop_begin_global_suspend (void)
 {
-	if (mono_threads_are_safepoints_enabled ())
+	if (mono_threads_are_safepoints_enabled ()) {
 		mono_polling_required = 1;
+		/* AFTER the flag, never before: a worker that takes its safepoint helper because of this bit must
+		 * find mono_polling_required already set when it re-derives the word. */
+		MONO_WASM_JIT_POLL_ALL_WORKERS ();
+	}
 }
 
 void

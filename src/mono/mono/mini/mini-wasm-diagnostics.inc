@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 244);   /* P3 re-emission: mid-walk generation window */
+g_static_assert (WJC_MAX == 260);   /* + replacement give-ups, + the retire/reclaim census */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -321,6 +321,30 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_SW_CLOSURE_MAX), WJC_(WJC_SWEEP_RUNS), WJC_(WJC_SWEEP_SELF_DEAD),
 		WJC_(WJC_SWEEP_DEP_BAD), WJC_(WJC_FSLOT_ORPHANED), WJC_(WJC_ADMIT_ORPHANED),
 		WJC_(WJC_FSLOT_REUSED), WJC_(WJC_ADMIT_GEN_MOVED_MIDWALK));
+	/* THE THREE BOUNDS THAT MUST NOT BIND, printed together because each one fails SILENTLY.
+	 *   install_budget_out   the closure walk gave up -> admissions refused -> a tier that admits nothing
+	 *   retry_full           a drain overflowed its carry list -> it pinned the epoch -> a closure walk
+	 *                        on every loop back-edge on that worker
+	 *   worker_slots_full    a worker got the always-set action word -> it takes the out-of-line
+	 *                        safepoint helper forever
+	 * retire_depth is the other end of the same question: reclamation is blocked while any worker is
+	 * inside the registry reader bracket, so a large depth with few reclaims means the grace period has
+	 * degenerated back into the leak it replaced. */
+	printf ("[wasm-jit bounds] closure_max=%lld install_budget_out=%lld | rv_retry ok=%lld maxn=%lld full=%lld"
+		" | worker_slots=%lld full=%lld | retired=%lld freed=%lld reclaims=%lld depth_max=%lld\n",
+		WJC_(WJC_SW_CLOSURE_MAX), WJC_(WJC_INSTALL_BUDGET_OUT),
+		WJC_(WJC_RV_RETRY_OK), WJC_(WJC_RV_RETRY_MAXN), WJC_(WJC_RV_RETRY_FULL),
+		WJC_(WJC_WORKER_SLOTS), WJC_(WJC_WORKER_SLOTS_FULL),
+		WJC_(WJC_RETIRED), WJC_(WJC_RETIRE_FREED), WJC_(WJC_RETIRE_RECLAIMS), WJC_(WJC_RETIRE_DEPTH_MAX));
+	/* The mandatory-replacement chain, end to end. Every step must be readable or "re-emission works" is
+	 * an assertion: requested (IKVM body swaps + profile triggers) -> compiled -> republished -> adopted,
+	 * with the three ways a mandatory one can be lost broken out. */
+	printf ("[wasm-jit replace] reframe ok=%lld fail=%lld | merge_off=%lld merge_split=%lld"
+		" | required_giveup=%lld required_dropped=%lld batch_wait=%lld\n",
+		WJC_(WJC_REFRAME_OK), WJC_(WJC_REEMIT_REFRAME_FAIL),
+		WJC_(WJC_COLOCATE_MERGE_OFF), WJC_(WJC_COLOCATE_MERGE_SPLIT),
+		WJC_(WJC_REEMIT_REQUIRED_GIVEUP), WJC_(WJC_REEMIT_REQUIRED_DROPPED),
+		WJC_(WJC_REEMIT_BATCH_WAIT));
 	printf ("[wasm-jit rendezvous] count=%lld members=%lld drains=%lld drain_threads=%lld slots=%lld refused=%lld log_full=%lld\n",
 		WJC_(WJC_RV_COUNT), WJC_(WJC_RV_MEMBERS), WJC_(WJC_RV_DRAIN), WJC_(WJC_RV_DRAIN_THREADS),
 		WJC_(WJC_RV_DRAIN_SLOT), WJC_(WJC_RV_DRAIN_REFUSED), WJC_(WJC_RV_LOG_FULL));

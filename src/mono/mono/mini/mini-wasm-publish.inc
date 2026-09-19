@@ -49,10 +49,146 @@ static __thread int    wj_draining;
  * are different claims and only the second one proves the rendezvous reached the whole fleet. */
 static __thread int    wj_drained_ever;
 
+/*
+ * DESCRIPTORS THIS THREAD OWES A RE-ADMISSION, carried forward instead of pinning the epoch.
+ *
+ * The first version stopped the walk at the first refusal and refused to advance wj_local_epoch, so that
+ * the generated safepoint check would take the slow path again. Against a refusal that CLEARS that is
+ * right. Against one that does not it is catastrophic, and the emitted check makes it so: local != global
+ * stays true forever, so every loop back-edge in every JITted method on this worker calls the drain,
+ * which walks the log and re-runs a full dependency-closure DFS. That is R244's refusal storm -- 14-23
+ * million refusals per run, 26% of the client thread -- relocated onto the hottest path in the program.
+ *
+ * A bounded per-thread carry list separates the two questions: the epoch always advances, and the owed
+ * work is retried at the next safepoint until it succeeds. Refusals here are ordinary (a dependency this
+ * worker has not registered yet) and clear on their own.
+ *
+ * ON OVERFLOW the old pinning behaviour is restored for that one drain, because the alternative is to
+ * DROP a re-admission -- and a dropped one leaves this worker calling the superseded body at a live
+ * f-slot with nothing that will ever revisit it. For an IKVM generation-2 swap that is merely slower; for
+ * a detour it is the patch silently not applied. Counted, so "the list never overflows" is a reading.
+ */
+#define WJ_RV_RETRY_MAX 64
+static __thread gint32 wj_rv_retry [WJ_RV_RETRY_MAX];
+static __thread int    wj_rv_retry_n;
+
+/*
+ * THE PER-WORKER SAFEPOINT ACTION WORD, and why the emitted check reads one word rather than two.
+ *
+ * A JIT safepoint now has two reasons to be taken -- the GC wants to suspend, or this worker has a code
+ * publication it has not adopted -- and the first version tested them separately in emitted code:
+ *
+ *     i32.const &mono_polling_required ; i32.load
+ *     i32.const &wj_global_epoch ; i32.load ; global.get 9 ; i32.load ; i32.ne ; i32.or ; if
+ *
+ * i.e. two extra loads, an i32.ne and an i32.or on EVERY LOOP BACK-EDGE IN THE TIER, since that is where
+ * mono puts OP_GC_SAFE_POINT. Paying that everywhere to support a feature whose rate is ~574 publications
+ * a run is the wrong trade, and it is avoidable: the two reasons can share one word if the word is
+ * per-worker, because then either writer can set it and the worker itself clears it.
+ *
+ *     global.get 9 ; i32.load ; if          <- exactly what HEAD emitted for the GC flag alone
+ *
+ * The word lives in a process-wide slab rather than in __thread storage for one reason: OTHER THREADS
+ * WRITE IT. A publisher and the GC suspend initiator both have to reach every worker's word, and a
+ * `__thread` address is only obtainable by the owning thread. Slots are claimed on first use and never
+ * released -- a thread that exits parks its slot, which is the same bounded-retention trade the registry
+ * makes, and WJC_WORKER_SLOTS says how close to the cap the process gets.
+ *
+ * CLEARING IS BY RECOMPUTATION FROM TRUTH, not by the writers. Each writer only ever SETS, so a lost
+ * update costs a spurious helper call; only the owning worker clears, and it does so by re-deriving both
+ * conditions after servicing them. The failure mode that matters is a MISSED SET, and both writers set
+ * after making their condition true, so any safepoint reached afterwards observes it.
+ */
+#define WJ_ACT_GC   1
+#define WJ_ACT_PUB  2
+#define WJ_WORKER_MAX 1024
+static volatile gint32 wj_worker_action [WJ_WORKER_MAX];
+static volatile gint32 wj_worker_n;
+static volatile gint32 wj_worker_action_overflow;      /* the shared always-set fallback; see below */
+static __thread volatile gint32 *wj_my_action;
+
+/*
+ * This worker's action word, claimed on first use. Called from the instantiate sites' EM_ASM to supply the
+ * `s.g` import, which happens once per module instantiation per worker -- hence the cached TLS pointer.
+ */
 WJ_KEEPALIVE gint32 *
-mono_wasm_jit_worker_epoch_addr (void)
+mono_wasm_jit_worker_action_addr (void)
 {
-	return &wj_local_epoch;
+	gint32 idx;
+	if (G_LIKELY (wj_my_action))
+		return (gint32 *) wj_my_action;
+	idx = mono_atomic_inc_i32 (&wj_worker_n) - 1;
+	if (idx >= WJ_WORKER_MAX) {
+		/* OUT OF SLOTS: hand back a word that is permanently set. Correct -- this worker simply takes
+		 * the out-of-line helper at every safepoint and re-derives both conditions there -- and slow,
+		 * which is the right way round. Counted so it is never silently the reason for a slow worker. */
+		mono_atomic_store_i32 (&wj_worker_action_overflow, WJ_ACT_GC | WJ_ACT_PUB);
+		mono_wasm_jit_counters [WJC_WORKER_SLOTS_FULL]++;
+		wj_my_action = &wj_worker_action_overflow;
+		return (gint32 *) wj_my_action;
+	}
+	if (idx + 1 > (gint32) mono_wasm_jit_counters [WJC_WORKER_SLOTS])
+		mono_wasm_jit_counters [WJC_WORKER_SLOTS] = idx + 1;
+	wj_my_action = &wj_worker_action [idx];
+	/* Start set: this worker has not adopted anything yet, and deriving that here would race the
+	 * publisher. One extra helper call on its first safepoint settles it. */
+	mono_atomic_store_i32 (wj_my_action, WJ_ACT_GC | WJ_ACT_PUB);
+	return (gint32 *) wj_my_action;
+}
+
+/* mono/utils/atomic.h has no fetch-or; CAS is the portable one every backend here implements. */
+static void
+wj_action_or (volatile gint32 *w, gint32 bit)
+{
+	gint32 old;
+	do {
+		old = mono_atomic_load_i32 (w);
+		if ((old & bit) == bit)
+			return;
+	} while (mono_atomic_cas_i32 (w, old | bit, old) != old);
+}
+
+/* Raise a bit on every worker that has ever run JIT code. Both writers are rare: a GC suspend and a code
+ * publication. Never clears -- see the note above. */
+static void
+wj_worker_action_raise_all (gint32 bit)
+{
+	gint32 n = mono_atomic_load_i32 (&wj_worker_n), i;
+	if (n > WJ_WORKER_MAX)
+		n = WJ_WORKER_MAX;
+	for (i = 0; i < n; ++i)
+		wj_action_or (&wj_worker_action [i], bit);
+	wj_action_or (&wj_worker_action_overflow, bit);
+}
+
+/*
+ * Called by mono_threads_coop_begin_global_suspend AFTER it sets mono_polling_required, so a worker that
+ * reaches a safepoint any time later observes the bit. A worker that read its word a moment earlier is
+ * between safepoints and will read the new value at the next one -- which is the same guarantee the bare
+ * `mono_polling_required` load gave, and rests on the same premise: a loop without an OP_GC_SAFE_POINT
+ * never polls, with or without this.
+ */
+void mono_wasm_jit_poll_all_workers (void);
+void
+mono_wasm_jit_poll_all_workers (void)
+{
+	wj_worker_action_raise_all (WJ_ACT_GC);
+}
+
+/*
+ * 1 once the log is exhausted. PERMANENT: wj_rv_log_full is a latch and the log is never reclaimed,
+ * because every worker reads its records lock-free and nothing recalls them.
+ *
+ * Exported because the BROKER has to know. A refusal that can never clear, fed by a retry path that
+ * cannot drop, is this tree's most-repeated bug (CLAUDE.md's admission rule, arrived at from a third
+ * direction): the re-emission broker used to re-queue every mandatory descriptor on a failed publication,
+ * so past record 4096 it recompiled the whole mandatory population forever, publishing none of it.
+ */
+int mono_wasm_jit_rendezvous_exhausted (void);
+int
+mono_wasm_jit_rendezvous_exhausted (void)
+{
+	return wj_rv_log_full || wj_global_epoch >= WJ_RV_LOG_MAX;
 }
 
 /*
@@ -73,15 +209,30 @@ void
 mono_wasm_jit_rendezvous_drain (void)
 {
 	gint32 target, i, completed;
-	gboolean retry = FALSE;
+	gboolean pin = FALSE;
+	int k;
 
 	target = wj_global_epoch;
-	if (G_LIKELY (wj_local_epoch == target))
+	if (G_LIKELY (wj_local_epoch == target && wj_rv_retry_n == 0))
 		return;
 	if (wj_draining)
 		return;
 	wj_draining = 1;
 	completed = wj_local_epoch;
+
+	/* Owed re-admissions first, swap-removing the ones that now succeed. ORDER DOES NOT MATTER HERE, and
+	 * that is worth stating because it does matter twenty lines below: the LOG must be replayed oldest
+	 * first, since a descriptor republished twice has to end on the later bytes. A carry entry is just
+	 * "re-admit this descriptor", and admit resolves against the registry's CURRENT generation, so the
+	 * later state is what it installs whichever order they are tried in. */
+	for (k = 0; k < wj_rv_retry_n; ) {
+		if (mono_wasm_jit_admit (wj_rv_retry [k])) {
+			mono_wasm_jit_counters [WJC_RV_RETRY_OK]++;
+			wj_rv_retry [k] = wj_rv_retry [--wj_rv_retry_n];
+		} else {
+			++k;
+		}
+	}
 
 	/* Walk every rendezvous this thread has not yet seen, oldest first. Oldest first matters: a
 	 * descriptor republished twice must end on the LATER bytes, and admit resolves against the registry's
@@ -183,18 +334,30 @@ mono_wasm_jit_rendezvous_drain (void)
 				mono_wasm_jit_counters [WJC_RV_DRAIN_SLOT]++;
 			else {
 				mono_wasm_jit_counters [WJC_RV_DRAIN_REFUSED]++;
-				retry = TRUE;
-				break;
+				/* Carry it rather than stopping the walk. See WJ_RV_RETRY_MAX. */
+				for (k = 0; k < wj_rv_retry_n; ++k)
+					if (wj_rv_retry [k] == desc_id) break;
+				if (k < wj_rv_retry_n) {
+					/* already owed */
+				} else if (wj_rv_retry_n < WJ_RV_RETRY_MAX) {
+					wj_rv_retry [wj_rv_retry_n++] = desc_id;
+				} else {
+					mono_wasm_jit_counters [WJC_RV_RETRY_FULL]++;
+					pin = TRUE;
+					break;
+				}
 			}
 		}
-		if (retry)
+		if (pin)
 			break;
 		completed = i + 1;
 	}
-	/* Never acknowledge a generation whose slots were not installed. The generated epoch check will take
-	 * this slow path again at the next safepoint; acknowledging here would make an old table entry look
-	 * current and turn a transient installation failure into stale-code execution. */
-	wj_local_epoch = retry ? completed : target;
+	/* The epoch advances unless the carry list overflowed. An un-acknowledged generation is not
+	 * stale-code execution -- the owed descriptors are re-admitted above at every later safepoint -- it is
+	 * only a delay, and the delay is bounded by the refusal clearing. */
+	wj_local_epoch = pin ? completed : target;
+	if (wj_rv_retry_n > (int) mono_wasm_jit_counters [WJC_RV_RETRY_MAXN])
+		mono_wasm_jit_counters [WJC_RV_RETRY_MAXN] = wj_rv_retry_n;
 	wj_draining = 0;
 
 	mono_wasm_jit_counters [WJC_RV_DRAIN]++;
@@ -204,16 +367,39 @@ mono_wasm_jit_rendezvous_drain (void)
 	}
 }
 
-/* One emitted call handles both reasons a JIT safepoint can be taken. Publication does not request a GC
- * suspension, so generation adoption must not be hidden behind mono_threads_state_poll's slow path. */
+/*
+ * One emitted call handles both reasons a JIT safepoint can be taken. Publication does not request a GC
+ * suspension, so generation adoption must not be hidden behind mono_threads_state_poll's slow path.
+ *
+ * The word is cleared here and only here, by re-deriving both conditions after servicing them. Deriving
+ * rather than clearing is what makes a lost update from either writer harmless.
+ */
 void
 mono_wasm_jit_safepoint_poll (void)
 {
 	extern volatile size_t mono_polling_required;
 	extern void mono_threads_state_poll (void);
+	/* CLEAR FIRST, THEN SERVICE, THEN RE-RAISE WHAT IS STILL TRUE.
+	 *
+	 * The obvious order -- service, then store the re-derived word -- LOSES A WAKEUP: a publisher that
+	 * raises WJ_ACT_PUB between the last condition read and the store is clobbered, and that worker then
+	 * misses the publication until its next coop re-entry. Clearing up front cannot lose one, because any
+	 * raise concurrent with the servicing lands after the clear and survives it; the cost is at worst one
+	 * redundant trip through here. A plain store racing wj_action_or is safe for the same reason the OR is
+	 * a CAS loop: it simply retries and re-applies its bit to the cleared word. */
+	if (wj_my_action && wj_my_action != &wj_worker_action_overflow)
+		mono_atomic_store_i32 (wj_my_action, 0);
+
 	if (mono_polling_required)
 		mono_threads_state_poll ();
 	mono_wasm_jit_rendezvous_drain ();
+
+	if (wj_my_action && wj_my_action != &wj_worker_action_overflow) {
+		if (mono_polling_required)
+			wj_action_or (wj_my_action, WJ_ACT_GC);
+		if (wj_local_epoch != wj_global_epoch || wj_rv_retry_n)
+			wj_action_or (wj_my_action, WJ_ACT_PUB);
+	}
 }
 
 /*
@@ -231,7 +417,7 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 {
 	gint32 epoch;
 	gint32 *copy;
-	int i, nexp = 0, published = 0;
+	int i, nexp = 0, published = 0, nexp_cap = 0;
 
 	if (n <= 0 || !descs)
 		return 0;
@@ -250,6 +436,9 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 	/* Do not recursively publish while this worker is adopting a generation. */
 	if (wj_draining)
 		return 0;
+
+	/* From here to the unlock every read of re->batch is of a retireable pointer. */
+	wj_reg_read_enter ();
 
 	/* Expand complete groups before taking the short publication lock:
 	 *
@@ -270,11 +459,16 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 			WjRegEntry *re = (descs [i] > 0 && descs [i] <= wj_reg_n) ? wj_reg_at (descs [i] - 1) : NULL;
 			cap += (re && re->batch) ? re->batch->n : 1;
 		}
-		if (cap <= 0)
+		if (cap <= 0) {
+			wj_reg_read_leave ();
 			return 0;
+		}
+		nexp_cap = cap;
 		copy = (gint32 *) g_malloc ((gsize) cap * sizeof (gint32));
-		if (!copy)
+		if (!copy) {
+			wj_reg_read_leave ();
 			return 0;
+		}
 		nexp = 0;
 		for (i = 0; i < n; ++i) {
 			WjRegEntry *re = (descs [i] > 0 && descs [i] <= wj_reg_n) ? wj_reg_at (descs [i] - 1) : NULL;
@@ -309,6 +503,7 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		}
 		if (nexp <= 0) {
 			g_free (copy);
+			wj_reg_read_leave ();
 			return 0;
 		}
 		n = nexp;
@@ -329,6 +524,7 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		wj_rv_log_full = 1;
 		mono_wasm_jit_counters [WJC_RV_LOG_FULL]++;
 		mono_loader_unlock ();
+		wj_reg_read_leave ();
 		g_free (copy);
 		return 0;
 	}
@@ -352,17 +548,24 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		 * member's entry generation (what each descriptor's own fast path compares against). The log
 		 * carries one representative, but the generations have to cover the whole group or a sibling
 		 * would keep serving its cached verdict. */
+		/* MINT FROM wj_batch_generation, THE ONE COUNTER THAT FEEDS THIS FIELD. `epoch + 1` was a second,
+		 * independent sequence written into the same word that mono_wasm_jit_register (:1893, :1937) and
+		 * mono_wasm_jit_batch_bind fill from wj_batch_generation -- so the two value spaces overlap, and a
+		 * worker whose cached wj_desc_generation[desc] happens to equal a recycled value takes admit's
+		 * "already current" fast path over slots it never reinstalled. Rare while publication was rare;
+		 * this design republishes on every IKVM body swap. One counter, monotonic, shared. */
+		guint32 gen = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 		if (re->batch) {
 			int k;
-			re->batch->generation = (guint32) (epoch + 1);
+			re->batch->generation = gen;
 			for (k = 0; k < re->batch->n; ++k) {
 				int m = re->batch->desc [k];
 				WjRegEntry *mre = (m > 0 && m <= wj_reg_n) ? wj_reg_at (m - 1) : NULL;
 				if (mre)
-					mre->generation = (guint32) (epoch + 1);
+					mre->generation = gen;
 			}
 		} else {
-			re->generation = (guint32) (epoch + 1);
+			re->generation = gen;
 		}
 		++published;
 	}
@@ -370,9 +573,17 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		/* Nothing to republish after the batched members were dropped. Leave the epoch
 		 * alone -- bumping it would send every worker through a drain that has no work in it. */
 		mono_loader_unlock ();
+		wj_reg_read_leave ();
 		g_free (copy);
 		return 0;
 	}
+
+	/* Shrink before retaining. `copy` was sized for FULL group expansion (cap counts every member of
+	 * every group) and then filled with ONE REPRESENTATIVE per group, so at the shipped
+	 * REEMIT_BATCH=16 / COLOCATE_MAX=16 it is ~4 KB allocated against ~256 B used -- and the log never
+	 * frees anything, by design. The slack, not the payload, is what made the log a memory question. */
+	if (n < (int) (nexp_cap))
+		copy = (gint32 *) g_realloc (copy, (gsize) n * sizeof (gint32));
 
 	wj_rv_log [epoch].n = n;
 	wj_rv_log [epoch].epoch = epoch + 1;
@@ -381,6 +592,11 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 	mono_memory_barrier ();              /* ... and the pointer before the epoch that indexes it */
 	wj_global_epoch = epoch + 1;
 	mono_loader_unlock ();
+	wj_reg_read_leave ();
+
+	/* AFTER the epoch is visible, never before: a worker that takes the helper because of this bit must
+	 * find work when it gets there, and one that reads the epoch directly is already correct. */
+	wj_worker_action_raise_all (WJ_ACT_PUB);
 
 	/* The initiator owns a table too, and it is not going through a resume hook. */
 	mono_wasm_jit_rendezvous_drain ();

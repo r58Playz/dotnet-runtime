@@ -12,7 +12,13 @@ exists because a previous pass got it wrong at real cost.
 
 | | |
 |---|---|
-| the emitter | `src/mono/mono/mini/mini-wasm.c` (~11k lines), `wasm-encoder.c` |
+| the backend | `src/mono/mono/mini/mini-wasm.c` + five `#include`d `.inc` files, `wasm-encoder.c` |
+| ... `-emitter.inc` | IR -> wasm lowering, the biggest piece |
+| ... `-ir.inc` | the relocatable body (`WjBody`), `wj_assemble`, the call forms |
+| ... `-batching.inc` | co-location: the planner, `rebatch`, `batch_bind`, rollback |
+| ... `-publish.inc` | asynchronous republication: the epoch log, the per-worker drain |
+| ... `-diagnostics.inc` | counters and dumps |
+| ... `mini-wasm.c` itself | knobs, the registry, admission, the GC shadow frame |
 | the assembler (`wj_assemble`) | resolves a body's relocations and frames N members into one module |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
 | the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
@@ -41,9 +47,11 @@ comment that misleads.
    inventing it.
 4. **When a result is retracted, fix the comment that carried it.** A retracted fps win sat in the source for
    months after the A/B that killed it.
-5. **Keep failed experiments, with their result and their lesson.** The comments recording a measured
-   regression and *why the reasoning was wrong* are what stop the next reader re-running them. Do not
-   compress them away.
+5. **A failed experiment belongs in `MINECRAFT-FINDINGS.md`, not in the source.** Its result and the
+   reason the reasoning was wrong are what stop the next reader re-running it, so they must survive --
+   but in the log, cited from code by round (`/* ... see R258 */`). Keep in code only what a reader must
+   know to edit the line in front of them: the invariant, the default, and the trap that is not visible
+   locally. When you evict a narrative from a comment, paste it into the log in the same commit.
 6. **If you cite V8 behaviour, cite the file.** The source is checked out locally; "V8 probably..." is not a
    reason to ship anything.
 
@@ -91,7 +99,7 @@ each worker then calls `new WebAssembly.Module(bytes)` and `new WebAssembly.Inst
 { m: { h: wasmMemory },      // shared linear memory
   f: { f: wasmTable },       // this worker's function table
   x: { e: wasmExports["__cpp_exception"] },
-  s: { p, l, c, v, n, d, m, b, i } }   // the per-thread globals, indices 0..8
+  s: { p, l, c, v, n, d, m, b, i, g } }   // the per-thread globals, indices 0..9
 ```
 
 Repeated `new WebAssembly.Module` on identical bytes is cheap because V8 keys its in-process
@@ -106,10 +114,18 @@ Three consequences, all load-bearing:
   immutable import resolves per worker while the bytes stay identical — the emitter already does this nine
   times (`wasm-encoder.c`): `s.p` `__stack_pointer` (index 0, the only MUTABLE one), `s.l`/`s.c`
   = `&wj_slot_live`/`_cap`, `s.v`/`s.n` = `&wj_vcall_pic`/`_cap`, `s.d`/`s.m` = `&wj_delegate_pic`/`_cap`,
-  `s.b` = this worker's scratch base, `s.i` = `&mono_wasm_jit_cur_island_il_state`. Cost is one load, not the
-  four a mutable import costs. **Adding a global is not free**: indices 0..8 are a hard-coded contract with
-  the emitter, and letting the import COUNT literal fall out of step produces "section was shorter than
-  expected size" and `registered` 0 from boot.
+  `s.b` = this worker's scratch base, `s.i` = `&mono_wasm_jit_cur_island_il_state`, `s.g` = this worker's
+  SAFEPOINT ACTION WORD (see below). Cost is one load, not the four a mutable import costs. **Adding a
+  global is not free**: indices 0..9 are a hard-coded contract with the emitter. The import COUNT is now
+  derived from the name table rather than hand-maintained; when it was not, falling out of step produced
+  "section was shorter than expected size" and `registered` 0 from boot.
+
+  **`s.g` is how a worker learns anything at all.** It is one i32, per worker, in a process-wide slab (not
+  `__thread` -- other threads write it). Non-zero means the emitted safepoint must take its out-of-line
+  helper: the GC wants to suspend, or a code publication has not been adopted here yet. Either writer only
+  ever SETS; only the owning worker clears, by re-deriving both conditions. Folding the two into one word
+  is what keeps the emitted check at ONE LOAD -- testing them separately cost two extra loads, an `i32.ne`
+  and an `i32.or` on every loop back-edge in the tier (R268).
 * **INSTALLATION is per-worker, which is why admission gates entry** rather than the emitted code testing
   anything.
 
@@ -469,7 +485,7 @@ point of it.
 | local renaming, coalescing, `local.tee`, copy-chain elimination as *runtime* levers | V8 source proves local ops are free; these are wire-size only |
 | helper-import cap | not binding: max 30 declared in any hot module, median 3, cap 192 |
 | `IKVM_LAZY_BODIES=0` | 11.2% WORSE; the shipped setting is already optimal |
-| `MONO_WASM_JIT_RELINK_JITTED=0` (refusing an IKVM body swap once the wasm JIT compiled generation 1) | **NOW SHIPS 1** (R252). The refusal was too strong: gen-1's emitted code stays CORRECT after a swap, so gen 1 is left live at its own f-slot and gen 2 registers into a **FRESH e/f pair** -- nothing republishes a live slot, which is what every wedge in the deleted re-emission subsystem traced to. Worth **-5.2%** server tick (430.7 -> 408.3 G instructions over an identical 2,406 ticks), IKVM `late` 619 -> 37, installs 3,250 -> 3,750. **No cost bucket rose** (`our JIT tier helpers` FELL 15.86 -> 14.83) because the swaps happen during world load: `relinkRefreshed` 574/run, only **4 in-game**. The INTERPRETER half of that refusal stays unconditional -- tier-up across two different ILs asserts in `lookup_patchpoint_data` |
+| `MONO_WASM_JIT_RELINK_JITTED=0` (refusing an IKVM body swap once the wasm JIT compiled generation 1) | **SHIPS 1**, but **the shape has changed and the measurement has not been redone** (R268). R252 measured **-5.2%** server tick (430.7 -> 408.3 G instructions over an identical 2,406 ticks; IKVM `late` 619 -> 37, installs 3,250 -> 3,750, no cost bucket rose) on a design where gen 1 stayed live and gen 2 took a **FRESH e/f pair**. That design is gone: generation 2 now keeps the descriptor and the pair and is republished, because a fresh pair means already-co-located and already-devirted callers never reach generation 2, and because a detour requires same-slot replacement. `relinkRefreshed` is 574/run with only **4 in-game**, so R252's number says nothing about whether the republication machinery pays for itself in the plateau. The INTERPRETER half of the refusal stays unconditional -- tier-up across two different ILs asserts in `lookup_patchpoint_data` |
 | carrying a gen-1 PERMANENT bail into gen 2 as a lever | **MEASURES ZERO** (R252). `WJC_RELINK_BAIL_CLEARED` is 0 over a full run: IKVM's relink hook IS the method's first execution, where a method is untried or already live, so the `-1` state is never reached there. The arm is kept and the zero recorded at the site -- without the counter it would read as a shipped fix forever |
 | `IKVM_LAZY_SIG=0` (refusing lazy-body candidates whose signature carries an unloadable) | **NOW SHIPS 1** (R251). Admitting them is worth **-9.5% server tick, -52% skipped ticks, +14.4% ticks completed**, both orders, n=2/arm, non-overlapping. Dispatch pool 47.9 -> 36.4 M/tick, type-check pool 11.6 -> 7.3 (generation 2 emits a plain checkcast where generation 1 needed the dynamic chain). **The 2026-09-10 arm that measured this a WASH is superseded, not contradicted**: it ran on the build carrying the R244 admission regression, so its +3.993 admission / +3.321 interpreter loss was mostly the regression. Residual churn on the fixed build is +0.8 M/tick, 8:1 against the win |
 | `__<>DynamicBinder__` receiver castclass | load-bearing — the adapter's cast *is* the type check; removing it turns a ClassCastException into memory corruption |
@@ -482,8 +498,9 @@ point of it.
 | `MONO_WASM_JIT_THREAD_SP` (threading the frame pointer as a parameter) | **REFUTED, R218.** jbox2d, 6 rounds both orders, checksum-gated, tier fully alive: median **1.2485 -> 1.7375 ms/step, +39.2%**, non-overlapping 6/6. The plan's reasoning — "params are `local.get`, which is free" — conflates two things: `local.get` of an EXISTING local is free; ADDING A PARAMETER is an argument materialisation at every call site plus one more live incoming value in every callee, on a tier already at 32.21% register pressure. **Price a calling-convention change at the CALL SITES, never as a local-op count.** (`s.p` traffic is 4.4-5.3% of window and threading removes only 1 of its 3 ops.) If revisited, the parameter must go TRAILING — a leading param shifts every argument index the prologue pin stores read |
 | `MONO_WASM_JIT_STABLE_IC_IDS` | reusing the profile record's id makes two sites in one method that call the same base share a PIC slot — 6,345 emissions per boot. Ships 0 |
 | `MONO_WASM_JIT_DELEGATE_OBJ_PIC` (object-keyed delegate cache) | **R193: works and is not worth it.** Miss-path publications 88,209,759 -> **1,996** (44,000x) while the emitted stub shrinks **1,311 -> 1,289 B (-1.7%)** — the `wj_slot_live` probe costs back what the site-id derivation saved, and that probe is unavoidable because the cached f-slot NUMBER is process-wide while its INSTALLATION is per worker. Sized before spending an arm: ~4.8% of delegate dispatches were missing the recipe, so the ceiling is ~0.26% of window. Ships 0 |
-| `MONO_WASM_JIT_REEMIT` (re-emission with a matured profile) | **Mechanism sound, population wrong, and now throughput-bound.** Re-emitted bodies reach 54.7% devirt coverage against 28.1% run-wide, but are 2.25% of sites, so run-wide coverage moves ~+0.6 pts. What binds, in order: **drain reach** (56,667 queued vs ~5,800 gated) > **compile-lock contention** (`busy=5,134` vs `done=189`) > co-location conflict (`batched=496`). Note the trigger must not key off `wasm_jit_invoke_in`, which is incremented only under `mono_wasm_jit_stats` — any arm run without `--stats` measures nothing. `MONO_WASM_JIT_COLOCATE_DEPS=0` + re-emission WEDGED (2 of 2) — **but that arm can no longer be run: there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no such variable anywhere in the tree (R245). Co-location is unconditional.** Ships 0 |
+| `MONO_WASM_JIT_REEMIT` (re-emission with a matured profile) | **The OPTIONAL, profile-driven arm still ships 0. The broker it uses is no longer optional**: an IKVM body swap enqueues a MANDATORY replacement through the same queue regardless of this knob (`wasm_jit_reemit_required`), so "REEMIT=0" no longer means "no re-emission ran". Read `WJC_REEMIT_REQUIRED_*` before concluding anything about a run. For the optional arm: **mechanism sound, population wrong, and throughput-bound.** Re-emitted bodies reach 54.7% devirt coverage against 28.1% run-wide, but are 2.25% of sites, so run-wide coverage moves ~+0.6 pts. What binds, in order: **drain reach** (56,667 queued vs ~5,800 gated) > **compile-lock contention** (`busy=5,134` vs `done=189`) > co-location conflict (`batched=496`). Note the trigger must not key off `wasm_jit_invoke_in`, which is incremented only under `mono_wasm_jit_stats` — any arm run without `--stats` measures nothing. `MONO_WASM_JIT_COLOCATE_DEPS=0` + re-emission WEDGED (2 of 2) — **but that arm can no longer be run: there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no such variable anywhere in the tree (R245). Co-location is unconditional.** Ships 0 |
 | module batching **as it was originally built** | measured negative four times (-26.6%, -35.7%, -13.0%, regression) for two mechanical reasons, and BOTH are now gone: producing a batched body cost a full `mini_method_compile` per member (bodies are now relocatable and re-framing is a memcpy), and the planner planned a plateau ONCE, on a quiescence this workload never reaches. Do not re-run the OLD arms or re-tune `batch_max`/`batch_bytes` (measured non-binding). **Co-location is UNCONDITIONAL** — R245 verified there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no variable behind it, so the `=1`/`=0` arms this file used to describe are not performable. Same for `MONO_WASM_JIT_SCC_COLOCATE`, which several comments still offer as an in-binary A/B. `COLOCATE_MERGE` and `COLOCATE_MAX` are real |
+| **raising co-location's STATIC capture** | **CLOSED ON OUTCOME (R258), and this is the one to read before spending anything here.** `MONO_WASM_JIT_COLOCATE_MERGE=1` moved captured call edges **32.4% -> 44.2%** and `callform local` **+126%** -- and the server tick did not move: OFF mean 167.0 (spread 8.4 = 5.0%), ON mean 165.1, a difference of **-1.2%, one quarter of the control arm's own spread**. The reason is that execution-weighted co-residency only went **4.47% -> 6.53%**, and 2.1 points against a ~5% IC-miss share of dispatch is ~0.1% of dispatch. Ships 0. **Static capture is not the binding constraint; execution weight is.** If this is revisited the target is a profile-weighted global partitioner -- `partreach.py` puts the cap-16 ceiling at 96.4% and a global agglomerative partition at 51.5% of the residual, and an offline seed-and-grow reaches 79% of call edges internal at 16 members, 85.5% execution-weighted |
 | **co-location as a route to "most dispatch is a direct call"** | CLOSED ON STRUCTURE (R195). The reachable set is only the devirt predicted arms — both `WASM_RELOC_CALL` sites are gated on the callee already having an f-slot, so a callee un-JITted at emit time has NO hole and only RE-EMISSION can convert it. Arm-local plateaus ~30% because **co-location is a PARTITION and the arm graph is not partitionable**: if two callers hold arms on the same target, only one can have it co-resident. Proof it is the partition and not tuning: surviving refusals are **100% caps, 0 rules**, and doubling `COLOCATE_MAX` bought **+1.5 points**. `max=64`+`bytes=131072` also CRASHES (undiagnosed); `max=32` is clean. The mechanism that bypasses a partition is DUPLICATION — shadow copies |
 | **SCC co-location as a source of reach** | 7 modules / 24 members per boot against a ~24,000-method tier. Cycles are rare on this workload. Kept as a CORRECTNESS mechanism (an intra-cycle import cannot be ordered), never as a performance lever |
 | shadow copies — cap sweeps (`WJ_SHADOW_MAX`, `MONO_WASM_JIT_SHADOW_BYTES`) | **CLOSED after ranking, R201/R202.** SELECTION ORDER was the real variable: ranking candidates by **sites/bytes descending** gives 63.7% arm-local with 2.8% FEWER bodies than encounter order at identical caps. After that, raising the caps drove `ShadowCap` to 0 and conversion did **not** move — with ranked selection the candidate SUPPLY is exhausted. **A cap closed as "non-binding" is closed only for the population it was measured on** — an earlier sweep saw 169 shadows where the current stack has 23,202, and its closure had to be retracted. Ships `MONO_WASM_JIT_SHADOW=0`; plateau is ~63% arm-local ≈ ~54% of executed dispatch direct, at **+50% bodies**, and the timing cost of that is still unpriced |
