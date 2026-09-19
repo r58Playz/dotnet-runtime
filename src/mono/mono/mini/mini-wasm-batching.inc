@@ -277,34 +277,22 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 }
 
 /*
- * MONO_WASM_JIT_DUMP_DEP_GRAPH=1: emit the whole registry dependency graph as plain integers, once, so the
- * cycle structure can be computed OFFLINE instead of guessed at.
+ * MONO_WASM_JIT_DUMP_DEP_GRAPH=1: the whole registry dependency graph as plain integers, once, so cycle
+ * structure can be computed offline. Sized the co-location cycle question in R253/R258.
  *
- * The question this exists to answer: a co-located group's admission defers only when an IMPORT edge points
- * at a descriptor already `visiting` in the current DFS -- a cycle (R160 addendum). Grouping contracts N
- * methods into ONE node of this graph, and contracting nodes in a DAG creates cycles. Whether that is worth
- * fixing by merging each cycle into one module depends entirely on how BIG the cycles are, and nothing in
- * the tree could answer that: the graph accessors above are plain C for in-process planners, with no JS
- * export, so there was no way to look.
- *
- * Emits one line per registry entry:
  *   G <desc> <batch_generation> <e> <f> <ndeps> [d<fslot>...]
- * FIVE numeric fields, not six. This comment used to document an `<nimports>` field and `i<fslot>` edges
- * alongside the `d` ones, with a paragraph on why a cycle through an `i` edge is fatal where a `d` cycle
- * is not. METHOD IMPORTS WERE REMOVED IN R163 and the emitter below has written neither since. The stale
- * shape was not harmless: scratchpad/wj/depcycles.py matched on six groups, so it parsed every archived
- * pre-R163 dump and ZERO dumps taken since, and it reports that as "no WJ_GRAPH block found (was
- * MONO_WASM_JIT_DUMP_DEP_GRAPH=1 and --dumps set?)" -- which reads as "the knob did not fire", not as
- * "the parser is stale". Both are fixed together; keep them together.
  *
- * `batch_generation` is 0 for a standalone entry and otherwise identifies the group -- entries sharing one
- * are premarked `visiting` together, so offline they contract to a single node. Dependencies are f-slots;
- * `f` on each line is what maps them back to a descriptor.
+ * FIVE numeric fields, not six, and keep this line in step with scratchpad/wj/depcycles.py: that parser
+ * matched on six groups (an `<nimports>` field and `i<fslot>` edges that method imports used to produce,
+ * removed in R163) and so silently parsed ZERO dumps for ~90 rounds while reporting "no WJ_GRAPH block
+ * found", which reads as "the knob did not fire" rather than "the parser is stale".
  *
- * MAIN-THREAD SAFE, and it has to be: like every other dump here it is called from JS on the main thread,
- * where taking the loader lock can deadlock against a GC-suspended worker. It reads nothing but plain ints
- * out of the registry -- no MonoMethod deref, no name resolution, no Mono API. A concurrent registration can
- * tear one line; that is acceptable for a census and is why the count is printed rather than implied.
+ * `batch_generation` is 0 for a standalone entry and otherwise identifies the group; dependencies are
+ * f-slots, and `f` on each line maps them back to a descriptor.
+ *
+ * MAIN-THREAD SAFE and it has to be: called from JS on the main thread, where taking the loader lock can
+ * deadlock against a GC-suspended worker. Plain ints only -- no MonoMethod deref, no name resolution, no
+ * Mono API. A concurrent registration can tear one line, which is why the count is printed not implied.
  */
 WJ_KEEPALIVE void mono_wasm_jit_dump_dep_graph (void);
 WJ_KEEPALIVE void
