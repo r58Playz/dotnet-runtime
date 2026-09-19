@@ -340,7 +340,7 @@ mono_wasm_jit_dump_stats (void)
 	 * an assertion: requested (IKVM body swaps + profile triggers) -> compiled -> republished -> adopted,
 	 * with the three ways a mandatory one can be lost broken out. */
 	printf ("[wasm-jit replace] reframe ok=%lld fail=%lld | merge_off=%lld merge_split=%lld"
-		" | required_giveup=%lld required_dropped=%lld batch_wait=%lld\n",
+		" | required_giveup=%lld required_dropped=%lld drain_skip=%lld\n",
 		WJC_(WJC_REFRAME_OK), WJC_(WJC_REEMIT_REFRAME_FAIL),
 		WJC_(WJC_COLOCATE_MERGE_OFF), WJC_(WJC_COLOCATE_MERGE_SPLIT),
 		WJC_(WJC_REEMIT_REQUIRED_GIVEUP), WJC_(WJC_REEMIT_REQUIRED_DROPPED),

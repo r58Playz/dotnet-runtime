@@ -2911,6 +2911,30 @@ wj_reemit_drain_one (void)
 	 * removes the shared state rather than guarding each field, and costs nothing -- publication is rate
 	 * limited to one rendezvous per interval regardless, so a second concurrent drainer had nothing to
 	 * win. Every exit below goes through `out` so the flag is always released. */
+	/*
+	 * TWO PLAIN LOADS BEFORE THE CONTENDED CAS. This function is called from wasm_jit_maybe_compile --
+	 * i.e. on every interp->JIT threshold check -- and from all four compile_publish exits, and it is
+	 * called between 2.3 and 8.0 MILLION times per run (WJC_REEMIT_BATCH_WAIT). Paying a CAS on a shared
+	 * line that often, to discover there is nothing to do, is the sort of cost this tier is made of.
+	 *
+	 * Both reads are unsynchronised and that is sound for what they decide: the surrounding code already
+	 * documents that "a missed visit is harmless, and the current compiler owner calls the broker again
+	 * when it releases compilation ownership". The only way to be wrong is to skip a visit that had work,
+	 * and the next call picks it up.
+	 *
+	 * THE BATCH-FULL ARM IS THE WAIT, and it has to be here rather than after the queue pop. It used to
+	 * sit after it and re-queued the entry it had just taken, which is a spin, not a wait: wj_reemit_flush
+	 * is rate-limited to MONO_WASM_JIT_REEMIT_INTERVAL_MS, so for the whole interval every call popped an
+	 * entry and pushed it straight back. MEASURED on the first build where group re-framing actually
+	 * worked (2026-09-19): drained = 2,824,446 against 847 real outcomes, a world.generate stalled at
+	 * 89.9 s against a 31 s norm, and one `memory access out of bounds`. Leaving the entry queued IS the
+	 * wait; the flush below cannot make the batch fuller, so this arm never needs re-testing after it.
+	 */
+	if (wj_reemit_batch_n == 0 && wj_reemit_head == wj_reemit_tail && !wj_reemit_overflow_head) {
+		mono_wasm_jit_counters [WJC_REEMIT_BATCH_WAIT]++;
+		return;       /* nothing queued and no partial batch to flush */
+	}
+
 	if (mono_atomic_cas_i32 (&wj_reemit_draining, 1, 0) != 0)
 		return;
 
@@ -2926,19 +2950,20 @@ wj_reemit_drain_one (void)
 	if (wj_reemit_batch_n > 0)
 		wj_reemit_flush ();
 
-	/* STOP HERE IF THE BATCH IS STILL FULL -- BEFORE THE POP, which is the half the paragraph above got
-	 * right in prose and wrong in code. The test used to sit AFTER the dequeue and re-queued the entry it
-	 * had just taken, which is a spin rather than a wait: wj_reemit_flush is rate-limited to
-	 * MONO_WASM_JIT_REEMIT_INTERVAL_MS, and the drain is called from five places including every
-	 * compile_publish exit, so for the whole interval each call popped an entry and pushed it straight
-	 * back. MEASURED on the first build where group re-framing actually worked (2026-09-19):
-	 * drained = 2,824,446 against 847 real outcomes, world.generate stalled at 89.9 s against a 31 s
-	 * norm, and one `memory access out of bounds`. Leaving the entry queued IS the wait. */
+	/* AFTER THE FLUSH, NEVER BEFORE IT. Hoisting this above the CAS to save an atomic DEADLOCKED the
+	 * broker: wj_reemit_flush is the only thing that empties the batch and it lives inside this function,
+	 * so returning early on a full batch meant the batch stayed full forever. MEASURED, 2026-09-19:
+	 * drained 3,191 -> 36, qfull 0 -> 460, world.generate 31 s -> 94.7 s (stall). The cheap pre-CAS gate
+	 * above is therefore only allowed to skip when there is NOTHING to do, batch included.
+	 *
+	 * The arm itself is the WAIT, and it must stay before the queue pop: it used to sit after it and
+	 * re-queued the entry it had just taken, which is a spin -- the flush is rate-limited to
+	 * MONO_WASM_JIT_REEMIT_INTERVAL_MS, so every call for the whole interval popped and re-pushed.
+	 * drained = 2,824,446 against 847 real outcomes, with a stalled world.generate and an OOB trap. */
 	if (wj_reemit_batch_n >= mono_wasm_jit_reemit_batch ||
-	    wj_reemit_batch_n >= WJ_REEMIT_BATCH_MAX) {
-		mono_wasm_jit_counters [WJC_REEMIT_BATCH_WAIT]++;
+	    wj_reemit_batch_n >= WJ_REEMIT_BATCH_MAX)
 		goto out;
-	}
+
 
 	/* The drainer and producers share one topology lock. This pop never waits: a missed visit is harmless,
 	 * and the current compiler owner calls the broker again when it releases compilation ownership. */
