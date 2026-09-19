@@ -363,7 +363,9 @@ emit_functype (WasmBuf *sec, const WasmValtype *params, guint32 nparams, WasmVal
  *          NOT the same as MONO_WASM_JIT_INLINE_ILOFS, which measured 9.8% WORSE: that variant kept the
  *          il_state pointer in a wasm LOCAL, live across every call in the body. This re-derives it from
  *          the global at each store, so nothing is live between them.
- * Every module declares all NINE whether or not it uses them, because the emitter's indices are absolute.
+ *   9 s.g  address of this worker's publication epoch. Generated safepoints compare it with the
+ *          process-wide epoch before returning to managed code.
+ * Every module declares all TEN whether or not it uses them, because the emitter's indices are absolute.
  *
  * Function imports come LAST in this section but FIRST in the function index space -- wasm gives imported
  * functions indices 0..nfimports-1 regardless of section order -- which is why every defined-function
@@ -373,7 +375,7 @@ static void
 emit_import_section (WasmBuf *out, gboolean import_table, gboolean import_eh_tag, guint32 eh_type_idx,
                      const WasmFuncImport *fimports, guint32 nfimports)
 {
-	static const char *const gnames [] = { "p", "l", "c", "v", "n", "d", "m", "b", "i" };
+	static const char *const gnames [] = { "p", "l", "c", "v", "n", "d", "m", "b", "i", "g" };
 	WasmBuf sec;
 	guint32 i;
 

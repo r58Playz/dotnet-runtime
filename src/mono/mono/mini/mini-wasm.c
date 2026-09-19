@@ -40,6 +40,8 @@ gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTab
 	MonoMethod **out_target, guint32 *out_samples, int *out_why); /* interp.c; lock-free pre-JIT receiver profile */
 void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
 void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
+gint32 *mono_wasm_jit_worker_epoch_addr (void);
+void mono_wasm_jit_safepoint_poll (void);
 #define WJ_KEEPALIVE EMSCRIPTEN_KEEPALIVE
 #else
 #define WJ_KEEPALIVE
@@ -428,12 +430,11 @@ int mono_wasm_jit_colocate_max = 16;      /* MONO_WASM_JIT_COLOCATE_MAX: members
  * Byte-identical is the entire point. The rendezvous is then a provable NO-OP semantically -- every worker
  * re-instantiates the same module into the same slots and ends where it started -- so any fault, wedge or
  * frame-rate change under it is the MECHANISM misbehaving and cannot be a miscompiled replacement body.
- * That separation is what makes this worth a knob: it exercises stop-the-world, the epoch, the log, the
+ * That separation is what makes this worth a knob: it exercises publication, the epoch, the log, the
  * per-thread drain and the re-admission path at whatever rate is asked for, with the one variable that
  * could confuse the result held fixed.
  *
- * SHIPS 0. A run with it on is a mechanism test and its timings are void (each rendezvous is a full STW
- * plus a re-instantiation on every worker). */
+ * SHIPS 0. A run with it on is a mechanism test and its timings include the requested re-instantiations. */
 /* MONO_WASM_JIT_REEMIT: 1 = on, 0 = off. Re-emit a JITted method once ANY ONE of its inline-cache sites
  * has missed MONO_WASM_JIT_REEMIT_MISSES times, republishing onto the SAME e/f pair through the rendezvous
  * so its callers execute the new body.
@@ -461,11 +462,11 @@ int mono_wasm_jit_reemit_inflight = 0;
 /* Misses at ONE site before it contributes a re-emission trigger. High enough that a site must be genuinely
  * hot rather than merely warm; the site then never triggers again (WjVcallSite.reemit_noted). */
 int mono_wasm_jit_reemit_misses = 64;
-/* MONO_WASM_JIT_REEMIT_BATCH: descriptors republished per rendezvous, and MONO_WASM_JIT_REEMIT_INTERVAL_MS
- * the floor between rendezvous. BOTH EXIST BECAUSE PER-METHOD PUBLICATION WEDGED BOOT: one stop-the-world
- * plus a re-instantiation on every worker, per re-emitted method, with many sites crossing the threshold
- * together during class loading, produced 90 s of no output before the main screen. A rendezvous is a
- * GLOBAL PAUSE; the one thing it must never be is frequent. Clamped to [1, 64] -- 64 is
+/* MONO_WASM_JIT_REEMIT_BATCH: descriptors published per record, and MONO_WASM_JIT_REEMIT_INTERVAL_MS
+ * the floor between optional profile-driven batches. Batching prevents a burst of matured sites from
+ * producing one log record and one instantiation pass per method during class loading. Mandatory semantic
+ * replacements bypass the optional rate limit but still use the same queue and publication chokepoint.
+ * Clamped to [1, 64] -- 64 is
  * WJ_REEMIT_BATCH_MAX in interp.c and overrunning it would be a stack write past the array. */
 int mono_wasm_jit_reemit_batch = 16;
 int mono_wasm_jit_reemit_interval = 1000;
@@ -1349,7 +1350,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 					return f;
 				} });
 			}
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8, v: $9, n: $10, d: $11, m: $12, b: $13, i: $14 }, h: Module.__wjHelperImports });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8, v: $9, n: $10, d: $11, m: $12, b: $13, i: $14, g: Module._mono_wasm_jit_worker_epoch_addr () }, h: Module.__wjHelperImports });
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
 			/* AN F-SLOT ONLY EVER HOLDS A JIT `f` FROM A MODULE THIS EMITTER PRODUCED, and that is a
 			 * load-bearing invariant, not an observation: it is what lets a caller bake a functype for
@@ -1484,7 +1485,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 					return f;
 				} });
 			}
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14, i: $15 }, h: Module.__wjHelperImports });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14, i: $15, g: Module._mono_wasm_jit_worker_epoch_addr () }, h: Module.__wjHelperImports });
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
 			/* TWO PASSES, and `es / 4` rather than `es >> 2`. Both are the same bug seen twice.
 			 *
@@ -1627,6 +1628,91 @@ wj_depset_new (const int *slots, const guint32 *sigs, MonoMethod *const *methods
 	return d;
 }
 
+/* Superseded registry payloads are protected by admission readers, not retained forever. A reader enters
+ * before snapshotting a registry pointer and leaves after its dependency walk/instantiation completes.
+ * Publishers swap the pointer first and retire the old allocation; the last reader reclaims the list.
+ * New readers can only acquire the new pointer, so no global pause or per-worker acknowledgement is needed. */
+typedef enum {
+	WJ_RETIRED_BYTES,
+	WJ_RETIRED_DEPSET
+} WjRetiredKind;
+
+typedef struct _WjRetiredPayload WjRetiredPayload;
+struct _WjRetiredPayload {
+	gpointer ptr;
+	WjRetiredKind kind;
+	WjRetiredPayload *next;
+};
+
+static volatile gint32 wj_admit_readers;
+static volatile gint32 wj_retired_lock;
+static WjRetiredPayload *wj_retired_payloads;
+
+static void
+wj_retired_enter (void)
+{
+	while (mono_atomic_cas_i32 (&wj_retired_lock, 1, 0) != 0)
+		mono_thread_info_yield ();
+}
+
+static void
+wj_retired_leave (void)
+{
+	mono_atomic_store_i32 (&wj_retired_lock, 0);
+}
+
+static void
+wj_depset_free (WjDepSet *d)
+{
+	if (!d)
+		return;
+	g_free (d->slot);
+	g_free (d->sig);
+	g_free (d->method);
+	g_free (d);
+}
+
+static void
+wj_reclaim_retired (void)
+{
+	WjRetiredPayload *p, *next;
+	if (mono_atomic_load_i32 (&wj_admit_readers) != 0)
+		return;
+	wj_retired_enter ();
+	if (mono_atomic_load_i32 (&wj_admit_readers) != 0) {
+		wj_retired_leave ();
+		return;
+	}
+	p = wj_retired_payloads;
+	wj_retired_payloads = NULL;
+	wj_retired_leave ();
+	while (p) {
+		next = p->next;
+		if (p->kind == WJ_RETIRED_DEPSET)
+			wj_depset_free ((WjDepSet *) p->ptr);
+		else
+			g_free (p->ptr);
+		g_free (p);
+		p = next;
+	}
+}
+
+static void
+wj_retire_payload (gpointer ptr, WjRetiredKind kind)
+{
+	WjRetiredPayload *p;
+	if (!ptr)
+		return;
+	p = g_new (WjRetiredPayload, 1);
+	p->ptr = ptr;
+	p->kind = kind;
+	wj_retired_enter ();
+	p->next = wj_retired_payloads;
+	wj_retired_payloads = p;
+	wj_retired_leave ();
+	wj_reclaim_retired ();
+}
+
 typedef struct {
 	int e, f, len;
 	int body_len;       /* original single-method module size; retained across generational rebatches */
@@ -1759,9 +1845,8 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			 * re-emit path alone, and was the last link in the chain that made every re-emit publish
 			 * nothing -- registration returned 0, so e_slot stayed 0, so the drain reported NO_PUBLISH.
 			 *
-			 * The OLD descriptor is left in the registry and simply loses ownership of the slot. That is
-			 * already a handled state: mono_wasm_jit_rebatch refuses to frame a descriptor for which
-			 * wj_desc_for_fslot names someone else (WASM_JIT_REBATCH_STALE), which is precisely this. */
+			 * Same-method registration therefore updates the existing descriptor below. A distinct method is
+			 * still a collision and is refused above; it may not steal this logical method's stable pair. */
 			int old_desc = wj_fslot_desc_chunks [fci][f_slot % WJ_SLOT_CHUNK];
 			WjRegEntry *old_re = (old_desc > 0 && old_desc <= wj_reg_n) ? wj_reg_at (old_desc - 1) : NULL;
 			gboolean same_method = old_re && (old_re->body_method == method || old_re->logical_method == method);
@@ -1771,8 +1856,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				mono_loader_unlock ();
 				return 0;
 			}
-			/* A method re-registering onto the f-slot it already owns. Re-emission was the original producer of
-	 * this and is gone; rebatch re-framing is what reaches it now. */
+			/* A new generation registering onto the f-slot this logical method already owns. */
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_FSLOT_REREGISTER);
 
 			/* REUSE THE DESCRIPTOR. DO NOT MINT A NEW ONE.
@@ -1797,6 +1881,8 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			 * publish the word that makes them reachable (the generation). Old bytes/depsets are never
 			 * freed -- a worker mid-walk may hold either, and both are self-consistent. */
 			if (same_method && old_re && !old_re->batch) {
+				void *old_bytes = old_re->bytes;
+				WjDepSet *old_depset = old_re->depset;
 				old_re->bytes = bytes;
 				old_re->len = len;
 				old_re->body_len = len;
@@ -1807,6 +1893,32 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 				mono_wasm_jit_counters [WJC_FSLOT_REUSED]++;
 				mono_loader_unlock ();
+				{
+					extern void mono_wasm_jit_repoint_imethod_bytes (gpointer, void *, int);
+					mono_wasm_jit_repoint_imethod_bytes (old_re->logical_imethod, bytes, len);
+				}
+				if (old_bytes != bytes)
+					wj_retire_payload (old_bytes, WJ_RETIRED_BYTES);
+				if (old_depset != old_re->depset)
+					wj_retire_payload (old_depset, WJ_RETIRED_DEPSET);
+				return old_desc;
+			}
+			if (same_method && old_re && old_re->batch) {
+				WjDepSet *old_depset = old_re->depset;
+				/* A batched member also keeps its descriptor. Its freshly emitted relocatable body is
+				 * attached by the caller immediately after registration; the compile broker then
+				 * re-frames the complete existing group before publishing a generation. Do not point
+				 * this entry at the temporary standalone module: admitting a sibling would reinstall
+				 * the old batch over it. */
+				old_re->body_len = len;
+				old_re->f_sig_id = f_sig_id;
+				old_re->no_gc = no_gc ? 1 : 0;
+				old_re->depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
+				mono_memory_barrier ();
+				mono_wasm_jit_counters [WJC_FSLOT_REUSED]++;
+				mono_loader_unlock ();
+				if (old_depset != old_re->depset)
+					wj_retire_payload (old_depset, WJ_RETIRED_DEPSET);
 				return old_desc;
 			}
 			/* ORPHAN THE OLD DESCRIPTOR. It keeps its registry entry and its bytes, but it has just lost
@@ -3082,8 +3194,8 @@ wj_make_callable (int desc_id)
 	return (desc_id < wj_desc_state_cap && wj_desc_state [desc_id] == 2) ? 1 : 0;
 }
 
-int
-mono_wasm_jit_admit (int desc_id)
+static int
+wj_admit_impl (int desc_id)
 {
 	WjRegEntry *re;
 	WjBatchDesc *batch;
@@ -3557,9 +3669,19 @@ fail:
 	return 0;
 }
 
+int
+mono_wasm_jit_admit (int desc_id)
+{
+	int result;
+	mono_atomic_inc_i32 (&wj_admit_readers);
+	mono_memory_barrier (); /* announce the reader before acquiring any retireable registry pointer */
+	result = wj_admit_impl (desc_id);
+	mono_memory_barrier ();
+	if (mono_atomic_dec_i32 (&wj_admit_readers) == 0)
+		wj_reclaim_retired ();
+	return result;
+}
 #include "mini-wasm-publish.inc"
-
-
 /*
  * GC-safe object references for JITted methods — C-STACK FRAMES.
  *
@@ -4111,6 +4233,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 
 #endif // DISABLE_JIT
 
+
 const char*
 mono_arch_fregname (int reg)
 {
@@ -4310,6 +4433,7 @@ mono_thread_state_init_from_handle (MonoThreadUnwindState *tctx, MonoThreadInfo 
 #ifdef DISABLE_THREADS
 
 // this points to System.Threading.TimerQueue.TimerHandler C# method
+
 static void *timer_handler;
 
 EMSCRIPTEN_KEEPALIVE void

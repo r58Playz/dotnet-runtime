@@ -211,8 +211,8 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 
 	MonoJitMemoryManager *jit_mm = jit_mm_for_method (target);
 	InterpMethod *old_imethod, *new_imethod;
-	/* Set when generation 1 was already live in the tier, so generation 2 must NOT inherit its slots. */
-	gboolean fresh_slots = FALSE;
+	/* Set when the method already owns a live descriptor and needs a mandatory same-slot update. */
+	gboolean replace_live_generation = FALSE;
 	extern int mono_wasm_jit_relink_jitted;
 
 	jit_mm_lock (jit_mm);
@@ -236,29 +236,17 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 		return 0;
 	}
 
-	/* The WASM-JIT half is a different question, and the answer this used to give was too strong. It
-	 * refused because "an f-slot other modules may have baked as a direct call cannot be invalidated
-	 * from here" -- true, and it does not need to be. Generation 1's emitted code stays CORRECT after
-	 * the swap: it is a compilation of the same Java method, merely one that still goes through the
-	 * dynamic-dispatch helpers. So generation 1 is left installed and live at its own f-slot forever,
-	 * and generation 2 registers into a FRESH e/f pair (mono_wasm_jit_register already supports a
-	 * method re-registering; it refuses only a slot owned by a DIFFERENT method). Callers that baked
-	 * gen-1's f-slot, and callers that co-located gen-1's body, keep reaching gen-1 -- slower, never
-	 * wrong -- until they are themselves re-emitted.
-	 *
-	 * THIS IS THE DISTINCTION THAT KILLED THE OLD RE-EMISSION SUBSYSTEM: its wedges all trace to
-	 * REPUBLISHING a live slot, after which a thread could enter a slot it had never instantiated and
-	 * hit the jiterpreter prefill (`function signature mismatch`). Nothing here republishes.
-	 *
-	 * Cost is two leaked table entries per swapped method -- the allocator has no free -- against
-	 * ~68k spare of a 131,072-entry table, for a population of ~736 per in-game window. */
+	/* A live wasm method can be replaced because its logical identity, descriptor and table pair remain
+	 * stable. The new body is compiled as another generation and each worker installs that generation in
+	 * its own table at a JIT safepoint. Existing frames may finish the old body; new entries use the same
+	 * e/f slots once that worker adopts the publication. */
 	if ((old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0) &&
 	    !mono_wasm_jit_relink_jitted) {
 		jit_mm_unlock (jit_mm);
 		mono_atomic_inc_i32 (&mono_interp_relink_late);
 		return 0;
 	}
-	fresh_slots = (old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0);
+	replace_live_generation = (old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0);
 
 	((MonoMethodWrapper *)target)->header = new_header;
 
@@ -305,19 +293,21 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	 * otherwise -- "gen-1 bails on constructs gen-2 removes, so the -1 population is exactly the one
 	 * with the most to gain" -- is sound about which methods WOULD benefit and wrong about when the swap
 	 * happens: IKVM's relink hook IS the method's first execution, where the method is either untried
-	 * (slot 0) or already live (slot > 0, the fresh_slots arm above). Reaching -1 first needs a
+	 * (slot 0) or already live (slot > 0, the replace_live_generation arm above). Reaching -1 first needs a
 	 * force-compiled island callee that bailed AND is then swapped, and that intersection is empty here.
 	 * The arm stays because the transition it forbids is wrong if it ever does occur, and it costs one
 	 * compare; the counter stays because a 0 here is the only thing that distinguishes "cannot happen"
 	 * from "silently stopped happening". */
-	if (fresh_slots) {
-		/* Generation 1 is LIVE and stays that way. Handing its e/f pair or its descriptor to generation 2
-		 * is what would turn this into slot republication; leaving them zero makes generation 2 an
-		 * ordinary untried method that will allocate its own pair when it gets hot. */
-		new_imethod->wasm_jit_slot = 0;
+	if (replace_live_generation) {
+		/* This is a new code generation of the same MonoMethod, not a second method. Preserve the pair and
+		 * descriptor; per-worker epoch adoption republishes it without consuming table entries. */
+		new_imethod->wasm_jit_slot = old_imethod->wasm_jit_slot;
 		new_imethod->wasm_jit_bail = 0;
-		new_imethod->wasm_jit_desc = 0;
-		new_imethod->wasm_jit_fslot = 0;
+		new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;
+		new_imethod->wasm_jit_fslot = old_imethod->wasm_jit_fslot;
+		new_imethod->wasm_jit_bytes = old_imethod->wasm_jit_bytes;
+		new_imethod->wasm_jit_bytes_len = old_imethod->wasm_jit_bytes_len;
+		new_imethod->wasm_jit_reemit_required = 1;
 		mono_atomic_inc_i32 (&mono_interp_relink_refreshed);
 		mono_wasm_jit_count (WJC_RELINK_REFRESHED);
 	} else if (old_imethod->wasm_jit_slot == -1) {
@@ -354,6 +344,14 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	/* Outside the jit-mm lock, and load-bearing: a caller that was already transformed baked the OLD
 	 * InterpMethod* into its data_items, so without this it keeps calling generation 1 forever. */
 	patch_imethod_refs (old_imethod, new_imethod);
+
+	if (replace_live_generation && new_imethod->wasm_jit_desc > 0) {
+#ifdef HOST_BROWSER
+		extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
+		mono_wasm_jit_bind_logical (new_imethod->wasm_jit_desc, target);
+		mono_wasm_jit_request_reemit (new_imethod->wasm_jit_desc);
+#endif
+	}
 
 	/* Announce the first one unconditionally. Two reasons: it is the liveness signal for a feature whose
 	 * failure mode is silence (a swap that never fires reads exactly like a swap that is not compiled in),

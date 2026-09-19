@@ -1,4 +1,3 @@
-
 /*
  * Conservative structured-CFG recognizer.
  *
@@ -175,7 +174,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	WasmValtype ret_vt;
 	WasmCallInfo self_ci;              /* the method's OWN callee ABI (self-sig); also the registered f_sig_id, so callers' baked dep_sig and our registration can never disagree */
 	int nwparams;                      /* wasm param count of func f = nargs + (hidden vret ? 1 : 0) + (threaded frame base ? 1 : 0). ALL local-index math is based on this, not nargs: wasm locals are numbered after the params */
-	gboolean self_has_byaddr = FALSE;  /* stats: method takes >=1 by-addr vtype arg */
+	gboolean self_has_byaddr G_GNUC_UNUSED = FALSE;  /* stats: method takes >=1 by-addr vtype arg */
 	WasmBuf body, out;
 	WjBody *wj_stored_body = NULL;   /* the relocatable body, handed to the registry on successful registration */
 	MonoBasicBlock *bb;
@@ -186,14 +185,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int scratch_idx G_GNUC_UNUSED = 0; /* i32 local holding the per-thread interp-residual scratch ptr */
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int spentry_idx = 0;               /* i32 local: C-stack SP at entry (exit/landing-pad restore target) */
-	int framebytes = 0, refbytes_al = 0; /* C-stack frame size (16-aligned) / 8-aligned ref-slot bytes */
-	gboolean method_nogc = FALSE;        /* transitive direct-call effect published in WjRegEntry */
-	int effective_gcp_count = 0;         /* static returning GC points after direct no-GC resolution */
+	int framebytes G_GNUC_UNUSED = 0, refbytes_al G_GNUC_UNUSED = 0; /* C-stack frame size (16-aligned) / 8-aligned ref-slot bytes */
+	gboolean method_nogc G_GNUC_UNUSED = FALSE;        /* transitive direct-call effect published in WjRegEntry */
+	int effective_gcp_count G_GNUC_UNUSED = 0;         /* static returning GC points after direct no-GC resolution */
 	gboolean lazy_ref_frame = FALSE;     /* defer a pure ref frame until the first effective GC point */
-	MonoInst *terminal_vcall_ins = NULL; /* last GC point in an acyclic forwarding wrapper; owns root handoff + guarded specialization */
-	int terminal_vcall_ord = -1;         /* layout ordinal used to prove every elided reference dies at/before that handoff */
-	gboolean terminal_vcall_handoff = FALSE; /* all pre-call references die at the terminal vcall; poll-prefix frames may stay cold */
-	gboolean terminal_vcall_poll_prefix = FALSE; /* every earlier effective GC point is a conditional OP_GC_SAFE_POINT poll */
+	MonoInst *terminal_vcall_ins G_GNUC_UNUSED = NULL; /* last GC point in an acyclic forwarding wrapper; owns root handoff + guarded specialization */
+	int terminal_vcall_ord G_GNUC_UNUSED = -1;         /* layout ordinal used to prove every elided reference dies at/before that handoff */
+	gboolean terminal_vcall_handoff G_GNUC_UNUSED = FALSE; /* all pre-call references die at the terminal vcall; poll-prefix frames may stay cold */
+	gboolean terminal_vcall_poll_prefix G_GNUC_UNUSED = FALSE; /* every earlier effective GC point is a conditional OP_GC_SAFE_POINT poll */
 	int vc_fslot_idx = 0;              /* i32 local: inline virtual-IC fast-path resolved f-slot */
 	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
 	int aic_vtab_idx = 0, aic_ti_idx = 0, aic_rgctx_idx = 0; /* i32 locals: AOT-vcall IC — this->vtable, ti<<1|kind2, rgctx */
@@ -214,7 +213,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean has_vcall = FALSE;        /* TRUE: method has >=1 OP_*CALL_MEMBASE (a vcall-IC site) -> emit the prologue slotlive fetch */
 	int vc_ic_idx = 0;                 /* i64 local: inline virtual-IC fast-path IC value (vtable|imethod<<32) */
 	int eh_exc_idx = 0, eh_h_idx = 0;  /* i32 locals: in-method EH catch landing pad — saved C++ exc ptr + dispatch result */
-	int ilofs_ti = -1;                 /* functype index for (i32,i32)->i32: enter_island (method, ndata) -> il_state */
+	int ilofs_ti G_GNUC_UNUSED = -1;                 /* functype index for (i32,i32)->i32: enter_island (method, ndata) -> il_state */
 	int finally_ind_idx = 0;           /* i32 local: in-method finally indicator (continuation bb idx, or -1 = rethrow) */
 	gboolean eh_has_finally = FALSE;   /* TRUE: method has >=1 FINALLY clause (milestone 2c) */
 	WasmEhTable *eh_table = NULL;      /* in-method EH clause table (built below, baked into the catch landing pad) */
@@ -223,7 +222,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int resid_void_ti = -1;            /* ()->void: mono_wasm_jit_continue_unwind. Registered UNCONDITIONALLY --
 	                                    * the residual/vcall/delegate threw==1 sites occur in non-EH methods too,
 	                                    * where eh_endcatch_ti is never set up. */
-	int nrefslots = 0;                 /* number of reference vregs routed to the GC ref shadow stack */
+	int nrefslots G_GNUC_UNUSED = 0;                 /* number of reference vregs routed to the GC ref shadow stack */
 	/* MONO_WASM_JIT_SLOTZERO: dead-slot kill chains, built by the SLOTLIVE walk (classifier block) and
 	 * consumed by the emit loop below. Both iterate the identical bb/ins sequence, so a plain running
 	 * instruction ordinal links them: sl_kill_head[ord] = first vreg whose slot dies right BEFORE the
@@ -2948,15 +2947,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				break;
 			}
 			case OP_GC_SAFE_POINT: {
-				/* Cooperative-GC safepoint poll: if (mono_polling_required) mono_threads_state_poll().
-				 * REQUIRED for multithreaded GC — without it a JITted loop never reaches a safepoint,
-				 * so the GC can't suspend the thread and the coop suspend deadlocks (every thread must
-				 * poll). Bake the address of the global flag + the poll icall's table index at emit
-				 * time; the IR's sreg1 (flag address via AOTCONST) is ignored. */
+				/* Cooperative-GC and code-publication safepoint. The imported s.g global is the
+				 * address of THIS worker's epoch; unlike a baked TLS address it remains correct when
+				 * the same module is instantiated by another worker. */
 #ifdef HOST_BROWSER
 				{
 					extern volatile size_t mono_polling_required;
-					extern void mono_threads_state_poll (void);
 					WasmFuncType pt; int pti = -1, pk;
 					memset (&pt, 0, sizeof (pt)); pt.ret = WASM_VOID; pt.nparams = 0;
 					for (pk = 0; pk < nextra; ++pk) if (functype_eq (&extra_types [pk], &pt)) { pti = ti_base + pk; break; }
@@ -2964,11 +2960,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					uses_calls = TRUE;
 					wasm_i32_const (&body, (gint32) (intptr_t) &mono_polling_required);
 					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);              /* if (flag != 0) */
+					wasm_i32_const (&body, (gint32) (intptr_t) &wj_global_epoch);
+					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = &wj_local_epoch */
+					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+					wasm_op (&body, WASM_OP_I32_NE);
+					wasm_op (&body, WASM_OP_I32_OR);
+					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 					/* Materialize roots inside the rare taken arm, not before the flag load. */
 					ENSURE_REF_FRAME ();
 					/* Direct import: a C function address in dotnet.native.wasm, fixed for the process. */
-					wj_emit_helper_call (&body, (gpointer) &mono_threads_state_poll, (guint32) pti);
+					wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll, (guint32) pti);
 					RELEASE_LAZY_REF_FRAME ();
 					wasm_op (&body, WASM_OP_END);
 				}
@@ -4541,8 +4543,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								wj_count (WJC_DELEGATE_DEVIRT_THIN);   /* had a record, below the bar */
 							}
 						}
-						else
+						else {
 							wj_count (WJC_DEVIRT_SITE);
+						}
 							/* THE DISAGREEMENT DETECTOR. Bumped ungated, because its whole job is to
 							 * contradict WJC_REEMIT_COMPILED if the recompile never reaches the
 							 * emitter. R179's headline bug was exactly that -- 31 re-emissions
@@ -6426,7 +6429,17 @@ vcall_cold_miss_emit:
 					cached = NULL;
 				} else {
 					{ WjRegEntry *sre = wj_reg_at (cfg->wasm_jit_result.desc_id - 1);
-					  if (sre) { sre->body = wj_stored_body; wj_stored_body = NULL; } }
+					  if (sre) {
+						/* Same-descriptor generations replace the relocatable body too. Compilation is
+						 * process-serialized and admission never reads WjBody, so no concurrent reader can
+						 * retain the superseded body. Keeping it leaked every code buffer and relocation
+						 * vector produced by re-emission until the wasm heap reached 4 GiB. */
+						WjBody *old_body = sre->body;
+						sre->body = wj_stored_body;
+						wj_stored_body = NULL;
+						if (old_body && old_body != sre->body)
+							wj_body_free (old_body);
+					  } }
 					if (mono_wasm_jit_verbose >= 1) {
 						printf ("WASM_JIT_REGISTERED %s desc=%d e_slot=%d f_slot=%d len=%u deps=%d [", mname, cfg->wasm_jit_result.desc_id, e_slot, f_slot, (unsigned) out.len, cfg->wasm_jit_result.ndirect_deps);
 						for (i = 0; i < cfg->wasm_jit_result.ndirect_deps; ++i)

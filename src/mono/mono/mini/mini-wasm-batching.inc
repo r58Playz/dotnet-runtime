@@ -205,8 +205,10 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 		printf ("WASM_JIT_COLOCATE_ROLLBACK members=%d (group unwound; members keep standalone modules)\n", n);
 	for (i = 0; i < n; i++) {
 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
+		WjDepSet *failed_depset;
 		if (!re)
 			continue;
+		failed_depset = re->depset;
 		/* Back to whatever group the member was in, which is NULL unless this bind was a MERGE. See
 		 * WjRegSaved.batch: clearing unconditionally would strand an absorbed member on a shared module
 		 * it no longer claims membership of. */
@@ -223,6 +225,11 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 		mono_memory_barrier ();
 		re->depset = saved [i].depset;
 		mono_memory_barrier ();
+		/* This set belonged only to the generation being rolled back.  Retire it after
+		 * restoring the saved pointer; freeing the saved set before rollback made the
+		 * restored registry entry point at released storage. */
+		if (failed_depset != saved [i].depset)
+			wj_retire_payload (failed_depset, WJ_RETIRED_DEPSET);
 		/* RESTORE THE ORIGINAL GENERATION -- do not mint a new one.
 		 *
 		 * A new generation invalidates the entry for EVERY worker, and every one of them then re-admits and
@@ -357,9 +364,6 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	bd->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 	for (i = 0; i < n; i++) {
 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
-		int *new_deps = NULL;
-		guint32 *new_dep_sig = NULL;
-		MonoMethod **new_dep_method = NULL;
 #ifdef HOST_BROWSER
 		/* batch_finish has already overwritten these slots on the compiling worker. Any previously
 		 * installed guard-free AOT adapter must stop entering them until admission below succeeds. */
@@ -438,6 +442,10 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	if (!mono_wasm_jit_admit (desc_ids [0])) {
 		if (saved) {
 			wj_batch_rollback (desc_ids, n, saved, bd);
+			/* No registry entry can acquire this failed generation after rollback.  An
+			 * admission that acquired it before rollback is covered by the registry-reader
+			 * grace period, so the large module blob no longer has to leak forever. */
+			wj_retire_payload (bytes, WJ_RETIRED_BYTES);
 			g_free (saved);
 			/* DO NOT FREE bd OR ITS ARRAYS -- USE AFTER FREE (2026-09-09). `re->batch = bd` was published
 			 * to every worker above, so a worker already inside mono_wasm_jit_admit is holding
@@ -447,19 +455,45 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			 * already did. Freeing here produced `RuntimeError: memory access out of bounds` at :3088
 			 * off a garbage batch->n, on a worker that entered admit from vcall_resolve_fslot -- 2 traps
 			 * in a 5-run batch, 2026-09-09, symbolised against the split DWARF.
-			 * Retaining is the rule the depset arrays already follow ("Old arrays intentionally remain
-			 * allocated: another worker may still be walking the prior generation lock-free") -- the
-			 * batch descriptor was the one allocation that broke it. Bounded: colocate_refused = 1 makes
+			 * The descriptor remains retained for that reason. Its much larger module bytes are retired
+			 * through the admission-reader grace period above. Bounded: colocate_refused = 1 makes
 			 * rollback once-only per method, and a descriptor is ~48 + 12*n bytes with n <= COLOCATE_MAX. */
 			if (G_UNLIKELY (mono_wasm_jit_stats))
 				mono_wasm_jit_add (WJC_COLOCATE_ROLLBACK, n);
 			/* Also the string deploy.sh proves this build by -- see the rollback printf above. Retention
 			 * is what this round changed, so it is the thing worth being able to count in a log. */
 			if (mono_wasm_jit_verbose >= 2)
-				printf ("WASM_JIT_BATCH_RETAIN members=%d (descriptor and bytes kept; a concurrent admit may still hold them)\n", n);
-			return 0;   /* caller still owns `bytes`; the group never happened */
+				printf ("WASM_JIT_BATCH_RETAIN members=%d (descriptor retained; module bytes retired after readers)\n", n);
+			return 0;   /* failed generation was retired; no registry entry owns it */
 		}
 		printf ("WASM_JIT_BATCH_ADMIT_FAIL generation=%u members=%d\n", bd->generation, n);
+	}
+	/* Commit: the saved payloads are no longer reachable from the registry.  Retire
+	 * each old module once (all members of an old batch share the same pointer) and
+	 * the old immutable dependency sets after admission readers have quiesced. */
+	if (saved) {
+		/* Registry publication and the compatibility InterpMethod copy are one commit.
+		 * Do this before retiring any previous shared blob so tier replacement can never
+		 * copy a dangling wasm_jit_bytes pointer. */
+		extern void mono_wasm_jit_repoint_imethod_bytes (gpointer, void *, int);
+		for (i = 0; i < n; ++i) {
+			WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
+			if (re)
+				mono_wasm_jit_repoint_imethod_bytes (re->logical_imethod, bytes, len);
+		}
+		for (i = 0; i < n; ++i) {
+			WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
+			int j;
+			if (saved [i].depset && (!re || saved [i].depset != re->depset))
+				wj_retire_payload (saved [i].depset, WJ_RETIRED_DEPSET);
+			if (!saved [i].bytes || saved [i].bytes == bytes)
+				continue;
+			for (j = 0; j < i; ++j)
+				if (saved [j].bytes == saved [i].bytes)
+					break;
+			if (j == i)
+				wj_retire_payload (saved [i].bytes, WJ_RETIRED_BYTES);
+		}
 	}
 	g_free (saved);
 	return 1;
@@ -654,6 +688,30 @@ done:
 	}
 	g_free (members); g_free (e_slots); g_free (f_slots);
 	return ok;
+}
+
+/* Re-frame the complete batch currently containing desc_id after one member's retained body changed.
+ * Returns 0 for a standalone descriptor, 1 on a successful batch refresh, and -1 for a transient failure.
+ * The descriptor list is copied under the registry lock; framing/instantiation stays outside it. */
+int
+mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len)
+{
+	WjRegEntry *re;
+	int *descs = NULL, n = 0, ok;
+
+	mono_loader_lock ();
+	re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
+	if (re && re->batch) {
+		n = re->batch->n;
+		descs = g_new (int, n);
+		memcpy (descs, re->batch->desc, sizeof (int) * (gsize) n);
+	}
+	mono_loader_unlock ();
+	if (!descs)
+		return 0;
+	ok = mono_wasm_jit_rebatch (descs, n, out_bytes, out_len);
+	g_free (descs);
+	return ok ? 1 : -1;
 }
 
 /* Refusal accounting for co-location. Stats-gated like every other WJC_* bump, so a clean timing run
