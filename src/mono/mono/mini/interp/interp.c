@@ -508,9 +508,36 @@ mono_interp_peek_imethod (MonoMethod *method)
 	InterpMethod *imethod;
 
 	jit_mm_lock (jit_mm);
-	imethod = jit_mm->interp_code_hash.table
-		? (InterpMethod*) mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, method)
-		: NULL;
+	if (G_LIKELY (jit_mm->interp_code_hash.table)) {
+		imethod = (InterpMethod*) mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, method);
+	} else {
+		/* THE RACE, OBSERVED SAFELY. This branch is the SAME WINDOW that aborts the process when an
+		 * unguarded mono_interp_get_imethod wins it instead of us: a memory manager reachable by this
+		 * thread whose interp_code_hash has not been initialised yet.
+		 *
+		 * It is counted, UNGATED, because it is the positive control for that fix. Counting the CRASH is
+		 * nearly useless -- it is intermittent, it needs the unguarded reader to win, and distinguishing
+		 * "fixed" from "lucky" would take ~10 runs. Counting the WINDOW is deterministic and far more
+		 * sensitive: every guarded reader that lands in it increments this, whether or not anyone crashes.
+		 * NON-ZERO MEANS THE RACE IS LIVE.
+		 *
+		 * MEASURED 0 ON THE UNFIXED BUILD, 3 clean runs, 2026-09-16 -- so the publish-before-initialise
+		 * ordering this was written to catch is NOT demonstrably the cause of the
+		 * `mono-internal-hash.c:47` aborts, and the ordering fix that shipped alongside it is a
+		 * correctness fix on its own merits rather than a proven repair. Neither run faulted, so the
+		 * reading is uninformative rather than exculpatory: the test that would settle it is a run that
+		 * DOES fault while this reads 0.
+		 *
+		 * The competing explanation is the one CLAUDE.md already documents as UNGUARDED: a dangling
+		 * MonoMethod* (IKVM frees dynamic types while the registry and the call profile retain raw
+		 * pointers) makes jit_mm_for_method read runtime_info out of freed memory, and a garbage
+		 * interp_code_hash.table that happens to be NULL gives exactly this assert while any other
+		 * garbage gives the `memory access out of bounds` and `mono_class_get_flags` variants -- which is
+		 * why those three cluster. Keep this counter: on a faulting run it discriminates between the two
+		 * in one reading. */
+		mono_wasm_jit_counters [WJC_JITMM_UNINIT]++;
+		imethod = NULL;
+	}
 	jit_mm_unlock (jit_mm);
 	return imethod;
 }
@@ -1854,6 +1881,26 @@ typedef struct {
 	 * jit_mm lock is safe. */
 	InterpMethod *caller_im;
 	MonoMethod *base;
+	/* IC MISSES AT THIS SITE, and the re-emission trigger's only input.
+	 *
+	 * A miss here means the profile can now predict something the emitter could not see when this body
+	 * was compiled -- which is the ONE observation that says re-emitting the caller would change its
+	 * code. R179 tried the other trigger, `invoke_in` (interp->JIT boundary crossings), and measured
+	 * vicMiss 1.00x: it selected methods that cross the boundary, which is not the population that is hot
+	 * INSIDE JIT code. R208 identified this site as the right one before the subsystem was deleted.
+	 *
+	 * Saturating rather than wrapping, and read without atomics: an approximate count is all a threshold
+	 * needs, and this is the 78.8%-of-observations path. */
+	guint32 misses;
+	/* One-shot per SITE: 0 idle, 1 already contributed a trigger. Without it a hot site re-enqueues its
+	 * caller on every miss, which is R179's bugs #6 and #7 exactly -- 35,617,130 enqueues for 4 re-emits,
+	 * and an arm that ran SLOWER than control purely from queue traffic. Per-site rather than per-method
+	 * because the method-level dedup belongs to the queue, and a site that has already spoken has nothing
+	 * to add however often it misses again.
+	 *
+	 * Also keeps this header 8-byte aligned, which the assert below requires: the resolver IC follows it
+	 * inline and must stay naturally aligned. */
+	guint32 reemit_noted;
 } WjVcallSite;
 
 g_static_assert ((sizeof (WjVcallSite) & 7) == 0);
@@ -1906,6 +1953,87 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 	return wj_vcall_pic + (gsize) site->site_id * mono_wasm_jit_vcall_ways;
 }
 
+/* ================================================================================================== *
+ * RE-EMISSION
+ *
+ * Recompile a method that is ALREADY JITted and republish it onto the SAME e/f slots, so every caller --
+ * including ones that baked the f-slot as a direct call and ones that co-located the old body -- starts
+ * executing the new code.
+ *
+ * WHY IT IS WORTH ANYTHING (R257/R259, measured):
+ *   - 68% of call sites resolve a callee f-slot at emit time; 31% miss only because the callee had not
+ *     been compiled YET, and ~1% are structurally unreachable. Re-emission is the ONLY mechanism that
+ *     turns the 31% into holes a later pass can name.
+ *   - Relaxing the devirt monomorphism bar (PRED_PCT) moves `poly` sites into `no_fslot` rather than into
+ *     arms, 91% of them, because the predicted target is not compiled. So devirt coverage is gated on the
+ *     same thing, and re-emission is upstream of it rather than an alternative to it.
+ *
+ * WHY IT IS SAFE NOW AND WAS NOT BEFORE. Reusing the slot pair means REPUBLISHING A LIVE SLOT, and every
+ * wedge in the deleted re-emission subsystem traced to that: a worker could enter a slot it had never
+ * instantiated and hit the jiterpreter prefill (`function signature mismatch`). mono_wasm_jit_rendezvous
+ * is what closes it -- stop the world, bump the descriptor generation, and have every worker that had the
+ * slot installed re-instantiate before it runs any more JIT code.
+ *
+ * R179's SEVEN BUGS, and what is done differently:
+ *   #1 the gate in wasm_jit_compile_publish closed on every re-emit -> 31 no-ops reported as successes.
+ *      Now an explicit `reemit` parameter, and REEMIT_SITE is counted so two counters must agree.
+ *   #2 COMPILE_BUSY treated as a verdict -> burned the method's one shot. Now BUSY re-queues.
+ *   #5 register refused the slot as a collision. Fixed in-tree since (same-method re-registration).
+ *   #6/#7 the queue re-enqueued rejected candidates -> 35,617,130 enqueues for 4 re-emits. Now the
+ *      trigger is one-shot per SITE (reemit_noted) and the queue dedups per METHOD.
+ * ================================================================================================== */
+
+extern int mono_wasm_jit_reemit;          /* MONO_WASM_JIT_REEMIT, ships 0 -- see mini-wasm.c */
+extern int mono_wasm_jit_reemit_batch;    /* MONO_WASM_JIT_REEMIT_BATCH: descriptors per rendezvous */
+extern int mono_wasm_jit_reemit_interval; /* MONO_WASM_JIT_REEMIT_INTERVAL_MS: floor between rendezvous */
+extern int mono_wasm_jit_reemit_max;      /* MONO_WASM_JIT_REEMIT_MAX: ceiling on re-emissions per run */
+extern int mono_wasm_jit_reemit_misses;   /* MONO_WASM_JIT_REEMIT_MISSES */
+
+/* Sized for the POPULATION, not for a trickle. With the per-method one-shot an enqueue happens at most
+ * once per method ever, so the O(queue) dedup scan below is paid ~once per method rather than per miss,
+ * and 256 was a throughput limiter rather than a safety bound: a dropped enqueue is a method that never
+ * gets re-emitted at all, because its site's one-shot has already fired. Watch WJC_REEMIT_QFULL. */
+/* How many times one method may lose the compile CAS and be re-queued before it is given up on. See the
+ * BUSY arm in wj_reemit_drain_one: unbounded, that arm cycles a descriptor through the queue forever and
+ * stops the drain ever going idle. */
+#define WJ_REEMIT_BUSY_MAX 8
+
+#define WJ_REEMIT_QUEUE_MAX 1024
+static gint32 wj_reemit_queue [WJ_REEMIT_QUEUE_MAX];
+static volatile gint32 wj_reemit_head;   /* next slot to write */
+static volatile gint32 wj_reemit_tail;   /* next slot to read */
+
+/* Enqueue a descriptor for re-emission. Deduped against what is already pending, because several sites in
+ * one method will each reach the threshold and they all name the same body. Drops on a full queue rather
+ * than blocking or growing: a missed re-emission costs an optimisation, and this runs on the IC miss path.
+ */
+static gboolean
+wj_reemit_enqueue (gint32 desc_id)
+{
+	gint32 h, t, i;
+	if (desc_id <= 0)
+		return FALSE;
+	/* Racy by design, matching the promotion queue: concurrent enqueues can lose one (a missed
+	 * optimisation) and can duplicate one (deduped above, or absorbed by the drain's BUSY path). What it
+	 * must not do is block or allocate -- this is the IC miss path. */
+	h = wj_reemit_head; t = wj_reemit_tail;
+	for (i = t; i != h; i = (i + 1) % WJ_REEMIT_QUEUE_MAX) {
+		if (wj_reemit_queue [i] == desc_id) {
+			mono_wasm_jit_counters [WJC_REEMIT_DEDUP]++;
+			return TRUE;
+		}
+	}
+	if (((h + 1) % WJ_REEMIT_QUEUE_MAX) == t) {
+		mono_wasm_jit_counters [WJC_REEMIT_QFULL]++;
+		return FALSE;
+	}
+	wj_reemit_queue [h] = desc_id;
+	mono_memory_barrier ();
+	wj_reemit_head = (h + 1) % WJ_REEMIT_QUEUE_MAX;
+	mono_wasm_jit_counters [WJC_REEMIT_QUEUED]++;
+	return TRUE;
+}
+
 static void
 wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fslot)
 {
@@ -1938,6 +2066,30 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 		/* CO-LOCATION REACH, measured where it actually happens. Same reasoning as the profile record
 		 * above: this is the miss path, so the PIC hit path stays a pure TLS load. See WJC_VIC_TGT_*
 		 * for why WJC_CALL_LOCAL cannot answer this and for the lower-bound caveat. */
+		/* RE-EMISSION TRIGGER. A miss HERE means the profile can now predict something the emitter could
+		 * not see when this body was compiled -- the one observation that says re-emitting the caller
+		 * would change its code. Ungated by --stats: a trigger that only fires in a stats run is not a
+		 * feature. One-shot per site, and the queue dedups per method, so a hot site cannot re-enqueue
+		 * its caller on every miss (R179 bugs #6/#7: 35,617,130 enqueues for 4 re-emits). */
+		if (G_UNLIKELY (mono_wasm_jit_reemit > 0) && site->caller_im && !site->reemit_noted) {
+			if (site->misses < (guint32) 0xffffffffu)
+				site->misses++;
+			if (site->misses >= (guint32) mono_wasm_jit_reemit_misses &&
+			    site->caller_im->wasm_jit_desc > 0 && site->caller_im->wasm_jit_fslot > 0) {
+				site->reemit_noted = 1;
+				/* ONE RE-EMISSION PER METHOD, and the flag has to live on the METHOD.
+				 *
+				 * reemit_noted above bounds this SITE, which is not the same thing and does not bound
+				 * anything: re-emitting builds a new body, and the new body's IC sites are fresh, so
+				 * misses and reemit_noted are both 0 again and the method re-enqueues itself. At
+				 * MISSES=64 the loop is slow enough that the MAX cap hides it; at the low threshold
+				 * that reaching most of the population requires, it is unbounded. */
+				if (site->caller_im->wasm_jit_reemitted)
+					mono_wasm_jit_counters [WJC_REEMIT_METHOD_DONE]++;
+				else if (wj_reemit_enqueue (site->caller_im->wasm_jit_desc))
+					site->caller_im->wasm_jit_reemitted = 1;   /* 1 = queued, 2 = re-emitted */
+			}
+		}
 		if (G_UNLIKELY (mono_wasm_jit_stats) && site->caller_im) {
 			extern int mono_wasm_jit_call_is_colocated (int caller_desc, int callee_fslot);
 			switch (mono_wasm_jit_call_is_colocated (site->caller_im->wasm_jit_desc, fslot)) {
@@ -2085,6 +2237,7 @@ typedef struct {
 g_static_assert (sizeof (WjLocalDelegatePicEntry) == 16);
 
 extern int mono_wasm_jit_admit (int desc_id);   /* declared locally at several call sites; needed here too */
+extern int mono_wasm_jit_rendezvous_test;      /* MONO_WASM_JIT_RENDEZVOUS_TEST, ships 0 -- see mini-wasm.c */
 
 static __thread WjLocalDelegatePicEntry *wj_delegate_pic;
 static __thread gint32 wj_delegate_pic_cap;   /* sites, not entries */
@@ -2427,7 +2580,7 @@ enum {
  * -1 = permanent bail. OUT (may be NULL) receives the emit result by value — the blocker set rides
  * on it, not thread-locals. */
 static int
-wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
+wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean reemit)
 {
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 	extern gboolean mono_wasm_jit_method_denied (MonoMethod *m);
@@ -2448,10 +2601,20 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 	 * after that thread published fslot + released the lock — the lock serializes compiles but doesn't
 	 * un-stale a guard already passed. Without this re-check that worker recompiles the same method, leaking
 	 * a fresh global table-slot pair and re-emitting identical bytes (the duplicate WASM_JIT_REGISTERED). */
-	/* Nothing gets past this gate any more: re-emission was the one caller that needed to, and it is
-	 * gone. Without the gate a second worker recompiles the same method and leaks a fresh table-slot
-	 * pair, re-emitting identical bytes (the duplicate WASM_JIT_REGISTERED). */
-	if (im->wasm_jit_fslot > 0) {
+	/* RE-EMISSION IS THE ONE CALLER ALLOWED PAST THIS GATE, and it must be, because every re-emission
+	 * candidate has an f-slot BY DEFINITION -- that is what makes it a candidate.
+	 *
+	 * THIS EXACT GATE IS R179's BUG #1: the old drain set its state before calling here, the gate closed
+	 * on it, and 31 no-ops were reported as successes across two experiments. It was caught only because
+	 * a second counter added for another purpose (WJC_REEMIT_SITE) read 0 while REEMIT_DONE read 31. So
+	 * the bypass is explicit and the caller passes it in, rather than being inferred from any state the
+	 * gate could also see.
+	 *
+	 * For everyone else the gate stays: without it a second worker recompiles the same method and leaks a
+	 * fresh table-slot pair, re-emitting identical bytes (the duplicate WASM_JIT_REGISTERED). A re-emit
+	 * does NOT leak a pair, because mono_wasm_jit_pin_slots_for_reemit pointed the self-reservation at the
+	 * pair this method already owns. */
+	if (im->wasm_jit_fslot > 0 && !reemit) {
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		if (out) {
 			out->desc_id = im->wasm_jit_desc;
@@ -2510,6 +2673,25 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 		 * R195: residual healing is also the tiering edge, so removing the guard removes re-emission's
 		 * input rather than just a branch, and here there is no re-emission left to feed anyway. */
 		wj_waiter_drain (logical_method);   /* event-driven wake: re-queue any methods parked waiting on this callee */
+		/* POSITIVE CONTROL for the republication rendezvous, MONO_WASM_JIT_RENDEZVOUS_TEST=N, ships 0.
+		 * Republish this very descriptor with its own BYTE-IDENTICAL bytes, so the rendezvous is a proven
+		 * semantic no-op: every worker re-instantiates the same module into the same slots and ends where
+		 * it started. Anything that breaks under it is therefore the MECHANISM -- stop-the-world, the
+		 * epoch, the log, the per-thread drain, the re-admission -- and cannot be a miscompiled body.
+		 *
+		 * BEFORE colocate_deps_now, not after, and that is not incidental: co-location moves the
+		 * descriptor into a BATCH, and a batched member's generation lives on the batch, so the
+		 * rendezvous would refuse it (WJC_RV_REFUSED_BATCHED) and the control would mostly test nothing.
+		 * Publication has already happened at this point -- the method is invocable and every worker can
+		 * reach it -- which is the state a republication actually has to be safe in. */
+		if (G_UNLIKELY (mono_wasm_jit_rendezvous_test > 0)) {
+			static gint32 wj_rv_test_seq;
+			if ((mono_atomic_inc_i32 (&wj_rv_test_seq) % mono_wasm_jit_rendezvous_test) == 0) {
+				extern int mono_wasm_jit_rendezvous (const int *descs, int n);
+				int d = r.desc_id;
+				mono_wasm_jit_rendezvous (&d, 1);
+			}
+		}
 		/* CO-LOCATION, after publication and never before it. The method is already invocable at this
 		 * point and stays invocable whatever happens next: a re-frame that fails leaves every member on
 		 * the standalone module it already has. That ordering is the whole difference from every batching
@@ -2536,6 +2718,196 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out)
 	im->wasm_jit_bail = (gint16) r.bail;   /* permanent bail: record why, for the vcall-residual breakdown */
 	im->wasm_jit_fail = r.fail_reason;     /* exact gate (static literal), for the weighted vperm top-N dump */
 	return WASM_JIT_COMPILE_PERM;
+}
+
+/* Descriptors compiled and waiting to be republished together. One rendezvous for the lot: see the note
+ * at the flush below for why per-method publication wedged boot. */
+#define WJ_REEMIT_BATCH_MAX 64
+static int wj_reemit_batch [WJ_REEMIT_BATCH_MAX];
+static int wj_reemit_batch_n;
+static volatile gint32 wj_reemit_draining;   /* one drainer process-wide; see the CAS in drain_one */
+static int wj_reemit_flush (void);   /* 1 = published (or nothing to publish), 0 = rate-limited */
+
+/*
+ * Drain ONE re-emission. Called from the compile safe point (wasm_jit_maybe_compile), never from the miss
+ * path itself: a re-emit force-compiles and then stops the world, and neither belongs inside an inline
+ * cache miss.
+ *
+ * One per visit on purpose. The cost is a full compile plus a stop-the-world with a re-instantiation on
+ * every worker that had the slot; batching several would lengthen a single pause rather than reduce total
+ * work, and the queue is drained continuously anyway.
+ */
+static void
+wj_reemit_drain_one (void)
+{
+	extern int mono_wasm_jit_reemit;
+	extern int mono_wasm_jit_pin_slots_for_reemit (MonoMethod *method);
+	extern gpointer mono_wasm_jit_desc_logical_imethod (int desc_id);
+	gint32 t, desc_id, old_f;
+	InterpMethod *im;
+	MonoWasmJitResult res;
+	int r;
+
+	if (!mono_wasm_jit_reemit)
+		return;
+
+	/* ONE DRAINER AT A TIME, PROCESS-WIDE.
+	 *
+	 * wasm_jit_maybe_compile runs on every worker, so without this the batch append
+	 * (`wj_reemit_batch [wj_reemit_batch_n++]`) and its bound check race: many threads pass the
+	 * "is the batch full" test together and then all increment. MEASURED CONSEQUENCE, 2026-09-16:
+	 * 5 rendezvous republished 2,976 members against 200 compiles -- 595 per call against a batch cap of
+	 * 16 and an array bound of 64. That is a WRITE PAST THE ARRAY, and the run recorded a wasm-trap.
+	 *
+	 * The CAS on the queue pop was NOT enough: it stopped two threads claiming the same queue entry, and
+	 * they then ran the rest of the drain concurrently on shared batch state. Serialising the whole drain
+	 * removes the shared state rather than guarding each field, and costs nothing -- publication is rate
+	 * limited to one rendezvous per interval regardless, so a second concurrent drainer had nothing to
+	 * win. Every exit below goes through `out` so the flag is always released. */
+	if (mono_atomic_cas_i32 (&wj_reemit_draining, 1, 0) != 0)
+		return;
+
+	/* PUBLISH FIRST, UNDER THIS LOCK. Two jobs, and both have to be here rather than at the call site:
+	 *
+	 *  - a PARTIAL batch has to go out once the interval elapses, or a trickle of re-emissions (the steady
+	 *    state, once the class-loading burst is over) sits compiled-but-unpublished until enough
+	 *    accumulate to fill a batch -- which on a quiet tier is never;
+	 *  - a FULL batch that the rate limit still refuses means STOP, not keep compiling, because draining
+	 *    on would either overrun the batch or force the rendezvous the limit just declined.
+	 *
+	 * The queue is bounded and dedups, so it is the right place for a backlog to wait. */
+	if (wj_reemit_batch_n > 0)
+		wj_reemit_flush ();
+	if (wj_reemit_batch_n >= mono_wasm_jit_reemit_batch)
+		goto out;
+
+	do {
+		t = wj_reemit_tail;
+		if (t == wj_reemit_head)
+			goto out;
+	} while (mono_atomic_cas_i32 (&wj_reemit_tail, (t + 1) % WJ_REEMIT_QUEUE_MAX, t) != t);
+	desc_id = wj_reemit_queue [t];
+	mono_wasm_jit_counters [WJC_REEMIT_DRAINED]++;
+
+	/* Hard ceiling on how much of a run this feature may spend. Two boot wedges came from an unbounded
+	 * rate, and a bound that cannot be exceeded is worth more than a rate that is merely usually low. */
+	if (mono_wasm_jit_counters [WJC_REEMIT_COMPILED] >= (gint64) mono_wasm_jit_reemit_max) {
+		mono_wasm_jit_counters [WJC_REEMIT_CAPPED]++;
+		goto out;
+	}
+
+	/* Resolve through the REGISTRY, which already owns the raw-pointer retention risk, rather than
+	 * holding an InterpMethod* in the queue and adding a second holder of it. */
+	im = (InterpMethod *) mono_wasm_jit_desc_logical_imethod (desc_id);
+	if (!im || !im->method || im->wasm_jit_fslot <= 0) {
+		mono_wasm_jit_counters [WJC_REEMIT_GONE]++;
+		goto out;
+	}
+	/* The interpreter's own promotion is a hard refusal, exactly as it is for an IKVM body swap
+	 * (tiering.c): a tiered imethod is reachable through optimized_imethod and through patchpoints inside
+	 * running frames, and there is no version of migrating a frame between two compilations that is
+	 * merely slow. */
+	if (im->optimized || im->optimized_imethod || im->retired) {
+		mono_wasm_jit_counters [WJC_REEMIT_REFUSED]++;
+		goto out;
+	}
+	if (!mono_wasm_jit_pin_slots_for_reemit (im->method)) {
+		mono_wasm_jit_counters [WJC_REEMIT_REFUSED]++;
+		goto out;
+	}
+
+	/* The pin's own check. WJC_FSLOT_REREGISTER cannot serve: mono_wasm_jit_rebatch re-registers every
+	 * member each time co-location re-frames a group, so it counts re-framings as well as re-emits and
+	 * read 20 against 5 compiles. Comparing the f-slot the method had BEFORE the compile with the one it
+	 * came back with is the direct test, and the only one that catches R170's failure -- a re-emit landing
+	 * on a FRESH pair, which silently leaks two table entries and republishes nothing anyone calls. */
+	old_f = im->wasm_jit_fslot;
+
+	memset (&res, 0, sizeof (res));
+	{
+		extern int mono_wasm_jit_reemit_inflight;
+		mono_wasm_jit_reemit_inflight = 1;
+		r = wasm_jit_compile_publish (im, &res, TRUE);
+		mono_wasm_jit_reemit_inflight = 0;
+	}
+	if (r == WASM_JIT_COMPILE_BUSY) {
+		/* R179 BUG #2: a lost CAS is not a verdict. Put it back -- but ON A BUDGET.
+		 *
+		 * This re-enqueue does not consult the per-method one-shot (the method is already flagged
+		 * queued, which is what stops its SITES re-triggering), so it is the one path that can cycle a
+		 * descriptor through the queue without bound. Measured unbounded: 82,270 BUSY against 1,175
+		 * compiles. That is not merely wasted work -- it keeps the drain alive for the whole run, so
+		 * re-emission runs through the IN-GAME window, and that produced 1,065,783 admitDepNotLive
+		 * refusals amplified to 18.8M alAdmit0 (the R244 retry-storm class, which cost 26% of the client
+		 * thread and 39% of the server tick when it last happened) and, at a higher rate, a
+		 * `function signature mismatch` trap. With a budget the drain goes idle once every candidate has
+		 * had its turn, which is what makes a large MAX safe.
+		 *
+		 * Return ignored: the method stays flagged queued either way, so it cannot re-trigger; if the
+		 * ring is full the candidate is lost, a missed optimisation counted as QFULL. */
+		if (im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX) {
+			im->wasm_jit_reemit_busy++;
+			(void) wj_reemit_enqueue (desc_id);
+			mono_wasm_jit_counters [WJC_REEMIT_BUSY]++;
+		} else {
+			mono_wasm_jit_counters [WJC_REEMIT_BUSY_GIVEUP]++;
+		}
+		goto out;
+	}
+	if (r != WASM_JIT_COMPILE_JITTED || res.desc_id <= 0) {
+		mono_wasm_jit_counters [WJC_REEMIT_FAILED]++;
+		goto out;
+	}
+	mono_wasm_jit_counters [WJC_REEMIT_COMPILED]++;
+	/* Set only on the path where a body was actually produced. A BUSY or FAILED drain must leave the
+	 * method eligible -- R179 bug #2 was exactly this shape, a lost CAS burning the method's one shot. */
+	im->wasm_jit_reemitted = 2;
+	if (res.f_slot != old_f)
+		mono_wasm_jit_counters [WJC_REEMIT_SLOT_MOVED]++;
+
+	/* Bounded at the WRITE as well as at the loop top: the check above decides when to stop draining,
+	 * this one is the invariant the array itself depends on. */
+	if (wj_reemit_batch_n < WJ_REEMIT_BATCH_MAX)
+		wj_reemit_batch [wj_reemit_batch_n++] = res.desc_id;
+	/* No flush here: the next visit publishes it, under this same lock, subject to the same rate limit.
+	 * Flushing on the append is what made the batch-full path bypass the limit in the first place. */
+out:
+	mono_atomic_store_i32 (&wj_reemit_draining, 0);
+}
+
+
+/* Republish everything compiled since the last flush. `forced` skips the interval floor (the batch is
+ * full); otherwise the floor applies, so a trickle of re-emissions does not turn into a stream of global
+ * pauses. */
+static int
+wj_reemit_flush (void)
+{
+	extern int mono_wasm_jit_rendezvous (const int *descs, int n);
+	extern gint64 mono_msec_ticks (void);   /* mono/utils/mono-time.h -- declared here to avoid pulling
+	                                         * a new header into this file for one call */
+	static gint64 last_ms;
+	gint64 now;
+	int n;
+
+	n = wj_reemit_batch_n;
+	if (n <= 0)
+		return 1;
+	/* THE INTERVAL IS A HARD RATE LIMIT, and it applies to the batch-full path TOO. The first version took
+	 * a `forced` flag and skipped the floor when the batch filled -- which is every time, during class
+	 * loading, because triggers arrive far faster than 16 per interval. So batching changed the SHAPE of
+	 * the pauses and not their RATE, and the runtime wedged at boot a second time in exactly the same
+	 * way: 90 s with no output before the main screen. A rendezvous is a global stop-the-world; nothing
+	 * about a full batch makes one more affordable. */
+	now = (gint64) mono_msec_ticks ();
+	if (last_ms && (now - last_ms) < (gint64) mono_wasm_jit_reemit_interval)
+		return 0;
+	last_ms = now;
+	wj_reemit_batch_n = 0;
+	if (mono_wasm_jit_rendezvous (wj_reemit_batch, n))
+		mono_wasm_jit_add (WJC_REEMIT_REPUBLISHED, n);
+	else
+		mono_wasm_jit_add (WJC_REEMIT_NO_RENDEZVOUS, n);
+	return 1;
 }
 
 /* Lever C cold gate: should this blocking callee be SKIPPED as too cold to pull into the island right now?
@@ -3005,7 +3377,7 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 		int r, i, pulled = 0, min_cyc = -1;
 		if (*budget <= 0) { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_BUDGET_EXHAUSTED); ret = 0; goto pop; }
 		(*budget)--;
-		r = wasm_jit_compile_publish (im, &res);
+		r = wasm_jit_compile_publish (im, &res, FALSE);
 		if (r == WASM_JIT_COMPILE_BUSY) { ret = r; goto pop; }  /* transient retry: don't park as if a blocker event is pending */
 		if (r != WASM_JIT_COMPILE_BLOCKED) { ret = r; goto pop; } /* JITted (1) or permanent (-1) */
 		if (res.nblockers == 0) { ret = WASM_JIT_COMPILE_BUSY; goto pop; } /* no blocker recorded -> transient retry */
@@ -3157,6 +3529,14 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 {
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh, mono_wasm_jit_island_budget;
 	wasm_jit_drain_promotions ();   /* Lever A: upward island growth for hot interp callers */
+	/* Re-emission drains HERE, at the same safe point, and not on the IC miss path that feeds it: a
+	 * re-emit force-compiles and then stops the world, and neither belongs inside an inline-cache miss.
+	 * One per visit -- the cost is a compile plus a stop-the-world with a re-instantiation on every worker
+	 * that held the slot, so batching would lengthen one pause rather than reduce total work. */
+	/* Drains AND publishes, both under its own lock -- see the note there. The periodic partial flush
+	 * used to be a second call right here, outside that lock, which let it reset wj_reemit_batch_n and
+	 * hand the array to a rendezvous while a concurrent drain was still appending to it. */
+	wj_reemit_drain_one ();
 	/* Hotness gate. The bump MUST be atomic: wasm_jit_hits lives on the SHARED InterpMethod and is bumped
 	 * from every worker (render/server/pool) in the auto-walk. A plain `++` loses updates AND lets one
 	 * thread's write skip the exact threshold value — which under the old (non-atomic) `== thresh` test

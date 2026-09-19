@@ -4533,6 +4533,16 @@ init_jit_mem_manager (MonoMemoryManager *mem_manager)
 	mono_jit_code_hash_init (&info->interp_code_hash);
 	mono_os_mutex_init_recursive (&info->jit_code_hash_lock);
 
+	/* PUBLISH THE CONTENTS, FENCE, THEN THE POINTER THAT MAKES THEM REACHABLE. Without the fence the
+	 * store below may become visible before the mono_jit_code_hash_init above it, and a reader that
+	 * observes a non-NULL runtime_info with an uninitialised interp_code_hash aborts in
+	 * mono_internal_hash_table_lookup (`table->table != NULL'). Plain stores to shared memory are
+	 * unordered under the wasm threads model, so this is not theoretical on the browser build -- it is
+	 * the second of the two windows that produced that intermittent whole-run abort; the first was
+	 * publishing the memory manager into its ALCs before this callback ran at all (memory-manager.c).
+	 *
+	 * Same discipline the wasm JIT registry already follows for exactly the same reason. */
+	mono_memory_barrier ();
 	mem_manager->runtime_info = info;
 }
 

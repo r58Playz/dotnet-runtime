@@ -10092,6 +10092,44 @@ mono_interp_transform_init (void)
 #if HOST_BROWSER
 /* runtime wasm JIT: the function-table slot of a callee's scalar method fn `f` (0 if the callee
  * isn't JIT-compiled), so a JITted caller can lower a call to it as a call_indirect. */
+/*
+ * CALLEE-RESOLUTION CENSUS. Classifies why a call site did or did not get an f-slot, which is the same
+ * question as "can the co-locator see this site at all".
+ *
+ * WHY IT IS THE SAME QUESTION. The co-locator's entire input is re->depset, and a depset entry is created
+ * only where wj_result_add_direct_dep runs -- i.e. only at the five sites that emit WASM_RELOC_CALL, i.e.
+ * only where THIS lookup returned > 0. Everything it returns 0 for emits WASM_RELOC_AOT or an indirect
+ * form, neither of which carries a callee identity (wasm-encoder.h: `sym` is set for CALL/SELF only), so
+ * the callee is invisible to every later pass. The co-locator cannot group, and cannot force-compile,
+ * what it cannot name.
+ *
+ * The split of the invisible half is what sizes re-emission:
+ *   BAILED   the callee permanently bailed (wasm_jit_slot == -1). Never convertible; re-emitting the
+ *            caller a thousand times will not give this site a hole.
+ *   UNTRIED  the callee has an InterpMethod and has simply not been compiled YET. THIS IS THE REACHABLE
+ *            POPULATION -- the site would get a real WASM_RELOC_CALL hole if the caller were re-emitted
+ *            after the callee JITted.
+ *   NOIM     no InterpMethod at all: the callee has never been executed on this thread. Mostly not
+ *            reachable, and counted apart from UNTRIED so the two are never conflated.
+ *
+ * Stats-gated and called only from the resolution functions below, so a clean run pays nothing. It costs
+ * one extra peek on the miss path only; the hit path reads the `im` the caller already has.
+ */
+static void
+wj_note_callee_resolution (InterpMethod *im, int got_fslot)
+{
+	if (G_LIKELY (!mono_wasm_jit_stats))
+		return;
+	if (got_fslot > 0)
+		mono_wasm_jit_count (WJC_CALLEE_HAS_FSLOT);
+	else if (!im)
+		mono_wasm_jit_count (WJC_CALLEE_NO_FSLOT_NOIM);
+	else if (im->wasm_jit_slot == -1)
+		mono_wasm_jit_count (WJC_CALLEE_NO_FSLOT_BAILED);
+	else
+		mono_wasm_jit_count (WJC_CALLEE_NO_FSLOT_UNTRIED);
+}
+
 int
 mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 {
@@ -10099,7 +10137,9 @@ mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 	InterpMethod *im = mono_interp_peek_imethod (method);
 	/* Prefer the published (live) f-slot; else the reserved-but-unpublished slot of an SCC member currently
 	 * being batch-compiled, so mutually-recursive cycle members bake each other's f-slot at emit time. */
-	return im ? (im->wasm_jit_fslot > 0 ? im->wasm_jit_fslot : im->wasm_jit_resv_fslot) : 0;
+	int fs = im ? (im->wasm_jit_fslot > 0 ? im->wasm_jit_fslot : im->wasm_jit_resv_fslot) : 0;
+	wj_note_callee_resolution (im, fs);
+	return fs;
 }
 
 /* A callee's f-slot, where an UNPUBLISHED reservation is visible only to a FELLOW BATCH MEMBER.
@@ -10120,14 +10160,17 @@ mono_wasm_jit_get_callee_fslot_batchlocal (MonoMethod *callee, MonoMethod *self)
 {
 	InterpMethod *cim = mono_interp_peek_imethod (callee);
 	InterpMethod *sim;
-	if (!cim)
-		return 0;
-	if (cim->wasm_jit_fslot > 0)
-		return cim->wasm_jit_fslot;
-	if (cim->wasm_jit_resv_fslot <= 0)
-		return 0;
-	sim = self ? mono_interp_peek_imethod (self) : NULL;
-	return (sim && sim->wasm_jit_resv_fslot > 0) ? cim->wasm_jit_resv_fslot : 0;
+	int fs = 0;
+	if (cim) {
+		if (cim->wasm_jit_fslot > 0)
+			fs = cim->wasm_jit_fslot;
+		else if (cim->wasm_jit_resv_fslot > 0) {
+			sim = self ? mono_interp_peek_imethod (self) : NULL;
+			fs = (sim && sim->wasm_jit_resv_fslot > 0) ? cim->wasm_jit_resv_fslot : 0;
+		}
+	}
+	wj_note_callee_resolution (cim, fs);
+	return fs;
 }
 
 /* Stable identity baked into a direct residual callsite. The runtime late-fslot helper follows
@@ -10243,6 +10286,38 @@ mono_wasm_jit_reserve_self (MonoMethod *method, int *e_out, int *f_out)
 	im->wasm_jit_self_resv_fslot = f;
 	*e_out = e;
 	*f_out = f;
+	return 1;
+}
+
+/*
+ * RE-EMISSION SLOT PIN. Point the method's self-reservation at the pair it is ALREADY published on, so a
+ * recompile lands on the same e/f slots instead of allocating fresh ones.
+ *
+ * This is the whole difference between re-emission and R252's IKVM body swap, and it is deliberate in both
+ * directions. R252 gives generation 2 a FRESH pair precisely so nothing republishes a live slot: gen-1's
+ * callers keep reaching gen-1, which is correct-but-slower for an equivalence-preserving swap. Re-emission
+ * wants the opposite -- the entire point is that callers who baked this f-slot, and callers who co-located
+ * this body, start executing the NEW code -- so it must reuse the pair and then force every worker to
+ * re-instantiate. That second half is mono_wasm_jit_rendezvous; without it this would be exactly the
+ * republish-a-live-slot hazard that killed the old re-emission subsystem.
+ *
+ * R170 had a pin keyed on the MonoMethod and it did not hold: compile_publish re-looks-up the InterpMethod
+ * under the jit-mm lock after compiling, so an InterpMethod-keyed seed was read from the wrong object and
+ * every re-emit landed on a fresh pair (WASM_JIT_REEMIT_SLOT_MOVED x20). Writing the reservation onto the
+ * InterpMethod the emitter will itself consult -- the same field mono_wasm_jit_self_reserved reads -- is
+ * what makes it stick.
+ */
+int mono_wasm_jit_pin_slots_for_reemit (MonoMethod *method);
+int
+mono_wasm_jit_pin_slots_for_reemit (MonoMethod *method)
+{
+	/* PEEK: same reasoning as every other predicate on this path -- it runs on a worker and
+	 * mono_interp_get_imethod would CREATE. A method with no InterpMethod has nothing to re-emit. */
+	InterpMethod *im = mono_interp_peek_imethod (method);
+	if (!im || im->wasm_jit_slot <= 0 || im->wasm_jit_fslot <= 0)
+		return 0;
+	im->wasm_jit_self_resv_eslot = im->wasm_jit_slot;
+	im->wasm_jit_self_resv_fslot = im->wasm_jit_fslot;
 	return 1;
 }
 
