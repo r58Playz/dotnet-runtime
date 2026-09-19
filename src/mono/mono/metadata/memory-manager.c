@@ -127,15 +127,30 @@ mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collec
 		memory_manager->type_init_exception_hash = mono_g_hash_table_new_type_internal (mono_aligned_addr_hash, NULL, MONO_HASH_VALUE_GC, MONO_ROOT_SOURCE_DOMAIN, domain, "Domain Type Initialization Exception Table");
 	}
 
-	/* Register it into its ALCs */
+	/* INITIALISE BEFORE PUBLISHING, not after. This used to register the manager into its ALCs first and
+	 * only then call init_mem_manager -- which is what creates the JIT side, interp_code_hash included.
+	 * Between those two points the manager is reachable by every other thread while its runtime_info is
+	 * absent or half-built, and a reader that gets there asserts:
+	 *
+	 *     mono-internal-hash.c:47, condition `table->table != NULL' not met
+	 *
+	 * That abort is an INTERMITTENT WHOLE-RUN KILL on the browser build, where a dozen workers compile and
+	 * dispatch concurrently from the moment classes start loading. It is dated in this tree's archived
+	 * logs to 2026-08-29 and has been reproducing ever since, and mono_interp_peek_imethod's guard
+	 * (`interp_code_hash.table ? lookup : NULL`) is a symptom fix at ONE reader rather than the cause --
+	 * mono_interp_get_imethod, which must CREATE, has no such escape and is the one that aborts.
+	 *
+	 * Ordering is the whole fix: nothing between these two points needs the registration, and
+	 * init_jit_mem_manager touches only the manager it was handed. */
+	if (mono_get_runtime_callbacks ()->init_mem_manager)
+		mono_get_runtime_callbacks ()->init_mem_manager (memory_manager);
+
+	/* Register it into its ALCs. LAST, so anything that can now find it finds it complete. */
 	for (int i = 0; i < nalcs; ++i) {
 		mono_alc_memory_managers_lock (alcs [i]);
 		g_ptr_array_add (alcs [i]->generic_memory_managers, memory_manager);
 		mono_alc_memory_managers_unlock (alcs [i]);
 	}
-
-	if (mono_get_runtime_callbacks ()->init_mem_manager)
-		mono_get_runtime_callbacks ()->init_mem_manager (memory_manager);
 
 	return memory_manager;
 }

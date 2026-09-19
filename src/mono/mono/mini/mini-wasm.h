@@ -261,7 +261,7 @@ enum {
 	 * side is the whole reason this is a knob: R153's world-load stall came from methods that could not
 	 * clear their blockers and ran interpreted, and this deliberately creates more blockers. */
 	WJC_DEVIRT_FORCED, WJC_DEVIRT_FORCE_CAPPED,
-	/* MONO_WASM_JIT_COLOCATE_TIGHT_DEPS: dependency entries dropped when a re-framed module's dependency
+	/* THE CAPTURED-EDGE COUNT, and the only place it is recorded. Dependency entries dropped when a re-framed module's dependency
 	 * set was recomputed from the assembler instead of inherited from the generation each member was
 	 * compiled as. Every entry counted here is a callee that became a module-local `call <funcidx>` and so
 	 * needs no admission -- i.e. this is the size of the admission closure the old code was demanding for
@@ -334,9 +334,17 @@ enum {
 	WJC_COLOCATE_DEP_UNREG, WJC_COLOCATE_DEP_NOBODY, WJC_COLOCATE_DEP_BATCHED,
 	WJC_COLOCATE_DEP_REFUSED, WJC_COLOCATE_DEP_BYTE_CAP, WJC_COLOCATE_MEMBER_CAP,
 	WJC_COLOCATE_SINGLETON, WJC_COLOCATE_REBATCH_FAIL,
-	/* CO-LOCATION REACH AS EXECUTED, split by where the runtime target actually lives. Bumped on the IC
-	 * MISS/publish path -- i.e. once per distinct (site, receiver) pair, not per dispatch -- because that
-	 * is the only place the resolved target and the calling descriptor are both in hand.
+	/* CO-LOCATION REACH AS EXECUTED, split by where the runtime target actually lives. Bumped in
+	 * wj_vcall_pic_publish, because that is the only place the resolved target and the calling descriptor
+	 * are both in hand.
+	 *
+	 * WEIGHTING, CORRECTED: this is ONCE PER IC MISS, not "once per distinct (site, receiver) pair" as
+	 * this comment used to claim -- the bump is unconditional inside the publish, before the pair dedup
+	 * below it. The magnitudes say so too: ~80-94 M per run, which is miss traffic, not a count of
+	 * distinct pairs. Read it as miss-weighted, and note the bias that implies: a polymorphic site misses
+	 * repeatedly and is over-weighted relative to a monomorphic one that hits, and IC HITS are not counted
+	 * at all. So it is an execution weighting of the MISS population, which is the right denominator for
+	 * "would grouping have helped this dispatch" and the wrong one for "what share of all dispatch".
 	 *
 	 * Why this and not WJC_CALL_LOCAL: CALL_LOCAL counts relocations the assembler turned into
 	 * `call <funcidx>`, which is the call-FORM half of co-location. R183's differential measured the
@@ -640,6 +648,272 @@ enum {
 	 * with a fresh e/f pair rather than inheriting gen-1's. Zero with the knob on means the swap path
 	 * never reaches an already-JITted method, which would make the knob inert. */
 	WJC_RELINK_REFRESHED,
+	/* The cycle-break arm of mono_wasm_jit_admit refused: wj_install_closure_root could not install the
+	 * whole closure, so admit returns 0 AND leaves the descriptor at wj_desc_state == 1 -- the state this
+	 * file calls the worst of the three to be stuck in, because nothing clears it but a generation bump.
+	 * It was the one route on the admission path with no counter at all, which is precisely the shape
+	 * that hid R244's 14-23M/run regression. Read it against CYCLE_BREAK_INSTALL: fail/(install+fail) is
+	 * how often breaking a cycle fails outright. Non-zero is not automatically a bug -- a closure whose
+	 * dep is genuinely unregistered yet is transient -- but a LARGE or GROWING value is, because each one
+	 * discards the entire DFS walk and the next dispatch redoes it. */
+	WJC_CYCLE_BREAK_FAIL,
+	/* The instantiate path found itself already in a coop BLOCKING state and so did NOT enter a GC-safe
+	 * region around `new WebAssembly.Module`. EXPECTED ZERO -- every caller is reached from the
+	 * interpreter or the compile path, both GC-unsafe, and no JS export reaches them (checked). It is
+	 * counted rather than asserted because the alternative is `mono_fatal_with_history ("Cannot
+	 * transition thread ... from STATE_BLOCKING with DO_BLOCKING")`, i.e. a hard abort, and one MONO
+	 * forced abort wedges a whole measurement batch. NON-ZERO means a new caller reaches instantiation
+	 * from managed code through a P/Invoke and needs MONO_ENTER_GC_UNSAFE at its boundary the way
+	 * mono_interp_replace_method_body does; the run is still correct, it merely blocks STW again.
+	 * BUMPED UNGATED (like WJC_ABI_MISMATCH_*), because a guard whose counter needs --stats is not
+	 * evidence of anything in a clean run, and this path should never execute at all. */
+	WJC_JS_BLOCKING_SKIPPED,
+	/* THE REPUBLICATION RENDEZVOUS (mini-wasm.c). Read these as an identity, not individually:
+	 *   RV_COUNT      rendezvous performed; RV_MEMBERS descriptors republished across them.
+	 *   RV_DRAIN      drains that did work -- ONE PER THREAD PER RENDEZVOUS in the healthy case, so
+	 *                 RV_DRAIN should be about RV_COUNT x RV_DRAIN_THREADS. Much less means threads are
+	 *                 not reaching a re-entry hook; much more means the epoch is being bumped by
+	 *                 something other than a rendezvous.
+	 *   RV_DRAIN_THREADS  DISTINCT threads that have ever drained. THIS IS THE ONE THAT PROVES THE
+	 *                 MECHANISM: a rendezvous that reaches only the initiator is not a rendezvous, and a
+	 *                 global drain count cannot tell the two apart.
+	 *   RV_DRAIN_SLOT / _REFUSED  per-descriptor re-admissions that succeeded / were refused. REFUSED is
+	 *                 not automatically a bug (admission refuses transiently and the next dispatch
+	 *                 retries) but it means that worker is running on the OLD body until it does.
+	 *   RV_LOG_FULL   rendezvous refused because the log is exhausted. Non-zero means the feature stopped
+	 *                 working part way through a run, silently, which is the worst way for it to fail. */
+	WJC_RV_COUNT, WJC_RV_MEMBERS, WJC_RV_DRAIN, WJC_RV_DRAIN_THREADS,
+	WJC_RV_DRAIN_SLOT, WJC_RV_DRAIN_REFUSED, WJC_RV_LOG_FULL,
+	/* RETIRED, NOT RENUMBERED -- the slot stays so archived captures keep meaning what they meant.
+	 *
+	 * It counted descriptors DROPPED from a rendezvous for being co-located, back when a batched member
+	 * could not be republished alone. That refusal is gone: the rendezvous now expands a batched member
+	 * to its whole GROUP, bumps the batch generation as well as every member's, and logs one
+	 * representative. Nothing bumps this any more, so it is no longer printed -- a permanently-zero
+	 * field on a live line reads as "this never happens" rather than "this check is gone". */
+	WJC_RV_REFUSED_BATCHED,
+	/* Drain entries where THIS thread never had the module installed, so there was nothing stale in its
+	 * table and re-admitting would have been pure work -- and not even pure: a refusal on such a thread
+	 * leaves the cached generation mismatched forever, because admit writes it only on success, so every
+	 * later dispatch re-attempts. EXPECT THIS TO DOMINATE drain_slot + drain_refused: most workers never
+	 * touch most methods. A LOW value alongside a high refused count is the regression to watch for. */
+	WJC_RV_DRAIN_SKIPPED,
+	/* CALLEE-RESOLUTION CENSUS (transform.c, wj_note_callee_resolution). Counted once per CALL SITE at
+	 * emit time, at the one lookup every direct/devirt/delegate gate goes through.
+	 *
+	 * IT ANSWERS TWO QUESTIONS AT ONCE, and they are the two that decide whether re-emission is worth
+	 * building:
+	 *
+	 * 1. CAN THE CO-LOCATOR SEE THE SITE? Its whole input is re->depset, and a depset entry exists only
+	 *    where WASM_RELOC_CALL was emitted, i.e. only where this lookup returned > 0. HAS_FSLOT over the
+	 *    total is therefore literally the co-locator's field of view. Everything else emits AOT or an
+	 *    indirect form, and those relocations carry no `sym` -- so the callee has no NAME any later pass
+	 *    could use. The co-locator cannot group, and cannot force-compile, what it cannot name.
+	 *
+	 * 2. HOW MUCH OF THE BLIND HALF IS REACHABLE? UNTRIED is the population a re-emission would convert:
+	 *    the callee exists and simply had not been compiled when the caller was. BAILED never will be
+	 *    (wasm_jit_slot == -1 is terminal). NOIM has never run at all. Keeping the three apart is the
+	 *    point -- a single "no f-slot" counter conflates a ceiling with a floor.
+	 *
+	 * SITE-COUNTED, NOT EXECUTION-WEIGHTED, and this file's own rule applies: weight a bucket by
+	 * execution before spending on it. Pair it with the colocate-reach triple, which is miss-weighted. */
+	WJC_CALLEE_HAS_FSLOT, WJC_CALLEE_NO_FSLOT_UNTRIED,
+	WJC_CALLEE_NO_FSLOT_BAILED, WJC_CALLEE_NO_FSLOT_NOIM,
+	/* mono_interp_peek_imethod found a memory manager whose interp_code_hash was not initialised yet --
+	 * i.e. it landed in the publish-before-initialise window that aborts the process when an unguarded
+	 * mono_interp_get_imethod wins the same race (`mono-internal-hash.c:47`). Bumped UNGATED: it is the
+	 * positive control for that fix, and a race detector behind --stats is not evidence in a clean run.
+	 * MUST BE 0. Non-zero means the window is live regardless of whether anything crashed this run. */
+	WJC_JITMM_UNINIT,
+	/* RE-EMISSION (interp.c). Read as an identity, and the identity is the point: R179's seven bugs were
+	 * every one of them caught by two counters DISAGREEING about the same event, never by a number looking
+	 * wrong -- `REEMIT_DONE=31` while `REEMIT_SITE=0`, `done=4` while `queued=35,617,130`.
+	 *
+	 *   QUEUED    triggers accepted.  DEDUP  triggers dropped because the method was already pending.
+	 *   QFULL     dropped on a full queue -- a missed optimisation, not an error, but a LARGE value means
+	 *             the drain is not keeping up and the trigger is mis-tuned.
+	 *   DRAINED   popped.  Must equal COMPILED + BUSY + FAILED + REFUSED + GONE.
+	 *   BUSY      lost the compile CAS; RE-QUEUED, not consumed (R179 bug #2 was treating it as a verdict).
+	 *   REFUSED   interpreter-tiered/retired, or the slot pin declined.
+	 *   GONE      the descriptor no longer resolves to a live JITted imethod.
+	 *   COMPILED  new bytes produced.
+	 *   REPUBLISHED  ... and every worker forced to re-instantiate them. THIS IS THE ONE THAT MATTERS:
+	 *             COMPILED without REPUBLISHED is a re-emission nobody executes, which is precisely what a
+	 *             re-emission subsystem without a rendezvous silently is.
+	 *   SITE      devirt sites emitted DURING a re-emission. Zero here with COMPILED non-zero means the
+	 *             recompile is not reaching the emitter -- R179 bug #1's signature. */
+	WJC_REEMIT_QUEUED, WJC_REEMIT_DEDUP, WJC_REEMIT_QFULL, WJC_REEMIT_DRAINED,
+	WJC_REEMIT_BUSY, WJC_REEMIT_REFUSED, WJC_REEMIT_GONE, WJC_REEMIT_FAILED,
+	WJC_REEMIT_COMPILED, WJC_REEMIT_REPUBLISHED, WJC_REEMIT_NO_RENDEZVOUS, WJC_REEMIT_SITE,
+	/* Drains refused because MONO_WASM_JIT_REEMIT_MAX was reached. Non-zero means the run wanted more
+	 * re-emission than the ceiling allows -- informative, not an error. */
+	WJC_REEMIT_CAPPED,
+	/* A re-emit came back on a DIFFERENT f-slot than it went in on, i.e. the slot pin did not hold and it
+	 * landed on a fresh pair. MUST BE 0: that is R170's failure (REEMIT_SLOT_MOVED x20), it leaks two
+	 * table entries per occurrence, and it republishes a slot nobody calls -- all invisible in every other
+	 * counter. WJC_FSLOT_REREGISTER cannot answer this; rebatch bumps it too. */
+	WJC_REEMIT_SLOT_MOVED,
+	/* The devirt census restricted to RE-EMITTED bodies (WJ_REEMIT_SCOPED). emitted/SITE is the coverage
+	 * of re-emitted code, to be read against the run-wide devirt line; NO_FSLOT is the bucket R259 showed
+	 * gates both `poly` and coverage, and is the one re-emission is supposed to drain. */
+	WJC_REEMIT_EMITTED, WJC_REEMIT_NO_REC, WJC_REEMIT_NO_FSLOT,
+	/* Triggers suppressed because this METHOD has already been re-emitted once.
+	 *
+	 * The one-shot that shipped first was per SITE (WjVcallSite.reemit_noted), which does NOT bound a
+	 * method: re-emitting it builds a new body whose IC sites are FRESH, with misses = 0 and
+	 * reemit_noted = 0, so the same method re-triggers itself. At MISSES=64 that loop is slow enough to
+	 * hide behind the MAX cap; at a low threshold -- which is what reaching most of the population needs,
+	 * because a monomorphic site misses ONCE and then hits forever -- it is unbounded. This counter is
+	 * how that is seen rather than assumed: it must be LARGE next to WJC_REEMIT_QUEUED, since every hot
+	 * site in an already-re-emitted method lands here. Zero means the flag is not being set. */
+	WJC_REEMIT_METHOD_DONE,
+	/* ADMISSION DFS RECURSION DEPTH. mono_wasm_jit_admit and wj_admit_dependencies are mutually
+	 * recursive with no depth parameter anywhere, and the walk descends one level per dependency EDGE.
+	 *
+	 * This is the actual ceiling on re-emission, and it took a captured stack to see it: every re-emission
+	 * arm that wedged at boot died with `RangeError: Maximum call stack size exceeded` whose stack is 64
+	 * frames of this pair alternating, and every arm that passed has ZERO such faults (8 runs, perfect
+	 * discrimination, 2026-09-17). The mechanism is not incidental -- re-emission works by turning
+	 * INDIRECT calls into DIRECT ones, a direct call is exactly what puts a callee in the caller's
+	 * depset, so a re-emission that succeeds is one that LENGTHENS admission chains. The feature's
+	 * success and this overflow are the same event.
+	 *
+	 * DEPTH_MAX is a high-water mark, not a count: it is written only when it grows. Read it against a
+	 * re-emission-off control -- the claim is that it grows with re-emissions, and a flat high-water
+	 * would refute the whole diagnosis. DEPTH_OVER counts walks past WJ_ADMIT_DEPTH_WARN, i.e. how close
+	 * to the cliff a passing run runs. */
+	WJC_ADMIT_DEPTH_MAX, WJC_ADMIT_DEPTH_OVER,
+	/* The generation reset declined to clear a VISITING (state 1) descriptor -- i.e. this is the race
+	 * that turned re-emission into a boot wedge, caught.
+	 *
+	 * R262: the reset ran BEFORE the state==1 cycle-break test and cleared it, and on the non-batch path
+	 * wj_desc_generation is not written before the dependency walk, so the mismatch persists for the
+	 * whole walk: every re-entry through a cycle edge cleared the marker, re-marked visiting and
+	 * descended again. Unbounded recursion, and a V8 `Maximum call stack size exceeded` at the bottom of
+	 * it. Only a rendezvous bumps a live descriptor's generation while walks are in flight, which is why
+	 * only re-emission ever hit it.
+	 *
+	 * Per CLAUDE.md, NON-ZERO IS THE HEALTHY READING: a zero here means the guard is dead code, not that
+	 * the race is impossible -- and the measured control (re-emission off) reaches admission depth 22,
+	 * so anything approaching the stack limit is this bug and not a deep graph. */
+	WJC_ADMIT_GEN_RESET_VISITING,
+	/* Re-emissions abandoned after WJ_REEMIT_BUSY_MAX losses of the compile CAS. Read it against
+	 * WJC_REEMIT_BUSY: the pair says whether contention is costing candidates (giveup large) or merely
+	 * costing retries (busy large, giveup small). The budget exists because an unbounded BUSY re-enqueue
+	 * keeps the drain alive for the whole run, which is what pushed re-emission into the in-game window
+	 * and produced an 18.8M admission-refusal storm. */
+	WJC_REEMIT_BUSY_GIVEUP,
+	/* A state-1 (VISITING) marker found with wj_admit_depth == 0, i.e. LEAKED by a walk that is no longer
+	 * running, and cleared. NON-ZERO IS THE HEALTHY READING, and non-zero also proves the leak is real.
+	 *
+	 * State 1 only means anything while this thread is inside the DFS. A leaked marker is worse than
+	 * useless: every later admit takes the state==1 arm, which is the INSTALL-ONLY cycle break, so it
+	 * returns 1 ("admitted") without ever admitting the closure -- and generated code call_indirects a
+	 * dependency f-slot with no liveness check, so the slot still holds
+	 * mono_jiterp_placeholder_jit_call and the call traps with `function signature mismatch`.
+	 *
+	 * MEASURED 0 (2026-09-17) on the configuration that DOES trap, with the trap still firing. So this
+	 * was built as R264 wall 3's cause and is NOT: no marker is being leaked. The guard is kept because
+	 * a leak here would be silent and permanent, and because the `fail:` arm below genuinely can produce
+	 * one -- but per this file's rule the zero is recorded rather than the guard being read as a fix.
+	 * Do not cite this counter as an explanation of the signature-mismatch trap.
+	 *
+	 * The known leak is the `fail:` label, whose batch arm clears a sibling only when
+	 * wj_desc_generation[sibling] == batch->generation -- so a rebatch landing mid-walk leaves every
+	 * sibling of a FAILED walk marked forever. Fixed there too; this counter is the backstop for any
+	 * leak path not yet found, which is why it is depth-based rather than specific to that one. */
+	WJC_ADMIT_STALE_VISITING,
+	/* `re->batch` changed identity WHILE this admission was running, i.e. the group was re-framed under
+	 * the walk. NON-ZERO IS THE HEALTHY READING and is also the proof the race is real.
+	 *
+	 * mono_wasm_jit_admit snapshots `batch = re->batch` and then used to re-read `re->batch` about
+	 * fifteen more times, including five reads inside ONE instantiate call
+	 * (`re->batch->e, ->f, ->n, ->bytes, ->len`). mono_wasm_jit_rebatch publishes a FRESH WjBatchDesc, so
+	 * each descriptor is internally consistent but the POINTER moves -- and a re-frame landing between
+	 * those reads pairs one module's bytes with another's slot list, writing exports into slots that
+	 * belong to different methods. The sibling publish loop had the same split: it validated membership
+	 * against the snapshot and then marked liveness from `re->batch`, so it could announce slots live
+	 * that this call never instantiated. Either route ends at a call_indirect to a slot holding the
+	 * wrong arity -- `function signature mismatch`, intermittently, and more often the more rebatching
+	 * happens. CLAUDE.md names this exactly: "a stale pointer frames the wrong function." */
+	WJC_ADMIT_BATCH_SWAPPED,
+	/* The rendezvous drain found a descriptor at STATE 2 ("admitted, dispatchable") whose e/f slots this
+	 * worker has NOT installed, and downgraded it. NON-ZERO IS THE HEALTHY READING and is also the proof
+	 * this path is reachable.
+	 *
+	 * The drain's skip arm records the new generation so the descriptor stops taking admit's
+	 * generation-mismatch arm on every dispatch, and its comment asserted "State is left untouched:
+	 * 0 means untried". Nothing guarantees state is 0. If it is 2, then state 2 + the CURRENT generation
+	 * is exactly what admit's fast path believes -- and that fast path trusts the STATE, not the liveness
+	 * bitmap -- so it returns 1 for a descriptor whose slots were never written here, the caller goes
+	 * live, and its call_indirect lands on mono_jiterp_placeholder_jit_call. That is R165's finding
+	 * verbatim ("state 2 with neither slot installed, holding the prefill"), recreated by code added in
+	 * Phase 2 rather than by the path R165 fixed.
+	 *
+	 * Downgrade 2 -> 0 only. State 3 is left alone so the permfail bound survives; clearing it would
+	 * route a permanent condition back into the retry path, which is R244. */
+	WJC_RV_DRAIN_STALE2,
+	/* The drain cleared a descriptor's installed bits and had to force its state off 2 so that
+	 * mono_wasm_jit_admit would actually re-instantiate instead of taking its fast path.
+	 *
+	 * THE BUG THIS FIXES, and it is the one the R267 bisection pointed at. The drain clears the installed
+	 * bits and then calls admit to rebuild -- but admit's fast path is
+	 *     if (state == 2 && wj_desc_generation [desc] == re->generation) return 1;
+	 * which trusts the STATE and never looks at the bitmap. The rendezvous bumps re->generation under the
+	 * stop, so normally this thread's cached generation mismatches and the fast path is skipped. But
+	 * after the world restarts, a thread can LAZILY ADMIT the descriptor -- writing the new generation and
+	 * installing the slots -- before it reaches a coop re-entry point that runs the drain. The drain then
+	 * clears the bits, calls admit, gets an immediate fast-path success, and THE SLOTS ARE NEVER
+	 * REINSTALLED. The next call_indirect through that f-slot hits mono_jiterp_placeholder_jit_call:
+	 * `function signature mismatch`, intermittently, scaling with rendezvous count.
+	 *
+	 * NON-ZERO IS THE HEALTHY READING -- it counts the window being closed, not an error. */
+	WJC_RV_DRAIN_REFRESH_FORCED,
+	/* MONO_WASM_JIT_SINGLE_WRITER: descriptors published by the single writer, and closure installs it
+	 * refused. Read PUBLISHED against WJC_REGISTERED to confirm the path is actually carrying admission,
+	 * and INSTALL_FAIL against WJC_ADMIT_FAIL_RETRY -- a refusal here is transient by construction
+	 * (budget exhaustion or a failed instantiate), so it must not grow without bound. */
+	WJC_SW_PUBLISHED, WJC_SW_INSTALL_FAIL,
+	/* Closure verification refused the admission: some member of the installed closure has a dependency
+	 * whose ABI/identity does not agree, or whose baked slot is not live here. The recursive admit
+	 * expressed this as a refusal propagating up from the offending level; the single writer has to check
+	 * it explicitly, and NOT doing so is what regressed a clean config twice (see wj_make_callable). */
+	WJC_SW_VERIFY_FAIL,
+	/* High-water closure size seen by the single writer's install walk, so WJ_INSTALL_MAX can be sized
+	 * from data rather than guessed. If this sits AT the cap the walk is being truncated and admissions
+	 * are being refused for lack of budget, which presents as a boot that never finishes with no fault
+	 * at all -- the tier admits nothing and everything interprets. */
+	WJC_SW_CLOSURE_MAX,
+	/* MONO_WASM_JIT_SWEEP: TIME-OF-USE verification. Re-checks descriptors this thread has ALREADY
+	 * published (state 2, generation current) and reports any whose own slots died or whose dependency
+	 * set no longer verifies.
+	 *
+	 * Why this exists: the single writer verifies the full closure at PUBLISH time and
+	 * `sw_verify_fail` is 0 on every run -- yet re-emission still traps 4/4. So the trap is not an
+	 * illegitimate publication; something invalidates a LEGITIMATE one afterwards, and no amount of
+	 * publish-time checking can see that. Re-emission is the only thing that replaces a live descriptor's
+	 * BYTES and its DEPSET, and a new body has different direct calls, i.e. a different required closure
+	 * than the one verified when its callers were admitted.
+	 *
+	 * DEP_BAD non-zero under re-emission and zero without it confirms that reading. SELF_DEAD separates
+	 * "my own e/f slot stopped being live" from "a dependency did". */
+	WJC_SWEEP_RUNS, WJC_SWEEP_SELF_DEAD, WJC_SWEEP_DEP_BAD,
+	/* Descriptors that lost their f-slot to a re-registration of the same method, and admissions refused
+	 * because the descriptor is one of them. ORPHANED tracks re-emission's rate; ADMIT_ORPHANED is the
+	 * catch -- non-zero means workers really were holding stale admissions of a slot-less descriptor,
+	 * which is the trap in R267 addendum 10. */
+	WJC_FSLOT_ORPHANED, WJC_ADMIT_ORPHANED,
+	/* Re-registrations that UPDATED the existing descriptor in place instead of minting a new one. This
+	 * should carry essentially all of re-emission's republications, and WJC_FSLOT_ORPHANED should fall to
+	 * ~0 as a result -- an orphan only remains possible for a batched descriptor, which this path
+	 * declines. Read the pair together: REUSED high with ORPHANED ~0 is the fix working. */
+	WJC_FSLOT_REUSED,
+	/* An admission finished against a generation that had MOVED since its dependency walk began -- i.e. the
+	 * method was re-emitted mid-walk and `depset`/`generation` were replaced under it. Publishing the fresh
+	 * generation there would mark this worker current with a dependency it never installed; the walk's own
+	 * recorded generation is published instead, so the worker is simply stale and re-admits. NON-ZERO IS
+	 * EXPECTED under re-emission and is the window being closed, not an error. */
+	WJC_ADMIT_GEN_MOVED_MIDWALK,
 	WJC_MAX
 };
 

@@ -421,16 +421,77 @@ int mono_wasm_jit_colocate_max = 16;      /* MONO_WASM_JIT_COLOCATE_MAX: members
 /* MONO_WASM_JIT_COLOCATE_BYTES: total member wire bytes. Not a V8 inlining limit -- kMaxInlinedCount (60)
  * bounds inlining INTO one function and must not be reused as a per-module cap -- just a bound on how much
  * one publish re-serialises. */
-int mono_wasm_jit_colocate_bytes = 32768;
-/* MONO_WASM_JIT_COLOCATE_TIGHT_DEPS: publish the dependency set the ASSEMBLER derived for the module a
- * re-framing actually installs, instead of leaving whatever set the members were compiled as.
+/* MONO_WASM_JIT_RENDEZVOUS_TEST=N: THE POSITIVE CONTROL for the republication rendezvous, and nothing
+ * else. Every N-th successful compile-publish, republish that very descriptor through
+ * mono_wasm_jit_rendezvous with its OWN, BYTE-IDENTICAL bytes.
  *
- * See the block in mono_wasm_jit_batch_bind. Default 1 because leaving it off is a measured pathology, not
- * a conservative choice: a rebatch has no capture phase, so the old code skipped the dep republish entirely
- * and every co-located member went on demanding admission of the callees it now calls with
- * `call <funcidx>`. It is a knob at all so the repair can be A/B'd WITHIN one binary against the rest of
- * this change, which CLAUDE.md prefers to a cross-binary comparison at an ~11.5% floor. */
-int mono_wasm_jit_colocate_tight_deps = 1;
+ * Byte-identical is the entire point. The rendezvous is then a provable NO-OP semantically -- every worker
+ * re-instantiates the same module into the same slots and ends where it started -- so any fault, wedge or
+ * frame-rate change under it is the MECHANISM misbehaving and cannot be a miscompiled replacement body.
+ * That separation is what makes this worth a knob: it exercises stop-the-world, the epoch, the log, the
+ * per-thread drain and the re-admission path at whatever rate is asked for, with the one variable that
+ * could confuse the result held fixed.
+ *
+ * SHIPS 0. A run with it on is a mechanism test and its timings are void (each rendezvous is a full STW
+ * plus a re-instantiation on every worker). */
+/* MONO_WASM_JIT_REEMIT: 1 = on, 0 = off. Re-emit a JITted method once ANY ONE of its inline-cache sites
+ * has missed MONO_WASM_JIT_REEMIT_MISSES times, republishing onto the SAME e/f pair through the rendezvous
+ * so its callers execute the new body.
+ *
+ * A FLAG, NOT A COUNT. An earlier draft of this comment read "=N ... once N of its sites have missed",
+ * which the code never implemented -- the trigger tests `> 0` and fires on the first site to cross the
+ * threshold. The threshold itself is MONO_WASM_JIT_REEMIT_MISSES; that is the tuning knob.
+ *
+ * SHIPS 0 until it is measured. The old re-emission subsystem shipped 0 through seven implementation bugs
+ * and was deleted; what is different now is the rendezvous (nothing else could republish a live slot) and
+ * the trigger (the IC miss path, which R179 named as the right observation point after measuring that the
+ * interp->JIT boundary was the wrong one at vicMiss 1.00x). Neither of those makes it correct by itself. */
+int mono_wasm_jit_reemit = 0;
+/* Set only while a re-emission's force-compile is running, so the devirt census can tell a re-emitted body
+ * apart from a first emission. A plain global is sound because compiles are serialised by the wj_compiling
+ * CAS -- exactly one is in flight process-wide. */
+int mono_wasm_jit_reemit_inflight = 0;
+/* THE DEVIRT CENSUS, SCOPED TO RE-EMITTED BODIES. This is the question re-emission exists to answer and
+ * the run-wide census cannot: R179 measured 46.3% devirt coverage on re-emitted bodies against 29.8%
+ * run-wide, which is the whole claim -- and then could not turn it into a run-wide gain because its
+ * candidates were the wrong population. Without this split, a re-emission arm can only report that it
+ * re-emitted N methods, not whether their code came out any better. Ungated like REEMIT_SITE: it must be
+ * readable in the same run that produces the compiles. */
+#define WJ_REEMIT_SCOPED(c) do { if (G_UNLIKELY (mono_wasm_jit_reemit_inflight)) mono_wasm_jit_counters [c]++; } while (0)
+/* Misses at ONE site before it contributes a re-emission trigger. High enough that a site must be genuinely
+ * hot rather than merely warm; the site then never triggers again (WjVcallSite.reemit_noted). */
+int mono_wasm_jit_reemit_misses = 64;
+/* MONO_WASM_JIT_REEMIT_BATCH: descriptors republished per rendezvous, and MONO_WASM_JIT_REEMIT_INTERVAL_MS
+ * the floor between rendezvous. BOTH EXIST BECAUSE PER-METHOD PUBLICATION WEDGED BOOT: one stop-the-world
+ * plus a re-instantiation on every worker, per re-emitted method, with many sites crossing the threshold
+ * together during class loading, produced 90 s of no output before the main screen. A rendezvous is a
+ * GLOBAL PAUSE; the one thing it must never be is frequent. Clamped to [1, 64] -- 64 is
+ * WJ_REEMIT_BATCH_MAX in interp.c and overrunning it would be a stack write past the array. */
+int mono_wasm_jit_reemit_batch = 16;
+int mono_wasm_jit_reemit_interval = 1000;
+/* MONO_WASM_JIT_REEMIT_MAX: re-emissions per process, a ceiling the rate limit cannot be talked out of. */
+int mono_wasm_jit_reemit_max = 200;
+int mono_wasm_jit_rendezvous_test = 0;
+int mono_wasm_jit_colocate_bytes = 32768;
+/* TIGHT DEPS ARE UNCONDITIONAL. mono_wasm_jit_batch_bind always republishes the dependency set the
+ * ASSEMBLER derived for the module a re-framing actually installs, instead of leaving whatever set the
+ * members were compiled as. Not doing it is a measured pathology rather than a conservative choice: a
+ * rebatch has no capture phase, so the old code skipped the republish and every co-located member went on
+ * demanding admission of callees it now reaches with `call <funcidx>` -- BATCH_ADMIT_FAIL 1966 and
+ * ADMIT_DEFER_GIVEUP 1540 against 3 in the control, and a give-up is permanent, so ~1540 methods lost the
+ * tier for the run.
+ *
+ * THE KNOB IS GONE BECAUSE IT NEVER EXISTED. `mono_wasm_jit_colocate_tight_deps` was declared, parsed from
+ * MONO_WASM_JIT_COLOCATE_TIGHT_DEPS, printed in the colocate stats line -- and NEVER BRANCHED ON. The
+ * republish ran unconditionally the whole time, so `=0` changed nothing while the printf reported
+ * `TIGHT_DEPS=0`, which is worse than no knob at all: an arm run with it reads as a control and is not one.
+ * This is R245's class exactly (MONO_WASM_JIT_COLOCATE_DEPS, MONO_WASM_JIT_SCC_COLOCATE), and it cost a
+ * dep-graph dump on 2026-09-16 that was taken specifically to get the UNTRIMMED graph and did not.
+ *
+ * It matters for reading WJ_GRAPH: because the republish always runs, an intra-group edge is DELETED from
+ * the depset when co-location converts it to a local call. So a `d` edge in the dump is one co-location
+ * FAILED to capture, and the captured count is WJC_TIGHT_DEPS_DROPPED. Anyone measuring capture off the
+ * dump alone gets the sign backwards -- see scratchpad/wj/partreach.py, which now reports both. */
 /* MONO_WASM_JIT_DUMP_DEP_GRAPH: one-shot dump of the registry dependency graph for offline cycle analysis
  * (scratchpad/wj/depcycles.py). Defined HERE, with the other knobs, rather than beside the dumper it gates:
  * the dumper lives inside #ifdef HOST_BROWSER but mono_wasm_jit_dump_stats does not, so a definition down
@@ -440,6 +501,11 @@ int mono_wasm_jit_dump_dep_graph_knob = 0;
 /* MONO_WASM_JIT_VERIFY_DEPS: probe every dep f-slot for the jiterpreter placeholder just before a
  * descriptor goes live. Diagnostic only; see the block in mono_wasm_jit_admit. */
 int mono_wasm_jit_verify_deps = 0;
+/* MONO_WASM_JIT_SINGLE_WRITER: route admission through wj_make_callable, the one function permitted to
+ * install or publish. Ships 0 until validated; see the block above wj_make_callable. */
+int mono_wasm_jit_single_writer = 0;
+/* MONO_WASM_JIT_SWEEP: re-verify already-published descriptors every N admissions. 0 = off. */
+int mono_wasm_jit_sweep = 0;
 /* MONO_WASM_JIT_DEVIRT_IMPORT is GONE, and deliberately not replaced.
  *
  * It used to import the target of a predicted-devirt HIT specifically, as a separate lever from the
@@ -541,7 +607,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm) ? ((*nm != '0') ? 1 : 0) : mono_wasm_jit_names; }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
-	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = per-worker instantiated-vs-entered census; adds a load+test to the interp->JIT boundary, so off while timing */
+	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = the ENTRY half of the per-worker census (mono_wasm_jit_liveness fields 6/9); adds a load+test to the interp->JIT boundary, so off while timing. The INSTANTIATION half (fields 5/7/8/10/13) is unconditional and needs no knob. */
 	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
 	{ extern int mono_wasm_jit_guard_keep_slotlive; const char *gk = g_getenv ("MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE"); mono_wasm_jit_guard_keep_slotlive = (gk && *gk && *gk != '0') ? 1 : 0; } /* 1 = keep elision on under STOREGUARD/OBJGUARD (partial guard coverage, real configuration) */
@@ -562,15 +628,23 @@ mono_wasm_jit_auto_init (void)
 	 * block above it said "DEFAULT ON, and 0 is MEASURED WORSE" -- and auto_init runs once and overwrites,
 	 * so the EFFECTIVE default was 0: the arm R153 measured as reintroducing `function signature mismatch`.
 	 * Every co-location measurement taken before this fix was on that arm. Expected to become non-binding
-	 * once COLOCATE_TIGHT_DEPS lands: a correct dep list is what made cross-group edges want to be imports. */
+	 * once the tight-dep republish lands: a correct dep list is what made cross-group edges want to be
+	 * imports. (It landed, and is unconditional -- see the note at wj_asm_policy_init.) */
 	{ extern int mono_wasm_jit_relink_jitted; const char *rj = g_getenv ("MONO_WASM_JIT_RELINK_JITTED"); if (rj && *rj) mono_wasm_jit_relink_jitted = (*rj != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_colocate_max, mono_wasm_jit_colocate_bytes;
 	  { extern int mono_wasm_jit_colocate_merge; const char *cg = g_getenv ("MONO_WASM_JIT_COLOCATE_MERGE"); mono_wasm_jit_colocate_merge = (cg && *cg && *cg != '0') ? 1 : 0; }
 	  const char *cm = g_getenv ("MONO_WASM_JIT_COLOCATE_MAX"); if (cm && *cm) { int v = atoi (cm); if (v >= 2 && v <= 512) mono_wasm_jit_colocate_max = v; }
 	  const char *cb = g_getenv ("MONO_WASM_JIT_COLOCATE_BYTES"); if (cb && *cb) { int v = atoi (cb); if (v > 0) mono_wasm_jit_colocate_bytes = v; } }
-	{ extern int mono_wasm_jit_colocate_tight_deps; const char *td = g_getenv ("MONO_WASM_JIT_COLOCATE_TIGHT_DEPS"); mono_wasm_jit_colocate_tight_deps = (td && *td) ? (*td != '0') : 1; }
+	{ extern int mono_wasm_jit_rendezvous_test; const char *rt = g_getenv ("MONO_WASM_JIT_RENDEZVOUS_TEST"); if (rt && *rt) { int v = atoi (rt); if (v >= 0) mono_wasm_jit_rendezvous_test = v; } }
+	{ extern int mono_wasm_jit_reemit; const char *re = g_getenv ("MONO_WASM_JIT_REEMIT"); if (re && *re) { int v = atoi (re); if (v >= 0) mono_wasm_jit_reemit = v; } }
+	{ extern int mono_wasm_jit_reemit_misses; const char *rm = g_getenv ("MONO_WASM_JIT_REEMIT_MISSES"); if (rm && *rm) { int v = atoi (rm); if (v > 0) mono_wasm_jit_reemit_misses = v; } }
+	{ extern int mono_wasm_jit_reemit_batch; const char *rb = g_getenv ("MONO_WASM_JIT_REEMIT_BATCH"); if (rb && *rb) { int v = atoi (rb); if (v >= 1 && v <= 64) mono_wasm_jit_reemit_batch = v; } }
+	{ extern int mono_wasm_jit_reemit_interval; const char *ri = g_getenv ("MONO_WASM_JIT_REEMIT_INTERVAL_MS"); if (ri && *ri) { int v = atoi (ri); if (v >= 0) mono_wasm_jit_reemit_interval = v; } }
+	{ extern int mono_wasm_jit_reemit_max; const char *rx = g_getenv ("MONO_WASM_JIT_REEMIT_MAX"); if (rx && *rx) { int v = atoi (rx); if (v >= 0) mono_wasm_jit_reemit_max = v; } }
 	{ extern int mono_wasm_jit_dump_dep_graph_knob; const char *dg = g_getenv ("MONO_WASM_JIT_DUMP_DEP_GRAPH"); mono_wasm_jit_dump_dep_graph_knob = (dg && *dg) ? (*dg != '0') : 0; }
 	{ extern int mono_wasm_jit_verify_deps; const char *vd = g_getenv ("MONO_WASM_JIT_VERIFY_DEPS"); mono_wasm_jit_verify_deps = (vd && *vd) ? (*vd != '0') : 0; }
+	{ extern int mono_wasm_jit_single_writer; const char *sw = g_getenv ("MONO_WASM_JIT_SINGLE_WRITER"); mono_wasm_jit_single_writer = (sw && *sw) ? (*sw != '0') : 0; }
+	{ extern int mono_wasm_jit_sweep; const char *sp = g_getenv ("MONO_WASM_JIT_SWEEP"); mono_wasm_jit_sweep = (sp && *sp) ? atoi (sp) : 0; }
 	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); int v = (rn && *rn) ? atoi (rn) : 0; mono_wasm_jit_raise_nogc = (v >= 0 && v <= 2) ? v : 0; } /* 0=off, 1=liveness-only exemption (shipped, UNVERIFIED), 2=POSITIVE CONTROL ONLY (level 1 minus the gen_skipped_raises guard = the codegen measured 4/4 dead). See wj_ins_is_gcpoint -- its verdicts must be read in order. */
 	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
 	/* Island heuristic levers (Part 5), all default off. */
@@ -1096,11 +1170,136 @@ static gint32 wj_stack_probe_hits = 0;
 
 #define WJC_(i) ((long long) mono_wasm_jit_counters [i])
 
-/* Every counter in the WJC_* enum must appear BOTH here and in the harness mirror (ikvmcraft
- * frontend/src/dotnet/jitbench.ts, `const WJ`), otherwise a counter is paid for on the hot path and
- * then never read. This assert is the tripwire: appending to the enum breaks the build until you have
- * bumped it, which is the prompt to add the new counter to this function and to jitbench.ts. */
-g_static_assert (WJC_MAX == 191);   /* R250: +RELINK_BAIL_CLEARED, +RELINK_REFRESHED (the IKVM body-swap edge) */
+/* A counter that is paid for on the hot path and then never read is waste, so a new WJC_* entry needs a
+ * reader. This assert is the tripwire: appending to the enum breaks the build until you have bumped it,
+ * which is the prompt to add the counter to this function and to a mirror.
+ *
+ * THERE ARE TWO MIRRORS AND THEY ARE NOT EQUALLY CURRENT -- the older wording here claimed every counter
+ * appears in both, and that has not been true for a long time. Measured 2026-09-12:
+ *   scratchpad/wj/lib/mcdrive.mjs   -- the measurement driver's subset, kept in lockstep, and the one
+ *                                      that matters for an A/B. Use scratchpad/wj/wjcsync.py after any
+ *                                      MID-ENUM deletion; appending needs no run.
+ *   ikvmcraft frontend/src/dotnet/jitbench.ts, `const WJ` -- the in-page bench UI. Names 146 of the 192
+ *                                      entries, highest index 155, with a hole at 67..77, so everything
+ *                                      added since R245 is absent from it. Its WJ_MAX is DERIVED from
+ *                                      the table, so the dump simply stops at 156 rather than lying.
+ * Adding to jitbench.ts is optional and app-side; adding to mcdrive.mjs is not optional if the counter
+ * is meant to settle a measurement. */
+/* Depth at which the admission DFS is counted as running deep. Defined here rather than next to the walk
+ * because the stats dump below prints it. */
+#define WJ_ADMIT_DEPTH_WARN 64
+
+g_static_assert (WJC_MAX == 244);   /* P3 re-emission: mid-walk generation window */
+
+/* Census counters — see the long note above mono_wasm_jit_liveness.
+ *
+ * THE GATE IS SPLIT, AND THE SPLIT IS THE POINT. The INSTANTIATION half below is unconditional; only
+ * the ENTRY half (wj_census_entered_total, via mono_wasm_jit_census_note_entry) is still behind
+ * MONO_WASM_JIT_ENTRYCENSUS, because that one costs a load+test at the interp->JIT boundary and so
+ * cannot be on while timing. Instantiation is counted at the two instantiate_*_local choke points,
+ * which run tens of thousands of times per run against a call that costs 29.4 us + 15.4 ns/byte
+ * (R147) -- an atomic add there is unmeasurable, and it buys the one number this tree could not
+ * previously read at all.
+ *
+ * Why that matters: WJC_ELAPSED_INSTANTIATION, which the `[wasm-jit time]` line prints as
+ * `instantiate=`, is added at exactly ONE site (the compiling thread's validating instantiation, at
+ * the bottom of mono_wasm_emit_method). Every per-worker instantiation done by admission -- i.e. the
+ * entire cost this backend actually pays for being per-worker -- was charged here instead, behind a
+ * knob that the measurement discipline says to leave off. So the per-worker instantiation bill had
+ * never been measured on a shipped configuration. It is fields 8/10/13 of mono_wasm_jit_liveness,
+ * which is documented as an always-on probe and now actually is one.
+ *
+ * FIRST READING, and it is why this was worth doing. 2026-09-12, wjbuild-p0-instcensus, full Minecraft
+ * (worldwait, 1 run, --stats --dumps, boot + world.generate 95.3 s in its STALL mode + a 20 s in-game
+ * window), read from the closing dumpWasmJit:
+ *     registered      31,374 methods
+ *     modules         17,249 distinct  (depcycles.py contracted nodes on the same run's WJ_GRAPH)
+ *     instantiations  134,452          = 7.79 per MODULE, 4.29 per registered method
+ *     inst_compile     4,908.4 ms      (the number this line used to print alone)
+ *     inst_all        16,152.5 ms      = 3.29x that
+ * So a module is instantiated on ~7.8 workers, and ~11.2 s per run of instantiation was invisible.
+ * Single run, one workload, no spread -- it sizes the pool, it does not settle a comparison.
+ *
+ * PROCESS-WIDE ATOMICS, not just thread-locals, and that is forced rather than preferred: the worker
+ * isolates whose numbers we want are pthreads parked in synchronous wasm, so CDP Runtime.evaluate never
+ * returns for them (33 of 34 worker targets read "unreachable"). The same blocking is why the unlanded
+ * SHARE_MODULES postMessage relay cannot work without JSPI suspends. Aggregating in C and reading the
+ * total from the page target is the only reliable channel. These live in the wasm heap, which pthreads
+ * share, so any thread's increment is visible.
+ *
+ * This used to be split by PATH -- an eager per-thread sweep (sync_thread), a direct-call backstop
+ * (instantiate_fslot), and admit. BOTH OF THE FIRST TWO HAD NO CALLERS and have been deleted, so those
+ * splits were structurally zero and the split itself was the finding: admit is the only path that ever
+ * instantiates on another worker. A first attempt instrumented only sync_thread and read a flat zero at
+ * 11,069 registered methods -- read at the time as "nothing is duplicated", when it actually meant the
+ * instrumented path was dead. Hooking the two instantiate_*_local choke points is what made the total
+ * unmissable, and it remains the right place. */
+static gint32 wj_census_inst_total;   /* every successful instantiation, any path, any thread */
+static gint32 wj_census_inst_admit;   /* via mono_wasm_jit_admit (per-worker, on demand at dispatch) */
+static gint32 wj_census_entered_total;/* distinct (thread, e-slot) pairs actually entered */
+/* gint32 MICROSECONDS, summed across every thread, and now accumulating unconditionally rather than only
+ * under a knob -- so the overflow bound is worth stating once: 2^31 us is ~35.8 minutes of CUMULATIVE
+ * cross-thread instantiation. A full measured run spends ~16 s (see the reading above), so the headroom is
+ * ~130x and a session would have to be extraordinary to reach it. Widen this to gint64 before trusting it
+ * on a soak; mono_wasm_jit_liveness returns int and would need a millisecond field either way. */
+static gint32 wj_census_inst_us_total;/* microseconds spent instantiating, all threads */
+
+/* One successful module instantiation on this thread, `ms` being the WebAssembly.Module+Instance time
+ * the EM_ASM measured. Unconditional -- see the gate-split note above. A batched module counts ONCE,
+ * not once per member: the WebAssembly.Instance and its export JSFunctions are what a batch amortizes,
+ * and counting n here would hide exactly the win batching is supposed to deliver. */
+#define WJ_CENSUS_NOTE_INSTANTIATE(ms) do {                                             \
+		mono_atomic_inc_i32 (&wj_census_inst_total);                            \
+		mono_atomic_add_i32 (&wj_census_inst_us_total, (gint32) ((ms) * 1000.0)); \
+	} while (0)
+
+/* GC-SAFE AROUND THE JS CALL. `new WebAssembly.Module` + `new WebAssembly.Instance` is a long synchronous
+ * call with no safepoint in it, and until now it ran GC-UNSAFE -- so a worker inside one could not answer a
+ * suspend request, and a fleet of them doing it at once could not answer at all. That is not hypothetical:
+ * it is `WAITING for 1 threads, got 0 suspended` / `suspend_thread suspend took 20001 ms` and 90 s of
+ * silent boot (R162 addendum, recorded at wj_batch_rollback). Under FULL cooperative suspend -- which this
+ * build uses, ENABLE_COOP_SUSPEND=1 in the generated config.h, asserted by mono_threads_suspend_init -- a
+ * thread in STATE_BLOCKING is treated as ALREADY SUSPENDED at zero rendezvous cost and only blocks on its
+ * way back out. Which is exactly the shape wanted for a 29.4 us + 15.4 ns/byte call.
+ *
+ * The region covers the WHOLE EM_ASM so both wasmTable.set calls land inside one blocking window; the
+ * slot-installed marking and the census stay outside, after.
+ *
+ * SUSPENDABILITY THIS ADMITS, DELIBERATELY. The thread becomes suspendable while wj_desc_state[desc] == 1
+ * (visiting) and possibly while holding the wj_compiling CAS. Both were already true -- a compile runs
+ * cctors, which interpret, which poll -- and all admission state is __thread, so a suspension here is
+ * observationally identical to one at a poll inside the same DFS. wj_compiling is a NON-BLOCKING CAS and
+ * every other compiler try-locks, so nothing can wait on it. No caller holds the loader lock across the
+ * call either: mono_wasm_emit_method instantiates BEFORE mono_wasm_jit_register takes it, and both
+ * mono_wasm_jit_admit and mono_wasm_jit_rebatch are lock-free here. So this strictly removes a reason to
+ * block STW and adds no lock-ordering edge.
+ *
+ * WHY THE STATE TEST RATHER THAN A BARE MONO_ENTER_GC_SAFE. DO_BLOCKING is legal only from STATE_RUNNING
+ * and STATE_ASYNC_SUSPEND_REQUESTED (mono-threads-state-machine.c: "Blocking is not nestable"); every
+ * other state is mono_fatal_with_history, a hard abort, and one MONO forced abort wedges a whole batch.
+ * All four call sites are reached GC-unsafe today and no JS export reaches them, so the else arm should
+ * never run -- WJC_JS_BLOCKING_SKIPPED exists to say so out loud rather than to be trusted silently. */
+#define WJ_JS_BLOCKING_BEGIN(cookie, sd, entered)                                       \
+	MONO_STACKDATA (sd);                                                            \
+	gpointer cookie = NULL;                                                         \
+	gboolean entered = FALSE;                                                       \
+	do {                                                                            \
+		MonoThreadInfo *__wj_ti = mono_thread_info_current_unchecked ();        \
+		int __wj_st = __wj_ti ? mono_thread_info_current_state (__wj_ti) : -1;  \
+		if (G_LIKELY (__wj_st == STATE_RUNNING ||                               \
+			      __wj_st == STATE_ASYNC_SUSPEND_REQUESTED)) {              \
+			cookie = mono_threads_enter_gc_safe_region_internal (&sd);      \
+			entered = TRUE;                                                 \
+		} else {                                                                \
+			mono_wasm_jit_counters [WJC_JS_BLOCKING_SKIPPED]++;             \
+		}                                                                       \
+	} while (0)
+
+#define WJ_JS_BLOCKING_END(cookie, sd, entered)                                         \
+	do {                                                                            \
+		if (G_LIKELY (entered))                                                 \
+			mono_threads_exit_gc_safe_region_internal (cookie, &sd);        \
+	} while (0)
 
 /* tiering.c's body-swap census. Declared here rather than including interp/tiering.h, which is an
  * interpreter-private header. */
@@ -1116,13 +1315,29 @@ mono_wasm_jit_dump_stats (void)
 	 * a static function's name can be inlined away and then never appears in the name section. This line
 	 * exists for that, and it is printed rather than merely declared so it cannot be dropped as unused.
 	 * Bump the tag whenever a runtime change needs to be provably deployed. */
-	printf ("[wasm-jit build] wjbuild-r252rjon\n");
+	printf ("[wasm-jit build] wjbuild-p3-reemit-cov\n");
 	printf ("[wasm-jit stats] registered=%lld bailed=%lld invalid=%lld invoked=%lld residual=%lld fastvcall=%lld (counting %s)\n",
 		WJC_(WJC_REGISTERED), WJC_(WJC_BAILED), WJC_(WJC_INVALID),
 		WJC_(WJC_INVOKE), WJC_(WJC_RESIDUAL), WJC_(WJC_FASTVCALL),
 		mono_wasm_jit_stats ? "on" : "OFF — set MONO_WASM_JIT_STATS=1");
-	printf ("[wasm-jit time] gen=%.1fms instantiate=%.1fms attempts=%lld bytes=%lld\n",
+	/* TWO INSTANTIATION NUMBERS, AND THEY ANSWER DIFFERENT QUESTIONS -- this line used to print only the
+	 * first under the bare label `instantiate=`, which read as the tier's whole instantiation bill and is
+	 * not remotely that.
+	 *
+	 *   inst_compile = WJC_ELAPSED_INSTANTIATION, added at ONE site (mono_wasm_emit_method's validating
+	 *                  instantiation on whichever worker won the compile). One per METHOD.
+	 *   inst_all     = every instantiation on every worker, including the per-worker ones admission does
+	 *                  on demand -- i.e. the cost of the table being per-worker. One per (worker, MODULE).
+	 *
+	 * inst_all/modules near 1.0 means no per-worker duplication to remove; N means every module is being
+	 * instantiated on ~N threads. Compare `modules` against `registered` on the stats line above, not
+	 * against attempts: a batched module is one instantiation for n methods, deliberately.
+	 *
+	 * inst_all is stats-INDEPENDENT (mono_wasm_jit_liveness fields 8/13), so it is the only one of the
+	 * two that is also readable in a clean timing run. */
+	printf ("[wasm-jit time] gen=%.1fms inst_compile=%.1fms inst_all=%.1fms modules=%d attempts=%lld bytes=%lld\n",
 		(double) WJC_(WJC_ELAPSED_GENERATION) / 1000.0, (double) WJC_(WJC_ELAPSED_INSTANTIATION) / 1000.0,
+		(double) wj_census_inst_us_total / 1000.0, wj_census_inst_total,
 		WJC_(WJC_COMPILE_ATTEMPTS), WJC_(WJC_BYTES_GENERATED));
 	printf ("[wasm-jit island] attempt=%lld completed=%lld budget_exhausted=%lld depth_exceeded=%lld blocked_cold=%lld promoted_up=%lld promoted_down=%lld\n",
 		WJC_(WJC_ISLAND_ATTEMPT), WJC_(WJC_ISLAND_COMPLETED), WJC_(WJC_ISLAND_BUDGET_EXHAUSTED), WJC_(WJC_ISLAND_DEPTH_EXCEEDED),
@@ -1200,8 +1415,81 @@ mono_wasm_jit_dump_stats (void)
 	/* Islands started by the promotion drain rather than a threshold crossing. The drain runs on EVERY
 	 * safe point with a FRESH budget per queue entry (up to promotion_drain x island_budget force
 	 * compiles from one safe point), and none of it reached WJC_ISLAND_ATTEMPT before this. */
-	printf ("[wasm-jit islanddrain] attempt=%lld completed=%lld  cycle_break_install=%lld\n",
-		WJC_(WJC_ISLAND_DRAIN_ATTEMPT), WJC_(WJC_ISLAND_DRAIN_COMPLETED), WJC_(WJC_CYCLE_BREAK_INSTALL));
+	printf ("[wasm-jit islanddrain] attempt=%lld completed=%lld  cycle_break_install=%lld cycle_break_fail=%lld\n",
+		WJC_(WJC_ISLAND_DRAIN_ATTEMPT), WJC_(WJC_ISLAND_DRAIN_COMPLETED),
+		WJC_(WJC_CYCLE_BREAK_INSTALL), WJC_(WJC_CYCLE_BREAK_FAIL));
+	/* js_blocking_skipped MUST BE 0. Non-zero means some caller now reaches instantiation from managed
+	 * code already in a coop BLOCKING state, so that instantiation blocked STW exactly as it did before
+	 * this change -- correct, merely slow, and the fix is MONO_ENTER_GC_UNSAFE at that caller's P/Invoke
+	 * boundary. Printed unconditionally, and counted ungated, because a clean timing run is where it
+	 * matters and --stats is off there. */
+	printf ("[wasm-jit gcstate] js_blocking_skipped=%lld (must be 0)  jitmm_uninit=%lld (must be 0 -- the interp_code_hash publish race)\n",
+		WJC_(WJC_JS_BLOCKING_SKIPPED), WJC_(WJC_JITMM_UNINIT));
+	/* drain_threads is the load-bearing one: a rendezvous that reaches only the thread that called it is
+	 * not a rendezvous. Expect drains ~= count x drain_threads. */
+	/* THE IDENTITY, WITH `capped` AS A TERM -- it was missing and the line printed a sum that did not
+	 * hold: drained 930 against parts 208, the 722 difference being exactly the cap refusals, which are
+	 * counted after DRAINED is bumped. A dump whose own total contradicts its own body is this file's
+	 * documented signature for a broken census, and it was printing one.
+	 *
+	 * COMPILED must also equal REPUBLISHED + NO_RENDEZVOUS. When it did not -- 2,976 republished against
+	 * 200 compiled -- that was not a counting error but a BUFFER OVERRUN in the batch array.
+	 *
+	 * `rereg` is WJC_FSLOT_REREGISTER, and it is HERE because it is the only way to see that the slot pin
+	 * held. A re-emit re-registers the SAME method on the SAME f-slot, so it takes the re-registration
+	 * arm rather than FSLOT_COLLISION; if rereg does not track COMPILED, the pin did not stick and the
+	 * re-emits landed on FRESH pairs -- which is R170's failure exactly (REEMIT_SLOT_MOVED x20), is
+	 * invisible in every other counter, and silently leaks two table entries per method. The counter was
+	 * bumped and printed NOWHERE before this, so that check could not be made at all. */
+	/* Re-emitted bodies against the run-wide census on the line above: emitted/sites is the coverage
+	 * comparison R179 made, and no_fslot is the one R259 says gates everything -- if re-emission works,
+	 * that share should be much lower here than run-wide, because the callees have since compiled. */
+	{
+		long long rs = WJC_(WJC_REEMIT_SITE), re_ = WJC_(WJC_REEMIT_EMITTED);
+		printf ("[wasm-jit reemit-devirt] sites=%lld emitted=%lld no_rec=%lld no_fslot=%lld -> coverage %.1f%% (run-wide is on the devirt line)\n",
+			rs, re_, WJC_(WJC_REEMIT_NO_REC), WJC_(WJC_REEMIT_NO_FSLOT),
+			rs ? 100.0 * (double) re_ / (double) rs : 0.0);
+	}
+	printf ("[wasm-jit reemit] queued=%lld dedup=%lld mdone=%lld qfull=%lld | drained=%lld = compiled %lld + busy %lld (giveup %lld) + failed %lld + refused %lld + gone %lld + capped %lld | republished=%lld no_rv=%lld sites=%lld rereg=%lld slot_moved=%lld (knob=%d misses=%d batch=%d interval=%dms max=%d)\n",
+		WJC_(WJC_REEMIT_QUEUED), WJC_(WJC_REEMIT_DEDUP), WJC_(WJC_REEMIT_METHOD_DONE),
+		WJC_(WJC_REEMIT_QFULL), WJC_(WJC_REEMIT_DRAINED),
+		WJC_(WJC_REEMIT_COMPILED), WJC_(WJC_REEMIT_BUSY), WJC_(WJC_REEMIT_BUSY_GIVEUP),
+		WJC_(WJC_REEMIT_FAILED),
+		WJC_(WJC_REEMIT_REFUSED), WJC_(WJC_REEMIT_GONE), WJC_(WJC_REEMIT_CAPPED), WJC_(WJC_REEMIT_REPUBLISHED),
+		WJC_(WJC_REEMIT_NO_RENDEZVOUS), WJC_(WJC_REEMIT_SITE), WJC_(WJC_FSLOT_REREGISTER), WJC_(WJC_REEMIT_SLOT_MOVED),
+		mono_wasm_jit_reemit, mono_wasm_jit_reemit_misses,
+		mono_wasm_jit_reemit_batch, mono_wasm_jit_reemit_interval, mono_wasm_jit_reemit_max);
+	/* The admission DFS's own depth. Printed next to re-emission because that is what moves it: see
+	 * WJC_ADMIT_DEPTH_MAX. A run that wedges never reaches this print, so read it from the arms that
+	 * PASS -- how close they ran to the cliff is the whole question. */
+	printf ("[wasm-jit admit-depth] high_water=%lld over_%d=%lld gen_reset_visiting=%lld stale_visiting=%lld batch_swapped=%lld rv_stale2=%lld rv_forced=%lld | single_writer=%d sw_published=%lld sw_install_fail=%lld sw_verify_fail=%lld sw_closure_max=%lld sw_scope=recursive-group | sweep runs=%lld self_dead=%lld dep_bad=%lld | orphaned=%lld admit_orphaned=%lld reused=%lld gen_moved_midwalk=%lld\n",
+		WJC_(WJC_ADMIT_DEPTH_MAX), WJ_ADMIT_DEPTH_WARN, WJC_(WJC_ADMIT_DEPTH_OVER),
+		WJC_(WJC_ADMIT_GEN_RESET_VISITING), WJC_(WJC_ADMIT_STALE_VISITING),
+		WJC_(WJC_ADMIT_BATCH_SWAPPED), WJC_(WJC_RV_DRAIN_STALE2),
+		WJC_(WJC_RV_DRAIN_REFRESH_FORCED), mono_wasm_jit_single_writer,
+		WJC_(WJC_SW_PUBLISHED), WJC_(WJC_SW_INSTALL_FAIL), WJC_(WJC_SW_VERIFY_FAIL),
+		WJC_(WJC_SW_CLOSURE_MAX), WJC_(WJC_SWEEP_RUNS), WJC_(WJC_SWEEP_SELF_DEAD),
+		WJC_(WJC_SWEEP_DEP_BAD), WJC_(WJC_FSLOT_ORPHANED), WJC_(WJC_ADMIT_ORPHANED),
+		WJC_(WJC_FSLOT_REUSED), WJC_(WJC_ADMIT_GEN_MOVED_MIDWALK));
+	printf ("[wasm-jit rendezvous] count=%lld members=%lld drains=%lld drain_threads=%lld slots=%lld refused=%lld log_full=%lld\n",
+		WJC_(WJC_RV_COUNT), WJC_(WJC_RV_MEMBERS), WJC_(WJC_RV_DRAIN), WJC_(WJC_RV_DRAIN_THREADS),
+		WJC_(WJC_RV_DRAIN_SLOT), WJC_(WJC_RV_DRAIN_REFUSED), WJC_(WJC_RV_LOG_FULL));
+	/* THE CO-LOCATOR'S FIELD OF VIEW, and the re-emission headroom, from one census. `visible` is the
+	 * share of call sites whose callee the co-locator can even name; `reachable` is the share of the blind
+	 * half that a re-emission could convert (the callee exists and was merely not compiled yet), as
+	 * against `bailed` (terminal) and `noim` (never executed). Site-counted, not execution-weighted. */
+	{
+		long long hf = WJC_(WJC_CALLEE_HAS_FSLOT), un = WJC_(WJC_CALLEE_NO_FSLOT_UNTRIED),
+			  ba = WJC_(WJC_CALLEE_NO_FSLOT_BAILED), ni = WJC_(WJC_CALLEE_NO_FSLOT_NOIM),
+			  tot = hf + un + ba + ni;
+		printf ("[wasm-jit callee] sites=%lld has_fslot=%lld untried=%lld bailed=%lld noim=%lld"
+			" | colocator sees %.1f%%, re-emission could reach a further %.1f%%\n",
+			tot, hf, un, ba, ni,
+			tot ? 100.0 * (double) hf / (double) tot : 0.0,
+			tot ? 100.0 * (double) un / (double) tot : 0.0);
+	}
+	printf ("[wasm-jit rendezvous] skipped=%lld (thread never had the module installed, so nothing to replace)\n",
+		WJC_(WJC_RV_DRAIN_SKIPPED));
 	/* Fast-path VOLUME. These dispatches are pure emitted wasm and call no counting helper, so without
 	 * MONO_WASM_JIT_PROFILE_FAST=1 they are invisible and the counted totals above (invoked / fastvcall /
 	 * residual) understate real dispatch volume — frame cost then can't be attributed. The counters are
@@ -1229,10 +1517,13 @@ mono_wasm_jit_dump_stats (void)
 	 * WjBatch/WjBatchMember. Co-location goes through mono_wasm_jit_rebatch over retained relocatable
 	 * bodies, which is what both live callers -- wasm_jit_compile_scc and colocate_deps_now -- already did. */
 	printf ("[wasm-jit batching] one path: relocatable rebatch; no method imports, so admission never defers\n");
-	printf ("[wasm-jit colocate] colocated_members=%lld of registered=%lld tight_deps_dropped=%lld rolled_back=%lld scc_refused=%lld (TIGHT_DEPS=%d)\n",
+	/* tight_deps_dropped IS THE CAPTURED-EDGE COUNT: it sums (deps before framing - deps after) over every
+	 * member, and a dep disappears exactly when co-location turned that call into a module-local one. Read
+	 * it against the edges left in WJ_GRAPH for the capture RATE -- 12,966 captured against 26,732
+	 * residual = 32.7% on 2026-09-16, which is R195's ~30% plateau arrived at independently. */
+	printf ("[wasm-jit colocate] colocated_members=%lld of registered=%lld tight_deps_dropped=%lld rolled_back=%lld scc_refused=%lld\n",
 		WJC_(WJC_COLOCATED_MEMBERS), WJC_(WJC_REGISTERED), WJC_(WJC_TIGHT_DEPS_DROPPED),
-		WJC_(WJC_COLOCATE_ROLLBACK), WJC_(WJC_COLOCATE_SCC_REFUSED),
-		mono_wasm_jit_colocate_tight_deps);
+		WJC_(WJC_COLOCATE_ROLLBACK), WJC_(WJC_COLOCATE_SCC_REFUSED));
 	/* WHY the groups that were not formed were not formed. The parts must sum, so print the identity
 	 * and its residual rather than leaving the reader to add up eleven numbers: a non-zero `unaccounted`
 	 * means a refusal path was added without a counter, which is the failure this split exists to stop.
@@ -1606,27 +1897,6 @@ mono_wasm_jit_slot_live_cap_addr (void)
 	return &wj_slot_live_cap;
 }
 
-/* Census counters (MONO_WASM_JIT_ENTRYCENSUS=1) — see the long note above mono_wasm_jit_liveness.
- *
- * PROCESS-WIDE ATOMICS, not just thread-locals, and that is forced rather than preferred: the worker
- * isolates whose numbers we want are pthreads parked in synchronous wasm, so CDP Runtime.evaluate never
- * returns for them (33 of 34 worker targets read "unreachable"). The same blocking is why the unlanded
- * SHARE_MODULES postMessage relay cannot work without JSPI suspends. Aggregating in C and reading the
- * total from the page target is the only reliable channel. These live in the wasm heap, which pthreads
- * share, so any thread's increment is visible.
- *
- * This used to be split by PATH -- an eager per-thread sweep (sync_thread), a direct-call backstop
- * (instantiate_fslot), and admit. BOTH OF THE FIRST TWO HAD NO CALLERS and have been deleted, so those
- * splits were structurally zero and the split itself was the finding: admit is the only path that ever
- * instantiates on another worker. A first attempt instrumented only sync_thread and read a flat zero at
- * 11,069 registered methods -- read at the time as "nothing is duplicated", when it actually meant the
- * instrumented path was dead. Hooking the two instantiate_*_local choke points is what made the total
- * unmissable, and it remains the right place. */
-static gint32 wj_census_inst_total;   /* every successful instantiation, any path, any thread */
-static gint32 wj_census_inst_admit;   /* via mono_wasm_jit_admit (per-worker, on demand at dispatch) */
-static gint32 wj_census_entered_total;/* distinct (thread, e-slot) pairs actually entered */
-static gint32 wj_census_inst_us_total;/* microseconds spent instantiating, all threads */
-
 /* Instantiate a cached JITted module into the CURRENT thread's wasm function table. The table is
  * per-thread for dynamically-added entries, so each thread must do this once (lazily, on its first
  * invoke of the method — interp.c MINT_CALL) before call_indirect-ing the slot. Returns 1 on success,
@@ -1647,6 +1917,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 	 * ternary, NOT JS >>>, since clang parses the EM_ASM body tokens and >>> is not a C operator.)
 	 * out_ms ($6, an 8-byte-aligned double*) receives the WebAssembly.Module+Instance compile time in ms
 	 * (Part 2 instantiation timing) — measured on both the success and CompileError paths; 0/NULL skips it. */
+	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
 	_ok = EM_ASM_INT ({
 		var p = $2 < 0 ? $2 + 4294967296 : $2;
 		var eb = $4 < 0 ? $4 + 4294967296 : $4;
@@ -1736,16 +2007,14 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 	   (int) (intptr_t) mono_wasm_jit_delegate_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_delegate_pic_cap_addr (),
 	   (int) (intptr_t) mono_wasm_jit_scratch (),
 	   (int) (intptr_t) mono_wasm_jit_cur_island_il_state_addr ());
+	WJ_JS_BLOCKING_END (__wj_cookie, __wj_sd, __wj_entered);
 	if (_ok) {
 		/* Physical installation is not dispatch admission. A freshly compiled module can have unchecked
 		 * direct dependencies that are still placeholders on this thread; only mono_wasm_jit_admit marks
 		 * e/f live after recursively admitting the complete closure. */
 		wj_mark_slot_installed (e_slot);
 		wj_mark_slot_installed (f_slot);
-		if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
-			mono_atomic_inc_i32 (&wj_census_inst_total);
-			mono_atomic_add_i32 (&wj_census_inst_us_total, (gint32) (*out_ms * 1000.0));
-		}
+		WJ_CENSUS_NOTE_INSTANTIATE (*out_ms);
 	}
 	return _ok;
 }
@@ -1776,6 +2045,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 	 * clang tokenises this body as C, so it must stay parseable as such: `var x = ...;` at statement
 	 * level is tolerated, but a declaration in a for-initialiser (`for (var k = 0; ...)`) is not, and
 	 * neither is `>>>`. Hence the hoisted `var` + while loop below. */
+	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
 	_ok = EM_ASM_INT ({
 		var es = $0 < 0 ? $0 + 4294967296 : $0;
 		var fs = $1 < 0 ? $1 + 4294967296 : $1;
@@ -1910,6 +2180,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 	   (int) (intptr_t) mono_wasm_jit_delegate_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_delegate_pic_cap_addr (),
 	   (int) (intptr_t) mono_wasm_jit_scratch (),
 	   (int) (intptr_t) mono_wasm_jit_cur_island_il_state_addr ());
+	WJ_JS_BLOCKING_END (__wj_cookie, __wj_sd, __wj_entered);
 	if (_ok) {
 		for (i = 0; i < n; i++) {
 			wj_mark_slot_installed (e_slots [i]);
@@ -1918,10 +2189,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 		/* One MODULE, n methods — count it as one instantiation, because the WebAssembly.Instance and
 		 * its export JSFunctions (the JSDispatchTable entries the renderer dies allocating) are what a
 		 * batch amortizes. Counting n here would hide exactly the win batching is supposed to deliver. */
-		if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
-			mono_atomic_inc_i32 (&wj_census_inst_total);
-			mono_atomic_add_i32 (&wj_census_inst_us_total, (gint32) (*out_ms * 1000.0));
-		}
+		WJ_CENSUS_NOTE_INSTANTIATE (*out_ms);
 	}
 	return _ok;
 }
@@ -2063,6 +2331,16 @@ typedef struct {
 	 * Costs roughly the module minus its framing (median module 780 wire bytes) plus the relocation array,
 	 * retained for the life of the process, against a re-compile that costs the whole mono front end. */
 	struct _WjBody *body;
+	/* THIS DESCRIPTOR NO LONGER OWNS ITS f-SLOT. Set when a re-registration of the same method takes the
+	 * slot over (see the FSLOT_REREGISTER arm). The entry stays in the registry -- nothing is ever freed
+	 * here, lock-free readers hold pointers into it -- but it must never be admitted again: instantiating
+	 * its module would write the OLD body into slots that now belong to the new descriptor.
+	 *
+	 * Without this, workers that had already admitted the old descriptor keep wj_desc_state == 2 with a
+	 * matching generation forever, because the new generation lives on a DIFFERENT registry entry. They
+	 * then dispatch into a slot whose current owner they never installed -- the jiterpreter prefill --
+	 * and the emitted call_indirect traps. That is R267 addendum 10's root cause. */
+	guint8 orphaned;
 } WjRegEntry;
 #define WJ_REG_CHUNK   8192
 #define WJ_REG_NCHUNKS 1024      /* up to 8M JITted methods; the 4KB top-level pointer array never moves */
@@ -2125,6 +2403,57 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			/* A method re-registering onto the f-slot it already owns. Re-emission was the original producer of
 	 * this and is gone; rebatch re-framing is what reaches it now. */
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_FSLOT_REREGISTER);
+
+			/* REUSE THE DESCRIPTOR. DO NOT MINT A NEW ONE.
+			 *
+			 * The comment above says replacing what the slot holds is benign, and it is -- but allocating
+			 * a FRESH registry entry to do it is not, and that was R267 addendum 10's root cause. The
+			 * per-worker admission cache is keyed by DESCRIPTOR ID: `wj_desc_state [d] == 2` with
+			 * `wj_desc_generation [d] == re->generation`. Minting a new descriptor leaves every worker
+			 * holding a valid-looking admission of the OLD id, whose `re->generation` never moves again
+			 * because the new generation lives on a different entry. Those workers dispatch into a slot
+			 * whose current owner they never installed -- the jiterpreter prefill -- and trap.
+			 *
+			 * Updating this entry in place removes the whole problem rather than compensating for it:
+			 *   - wj_desc_for_fslot keeps naming this descriptor, so nothing is orphaned;
+			 *   - bumping THIS entry's generation is exactly what invalidates every worker's cached
+			 *     admission, and the rendezvous already does that proactively;
+			 *   - CALLERS NEED NO INVALIDATION AT ALL. They baked the SLOT, and the slot holds a valid
+			 *     function of the same signature throughout -- old body or new, both correct. That is why
+			 *     a reverse fan-in index is not required here.
+			 *
+			 * Ownership discipline as everywhere else in this registry: publish the contents, fence, then
+			 * publish the word that makes them reachable (the generation). Old bytes/depsets are never
+			 * freed -- a worker mid-walk may hold either, and both are self-consistent. */
+			if (same_method && old_re && !old_re->batch) {
+				old_re->bytes = bytes;
+				old_re->len = len;
+				old_re->body_len = len;
+				old_re->f_sig_id = f_sig_id;
+				old_re->no_gc = no_gc ? 1 : 0;
+				old_re->depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
+				mono_memory_barrier ();
+				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
+				mono_wasm_jit_counters [WJC_FSLOT_REUSED]++;
+				mono_loader_unlock ();
+				return old_desc;
+			}
+			/* ORPHAN THE OLD DESCRIPTOR. It keeps its registry entry and its bytes, but it has just lost
+			 * the slot, and every worker that admitted it still believes otherwise: wj_desc_state == 2
+			 * with a matching wj_desc_generation, because re->generation lives on THIS entry and the new
+			 * one is a different entry entirely. Those workers dispatch into a slot whose current owner
+			 * they never installed and hit the prefill.
+			 *
+			 * Bumping the generation is what invalidates the per-worker cache, because the generation
+			 * compare is the only signal admit's fast path consults -- and the flag is what stops the
+			 * ensuing re-admission from instantiating the old module back over the new owner's slots.
+			 * Contents before the pointer/word that publishes them, as everywhere else here. */
+			if (old_re && old_desc != (int) (n + 1)) {
+				old_re->orphaned = 1;
+				mono_memory_barrier ();
+				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
+				mono_wasm_jit_counters [WJC_FSLOT_ORPHANED]++;
+			}
 		}
 		if (ci < WJ_REG_NCHUNKS) {
 			WjRegEntry *chunk = wj_reg_chunks [ci];
@@ -2290,9 +2619,16 @@ mono_wasm_jit_liveness (int field)
 	 * There is no way to infer this from the outside: the allocator has no free and exposes no cursor. */
 	case 4: { extern int mono_jiterp_table_remaining (int type); return mono_jiterp_table_remaining (1); }
 #endif
-	/* Census (MONO_WASM_JIT_ENTRYCENSUS=1). Fields 5-7 are THREAD-LOCAL and only meaningful on a thread
-	 * you can actually evaluate in; 8-12 are process-wide atomics and are the ones to trust, because the
-	 * pthread workers are parked in blocking wasm and CDP cannot evaluate in them at all.
+	/* Census. THE GATE IS SPLIT: the INSTANTIATION fields (5, 7, 8, 10, 13) are unconditional, and only
+	 * the ENTRY fields (6, 9) still need MONO_WASM_JIT_ENTRYCENSUS=1 -- that half costs a load+test at
+	 * the interp->JIT boundary, the instantiation half is two atomics at a choke point that already
+	 * costs 29.4 us + 15.4 ns/byte. Before the split, field 8/13 read zero on every timed arm, which is
+	 * why the per-worker instantiation bill had never been measured. An ENTRY field reading 0 still means
+	 * "the knob was off", not "nothing was entered".
+	 *
+	 * Fields 5-7 are THREAD-LOCAL and only meaningful on a thread you can actually evaluate in; 8-13 are
+	 * process-wide atomics and are the ones to trust, because the pthread workers are parked in blocking
+	 * wasm and CDP cannot evaluate in them at all.
 	 *
 	 * The headline is field 8 against field 2: total instantiations vs distinct methods registered. A
 	 * ratio near 1.0 means each module is instantiated about once and there is no per-worker duplication
@@ -2305,10 +2641,10 @@ mono_wasm_jit_liveness (int field)
 	 * both of which turned out to have no callers and are gone. The gap is deliberate so a number read
 	 * off an archived capture still means what it meant when it was taken. */
 	case 5: return wj_census_instantiated;
-	case 6: return wj_census_entered;
+	case 6: return wj_census_entered;                       /* ENTRYCENSUS-gated */
 	case 7: return (int) (wj_census_inst_us / 1000);        /* ms this thread spent instantiating */
 	case 8: return wj_census_inst_total;                    /* ALL instantiations, all threads, all paths */
-	case 9: return wj_census_entered_total;                 /* distinct (thread, e-slot) pairs entered */
+	case 9: return wj_census_entered_total;                 /* ENTRYCENSUS-gated: distinct (thread, e-slot) pairs entered */
 	case 10: return wj_census_inst_admit;                   /* of which: via mono_wasm_jit_admit */
 	/* 11, 12: retired (instantiate_fslot / sync_thread — both were dead code). */
 	case 13: return wj_census_inst_us_total / 1000;         /* ms spent instantiating, all threads */
@@ -2433,6 +2769,18 @@ mono_wasm_jit_eslot_probe (int slot, int *out_len)
 #else
 	(void) slot; if (out_len) *out_len = -1; return 1;
 #endif
+}
+
+/* The InterpMethod a descriptor was registered against, resolved AT REGISTRATION on a thread where the
+ * method was live (see the WjRegEntry note on logical_imethod and R151's two worker boot faults). Handed
+ * out so re-emission can carry a plain int through its queue instead of becoming a second holder of a raw
+ * InterpMethod* -- the registry already owns that retention risk, and one owner is enough. */
+gpointer mono_wasm_jit_desc_logical_imethod (int desc_id);
+gpointer
+mono_wasm_jit_desc_logical_imethod (int desc_id)
+{
+	WjRegEntry *re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
+	return re ? re->logical_imethod : NULL;
 }
 
 WJ_KEEPALIVE /* How many methods the JIT tier has registered. Descriptor ids are handed out in
@@ -2607,6 +2955,12 @@ mono_wasm_jit_admit_live (int desc_id)
  * are re-walked on EVERY dispatch, forever, which is how R244's 13.6-22.8 MILLION per run happened with
  * `registered` perfectly flat. Every refusal below is counted so that rate is visible.
  */
+/* Recursion depth of the admission DFS, per thread because the walk is per thread. See
+ * WJC_ADMIT_DEPTH_MAX for why this exists: the mutual recursion below has no depth bound and overflows
+ * the wasm stack once re-emission lengthens dependency chains. Instrumented before being fixed, so the
+ * explicit-stack rewrite can be sized against a measured distribution rather than a guess. */
+static __thread int wj_admit_depth;
+
 static int
 wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 {
@@ -2691,7 +3045,18 @@ wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 			}
 			return 0;
 		}
-		if (!mono_wasm_jit_admit (dep_id)) {
+		int __wj_dep_r;
+		/* THE recursion site. Depth is tracked here rather than inside mono_wasm_jit_admit because that
+		 * function has many returns and a hot already-admitted fast path that must not grow; this is the
+		 * single edge the DFS descends through. */
+		++wj_admit_depth;
+		if (wj_admit_depth > (int) mono_wasm_jit_counters [WJC_ADMIT_DEPTH_MAX])
+			mono_wasm_jit_counters [WJC_ADMIT_DEPTH_MAX] = wj_admit_depth;
+		if (wj_admit_depth == WJ_ADMIT_DEPTH_WARN)
+			mono_wasm_jit_counters [WJC_ADMIT_DEPTH_OVER]++;
+		__wj_dep_r = mono_wasm_jit_admit (dep_id);
+		--wj_admit_depth;
+		if (!__wj_dep_r) {
 			/* Propagation, not a root cause: the dep counted its OWN refusal reason at its own exit.
 			 * Counted anyway because without it this route was invisible, and on HEAD it is ~45% of
 			 * alAdmit0 -- the share that made ADMIT_DEP_NOT_LIVE look like the whole story when it was
@@ -2775,18 +3140,42 @@ wj_admit_install_only (int desc_id, WjRegEntry *re)
 {
 	char eb [192];
 	double ms = 0;
+	guint32 gen;
 
+	/* Never re-instantiate a descriptor that has lost its slot: its module's exports would land on top of
+	 * whoever owns those slots now. */
+	if (G_UNLIKELY (re->orphaned)) {
+		mono_wasm_jit_counters [WJC_ADMIT_ORPHANED]++;
+		return FALSE;
+	}
+	/* ONE READ OF THE GENERATION, used for both the decision and the record.
+	 *
+	 * `re->generation` and `re->depset` are replaced together when a method is re-emitted. Re-reading the
+	 * generation AFTER doing the work certifies this worker against a generation whose DEPSET it never
+	 * walked: the walk installs depset A, re-emission swaps in depset B and bumps the generation, and the
+	 * publish then writes the NEW generation over an admission performed against the OLD one. The
+	 * descriptor is thereafter considered current with a dependency that was never installed here -- which
+	 * is what the sweep caught (`dep[3] ... inst=0`, caller at state 2 with a current generation).
+	 *
+	 * Publishing the SNAPSHOT is both correct and self-healing: if the generation moved meanwhile, this
+	 * worker's cache is merely stale and the next dispatch re-admits against the new depset. */
+	gen = re->generation;
 	if (wj_slot_is_installed (re->e) && wj_slot_is_installed (re->f) &&
-	    wj_desc_generation [desc_id] == re->generation)
+	    wj_desc_generation [desc_id] == gen)
 		return TRUE;
 	eb [0] = 0;
-	if (re->batch) {
+	{
+	/* ONE SNAPSHOT. mono_wasm_jit_rebatch publishes a FRESH WjBatchDesc, so re-reading `re->batch`
+	 * across these arguments can hand the instantiate one module's bytes with another's slot list --
+	 * see WJC_ADMIT_BATCH_SWAPPED. */
+	WjBatchDesc *ibatch = re->batch;
+	if (ibatch) {
 		extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
-		if (!mono_wasm_jit_instantiate_batch_local (re->batch->e, re->batch->f, re->batch->n,
-		                                            re->batch->bytes, re->batch->len, eb, (int) sizeof (eb), &ms)) {
+		if (!mono_wasm_jit_instantiate_batch_local (ibatch->e, ibatch->f, ibatch->n,
+		                                            ibatch->bytes, ibatch->len, eb, (int) sizeof (eb), &ms)) {
 			static int _n = 0;
 			if (_n++ < 20)
-				printf ("WASM_JIT_CYCLE_INSTALL_FAIL desc=%d (batch n=%d) : %s\n", desc_id, re->batch->n, eb);
+				printf ("WASM_JIT_CYCLE_INSTALL_FAIL desc=%d (batch n=%d) : %s\n", desc_id, ibatch->n, eb);
 			return FALSE;
 		}
 	} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len, eb, (int) sizeof (eb), &ms)) {
@@ -2795,13 +3184,24 @@ wj_admit_install_only (int desc_id, WjRegEntry *re)
 			printf ("WASM_JIT_CYCLE_INSTALL_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
 		return FALSE;
 	}
-	wj_desc_generation [desc_id] = re->generation;
+	}
+	/* The snapshot, not a fresh read -- see the note at the top of this function. */
+	wj_desc_generation [desc_id] = gen;
 	return TRUE;
 }
 
 /* Per-thread bookkeeping for the install-closure walk below. Same stamp trick as wj_asm_reaches: a
  * generation counter instead of clearing a 24k array on every call. */
-#define WJ_INSTALL_MAX 512
+/* Sized for the UNION of a co-located group's closures, not for one method's. wj_install_closure_group
+ * seeds the walk from every member of a batch, and the planner has produced 211-member groups, so 512 was
+ * exhausted immediately -- the walk then refused admission transiently FOREVER, which presents as a boot
+ * that never finishes with `faults=[]` and no trap: the tier simply never admits anything and everything
+ * falls back to the interpreter. */
+#define WJ_INSTALL_MAX 4096
+/* The closure the current install pass touched, in stamp order. See wj_make_callable: enumerating it is
+ * what lets publication happen strictly AFTER every install in the closure has completed. */
+static __thread int      wj_clo_list [WJ_INSTALL_MAX];
+static __thread int      wj_clo_n;
 static __thread guint32 *wj_inst_stamp;
 static __thread int      wj_inst_cap;
 static __thread guint32  wj_inst_gen;
@@ -2845,12 +3245,25 @@ wj_install_closure (int desc_id)
 	gboolean ok = TRUE;
 	int i;
 
-	if (desc_id <= 0 || wj_inst_budget-- <= 0)
+	if (desc_id <= 0)
 		return FALSE;
 	wj_inst_stamp_ensure (desc_id + 1);
 	if (wj_inst_stamp [desc_id] == wj_inst_gen)
 		return TRUE;                     /* already handled in this pass (or on the stack: a cycle) */
+	/* CHARGE THE BUDGET FOR DISTINCT NODES ONLY. The decrement used to sit above the stamp test, so every
+	 * REVISIT burned budget too -- and a diamond-shaped dependency graph revisits constantly, so the walk
+	 * gave up far below its nominal closure size. The cap means "how big a closure may be", not "how many
+	 * edges may be traversed". */
+	if (wj_inst_budget-- <= 0)
+		return FALSE;
 	wj_inst_stamp [desc_id] = wj_inst_gen;
+	/* Collect the closure as it is stamped, so the publish pass can enumerate exactly what was
+	 * installed. Bounded by the same budget that bounds the walk. */
+	if (wj_clo_n < WJ_INSTALL_MAX) {
+		wj_clo_list [wj_clo_n++] = desc_id;
+		if (wj_clo_n > (int) mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX])
+			mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX] = wj_clo_n;
+	}
 	re = wj_reg_at (desc_id - 1);
 	if (!re)
 		return FALSE;
@@ -2860,6 +3273,30 @@ wj_install_closure (int desc_id)
 			int d = wj_desc_for_fslot (ds->slot [i]);
 			if (d > 0 && !wj_install_closure (d))
 				ok = FALSE;
+		}
+	}
+	/* THE BATCH IS THE UNIT, AT EVERY LEVEL -- not just at the root.
+	 *
+	 * Installing this descriptor instantiates its whole module, which makes ALL n members callable; there
+	 * is no way to bring up one member alone. So every member's dependency closure must be installed too,
+	 * and that obligation is RECURSIVE: it applies wherever a batch is encountered in the walk, not only
+	 * where the walk started. Seeding only from the root's batch left exactly this hole -- a dep in
+	 * ANOTHER group was installed, its whole module went callable, and the siblings that were not
+	 * themselves dependencies had their own deps skipped.
+	 *
+	 * Observed as: batch[8] entry -> (f-slot) batch[2].JsonObject:.ctor -> (module-local)
+	 * batch[2].LinkedTreeMap:.ctor -> trap. LinkedTreeMap became callable on JsonObject's closure alone.
+	 *
+	 * Terminates because every member is stamped on entry, so each descriptor is walked once per pass. */
+	{
+		WjBatchDesc *mb = re->batch;          /* one snapshot -- see WJC_ADMIT_BATCH_SWAPPED */
+		if (mb) {
+			int bi;
+			for (bi = 0; bi < mb->n; ++bi) {
+				int m = mb->desc [bi];
+				if (m > 0 && m != desc_id && !wj_install_closure (m))
+					ok = FALSE;
+			}
 		}
 	}
 	if (!wj_admit_install_only (desc_id, re))
@@ -2879,12 +3316,400 @@ wj_install_closure_root (int desc_id, WjRegEntry *re)
 	wj_inst_budget = WJ_INSTALL_MAX;
 	return wj_install_closure (desc_id);
 }
+
+/* Seed the walk from EVERY member of a batch, under ONE stamp generation and ONE budget.
+ *
+ * Instantiating a batch module makes all n members callable at once -- there is no way to bring up one
+ * member alone -- so publishing any of them requires the UNION of all n dependency closures to be
+ * installed, not just the triggering member's. The recursive path said so explicitly ("admit the union of
+ * all sibling dependency closures before publishing any sibling live") and walked every sibling's deps.
+ *
+ * Omitting that is what regressed the single writer on a configuration with zero traps: a sibling was
+ * published on the strength of the ROOT's closure while its own dependency was never installed, and its
+ * call_indirect hit the jiterpreter prefill. The trap stack showed caller and callee in the same batch
+ * module (`wasmjit-batch[2]`, unparseSig -> forBasicType), which is that fault exactly. */
+static gboolean
+wj_install_closure_group (int desc_id, WjRegEntry *re)
+{
+	WjBatchDesc *ibatch = re->batch;      /* one snapshot -- see WJC_ADMIT_BATCH_SWAPPED */
+	gboolean ok = TRUE;
+	int i;
+
+	if (!ibatch)
+		return wj_install_closure_root (desc_id, re);
+
+	wj_inst_stamp_ensure (desc_id + 1);
+	if (++wj_inst_gen == 0) {
+		memset (wj_inst_stamp, 0, sizeof (guint32) * (gsize) wj_inst_cap);
+		wj_inst_gen = 1;
+	}
+	wj_inst_budget = WJ_INSTALL_MAX;
+	for (i = 0; i < ibatch->n; ++i) {
+		int m = ibatch->desc [i];
+		if (m > 0 && !wj_install_closure (m))
+			ok = FALSE;
+	}
+	return ok;
+}
 /* The f-slot signature is (body->param_types) -> body->ret_type, so the expected table arity IS
  * body->nparams. Accessor because WjBody is defined further down, with the assembler that owns it. */
 static int wj_body_nparams (struct _WjBody *b);
 
 
 
+
+/* ==================================================================================================
+ * THE SINGLE WRITER  (MONO_WASM_JIT_SINGLE_WRITER, ships 0 until validated)
+ *
+ * R267: installation is not funnelled through the code that enforces the dependency invariant. FOUR
+ * paths write this worker's table and only mono_wasm_jit_admit admits the closure first; the cycle break
+ * installs WITHOUT the closure and returns 1 meaning "admitted", so "admitted" has two meanings. The
+ * invariant "a live f-slot implies this worker installed it AND its whole transitive closure" is upheld
+ * by convention across four installers, two liveness markers, a four-state machine, a per-descriptor
+ * generation and a per-thread bitmap -- and this file records six leaks of that agreement (R151, R165,
+ * R166 x3, and R262/R265/R266 today).
+ *
+ * THE OBSERVATION THAT MAKES THIS SMALL: INSTALL ORDER IS IRRELEVANT. Installing is writing table slots,
+ * and slot writes are independent, so a dependency CYCLE does not obstruct installing both members. Only
+ * PUBLICATION needs ordering, and "install the entire closure, then publish it" satisfies the invariant
+ * with no topological sort, no SCC condensation and no install-only escape hatch. The cycle break exists
+ * only because publication currently happens mid-DFS; remove that and it has no reason to exist.
+ *
+ * Consequences, each of which deletes a bug class rather than a bug:
+ *   - no recursion through mono_wasm_jit_admit, so no VISITING state, so nothing for a generation bump to
+ *     clear (R262) and no marker to leak (R265);
+ *   - liveness is marked for the WHOLE closure before anything is published, so "live" can never precede
+ *     "closure installed" -- R165's `state 2 with neither slot installed` is unrepresentable;
+ *   - one batch snapshot per install (wj_admit_install_only already takes exactly one), so R266's tear
+ *     has nowhere to happen.
+ * ================================================================================================== */
+
+/* Every check wj_admit_dependencies makes EXCEPT the recursive admit: the closure install has already
+ * run, so this only confirms that what is installed is the RIGHT thing. Same counters, so the census
+ * stays comparable across the knob. */
+static gboolean
+wj_verify_deps_installed (WjRegEntry *re)
+{
+	WjDepSet *ds = re->depset;
+	int i;
+	for (i = 0; ds && i < ds->n; ++i) {
+		int dep_id = wj_desc_for_fslot (ds->slot [i]);
+		WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
+		gboolean ident_bad = ds->method [i] && dep &&
+			dep->logical_method != ds->method [i] && dep->body_method != ds->method [i];
+		if (ident_bad)
+			mono_wasm_jit_counters [WJC_ABI_MISMATCH_IDENT]++;
+		if (!dep_id || !dep || dep->f_sig_id != ds->sig [i] || ident_bad) {
+			mono_wasm_jit_counters [!dep_id ? WJC_ABI_MISMATCH_UNREG
+			                        : (!dep ? WJC_ABI_MISMATCH_CHUNK : WJC_ABI_MISMATCH_SIG)]++;
+			return FALSE;
+		}
+		/* ADMISSION'S ACTUAL CONTRACT (R239): test the slot the CALLER BAKED, not dep->f, because a
+		 * callee that re-registered leaves the baked slot stale and generated code calls the baked one. */
+		if (!mono_wasm_jit_slot_live (ds->slot [i])) {
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_DEP_NOT_LIVE);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+/* TIME-OF-USE VERIFICATION. See WJC_SWEEP_*: publish-time checking is provably insufficient here, so
+ * re-check what was already published and find the descriptor that went bad after the fact. */
+static __thread int wj_sweep_tick;
+
+/* Does any dependency's SLOT hold a function whose arity differs from that dependency's own parameter
+ * count? This is the only check here that looks at the table rather than at the registry's claims about
+ * it, and it is the one a baked `call_indirect` actually depends on. */
+static gboolean
+wj_deps_arity_bad (WjRegEntry *re)
+{
+	WjDepSet *ds = re->depset;
+	int i;
+	for (i = 0; ds && i < ds->n; ++i) {
+		int dep_id = wj_desc_for_fslot (ds->slot [i]);
+		WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
+		int len = -1, ok, want;
+		if (!dep || !dep->body)
+			continue;
+		ok = mono_wasm_jit_eslot_probe (ds->slot [i], &len);
+		want = wj_body_nparams (dep->body);
+		if (ok && want >= 0 && len != want)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void
+wj_sweep_published (void)
+{
+	int d, cap;
+	if (G_LIKELY (!mono_wasm_jit_sweep))
+		return;
+	if (++wj_sweep_tick < mono_wasm_jit_sweep)
+		return;
+	wj_sweep_tick = 0;
+	/* BOUND THE DIAGNOSTIC. Each sweep is O(registered) and it ran 33,785 times in one run -- about a
+	 * billion dependency checks -- which made the instrument a leading cause of the stalls it was hired to
+	 * explain. A few hundred sweeps sample the same states; the reports repeat identically anyway. */
+	if (mono_wasm_jit_counters [WJC_SWEEP_RUNS] > 300)
+		return;
+	mono_wasm_jit_counters [WJC_SWEEP_RUNS]++;
+	/* COUNTERS THAT SURVIVE A STALL.
+	 *
+	 * mono_wasm_jit_dump_stats only runs at the end of a healthy run, so every configuration that WEDGES
+	 * during boot -- which is every interesting one here -- has yielded no counters at all, four rounds
+	 * running. Whether a fix even fired then cannot be read, and a fix whose catch counter is unread is
+	 * indistinguishable from a guess that compiled. Printing the few that adjudicate re-emission from
+	 * inside the sweep costs one line per sweep and is readable from a stalled run's log. */
+	{
+		static int _every = 0;
+		if ((_every++ % 8) == 0)
+			printf ("WASM_JIT_LIVE_COUNTERS4 reused=%lld orphaned=%lld admit_orphaned=%lld gen_moved=%lld sw_pub=%lld sw_vfail=%lld rv_forced=%lld sweep_runs=%lld\n",
+				(long long) mono_wasm_jit_counters [WJC_FSLOT_REUSED],
+				(long long) mono_wasm_jit_counters [WJC_FSLOT_ORPHANED],
+				(long long) mono_wasm_jit_counters [WJC_ADMIT_ORPHANED],
+				(long long) mono_wasm_jit_counters [WJC_ADMIT_GEN_MOVED_MIDWALK],
+				(long long) mono_wasm_jit_counters [WJC_SW_PUBLISHED],
+				(long long) mono_wasm_jit_counters [WJC_SW_VERIFY_FAIL],
+				(long long) mono_wasm_jit_counters [WJC_RV_DRAIN_REFRESH_FORCED],
+				(long long) mono_wasm_jit_counters [WJC_SWEEP_RUNS]);
+	}
+	cap = wj_desc_state_cap < wj_reg_n + 1 ? wj_desc_state_cap : wj_reg_n + 1;
+	for (d = 1; d < cap; ++d) {
+		WjRegEntry *re;
+		if (wj_desc_state [d] != 2)
+			continue;
+		re = wj_reg_at (d - 1);
+		if (!re)
+			continue;
+		/* A stale generation is not a fault: the cache is simply out of date and the next dispatch
+		 * re-admits. Only descriptors this thread believes are CURRENT and CALLABLE are interesting. */
+		if (wj_desc_generation [d] != re->generation)
+			continue;
+		if (!mono_wasm_jit_slot_live (re->e) || !mono_wasm_jit_slot_live (re->f)) {
+			static int _n1 = 0;
+			mono_wasm_jit_counters [WJC_SWEEP_SELF_DEAD]++;
+			if (_n1++ < 20)
+				printf ("WASM_JIT_SWEEP_SELF_DEAD desc=%d e=%d f=%d e_live=%d f_live=%d e_inst=%d f_inst=%d gen=%u\n",
+					d, re->e, re->f, mono_wasm_jit_slot_live (re->e), mono_wasm_jit_slot_live (re->f),
+					wj_slot_is_installed (re->e), wj_slot_is_installed (re->f), re->generation);
+			continue;
+		}
+		if (!wj_verify_deps_installed (re)) {
+			static int _n2 = 0;
+			WjDepSet *ds = re->depset;
+			int i;
+			mono_wasm_jit_counters [WJC_SWEEP_DEP_BAD]++;
+			if (_n2++ < 20) {
+				printf ("WASM_JIT_SWEEP_DEP_BAD desc=%d gen=%u batch=%d ndeps=%d\n",
+					d, re->generation, re->batch ? re->batch->n : 0, ds ? ds->n : 0);
+				for (i = 0; ds && i < ds->n; ++i) {
+					int dep_id = wj_desc_for_fslot (ds->slot [i]);
+					WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
+					if (!dep_id || !dep || dep->f_sig_id != ds->sig [i] ||
+					    !mono_wasm_jit_slot_live (ds->slot [i]))
+						/* `inst` vs `live` is THE distinction. They are two different bitmaps and live is a
+						 * subset of installed: a slot can hold the right function (call works) while simply
+						 * not being MARKED live, which is bookkeeping and cannot trap. Only inst=0 means
+						 * the table really holds mono_jiterp_placeholder_jit_call. Printing live alone
+						 * cannot tell a stale marking from a missing function. */
+						{
+						/* PROBE THE TABLE ITSELF. Everything else on this line is BOOKKEEPING -- what the
+						 * registry says is installed and what signature it records. Nothing has yet
+						 * compared the FUNCTION ACTUALLY IN THE SLOT against that claim, and a
+						 * `function signature mismatch` on a baked call_indirect means exactly that the
+						 * occupant's type differs from the caller's baked expectation. `arity` is the
+						 * installed function's real parameter count, `want_ar` the dep's own nparams;
+						 * arity 4 with want_ar != 4 is the jiterpreter prefill
+						 * (mono_jiterp_placeholder_jit_call). */
+						int probe_len = -1;
+						int probe_ok = mono_wasm_jit_eslot_probe (ds->slot [i], &probe_len);
+						int want_ar = (dep && dep->body) ? wj_body_nparams (dep->body) : -1;
+						printf ("   dep[%d] slot=%d desc=%d live=%d inst=%d probe=%d arity=%d want_ar=%d want_sig=%u have_sig=%u dep_gen=%u dep_state=%d%s\n",
+							i, ds->slot [i], dep_id, mono_wasm_jit_slot_live (ds->slot [i]),
+							wj_slot_is_installed (ds->slot [i]), probe_ok, probe_len, want_ar,
+							ds->sig [i], dep ? dep->f_sig_id : 0, dep ? dep->generation : 0,
+							(dep_id > 0 && dep_id < wj_desc_state_cap) ? wj_desc_state [dep_id] : -1,
+							(probe_len == 4 && want_ar != 4) ? "  <-- JITERPRETER PLACEHOLDER"
+							: (probe_ok && want_ar >= 0 && probe_len != want_ar) ? "  <-- WRONG ARITY IN SLOT" : "");
+						}
+				}
+			}
+		}
+	}
+}
+
+static int
+wj_make_callable (int desc_id)
+{
+	WjRegEntry *re;
+	int k;
+
+	if (desc_id <= 0 || desc_id > wj_reg_n) {
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_BAD_ID);
+		return 0;
+	}
+	wj_desc_state_ensure (desc_id + 1);
+	mono_memory_barrier ();
+	re = wj_reg_at (desc_id - 1);
+	if (!re) {
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_NO_ENTRY);
+		return 0;
+	}
+	/* AN ORPHANED DESCRIPTOR IS NEVER ADMISSIBLE AGAIN -- it no longer owns its f-slot, so instantiating
+	 * its module would write the old body over the slot's current owner. This must come BEFORE the
+	 * generation arm below: orphaning bumps the generation to invalidate every worker's cache, and that
+	 * arm would otherwise reset state 3 -> 0 and walk straight into the re-admission this prevents. No
+	 * per-thread state is needed because being slot-less is a process-wide, permanent fact. */
+	if (G_UNLIKELY (re->orphaned)) {
+		mono_wasm_jit_counters [WJC_ADMIT_ORPHANED]++;
+		return 0;
+	}
+	/* The permfail bound is the one piece of the old state machine that must survive verbatim: without it
+	 * a descriptor whose bytes will never instantiate is retried on every dispatch forever (R167:
+	 * 959,405 refusals at 0.02 fps). */
+	if (desc_id < wj_desc_state_cap && wj_desc_state [desc_id] == 3 &&
+	    wj_desc_permfail [desc_id] >= WJ_PERMFAIL_MAX) {
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_PERMFAIL);
+		return 0;
+	}
+#ifdef HOST_BROWSER
+	/* Restore the guarded trampoline before the table underneath it changes; repatched per member below. */
+	if (desc_id < wj_desc_state_cap && wj_desc_generation [desc_id] != re->generation && re->logical_imethod)
+		mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod);
+#endif
+
+	wj_clo_n = 0;
+	if (!wj_install_closure_group (desc_id, re)) {
+		/* TRANSIENT BY CONSTRUCTION: either the 512 budget ran out or an instantiate failed. State 0, so
+		 * the next dispatch retries -- and per R166 the retry is cheap because the instantiate itself is
+		 * guarded by wj_slot_is_installed. */
+		/* PERMANENT FAILURES MUST TERMINATE. The recursive path split its refusals: bad bytes set
+		 * fail_perm, bumped wj_desc_permfail and landed at state 3, everything else at state 0. Losing
+		 * that split routes a condition that can never clear into the retry path, which is R167
+		 * (959,405 refusals at 0.02 fps) and R244 (14-23M/run). wj_install_closure does not report WHY it
+		 * failed, so count consecutive failures per descriptor and promote at the same bound -- same
+		 * terminal state, same cap, without plumbing the cause through the walk. */
+		if (desc_id < wj_desc_state_cap) {
+			if (wj_desc_permfail [desc_id] < 255)
+				wj_desc_permfail [desc_id]++;
+			wj_desc_state [desc_id] = (wj_desc_permfail [desc_id] >= WJ_PERMFAIL_MAX) ? 3 : 0;
+		}
+		mono_wasm_jit_counters [WJC_SW_INSTALL_FAIL]++;
+		return 0;
+	}
+
+	/* PASS 1 -- LIVENESS FOR THE WHOLE CLOSURE, and only now that every install in it has completed.
+	 * This ordering is the entire point: a dep's liveness is what pass 2 verifies, so marking must be
+	 * global before any verification runs, and publication must follow both. */
+	for (k = 0; k < wj_clo_n; ++k) {
+		int d = wj_clo_list [k];
+		WjRegEntry *dre = (d > 0 && d <= wj_reg_n) ? wj_reg_at (d - 1) : NULL;
+		if (!dre)
+			continue;
+		wj_mark_slot_live (dre->e);
+		wj_mark_slot_live (dre->f);
+	}
+	/* ...and the root's batch siblings, which the batch instantiate above wrote 2N slots for but which
+	 * need not appear in the closure (a sibling is only in it if it is also a DEPENDENCY). Without this
+	 * they fail pass 2's liveness test and never publish -- R166 measured that omission at 106,724,167
+	 * vfbNotLive, because an unpublished sibling falls back to the interpreter on every virtual call. */
+	if (re->batch) {
+		WjBatchDesc *lbatch = re->batch;          /* one snapshot -- see WJC_ADMIT_BATCH_SWAPPED */
+		int bi;
+		for (bi = 0; bi < lbatch->n; ++bi) {
+			wj_mark_slot_live (lbatch->e [bi]);
+			wj_mark_slot_live (lbatch->f [bi]);
+		}
+	}
+
+	/* PASS 1b -- VERIFY THE WHOLE CLOSURE, because the old path did.
+	 *
+	 * This is the step whose absence regressed a clean config twice. The recursive admit verified
+	 * TRANSITIVELY: admit(R) -> admit(D) -> admit(E), and a sig or identity mismatch anywhere propagated
+	 * a refusal all the way to the root, so R never became callable over a broken E. Verifying only the
+	 * ROOT's own deps is one level deep, and one level is not enough -- R's dep D looks perfect (installed,
+	 * live, right ABI) while D's own dep E is mismatched, so R publishes, R calls D, D call_indirects E
+	 * and traps. Measured: re-emission OFF went sig 0 -> 4 with a stall, on a path that had been clean.
+	 *
+	 * VERIFY ALL, PUBLISH ONE. Those are different questions about different descriptors: installing the
+	 * closure is a statement about the table, verifying it is a statement about ABI agreement across the
+	 * whole reachable graph, and publishing is a statement about one descriptor's admissibility. The
+	 * first cut conflated verify with publish in one direction (verified all, published all) and the
+	 * second in the other (verified one, published one). */
+	for (k = 0; k < wj_clo_n; ++k) {
+		int d = wj_clo_list [k];
+		WjRegEntry *dre = (d > 0 && d <= wj_reg_n) ? wj_reg_at (d - 1) : NULL;
+		if (!dre)
+			continue;
+		if (!mono_wasm_jit_slot_live (dre->e) || !mono_wasm_jit_slot_live (dre->f) ||
+		    !wj_verify_deps_installed (dre)) {
+			/* Transient, and scoped to the ROOT exactly as the recursive refusal was: the next dispatch
+			 * re-walks the closure, which R166 notes is cheap because the instantiate is guarded. */
+			if (desc_id < wj_desc_state_cap)
+				wj_desc_state [desc_id] = 0;
+			mono_wasm_jit_counters [WJC_SW_VERIFY_FAIL]++;
+			return 0;
+		}
+	}
+
+	/* PASS 2 -- PUBLISH THE ROOT AND ITS BATCH SIBLINGS ONLY, never the whole closure.
+	 *
+	 * The first version of this published every closure member, and that REGRESSED a configuration that
+	 * had zero traps: old path with re-emission off, sig 0 -> 4 plus a stall. Publishing a dependency is
+	 * NOT the same as admitting it. wj_verify_deps_installed below tests liveness that pass 1 has just
+	 * granted, so for an in-closure dep it is close to tautological and does not reproduce what the
+	 * recursive admit actually checked before declaring a descriptor callable. Installing the closure is
+	 * a statement about the TABLE; publishing is a statement about a descriptor's own admissibility, and
+	 * only the root (plus the batch siblings that share its module, as the old path did) has had that
+	 * established here.
+	 *
+	 * The ORDERING is what this refactor is for and it is unaffected: every install in the closure
+	 * completes before anything is published, so no publication happens mid-walk and the install-only
+	 * cycle break has nothing left to do. */
+	{
+	WjBatchDesc *pbatch = re->batch;              /* one snapshot */
+	int pn = pbatch ? pbatch->n : 1, pi;
+	for (pi = 0; pi < pn; ++pi) {
+		/* Iterate the BATCH's own member list rather than filtering the closure, so a sibling that is
+		 * not a dependency of the root is still published -- that is the old path's set exactly. */
+		int d = pbatch ? pbatch->desc [pi] : desc_id;
+		WjRegEntry *dre = (d > 0 && d <= wj_reg_n) ? wj_reg_at (d - 1) : NULL;
+		if (!dre)
+			continue;
+		wj_desc_state_ensure (d + 1);
+		if (d >= wj_desc_state_cap)
+			continue;
+		/* wj_mark_slot_live refuses an uninstalled slot SILENTLY (R151), so believe the bitmap, never the
+		 * fact that we asked. */
+		if (!mono_wasm_jit_slot_live (dre->e) || !mono_wasm_jit_slot_live (dre->f)) {
+			wj_desc_state [d] = 0;
+			continue;
+		}
+		if (!wj_verify_deps_installed (dre) || wj_deps_arity_bad (dre)) {
+			wj_desc_state [d] = 0;
+			continue;
+		}
+		wj_desc_state [d] = 2;
+		/* DO NOT RE-READ THE GENERATION HERE. wj_admit_install_only already recorded the generation it
+		 * actually installed, and re-reading would certify this worker against a generation whose depset
+		 * it never walked -- a method re-emitted mid-walk replaces `depset` and `generation` together.
+		 * Leaving the recorded value in place is self-healing: if it is behind, the next dispatch
+		 * re-admits against the new depset. */
+		if (wj_desc_generation [d] != dre->generation)
+			mono_wasm_jit_counters [WJC_ADMIT_GEN_MOVED_MIDWALK]++;
+		/* wj_admit_install_only already recorded the generation it installed; leave it. Skipping the write
+		 * is correct HERE (unlike the old path above) precisely because the installer sets it. */
+		mono_wasm_jit_counters [WJC_SW_PUBLISHED]++;
+#ifdef HOST_BROWSER
+		if (dre->logical_imethod)
+			mono_jiterp_wasm_jit_patch_interp_entry (dre->logical_imethod);
+#endif
+	}
+	}
+	return (desc_id < wj_desc_state_cap && wj_desc_state [desc_id] == 2) ? 1 : 0;
+}
 
 int
 mono_wasm_jit_admit (int desc_id)
@@ -2898,6 +3723,7 @@ mono_wasm_jit_admit (int desc_id)
 	 * dispatch retries)? Default transient. See the `fail:` label for why the old unconditional 3 was the
 	 * single largest cost of co-location. */
 	gboolean fail_perm = FALSE;
+	guint32 gen_snapshot = 0;   /* re->generation as of BEFORE the dependency walk; see the publish below */
 	char eb [192]; double ms = 0;
 	if (desc_id <= 0 || desc_id > wj_reg_n) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_BAD_ID);
@@ -2926,6 +3752,15 @@ mono_wasm_jit_admit (int desc_id)
 			return 1;
 	}
 
+	/* THE FORK. Above is the shared fast path (a pure per-thread cache check, unchanged). Below is the
+	 * ORIGINAL multi-installer path, kept so the refactor is an in-binary A/B rather than a one-way
+	 * rewrite -- CLAUDE.md prefers a within-binary knob comparison to a cross-binary one, and this path
+	 * carries every admission on the shipped config. Delete it once the single writer is proven. */
+	if (G_UNLIKELY (mono_wasm_jit_sweep))
+		wj_sweep_published ();
+	if (G_UNLIKELY (mono_wasm_jit_single_writer))
+		return wj_make_callable (desc_id);
+
 	wj_desc_state_ensure (desc_id + 1);
 	mono_memory_barrier ();
 	re = wj_reg_at (desc_id - 1);
@@ -2933,6 +3768,16 @@ mono_wasm_jit_admit (int desc_id)
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_NO_ENTRY);
 		return 0;
 	}
+	/* AN ORPHANED DESCRIPTOR IS NEVER ADMISSIBLE AGAIN -- it no longer owns its f-slot, so instantiating
+	 * its module would write the old body over the slot's current owner. This must come BEFORE the
+	 * generation arm below: orphaning bumps the generation to invalidate every worker's cache, and that
+	 * arm would otherwise reset state 3 -> 0 and walk straight into the re-admission this prevents. No
+	 * per-thread state is needed because being slot-less is a process-wide, permanent fact. */
+	if (G_UNLIKELY (re->orphaned)) {
+		mono_wasm_jit_counters [WJC_ADMIT_ORPHANED]++;
+		return 0;
+	}
+	gen_snapshot = re->generation;
 	watch = mono_wasm_jit_watch && re->logical_method && re->logical_method->name &&
 		strstr (re->logical_method->name, mono_wasm_jit_watch);
 	if (watch)
@@ -2955,17 +3800,58 @@ mono_wasm_jit_admit (int desc_id)
 				mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod);
 #endif
 		/* A NEW generation earns a fresh attempt -- unless this worker has already burned
-		 * WJ_PERMFAIL_MAX of them on bytes that would not instantiate. See wj_desc_permfail. */
-		if (wj_desc_state [desc_id] != 3 || wj_desc_permfail [desc_id] < WJ_PERMFAIL_MAX)
+		 * WJ_PERMFAIL_MAX of them on bytes that would not instantiate. See wj_desc_permfail.
+		 *
+		 * BUT NEVER CLEAR STATE 1. State 1 is not a cached verdict, it is "THIS thread is inside a DFS
+		 * on this descriptor right now", and the cycle break below is the only thing standing between a
+		 * cyclic depset and unbounded recursion. A generation change invalidates the admission CACHE
+		 * (states 2 and 3); it says nothing about a walk in flight, and clearing the marker under one
+		 * defeats the break: on the non-batch path wj_desc_generation is not written until the walk
+		 * completes, so the mismatch persists, and every re-entry through a cycle edge cleared the
+		 * marker, re-marked visiting, and descended again. That is R262's boot wedge -- a V8 `Maximum
+		 * call stack size exceeded` whose stack is this function and wj_admit_dependencies alternating,
+		 * on a workload whose measured admission depth with re-emission OFF is 22. Re-emission is the
+		 * only thing that bumps a LIVE descriptor's generation while walks are in flight, which is why
+		 * nothing else ever reached it. */
+		if (wj_desc_state [desc_id] == 1 && wj_admit_depth > 0)
+			mono_wasm_jit_counters [WJC_ADMIT_GEN_RESET_VISITING]++;
+		else if (wj_desc_state [desc_id] != 3 || wj_desc_permfail [desc_id] < WJ_PERMFAIL_MAX)
 			wj_desc_state [desc_id] = 0;
+	}
+	/* STATE 1 AT DEPTH 0 IS A LEAK, NOT A CYCLE. (This was built believing it was R264 wall 3's cause;
+	 * WJC_ADMIT_STALE_VISITING then measured 0 while the trap still fired, so it is NOT that cause. It
+	 * is kept as correct hygiene -- a leaked marker would be silent and permanent -- not as a fix.)
+	 * The cycle break below is INSTALL-ONLY: it returns 1 without admitting the closure, which is correct
+	 * for a real cycle (the in-flight walk above it will finish the job) and catastrophic for a stale
+	 * marker (nothing will). A dependency then stays at mono_jiterp_placeholder_jit_call while its caller
+	 * is live, and the emitted call_indirect traps with `function signature mismatch`. This thread is not
+	 * in a DFS at depth 0, so no cycle through this descriptor is possible; the marker was leaked. */
+	if (wj_desc_state [desc_id] == 1 && wj_admit_depth == 0) {
+		mono_wasm_jit_counters [WJC_ADMIT_STALE_VISITING]++;
+		wj_desc_state [desc_id] = 0;
 	}
 	if (wj_desc_state [desc_id] == 1) {
 		/* Dependency cycle within this admission DFS. Break it -- but INSTALL first, because the caller
 		 * about to go live will call_indirect this f-slot and generated indirect calls carry no liveness
 		 * check. See wj_admit_install_only. */
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_CYCLE_BREAK_INSTALL);
-		if (!wj_install_closure_root (desc_id, re))
+		if (!wj_install_closure_root (desc_id, re)) {
+			/* The ONLY refusal on this path that had no counter, and it is also the only one that
+			 * returns while leaving wj_desc_state[desc_id] == 1. Everything else either counts itself
+			 * or goes through `fail:`, which clears the visiting state for this descriptor and its
+			 * batch siblings. Counted, not fixed, deliberately: whether state 1 is the right thing to
+			 * leave behind here is a separate question from being able to see how often it happens.
+			 *
+			 * MEASURED ZERO ON FIRST READING, and unlike most zeros this one is INFORMATIVE, because its
+			 * sibling proves the path runs: 2026-09-12, full Minecraft boot + worldgen + in-game,
+			 * cycle_break_install = 2,513 with cycle_break_fail = 0. So the cycle break is common and
+			 * wj_install_closure_root has never failed on this workload -- the uncounted route was
+			 * harmless, which is a fact nobody could state before. Keep the counter: a zero next to a
+			 * non-zero sibling distinguishes "cannot happen here" from "silently stopped happening",
+			 * which a missing counter cannot. */
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_CYCLE_BREAK_FAIL);
 			return 0;
+		}
 		return 1;
 	}
 	if (wj_desc_state [desc_id] == 3) {
@@ -2998,8 +3884,14 @@ mono_wasm_jit_admit (int desc_id)
 			    sre->batch != batch)
 				goto fail;
 			wj_desc_state_ensure (sibling + 1);
-			if (wj_desc_generation [sibling] != batch->generation)
-				wj_desc_state [sibling] = 0;
+			/* Same rule as the standalone reset above: a sibling that is VISITING is an ancestor of
+			 * the current walk, and clearing its marker defeats the cycle break identically. */
+			if (wj_desc_generation [sibling] != batch->generation) {
+				if (wj_desc_state [sibling] == 1 && wj_admit_depth > 0)
+					mono_wasm_jit_counters [WJC_ADMIT_GEN_RESET_VISITING]++;
+				else
+					wj_desc_state [sibling] = 0;
+			}
 			if (wj_desc_state [sibling] == 3)
 				goto fail;
 			wj_desc_state [sibling] = 1;
@@ -3024,11 +3916,13 @@ mono_wasm_jit_admit (int desc_id)
 	    wj_desc_generation [desc_id] != re->generation) {
 		instantiated_here = TRUE;
 		eb [0] = 0;
-		if (re->batch) {
+		/* `batch`, NOT `re->batch`: the snapshot taken before the premark loop. Re-reading the pointer
+		 * here is what let a concurrent re-frame pair one module's bytes with another's slot list. */
+		if (batch) {
 			extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
-			if (!mono_wasm_jit_instantiate_batch_local (re->batch->e, re->batch->f, re->batch->n,
-			                                            re->batch->bytes, re->batch->len, eb, (int) sizeof (eb), &ms)) {
-				printf ("WASM_JIT_ADMIT_FAIL desc=%d (batch n=%d) e=%d f=%d : %s\n", desc_id, re->batch->n, re->e, re->f, eb);
+			if (!mono_wasm_jit_instantiate_batch_local (batch->e, batch->f, batch->n,
+			                                            batch->bytes, batch->len, eb, (int) sizeof (eb), &ms)) {
+				printf ("WASM_JIT_ADMIT_FAIL desc=%d (batch n=%d) e=%d f=%d : %s\n", desc_id, batch->n, re->e, re->f, eb);
 				fail_perm = TRUE;   /* a LinkError/CompileError on these bytes will not fix itself */
 				goto fail;
 			}
@@ -3057,11 +3951,9 @@ mono_wasm_jit_admit (int desc_id)
 		}
 		/* Path tag only; the total is counted inside instantiate_*_local. This is THE per-worker path --
 		 * already demand-driven at dispatch, so a high count here is not by itself removable waste. */
-		if (G_UNLIKELY (mono_wasm_jit_entry_census)) {
-			wj_census_instantiated++;
-			wj_census_inst_us += (gint64) (ms * 1000.0);
-			mono_atomic_inc_i32 (&wj_census_inst_admit);
-		}
+		wj_census_instantiated++;
+		wj_census_inst_us += (gint64) (ms * 1000.0);
+		mono_atomic_inc_i32 (&wj_census_inst_admit);
 	}
 	/* Publish dispatchability only after every unchecked direct dependency is admitted. */
 	/* MONO_WASM_JIT_VERIFY_DEPS=1: test the invariant directly, at the only moment it matters -- just
@@ -3151,8 +4043,24 @@ mono_wasm_jit_admit (int desc_id)
 		goto fail;
 	}
 	wj_desc_state [desc_id] = 2;
-	wj_desc_generation [desc_id] = re->generation;
-	if (re->batch) {
+	/* Publish the generation this admission WALKED, and publish it unconditionally.
+	 *
+	 * The first version of this skipped the write whenever the recorded value differed from
+	 * `re->generation` -- which on a FIRST admission is always (recorded 0 vs a live generation), so no
+	 * descriptor was ever cached and every dispatch re-admitted from scratch: `gen_moved` measured
+	 * 6,140,331 in one run, R244's retry storm introduced wholesale. The snapshot is taken before the
+	 * dependency walk, so it still cannot certify this worker against a generation whose depset it never
+	 * walked; if the generation moved underneath, the recorded value is simply behind and the next
+	 * dispatch re-admits. Counted, not skipped. */
+	if (gen_snapshot != re->generation)
+		mono_wasm_jit_counters [WJC_ADMIT_GEN_MOVED_MIDWALK]++;
+	wj_desc_generation [desc_id] = gen_snapshot;
+	/* MUST be the snapshot, not re->batch: the premark loop above validated membership against `batch`,
+	 * so publishing from a different descriptor would mark liveness for a set this call never premarked
+	 * and never instantiated. Counted, because a swap here is the race itself. */
+	if (batch != re->batch)
+		mono_wasm_jit_counters [WJC_ADMIT_BATCH_SWAPPED]++;
+	if (batch) {
 		/* THE PREMARK MUST ALWAYS BE UNDONE, AND `instantiated_here` USED TO GATE THE UNDOING.
 		 *
 		 * This loop was `if (re->batch && instantiated_here)`. The reasoning was about the LIVENESS
@@ -3177,8 +4085,8 @@ mono_wasm_jit_admit (int desc_id)
 		 *
 		 * So: always run the loop, and gate only the marking. On the skip path the bitmap is simply read
 		 * rather than written, which is exactly the invariant the guard was protecting. */
-		for (i = 0; i < re->batch->n; ++i) {
-			int sibling = re->batch->desc [i];
+		for (i = 0; i < batch->n; ++i) {
+			int sibling = batch->desc [i];
 			if (sibling <= 0)
 				continue;
 			wj_desc_state_ensure (sibling + 1);
@@ -3187,17 +4095,17 @@ mono_wasm_jit_admit (int desc_id)
 			 * never wrote was announced as admitted regardless of what the bitmap decided. Mark first,
 			 * then believe the bitmap. */
 			if (instantiated_here) {
-				wj_mark_slot_live (re->batch->e [i]);
-				wj_mark_slot_live (re->batch->f [i]);
+				wj_mark_slot_live (batch->e [i]);
+				wj_mark_slot_live (batch->f [i]);
 			}
-			if (!mono_wasm_jit_slot_live (re->batch->e [i]) || !mono_wasm_jit_slot_live (re->batch->f [i])) {
+			if (!mono_wasm_jit_slot_live (batch->e [i]) || !mono_wasm_jit_slot_live (batch->f [i])) {
 				/* Third leak of the same invariant: `continue` used to leave this sibling on the state 1
 				 * set by the visiting loop. Put it back to 0 so the next dispatch retries it. */
 				wj_desc_state [sibling] = 0;
 				continue;
 			}
 			wj_desc_state [sibling] = 2;
-			wj_desc_generation [sibling] = re->batch->generation;
+			wj_desc_generation [sibling] = batch->generation;
 #ifdef HOST_BROWSER
 			/* Patch EVERY sibling, not just the descriptor that triggered this admission.
 			 * mono_wasm_jit_batch_bind unpatches all n members before rebinding them (their e/f slots are
@@ -3253,15 +4161,415 @@ fail:
 	if (batch) {
 		for (i = 0; i < batch->n; ++i) {
 			int sibling = batch->desc [i];
-			if (sibling > 0 && sibling < wj_desc_state_cap &&
-			    wj_desc_generation [sibling] == batch->generation)
+			if (sibling <= 0 || sibling >= wj_desc_state_cap)
+				continue;
+			/* THE GENERATION GUARD LEAKED THE VISITING MARKER. This walk set state 1 on every sibling
+			 * above; if a rebatch or a re-emission bumped the generation while the walk was running,
+			 * the guard below stopped it being un-set and the sibling stayed VISITING FOREVER. That is
+			 * survivable only as long as something else clears it -- which the generation reset used to
+			 * do by accident, until R262 correctly stopped clearing in-flight markers. Then it became
+			 * permanent, and a permanent state 1 routes every later admit into the install-only cycle
+			 * break: admitted without its closure, dependency f-slot still the jiterpreter placeholder,
+			 * and a signature-mismatch trap on the first call. That chain is REAL but is NOT what the
+			 * observed trap is -- WJC_ADMIT_STALE_VISITING measured 0 while it still fired. Fixed anyway,
+			 * because the leak itself is real: always un-mark a VISITING sibling.
+			 * Only the PERMANENT verdict stays generation-scoped, because condemning a descriptor whose
+			 * bytes someone else has since replaced is not this walk's call to make. */
+			if (wj_desc_generation [sibling] == batch->generation)
 				wj_desc_state [sibling] = fail_perm ? 3 : 0;
+			else if (wj_desc_state [sibling] == 1)
+				wj_desc_state [sibling] = 0;
 		}
 	} else {
 		wj_desc_state [desc_id] = fail_perm ? 3 : 0;
 	}
 	return 0;
 }
+
+/* ================================================================================================== *
+ * THE REPUBLICATION RENDEZVOUS
+ *
+ * The problem this exists for, stated once. A JITted method's bytes are published process-wide, but each
+ * worker instantiates its own WebAssembly.Instance and writes its own function table -- ONE WORKER CANNOT
+ * WRITE ANOTHER'S -- and generated code call_indirects an f-slot with NO liveness check, by design. So a
+ * live f-slot can never be re-pointed: between "worker A decided" and "worker B re-instantiated", B's code
+ * keeps calling the old body. For an equivalence-preserving swap that is merely slower (R252 leaves
+ * generation 1 live and gives generation 2 a FRESH pair for exactly this reason). For anything that
+ * CHANGES BEHAVIOUR -- a re-emission whose callers must see the new body, a MonoMod detour -- it is wrong.
+ *
+ * The only way to repoint a slot safely is to stop every worker, and then have each worker re-instantiate
+ * ITS OWN table before it executes another instruction of JIT code.
+ *
+ * WHAT IS REUSED RATHER THAN BUILT. Three things already exist and are proven:
+ *   - mono_stop_world / mono_restart_world (gc-internals.h, sgen-stw.c) -- a public non-collection STW
+ *     pair that interp_invalidate_transformed (interp.c) already uses for exactly this kind of job.
+ *   - the GENERATION mechanism: wj_desc_generation[desc] != re->generation already makes a worker drop its
+ *     admission cache and re-instantiate (mono_wasm_jit_admit). Bumping re->generation is the whole
+ *     publication step.
+ *   - mono_wasm_jit_admit itself does the re-instantiation, in dependency order, with every refusal
+ *     counted. The drain below calls it rather than reimplementing a second, less-tested installer.
+ * What is NEW is only the guarantee the generation mechanism lacks: that no thread ENTERS the slot in the
+ * window between the bump and its own re-admission.
+ *
+ * WHY AN EPOCH AND A LOG, not a single "current batch". A thread parked at a safepoint drains the moment
+ * it resumes. A thread that was in GC-SAFE when the world stopped was never parked at all (coop counts it
+ * suspended immediately) and drains when it comes back. That second thread can sit out SEVERAL rendezvous
+ * -- it is not executing JIT code meanwhile, so its stale entries are harmless until it returns -- and
+ * then must catch up on ALL of them. A single slot would lose the earlier ones. The log is append-only and
+ * never freed, per this file's ownership rule: it is read lock-free by every worker and nothing recalls it.
+ * ================================================================================================== */
+
+/* One rendezvous: the descriptors republished, and the epoch that publication established. */
+typedef struct {
+	gint32  epoch;
+	gint32  n;
+	gint32 *desc;     /* owned, never freed */
+} WjRendezvous;
+
+#define WJ_RV_LOG_MAX 4096          /* rendezvous per process; see wj_rv_log_full */
+static WjRendezvous  wj_rv_log [WJ_RV_LOG_MAX];
+static volatile gint32 wj_global_epoch;      /* published LAST, after the log entry's contents */
+static gint32 wj_rv_log_full;                /* 1 once the log is exhausted: refuse further rendezvous */
+
+/* This thread's position in the log, and the re-entrancy guard. Both __thread: the drain runs on the
+ * thread that owns the table it is fixing, and nothing else reads them. */
+static __thread gint32 wj_local_epoch;
+static __thread int    wj_draining;
+/* Has THIS thread ever drained? Turns the global drain count into a participation count, which is the
+ * number the positive control actually needs -- "some thread drained 500 times" and "every thread drained"
+ * are different claims and only the second one proves the rendezvous reached the whole fleet. */
+static __thread int    wj_drained_ever;
+
+/*
+ * Catch this thread up to the global epoch. Called from the three coop re-entry points, i.e. from every
+ * place a thread can resume executing managed code after having been stopped or blocked.
+ *
+ * FAST PATH IS ONE GLOBAL LOAD AND ONE COMPARE. wj_global_epoch is 0 until the first rendezvous, so a
+ * process that never republishes pays exactly that, at sites that are already out-of-line calls doing CAS
+ * work.
+ *
+ * RE-ENTRANCY IS REAL AND IS GUARDED. The drain calls mono_wasm_jit_admit, which instantiates, which now
+ * enters a GC-SAFE region (the Phase 1 bracket) -- and leaving that region is ITSELF one of the three
+ * call sites. Without wj_draining this recurses until the stack dies. The guard makes the nested call a
+ * no-op; the outer drain is still walking the log and will finish the work.
+ */
+void mono_wasm_jit_rendezvous_drain (void);
+void
+mono_wasm_jit_rendezvous_drain (void)
+{
+	gint32 target, i;
+
+	target = wj_global_epoch;
+	if (G_LIKELY (wj_local_epoch == target))
+		return;
+	if (wj_draining)
+		return;
+	wj_draining = 1;
+
+	/* Walk every rendezvous this thread has not yet seen, oldest first. Oldest first matters: a
+	 * descriptor republished twice must end on the LATER bytes, and admit resolves against the registry's
+	 * CURRENT generation, so replaying in order costs at most one redundant instantiation and replaying
+	 * out of order could leave the earlier one installed. */
+	for (i = wj_local_epoch; i < target && i < WJ_RV_LOG_MAX; ++i) {
+		WjRendezvous *rv = &wj_rv_log [i];
+		gint32 k;
+		if (!rv->desc)
+			continue;
+		for (k = 0; k < rv->n; ++k) {
+			int desc_id = rv->desc [k];
+			if (desc_id <= 0)        /* dropped at publish time (no entry, or co-located) */
+				continue;
+			/* CLEAR THE INSTALLED BITS AND NOTHING ELSE, then let admit do the work.
+			 *
+			 * Clearing the bits is what forces a real re-instantiation rather than a no-op:
+			 * wj_mark_slot_live refuses an uninstalled slot, so admit's liveness publication depends on
+			 * the instantiate actually running.
+			 *
+			 * DO NOT ALSO POKE wj_desc_state / wj_desc_generation HERE. The first version did, setting
+			 * generation to (guint32)-1 to "force the mismatch arm", and that was a RETRY STORM: admit
+			 * only writes wj_desc_generation on SUCCESS, so a descriptor whose re-admission failed kept
+			 * -1 forever, and -1 never equals re->generation -- which made admit's "a NEW generation
+			 * earns a fresh attempt" arm fire on EVERY dispatch, defeating the state-3 permanent refusal
+			 * and its permfail bound outright. Measured: admitDepAdmit0 332,376,959 and admitState3
+			 * 33,249,377 in one world.generate against 2 and 0 with the knob off, and the run wedged.
+			 * This is CLAUDE.md's "routing a PERMANENT condition into the retry path spins forever",
+			 * arrived at from the other direction.
+			 *
+			 * None of it was needed. The rendezvous already bumped re->generation under the stop, so this
+			 * thread's cached generation mismatches by construction; admit's own generation arm resets
+			 * the state, keeps the permfail bound, and writes the generation back when it succeeds. */
+			WjRegEntry *re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
+			if (!re)
+				continue;
+			/* ONLY THREADS THAT ACTUALLY HAD IT INSTALLED RE-ADMIT. A thread that never instantiated this
+			 * module has nothing stale in its table -- there is no old body for it to keep calling -- so
+			 * re-admitting would be pure work, and worse than pure work:
+			 *
+			 * admit walks the whole direct-call closure and can refuse for entirely ordinary reasons on a
+			 * thread that has never needed this method (a dependency not registered here yet). A REFUSAL
+			 * LEAVES THE CACHED GENERATION MISMATCHED, because admit writes wj_desc_generation only on
+			 * success -- so every later dispatch takes the generation arm again and re-attempts, forever.
+			 * That is R244's shape exactly: a condition that cannot clear, routed into the retry path.
+			 * Measured at 42% of re-admissions refused (275 of 654 in one run) and admitState3 going from
+			 * 0 with the knob off to 13.5M with it on, at matched world.generate duration.
+			 *
+			 * Threads that DO have it installed are the entire population that matters: they are the only
+			 * ones holding a stale table entry, which is the whole thing a rendezvous exists to replace. */
+			if (!wj_slot_is_installed (re->e) && !wj_slot_is_installed (re->f)) {
+				/* Record the generation as seen so this descriptor stops taking the mismatch arm on
+				 * every dispatch. State is left untouched: 0 means untried, and the ordinary lazy
+				 * admission path will install it if this thread ever does need it. */
+				wj_desc_state_ensure (desc_id);
+				if (desc_id < wj_desc_state_cap) {
+					/* STATE MUST NOT CLAIM CALLABLE WHILE THE BITMAP SAYS OTHERWISE. The line below
+					 * records the new generation; combined with state 2 that is precisely what admit's
+					 * fast path accepts -- and it trusts the STATE, not the bitmap -- so it would return
+					 * 1 for a descriptor whose slots this worker never wrote, and the caller's
+					 * call_indirect would hit the jiterpreter prefill. R165 recorded exactly that
+					 * ("state 2 with neither slot installed, holding the prefill"); this is the same
+					 * failure reachable through the drain. Downgrade 2 -> 0 = "untried at this
+					 * generation", which is what the skip arm actually means. Leave 3 alone: clearing a
+					 * permanent refusal would route it back into the retry path (R244). */
+					if (wj_desc_state [desc_id] == 2) {
+						wj_desc_state [desc_id] = 0;
+						mono_wasm_jit_counters [WJC_RV_DRAIN_STALE2]++;
+					}
+					wj_desc_generation [desc_id] = re->generation;
+				}
+				mono_wasm_jit_counters [WJC_RV_DRAIN_SKIPPED]++;
+				continue;
+			}
+			/* DO NOT CLEAR THE INSTALLED BITS.
+			 *
+			 * Clearing them and then re-admitting opens a window in which the slot is marked uninstalled
+			 * while every caller that already admitted this descriptor is still published: if the
+			 * re-admit below refuses for any ordinary transient reason, the slot STAYS uninstalled, and
+			 * those callers' call_indirect hits mono_jiterp_placeholder_jit_call. Observed directly --
+			 * `desc=1634 gen=427` published with `dep[3] -> desc 1748 inst=0`, a dependency that had been
+			 * installed when 1634 was admitted and was un-installed afterwards. `installed` is otherwise
+			 * monotonic, so this was the only thing that could have done it.
+			 *
+			 * And the clear is not needed: the rendezvous has already bumped re->generation, and
+			 * wj_admit_install_only re-instantiates whenever the recorded generation differs, regardless
+			 * of the installed bits. It bought nothing and cost the window. */
+			/* THE STATE MUST NOT OUTLIVE THE BITS WE JUST CLEARED. admit's fast path returns 1 on
+			 * `state == 2 && generation matches` WITHOUT consulting the liveness bitmap, so if this
+			 * thread lazily admitted the descriptor after the rendezvous bumped re->generation but before
+			 * reaching this drain, the call below short-circuits and the slots we just cleared are never
+			 * reinstalled -- leaving the jiterpreter prefill under a live caller. See
+			 * WJC_RV_DRAIN_REFRESH_FORCED. State 3 is left alone so the permfail bound survives. */
+			if (desc_id < wj_desc_state_cap && wj_desc_state [desc_id] == 2) {
+				wj_desc_state [desc_id] = 0;
+				mono_wasm_jit_counters [WJC_RV_DRAIN_REFRESH_FORCED]++;
+			}
+			if (mono_wasm_jit_admit (desc_id))
+				mono_wasm_jit_counters [WJC_RV_DRAIN_SLOT]++;
+			else
+				mono_wasm_jit_counters [WJC_RV_DRAIN_REFUSED]++;
+		}
+	}
+	wj_local_epoch = target;
+	wj_draining = 0;
+
+	mono_wasm_jit_counters [WJC_RV_DRAIN]++;
+	if (!wj_drained_ever) {
+		wj_drained_ever = 1;
+		mono_wasm_jit_counters [WJC_RV_DRAIN_THREADS]++;
+	}
+}
+
+/*
+ * Republish `n` descriptors at their EXISTING e/f slots, and guarantee every worker re-instantiates before
+ * it runs any more JIT code. Returns 1 on success, 0 if the rendezvous was refused.
+ *
+ * MUST BE CALLED GC-UNSAFE, from a thread that may safepoint. mono_stop_world asserts
+ * !mono_thread_info_will_not_safepoint on the caller, and takes LOCK_GC + the suspend lock itself.
+ *
+ * The caller is responsible for having already written the new bytes into re->bytes/re->len (or for
+ * republishing the same bytes, which is what the positive control does). This function owns only the
+ * ordering: contents, fence, then the epoch that makes them reachable -- the same discipline
+ * mono_wasm_jit_register and mono_wasm_jit_batch_bind use, for the same reason.
+ */
+int mono_wasm_jit_rendezvous (const int *descs, int n);
+int
+mono_wasm_jit_rendezvous (const int *descs, int n)
+{
+	gint32 epoch;
+	gint32 *copy;
+	int i, nexp = 0, published = 0;
+
+	if (n <= 0 || !descs)
+		return 0;
+	if (wj_rv_log_full) {
+		mono_wasm_jit_counters [WJC_RV_LOG_FULL]++;
+		return 0;
+	}
+
+	/* Cheap pre-check only, so a full stop-the-world is not spent just to discover there is no room.
+	 * The AUTHORITATIVE read is below, after the stop -- see there for why it has to be. */
+	if (wj_global_epoch >= WJ_RV_LOG_MAX) {
+		wj_rv_log_full = 1;
+		mono_wasm_jit_counters [WJC_RV_LOG_FULL]++;
+		return 0;
+	}
+
+	/* CANNOT STW FROM INSIDE A DRAIN. The drain runs on a thread that has just resumed and is about to
+	 * re-enter managed code; stopping the world from there would have this thread waiting on a handshake
+	 * it is itself part of. */
+	if (wj_draining)
+		return 0;
+
+	/* EXPAND GROUPS, AND DO IT BEFORE THE STOP. Two things wrong with the old shape, both measured:
+	 *
+	 * 1. A CO-LOCATED MEMBER CANNOT BE REPUBLISHED ALONE -- admission compares a batched member against
+	 *    its BATCH's generation, not its entry's -- so the old code refused it. Since ~71% of registered
+	 *    methods end up in a group, re-emission met that immediately: `RV count=0` with every attempt
+	 *    refused (2026-09-17). The fix is the one R256 named: republish the whole GROUP. Every member is
+	 *    re-instantiated together, which is what instantiate_batch_local does anyway -- one module backs
+	 *    them all.
+	 * 2. THE EXPANSION AND THE EMPTINESS TEST HAVE TO HAPPEN BEFORE mono_stop_world. The old code stopped
+	 *    the world, THEN discovered nothing was publishable, then restarted -- a full global pause that
+	 *    accomplished nothing, once per flush. That is what wedged boot three times: not the rendezvous
+	 *    cost, and not a deadlock, but pauses buying literally nothing.
+	 *
+	 * Reading re->batch unsynchronised here is sound for what it decides: a descriptor that gets batched
+	 * between this walk and the stop is simply published as a singleton, which the generation bump below
+	 * then corrects on the next re-frame. Getting it wrong costs an extra republish, not correctness. */
+	{
+		int cap = 0;
+		for (i = 0; i < n; ++i) {
+			WjRegEntry *re = (descs [i] > 0 && descs [i] <= wj_reg_n) ? wj_reg_at (descs [i] - 1) : NULL;
+			cap += (re && re->batch) ? re->batch->n : 1;
+		}
+		if (cap <= 0)
+			return 0;
+		copy = (gint32 *) g_malloc ((gsize) cap * sizeof (gint32));
+		if (!copy)
+			return 0;
+		nexp = 0;
+		for (i = 0; i < n; ++i) {
+			WjRegEntry *re = (descs [i] > 0 && descs [i] <= wj_reg_n) ? wj_reg_at (descs [i] - 1) : NULL;
+			int j, m;
+			if (!re)
+				continue;
+			/* ONE REPRESENTATIVE PER GROUP IN THE LOG, not every member.
+			 *
+			 * The drain re-instantiates each logged descriptor on each worker that had it installed --
+			 * and instantiate_batch_local installs ALL 2N slots of a group in ONE call. So admitting one
+			 * member re-instantiates the whole module and installs every sibling's pair; the other N-1
+			 * admits are redundant by construction, and each one is a closure walk, multiplied by every
+			 * worker. MEASURED: expanding every member wedged boot at ~3 rendezvous while a single
+			 * rendezvous of 3 members was fine, and raising the batch size (fewer, larger rendezvous)
+			 * did NOT help -- which is what says the cost is per-MEMBER, not per-rendezvous.
+			 *
+			 * The GENERATION bump below still covers every member; it is only the log -- the thing the
+			 * drain walks -- that collapses to one entry per group. A sibling whose own cached generation
+			 * is now stale simply re-admits lazily on its next dispatch, by which time the batch
+			 * instantiate has already installed its slots, so that admit takes the cheap path. */
+			if (re->batch) {
+				m = re->batch->desc [0];            /* representative; siblings ride its instantiate */
+				if (m <= 0 || m > wj_reg_n)
+					continue;
+			} else {
+				m = descs [i];
+			}
+			for (j = 0; j < nexp; ++j)              /* two inputs can share a group */
+				if (copy [j] == m) break;
+			if (j == nexp && nexp < cap)
+				copy [nexp++] = m;
+		}
+		if (nexp <= 0) {
+			g_free (copy);
+			return 0;
+		}
+		n = nexp;
+	}
+
+	/* STOP THE WORLD. After this returns every other thread is either parked at a safepoint or was already
+	 * in a GC-safe region; neither is executing JIT code. */
+	mono_stop_world (MONO_THREAD_INFO_FLAGS_NO_GC);
+
+	/* READ THE EPOCH HERE, NOT BEFORE THE STOP. mono_stop_world takes LOCK_GC, so this is the only point
+	 * at which two concurrent rendezvous serialise against each other. Reading it before the stop let both
+	 * see the same value, write the SAME log slot -- the second overwriting the first -- and both set the
+	 * epoch to it, which silently LOSES a republication. Losing one means a worker keeps calling a body it
+	 * was told to stop calling, i.e. precisely the class this mechanism exists to prevent. */
+	epoch = wj_global_epoch;
+	if (epoch >= WJ_RV_LOG_MAX) {
+		/* REFUSE rather than wrap, for the same reason. Bounded retention is the cheap side of that trade:
+		 * the log is a few thousand small arrays, never freed, because every worker reads them lock-free
+		 * and nothing recalls them. */
+		wj_rv_log_full = 1;
+		mono_wasm_jit_counters [WJC_RV_LOG_FULL]++;
+		mono_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC);
+		g_free (copy);
+		return 0;
+	}
+
+	/* Bump each descriptor's generation. This is the existing signal every worker's admission path already
+	 * tests (mono_wasm_jit_admit's generation arm); the drain only makes the re-admission PROMPT and
+	 * mandatory rather than lazy.
+	 *
+	 * A CO-LOCATED MEMBER IS REFUSED, and the reason is not conservatism. For a batched entry the
+	 * generation that admission actually compares against lives on the BATCH, not the entry: batch_bind
+	 * sets re->generation = bd->generation, and admit's sibling premark tests
+	 * wj_desc_generation[sibling] != batch->generation (see the sibling loop). Bumping only re->generation
+	 * would make the member look stale while every sibling still looked current -- an incoherent state
+	 * that admit has no arm for. Republishing a co-located body means republishing the WHOLE GROUP, which
+	 * is a different operation than this one and belongs with whatever re-emits the group. Counted so the
+	 * size of the refused population is visible rather than inferred. */
+	for (i = 0; i < n; ++i) {
+		WjRegEntry *re = (copy [i] > 0 && copy [i] <= wj_reg_n) ? wj_reg_at (copy [i] - 1) : NULL;
+		if (!re) {
+			copy [i] = 0;
+			continue;
+		}
+		/* A group's generation lives on the BATCH, and admission's sibling premark tests it there, so
+		 * bump both: the batch (what siblings are compared against) and the entry (what this descriptor's
+		 * own fast path compares against). Idempotent across members of the same group. */
+		/* Bump the BATCH's generation (what admission's sibling premark compares against) and EVERY
+		 * member's entry generation (what each descriptor's own fast path compares against). The log
+		 * carries one representative, but the generations have to cover the whole group or a sibling
+		 * would keep serving its cached verdict. */
+		if (re->batch) {
+			int k;
+			re->batch->generation = (guint32) (epoch + 1);
+			for (k = 0; k < re->batch->n; ++k) {
+				int m = re->batch->desc [k];
+				WjRegEntry *mre = (m > 0 && m <= wj_reg_n) ? wj_reg_at (m - 1) : NULL;
+				if (mre)
+					mre->generation = (guint32) (epoch + 1);
+			}
+		} else {
+			re->generation = (guint32) (epoch + 1);
+		}
+		++published;
+	}
+	if (!published) {
+		/* Nothing to republish after the batched members were dropped. Restart and leave the epoch
+		 * alone -- bumping it would send every worker through a drain that has no work in it. */
+		mono_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC);
+		g_free (copy);
+		return 0;
+	}
+
+	wj_rv_log [epoch].n = n;
+	wj_rv_log [epoch].epoch = epoch + 1;
+	mono_memory_barrier ();              /* contents before the pointer that makes them reachable */
+	wj_rv_log [epoch].desc = copy;
+	mono_memory_barrier ();              /* ... and the pointer before the epoch that indexes it */
+	wj_global_epoch = epoch + 1;
+
+	mono_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC);
+
+	/* The initiator owns a table too, and it is not going through a resume hook. */
+	mono_wasm_jit_rendezvous_drain ();
+
+	mono_wasm_jit_counters [WJC_RV_COUNT]++;
+	mono_wasm_jit_add (WJC_RV_MEMBERS, n);
+	return 1;
+}
+
 
 /*
  * GC-safe object references for JITted methods — C-STACK FRAMES.
@@ -6739,8 +8047,22 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 		wj_desc_state_ensure (desc_ids [i] + 1);
 		wj_desc_state [desc_ids [i]] = 0;
 		wj_desc_generation [desc_ids [i]] = saved [i].generation;
-		wj_clear_slot_installed (re->e);
-		wj_clear_slot_installed (re->f);
+		/* DO NOT CLEAR THE INSTALLED BITS -- it is either a no-op or actively harmful, and it opens the
+		 * one window in which a slot can go backwards.
+		 *
+		 * If the group WAS instantiated here, the slot holds that module's export for THIS SAME METHOD:
+		 * a valid function with the identical signature, so un-installing it destroys good state for no
+		 * gain. If the group was never instantiated -- the usual reason a rollback happens -- the bits
+		 * were never set and clearing does nothing.
+		 *
+		 * What it costs is the same hazard the rendezvous drain had: between the clear and a successful
+		 * re-admit the slot is marked uninstalled while every CALLER that already admitted this
+		 * descriptor stays published at state 2, and a transient refusal in that window leaves it that
+		 * way. Generated code carries no liveness check, so those callers land on
+		 * mono_jiterp_placeholder_jit_call. `installed` is monotonic everywhere else in this file, and
+		 * the sweep's surviving `inst=0` reports are descriptors that had been installed when their
+		 * callers were admitted. State and generation above are still reverted, which is what actually
+		 * forces a re-admit of the restored standalone module. */
 	}
 	(void) bd;
 }
@@ -6757,12 +8079,18 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
  * export, so there was no way to look.
  *
  * Emits one line per registry entry:
- *   G <desc> <batch_generation> <e> <f> <ndeps> <nimports> [d<fslot>...] [i<fslot>...]
+ *   G <desc> <batch_generation> <e> <f> <ndeps> [d<fslot>...]
+ * FIVE numeric fields, not six. This comment used to document an `<nimports>` field and `i<fslot>` edges
+ * alongside the `d` ones, with a paragraph on why a cycle through an `i` edge is fatal where a `d` cycle
+ * is not. METHOD IMPORTS WERE REMOVED IN R163 and the emitter below has written neither since. The stale
+ * shape was not harmless: scratchpad/wj/depcycles.py matched on six groups, so it parsed every archived
+ * pre-R163 dump and ZERO dumps taken since, and it reports that as "no WJ_GRAPH block found (was
+ * MONO_WASM_JIT_DUMP_DEP_GRAPH=1 and --dumps set?)" -- which reads as "the knob did not fire", not as
+ * "the parser is stale". Both are fixed together; keep them together.
+ *
  * `batch_generation` is 0 for a standalone entry and otherwise identifies the group -- entries sharing one
  * are premarked `visiting` together, so offline they contract to a single node. Dependencies are f-slots;
- * `f` on each line is what maps them back to a descriptor. Deps and imports are labelled separately because
- * they are NOT equivalent: a cycle through `d` edges is harmless (the deps loop accepts admit()'s
- * cycle-break), while a cycle containing an `i` edge is the fatal one (the imports loop demands state 2).
+ * `f` on each line is what maps them back to a descriptor.
  *
  * MAIN-THREAD SAFE, and it has to be: like every other dump here it is called from JS on the main thread,
  * where taking the loader lock can deadlock against a GC-suspended worker. It reads nothing but plain ints
@@ -6803,7 +8131,6 @@ int
 mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_slots, int n,
                           void *bytes, int len)
 {
-	extern int mono_wasm_jit_colocate_tight_deps;
 	WjBatchDesc *bd;
 	WjRegSaved *saved = NULL;
 	int i;
@@ -7371,8 +8698,8 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	/* R211's MULTI-HOP FRONTIER EXPANSION stood here, behind MONO_WASM_JIT_COLOCATE_HOPS, and it is
 	 * DELETED as INERT AT EVERY VALUE. It grew the group past the seed's immediate callees by walking
 	 * `body->f_body.relocs` breadth-first -- deliberately the relocations and not the depset, because
-	 * COLOCATE_TIGHT_DEPS ships 1 and empties a member's depset once its group is framed, which is why
-	 * the first version measured 12 members added across a whole run.
+	 * the tight-dep republish is UNCONDITIONAL and empties a member's depset once its group is framed,
+	 * which is why the first version measured 12 members added across a whole run.
 	 *
 	 * The offline result that motivated it is real and worth keeping: on the tier's own reloc call graph
 	 * a seed-and-grow partition with a frontier reaches 79%% of call edges internal at 16 members and
@@ -11950,6 +13277,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						}
 						else
 							wj_count (WJC_DEVIRT_SITE);
+							/* THE DISAGREEMENT DETECTOR. Bumped ungated, because its whole job is to
+							 * contradict WJC_REEMIT_COMPILED if the recompile never reaches the
+							 * emitter. R179's headline bug was exactly that -- 31 re-emissions
+							 * reported, 31 no-ops -- and it was found only because this counter,
+							 * added for another purpose, read 0 while the other read 31. A
+							 * re-emission arm with COMPILED > 0 and SITE == 0 is not a result. */
+							if (G_UNLIKELY (mono_wasm_jit_reemit_inflight))
+								mono_wasm_jit_counters [WJC_REEMIT_SITE]++;
 						if (!is_delegate_invoke &&
 						    /* MONO_WASM_JIT_VCALL_SLIM gated this and shipped 1: replace a perfectly
 						     * monomorphic profiled site's whole PIC/AOT diamond with one guarded admitted
@@ -12009,7 +13344,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 											}
 											wj_count (WJC_DEVIRT_FORCE_CAPPED);
 										}
-										wj_count (WJC_DEVIRT_NO_FSLOT); ic_tag = 6;
+										wj_count (WJC_DEVIRT_NO_FSLOT); WJ_REEMIT_SCOPED (WJC_REEMIT_NO_FSLOT); ic_tag = 6;
 										pred_vt = NULL;
 										pred_target = NULL;
 										pred_fslot = 0;
@@ -12037,7 +13372,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								 * directions, so the split decides the fix. */
 								ic_tag = pred_why;
 								switch (pred_why) {
-								case 1 /* WJ_PRED_NO_REC */:  wj_count (WJC_DEVIRT_NO_REC); break;
+								case 1 /* WJ_PRED_NO_REC */:  wj_count (WJC_DEVIRT_NO_REC); WJ_REEMIT_SCOPED (WJC_REEMIT_NO_REC); break;
 								case 2 /* WJ_PRED_COLD */:    wj_count (WJC_DEVIRT_COLD); break;
 								case 3 /* WJ_PRED_POLY */:    wj_count (WJC_DEVIRT_POLY); break;
 								case 4 /* WJ_PRED_POLY_90 */: wj_count (WJC_DEVIRT_POLY); wj_count (WJC_DEVIRT_POLY_90); break;
@@ -12406,7 +13741,7 @@ vcall_nullchk_done:
 							 * prediction miss, but turns the second and later calls of the common alternate into
 							 * direct f-slot dispatch instead of repeatedly entering the shared resolver. */
 							if (pred_fslot > 0 && pred_vt && pred_target && !is_delegate_invoke) {
-								wj_count (WJC_DEVIRT_EMITTED);
+								wj_count (WJC_DEVIRT_EMITTED); WJ_REEMIT_SCOPED (WJC_REEMIT_EMITTED);
 								ic_tag = 7;   /* R205: any IC hit below this guard is the ALTERNATE receiver */
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_miss */
 									if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt this ld"; goto done; }

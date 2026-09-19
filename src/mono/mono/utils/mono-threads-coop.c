@@ -111,6 +111,29 @@ static int coop_save_count;
 static void
 mono_threads_state_poll_with_info (MonoThreadInfo *info);
 
+#if defined (HOST_BROWSER) && !defined (DISABLE_THREADS)
+/* THE WASM JIT'S REPUBLICATION RENDEZVOUS (mini-wasm.c). Defined there, called here, because this is the
+ * only place in the runtime that can express its guarantee.
+ *
+ * The wasm function table is PER-WORKER and one worker cannot write another's, so a JITted method's table
+ * entry can only be replaced by the owning worker, and generated code call_indirects it with no liveness
+ * check. Re-pointing a live slot therefore needs every worker to re-instantiate BEFORE it runs any more
+ * JIT code -- and the three call sites below are exactly the points at which a thread resumes executing
+ * managed code after having been stopped or blocked:
+ *   - the safepoint poll, for a thread the stop-the-world parked;
+ *   - leaving a GC-safe region, for a thread coop counted as already-suspended and never parked at all;
+ *   - entering a GC-unsafe region, the unbalanced/attach form of the same.
+ * Between them they cover every route back. They are also exactly where info->async_target is already
+ * dispatched, which is the runtime's own precedent for "run this on the victim thread once it is safe".
+ *
+ * The fast path is a global load and a compare (see mono_wasm_jit_rendezvous_drain), and the global is 0
+ * until the first rendezvous, so a run that never republishes pays that and nothing else. */
+extern void mono_wasm_jit_rendezvous_drain (void);
+#define MONO_WASM_JIT_RENDEZVOUS_DRAIN() mono_wasm_jit_rendezvous_drain ()
+#else
+#define MONO_WASM_JIT_RENDEZVOUS_DRAIN() do { } while (0)
+#endif
+
 void
 mono_threads_state_poll (void)
 {
@@ -148,6 +171,8 @@ mono_threads_state_poll_with_info (MonoThreadInfo *info)
 		mono_thread_info_wait_for_resume (info);
 		break;
 	}
+
+	MONO_WASM_JIT_RENDEZVOUS_DRAIN ();
 
 	if (info->async_target) {
 		info->async_target (info->user_data);
@@ -399,6 +424,8 @@ mono_threads_exit_gc_safe_region_unbalanced_internal (gpointer cookie, MonoStack
 		g_error ("Unknown thread state");
 	}
 
+	MONO_WASM_JIT_RENDEZVOUS_DRAIN ();
+
 	if (info->async_target) {
 		info->async_target (info->user_data);
 		info->async_target = NULL;
@@ -505,6 +532,8 @@ mono_threads_enter_gc_unsafe_region_unbalanced_with_info (MonoThreadInfo *info, 
 	default:
 		g_error ("Unknown thread state %s", function_name);
 	}
+
+	MONO_WASM_JIT_RENDEZVOUS_DRAIN ();
 
 	if (info->async_target) {
 		info->async_target (info->user_data);
