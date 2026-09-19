@@ -2101,6 +2101,7 @@ wj_reemit_enqueue (gint32 desc_id, gboolean mandatory)
 		return FALSE;
 	}
 	wj_reemit_queue [h] = desc_id;
+	mono_memory_barrier ();   /* the slot's contents before the head that makes them reachable */
 	wj_reemit_head = (h + 1) % WJ_REEMIT_QUEUE_MAX;
 	mono_wasm_jit_counters [WJC_REEMIT_QUEUED]++;
 	wj_reemit_queue_leave ();
@@ -2109,6 +2110,8 @@ wj_reemit_enqueue (gint32 desc_id, gboolean mandatory)
 }
 
 static void wj_reemit_drain_one (void);
+/* mini-wasm-publish.inc: 1 once the publication log is exhausted, which is permanent. */
+extern int mono_wasm_jit_rendezvous_exhausted (void);
 
 /* Semantic replacements use the same deduplicated broker as profile-driven re-emission. Enqueue only:
  * replacement hooks arrive in large class-loading bursts, and compiling synchronously here turns each
@@ -2765,10 +2768,24 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		int br = mono_wasm_jit_refresh_batch (r.desc_id, &batch_bytes, &batch_len);
 		if (br < 0) {
 			/* Keep the old shared batch canonical and retry the replacement. The temporary standalone
-			 * instance may exist on this worker, but no generation exposes it to other workers. */
+			 * instance may exist on this worker, but no generation exposes it to other workers.
+			 *
+			 * FREE THE STANDALONE BLOB. NOBODY ELSE OWNS IT. br < 0 implies the descriptor is BATCHED
+			 * (refresh_batch returns 0 for a standalone one), and mono_wasm_jit_register's batched
+			 * re-registration arm deliberately does not store these bytes into re->bytes -- the group's
+			 * shared module stays canonical. The `if (r.e_slot > 0)` block below, the only thing that
+			 * hands ownership to InterpMethod.wasm_jit_bytes, is skipped because e_slot was just zeroed.
+			 * So without this free the buffer is unreachable, and the retry below produces another one:
+			 * one leaked module per attempt, at compile-safepoint rate. V8 leaks harder than we do here,
+			 * since each attempt also mints a NativeModule + Instance kept alive by the table entry. */
+			g_free (r.bytes);
+			r.bytes = NULL;
+			r.bytes_len = 0;
 			r.e_slot = 0;
 			r.f_slot = 0;
 			r.retriable = 1;
+			r.nblockers = 0;
+			mono_wasm_jit_counters [WJC_REEMIT_REFRAME_FAIL]++;
 		} else if (br > 0) {
 			g_free (r.bytes); /* WebAssembly.Module consumed the temporary standalone bytes synchronously. */
 			r.bytes = batch_bytes;
@@ -2909,6 +2926,20 @@ wj_reemit_drain_one (void)
 	if (wj_reemit_batch_n > 0)
 		wj_reemit_flush ();
 
+	/* STOP HERE IF THE BATCH IS STILL FULL -- BEFORE THE POP, which is the half the paragraph above got
+	 * right in prose and wrong in code. The test used to sit AFTER the dequeue and re-queued the entry it
+	 * had just taken, which is a spin rather than a wait: wj_reemit_flush is rate-limited to
+	 * MONO_WASM_JIT_REEMIT_INTERVAL_MS, and the drain is called from five places including every
+	 * compile_publish exit, so for the whole interval each call popped an entry and pushed it straight
+	 * back. MEASURED on the first build where group re-framing actually worked (2026-09-19):
+	 * drained = 2,824,446 against 847 real outcomes, world.generate stalled at 89.9 s against a 31 s
+	 * norm, and one `memory access out of bounds`. Leaving the entry queued IS the wait. */
+	if (wj_reemit_batch_n >= mono_wasm_jit_reemit_batch ||
+	    wj_reemit_batch_n >= WJ_REEMIT_BATCH_MAX) {
+		mono_wasm_jit_counters [WJC_REEMIT_BATCH_WAIT]++;
+		goto out;
+	}
+
 	/* The drainer and producers share one topology lock. This pop never waits: a missed visit is harmless,
 	 * and the current compiler owner calls the broker again when it releases compilation ownership. */
 	if (!wj_reemit_queue_enter (FALSE))
@@ -2937,13 +2968,29 @@ wj_reemit_drain_one (void)
 	im = (InterpMethod *) mono_wasm_jit_desc_logical_imethod (desc_id);
 	if (!im || !im->method || im->wasm_jit_fslot <= 0) {
 		mono_wasm_jit_counters [WJC_REEMIT_GONE]++;
+		/* No flag to clear and no owner to clear it on: there is no InterpMethod, or it holds no f-slot,
+		 * so there is nothing installed for a replacement to replace. */
 		goto out;
 	}
+	/* EVERY REFUSAL BELOW DECIDES WHETHER ITS CONDITION CAN EVER CLEAR, and the ones that cannot clear
+	 * drop `wasm_jit_reemit_required` on the way out. Leaving it set is not harmless: wj_waiter_wake
+	 * reroutes any woken waiter on this method straight back into the broker on the strength of that
+	 * flag, so a permanent refusal becomes a permanent re-queue. That is CLAUDE.md's admission rule --
+	 * "before adding a refusal, decide whether its condition can ever clear, and count it" -- applied to
+	 * the broker rather than to admission. */
+#define WJ_REEMIT_DROP_REQUIRED() do { \
+		if (im->wasm_jit_reemit_required) { \
+			im->wasm_jit_reemit_required = 0; \
+			mono_wasm_jit_counters [WJC_REEMIT_REQUIRED_DROPPED]++; \
+		} \
+	} while (0)
 	if (!mono_wasm_jit_reemit && !im->wasm_jit_reemit_required)
 		goto out;
-	if (wj_reemit_batch_n >= mono_wasm_jit_reemit_batch ||
-	    wj_reemit_batch_n >= WJ_REEMIT_BATCH_MAX) {
-		(void) wj_reemit_enqueue (desc_id, im->wasm_jit_reemit_required != 0);
+	/* PUBLICATION IS GONE, SO COMPILING IS POINTLESS. The rendezvous log is finite and its exhaustion is
+	 * a latch, not a transient: past that point every publication returns 0, and a broker that keeps
+	 * compiling feeds a queue whose only exit is the retry path. Stop at the source and say so once. */
+	if (mono_wasm_jit_rendezvous_exhausted ()) {
+		WJ_REEMIT_DROP_REQUIRED ();
 		goto out;
 	}
 	/* The optimization has a hard budget. A semantic body replacement is not optional and cannot be
@@ -2959,10 +3006,15 @@ wj_reemit_drain_one (void)
 	 * merely slow. */
 	if (im->optimized || im->optimized_imethod || im->retired) {
 		mono_wasm_jit_counters [WJC_REEMIT_REFUSED]++;
+		WJ_REEMIT_DROP_REQUIRED ();   /* tiering is one-way: this imethod will never be eligible again */
 		goto out;
 	}
 	if (!mono_wasm_jit_pin_slots_for_reemit (im->method)) {
 		mono_wasm_jit_counters [WJC_REEMIT_REFUSED]++;
+		/* The pin fails only when the method has no InterpMethod or no live pair, which the gate above
+		 * already established it has -- so this is a lost race with tiering, i.e. the same one-way
+		 * transition. Not retried for that reason. */
+		WJ_REEMIT_DROP_REQUIRED ();
 		goto out;
 	}
 
@@ -2995,17 +3047,27 @@ wj_reemit_drain_one (void)
 		 *
 		 * Return ignored: the method stays flagged queued either way, so it cannot re-trigger; if the
 		 * ring is full the candidate is lost, a missed optimisation counted as QFULL. */
-		if (im->wasm_jit_reemit_required || im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX) {
+		/* THE BUDGET APPLIES TO A MANDATORY REPLACEMENT TOO. Exempting it looked right -- a semantic swap
+		 * is not optional -- but the exemption removed the only bound on a path whose re-enqueue cannot
+		 * drop, and `wasm_jit_reemit_busy` is a guint8, so an exempt method also wraps it. A budget that
+		 * one caller ignores is not a budget. */
+		if (im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX) {
 			im->wasm_jit_reemit_busy++;
 			(void) wj_reemit_enqueue (desc_id, im->wasm_jit_reemit_required != 0);
 			mono_wasm_jit_counters [WJC_REEMIT_BUSY]++;
 		} else {
 			mono_wasm_jit_counters [WJC_REEMIT_BUSY_GIVEUP]++;
+			if (im->wasm_jit_reemit_required) {
+				im->wasm_jit_reemit_required = 0;
+				mono_wasm_jit_counters [WJC_REEMIT_REQUIRED_GIVEUP]++;
+			}
 		}
 		goto out;
 	}
 	if (r != WASM_JIT_COMPILE_JITTED || res.desc_id <= 0) {
 		mono_wasm_jit_counters [WJC_REEMIT_FAILED]++;
+		if (r == WASM_JIT_COMPILE_PERM)
+			WJ_REEMIT_DROP_REQUIRED ();   /* the emitter bailed: no future attempt can produce a body */
 		if (im->wasm_jit_reemit_required && r == WASM_JIT_COMPILE_BLOCKED) {
 			int b;
 			/* BLOCKED is not a polling condition. Park on the exact callees reported by the emitter and let
@@ -3016,16 +3078,34 @@ wj_reemit_drain_one (void)
 				if (blocker && blocker != im->method)
 					wj_waiter_register (blocker, im->method);
 			}
-			/* A retriable result with no named blocker is the genuinely transient form. */
-			if (res.nblockers == 0)
-				(void) wj_reemit_enqueue (desc_id, TRUE);
+			/* A retriable result with no named blocker is the genuinely transient form -- today that is
+			 * only a failed group re-frame (WJC_REEMIT_REFRAME_FAIL). ON THE SAME BUDGET AS A LOST CAS,
+			 * for the same reason: `mandatory` means wj_reemit_enqueue never drops, so an unbounded
+			 * re-enqueue of a condition that does not clear rebuilds this body at every compile safepoint
+			 * forever. Give up loudly rather than silently, and clear the flag so wj_waiter_wake stops
+			 * rerouting the method here (interp.c wj_waiter_wake). */
+			if (res.nblockers == 0) {
+				if (im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX) {
+					im->wasm_jit_reemit_busy++;
+					(void) wj_reemit_enqueue (desc_id, TRUE);
+				} else {
+					im->wasm_jit_reemit_required = 0;
+					mono_wasm_jit_counters [WJC_REEMIT_REQUIRED_GIVEUP]++;
+				}
+			}
 		}
 		goto out;
 	}
 	mono_wasm_jit_counters [WJC_REEMIT_COMPILED]++;
 	/* Set only on the path where a body was actually produced. A BUSY or FAILED drain must leave the
-	 * method eligible -- R179 bug #2 was exactly this shape, a lost CAS burning the method's one shot. */
-	im->wasm_jit_reemitted = 2;
+	 * method eligible -- R179 bug #2 was exactly this shape, a lost CAS burning the method's one shot.
+	 *
+	 * AND ONLY FOR THE OPTIONAL PATH. wasm_jit_reemitted is the PROFILE trigger's per-method one-shot;
+	 * a semantic replacement is a different feature that happens to share this broker, and consuming the
+	 * one-shot on its behalf silently disqualifies the method from ever being re-emitted with a matured
+	 * profile (it reports WJC_REEMIT_METHOD_DONE forever after). Different question, different flag. */
+	if (!im->wasm_jit_reemit_required)
+		im->wasm_jit_reemitted = 2;
 	if (res.f_slot != old_f)
 		mono_wasm_jit_counters [WJC_REEMIT_SLOT_MOVED]++;
 
@@ -3038,6 +3118,7 @@ wj_reemit_drain_one (void)
 out:
 	mono_atomic_store_i32 (&wj_reemit_draining, 0);
 }
+#undef WJ_REEMIT_DROP_REQUIRED
 
 
 /* Publish everything compiled since the last flush. The interval floor keeps a trickle of optional
@@ -3079,11 +3160,21 @@ wj_reemit_flush (void)
 	} else {
 		int i;
 		mono_wasm_jit_add (WJC_REEMIT_NO_RENDEZVOUS, n);
-		/* Optional profile refreshes may be dropped; semantic replacements may not. */
+		/* Optional profile refreshes may be dropped; semantic replacements are retried -- ON THE BUDGET.
+		 * mono_wasm_jit_rendezvous has one refusal that never clears (its log is finite and its
+		 * `full` flag is a latch), and against that an unbounded retry here spins every mandatory
+		 * descriptor through compile-and-republish for the rest of the run. */
 		for (i = 0; i < n; ++i) {
 			InterpMethod *im = (InterpMethod *) mono_wasm_jit_desc_logical_imethod (wj_reemit_batch [i]);
-			if (im && im->wasm_jit_reemit_required)
+			if (!im || !im->wasm_jit_reemit_required)
+				continue;
+			if (im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX) {
+				im->wasm_jit_reemit_busy++;
 				(void) wj_reemit_enqueue (wj_reemit_batch [i], TRUE);
+			} else {
+				im->wasm_jit_reemit_required = 0;
+				mono_wasm_jit_counters [WJC_REEMIT_REQUIRED_GIVEUP]++;
+			}
 		}
 	}
 	return 1;

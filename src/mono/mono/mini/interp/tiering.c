@@ -236,10 +236,20 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 		return 0;
 	}
 
-	/* A live wasm method can be replaced because its logical identity, descriptor and table pair remain
-	 * stable. The new body is compiled as another generation and each worker installs that generation in
-	 * its own table at a JIT safepoint. Existing frames may finish the old body; new entries use the same
-	 * e/f slots once that worker adopts the publication. */
+	/* A live wasm method can be replaced because its logical identity, descriptor and table pair stay
+	 * stable: the new body is compiled as another generation and each worker installs it into its OWN
+	 * table -- one worker cannot write another's -- at its next JIT safepoint.
+	 *
+	 * WHAT IS AND IS NOT GUARANTEED, stated here because it is the whole contract. Frames already running
+	 * the old body finish on it, which is true of method replacement on every runtime. No NEW entry uses
+	 * the old body after the owning worker's next safepoint. That window is bounded by the safepoint
+	 * check the emitter puts on every loop back-edge (mini-wasm-publish.inc), and it is the strongest
+	 * guarantee obtainable without stopping the world -- which was tried, and whose cost was pauses that
+	 * wedged boot three times.
+	 *
+	 * For an IKVM generation-2 swap the old body is merely SLOWER (same Java method, compiled against the
+	 * dynamic-dispatch helpers), so a late adoption is a missed optimisation. For a detour it is a patch
+	 * not yet applied. Both are bounded; neither is silent -- see WJC_REEMIT_REQUIRED_GIVEUP. */
 	if ((old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0) &&
 	    !mono_wasm_jit_relink_jitted) {
 		jit_mm_unlock (jit_mm);
@@ -299,8 +309,9 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	 * compare; the counter stays because a 0 here is the only thing that distinguishes "cannot happen"
 	 * from "silently stopped happening". */
 	if (replace_live_generation) {
-		/* This is a new code generation of the same MonoMethod, not a second method. Preserve the pair and
-		 * descriptor; per-worker epoch adoption republishes it without consuming table entries. */
+		/* A new code generation of the same MonoMethod, not a second method. Preserving the pair and the
+		 * descriptor is what lets callers that already baked this f-slot reach generation 2 at all, and it
+		 * consumes no table entries -- R252's fresh-pair shape leaked two per swap against ~68k spare. */
 		new_imethod->wasm_jit_slot = old_imethod->wasm_jit_slot;
 		new_imethod->wasm_jit_bail = 0;
 		new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;

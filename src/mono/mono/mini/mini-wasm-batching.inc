@@ -68,15 +68,19 @@ mono_wasm_jit_reg_graph_entry (int i, MonoMethod **out_method, int *out_len, int
 	gboolean *out_batched)
 {
 	WjRegEntry *re;
-	if (i < 0 || i >= wj_reg_n || !(re = wj_reg_at (i)))
-		return 0;
-	if (!re->logical_method && !re->body_method)
-		return 0;
-	if (out_method) *out_method = re->logical_method ? re->logical_method : re->body_method;
-	if (out_len) *out_len = re->body_len;
-	if (out_ndeps) *out_ndeps = re->depset ? re->depset->n : 0;
-	if (out_batched) *out_batched = re->batch != NULL;
-	return 1;
+	int ok = 0;
+	/* A diagnostic still dereferences re->depset and re->batch, and it runs on the MAIN thread while
+	 * workers are compiling. Knob-gated is not the same as safe. */
+	wj_reg_read_enter ();
+	if (i >= 0 && i < wj_reg_n && (re = wj_reg_at (i)) && (re->logical_method || re->body_method)) {
+		if (out_method) *out_method = re->logical_method ? re->logical_method : re->body_method;
+		if (out_len) *out_len = re->body_len;
+		if (out_ndeps) *out_ndeps = re->depset ? re->depset->n : 0;
+		if (out_batched) *out_batched = re->batch != NULL;
+		ok = 1;
+	}
+	wj_reg_read_leave ();
+	return ok;
 }
 
 /* The method identity whose IR was actually emitted for a registry entry.  This can differ from the
@@ -148,10 +152,13 @@ MonoMethod *
 mono_wasm_jit_reg_graph_dep (int i, int dep)
 {
 	WjRegEntry *re;
-	if (i < 0 || i >= wj_reg_n || !(re = wj_reg_at (i)) ||
-	    dep < 0 || !re->depset || dep >= re->depset->n)
-		return NULL;
-	return re->depset->method [dep];
+	MonoMethod *m = NULL;
+	wj_reg_read_enter ();
+	if (i >= 0 && i < wj_reg_n && (re = wj_reg_at (i)) &&
+	    dep >= 0 && re->depset && dep < re->depset->n)
+		m = re->depset->method [dep];
+	wj_reg_read_leave ();
+	return m;
 }
 
 /* Everything mono_wasm_jit_batch_bind overwrites on a registry entry, kept so the bind can be undone. */
@@ -306,6 +313,7 @@ mono_wasm_jit_dump_dep_graph (void)
 	int n = wj_reg_n, i, j;
 
 	printf ("WJ_GRAPH_BEGIN n=%d\n", n);
+	wj_reg_read_enter ();
 	for (i = 0; i < n; ++i) {
 		WjRegEntry *re = wj_reg_at (i);
 		if (!re)
@@ -318,6 +326,7 @@ mono_wasm_jit_dump_dep_graph (void)
 			printf (" d%d", ds->slot [j]); }
 		printf ("\n");
 	}
+	wj_reg_read_leave ();
 	printf ("WJ_GRAPH_END\n");
 }
 
@@ -486,6 +495,19 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			int j;
 			if (saved [i].depset && (!re || saved [i].depset != re->depset))
 				wj_retire_payload (saved [i].depset, WJ_RETIRED_DEPSET);
+			/* THE SUPERSEDED GROUP DESCRIPTOR, deduplicated the same way its bytes are: on a MERGE every
+			 * absorbed member named the same old WjBatchDesc, so it must be retired once. This used to be
+			 * retained on the success path as well as the failure path, and only the failure path has a
+			 * reason to be (a concurrent admit may still be walking it; rollback is once-only per method,
+			 * so that retention is bounded). On the success path it is unbounded: every re-frame of every
+			 * group strands one, and re-framing is what re-emission does constantly. */
+			if (saved [i].batch && (!re || saved [i].batch != re->batch)) {
+				for (j = 0; j < i; ++j)
+					if (saved [j].batch == saved [i].batch)
+						break;
+				if (j == i)
+					wj_retire_payload (saved [i].batch, WJ_RETIRED_BATCH);
+			}
 			if (!saved [i].bytes || saved [i].bytes == bytes)
 				continue;
 			for (j = 0; j < i; ++j)
@@ -559,19 +581,48 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		 */
 		if (re->batch) {
 			extern int mono_wasm_jit_colocate_merge;
-			int k, m;
-			if (!mono_wasm_jit_colocate_merge)
-				return 0;   /* merging off: the pre-R193 behaviour, refuse any batched member */
-			for (k = 0; k < re->batch->n; ++k) {
+			int k, m, complete = 1;
+			for (k = 0; k < re->batch->n && complete; ++k) {
 				for (m = 0; m < n; ++m)
 					if (desc_ids [m] == re->batch->desc [k])
 						break;
-				if (m == n) {
-					/* A sibling is missing: this would be a SPLIT. Refuse the whole request. */
-					if (G_UNLIKELY (mono_wasm_jit_stats))
-						mono_wasm_jit_count (WJC_COLOCATE_MERGE_SPLIT);
-					return 0;
-				}
+				if (m == n)
+					complete = 0;
+			}
+			/*
+			 * A PURE RE-FRAME IS NOT A MERGE, and conflating the two is what made re-emission structurally
+			 * impossible in the shipped configuration.
+			 *
+			 * The knob test used to come FIRST and refuse any batched member outright when
+			 * MONO_WASM_JIT_COLOCATE_MERGE is 0 -- which is what ships. But mono_wasm_jit_refresh_batch
+			 * calls this with EXACTLY the members of one existing group, to rebuild that group around a
+			 * replaced body. Every descriptor in the request is therefore batched, so the first one hit
+			 * the early return and the whole thing failed before the sibling check below could observe
+			 * that nothing was being split at all.
+			 *
+			 * MEASURED, 2026-09-19, worldwait 3 runs --stats --dumps on the shipped config: re-emission
+			 * `queued=5020 ... compiled 44 + failed 4730`, with `reframe_fail=4678` accounting for
+			 * essentially all of the failures -- i.e. 93% of mandatory IKVM generation-2 replacements
+			 * never landed, and the reason was this line rather than anything about the bodies. ~71% of
+			 * registered methods are in a group, so nearly every replacement met it.
+			 *
+			 * The guard's real subject is STRANDING: a group's members share one WebAssembly.Instance and
+			 * cannot be instantiated apart, so framing SOME of them leaves the rest pointing at a module
+			 * that no longer exports them. Re-framing a complete group strands nothing. Absorbing one
+			 * group into a larger request is the MERGE the knob governs, and that is still gated.
+			 */
+			if (complete && n == re->batch->n) {
+				/* The request is exactly this group: rebuild in place. */
+			} else if (!complete) {
+				/* A sibling is missing: this would be a SPLIT. Refuse the whole request. */
+				if (G_UNLIKELY (mono_wasm_jit_stats))
+					mono_wasm_jit_count (WJC_COLOCATE_MERGE_SPLIT);
+				return 0;
+			} else if (!mono_wasm_jit_colocate_merge) {
+				/* Complete, but alongside other descriptors: absorbing this group into a bigger one. */
+				if (G_UNLIKELY (mono_wasm_jit_stats))
+					mono_wasm_jit_count (WJC_COLOCATE_MERGE_OFF);
+				return 0;
 			}
 		}
 		/* THIS DESCRIPTOR MUST STILL OWN ITS SLOTS. A method that was re-emitted registers a NEW descriptor
@@ -599,6 +650,10 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		}
 	}
 
+	/* Every member's WjBody is borrowed by POINTER below -- name, param_types, extra_types, groups, and
+	 * the two code buffers -- and held across wj_assemble and a JS WebAssembly.Module compile. A
+	 * re-emission of any of those members retires that body. Held until `done:`. */
+	wj_reg_read_enter ();
 	members = g_new0 (WjAsmMember, n);
 	e_slots = g_new0 (int, n);
 	f_slots = g_new0 (int, n);
@@ -687,7 +742,44 @@ done:
 		wj_asm_deps_free (&wj_batch_deps [i]);
 	}
 	g_free (members); g_free (e_slots); g_free (f_slots);
+	wj_reg_read_leave ();
 	return ok;
+}
+
+/*
+ * PUT THIS WORKER BACK ON THE GROUP'S MODULE.
+ *
+ * Emitting a replacement for a batched member ends with a validating
+ * mono_wasm_jit_instantiate_local of the STANDALONE module, which writes this worker's table at the
+ * member's e/f pair -- over the group's entries. That is fine when the group is then re-framed, because
+ * the re-frame reinstalls all of them. When the re-frame FAILS it is not: this worker alone runs
+ * generation 2 at that slot while every other worker, and this entry's own depset, still describe
+ * generation 1. Generation 2's direct calls may name f-slots nobody admitted here.
+ *
+ * Re-instantiating the group's existing module restores the coherent state. No admission is needed: this
+ * closure was admitted when the group was installed and nothing about it has changed.
+ */
+static void
+wj_reinstall_batch_local (int desc_id)
+{
+	extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n,
+	                                                  const void *bytes, int len, char *errbuf, int errcap,
+	                                                  double *out_ms);
+	WjRegEntry *re;
+	WjBatchDesc *bd;
+	char eb [192];
+	double ms = 0;
+
+	wj_reg_read_enter ();
+	re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
+	bd = re ? re->batch : NULL;
+	if (bd && bd->bytes && bd->len > 0) {
+		eb [0] = 0;
+		if (!mono_wasm_jit_instantiate_batch_local (bd->e, bd->f, bd->n, bd->bytes, bd->len,
+		                                            eb, (int) sizeof (eb), &ms))
+			printf ("WASM_JIT_REFRAME_UNDO_FAIL desc=%d members=%d : %s\n", desc_id, bd->n, eb);
+	}
+	wj_reg_read_leave ();
 }
 
 /* Re-frame the complete batch currently containing desc_id after one member's retained body changed.
@@ -699,6 +791,10 @@ mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len)
 	WjRegEntry *re;
 	int *descs = NULL, n = 0, ok;
 
+	/* re->batch is a retireable pointer and the loader lock does not protect it from reclamation --
+	 * different lock, different question. The copy is taken under the reader bracket for that reason;
+	 * `descs` is then ours and rebatch re-reads everything it needs from the registry itself. */
+	wj_reg_read_enter ();
 	mono_loader_lock ();
 	re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
 	if (re && re->batch) {
@@ -707,10 +803,15 @@ mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len)
 		memcpy (descs, re->batch->desc, sizeof (int) * (gsize) n);
 	}
 	mono_loader_unlock ();
+	wj_reg_read_leave ();
 	if (!descs)
 		return 0;
 	ok = mono_wasm_jit_rebatch (descs, n, out_bytes, out_len);
 	g_free (descs);
+	if (ok)
+		mono_wasm_jit_counters [WJC_REFRAME_OK]++;
+	else
+		wj_reinstall_batch_local (desc_id);
 	return ok ? 1 : -1;
 }
 
@@ -791,24 +892,34 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	 * mono_wasm_force_compile; with relocatable bodies it costs a memcpy. */
 	if (desc_id <= 0)
 		return 0;
+	/* THE BRACKET, and it is not decoration: `rds` below is re->depset, it is dereferenced for the whole
+	 * body of this function -- across wj_asm_reaches walking OTHER descriptors' depsets, across a rebatch,
+	 * across wj_assemble and a JS WebAssembly.Module compile -- and a concurrent re-registration retires
+	 * exactly that pointer. Every `return` from here on must pass through the leave below. */
+	wj_reg_read_enter ();
 	re = wj_reg_at (desc_id - 1);
 	rds = re ? re->depset : NULL;
 	/* Structural ineligibility -- no entry, no retained body, no slot pair -- is not a co-location
 	 * REFUSAL and is deliberately outside TRY: there is nothing here that a planner could ever group.
 	 * TRY starts once we have a framable descriptor, so that the refusal arms below sum to it. */
-	if (!re || !re->body || re->e <= 0 || re->f <= 0)
+	if (!re || !re->body || re->e <= 0 || re->f <= 0) {
+		wj_reg_read_leave ();
 		return 0;
+	}
 	WJ_CO_COUNT (WJC_COLOCATE_TRY);
 	if (re->batch) {
 		WJ_CO_COUNT (WJC_COLOCATE_SELF_BATCHED);
+		wj_reg_read_leave ();
 		return 0;
 	}
 	if (re->colocate_refused) {
 		WJ_CO_COUNT (WJC_COLOCATE_SELF_REFUSED);
+		wj_reg_read_leave ();
 		return 0;
 	}
 	if (!rds || rds->n <= 0) {
 		WJ_CO_COUNT (WJC_COLOCATE_SELF_NO_DEPSET);
+		wj_reg_read_leave ();
 		return 0;
 	}
 	cap = mono_wasm_jit_colocate_max;
@@ -936,6 +1047,7 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 				if (G_UNLIKELY (mono_wasm_jit_stats))
 					mono_wasm_jit_count (WJC_COLOCATE_SCC_REFUSED);
 				g_free (descs);
+				wj_reg_read_leave ();
 				return 0;
 			}
 			continue;
@@ -967,11 +1079,13 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	if (n < 2) {
 		WJ_CO_COUNT (WJC_COLOCATE_SINGLETON);
 		g_free (descs);
+		wj_reg_read_leave ();
 		return 0;
 	}
 	if (!mono_wasm_jit_rebatch (descs, n, NULL, NULL)) {
 		WJ_CO_COUNT (WJC_COLOCATE_REBATCH_FAIL);
 		g_free (descs);
+		wj_reg_read_leave ();
 		return 0;
 	}
 	if (G_UNLIKELY (mono_wasm_jit_stats)) {
@@ -979,6 +1093,7 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 		mono_wasm_jit_count (WJC_COLOCATE_FORMED);
 	}
 	g_free (descs);
+	wj_reg_read_leave ();
 	return n;
 }
 

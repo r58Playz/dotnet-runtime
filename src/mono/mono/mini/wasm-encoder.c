@@ -348,7 +348,7 @@ emit_functype (WasmBuf *sec, const WasmValtype *params, guint32 nparams, WasmVal
  * expected size", `registered` sat at 0 from boot, and it cost a whole measurement session to find.
  * Count the emits below before editing the literal.
  *
- * The global index space is a fixed contract with the emitter, which hard-codes `global.get/set 0..7`:
+ * The global index space is a fixed contract with the emitter, which hard-codes `global.get/set 0..9`:
  *   0 s.p  __stack_pointer, i32 MUTABLE (the only mutable import; every framed method reads and writes it)
  *   1 s.l  &wj_slot_live          2 s.c  &wj_slot_live_cap
  *   3 s.v  &wj_vcall_pic          4 s.n  &wj_vcall_pic_cap
@@ -363,8 +363,10 @@ emit_functype (WasmBuf *sec, const WasmValtype *params, guint32 nparams, WasmVal
  *          NOT the same as MONO_WASM_JIT_INLINE_ILOFS, which measured 9.8% WORSE: that variant kept the
  *          il_state pointer in a wasm LOCAL, live across every call in the body. This re-derives it from
  *          the global at each store, so nothing is live between them.
- *   9 s.g  address of this worker's publication epoch. Generated safepoints compare it with the
- *          process-wide epoch before returning to managed code.
+ *   9 s.g  address of this worker's SAFEPOINT ACTION WORD (mini-wasm-publish.inc). Non-zero means the
+ *          emitted safepoint must take its out-of-line helper: the GC wants to suspend, or a code
+ *          publication has not been adopted here yet. One word rather than two conditions so the check
+ *          stays a single load on every loop back-edge; the helper re-derives and clears it.
  * Every module declares all TEN whether or not it uses them, because the emitter's indices are absolute.
  *
  * Function imports come LAST in this section but FIRST in the function index space -- wasm gives imported

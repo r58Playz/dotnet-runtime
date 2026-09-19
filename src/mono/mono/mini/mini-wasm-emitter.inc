@@ -2947,25 +2947,28 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				break;
 			}
 			case OP_GC_SAFE_POINT: {
-				/* Cooperative-GC and code-publication safepoint. The imported s.g global is the
-				 * address of THIS worker's epoch; unlike a baked TLS address it remains correct when
-				 * the same module is instantiated by another worker. */
+				/* Cooperative-GC and code-publication safepoint, in ONE load.
+				 *
+				 * REQUIRED for multithreaded GC -- without it a JITted loop never reaches a safepoint, the
+				 * GC cannot suspend the thread, and the coop suspend deadlocks. It is ALSO where a worker
+				 * adopts a code publication, which is what makes a live f-slot re-pointable at all.
+				 *
+				 * `s.g` is this worker's action word (mini-wasm-publish.inc): one i32 that either writer
+				 * -- the GC suspend initiator or a publisher -- can raise, and that only this worker
+				 * clears. An imported global rather than a baked address because the emitted BYTES are
+				 * process-wide and shared by every worker, so nothing per-thread may be baked into them.
+				 * This costs exactly what HEAD's bare `mono_polling_required` load cost; testing the two
+				 * conditions separately here cost two extra loads, an i32.ne and an i32.or on every loop
+				 * back-edge in the tier. */
 #ifdef HOST_BROWSER
 				{
-					extern volatile size_t mono_polling_required;
 					WasmFuncType pt; int pti = -1, pk;
 					memset (&pt, 0, sizeof (pt)); pt.ret = WASM_VOID; pt.nparams = 0;
 					for (pk = 0; pk < nextra; ++pk) if (functype_eq (&extra_types [pk], &pt)) { pti = ti_base + pk; break; }
 					if (pti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt; pti = ti_base + nextra++; }
 					uses_calls = TRUE;
-					wasm_i32_const (&body, (gint32) (intptr_t) &mono_polling_required);
+					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = this worker's action word */
 					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-					wasm_i32_const (&body, (gint32) (intptr_t) &wj_global_epoch);
-					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = &wj_local_epoch */
-					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-					wasm_op (&body, WASM_OP_I32_NE);
-					wasm_op (&body, WASM_OP_I32_OR);
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 					/* Materialize roots inside the rare taken arm, not before the flag load. */
 					ENSURE_REF_FRAME ();
@@ -6430,15 +6433,22 @@ vcall_cold_miss_emit:
 				} else {
 					{ WjRegEntry *sre = wj_reg_at (cfg->wasm_jit_result.desc_id - 1);
 					  if (sre) {
-						/* Same-descriptor generations replace the relocatable body too. Compilation is
+						/* A same-descriptor generation replaces the relocatable body too, and keeping the
+						 * old one leaked every code buffer and relocation vector re-emission produced.
+						 *
+						 * RETIRED, NOT FREED. The comment this replaces said "compilation is
 						 * process-serialized and admission never reads WjBody, so no concurrent reader can
-						 * retain the superseded body. Keeping it leaked every code buffer and relocation
-						 * vector produced by re-emission until the wasm heap reached 4 GiB. */
+						 * retain the superseded body". The first clause is true and the second is not:
+						 * mono_wasm_jit_admit reaches wj_deps_arity_bad (mini-wasm.c) on its unconditional
+						 * path, which dereferences dep->body->nparams for arbitrary DEPENDENCY descriptors
+						 * on whatever worker is admitting -- and admission never takes wj_compiling, so
+						 * being the only compiler buys nothing against it. Freeing here is a cross-thread
+						 * use-after-free on a body some other worker is reading. */
 						WjBody *old_body = sre->body;
 						sre->body = wj_stored_body;
 						wj_stored_body = NULL;
 						if (old_body && old_body != sre->body)
-							wj_body_free (old_body);
+							wj_retire_payload (old_body, WJ_RETIRED_BODY);
 					  } }
 					if (mono_wasm_jit_verbose >= 1) {
 						printf ("WASM_JIT_REGISTERED %s desc=%d e_slot=%d f_slot=%d len=%u deps=%d [", mname, cfg->wasm_jit_result.desc_id, e_slot, f_slot, (unsigned) out.len, cfg->wasm_jit_result.ndirect_deps);

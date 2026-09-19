@@ -879,10 +879,12 @@ enum {
 	 * expressed this as a refusal propagating up from the offending level; the single writer has to check
 	 * it explicitly, and NOT doing so is what regressed a clean config twice (see wj_make_callable). */
 	WJC_SW_VERIFY_FAIL,
-	/* High-water closure size seen by the single writer's install walk, so WJ_INSTALL_MAX can be sized
-	 * from data rather than guessed. If this sits AT the cap the walk is being truncated and admissions
-	 * are being refused for lack of budget, which presents as a boot that never finishes with no fault
-	 * at all -- the tier admits nothing and everything interprets. */
+	/* High-water closure size seen by the install walk. It no longer has a cap to sit at -- the list
+	 * grows and the runaway guard is sized from wj_reg_n -- so this is now a plain measurement of how
+	 * large real closures get. Read it against WJC_INSTALL_BUDGET_OUT, which is the thing that must
+	 * stay 0: the two together are what says "nothing is being truncated", where a saturated constant
+	 * used to say the opposite without anyone noticing (R267 addendum 12 read it AT 4096 on the SHIPPED
+	 * path, i.e. real closures were being truncated and their admissions refused). */
 	WJC_SW_CLOSURE_MAX,
 	/* MONO_WASM_JIT_SWEEP: TIME-OF-USE verification. Re-checks descriptors this thread has ALREADY
 	 * published (state 2, generation current) and reports any whose own slots died or whose dependency
@@ -914,6 +916,63 @@ enum {
 	 * recorded generation is published instead, so the worker is simply stale and re-admits. NON-ZERO IS
 	 * EXPECTED under re-emission and is the window being closed, not an error. */
 	WJC_ADMIT_GEN_MOVED_MIDWALK,
+	/* A mandatory (semantic) replacement that the broker gave up on, and the transient publication
+	 * failures that lead there.
+	 *
+	 * REFRAME_FAIL: the body compiled and registered, but re-framing its co-location GROUP failed, so the
+	 * group still carries the OLD body. The replacement is retried on the same bounded budget as a lost
+	 * compile CAS; when that runs out REQUIRED_GIVEUP fires, `wasm_jit_reemit_required` is cleared and the
+	 * old body stays live. Unbounded retry here is what leaked a module blob per attempt and recompiled
+	 * the same method at every compile safepoint until the wasm heap was exhausted before Minecraft
+	 * finished initialising -- the exact failure the BLOCKED arm's comment in interp.c was written to
+	 * prevent, on the one path it did not cover.
+	 *
+	 * REQUIRED_DROPPED: a mandatory replacement refused for a condition that CANNOT clear (no f-slot, the
+	 * interpreter tiered the method, the emitter bailed permanently). The flag is cleared so the method
+	 * stops being rerouted into the broker forever by wj_waiter_wake.
+	 *
+	 * BOTH MUST BE READ, AND A NON-ZERO GIVEUP IS A CORRECTNESS STATEMENT, NOT A MISSED OPTIMISATION, THE
+	 * DAY A TRUE DETOUR USES THIS PATH: for an IKVM generation-2 swap the old body is merely slower, but a
+	 * MonoMod-style detour that never lands is a silently un-applied patch. Whoever wires that up must
+	 * turn these into a reported failure rather than a counter. */
+	WJC_REEMIT_REFRAME_FAIL, WJC_REEMIT_REQUIRED_GIVEUP, WJC_REEMIT_REQUIRED_DROPPED,
+	/* Superseded registry payloads (module bytes, depsets, relocatable bodies, batch descriptors) retired
+	 * behind the reader grace period, and what became of them. See the long note above wj_retire_payload.
+	 *
+	 * RETIRED vs FREED is the leak reading: they should track. DEPTH_MAX is the one that matters, because
+	 * reclamation is blocked while ANY worker is inside the bracket and one parked inside a JS module
+	 * compile or a JSPI suspension defers everything -- a burst by design, unbounded in principle, so the
+	 * high-water mark is read rather than asserted. RECLAIMS is the liveness signal: 0 with RETIRED large
+	 * means the bracket is never observed empty and the scheme has degenerated into the leak it replaced. */
+	WJC_RETIRED, WJC_RETIRE_FREED, WJC_RETIRE_RECLAIMS, WJC_RETIRE_DEPTH_MAX,
+	/* Re-admissions a worker owes after a drain refused one, and how the carry list behaved. RETRY_OK is
+	 * the healthy reading and should track DRAIN_REFUSED; RETRY_MAXN is the high-water occupancy; a
+	 * NON-ZERO RETRY_FULL means the list overflowed and that drain fell back to pinning the epoch, which
+	 * puts a closure walk on every loop back-edge until it clears -- if it is ever non-zero, raise
+	 * WJ_RV_RETRY_MAX rather than ignoring it. */
+	WJC_RV_RETRY_OK, WJC_RV_RETRY_FULL, WJC_RV_RETRY_MAXN,
+	/* Workers that have claimed a safepoint action word (high-water), and claims that found the slab
+	 * full. SLOTS says how close WJ_WORKER_MAX is to binding; a non-zero SLOTS_FULL means some worker is
+	 * permanently taking the out-of-line safepoint helper -- correct, but slow, and invisible otherwise. */
+	WJC_WORKER_SLOTS, WJC_WORKER_SLOTS_FULL,
+	/* The install walk's runaway guard fired. MUST BE ZERO. It is sized from the registry size and the
+	 * stamp visits each descriptor once, so reaching it means the dependency graph is not what the walk
+	 * assumes -- not that a closure was legitimately large. */
+	WJC_INSTALL_BUDGET_OUT,
+	/* A rebatch request that was complete for its group but carried OTHER descriptors too -- a real merge,
+	 * refused because MONO_WASM_JIT_COLOCATE_MERGE ships 0. Split out from WJC_COLOCATE_MERGE_SPLIT
+	 * because the two used to be one early return that also swallowed the PURE RE-FRAME case, which is
+	 * neither a merge nor a split and is what re-emission needs (see mono_wasm_jit_rebatch). */
+	WJC_COLOCATE_MERGE_OFF,
+	/* Group re-frames that SUCCEEDED, the denominator WJC_REEMIT_REFRAME_FAIL never had. Before the pure
+	 * re-frame was separated from a merge this was structurally 0 in the shipped configuration and the
+	 * failure count alone could not say so. */
+	WJC_REFRAME_OK,
+	/* Drain calls that returned immediately because the publication batch was full and the flush was
+	 * still rate-limited. This is the WAIT, and it must be cheap: the entry stays queued and nothing is
+	 * dequeued. Read it against WJC_REEMIT_DRAINED -- when the same condition was handled by popping and
+	 * re-pushing instead, DRAINED read 2.8 MILLION against 847 real outcomes. */
+	WJC_REEMIT_BATCH_WAIT,
 	WJC_MAX
 };
 

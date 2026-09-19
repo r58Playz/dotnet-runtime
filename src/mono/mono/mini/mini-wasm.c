@@ -40,7 +40,7 @@ gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTab
 	MonoMethod **out_target, guint32 *out_samples, int *out_why); /* interp.c; lock-free pre-JIT receiver profile */
 void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
 void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
-gint32 *mono_wasm_jit_worker_epoch_addr (void);
+gint32 *mono_wasm_jit_worker_action_addr (void);
 void mono_wasm_jit_safepoint_poll (void);
 #define WJ_KEEPALIVE EMSCRIPTEN_KEEPALIVE
 #else
@@ -398,25 +398,25 @@ int mono_wasm_jit_devirt_arm2_pct = 15;
  * admit_live at 0 for a worker's lifetime and read as a 1.63x regression with every error counter at
  * zero, so the vfb and admit_live identities must be checked before any timing is quoted. */
 /* MONO_WASM_JIT_RELINK_JITTED: let an IKVM generation-2 body swap proceed even when generation 1 has
- * already been wasm-JITted. DEFAULT OFF while the arm is unmeasured -- the refusal it lifts is 736
- * methods per in-game window (interp-internals.h), i.e. methods that keep the dynamic-dispatch body
- * forever, and lifting it is the only route to them that does not need class-finish-time marking.
+ * already been wasm-JITted. The refusal it lifts costs 736 methods per in-game window, i.e. methods that
+ * keep the dynamic-dispatch body forever.
  *
- * It does NOT invalidate generation 1. Nothing republishes an existing f-slot: generation 2 registers
- * into a FRESH e/f pair and generation 1's module stays installed and live, so callers that baked its
- * f-slot (or co-located its body) keep reaching correct-but-slower code. That is what separates this
- * from the deleted re-emission subsystem, whose wedges all trace to republishing a live slot.
+ * IT NOW REPUBLISHES THE EXISTING PAIR, which is the opposite of what R252 shipped and is a deliberate
+ * change of direction rather than a regression. R252 gave generation 2 a FRESH e/f pair and left
+ * generation 1 live, precisely to avoid re-pointing a live f-slot; the cost is that every caller which
+ * baked generation 1's f-slot, and every group that co-located its body, keeps reaching the slow body
+ * forever. Same-slot replacement is what a detour (MonoMod/Everest-style) requires and what reaching
+ * generation 2 from existing callers requires, so the machinery it needs -- asynchronous publication,
+ * the per-worker action word, the adoption drain -- is now the thing being built rather than avoided.
+ * mono_wasm_jit_request_reemit (interp.c) is the entry point; mini-wasm-publish.inc is the mechanism.
  *
- * SHIPS 1. Measured 2026-09-12 on the server tick, instruction-weighted, BOTH ORDERS, n=2 per arm, on
- * top of IKVM_LAZY_SIG=1: 178.1/179.0 -> 171.2/169.7 M instr/tick, non-overlapping, and the matched
- * pair (both arms completed all 2,406 nominal ticks, so identical denominators) is 430.7 -> 408.3 G
- * instructions for the same work, -5.2%. IKVM's own refusal counter falls 619/619 -> 37/38 and its
- * installs rise 3,250 -> 3,750, reproducing exactly across arms.
- *
- * NO COST BUCKET ROSE -- `our JIT tier helpers` FELL 15.86 -> 14.83 M/tick. The re-JIT churn this was
- * expected to buy lands almost entirely OUTSIDE the measured window: WJC_RELINK_REFRESHED is 574 per
- * run of which only 4 are in-game, the rest during world load. 4 timing arms plus 2 mechanism runs,
- * zero faults of any trap class. */
+ * SHIPS 1, on the measurement of the OLD shape. 2026-09-12, server tick, instruction-weighted, BOTH
+ * ORDERS, n=2 per arm, on top of IKVM_LAZY_SIG=1: 178.1/179.0 -> 171.2/169.7 M instr/tick,
+ * non-overlapping; matched pair (both arms completed all 2,406 nominal ticks) 430.7 -> 408.3 G
+ * instructions, -5.2%. IKVM's refusal counter fell 619/619 -> 37/38, installs rose 3,250 -> 3,750.
+ * WJC_RELINK_REFRESHED was 574 per run of which only 4 were in-game, the rest during world load -- so
+ * that -5.2% says nothing about whether same-slot republication is worth its machinery IN THE PLATEAU,
+ * and it must be re-measured on this shape before the two are compared. */
 int mono_wasm_jit_relink_jitted = 1;
 int mono_wasm_jit_colocate_merge = 0;
 int mono_wasm_jit_colocate_max = 16;      /* MONO_WASM_JIT_COLOCATE_MAX: members per group, self included */
@@ -1350,7 +1350,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 					return f;
 				} });
 			}
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8, v: $9, n: $10, d: $11, m: $12, b: $13, i: $14, g: Module._mono_wasm_jit_worker_epoch_addr () }, h: Module.__wjHelperImports });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8, v: $9, n: $10, d: $11, m: $12, b: $13, i: $14, g: Module._mono_wasm_jit_worker_action_addr () }, h: Module.__wjHelperImports });
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
 			/* AN F-SLOT ONLY EVER HOLDS A JIT `f` FROM A MODULE THIS EMITTER PRODUCED, and that is a
 			 * load-bearing invariant, not an observation: it is what lets a caller bake a functype for
@@ -1485,7 +1485,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 					return f;
 				} });
 			}
-			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14, i: $15, g: Module._mono_wasm_jit_worker_epoch_addr () }, h: Module.__wjHelperImports });
+			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14, i: $15, g: Module._mono_wasm_jit_worker_action_addr () }, h: Module.__wjHelperImports });
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
 			/* TWO PASSES, and `es / 4` rather than `es >> 2`. Both are the same bug seen twice.
 			 *
@@ -1628,13 +1628,51 @@ wj_depset_new (const int *slots, const guint32 *sigs, MonoMethod *const *methods
 	return d;
 }
 
-/* Superseded registry payloads are protected by admission readers, not retained forever. A reader enters
- * before snapshotting a registry pointer and leaves after its dependency walk/instantiation completes.
- * Publishers swap the pointer first and retire the old allocation; the last reader reclaims the list.
- * New readers can only acquire the new pointer, so no global pause or per-worker acknowledgement is needed. */
+/*
+ * RECLAIMING SUPERSEDED REGISTRY PAYLOADS.
+ *
+ * This file's standing rule is "publish before you free, and prefer leaking to freeing": bytes, depsets
+ * and batch descriptors are read LOCK-FREE by other workers and nothing recalls a published pointer. That
+ * rule is right and is kept -- what is added here is the one thing that makes freeing possible at all,
+ * which is knowing when every reader that could be holding the OLD pointer has finished.
+ *
+ * WHY IT BECAME NECESSARY. Leaking is bounded only while re-publication is rare. Once an IKVM body swap
+ * republishes a live descriptor -- ~574 per run, plus re-emission -- each superseded generation strands a
+ * module blob, a depset and (on a re-frame) a batch descriptor, and the wasm heap is 4 GiB with the
+ * browser already sitting near 2.9 GB.
+ *
+ * THE SCHEME, and it is the whole of it: a reader brackets the window in which it may hold a registry
+ * pointer; a publisher swaps the pointer, then retires the old one; a retired payload is freed once the
+ * reader count is observed at zero. That observation is sufficient, and the argument is short -- a reader
+ * that entered BEFORE the retire is counted, so zero means all of them have left; a reader that entered
+ * AFTER it cannot have acquired the old pointer, because the swap already happened.
+ *
+ * THREE THINGS THE FIRST VERSION GOT WRONG, all of the same shape -- the bracket did not cover the readers.
+ *
+ *   1. It wrapped mono_wasm_jit_admit and nothing else, while re->depset is acquired and held across a
+ *      full wj_assemble and a JS module compile by mono_wasm_jit_colocate_deps_now, walked for ARBITRARY
+ *      other descriptors by wj_asm_reaches, read by mono_wasm_jit_rendezvous's group expansion, and read
+ *      by the dep-graph dumps on the main thread. None of those was bracketed, and no retire site is
+ *      itself a reader -- so the usual case was "retire, observe zero, free immediately", i.e. no grace
+ *      period at all. Every such site is bracketed below; adding a new reader means adding a bracket.
+ *   2. It counted PER RECURSION. The admission DFS re-enters through mono_wasm_jit_admit at every
+ *      dependency edge, so a contended atomic and two full fences were paid per node of every closure
+ *      walk, on twelve workers sharing one line, on the dispatch path. The depth counter is __thread and
+ *      only the outermost entry touches the shared word.
+ *   3. It reclaimed from the reader's EXIT, unconditionally -- a global spinlock on the dispatch path.
+ *      The exit now reads one plain word and does nothing at all in the steady state, because retires
+ *      happen during compilation and dispatch is not compiling.
+ *
+ * WHAT IS STILL TRUE: one worker parked inside the bracket (a JS module compile, a GC-safe region, a JSPI
+ * suspension) holds the count non-zero and defers reclamation of everything. That is a burst, not a leak,
+ * but it is unbounded in principle -- so the depth and its high-water mark are COUNTED. A guard whose
+ * bound is asserted rather than read is not a bound.
+ */
 typedef enum {
 	WJ_RETIRED_BYTES,
-	WJ_RETIRED_DEPSET
+	WJ_RETIRED_DEPSET,
+	WJ_RETIRED_BODY,
+	WJ_RETIRED_BATCH
 } WjRetiredKind;
 
 typedef struct _WjRetiredPayload WjRetiredPayload;
@@ -1644,9 +1682,12 @@ struct _WjRetiredPayload {
 	WjRetiredPayload *next;
 };
 
-static volatile gint32 wj_admit_readers;
+static volatile gint32 wj_reg_readers;        /* threads that may be holding a retireable pointer */
 static volatile gint32 wj_retired_lock;
+static volatile gint32 wj_retired_pending;    /* plain read on the reader-exit fast path */
 static WjRetiredPayload *wj_retired_payloads;
+static gint32 wj_retired_depth;               /* under wj_retired_lock */
+static __thread int wj_reg_read_depth;
 
 static void
 wj_retired_enter (void)
@@ -1672,29 +1713,56 @@ wj_depset_free (WjDepSet *d)
 	g_free (d);
 }
 
+struct _WjBody;   /* file scope, so the prototype below is not a fresh tag with prototype scope */
+static void wj_body_free (struct _WjBody *b);   /* mini-wasm-ir.inc; the typedef is not visible yet */
+
+static void
+wj_batchdesc_free (WjBatchDesc *bd)
+{
+	if (!bd)
+		return;
+	g_free (bd->e);
+	g_free (bd->f);
+	g_free (bd->desc);
+	/* NOT bd->bytes: the module blob is retired separately and deduplicated across the members that
+	 * shared it, so freeing it here would be a double free for a group of n > 1. */
+	g_free (bd);
+}
+
 static void
 wj_reclaim_retired (void)
 {
 	WjRetiredPayload *p, *next;
-	if (mono_atomic_load_i32 (&wj_admit_readers) != 0)
+	int freed = 0;
+
+	if (!wj_retired_pending)
+		return;
+	if (mono_atomic_load_i32 (&wj_reg_readers) != 0)
 		return;
 	wj_retired_enter ();
-	if (mono_atomic_load_i32 (&wj_admit_readers) != 0) {
+	if (mono_atomic_load_i32 (&wj_reg_readers) != 0) {
 		wj_retired_leave ();
 		return;
 	}
 	p = wj_retired_payloads;
 	wj_retired_payloads = NULL;
+	wj_retired_depth = 0;
+	mono_atomic_store_i32 (&wj_retired_pending, 0);
 	wj_retired_leave ();
 	while (p) {
 		next = p->next;
-		if (p->kind == WJ_RETIRED_DEPSET)
-			wj_depset_free ((WjDepSet *) p->ptr);
-		else
-			g_free (p->ptr);
+		switch (p->kind) {
+		case WJ_RETIRED_DEPSET: wj_depset_free ((WjDepSet *) p->ptr); break;
+		case WJ_RETIRED_BODY:   wj_body_free ((struct _WjBody *) p->ptr); break;
+		case WJ_RETIRED_BATCH:  wj_batchdesc_free ((WjBatchDesc *) p->ptr); break;
+		default:                g_free (p->ptr); break;
+		}
 		g_free (p);
 		p = next;
+		++freed;
 	}
+	mono_wasm_jit_counters [WJC_RETIRE_FREED] += freed;
+	mono_wasm_jit_counters [WJC_RETIRE_RECLAIMS]++;
 }
 
 static void
@@ -1709,8 +1777,39 @@ wj_retire_payload (gpointer ptr, WjRetiredKind kind)
 	wj_retired_enter ();
 	p->next = wj_retired_payloads;
 	wj_retired_payloads = p;
+	++wj_retired_depth;
+	if (wj_retired_depth > (gint32) mono_wasm_jit_counters [WJC_RETIRE_DEPTH_MAX])
+		mono_wasm_jit_counters [WJC_RETIRE_DEPTH_MAX] = wj_retired_depth;
+	mono_atomic_store_i32 (&wj_retired_pending, 1);
 	wj_retired_leave ();
+	mono_wasm_jit_counters [WJC_RETIRED]++;
+	/* A retire site is never itself inside the bracket when it can help it, so this usually reclaims on
+	 * the spot; when it cannot, the next reader-exit or the next retire will. */
 	wj_reclaim_retired ();
+}
+
+/*
+ * THE READER BRACKET. Hold it for as long as a registry pointer -- re->bytes, re->depset, re->body,
+ * re->batch, or anything reached through them -- may still be dereferenced. Re-entrant: only the outermost
+ * entry touches the shared counter, which matters because the admission DFS nests once per dependency.
+ */
+static void
+wj_reg_read_enter (void)
+{
+	if (wj_reg_read_depth++ == 0) {
+		mono_atomic_inc_i32 (&wj_reg_readers);
+		mono_memory_barrier ();   /* announce the reader before acquiring any retireable pointer */
+	}
+}
+
+static void
+wj_reg_read_leave (void)
+{
+	if (--wj_reg_read_depth == 0) {
+		mono_memory_barrier ();
+		if (mono_atomic_dec_i32 (&wj_reg_readers) == 0 && wj_retired_pending)
+			wj_reclaim_retired ();
+	}
 }
 
 typedef struct {
@@ -1904,21 +2003,33 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				return old_desc;
 			}
 			if (same_method && old_re && old_re->batch) {
-				WjDepSet *old_depset = old_re->depset;
-				/* A batched member also keeps its descriptor. Its freshly emitted relocatable body is
-				 * attached by the caller immediately after registration; the compile broker then
-				 * re-frames the complete existing group before publishing a generation. Do not point
-				 * this entry at the temporary standalone module: admitting a sibling would reinstall
-				 * the old batch over it. */
+				/* A BATCHED MEMBER KEEPS ITS DESCRIPTOR, AND PUBLISHES ALMOST NOTHING HERE.
+				 *
+				 * The module this entry belongs to is still the GROUP's, and the group still contains the
+				 * OLD body: re-framing it is a separate step (mono_wasm_jit_refresh_batch) that runs after
+				 * this returns and can fail. So this is the middle of a replacement, and whatever it
+				 * writes describes a generation that is not installed anywhere yet.
+				 *
+				 * THE DEPSET IS THE ONE THAT MATTERS AND IT IS NOT WRITTEN. Admission validates a caller's
+				 * closure against it, so publishing generation 2's dependencies over a module that still
+				 * contains generation 1 makes admission install the wrong closure while the old body runs
+				 * -- a baked call_indirect into an f-slot nothing admitted, i.e. the `function signature
+				 * mismatch` class. It would also be pointless on success: mono_wasm_jit_batch_bind
+				 * recomputes every member's depset from the ASSEMBLER's own resolution of the module it
+				 * installs, which is the only set that describes the code actually running.
+				 *
+				 * no_gc is forced off rather than updated, because it is a transitive property of the new
+				 * body's direct calls and a caller that believes a stale TRUE elides its GC frame. FALSE
+				 * is the safe direction and the next full registration restores it.
+				 *
+				 * body_len and f_sig_id are safe to write: the first is diagnostic, and the second is
+				 * derived from the MonoMethod's signature, which no body replacement can change. */
 				old_re->body_len = len;
 				old_re->f_sig_id = f_sig_id;
-				old_re->no_gc = no_gc ? 1 : 0;
-				old_re->depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
+				old_re->no_gc = 0;
 				mono_memory_barrier ();
 				mono_wasm_jit_counters [WJC_FSLOT_REUSED]++;
 				mono_loader_unlock ();
-				if (old_depset != old_re->depset)
-					wj_retire_payload (old_depset, WJ_RETIRED_DEPSET);
 				return old_desc;
 			}
 			/* ORPHAN THE OLD DESCRIPTOR. It keeps its registry entry and its bytes, but it has just lost
@@ -2680,11 +2791,38 @@ wj_admit_install_only (int desc_id, WjRegEntry *re)
  * exhausted immediately -- the walk then refused admission transiently FOREVER, which presents as a boot
  * that never finishes with `faults=[]` and no trap: the tier simply never admits anything and everything
  * falls back to the interpreter. */
-#define WJ_INSTALL_MAX 4096
+/*
+ * A RUNAWAY GUARD, NOT A SIZE LIMIT, and the difference is load-bearing.
+ *
+ * The stamp already visits each descriptor at most once per pass, so the natural bound on a walk is the
+ * size of the registry. A fixed constant here is therefore not a policy about how large a closure may be;
+ * it is only a floor under a corrupted graph. Sized from wj_reg_n at each root for that reason.
+ *
+ * WHY IT MATTERS: R267 addendum 12 measured sw_closure_max sitting AT the previous constant (4096) with
+ * re-emission off -- i.e. on the SHIPPED path -- so the walk was truncating real closures and refusing
+ * their admissions, which presents as a boot that never finishes with faults=[] and no trap at all.
+ * Raising a constant is the wrong answer to that twice over: it had already been raised once from 512 for
+ * the same reason, and a cap that is ever REACHED silently changes what the tier admits.
+ */
+#define WJ_INSTALL_SLACK 256
 /* The closure the current install pass touched, in stamp order. See wj_make_callable: enumerating it is
- * what lets publication happen strictly AFTER every install in the closure has completed. */
-static __thread int      wj_clo_list [WJ_INSTALL_MAX];
+ * what lets publication happen strictly AFTER every install in the closure has completed. GROWN, NEVER
+ * TRUNCATED: dropping an entry here does not shrink the walk, it hides an installed descriptor from the
+ * publish pass, which is the one thing this list exists to prevent. */
+static __thread int     *wj_clo_list;
+static __thread int      wj_clo_cap;
 static __thread int      wj_clo_n;
+
+static void
+wj_clo_ensure (int need)
+{
+	if (need <= wj_clo_cap)
+		return;
+	wj_clo_cap = wj_clo_cap ? wj_clo_cap * 2 : 1024;
+	if (wj_clo_cap < need)
+		wj_clo_cap = need;
+	wj_clo_list = (int *) g_realloc (wj_clo_list, sizeof (int) * (gsize) wj_clo_cap);
+}
 static __thread guint32 *wj_inst_stamp;
 static __thread int      wj_inst_cap;
 static __thread guint32  wj_inst_gen;
@@ -2737,16 +2875,17 @@ wj_install_closure (int desc_id)
 	 * REVISIT burned budget too -- and a diamond-shaped dependency graph revisits constantly, so the walk
 	 * gave up far below its nominal closure size. The cap means "how big a closure may be", not "how many
 	 * edges may be traversed". */
-	if (wj_inst_budget-- <= 0)
+	if (wj_inst_budget-- <= 0) {
+		mono_wasm_jit_counters [WJC_INSTALL_BUDGET_OUT]++;
 		return FALSE;
+	}
 	wj_inst_stamp [desc_id] = wj_inst_gen;
 	/* Collect the closure as it is stamped, so the publish pass can enumerate exactly what was
 	 * installed. Bounded by the same budget that bounds the walk. */
-	if (wj_clo_n < WJ_INSTALL_MAX) {
-		wj_clo_list [wj_clo_n++] = desc_id;
-		if (wj_clo_n > (int) mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX])
-			mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX] = wj_clo_n;
-	}
+	wj_clo_ensure (wj_clo_n + 1);
+	wj_clo_list [wj_clo_n++] = desc_id;
+	if (wj_clo_n > (int) mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX])
+		mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX] = wj_clo_n;
 	re = wj_reg_at (desc_id - 1);
 	if (!re)
 		return FALSE;
@@ -2796,7 +2935,7 @@ wj_install_closure_root (int desc_id, WjRegEntry *re)
 		memset (wj_inst_stamp, 0, sizeof (guint32) * (gsize) wj_inst_cap);
 		wj_inst_gen = 1;
 	}
-	wj_inst_budget = WJ_INSTALL_MAX;
+	wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
 	return wj_install_closure (desc_id);
 }
 
@@ -2826,7 +2965,7 @@ wj_install_closure_group (int desc_id, WjRegEntry *re)
 		memset (wj_inst_stamp, 0, sizeof (guint32) * (gsize) wj_inst_cap);
 		wj_inst_gen = 1;
 	}
-	wj_inst_budget = WJ_INSTALL_MAX;
+	wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
 	for (i = 0; i < ibatch->n; ++i) {
 		int m = ibatch->desc [i];
 		if (m > 0 && !wj_install_closure (m))
@@ -3673,12 +3812,9 @@ int
 mono_wasm_jit_admit (int desc_id)
 {
 	int result;
-	mono_atomic_inc_i32 (&wj_admit_readers);
-	mono_memory_barrier (); /* announce the reader before acquiring any retireable registry pointer */
+	wj_reg_read_enter ();
 	result = wj_admit_impl (desc_id);
-	mono_memory_barrier ();
-	if (mono_atomic_dec_i32 (&wj_admit_readers) == 0)
-		wj_reclaim_retired ();
+	wj_reg_read_leave ();
 	return result;
 }
 #include "mini-wasm-publish.inc"
