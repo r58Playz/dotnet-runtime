@@ -1,3 +1,4 @@
+/* Runtime wasm-JIT diagnostics and bounded observation buffers. Included by mini-wasm.c. */
 /* Single bench getter (analog of the jiterpreter's mono_jiterp_get_counter): the consumer's
  * heat-snapshot harness reads each counter by its WJC_* index via Module._mono_wasm_jit_get_counter().
  * Returns a double so the harness gets exact values past 2^53 isn't a concern at bench scale (and JS
@@ -481,7 +482,7 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_DEVIRT_POLY), WJC_(WJC_DEVIRT_POLY_90), WJC_(WJC_DEVIRT_SIG), WJC_(WJC_DEVIRT_NO_FSLOT),
 		WJC_(WJC_DELEGATE_SITE), WJC_(WJC_FAST_DEVIRT));
 	printf ("[wasm-jit devirt-arm2] emitted=%lld | thin=%lld no_alt=%lld no_fslot=%lld sig=%lld self=%lld"
-		"  (MONO_WASM_JIT_DEVIRT_ARM2=%d pct>=%d)  EXECUTED hits=%lld\n"
+		"  (pct>=%d)  EXECUTED hits=%lld\n"
 		"  thin is the break-even REFUSING a site, not a failure: an arm below ~15%% capture loses"
 		" (vcall_ways 4->1 was +9.6%% fps at ~1%% capture). Read hits against ic-why alt-receiver.\n",
 		WJC_(WJC_DEVIRT_ARM2_EMITTED), WJC_(WJC_DEVIRT_ARM2_THIN), WJC_(WJC_DEVIRT_ARM2_NO_ALT),

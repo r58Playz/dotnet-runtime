@@ -1,31 +1,28 @@
+/* Asynchronous code-generation publication. Included by mini-wasm.c so the registry and per-worker
+ * admission state remain private to one translation unit while publication evolves independently. */
+
 /* ================================================================================================== *
- * THE REPUBLICATION RENDEZVOUS
+ * ASYNCHRONOUS REPUBLICATION
  *
  * The problem this exists for, stated once. A JITted method's bytes are published process-wide, but each
  * worker instantiates its own WebAssembly.Instance and writes its own function table -- ONE WORKER CANNOT
  * WRITE ANOTHER'S -- and generated code call_indirects an f-slot with NO liveness check, by design. So a
- * live f-slot can never be re-pointed: between "worker A decided" and "worker B re-instantiated", B's code
- * keeps calling the old body. For an equivalence-preserving swap that is merely slower (R252 leaves
- * generation 1 live and gives generation 2 a FRESH pair for exactly this reason). For anything that
- * CHANGES BEHAVIOUR -- a re-emission whose callers must see the new body, a MonoMod detour -- it is wrong.
+ * live f-slot is repointed by its owning worker. Publication appends an immutable generation record and
+ * each worker adopts pending records at a JIT safepoint before returning to managed code. Workers need not
+ * synchronize with one another: an old frame may finish against a coherent old generation while another
+ * worker has already installed the replacement.
  *
- * The only way to repoint a slot safely is to stop every worker, and then have each worker re-instantiate
- * ITS OWN table before it executes another instruction of JIT code.
- *
- * WHAT IS REUSED RATHER THAN BUILT. Three things already exist and are proven:
- *   - mono_stop_world / mono_restart_world (gc-internals.h, sgen-stw.c) -- a public non-collection STW
- *     pair that interp_invalidate_transformed (interp.c) already uses for exactly this kind of job.
+ * WHAT IS REUSED RATHER THAN BUILT. Two things already exist and are proven:
  *   - the GENERATION mechanism: wj_desc_generation[desc] != re->generation already makes a worker drop its
  *     admission cache and re-instantiate (mono_wasm_jit_admit). Bumping re->generation is the whole
  *     publication step.
  *   - mono_wasm_jit_admit itself does the re-instantiation, in dependency order, with every refusal
  *     counted. The drain below calls it rather than reimplementing a second, less-tested installer.
- * What is NEW is only the guarantee the generation mechanism lacks: that no thread ENTERS the slot in the
- * window between the bump and its own re-admission.
+ * The additional guarantee is the emitted epoch check: a worker cannot pass a JIT safepoint with a
+ * publication it has not adopted.
  *
- * WHY AN EPOCH AND A LOG, not a single "current batch". A thread parked at a safepoint drains the moment
- * it resumes. A thread that was in GC-SAFE when the world stopped was never parked at all (coop counts it
- * suspended immediately) and drains when it comes back. That second thread can sit out SEVERAL rendezvous
+ * WHY AN EPOCH AND A LOG, not a single "current batch". A thread drains at a JIT safepoint or managed
+ * re-entry. A thread in GC-SAFE can sit out SEVERAL publications
  * -- it is not executing JIT code meanwhile, so its stale entries are harmless until it returns -- and
  * then must catch up on ALL of them. A single slot would lose the earlier ones. The log is append-only and
  * never freed, per this file's ownership rule: it is read lock-free by every worker and nothing recalls it.
@@ -52,6 +49,12 @@ static __thread int    wj_draining;
  * are different claims and only the second one proves the rendezvous reached the whole fleet. */
 static __thread int    wj_drained_ever;
 
+WJ_KEEPALIVE gint32 *
+mono_wasm_jit_worker_epoch_addr (void)
+{
+	return &wj_local_epoch;
+}
+
 /*
  * Catch this thread up to the global epoch. Called from the three coop re-entry points, i.e. from every
  * place a thread can resume executing managed code after having been stopped or blocked.
@@ -69,7 +72,8 @@ void mono_wasm_jit_rendezvous_drain (void);
 void
 mono_wasm_jit_rendezvous_drain (void)
 {
-	gint32 target, i;
+	gint32 target, i, completed;
+	gboolean retry = FALSE;
 
 	target = wj_global_epoch;
 	if (G_LIKELY (wj_local_epoch == target))
@@ -77,6 +81,7 @@ mono_wasm_jit_rendezvous_drain (void)
 	if (wj_draining)
 		return;
 	wj_draining = 1;
+	completed = wj_local_epoch;
 
 	/* Walk every rendezvous this thread has not yet seen, oldest first. Oldest first matters: a
 	 * descriptor republished twice must end on the LATER bytes, and admit resolves against the registry's
@@ -107,7 +112,7 @@ mono_wasm_jit_rendezvous_drain (void)
 			 * This is CLAUDE.md's "routing a PERMANENT condition into the retry path spins forever",
 			 * arrived at from the other direction.
 			 *
-			 * None of it was needed. The rendezvous already bumped re->generation under the stop, so this
+			 * None of it was needed. Publication already bumped re->generation before exposing the epoch, so this
 			 * thread's cached generation mismatches by construction; admit's own generation arm resets
 			 * the state, keeps the permfail bound, and writes the generation back when it succeeds. */
 			WjRegEntry *re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
@@ -176,11 +181,20 @@ mono_wasm_jit_rendezvous_drain (void)
 			}
 			if (mono_wasm_jit_admit (desc_id))
 				mono_wasm_jit_counters [WJC_RV_DRAIN_SLOT]++;
-			else
+			else {
 				mono_wasm_jit_counters [WJC_RV_DRAIN_REFUSED]++;
+				retry = TRUE;
+				break;
+			}
 		}
+		if (retry)
+			break;
+		completed = i + 1;
 	}
-	wj_local_epoch = target;
+	/* Never acknowledge a generation whose slots were not installed. The generated epoch check will take
+	 * this slow path again at the next safepoint; acknowledging here would make an old table entry look
+	 * current and turn a transient installation failure into stale-code execution. */
+	wj_local_epoch = retry ? completed : target;
 	wj_draining = 0;
 
 	mono_wasm_jit_counters [WJC_RV_DRAIN]++;
@@ -190,12 +204,21 @@ mono_wasm_jit_rendezvous_drain (void)
 	}
 }
 
+/* One emitted call handles both reasons a JIT safepoint can be taken. Publication does not request a GC
+ * suspension, so generation adoption must not be hidden behind mono_threads_state_poll's slow path. */
+void
+mono_wasm_jit_safepoint_poll (void)
+{
+	extern volatile size_t mono_polling_required;
+	extern void mono_threads_state_poll (void);
+	if (mono_polling_required)
+		mono_threads_state_poll ();
+	mono_wasm_jit_rendezvous_drain ();
+}
+
 /*
- * Republish `n` descriptors at their EXISTING e/f slots, and guarantee every worker re-instantiates before
- * it runs any more JIT code. Returns 1 on success, 0 if the rendezvous was refused.
- *
- * MUST BE CALLED GC-UNSAFE, from a thread that may safepoint. mono_stop_world asserts
- * !mono_thread_info_will_not_safepoint on the caller, and takes LOCK_GC + the suspend lock itself.
+ * Republish `n` descriptors at their EXISTING e/f slots. Every worker adopts the record independently at
+ * its next JIT safepoint or managed re-entry. Returns 1 on success, 0 if publication was refused.
  *
  * The caller is responsible for having already written the new bytes into re->bytes/re->len (or for
  * republishing the same bytes, which is what the positive control does). This function owns only the
@@ -217,21 +240,18 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		return 0;
 	}
 
-	/* Cheap pre-check only, so a full stop-the-world is not spent just to discover there is no room.
-	 * The AUTHORITATIVE read is below, after the stop -- see there for why it has to be. */
+	/* Cheap pre-check; the authoritative read is under the publication lock below. */
 	if (wj_global_epoch >= WJ_RV_LOG_MAX) {
 		wj_rv_log_full = 1;
 		mono_wasm_jit_counters [WJC_RV_LOG_FULL]++;
 		return 0;
 	}
 
-	/* CANNOT STW FROM INSIDE A DRAIN. The drain runs on a thread that has just resumed and is about to
-	 * re-enter managed code; stopping the world from there would have this thread waiting on a handshake
-	 * it is itself part of. */
+	/* Do not recursively publish while this worker is adopting a generation. */
 	if (wj_draining)
 		return 0;
 
-	/* EXPAND GROUPS, AND DO IT BEFORE THE STOP. Two things wrong with the old shape, both measured:
+	/* Expand complete groups before taking the short publication lock:
 	 *
 	 * 1. A CO-LOCATED MEMBER CANNOT BE REPUBLISHED ALONE -- admission compares a batched member against
 	 *    its BATCH's generation, not its entry's -- so the old code refused it. Since ~71% of registered
@@ -239,13 +259,10 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 	 *    refused (2026-09-17). The fix is the one R256 named: republish the whole GROUP. Every member is
 	 *    re-instantiated together, which is what instantiate_batch_local does anyway -- one module backs
 	 *    them all.
-	 * 2. THE EXPANSION AND THE EMPTINESS TEST HAVE TO HAPPEN BEFORE mono_stop_world. The old code stopped
-	 *    the world, THEN discovered nothing was publishable, then restarted -- a full global pause that
-	 *    accomplished nothing, once per flush. That is what wedged boot three times: not the rendezvous
-	 *    cost, and not a deadlock, but pauses buying literally nothing.
+	 * 2. Expansion and the emptiness test do not mutate shared state and do not belong under the lock.
 	 *
 	 * Reading re->batch unsynchronised here is sound for what it decides: a descriptor that gets batched
-	 * between this walk and the stop is simply published as a singleton, which the generation bump below
+	 * between this walk and the lock is simply published as a singleton, which the generation bump below
 	 * then corrects on the next re-frame. Getting it wrong costs an extra republish, not correctness. */
 	{
 		int cap = 0;
@@ -297,15 +314,13 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		n = nexp;
 	}
 
-	/* STOP THE WORLD. After this returns every other thread is either parked at a safepoint or was already
-	 * in a GC-safe region; neither is executing JIT code. */
-	mono_stop_world (MONO_THREAD_INFO_FLAGS_NO_GC);
-
-	/* READ THE EPOCH HERE, NOT BEFORE THE STOP. mono_stop_world takes LOCK_GC, so this is the only point
-	 * at which two concurrent rendezvous serialise against each other. Reading it before the stop let both
+	/* Serialize generation assignment and log publication. Readers remain lock-free: the epoch is stored
+	 * only after the complete log record and descriptor generations are visible. Reading it before this
+	 * short lock would let two concurrent publishers
 	 * see the same value, write the SAME log slot -- the second overwriting the first -- and both set the
 	 * epoch to it, which silently LOSES a republication. Losing one means a worker keeps calling a body it
 	 * was told to stop calling, i.e. precisely the class this mechanism exists to prevent. */
+	mono_loader_lock ();
 	epoch = wj_global_epoch;
 	if (epoch >= WJ_RV_LOG_MAX) {
 		/* REFUSE rather than wrap, for the same reason. Bounded retention is the cheap side of that trade:
@@ -313,7 +328,7 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		 * and nothing recalls them. */
 		wj_rv_log_full = 1;
 		mono_wasm_jit_counters [WJC_RV_LOG_FULL]++;
-		mono_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC);
+		mono_loader_unlock ();
 		g_free (copy);
 		return 0;
 	}
@@ -322,14 +337,8 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 	 * tests (mono_wasm_jit_admit's generation arm); the drain only makes the re-admission PROMPT and
 	 * mandatory rather than lazy.
 	 *
-	 * A CO-LOCATED MEMBER IS REFUSED, and the reason is not conservatism. For a batched entry the
-	 * generation that admission actually compares against lives on the BATCH, not the entry: batch_bind
-	 * sets re->generation = bd->generation, and admit's sibling premark tests
-	 * wj_desc_generation[sibling] != batch->generation (see the sibling loop). Bumping only re->generation
-	 * would make the member look stale while every sibling still looked current -- an incoherent state
-	 * that admit has no arm for. Republishing a co-located body means republishing the WHOLE GROUP, which
-	 * is a different operation than this one and belongs with whatever re-emits the group. Counted so the
-	 * size of the refused population is visible rather than inferred. */
+	 * Co-located members were expanded to one representative per complete group above. Their generation
+	 * lives on the batch, so publication bumps both the shared batch generation and every member entry. */
 	for (i = 0; i < n; ++i) {
 		WjRegEntry *re = (copy [i] > 0 && copy [i] <= wj_reg_n) ? wj_reg_at (copy [i] - 1) : NULL;
 		if (!re) {
@@ -358,9 +367,9 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 		++published;
 	}
 	if (!published) {
-		/* Nothing to republish after the batched members were dropped. Restart and leave the epoch
+		/* Nothing to republish after the batched members were dropped. Leave the epoch
 		 * alone -- bumping it would send every worker through a drain that has no work in it. */
-		mono_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC);
+		mono_loader_unlock ();
 		g_free (copy);
 		return 0;
 	}
@@ -371,8 +380,7 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 	wj_rv_log [epoch].desc = copy;
 	mono_memory_barrier ();              /* ... and the pointer before the epoch that indexes it */
 	wj_global_epoch = epoch + 1;
-
-	mono_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC);
+	mono_loader_unlock ();
 
 	/* The initiator owns a table too, and it is not going through a resume hook. */
 	mono_wasm_jit_rendezvous_drain ();

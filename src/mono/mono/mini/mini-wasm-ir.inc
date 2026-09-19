@@ -1173,6 +1173,7 @@ wj_ins_is_pinned_vcall_forward (MonoInst *ins)
 	default:
 		return FALSE;
 	}
+	call = (MonoCallInst *) ins;
 	/* ALWAYS FALSE IN THE SHIPPED CONFIGURATION, AND THAT IS LOAD-BEARING RATHER THAN VESTIGIAL.
 	 *
 	 * This used to read `mono_wasm_jit_vcall_inline_ic && mono_wasm_jit_vcall_shared_miss_enabled && ...`.
@@ -2684,4 +2685,5 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 		*out_st = st;
 	return TRUE;
 }
+
 

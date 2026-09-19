@@ -168,6 +168,7 @@ struct InterpMethod {
 	gint16 wasm_jit_bail;  // runtime wasm JIT: why this method permanently failed to JIT (set when slot==-1), for the weighted vcall-residual breakdown. 0=n/a; -2=EH clauses; -3=sig(arg/ret) type; -4=other; -8=gshared method; -11=island perm-leaf poison; -12=rgctx callsite; >0=the unsupported mini opcode number
 	guint8 wasm_jit_reemitted; // runtime wasm JIT (MONO_WASM_JIT_REEMIT): this method's body has already been re-emitted once with a matured profile, so its sites may no longer enqueue it. The one-shot CANNOT live on the IC site (WjVcallSite.reemit_noted): re-emission replaces the body, and the new body's IC sites are fresh -- misses 0, reemit_noted 0 -- so a per-site flag lets a method re-trigger itself forever. Bounds total re-emissions at one per method, which is what makes "how much of the population is reachable" a well-posed question.
 	guint8 wasm_jit_reemit_busy; // runtime wasm JIT (MONO_WASM_JIT_REEMIT): how many times this method's re-emission lost the wj_compiling CAS. Bounded, because the BUSY path re-enqueues and re-enqueuing does NOT consult wasm_jit_reemitted -- so without a budget a method that keeps losing the CAS spins the queue forever and the drain never goes idle. MEASURED: 82,270 busy against 1,175 compiles in one run, which kept re-emission running through the in-game window and produced an 18.8M admission-refusal storm (the R244 class) plus a `function signature mismatch` trap at higher rates.
+	guint8 wasm_jit_reemit_required; // semantic replacement/detour: preserve this method's descriptor and e/f pair and bypass the optional profile-reemission knob/cap
 	guint8 wasm_jit_blocked_noted; // runtime wasm JIT stats: this method was already counted (once) into the callee-not-jitted bail-histogram bucket — the island driver re-emits blocked methods every iteration, so publish-time distinct-method counting keeps the histogram terminal, not per-attempt
 	guint8 wasm_jit_entry_fast_ok; // runtime wasm JIT (MONO_WASM_JIT_AOT_ENTRY): this method has been admitted at least once, so later entries may try the fast path that skips the InterpFrame/LMF/maybe_compile/admit scaffolding. The fast path still verifies per-thread admission of the descriptor's current generation because automatic rebatching reuses its e/f slots.
 	const char *wasm_jit_fail; // runtime wasm JIT: the emitter's exact fail string (static literal) behind wasm_jit_bail, for the weighted vperm top-N dump (names the specific gate, e.g. "ldaddr of vtype with refs" vs just "ldaddr")
@@ -456,6 +457,11 @@ int
 mono_interp_type_size (MonoType *type, int mt, int *align_p);
 
 #if HOST_BROWSER
+
+/* Queue a same-descriptor wasm body generation. Mandatory IL replacements use this independently of the
+ * optional profile-driven re-emission knob. */
+void
+mono_wasm_jit_request_reemit (int desc_id);
 
 gboolean
 mono_jiterp_isinst (MonoObject* object, MonoClass* klass);
