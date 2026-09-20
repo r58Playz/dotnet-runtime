@@ -379,7 +379,27 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 		 * generation with the OLD import list admits against imports this generation no longer binds.
 		 * Setting it early was tried 2026-08-29 and took WASM_JIT_BATCH_ADMIT_FAIL from 0 to ~1200. */
 		/* Point the per-entry bytes at the shared module too, so anything reading re->bytes sees the
-		 * real module rather than the discarded standalone one. */
+		 * real module rather than the discarded standalone one.
+		 *
+		 * THE BARRIER IS LOAD-BEARING AND WAS MISSING (R269). Admission reads `re->batch` and, if NULL,
+		 * instantiates `re->bytes` through the SINGLE-METHOD path, which looks up exports "e"/"f". A
+		 * batched module names them "e<i>"/"f<i>", so a worker that observes the new `bytes` before the
+		 * new `batch` calls `wasmTable.set(slot, inst.exports.e)` with `undefined` and V8 throws
+		 * `Table.set(): Argument 1 is invalid for table: function-typed object must be null ... or a Wasm
+		 * function object` (wasm-js.cc:2547 -- argument 1 is the VALUE, not the index).
+		 *
+		 * MEASURED before the fix: ~23 admissions per run lost this way, on EVERY configuration tested
+		 * (pre-fix shipped, REEMIT=1, OBJGUARD, the exit gate), i.e. it long predates this round. The
+		 * export names came from a diagnostic added to the failure path: `exports=[f0,f1,e0,e1]` x140,
+		 * `[f0,f1,f2,e0,e1,e2]` x26, `[f0,f1,f2,f3,e0,e1,e2,e3]` x16 over 8 runs -- multi-member modules,
+		 * every time.
+		 *
+		 * The STORE ORDER was already right (batch first, so the intermediate state is `batch` set with
+		 * still-standalone bytes, which the reader handles); what was missing is the fence that stops the
+		 * two stores being observed out of order. Same rule as everywhere else in this registry, just
+		 * applied to the pair that needed it: publish the word that makes the group reachable, fence,
+		 * THEN publish the contents that are only valid once it is. */
+		mono_memory_barrier ();
 		re->bytes = bytes;
 		re->len = len;
 		/* Code generation is not topology-invariant: as more callees become JITted, a later batch
