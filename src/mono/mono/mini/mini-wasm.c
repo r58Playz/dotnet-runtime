@@ -665,7 +665,16 @@ mono_wasm_jit_auto_init (void)
 	 * (they insert per-store checks that only do anything when the JITted code actually RUNS). The offline
 	 * cross-compiler dump never executes JITted code, so skip their env here — otherwise auto_init would
 	 * reference browser-only globals and fail to link into mono-aot-cross. */
-	{ extern int mono_wasm_jit_storeguard; const char *sg = g_getenv ("MONO_WASM_JIT_STOREGUARD"); mono_wasm_jit_storeguard = (sg && *sg && *sg != '0') ? 1 : 0; } /* DEBUG: bounds-check every ref/addr-frame store to catch the wild store (traps at the culprit). default off */
+	{ extern int mono_wasm_jit_storeguard; const char *sg = g_getenv ("MONO_WASM_JIT_STOREGUARD"); mono_wasm_jit_storeguard = (sg && *sg && *sg != '0') ? 1 : 0; } /* DEBUG: bounds-check every ref/addr-frame STORE to catch the wild store (traps at the culprit).
+ * Emitted in mini-wasm-ir.inc, not in the emitter: check_store kind 0 in wasm_st (the ref
+ * shadow-stack store, refbase + slot*4) and kind 1 in wasm_addr_st (addrbase + off). It also
+ * disables the lazy GC frame and ref-slot elision, so every ref/addr vreg has a real slot to check.
+ *
+ * NOT the LOAD side: the ref shadow-stack load in wasm_ld and wasm_addr_ld are unguarded, and
+ * OBJGUARD's kind 4 (wasm_guard_memaddr) covers membase loads but not frame-slot loads. R269
+ * wasted time asserting this knob emitted nothing at all, from a grep of mini-wasm-emitter.inc
+ * alone -- every low-level guard lives in mini-wasm-ir.inc. Grep BOTH before describing a knob.
+ * default off */
 	{ extern int mono_wasm_jit_objguard; const char *og = g_getenv ("MONO_WASM_JIT_OBJGUARD"); mono_wasm_jit_objguard = (og && *og && *og != '0') ? 1 : 0; } /* DEBUG: before every ref-field store, validate the object BASE is a live heap object (catches missed-ref/stale-base wild stores). default off */
 #endif
 	{ extern int mono_wasm_jit_missedref; const char *mr = g_getenv ("MONO_WASM_JIT_MISSEDREF"); mono_wasm_jit_missedref = (mr && *mr && *mr != '0') ? 1 : 0; } /* DIAG: names a missed ref. For every method, log any NONREF-classified i32 vreg used as a MEMBASE load/store base or virtual-call receiver (a stale one of these is the wild-deref corruptor), with its defining opcode -> pins which wj_opcode_is_nonref case is wrong. Bounded. default off */
@@ -1370,7 +1379,16 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			return 1;
 		} catch (e) {
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
-			if (eb) stringToUTF8 ("" + e, eb, $5); /* surface the WebAssembly error to the caller */
+			/* NAME THE EXPORTS THE MODULE ACTUALLY HAS. R269 measured ~20 admissions per run failing here
+			 * with `Table.set(): Argument 1 is invalid for table: function-typed object must be null ...`,
+			 * which is V8 (wasm-js.cc:2547) saying the VALUE was not a function -- i.e. `inst.exports.e`
+			 * was `undefined`, not that the index was out of range. The single-method path looks up "e"/"f";
+			 * wasm_module_assemble names them "e<i>"/"f<i>" whenever nexport > 1. So the interesting datum
+			 * is which names the module really carries, and guessing at it from the C side is exactly the
+			 * classifier mistake this tree keeps paying for. Cheap: only on the failure path. */
+			var _ex = "";
+			try { _ex = " exports=[" + Object.keys (inst && inst.exports || {}).join (",") + "]"; } catch (e2) {}
+			if (eb) stringToUTF8 ("" + e + _ex, eb, $5); /* surface the WebAssembly error to the caller */
 			return 0;
 		}
 	}, e_slot, f_slot, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms,
@@ -2325,6 +2343,15 @@ wj_desc_state_ensure (int id)
  * see a freed pointer that still lands in range and the fault has not recurred; recording it here so the
  * next reader knows that crash mode is UNPROTECTED, not guarded. */
 
+/* Did the batch snapshot go stale between reading `re->batch` and reading `re->bytes`? See the call
+ * site: the pair must be consumed consistently, and the reader's natural order is the unsafe one. */
+static inline gboolean
+wj_batch_raced (WjRegEntry *re, WjBatchDesc *snapshot)
+{
+	mono_memory_barrier ();
+	return snapshot == NULL && re->batch != NULL;
+}
+
 int mono_wasm_jit_admit (int desc_id);
 
 /* The slot-live bitmap answers only whether some generation has occupied this table slot. Automatic
@@ -2806,9 +2833,22 @@ wj_admit_install_only (int desc_id, WjRegEntry *re)
  */
 #define WJ_INSTALL_SLACK 256
 /* The closure the current install pass touched, in stamp order. See wj_make_callable: enumerating it is
- * what lets publication happen strictly AFTER every install in the closure has completed. GROWN, NEVER
- * TRUNCATED: dropping an entry here does not shrink the walk, it hides an installed descriptor from the
- * publish pass, which is the one thing this list exists to prevent. */
+ * what lets publication happen strictly AFTER every install in the closure has completed. Never
+ * truncated WITHIN a pass -- dropping an entry does not shrink the walk, it hides an installed
+ * descriptor from the publish pass, which is the one thing this list exists to prevent -- and reset at
+ * every pass entry (wj_install_closure_root / _group).
+ *
+ * THE RESET USED TO LIVE ONLY IN wj_make_callable, WHICH SHIPS 0 (R269). That was harmless while
+ * wj_clo_list was a fixed WJ_INSTALL_MAX array whose append was guarded by `wj_clo_n < WJ_INSTALL_MAX`;
+ * R268 replaced it with an unbounded wj_clo_ensure and removed the guard, which turned a dead reset into
+ * an unbounded per-thread leak on the SHIPPED path -- appending one int per distinct descriptor per
+ * admission, on every worker, for the life of the process, and never read.
+ *
+ * It also means WJC_SW_CLOSURE_MAX was a CUMULATIVE APPEND COUNT on the shipped path, not a closure
+ * size: that is why it read 65,576 against wj_reg_n = 32,175, and why R267 addendum 12 saw it "sitting
+ * AT the cap" of 4,096 almost immediately. Any conclusion drawn from its magnitude before this fix is
+ * about how many admissions ran, not how big a closure is. The per-pass bound that actually truncates a
+ * walk is wj_inst_budget, and WJC_INSTALL_BUDGET_OUT is the counter that reports it. */
 static __thread int     *wj_clo_list;
 static __thread int      wj_clo_cap;
 static __thread int      wj_clo_n;
@@ -2926,6 +2966,19 @@ wj_install_closure (int desc_id)
 	return ok;
 }
 
+/* Did this install pass hold a coop-suspend off? The walk has no safepoint poll and is entered FROM
+ * mono_wasm_jit_safepoint_poll (via the rendezvous drain), so the thread has already satisfied its GC
+ * check for the pass before the walk starts; a suspend requested during the walk is therefore not
+ * serviced until the next back-edge. Counting the condition is far more sensitive than counting the
+ * stall it can cause -- the same argument WJC_JITMM_UNINIT is written on. */
+static void
+wj_walk_note_gc_pending (void)
+{
+	extern volatile size_t mono_polling_required;
+	if (mono_polling_required)
+		mono_wasm_jit_counters [WJC_ADMIT_WALK_GC_PENDING]++;
+}
+
 static gboolean
 wj_install_closure_root (int desc_id, WjRegEntry *re)
 {
@@ -2936,7 +2989,12 @@ wj_install_closure_root (int desc_id, WjRegEntry *re)
 		wj_inst_gen = 1;
 	}
 	wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
-	return wj_install_closure (desc_id);
+	wj_clo_n = 0;
+	{
+		gboolean r = wj_install_closure (desc_id);
+		wj_walk_note_gc_pending ();
+		return r;
+	}
 }
 
 /* Seed the walk from EVERY member of a batch, under ONE stamp generation and ONE budget.
@@ -2966,11 +3024,13 @@ wj_install_closure_group (int desc_id, WjRegEntry *re)
 		wj_inst_gen = 1;
 	}
 	wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
+	wj_clo_n = 0;
 	for (i = 0; i < ibatch->n; ++i) {
 		int m = ibatch->desc [i];
 		if (m > 0 && !wj_install_closure (m))
 			ok = FALSE;
 	}
+	wj_walk_note_gc_pending ();
 	return ok;
 }
 /* The f-slot signature is (body->param_types) -> body->ret_type, so the expected table arity IS
@@ -3202,7 +3262,8 @@ wj_make_callable (int desc_id)
 		mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod);
 #endif
 
-	wj_clo_n = 0;
+	/* wj_clo_n is reset by wj_install_closure_group / _root, next to the stamp and budget they also
+	 * reset -- the pass is the unit, and the reset belongs with the rest of the per-pass state. */
 	if (!wj_install_closure_group (desc_id, re)) {
 		/* TRANSIENT BY CONSTRUCTION: either the 512 budget ran out or an instantiate failed. State 0, so
 		 * the next dispatch retries -- and per R166 the retry is cheap because the instantiate itself is
@@ -3548,6 +3609,19 @@ wj_admit_impl (int desc_id)
 				fail_perm = TRUE;   /* a LinkError/CompileError on these bytes will not fix itself */
 				goto fail;
 			}
+		} else if (wj_batch_raced (re, batch)) {
+			/* THE SNAPSHOT WENT STALE. `batch` was read before `re->bytes`, and batch_bind publishes
+			 * `re->batch` then (now) a fence then `re->bytes` -- so a reader in THIS order can still pair
+			 * a stale NULL batch with already-batched bytes, and then instantiate a multi-export module
+			 * through the single-method path, which looks up "e"/"f" that a batched module does not have.
+			 *
+			 * Re-reading `re->batch` after the bytes closes it: if the group is visible NOW, the bytes we
+			 * were about to use may already be the shared module, so refuse and let the next dispatch
+			 * retry against a settled entry. TRANSIENT by construction -- state 0, not fail_perm -- which
+			 * is the whole difference from the failure this replaces, where ~23 admissions per run were
+			 * marked PERMANENTLY bad on bytes that were merely read at the wrong moment. */
+			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_BATCH_RACED);
+			goto fail;
 		} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len, eb, (int) sizeof (eb), &ms)) {
 			printf ("WASM_JIT_ADMIT_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
 			fail_perm = TRUE;   /* as above: bad bytes, not a transient ordering miss */
@@ -3971,6 +4045,29 @@ static inline gboolean
 wj_probe_ok (gsize a, gsize memsz)
 {
 	return !(a & 3) && a >= 1024 && a <= memsz - 8;
+}
+
+/* Is this pointer PLAUSIBLY a live runtime object? Alignment + heap range, nothing more.
+ *
+ * R151 wrote exactly this guard (`wj_method_ptr_ok`) for the "one boot in four dies in
+ * mono_interp_get_imethod on a worker" fault, never wired it into a call path, and it was later deleted
+ * with the reasoning: *"a range check cannot see a freed pointer that still lands in range and the fault
+ * has not recurred"*. The first half is still true and is stated again at every call site. **The second
+ * half expired on 2026-09-19**, when the fault recurred as a misaligned `a_cas` inside
+ * `mono_mem_manager_lock`, reached from `mono_interp_peek_imethod` <- `callee_perm_unjittable` <-
+ * `mono_wasm_emit_method`. So the guard is back, wired up this time, and honest about its reach: it
+ * converts the DETECTABLE subset of a dangling dereference into a counted refusal, and does nothing
+ * whatever about a freed pointer that still looks plausible. The real fix is to stop consulting retained
+ * raw MonoMethod* at emit time; see scratchpad/wj/p0/DANGLING-MONOMETHOD.md. */
+int mono_wasm_jit_ptr_plausible (gpointer p);
+int
+mono_wasm_jit_ptr_plausible (gpointer p)
+{
+#ifdef HOST_BROWSER
+	return wj_probe_ok ((gsize) (intptr_t) p, wj_memsz ()) ? 1 : 0;
+#else
+	return p != NULL;
+#endif
 }
 
 /* Called (when storeguard/objguard is on) right before a ref-shadow-stack (kind 0), addr-frame (kind 1),

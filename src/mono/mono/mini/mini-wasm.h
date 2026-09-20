@@ -879,12 +879,13 @@ enum {
 	 * expressed this as a refusal propagating up from the offending level; the single writer has to check
 	 * it explicitly, and NOT doing so is what regressed a clean config twice (see wj_make_callable). */
 	WJC_SW_VERIFY_FAIL,
-	/* High-water closure size seen by the install walk. It no longer has a cap to sit at -- the list
-	 * grows and the runaway guard is sized from wj_reg_n -- so this is now a plain measurement of how
-	 * large real closures get. Read it against WJC_INSTALL_BUDGET_OUT, which is the thing that must
-	 * stay 0: the two together are what says "nothing is being truncated", where a saturated constant
-	 * used to say the opposite without anyone noticing (R267 addendum 12 read it AT 4096 on the SHIPPED
-	 * path, i.e. real closures were being truncated and their admissions refused). */
+	/* High-water closure size seen by the install walk, PER PASS -- and only per pass since R269 fixed
+	 * the reset. `wj_clo_n` was reset only in wj_make_callable (MONO_WASM_JIT_SINGLE_WRITER, ships 0),
+	 * so on the shipped path this was a CUMULATIVE APPEND COUNT: it read 65,576 against a registry of
+	 * 32,175, and it reached any constant almost immediately. R267 addendum 12's "sitting AT the cap of
+	 * 4096, i.e. real closures are being truncated" was therefore read off a counter that could not
+	 * measure a closure size. The truncation question is answered by WJC_INSTALL_BUDGET_OUT alone,
+	 * which must stay 0. */
 	WJC_SW_CLOSURE_MAX,
 	/* MONO_WASM_JIT_SWEEP: TIME-OF-USE verification. Re-checks descriptors this thread has ALREADY
 	 * published (state 2, generation current) and reports any whose own slots died or whose dependency
@@ -973,6 +974,42 @@ enum {
 	 * dequeued. Read it against WJC_REEMIT_DRAINED -- when the same condition was handled by popping and
 	 * re-pushing instead, DRAINED read 2.8 MILLION against 847 real outcomes. */
 	WJC_REEMIT_BATCH_WAIT,
+	/* A closure install walk finished with a GC suspend ALREADY REQUESTED -- i.e. the walk was holding a
+	 * coop-suspend off. The walk has no safepoint poll, is reached FROM mono_wasm_jit_safepoint_poll via
+	 * the rendezvous drain (so the thread has just satisfied its GC check for that pass), and since R268
+	 * it may visit up to wj_reg_n descriptors while instantiating modules. R269 observed a void in-game
+	 * window whose two busy threads were `mono_threads_wait_pending_operations` at 99.98% and a spin in
+	 * admit/admit_dependencies/rendezvous_drain, which is what that would look like. NON-ZERO means the
+	 * mechanism is real; 0 across a faulting run exonerates it. */
+	WJC_ADMIT_WALK_GC_PENDING,
+	/* A wasm-JIT PUBLISH found no InterpMethod for the method it was about to publish into, so the
+	 * publication was skipped instead of dereferencing NULL. Two distinct conditions used to reach the
+	 * same two lines unguarded (interp.c, the compile_publish and SCC publish paths): an uninitialised
+	 * interp_code_hash aborts the process at `mono-internal-hash.c:47`, and a present-but-empty lookup
+	 * dereferences NULL and reports `memory access out of bounds` -- which are precisely the two fault
+	 * signatures R269 kept hitting. Skipping is recoverable: the publish reports BUSY, so the method
+	 * keeps its accrued hotness and re-attempts a stride later rather than being lost.
+	 *
+	 * NOT DISJOINT FROM WJC_JITMM_UNINIT -- this is the TOTAL and that one is the uninitialised-hash
+	 * SUBSET of it, so `publish_no_imethod - jitmm_uninit` is the plain-miss (tiering replaced the
+	 * InterpMethod) count. Stated explicitly because this tree has four recorded instances of a share
+	 * computed over counters nobody had checked for overlap. NON-ZERO is expected to be rare; a large
+	 * value means the publish path is routinely racing tiering.c and deserves its own round. */
+	WJC_PUBLISH_NO_IMETHOD,
+	/* A retained `MonoMethod *` failed the plausibility probe (misaligned or outside the heap) at
+	 * mono_interp_peek_imethod, so the lookup was refused instead of dereferencing it. Split by which
+	 * pointer failed: the METHOD itself, or the MonoJitMemoryManager derived from it -- the 2026-09-19
+	 * crash was the SECOND (the four derefs in jit_mm_for_method all succeeded and produced garbage,
+	 * which mono_mem_manager_lock then CASed).
+	 *
+	 * NON-ZERO IS THE HEALTHY READING once the class is live: it means a dangling dereference was caught
+	 * rather than executed. A permanent 0 means either the class is quiet or the probe is dead code --
+	 * and R151's version WAS dead code for its entire life, never spliced into a call path. */
+	WJC_DANGLING_METHOD, WJC_DANGLING_JITMM,
+	/* Admission read `re->batch` as NULL and then `re->bytes` as the SHARED module -- a stale snapshot,
+	 * refused as TRANSIENT instead of instantiating a multi-export module through the single-method path.
+	 * Before this existed the same event was ~23 PERMANENT admission failures per run. */
+	WJC_ADMIT_BATCH_RACED,
 	WJC_MAX
 };
 

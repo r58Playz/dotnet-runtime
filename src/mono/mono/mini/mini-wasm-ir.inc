@@ -819,6 +819,19 @@ static gboolean
 wasm_addr_ld (WasmBuf *b, WjCtx *c, int vreg)
 {
 	guint32 off = (guint32) c->addrslot [vreg];
+#ifdef HOST_BROWSER
+	/* STOREGUARD, LOAD SIDE -- the addr-frame counterpart of the kind-0 guard added to wasm_ld's refslot
+	 * branch. kind 1 was emitted only by wasm_addr_st, so an addr-frame READ through a bad addrbase was
+	 * unchecked. Direct emission, not wasm_guard_memaddr: that helper calls wasm_ld. */
+	if (G_UNLIKELY (c->storeguard && c->check_ti >= 0)) {
+		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->addrbase);
+		wasm_i32_const (b, (gint32) off);
+		wasm_op (b, WASM_OP_I32_ADD);
+		wasm_i32_const (b, 1);
+		wj_emit_helper_call (b, (gpointer) mono_wasm_jit_check_store, (guint32) c->check_ti);
+	}
+#endif
 	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->addrbase);
 	if (c->vt [vreg] == WASM_I32 && c->addr_ldkind && c->addr_ldkind [vreg]) {
 		/* sub-word local: read back only the live low byte(s) with the declared signedness, so a narrow
@@ -913,6 +926,25 @@ wasm_ld (WasmBuf *b, WjCtx *c, int vreg)
 			return TRUE;
 		}
 		/* reference vreg: load from the GC-scanned ref shadow stack */
+#ifdef HOST_BROWSER
+		/* STOREGUARD, LOAD SIDE. kinds 0/1 were store-only, so a frame LOAD through a bad refbase was
+		 * the one piece of emitter memory traffic no guard covered -- and after R269 excluded a wild
+		 * membase base (OBJGUARD kind 2/3), a bad membase EFFECTIVE address (kind 4, which adds the
+		 * offset), a garbage receiver (kind 5) and a misclassified ref (MISSEDREF), it is what the
+		 * surviving OOB hypothesis rests on.
+		 *
+		 * Emitted INLINE rather than through wasm_guard_memaddr on purpose: that helper calls wasm_ld
+		 * to push its base, so guarding wasm_ld with it would recurse at EMIT time. wasm_st's kind-0
+		 * guard three hundred lines below already uses this same direct shape for the same reason. */
+		if (G_UNLIKELY (c->storeguard && c->check_ti >= 0)) {
+			extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+			wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
+			wasm_i32_const (b, (gint32) (c->refslot [vreg] * 4));
+			wasm_op (b, WASM_OP_I32_ADD);
+			wasm_i32_const (b, 0);
+			wj_emit_helper_call (b, (gpointer) mono_wasm_jit_check_store, (guint32) c->check_ti);
+		}
+#endif
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
 		wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, (guint32) (c->refslot [vreg] * 4));
 		return TRUE;

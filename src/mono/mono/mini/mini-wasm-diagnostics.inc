@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 260);   /* + replacement give-ups, + the retire/reclaim census */
+g_static_assert (WJC_MAX == 265);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -235,9 +235,11 @@ mono_wasm_jit_dump_stats (void)
 	 * must account for every `return 0` on the path; if dep_not_live no longer equals cycle+pending, or
 	 * the admit0 propagation count is wildly larger than the sum of the root causes, a route has been
 	 * added without a counter again -- which is exactly how R244's regression stayed invisible. */
-	printf ("[wasm-jit admitroutes] dep_admit0=%lld bad_id=%lld no_entry=%lld permfail=%lld state3=%lld blockers_truncated=%lld\n",
+	printf ("[wasm-jit admitroutes] dep_admit0=%lld bad_id=%lld no_entry=%lld permfail=%lld state3=%lld"
+		" blockers_truncated=%lld batch_raced=%lld\n",
 		WJC_(WJC_ADMIT_DEP_ADMIT0), WJC_(WJC_ADMIT_BAD_ID), WJC_(WJC_ADMIT_NO_ENTRY),
-		WJC_(WJC_ADMIT_PERMFAIL), WJC_(WJC_ADMIT_STATE3), WJC_(WJC_BLOCKERS_TRUNCATED));
+		WJC_(WJC_ADMIT_PERMFAIL), WJC_(WJC_ADMIT_STATE3), WJC_(WJC_BLOCKERS_TRUNCATED),
+		WJC_(WJC_ADMIT_BATCH_RACED));
 	/* R245: the SCC batcher, which had ZERO counters until now -- every outcome was a verbose-only
 	 * printf, so its distribution was unobservable in a --stats run.
 	 *
@@ -273,8 +275,10 @@ mono_wasm_jit_dump_stats (void)
 	 * this change -- correct, merely slow, and the fix is MONO_ENTER_GC_UNSAFE at that caller's P/Invoke
 	 * boundary. Printed unconditionally, and counted ungated, because a clean timing run is where it
 	 * matters and --stats is off there. */
-	printf ("[wasm-jit gcstate] js_blocking_skipped=%lld (must be 0)  jitmm_uninit=%lld (must be 0 -- the interp_code_hash publish race)\n",
-		WJC_(WJC_JS_BLOCKING_SKIPPED), WJC_(WJC_JITMM_UNINIT));
+	printf ("[wasm-jit gcstate] js_blocking_skipped=%lld (must be 0)  jitmm_uninit=%lld (must be 0 -- the interp_code_hash publish race)"
+		"  publish_no_imethod=%lld  dangling: method=%lld jitmm=%lld\n",
+		WJC_(WJC_JS_BLOCKING_SKIPPED), WJC_(WJC_JITMM_UNINIT), WJC_(WJC_PUBLISH_NO_IMETHOD),
+		WJC_(WJC_DANGLING_METHOD), WJC_(WJC_DANGLING_JITMM));
 	/* drain_threads is the load-bearing one: a rendezvous that reaches only the thread that called it is
 	 * not a rendezvous. Expect drains ~= count x drain_threads. */
 	/* THE IDENTITY, WITH `capped` AS A TERM -- it was missing and the line printed a sum that did not
@@ -330,9 +334,10 @@ mono_wasm_jit_dump_stats (void)
 	 * retire_depth is the other end of the same question: reclamation is blocked while any worker is
 	 * inside the registry reader bracket, so a large depth with few reclaims means the grace period has
 	 * degenerated back into the leak it replaced. */
-	printf ("[wasm-jit bounds] closure_max=%lld install_budget_out=%lld | rv_retry ok=%lld maxn=%lld full=%lld"
+	printf ("[wasm-jit bounds] closure_max=%lld install_budget_out=%lld walk_gc_pending=%lld"
+		" | rv_retry ok=%lld maxn=%lld full=%lld"
 		" | worker_slots=%lld full=%lld | retired=%lld freed=%lld reclaims=%lld depth_max=%lld\n",
-		WJC_(WJC_SW_CLOSURE_MAX), WJC_(WJC_INSTALL_BUDGET_OUT),
+		WJC_(WJC_SW_CLOSURE_MAX), WJC_(WJC_INSTALL_BUDGET_OUT), WJC_(WJC_ADMIT_WALK_GC_PENDING),
 		WJC_(WJC_RV_RETRY_OK), WJC_(WJC_RV_RETRY_MAXN), WJC_(WJC_RV_RETRY_FULL),
 		WJC_(WJC_WORKER_SLOTS), WJC_(WJC_WORKER_SLOTS_FULL),
 		WJC_(WJC_RETIRED), WJC_(WJC_RETIRE_FREED), WJC_(WJC_RETIRE_RECLAIMS), WJC_(WJC_RETIRE_DEPTH_MAX));
@@ -556,10 +561,13 @@ mono_wasm_jit_dump_stats (void)
 		"  STATS run sizes the whole addressable population for free -- read it before spending a build.\n"
 		"  There is NO inliner in this pipeline for virtual calls:\n"
 		"  V8 cannot inline across modules (imports score 0) and mono's own gate refuses every callvirt,\n"
-		"  so `sites` is the whole population that pass would reach. READ `clauses` FIRST --\n"
-		"  mono_method_check_inlining rejects ANY method with a try/catch and Java is EH-dense, so it may\n"
-		"  be the entire story. `prof` is no_rec arriving here: 99.3%% of profile observations land AFTER\n"
-		"  the method is JITted, so a first compile usually has no record for the site at all.\n",
+		"  so `sites` is the whole population that pass would reach. THE BLOCKER IS `prof`, NOT\n"
+		"  `clauses` -- measured over 67,750 sites, 4 runs: prof 58.6%%, size 11.4%%, clauses 0.8%% (R269).\n"
+		"  This comment used to say to read `clauses` first, on the reasoning that Java is EH-dense and\n"
+		"  mono_method_check_inlining refuses any method with a clause; that reasoning is sound and the\n"
+		"  measurement still went the other way. `prof` is no_rec arriving here: 99.3%% of profile\n"
+		"  observations land AFTER the method is JITted, so a first compile usually has no record for the\n"
+		"  site at all -- which is why re-emission, not an EH change, is what would move this.\n",
 		WJC_(WJC_GI_SITE), WJC_(WJC_GI_CANDIDATE), WJC_(WJC_GI_ADMITTED), WJC_(WJC_GI_EMITTED),
 		WJC_(WJC_GI_REFUSED_PROF), WJC_(WJC_GI_REFUSED_CLAUSES), WJC_(WJC_GI_REFUSED_SIZE),
 		WJC_(WJC_GI_REFUSED_OTHER),

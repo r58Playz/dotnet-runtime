@@ -504,8 +504,50 @@ lookup_imethod (MonoMethod *method)
 InterpMethod *
 mono_interp_peek_imethod (MonoMethod *method)
 {
-	MonoJitMemoryManager *jit_mm = jit_mm_for_method (method);
+	MonoJitMemoryManager *jit_mm;
 	InterpMethod *imethod;
+
+	/* THE DANGLING-POINTER PROBE, and be clear about what it is worth.
+	 *
+	 * This predicate is asked about ARBITRARY callees on a worker inside the compile section, and the
+	 * registry / canonicalisation tables hand it raw `MonoMethod *` retained for the process lifetime
+	 * while IKVM frees dynamic types underneath. 2026-09-19 that killed a run: `callee_perm_unjittable`
+	 * -> here -> `jit_mm_for_method` -> four derefs that all "succeeded" on freed memory -> a garbage
+	 * MonoJitMemoryManager -> `mono_mem_manager_lock` -> `a_cas` on a MISALIGNED word -> wasm trap.
+	 *
+	 * So probe BOTH pointers: the method before dereferencing it, and the manager the derefs produced.
+	 * The second is the one that fired.
+	 *
+	 * IT DOES NOT FIX THE BUG. A freed pointer that still lands in range and stays aligned sails through,
+	 * exactly as R151 said when it deleted the previous version of this guard -- what expired is that
+	 * version's OTHER premise, "the fault has not recurred". This converts the detectable subset of a
+	 * dangling dereference into a counted refusal so it stops killing the process. The fix is to stop
+	 * consulting retained raw method pointers at emit time (scratchpad/wj/p0/DANGLING-MONOMETHOD.md).
+	 *
+	 * NULL is the correct conservative answer for every caller: "no imethod" means "never prepared",
+	 * which is what an unresolvable callee should look like. */
+#if HOST_BROWSER
+	/* HOST_BROWSER-ONLY, and the guard is structural rather than stylistic: the probe lives in
+	 * mini-wasm.c inside its `#ifdef HOST_BROWSER` region, and mini-wasm.c is linked into BOTH the
+	 * runtime and the offline cross-compiler while interp.c is in both too -- so an unguarded call here
+	 * leaves `mono-aot-cross` with an undefined symbol. That is the exact failure CLAUDE.md records in
+	 * the other direction for MONO_WASM_JIT_DEVIRT_PROFILE, and `csyn.sh` cannot catch it: the symbol
+	 * COMPILES in both databases, it is the cross LINK that breaks. */
+	{
+		extern int mono_wasm_jit_ptr_plausible (gpointer p);
+		if (G_UNLIKELY (!mono_wasm_jit_ptr_plausible (method))) {
+			mono_wasm_jit_counters [WJC_DANGLING_METHOD]++;
+			return NULL;
+		}
+		jit_mm = jit_mm_for_method (method);
+		if (G_UNLIKELY (!mono_wasm_jit_ptr_plausible (jit_mm))) {
+			mono_wasm_jit_counters [WJC_DANGLING_JITMM]++;
+			return NULL;
+		}
+	}
+#else
+	jit_mm = jit_mm_for_method (method);
+#endif
 
 	jit_mm_lock (jit_mm);
 	if (G_LIKELY (jit_mm->interp_code_hash.table)) {
@@ -540,6 +582,39 @@ mono_interp_peek_imethod (MonoMethod *method)
 	}
 	jit_mm_unlock (jit_mm);
 	return imethod;
+}
+
+/*
+ * THE PUBLISH PATH'S LOOKUP, GUARDED. Call with jit_mm already locked.
+ *
+ * The wasm JIT's publish sites looked the InterpMethod up and used it immediately, and neither of the
+ * two ways that can fail was handled:
+ *
+ *   - an interp_code_hash that has never been initialised ABORTS THE PROCESS inside
+ *     mono_internal_hash_table_lookup (`mono-internal-hash.c:47, table->table != NULL`);
+ *   - a lookup that legitimately MISSES returns NULL, and the callers dereferenced it, which reports
+ *     `memory access out of bounds` from a small offset off zero.
+ *
+ * Those are exactly the two fault signatures R269 measured (one abort in `world.generate`, and an OOB
+ * family), and both were reachable from two lines that had no check at all. A miss is not an invariant
+ * violation -- tiering.c can replace an InterpMethod underneath a compile -- so the right answer is to
+ * DECLINE the publication and let the next dispatch retry, which is the same recoverable contract
+ * admission already uses. The descriptor keeps its reserved slot; per CLAUDE.md's ownership rule,
+ * leaking that is preferable to freeing something another worker may hold.
+ */
+static InterpMethod *
+wj_publish_imethod_locked (MonoJitMemoryManager *jit_mm, MonoMethod *method)
+{
+	InterpMethod *im;
+	if (G_UNLIKELY (!jit_mm->interp_code_hash.table)) {
+		mono_wasm_jit_counters [WJC_JITMM_UNINIT]++;
+		mono_wasm_jit_counters [WJC_PUBLISH_NO_IMETHOD]++;
+		return NULL;
+	}
+	im = (InterpMethod *) mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, method);
+	if (G_UNLIKELY (!im))
+		mono_wasm_jit_counters [WJC_PUBLISH_NO_IMETHOD]++;
+	return im;
 }
 
 InterpMethod*
@@ -2679,7 +2754,7 @@ mono_wasm_jit_repoint_imethod_bytes (gpointer imethod_ptr, void *bytes, int len)
 		return;
 	jit_mm = jit_mm_for_method (im->method);
 	jit_mm_lock (jit_mm);
-	im = (InterpMethod *) mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, im->method);
+	im = wj_publish_imethod_locked (jit_mm, im->method);
 	if (im) {
 		im->wasm_jit_bytes = bytes;
 		im->wasm_jit_bytes_len = len;
@@ -2802,13 +2877,18 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		/* Serialize against tiering.c replacing the InterpMethod. Whichever operation wins the jit-mm lock,
 		 * the descriptor is either published to the replacement or copied by tier-up before replacement. */
 		jit_mm_lock (jit_mm);
-		im = (InterpMethod *)mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, logical_method);
-		im->wasm_jit_fslot = r.f_slot;
-		im->wasm_jit_bytes = r.bytes;
-		im->wasm_jit_bytes_len = r.bytes_len;
-		im->wasm_jit_desc = r.desc_id;
-		mono_memory_barrier ();   /* publish the immutable descriptor and compatibility fields before the slot gate */
-		im->wasm_jit_slot = r.e_slot;
+		im = wj_publish_imethod_locked (jit_mm, logical_method);
+		/* Skip only the STORES here; the block's normal cleanup (waiter drain, compile-lock release,
+		 * the re-emit drain) still runs, and the RETURN at the bottom reports the decline -- see the
+		 * note there for why it must not be JITTED. */
+		if (im) {
+			im->wasm_jit_fslot = r.f_slot;
+			im->wasm_jit_bytes = r.bytes;
+			im->wasm_jit_bytes_len = r.bytes_len;
+			im->wasm_jit_desc = r.desc_id;
+			mono_memory_barrier ();   /* publish the immutable descriptor and compatibility fields before the slot gate */
+			im->wasm_jit_slot = r.e_slot;
+		}
 		jit_mm_unlock (jit_mm);
 		/* MONO_WASM_JIT_HEAL_WAIT registered this method as a waiter on each of r.heal_callees[], so the
 		 * callee's own publish would wake it for RE-EMISSION and the new body would replace the
@@ -2841,13 +2921,27 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		 * the standalone module it already has. That ordering is the whole difference from every batching
 		 * arm measured here, all of which DEFERRED publication until the group was built and paid +36% on
 		 * boot for it. */
-		if (!reemit)
+		if (!reemit && im)
 			mono_wasm_jit_colocate_deps_now (r.desc_id);
 		/* The compiler owner services one queued follow-up after releasing ownership. The drain's own
 		 * re-entrancy guard makes this a no-op when compile_publish was itself called by the broker. */
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		wj_reemit_drain_one ();
-		return WASM_JIT_COMPILE_JITTED;
+		/* A DECLINED PUBLICATION MUST NOT REPORT JITTED, OR THE METHOD IS LOST.
+		 *
+		 * The hotness gate is `mono_atomic_inc_i32 (&hits) == mono_wasm_jit_thresh` -- EQUALITY, so the
+		 * automatic attempt fires exactly once in a method's life. Every non-JITTED outcome resets the
+		 * counter precisely so a retry can happen (BLOCKED -> 0, BUSY -> thresh-64); the JITTED branch
+		 * resets nothing and returns, because it has no reason to. Reporting JITTED here would therefore
+		 * leave a method with no e-slot AND no path back to the gate: interpreted forever, silently, with
+		 * every counter reading healthy.
+		 *
+		 * BUSY is the honest status. Its documented meaning -- transient, another thread's activity got in
+		 * the way, back off a small stride rather than discard the accrued hotness -- is exactly this
+		 * case: tiering.c replaced the InterpMethod underneath the compile. It is bounded (the stride
+		 * makes it one retry per ~64 calls, not per call) and it is counted, so a condition that never
+		 * clears shows up as a rising WJC_PUBLISH_NO_IMETHOD instead of a silent spin. */
+		return im ? WASM_JIT_COMPILE_JITTED : WASM_JIT_COMPILE_BUSY;
 	}
 	mono_atomic_store_i32 (&wj_compiling, 0);
 	if (r.retriable) {
@@ -3548,7 +3642,11 @@ out:
 			extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
 			mono_wasm_jit_bind_logical (results [i].desc_id, members [i]);
 			jit_mm_lock (jit_mm);
-			im = (InterpMethod *)mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, members [i]);
+			im = wj_publish_imethod_locked (jit_mm, members [i]);
+			if (!im) {
+				/* Declined, not fatal -- see wj_publish_imethod_locked. */
+				jit_mm_unlock (jit_mm); continue;
+			}
 			if (im->wasm_jit_fslot > 0) {
 				/* Raced to live elsewhere, so this batch's reservation went unused. PARK it rather than drop
 				 * it (see the abort path): the allocator cannot take a slot back. */
