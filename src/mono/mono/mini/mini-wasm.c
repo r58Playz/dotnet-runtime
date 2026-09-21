@@ -107,6 +107,7 @@ void mono_wasm_jit_safepoint_poll (void);
  * The default-on decision is expressed at the getenv site instead, which is where every other default
  * lives anyway. */
 int mono_wasm_jit_auto = -1;
+int mono_wasm_jit_badmeth = 1;   /* MONO_WASM_JIT_BADMETH: the dead-retained-MonoMethod guard; see mono_wasm_jit_method_usable */
 int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
 /* auto-JIT hotness threshold. 2000 was the pre-Minecraft value; 500 is what the product runs. R204 cut `no_fslot` 69%% by moving it, and that is worth NOTHING on the plateau -- it is a boot/worldgen effect, because 99.3%% of profile observations arrive AFTER a method is JITted. Right for boot, not a frame-rate lever. */
 /* MONO_WASM_JIT_OVER_AOT is deleted. It let the runtime wasm method-JIT compete with an
@@ -605,6 +606,11 @@ mono_wasm_jit_auto_init (void)
 	 * dispatch etc. — kept >=3 so a stats/bail run at verbose<=2 is never flooded by per-invocation logs). The 23k-line log
 	 * came from these firing whenever stats was on; the aggregated bail histogram replaces them at level 0. */
 	{ extern int mono_wasm_jit_verbose; const char *vb = g_getenv ("MONO_WASM_JIT_VERBOSE"); mono_wasm_jit_verbose = (vb && *vb) ? atoi (vb) : 0; }
+	/* The dead-retained-MonoMethod guard. DEFAULT ON: it converts a process abort into a counted refusal
+	 * and every catch is attributed to its retainer. Gated only so a regression in the guard itself can be
+	 * isolated in ONE binary -- the first version rejected live wrappers and dynamic methods and stalled
+	 * boot 3/3, and finding that cost a full rebuild because there was no arm to turn it off. */
+	{ const char *bm = g_getenv ("MONO_WASM_JIT_BADMETH"); mono_wasm_jit_badmeth = (bm && *bm) ? atoi (bm) : 1; }
 	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm) ? ((*nm != '0') ? 1 : 0) : mono_wasm_jit_names; }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
@@ -731,6 +737,29 @@ int mono_wasm_jit_names = 1;
  * the source of R199's intermittent `memory access out of bounds` (mono_method_get_full_name walking a
  * signature lazily, on a worker, inside the compile section), so `names=0` is the bisect arm for that
  * fault. The name is now cached at EMIT time, which is the fix; the knob is the fallback. */
+
+/*
+ * A header whose EH clause table does not name offsets in its own body. Called from
+ * mark_bb_in_region (method-to-ir.c), which used to g_assert here and take the whole process down.
+ *
+ * The name is printed ONLY under MONO_WASM_JIT_VERBOSE, and that gate is not politeness: this runs on
+ * a WORKER inside the compile section, and mono_method_get_full_name walking a signature lazily right
+ * there is the source of R199's intermittent `memory access out of bounds` -- the same reason
+ * MONO_WASM_JIT_NAMES still has a knob. The COUNTER is always bumped, so a silent run still reports
+ * the catch; only the attribution costs the risky call, and only when it is asked for.
+ */
+void
+mono_wasm_jit_note_bad_eh_clause (MonoMethod *method, guint32 off, guint32 code_size)
+{
+	mono_wasm_jit_count (WJC_BAD_EH_CLAUSE);
+
+	if (mono_wasm_jit_verbose > 0) {
+		char *name = method ? mono_method_get_full_name (method) : NULL;
+		g_print ("[wasm-jit] WASM_JIT_BAD_EH_CLAUSE: clause offset %u outside/unclaimed in %u-byte body of %s -- declining\n",
+			 off, code_size, name ? name : "<unknown>");
+		g_free (name);
+	}
+}
 /* The helper-import cap is now WJ_MAX_HELPER_IMPORTS-bounded and fixed at 192.
  *
  * MONO_WASM_JIT_MAX_HIMP is deleted as NON-BINDING, and the way that was established is the useful
@@ -4068,6 +4097,70 @@ mono_wasm_jit_ptr_plausible (gpointer p)
 #else
 	return p != NULL;
 #endif
+}
+
+/*
+ * Is this RETAINED MonoMethod* still usable, and if not, WHICH retainer produced it?
+ *
+ * The fault this catches is `loader.c:1826` -- `mono_metadata_token_table (m->token) == MONO_TABLE_METHOD'
+ * -- and the `mono_signature_to_name` -> `g_string_append` -> `dlrealloc` OOB three seconds behind it
+ * (R273). Both are a dead method reaching code that formats or resolves it, and by then the stack names
+ * mono internals rather than whoever handed the pointer over. `site` is the whole point: the registry,
+ * the call profile and the synchronized-wrapper canon table all retain for the process lifetime, so only
+ * a per-site count says which one to fix.
+ *
+ * WHY THIS IS SAFE TO CALL ON A DEAD POINTER, which is the only interesting question here:
+ *   - the range probe runs FIRST and short-circuits, so a wild pointer is never dereferenced at all;
+ *   - a FREED-but-in-range pointer IS dereferenced, and that is survivable -- the allocation is still
+ *     mapped, so `m->token` reads garbage rather than trapping. Reading one word of garbage is exactly
+ *     what lets us reject it before mono walks it into a metadata table with that garbage as an index.
+ * That asymmetry is why a range check alone was never enough (CLAUDE.md: "a freed pointer still lands in
+ * range") and why a range check plus ONE cheap structural test is.
+ *
+ * It does NOT make a retained pointer safe. Address reuse defeats it: a freed method whose storage now
+ * holds a live method passes both tests. This converts the DETECTABLE majority into a counted refusal and
+ * localises the retainer; the fix is still to stop retaining (DANGLING-MONOMETHOD.md, option 2).
+ */
+int mono_wasm_jit_method_usable (MonoMethod *m, int site);
+int
+mono_wasm_jit_method_usable (MonoMethod *m, int site)
+{
+	if (!mono_wasm_jit_badmeth)
+		return 1;
+
+	mono_wasm_jit_count (WJC_BADMETH_SEEN);
+
+	if (G_UNLIKELY (!mono_wasm_jit_ptr_plausible (m)))
+		goto dead;
+
+	/* MIRROR loader.c's OWN PRECONDITIONS, or this rejects live methods.
+	 *
+	 * `mono_method_signature_checked_slow` reaches the token assert only AFTER returning early for a
+	 * cached `signature` and for `is_inflated` (loader.c:1800-1811). A wrapper, a dynamic method or an
+	 * inflated generic legitimately carries a token that is not a METHOD token, and testing them all
+	 * unconditionally is wrong: it made `peek_imethod` answer NULL for every such method, and IKVM emits
+	 * them constantly. Measured: boot stalled 3/3 at ~6 s, and it survived an `IKVM_LAZY_RECOMPILE=0`
+	 * arm, which is what proved the fault was here and not in the IKVM rewrite deployed alongside it.
+	 *
+	 * So the token test applies to exactly the population the assert applies to, and nothing else. */
+	if (m->signature || m->is_inflated || m->wrapper_type != MONO_WRAPPER_NONE)
+		return 1;
+	if (G_UNLIKELY (mono_metadata_token_table (m->token) != MONO_TABLE_METHOD))
+		goto dead;
+	return 1;
+
+dead:
+	switch (site) {
+	case WJ_BADMETH_SITE_PEEK:     mono_wasm_jit_count (WJC_BADMETH_PEEK); break;
+	case WJ_BADMETH_SITE_REGISTRY: mono_wasm_jit_count (WJC_BADMETH_REGISTRY); break;
+	case WJ_BADMETH_SITE_PROFILE:  mono_wasm_jit_count (WJC_BADMETH_PROFILE); break;
+	case WJ_BADMETH_SITE_CANON:    mono_wasm_jit_count (WJC_BADMETH_CANON); break;
+	default: break;
+	}
+	if (mono_wasm_jit_verbose)
+		printf ("[wasm-jit badmeth] site=%d m=%p token=%x -- refused a dead retained MonoMethod\n",
+			site, (void *) m, mono_wasm_jit_ptr_plausible (m) ? m->token : 0);
+	return 0;
 }
 
 /* Called (when storeguard/objguard is on) right before a ref-shadow-stack (kind 0), addr-frame (kind 1),

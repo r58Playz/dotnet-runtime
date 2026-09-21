@@ -535,7 +535,11 @@ mono_interp_peek_imethod (MonoMethod *method)
 	 * COMPILES in both databases, it is the cross LINK that breaks. */
 	{
 		extern int mono_wasm_jit_ptr_plausible (gpointer p);
-		if (G_UNLIKELY (!mono_wasm_jit_ptr_plausible (method))) {
+		extern int mono_wasm_jit_method_usable (MonoMethod *m, int site);
+		/* Range probe ALONE was never enough -- a freed pointer still lands in range. This adds the
+		 * exact predicate loader.c:1826 asserts, evaluated here where returning NULL is correct
+		 * ("no imethod" == "never prepared") instead of aborting inside metadata. */
+		if (G_UNLIKELY (!mono_wasm_jit_method_usable (method, WJ_BADMETH_SITE_PEEK))) {
 			mono_wasm_jit_counters [WJC_DANGLING_METHOD]++;
 			return NULL;
 		}

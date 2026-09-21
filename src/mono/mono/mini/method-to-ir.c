@@ -796,13 +796,42 @@ mono_link_bblock (MonoCompile *cfg, MonoBasicBlock *from, MonoBasicBlock* to)
 static void
 mono_create_spvar_for_region (MonoCompile *cfg, int region);
 
-static void
+#ifdef TARGET_WASM
+/* Counted, not silent: a guard that catches a race must count its catches (mini-wasm.h). */
+void mono_wasm_jit_note_bad_eh_clause (MonoMethod *method, guint32 off, guint32 code_size);
+#endif
+
+static gboolean
 mark_bb_in_region (MonoCompile *cfg, guint region, uint32_t start, uint32_t end)
 {
-	MonoBasicBlock *bb = cfg->cil_offset_to_bb [start];
+	MonoBasicBlock *bb;
 
-	//start must exist in cil_offset_to_bb as those are il offsets used by EH which should have GET_BBLOCK early.
-	g_assert (bb);
+	/* start must exist in cil_offset_to_bb as those are il offsets used by EH which should have
+	 * GET_BBLOCK early -- so if it does not, the header's CLAUSE TABLE DOES NOT DESCRIBE THIS BODY.
+	 *
+	 * That is malformed metadata rather than a JIT bug, and on this runtime it can arrive at any
+	 * time: mono_interp_replace_method_body (interp/tiering.c) swaps a whole MonoMethodHeader --
+	 * code, locals AND clauses -- into a live wrapper for IKVM's generation-2 relink, so a bad clause
+	 * table reaches us as a compile request rather than at load time. This used to be a g_assert, and
+	 * an assert here kills the PROCESS over one method: declining costs that method its tier and
+	 * nothing else, since the interpreter already ran the same body to get it hot.
+	 *
+	 * Bounds first, and against cil_offset_to_bb_len rather than code_size: an out-of-range clause
+	 * offset made the ORIGINAL line read past the end of the array before the assert could fire, so
+	 * the abort was already the good case.
+	 *
+	 * THIS IS NOW A BACKSTOP, NOT THE FIX. The cause actually observed (R280) was a DEAD clause, and
+	 * compute_bb_regions below now skips those -- so reaching here means a clause table that is live
+	 * and still wrong, which is the header-swap case and nothing else. Keeping the check costs one
+	 * predictable branch per clause and is what makes the counter mean something: if
+	 * WJC_BAD_EH_CLAUSE is non-zero on a run, the dead-clause explanation does NOT cover it. */
+	if (G_UNLIKELY (start >= (uint32_t) cfg->cil_offset_to_bb_len) ||
+	    G_UNLIKELY (!(bb = cfg->cil_offset_to_bb [start]))) {
+#ifdef TARGET_WASM
+		mono_wasm_jit_note_bad_eh_clause (cfg->method, start, (guint32) cfg->cil_offset_to_bb_len);
+#endif
+		return FALSE;
+	}
 
 	if (cfg->verbose_level > 1)
 		g_print ("FIRST BB for %d is BB_%d\n", start, bb->block_num);
@@ -826,6 +855,8 @@ mark_bb_in_region (MonoCompile *cfg, guint region, uint32_t start, uint32_t end)
 
 	if (cfg->spvars)
 		mono_create_spvar_for_region (cfg, region);
+
+	return TRUE;
 }
 
 static void
@@ -836,11 +867,30 @@ compute_bb_regions (MonoCompile *cfg)
 	for (MonoBasicBlock *bb = cfg->bb_entry; bb; bb = bb->next_bb)
 		bb->region = -1;
 
+	/* Any clause whose offsets do not land on a basic block means the table does not describe this
+	 * body -- see mark_bb_in_region. Fail the COMPILE (invalid program), which mono_method_to_ir
+	 * turns into a -1 return at `cleanup:` and mini_method_compile hands back as a failed cfg; the
+	 * wasm JIT then bails this one method and the interpreter keeps running it. */
 	for (guint i = 0; i < header->num_clauses; ++i) {
 		MonoExceptionClause *clause = &header->clauses [i];
+		gboolean ok = TRUE;
+
+		/* A DEAD CLAUSE HAS NO BASIC BLOCKS LEFT TO MARK, and asking for them is the actual cause of
+		 * the abort described above. method_make_alwaysthrow_typeloadfailure (this file) handles a
+		 * method that references a type which failed to load by REMOVING every basic block the body
+		 * produced, emitting one that throws, and setting clause_is_dead for all clauses -- and it
+		 * runs DURING mono_method_to_ir, before this. The clause offsets then name blocks that no
+		 * longer exist.
+		 *
+		 * Every other consumer of clause_is_dead already guards on it (mini.c:2386, :2535, :3960,
+		 * mini-llvm.c:13480); this loop was the one that did not, so the always-throw path asserted
+		 * instead of compiling. It goes first on IKVM's workload because an unloadable type IS a
+		 * type-load failure, so this fires on ordinary managed code rather than on corrupt input. */
+		if (cfg->clause_is_dead && cfg->clause_is_dead [i])
+			continue;
 
 		if (clause->flags == MONO_EXCEPTION_CLAUSE_FILTER)
-			mark_bb_in_region (cfg, ((i + 1) << 8) | MONO_REGION_FILTER | clause->flags, clause->data.filter_offset, clause->handler_offset);
+			ok &= mark_bb_in_region (cfg, ((i + 1) << 8) | MONO_REGION_FILTER | clause->flags, clause->data.filter_offset, clause->handler_offset);
 
 		guint handler_region;
 		if (clause->flags == MONO_EXCEPTION_CLAUSE_FINALLY)
@@ -850,8 +900,14 @@ compute_bb_regions (MonoCompile *cfg)
 		else
 			handler_region = ((i + 1) << 8) | MONO_REGION_CATCH | clause->flags;
 
-		mark_bb_in_region (cfg, handler_region, clause->handler_offset, clause->handler_offset + clause->handler_len);
-		mark_bb_in_region (cfg, ((i + 1) << 8) | clause->flags, clause->try_offset, clause->try_offset + clause->try_len);
+		ok &= mark_bb_in_region (cfg, handler_region, clause->handler_offset, clause->handler_offset + clause->handler_len);
+		ok &= mark_bb_in_region (cfg, ((i + 1) << 8) | clause->flags, clause->try_offset, clause->try_offset + clause->try_len);
+
+		if (G_UNLIKELY (!ok)) {
+			mono_cfg_set_exception_invalid_program (cfg, g_strdup_printf ("EH clause %u does not describe this body (try %u+%u, handler %u+%u, code %d bytes) -- WASM_JIT_BAD_EH_CLAUSE",
+				i, clause->try_offset, clause->try_len, clause->handler_offset, clause->handler_len, cfg->cil_offset_to_bb_len));
+			return;
+		}
 	}
 
 	if (cfg->verbose_level > 2) {

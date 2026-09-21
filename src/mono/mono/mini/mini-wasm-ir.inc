@@ -1105,6 +1105,12 @@ wj_canonical_callee (MonoMethod *m)
 	canon = (MonoMethod *) g_hash_table_lookup (wj_sync_inner_canon, wrapped);
 	if (!canon) { canon = m; g_hash_table_insert (wj_sync_inner_canon, wrapped, m); }
 	mono_loader_unlock ();
+	/* This table NEVER removes an entry and its values were captured on some earlier compile, so it is
+	 * the largest retention window in the backend (DANGLING-MONOMETHOD.md ranks it first). Validate the
+	 * value at the point of USE and fall back to the caller's own method, which is live by construction
+	 * -- losing canonicalisation costs f-slot stability, not correctness. */
+	if (canon != m && G_UNLIKELY (!mono_wasm_jit_method_usable (canon, WJ_BADMETH_SITE_CANON)))
+		return m;
 	return canon;
 }
 
