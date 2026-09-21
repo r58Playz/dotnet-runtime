@@ -1010,7 +1010,35 @@ enum {
 	 * refused as TRANSIENT instead of instantiating a multi-export module through the single-method path.
 	 * Before this existed the same event was ~23 PERMANENT admission failures per run. */
 	WJC_ADMIT_BATCH_RACED,
+	/* A retained raw MonoMethod* that is no longer usable, CAUGHT AT THE POINT OF USE and attributed to
+	 * the retainer that produced it. Split by site because "it happened" is not root cause: the registry,
+	 * the call profile and the synchronized-wrapper canon table all retain for the process lifetime, and
+	 * only a per-site count says which one hands out the dead pointer. See R273 / DANGLING-MONOMETHOD.md.
+	 * NON-ZERO IS THE HEALTHY READING once the fault exists -- each catch is a `loader.c:1826` assert or an
+	 * OOB in mono_signature_to_name that did NOT happen. All zero means either the fault is absent or the
+	 * guards are not on the path, and `badmeth_seen` distinguishes those. */
+	WJC_BADMETH_SEEN,        /* validations performed -- a zero here means the guards never ran */
+	WJC_BADMETH_PEEK,        /* mono_interp_peek_imethod */
+	WJC_BADMETH_REGISTRY,    /* WjRegEntry body/logical method */
+	WJC_BADMETH_PROFILE,     /* WjProfSite id_targets[] */
+	WJC_BADMETH_CANON,       /* wj_sync_inner_canon value */
+
+	/* A header whose EH clause table does not describe its own body. Reached only through
+	 * mono_interp_replace_method_body's whole-header swap (IKVM generation 2), which is why it is a
+	 * wasm-JIT counter and not a mono one. Non-zero means the guard in mark_bb_in_region caught a
+	 * malformed body that USED TO ABORT THE PROCESS -- so non-zero is the healthy reading only in the
+	 * sense that the run survived; the body itself is still a bug in whoever emitted it. */
+	WJC_BAD_EH_CLAUSE,
 	WJC_MAX
+};
+
+/* Retainer identities for mono_wasm_jit_method_usable(). Kept beside the WJC_BADMETH_* counters they
+ * select so a new site cannot be added without a counter to attribute it to. */
+enum {
+	WJ_BADMETH_SITE_PEEK = 0,
+	WJ_BADMETH_SITE_REGISTRY,
+	WJ_BADMETH_SITE_PROFILE,
+	WJ_BADMETH_SITE_CANON,
 };
 
 extern int mono_wasm_jit_stats;                     /* master gate: MONO_WASM_JIT_STATS=1 */

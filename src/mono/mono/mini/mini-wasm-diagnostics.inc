@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 265);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe */
+g_static_assert (WJC_MAX == 271);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -279,6 +279,22 @@ mono_wasm_jit_dump_stats (void)
 		"  publish_no_imethod=%lld  dangling: method=%lld jitmm=%lld\n",
 		WJC_(WJC_JS_BLOCKING_SKIPPED), WJC_(WJC_JITMM_UNINIT), WJC_(WJC_PUBLISH_NO_IMETHOD),
 		WJC_(WJC_DANGLING_METHOD), WJC_(WJC_DANGLING_JITMM));
+	/* THE DEAD-METHOD CATCH, ATTRIBUTED. `seen` is the denominator and the liveness check on the guards
+	 * themselves: seen=0 means they never ran and every zero below is meaningless. A NON-ZERO catch is
+	 * the healthy reading -- each one is a `loader.c:1826` assert or a mono_signature_to_name OOB that
+	 * did not happen -- and WHICH site is non-zero is the root cause, because the fix differs per
+	 * retainer (R273, DANGLING-MONOMETHOD.md). */
+	printf ("[wasm-jit badmeth] seen=%lld (0 => guards never ran)  caught: peek=%lld registry=%lld profile=%lld canon=%lld\n",
+		WJC_(WJC_BADMETH_SEEN), WJC_(WJC_BADMETH_PEEK), WJC_(WJC_BADMETH_REGISTRY),
+		WJC_(WJC_BADMETH_PROFILE), WJC_(WJC_BADMETH_CANON));
+	/* Separate line, separate mechanism: badmeth is a DEAD POINTER, this is a LIVE method whose clause
+	 * table is inconsistent with its own body. Non-zero means mark_bb_in_region declined a method that
+	 * would previously have aborted the process -- run with MONO_WASM_JIT_VERBOSE=1 to get the name. */
+	/* WJ_DEADCLAUSE_SKIP is the DEPLOY MARKER for the build that added compute_bb_regions' dead-clause
+	 * guard. It has to be distinct from WASM_JIT_BAD_EH_CLAUSE: that string already shipped in the
+	 * decline-only build whose zip was staged, so grepping for it would pass against either. */
+	printf ("[wasm-jit badeh] WJ_DEADCLAUSE_SKIP bad_offsets=%lld (LIVE clause naming a missing bblock; counts OFFSETS not methods -- up to 3 per clause; verbose=1 names them)\n",
+		WJC_(WJC_BAD_EH_CLAUSE));
 	/* drain_threads is the load-bearing one: a rendezvous that reaches only the thread that called it is
 	 * not a rendezvous. Expect drains ~= count x drain_threads. */
 	/* THE IDENTITY, WITH `capped` AS A TERM -- it was missing and the line printed a sum that did not
