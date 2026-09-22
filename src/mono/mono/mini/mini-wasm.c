@@ -108,6 +108,8 @@ void mono_wasm_jit_safepoint_poll (void);
  * lives anyway. */
 int mono_wasm_jit_auto = -1;
 int mono_wasm_jit_badmeth = 1;   /* MONO_WASM_JIT_BADMETH: the dead-retained-MonoMethod guard; see mono_wasm_jit_method_usable */
+/* Forward: defined far below, but the registry's two diagnostic name walks need it long before that. */
+int mono_wasm_jit_method_usable (MonoMethod *m, int site);
 int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
 /* auto-JIT hotness threshold. 2000 was the pre-Minecraft value; 500 is what the product runs. R204 cut `no_fslot` 69%% by moving it, and that is worth NOTHING on the plateau -- it is a boot/worldgen effect, because 99.3%% of profile observations arrive AFTER a method is JITted. Right for boot, not a frame-rate lever. */
 /* MONO_WASM_JIT_OVER_AOT is deleted. It let the runtime wasm method-JIT compete with an
@@ -1736,11 +1738,65 @@ static WjRetiredPayload *wj_retired_payloads;
 static gint32 wj_retired_depth;               /* under wj_retired_lock */
 static __thread int wj_reg_read_depth;
 
+/*
+ * THE YIELD IN THIS LOOP DID NOTHING. mono_thread_info_yield() -> mono_threads_platform_yield(), which on
+ * wasm is `{ return TRUE; }` (mono-threads-wasm.c:169-172). So what read as "spin politely" was a bare,
+ * unbounded, uncounted CAS hammer on one shared word, from every worker that reaches the reader bracket.
+ *
+ * THREE CHANGES, and only the first is a performance fix:
+ *
+ * 1. TEST-AND-TEST-AND-SET. The old loop issued a WRITE (cmpxchg) on every attempt, so N spinners
+ *    ping-ponged the cache line N ways and each acquisition was slower the more threads wanted it.
+ *    Spinning on a plain LOAD keeps the line shared until it actually looks free. This is the standard
+ *    fix and it needs no new primitive, which matters here: the obvious ones are all unsafe. Anything
+ *    that blocks properly -- mono_thread_info_sleep(ms>0) -- does MONO_ENTER_GC_SAFE, and *leaving* a
+ *    GC-safe region is itself one of the rendezvous-drain call sites (mono-threads-coop.c:435), so
+ *    sleeping here would re-enter the drain from inside a lock the drain can want.
+ *
+ * 2. IT IS COUNTED. See WJC_RETIRE_SPIN_MAX. The count is the entire reason to touch this at all: a
+ *    hung run can now say whether this lock is where its cores went, and R275's hang could not.
+ *
+ * 3. IT IS BOUNDED -- as a DIAGNOSTIC, not as an escape. Past the bound it keeps spinning, because there
+ *    is nothing safe to do instead and the critical sections here hold no lock, allocate nothing and
+ *    reach no safepoint, so a holder always makes progress. Exceeding the bound therefore means an
+ *    invariant is broken rather than that the lock is busy, and the counter is how that becomes visible
+ *    instead of presenting as a frozen tier.
+ */
+#define WJ_RETIRED_SPIN_NOISY 10000
+
 static void
 wj_retired_enter (void)
 {
-	while (mono_atomic_cas_i32 (&wj_retired_lock, 1, 0) != 0)
-		mono_thread_info_yield ();
+	gint64 n = 0;
+	for (;;) {
+		/* Read first; only attempt the write when it looks free. */
+		if (mono_atomic_load_i32 (&wj_retired_lock) == 0 &&
+		    mono_atomic_cas_i32 (&wj_retired_lock, 1, 0) == 0)
+			break;
+		++n;
+	}
+	if (n) {
+		mono_wasm_jit_counters [WJC_RETIRE_SPINS] += n;
+		if (n > mono_wasm_jit_counters [WJC_RETIRE_SPIN_MAX])
+			mono_wasm_jit_counters [WJC_RETIRE_SPIN_MAX] = n;
+	}
+}
+
+/*
+ * Opportunistic acquisition, for a caller that has something better to do than wait. RECLAMATION IS
+ * ALWAYS OPTIONAL: if another thread holds this lock it is either retiring (and will reclaim on its way
+ * out) or already reclaiming, so failing here loses nothing but a few bytes held a little longer -- and
+ * this tree's rule is to prefer leaking to freeing. Keeping the reader-exit path off the spin entirely is
+ * worth far more than the reclaim, because that path runs at dispatch rate on every worker.
+ */
+static gboolean
+wj_retired_tryenter (void)
+{
+	if (mono_atomic_load_i32 (&wj_retired_lock) == 0 &&
+	    mono_atomic_cas_i32 (&wj_retired_lock, 1, 0) == 0)
+		return TRUE;
+	mono_wasm_jit_counters [WJC_RETIRE_TRYLOCK_MISS]++;
+	return FALSE;
 }
 
 static void
@@ -1786,7 +1842,11 @@ wj_reclaim_retired (void)
 		return;
 	if (mono_atomic_load_i32 (&wj_reg_readers) != 0)
 		return;
-	wj_retired_enter ();
+	/* TRY, do not spin. This is reached from wj_reg_read_leave, i.e. from the exit of every
+	 * mono_wasm_jit_admit, on every worker, at dispatch rate -- the last place that should contain an
+	 * unbounded busy wait. A miss just defers the free to the next retire or the next reader exit. */
+	if (!wj_retired_tryenter ())
+		return;
 	if (mono_atomic_load_i32 (&wj_reg_readers) != 0) {
 		wj_retired_leave ();
 		return;
@@ -2242,7 +2302,8 @@ mono_wasm_jit_census_note_entry (int eslot)
  * So this reads process state that exists regardless of stats: the auto/threshold config and the
  * registry high-water mark. It is O(1), allocation-free and safe to call from JS before every timed
  * run. Field: 0 = auto, 1 = threshold, 2 = registered methods (wj_reg_n), 3 = function-table
- * exhaustion events (see wj_table_exhausted), 4 = JIT_CALL table entries remaining (browser only).
+ * exhaustion events (see wj_table_exhausted), 4 = JIT_CALL table entries remaining (browser only),
+ * 14-17 = the hang probe (see the note at those cases).
  */
 EMSCRIPTEN_KEEPALIVE int
 mono_wasm_jit_liveness (int field)
@@ -2289,6 +2350,28 @@ mono_wasm_jit_liveness (int field)
 	case 10: return wj_census_inst_admit;                   /* of which: via mono_wasm_jit_admit */
 	/* 11, 12: retired (instantiate_fslot / sync_thread — both were dead code). */
 	case 13: return wj_census_inst_us_total / 1000;         /* ms spent instantiating, all threads */
+
+	/*
+	 * THE HANG PROBE, 14-17. Readable with MONO_WASM_JIT_STATS=0 and without --dumps, which is the whole
+	 * point: a wedged run's main thread never returns from Runtime.evaluate, so globalThis.dumpWasmJit()
+	 * times out and the counters that would explain the hang are exactly the ones that cannot be read.
+	 * R269 lost its one opportunity to read a hanging run that way and the round lost its answer.
+	 *
+	 * These four are plain loads of counters that are bumped UNGATED (the publish/retire family uses
+	 * `mono_wasm_jit_counters[X]++` directly, not the stats-gated helper), so a clean timing run carries
+	 * them too and they cost nothing to consult.
+	 *
+	 *   14 pub_reraise_max   a safepoint condition that never clears: the drain then runs at every loop
+	 *                        back-edge on that worker, which is what a frozen tier with a busy core is.
+	 *   15 rv_retry_dropped  carry-list entries given up on. NON-ZERO IS HEALTHY -- it counts the workers
+	 *                        that did not get pinned.
+	 *   16 worker_slots_full workers that got the permanently-set action word (past WJ_WORKER_MAX).
+	 *   17 retire_spin_max   worst single acquisition of the retired-payload lock.
+	 */
+	case 14: return (int) mono_wasm_jit_counters [WJC_ACT_PUB_RERAISE_MAX];
+	case 15: return (int) mono_wasm_jit_counters [WJC_RV_RETRY_DROPPED];
+	case 16: return (int) mono_wasm_jit_counters [WJC_WORKER_SLOTS_FULL];
+	case 17: return (int) mono_wasm_jit_counters [WJC_RETIRE_SPIN_MAX];
 	default: return -1;
 	}
 }
@@ -2304,7 +2387,11 @@ mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method)
 	if (re) {
 		/* Rebinding is valid only for the synchronized-inner body substitution or the same method. */
 		if (re->logical_method != re->body_method && re->logical_method != logical_method) {
-			char *oldn = mono_method_get_full_name (re->logical_method);
+			/* re->logical_method is retained for the process lifetime while IKVM frees dynamic types, and
+			 * mono_method_get_full_name WALKS THE SIGNATURE -- which is how a dead pointer here presents
+			 * as an OOB inside dlrealloc rather than as anything that names this site (R273). */
+			char *oldn = mono_wasm_jit_method_usable (re->logical_method, WJ_BADMETH_SITE_REGISTRY)
+				? mono_method_get_full_name (re->logical_method) : g_strdup ("<dead-method>");
 			char *newn = mono_method_get_full_name (logical_method);
 			printf ("WASM_JIT_LOGICAL_REBIND desc=%d old=%s new=%s\n", desc_id, oldn, newn);
 			g_free (oldn); g_free (newn);
@@ -2682,7 +2769,8 @@ wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
 				char *cn, *dn;
 				int now_fslot;
 				mono_loader_lock ();
-				cn = re->logical_method ? mono_method_get_full_name (re->logical_method) : NULL;
+				cn = (re->logical_method && mono_wasm_jit_method_usable (re->logical_method, WJ_BADMETH_SITE_REGISTRY))
+					? mono_method_get_full_name (re->logical_method) : NULL;
 				dn = dm ? mono_method_get_full_name (dm) : NULL;
 				now_fslot = dm ? mono_wasm_jit_get_callee_fslot (dm) : -1;
 				printf ("WASM_JIT_ABI_MISMATCH desc=%d dep_fslot=%d expected=0x%x actual=0x%x cause=%s dep_desc=%d dep_now_fslot=%d caller=%s dep=%s\n",
@@ -4019,6 +4107,160 @@ int mono_wasm_jit_storeguard = 0;
 int mono_wasm_jit_objguard = 0;
 
 /*
+ * THE PERMANENTLY-UN-JITTABLE SET -- answering a predicate about a MonoMethod* WITHOUT DEREFERENCING IT.
+ *
+ * mono_wasm_jit_callee_perm_unjittable is four lines and needs exactly ONE BIT ("has this callee been
+ * marked slot == -1"), yet reaching that bit cost four dereferences of a pointer the emitter does not own:
+ *
+ *     InterpMethod *im = mono_interp_peek_imethod (method);     // -> jit_mm_for_method (method)
+ *     return (im && im->wasm_jit_slot == -1) ? 1 : 0;           //    -> m_method_get_mem_manager (m)
+ *
+ * The emitter consults it about ARBITRARY callees, on a worker, while IKVM generates and frees dynamic
+ * types continuously -- so `method` is not always dereferenceable. It has crashed twice at this one site,
+ * from two DIFFERENT hazards:
+ *
+ *   2026-09-10  mono-internal-hash.c:47 `table->table != NULL'   -- an uninitialised interp_code_hash,
+ *               fixed by switching get_imethod -> peek_imethod.
+ *   2026-09-19  a MISALIGNED a_cas in mono_mem_manager_lock, reached through
+ *               peek_imethod -> jit_mm_for_method -> m_method_get_mem_manager on a freed method.
+ *               (In wasm, alignment is a hint for ordinary loads but ENFORCED for atomics, so a
+ *               misaligned CAS means the mutex address itself was garbage.)
+ *
+ * PEEK DOES NOT PROTECT AGAINST THE SECOND, and two rounds leaned on "use peek here" as though it settled
+ * the site. Peek avoids CREATING an InterpMethod; it still has to find the memory manager first, which is
+ * four dereferences of the method and its class before any guard can run. Same four lines, two hazards,
+ * one fix applied.
+ *
+ * THE FIX IS NOT A VALIDITY TEST. CLAUDE.md is right that a range check cannot fix this -- a freed pointer
+ * is still in range -- and mono_wasm_jit_method_usable below only converts the DETECTABLE subset into a
+ * counted refusal. So do not reach the bit that way at all: maintain the bit in a set keyed by the pointer
+ * VALUE, populated where the fact becomes true (the five sites that write wasm_jit_slot = -1), and answer
+ * by lookup. HASHING A POINTER NEVER DEREFERENCES IT -- which is the property no validity test can have.
+ *
+ * Failure modes, stated before building it rather than discovered afterwards:
+ *
+ *   ADDRESS REUSE (ABA). A freed method whose address is recycled reads as a false POSITIVE. Consequence:
+ *   one call edge routes through the interp residual when it need not -- slower by one JIT->interp
+ *   transition, still correct. The behaviour being replaced, for the same input, is a process kill.
+ *
+ *   STALENESS. The answer only ever goes 0 -> 1 in practice: WJC_RELINK_BAIL_CLEARED measures 0 over a
+ *   full run (R252), i.e. nothing ever clears a permanent bail. So append-only with no removal is sound
+ *   and the read path needs no lock -- and must not have one, because this runs per call site per emit
+ *   across compile workers, where a global lock would contend.
+ *
+ *   FULL. Refuse by answering 0 ("not permanently un-JITtable"), which is the CONSERVATIVE direction: the
+ *   island simply tries to pull the callee in, exactly as it does for any un-prepared callee. Counted, so
+ *   a table that silently stopped working is visible rather than presenting as a codegen change.
+ *
+ * Open-addressed, power-of-two, linear probe, never resized. 64 Ki slots = 256 KiB on wasm32 against a
+ * measured ~10.3k emit bails per run, so the load factor stays far below the point where probing degrades.
+ */
+#define WJ_PERM_SET_BITS  16
+#define WJ_PERM_SET_SIZE  (1 << WJ_PERM_SET_BITS)
+#define WJ_PERM_SET_MASK  (WJ_PERM_SET_SIZE - 1)
+static gpointer wj_perm_set [WJ_PERM_SET_SIZE];
+static volatile gint32 wj_perm_set_n;
+
+/* Pointers are 4-byte aligned at minimum, so the low bits carry no entropy; mix the high ones down. */
+static guint32
+wj_perm_hash (gpointer p)
+{
+	guint32 h = (guint32) (guintptr) p;
+	h ^= h >> 16;
+	h *= 0x7feb352du;
+	h ^= h >> 15;
+	return h & WJ_PERM_SET_MASK;
+}
+
+/*
+ * Record that `method` is permanently un-JITtable. Called from the sites that write wasm_jit_slot = -1,
+ * i.e. where the fact becomes true rather than where it is later consulted -- "resolve and consume in the
+ * same breath", applied to a fact instead of a pointer.
+ *
+ * Lock-free and idempotent. A racing insert of the SAME pointer can write the same slot twice, which is
+ * harmless; a racing insert of a DIFFERENT pointer can lose a probe and land one slot later, also
+ * harmless. Only a lost insert would matter, and a lost insert degrades to today's behaviour (the callee
+ * reads as not-perm), never to a wrong dereference.
+ */
+void mono_wasm_jit_note_perm_unjittable (MonoMethod *method);
+void
+mono_wasm_jit_note_perm_unjittable (MonoMethod *method)
+{
+	guint32 i, h;
+	if (!method)
+		return;
+	if (mono_atomic_load_i32 (&wj_perm_set_n) >= (WJ_PERM_SET_SIZE / 2)) {
+		mono_wasm_jit_counters [WJC_PERM_SET_FULL]++;
+		return;
+	}
+	h = wj_perm_hash (method);
+	for (i = 0; i < 64; ++i) {
+		guint32 k = (h + i) & WJ_PERM_SET_MASK;
+		gpointer cur = wj_perm_set [k];
+		if (cur == method)
+			return;                       /* already recorded */
+		if (!cur) {
+			if (mono_atomic_cas_ptr (&wj_perm_set [k], method, NULL) == NULL) {
+				mono_atomic_inc_i32 (&wj_perm_set_n);
+				mono_wasm_jit_counters [WJC_PERM_SET_ADDS]++;
+				return;
+			}
+			--i;                          /* lost the slot to a racer; re-examine it */
+		}
+	}
+	/* 64 probes without a free slot: the table is pathologically clustered rather than full. Same
+	 * conservative answer as full, and counted separately so the two are distinguishable. */
+	mono_wasm_jit_counters [WJC_PERM_SET_FULL]++;
+}
+
+/*
+ * Is `method` in the set? POINTER COMPARISON ONLY -- `method` is never dereferenced, so a freed or
+ * recycled pointer is answered safely rather than detected.
+ */
+int mono_wasm_jit_perm_unjittable_known (MonoMethod *method);
+int
+mono_wasm_jit_perm_unjittable_known (MonoMethod *method)
+{
+	guint32 i, h;
+	if (!method)
+		return 0;
+	h = wj_perm_hash (method);
+	for (i = 0; i < 64; ++i) {
+		guint32 k = (h + i) & WJ_PERM_SET_MASK;
+		gpointer cur = wj_perm_set [k];
+		if (cur == method) {
+			mono_wasm_jit_counters [WJC_PERM_SET_HITS]++;
+			return 1;
+		}
+		if (!cur)
+			return 0;                     /* a run of occupied slots ended: it was never inserted */
+	}
+	return 0;
+}
+
+/*
+ * Did this method's permanence just become STALE? The set is append-only, and the only thing that can
+ * falsify an entry is the relink clearing wasm_jit_slot from -1 back to 0 (tiering.c, the
+ * WJC_RELINK_BAIL_CLEARED arm). R252 measured that arm at ZERO over a full run -- IKVM's relink hook is
+ * the method's first execution, where a method is untried or already live, so -1 is never reached there.
+ *
+ * Rather than rest the design on someone else's measurement, COUNT IT. Non-zero means the set is handing
+ * out stale positives and the cost is real (an edge routed through the interp residual that need not be);
+ * zero means the staleness window this design accepts has never once opened. Either way it is a reading,
+ * and the alternative -- a removable entry -- would need tombstones and would cost the lock-free read.
+ */
+void mono_wasm_jit_note_perm_cleared (MonoMethod *method);
+void
+mono_wasm_jit_note_perm_cleared (MonoMethod *method)
+{
+	if (method && mono_wasm_jit_perm_unjittable_known (method)) {
+		mono_wasm_jit_counters [WJC_PERM_SET_STALE]++;
+		/* Undo the HITS bump this probe just caused: it is bookkeeping, not a predicate answer. */
+		mono_wasm_jit_counters [WJC_PERM_SET_HITS]--;
+	}
+}
+
+/*
  * STACK HEADROOM PROBE (MONO_WASM_JIT_STACKPROBE). Diagnostic; default off.
  *
  * Two rounds have now been spent shaving C-stack arrays on the theory that
@@ -4444,6 +4686,19 @@ get_storage (MonoType *type, MonoType **etype, gboolean is_return)
 	return ArgInvalid;
 }
 
+/*
+ * DEAD CODE ON THIS TARGET, and worth saying so because its asserts look alarming.
+ *
+ * `get_call_info` is static and has ZERO callers: the wasm JIT never builds a mono CallInfo -- it has its
+ * own WjCallInfo (mini-wasm-ir.inc) -- and mono_arch_allocate_vars / mono_local_regalloc / linear scan are
+ * all excluded for COMPILE_WASM, so nothing reaches it. `get_storage` is likewise called only from here.
+ *
+ * So the `g_assert (mini_is_gsharedvt_type ...)`, `g_assert (is_return)`, the `g_error ("Can't handle as
+ * return value ...")` and `g_assert (sig->call_convention != MONO_CALL_VARARG)` below are NOT reachable
+ * aborts, and converting them would be churn presented as a stability fix. They are also not safely
+ * convertible: the only failure value in scope, ArgInvalid, is returned in one place and handled by NO
+ * consumer, so a bail would become silent bad codegen rather than a refusal.
+ */
 static CallInfo*
 get_call_info (MonoMemPool *mp, MonoMethodSignature *sig)
 {
@@ -4968,7 +5223,21 @@ mini_wasm_is_scalar_vtype (MonoType *type, MonoType **etype)
 		*etype = m_class_get_byval_arg (mono_defaults.sbyte_class);
 	}
 
-	g_assert (!etype || *etype);
+	/*
+	 * REFUSE, DO NOT ABORT. This used to be `g_assert (!etype || *etype)`, i.e. "a scalar vtype always
+	 * yields a scalar type" -- but the JIT reaches this about arbitrary IKVM-generated value types on a
+	 * compile worker, and an abort here loses the whole run over one method the interpreter is executing
+	 * correctly. Returning FALSE costs that method the scalar-vtype ABI and nothing else.
+	 *
+	 * It is safe because THE CALLERS ALREADY HANDLE EXACTLY THIS CASE: mini-wasm-ir.inc:1402 is
+	 * `if (!mini_wasm_is_scalar_vtype (ut, &etype) || !etype)` -- it declines on a TRUE return with no
+	 * etype rather than trusting the assert. So the invariant was already not relied upon by the code it
+	 * was protecting, which is the difference between this assert and the ones in get_call_info below
+	 * (whose only failure representation, ArgInvalid, no consumer handles -- converting those would turn
+	 * an abort into silent bad codegen, so they stay).
+	 */
+	if (etype && !*etype)
+		return FALSE;
 
 	return TRUE;
 }

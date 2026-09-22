@@ -475,6 +475,24 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * ref-arg copy loop only walks cfg->args, so it never touches this param. */
 		int vrd = cfg->vret_addr ? cfg->vret_addr->dreg : -1;
 		if (vrd < 0 || vrd >= nvreg) { fail = "vret no var"; goto done; }
+		/*
+		 * THE HIDDEN VRET PARAM PUSHES THE ARITY ONE PAST WHAT wj_call_info BOUNDED.
+		 *
+		 * wj_call_info refuses `nargs > WASM_FUNCTYPE_MAX_PARAMS` (mini-wasm-ir.inc) and self_ci.valid is
+		 * checked above, so nargs is in range -- but nwparams becomes nargs + 1 here, so a signature with
+		 * exactly MAX args returning a vtype BY ADDRESS produced MAX + 1 and aborted the process at
+		 * `g_assert (nparams <= WASM_FUNCTYPE_MAX_PARAMS)` in wj_body_take, several hundred lines later
+		 * and with no hint that the arity was the cause.
+		 *
+		 * The CALL side already handles exactly this (`ci->ftype.nparams + 1 > WASM_FUNCTYPE_MAX_PARAMS`
+		 * -> valid = FALSE, "call nargs"); the SELF side simply never got the same check. Refuse here,
+		 * through the emitter's ordinary bail, so the method loses its tier and the run continues.
+		 *
+		 * Note param_types is mempool-allocated at nargs + 2, so this was never a buffer overrun -- the
+		 * assert really was the first thing to go wrong, unlike the mark_bb_in_region case where the
+		 * array was indexed before the assert could fire.
+		 */
+		if (nargs + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "self nargs+vret"; goto done; }
 		param_types [nargs] = WASM_I32;
 		vt [vrd] = WASM_I32;
 		li [vrd] = nargs;

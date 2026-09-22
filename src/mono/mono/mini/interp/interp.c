@@ -1458,6 +1458,23 @@ wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointe
  * ways discriminate on. Multicast delegates (del->method == NULL) are filtered by the caller: the emitted
  * IC deliberately misses on them, so counting them would inflate the arity and buy back nothing.
  */
+/* WJ_BADMETH_SITE_PROFILE was declared, given a counter and a switch arm, and then NEVER PASSED BY ANY
+ * CALLER -- so WJC_BADMETH_PROFILE read 0 for every run regardless of what happened, which is exactly the
+ * dead counter that reads as a shipped fix. These are its call sites. */
+static gboolean
+wj_method_usable_profile (MonoMethod *m)
+{
+#if HOST_BROWSER
+	extern int mono_wasm_jit_method_usable (MonoMethod *m, int site);
+	return mono_wasm_jit_method_usable (m, WJ_BADMETH_SITE_PROFILE) != 0;
+#else
+	/* The guard lives in mini-wasm.c's HOST_BROWSER region and this file is also linked into
+	 * mono-aot-cross; accept unconditionally there, where no wasm JIT runs. */
+	(void) m;
+	return TRUE;
+#endif
+}
+
 static void
 wj_prof_record_delegate (InterpMethod *caller, MonoDelegate *del)
 {
@@ -1533,6 +1550,11 @@ mono_wasm_jit_prof_predict_alt (gpointer caller_ptr, MonoMethod *base, MonoVTabl
 		MonoMethod *t = s->id_targets [k];
 		guint32 c = s->id_counts [k];
 		if (!id || !t || id == (gpointer) skip)
+			continue;
+		/* The profile keeps raw MonoMethod* for the process lifetime and this one is about to become a
+		 * DEVIRT TARGET -- the emitter bakes a call to it -- so a dead pointer here is not a bad
+		 * diagnostic, it is bad codegen. Skipping costs the site its prediction and nothing else. */
+		if (G_UNLIKELY (!wj_method_usable_profile (t)))
 			continue;
 		/* A sizing-only observation leaves id_targets NULL, so an identity can be present with no
 		 * target; those are skipped above rather than guessed at. */
@@ -1671,8 +1693,9 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 				MonoMethod *t = s->id_targets [k];
 				guint32 c = s->id_counts [k];
 				/* An identity seen only through a sizing-only observation has no resolved target and
-				 * cannot be called; skip rather than guess. */
-				if (!id || !t)
+				 * cannot be called; skip rather than guess. Same for a target whose method has since
+				 * been freed -- see the note at the other reader. */
+				if (!id || !t || G_UNLIKELY (!wj_method_usable_profile (t)))
 					continue;
 				if (c > best_c) { best_c = c; best_id = id; best_t = t; }
 			}
@@ -2108,16 +2131,64 @@ static WjReemitOverflow *wj_reemit_overflow_tail;
  * it declines the enqueue when another producer owns this very short critical section and may trigger
  * again later. A mandatory replacement waits because losing it would leave the old method body callable.
  * No allocation, compilation, Mono lock or safepoint occurs while this lock is held. */
+/*
+ * Mirror "this method is permanently un-JITtable" into a pointer-keyed set in the backend.
+ *
+ * The bit already lives in InterpMethod.wasm_jit_slot, but reaching it from the EMITTER costs four
+ * dereferences of a MonoMethod* the emitter does not own (peek_imethod -> jit_mm_for_method ->
+ * m_method_get_mem_manager), and that site has aborted the process twice on a freed pointer. Recording it
+ * HERE -- at the five places the fact becomes true -- lets the predicate answer by pointer comparison
+ * instead. See mono_wasm_jit_note_perm_unjittable in mini-wasm.c for the failure modes.
+ *
+ * Deliberately NOT conditional on mono_wasm_jit_stats: this feeds a correctness path, not a census, and a
+ * set populated only under --stats would make the predicate answer differently between a measured run and
+ * a shipped one.
+ */
+static void
+wj_note_perm (MonoMethod *m)
+{
+#if HOST_BROWSER
+	extern void mono_wasm_jit_note_perm_unjittable (MonoMethod *method);
+	if (m)
+		mono_wasm_jit_note_perm_unjittable (m);
+#else
+	(void) m;   /* see wj_method_usable_profile: the set lives behind HOST_BROWSER */
+#endif
+}
+
 static gboolean
 wj_reemit_queue_enter (gboolean mandatory)
 {
-	do {
-		if (mono_atomic_cas_i32 (&wj_reemit_queue_lock, 1, 0) == 0)
-			return TRUE;
-		if (!mandatory)
+	gint64 n = 0;
+	/*
+	 * THE YIELD ON THE MANDATORY ARM DID NOTHING: mono_thread_info_yield() is
+	 * `mono_threads_platform_yield()`, and on wasm that is `{ return TRUE; }`
+	 * (mono-threads-wasm.c:169-172). So a mandatory producer hammered this word with a cmpxchg per
+	 * iteration, from a worker, unbounded and uncounted.
+	 *
+	 * TEST-AND-TEST-AND-SET: spin on a plain load and only attempt the write when the lock looks free,
+	 * so contenders keep the cache line shared instead of ping-ponging it. Still an unbounded wait, and
+	 * that is deliberate -- the critical section holds no other lock, allocates nothing, compiles
+	 * nothing and reaches no safepoint (see the note above), so a holder always finishes. What changes
+	 * is that the wait is now VISIBLE: WJC_REEMIT_Q_SPIN_MAX is a high-water, so a hung run can say
+	 * whether this is where its cores went instead of leaving it to be inferred from a profile.
+	 */
+	for (;;) {
+		if (mono_atomic_load_i32 (&wj_reemit_queue_lock) == 0 &&
+		    mono_atomic_cas_i32 (&wj_reemit_queue_lock, 1, 0) == 0)
+			break;
+		if (!mandatory) {
+			mono_wasm_jit_counters [WJC_REEMIT_Q_SPINS] += n;
 			return FALSE;
-		mono_thread_info_yield ();
-	} while (TRUE);
+		}
+		++n;
+	}
+	if (n) {
+		mono_wasm_jit_counters [WJC_REEMIT_Q_SPINS] += n;
+		if (n > mono_wasm_jit_counters [WJC_REEMIT_Q_SPIN_MAX])
+			mono_wasm_jit_counters [WJC_REEMIT_Q_SPIN_MAX] = n;
+	}
+	return TRUE;
 }
 
 static void
@@ -3714,6 +3785,7 @@ out:
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_SCC_CONDEMNED);
 			im->wasm_jit_bail = (gint16) results [i].bail;
 			im->wasm_jit_slot = -1;
+			wj_note_perm (im->method);
 		} else {
 			int b, woke = 0;
 			for (b = 0; b < results [i].nblockers; b++) {
@@ -3825,6 +3897,7 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 				 * recognize the callee as residual-eligible. */
 				if (wj_slot_retriable (cim->wasm_jit_slot)) {
 					cim->wasm_jit_slot = -1;
+					wj_note_perm (cim->method);
 					wj_waiter_drain (callee);
 				}
 				/* Retry this method so the residual path can route only that edge through interp.
@@ -3915,6 +3988,7 @@ wasm_jit_drain_promotions (void)
 				pim->wasm_jit_slot = WASM_JIT_SLOT_RETRY;    /* transient retry: NOT waiter-parked, no blocker event pending */
 			} else {
 				pim->wasm_jit_slot = -1;       /* permanent (transitive perm blocker, bail=-11) */
+				wj_note_perm (pim->method);
 				wj_waiter_drain (pm);          /* wake anyone parked on pm so they discover the permanence */
 			}
 		}
@@ -3958,6 +4032,7 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 		 * described where the knob was, in mini-wasm.c. */
 		if (mono_interp_jit_call_supported (cmethod->method, mono_method_signature_internal (cmethod->method))) {
 			cmethod->wasm_jit_slot = -1;
+			wj_note_perm (cmethod->method);
 			return;
 		}
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_ATTEMPT);
@@ -4010,6 +4085,7 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 		} else {
 			if (wj_slot_retriable (cmethod->wasm_jit_slot)) {   /* same race: don't de-JIT a method another thread just published */
 				cmethod->wasm_jit_slot = -1;   /* permanent: emitter bail, or force_island hit a permanent blocker (bail=-11) */
+				wj_note_perm (cmethod->method);
 				wj_waiter_drain (cmethod->method);   /* wake anyone parked on us so they discover the permanence */
 			}
 		}

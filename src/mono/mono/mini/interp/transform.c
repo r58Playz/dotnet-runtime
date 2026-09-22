@@ -10329,15 +10329,41 @@ mono_wasm_jit_pin_slots_for_reemit (MonoMethod *method)
 int
 mono_wasm_jit_callee_perm_unjittable (MonoMethod *method)
 {
-	/* PEEK, NOT GET (2026-09-10). mono_interp_get_imethod creates an InterpMethod on a miss and its
-	 * lookup asserts on an uninitialised interp_code_hash, and this predicate is called from
-	 * mono_wasm_emit_method about arbitrary callees on a worker -- which aborted the process at
-	 * mono-internal-hash.c:47 `table->table != NULL', 2 runs in 6, 2026-09-10. That is R152's fault
-	 * returning at a new call site. Note mini-wasm.c:12194-12209 already forbids exactly this for
-	 * get_callee_fslot and then lists THIS function among the "pure" predicates -- it was not pure.
-	 * No imethod means the callee has never been prepared, which is not `slot == -1', so 0 is right. */
-	InterpMethod *im = mono_interp_peek_imethod (method);
-	return (im && im->wasm_jit_slot == -1) ? 1 : 0;
+	/*
+	 * ANSWERED BY POINTER COMPARISON. `method` is NEVER DEREFERENCED HERE.
+	 *
+	 * This site has crashed the process twice, from two different hazards, and the second one is why the
+	 * implementation changed shape rather than just swapping a call:
+	 *
+	 *   2026-09-10  mono-internal-hash.c:47 `table->table != NULL' (2 runs in 6) -- get_imethod CREATES
+	 *               on a miss and its lookup asserts on an uninitialised interp_code_hash. Fixed then by
+	 *               switching to mono_interp_peek_imethod.
+	 *   2026-09-19  a MISALIGNED a_cas inside mono_mem_manager_lock, reached through
+	 *               peek_imethod -> jit_mm_for_method -> m_method_get_mem_manager on a FREED method.
+	 *
+	 * PEEK DID NOT FIX THE SECOND, and two rounds cited "use peek here" as if it had settled the site.
+	 * Peek only avoids CREATING an InterpMethod; finding the memory manager still dereferences the method
+	 * and its class four times before any guard can run. The emitter asks this about ARBITRARY callees,
+	 * on a worker, while IKVM frees dynamic types continuously -- so the pointer is not always valid, and
+	 * CLAUDE.md is right that no range check can fix that (a freed pointer is still in range).
+	 *
+	 * So the bit is no longer READ from the callee. It is RECORDED where it becomes true -- the five
+	 * sites that write wasm_jit_slot = -1 -- into a pointer-keyed set, and answered by lookup. Hashing a
+	 * pointer never dereferences it. See mono_wasm_jit_note_perm_unjittable (mini-wasm.c) for the three
+	 * failure modes (ABA, staleness, full) and why each is acceptable; all three are counted, and the
+	 * worst of them costs one call edge an interp transition where the old behaviour was a process kill.
+	 *
+	 * A miss still means "not permanently un-JITtable", exactly as before: a callee with no InterpMethod
+	 * has never been prepared, which is not `slot == -1'.
+	 */
+#if HOST_BROWSER
+	extern int mono_wasm_jit_perm_unjittable_known (MonoMethod *m);
+	return mono_wasm_jit_perm_unjittable_known (method);
+#else
+	/* mini-wasm.c's HOST_BROWSER region owns the set, and this file is linked into mono-aot-cross too. */
+	(void) method;
+	return 0;
+#endif
 }
 
 /* runtime wasm JIT (cold-leaf residual, MONO_WASM_JIT_RESIDUAL_COLD): 1 if this un-JITted DIRECT callee is
