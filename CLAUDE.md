@@ -22,7 +22,7 @@ exists because a previous pass got it wrong at real cost.
 | the assembler (`wj_assemble`) | resolves a body's relocations and frames N members into one module |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
 | the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
-| IKVM (Java -> CLR, also uncommitted work) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm` |
+| IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm` — branch `wasm`, and it is CLEAN; the uncommitted IKVM-side work is in **ikvmcraft** (`loader/IkvmWasm.cs`, `loader/Transforms/Bench/`) |
 | measurement harness | `scratchpad/wj/` (see **The instruments**) |
 | **the running log — read before proposing anything** | `scratchpad/wj/MINECRAFT-FINDINGS.md` |
 | chromium/V8 source, for checking claims about V8 | `~/Documents/chromium/src` (v8 at `src/v8`) |
@@ -86,6 +86,20 @@ against that tree rather than trusting this list.
 * **V8's implicit null checks are WasmGC-only** (`null_checks_for_struct_op`, `wasm-lowering-reducer.h:405-425`).
 * **Classifier warning:** a case-insensitive match for "compile" hits the `-turbofan` SUFFIX on every symbol
   and reports ~88% of the window. Strip `-\d+-(turbofan|liftoff)$` before matching.
+
+## Verified mono-on-wasm facts
+
+* **`mono_thread_info_yield()` IS A NO-OP.** `mono_threads_platform_yield()` is `{ return TRUE; }`
+  (`utils/mono-threads-wasm.c:169-172`). So any `while (CAS...) mono_thread_info_yield ();` in this tree
+  is an unbounded, unyielding busy spin, and "spin politely" is not a thing that happens here. Both CAS
+  loops in the backend were that shape and are now test-and-test-and-set, bounded and counted
+  (`[wasm-jit spin]`). **A shared spinlock is also the only thing that can put two DIFFERENT threads on
+  the SAME ~22 bytes of generated code**, which is what R275 measured on the world-load hang — so this is
+  the first thing to price against any "two threads at 92% CPU" reading.
+* **Nothing that blocks properly is safe at those sites.** `mono_thread_info_sleep(ms>0)` does
+  `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
+  (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the
+  drain can want.
 
 ## Architecture invariants — check a design against these before building it
 
@@ -169,6 +183,29 @@ emitter produced. AOT bodies are reached through their own table indices and the
 functypes, never through an f-slot. That is what lets a caller bake a functype for an f-slot call with no
 runtime kind test, and what makes an ABI change safe to apply to every f-slot functype at once.
 
+### mono's rare paths are our COMMON ones, so the JIT must not assert on metadata it is handed
+
+A type-load failure is exceptional on most workloads. **Under IKVM it is ordinary control flow — an
+unloadable type IS a failed load** — so upstream code that treats it as "cannot happen" fires here
+routinely. `compute_bb_regions` was the one consumer of `clause_is_dead` that did not guard
+(`mini.c:2386`, `:2535`, `:3960` and `mini-llvm.c:13480` all did), so
+`method_make_alwaysthrow_typeloadfailure` — which removes every basic block and marks every clause dead —
+left the clause table naming blocks that no longer existed, and the JIT aborted the process instead of
+compiling a throw stub.
+
+The general rule this makes explicit: **a bad body arrives as a COMPILE REQUEST, not at load time.**
+`mono_interp_replace_method_body` swaps a whole header into a live wrapper ~4,500x per run, so the JIT can
+be handed an inconsistent one at any moment, and `g_assert` there loses the entire run over one method the
+interpreter is executing correctly. Convert to a counted bail on the existing pattern
+(`mono_wasm_jit_note_bad_eh_clause`), and put the bounds check FIRST — the original line indexed the array
+before the assert could fire, so an out-of-range offset was already an OOB read and the abort was the good
+case.
+
+**But check reachability before converting anything.** Four asserts on that list turned out to be in
+`get_call_info`, which is `static` with zero callers on this target, and whose only failure value
+(`ArgInvalid`) is handled by no consumer — so converting them would have turned an unreachable abort into
+reachable silent bad codegen (R282).
+
 ### Resolve and consume in the same breath
 
 Repeated bug shape, found in four separate subsystems: **something is looked up or validated on one thread,
@@ -225,14 +262,40 @@ And one trap already paid for: **a stable inline-cache id is not the same granul
 The record is keyed by callee base method; an IC belongs to one call site. Reusing the record's id makes two
 sites in one method that call the same base share a PIC slot.
 
-### Retained raw `MonoMethod *` are not always dereferenceable — UNPROTECTED
+### Retained raw `MonoMethod *` are not always dereferenceable — PARTLY GUARDED
 
 The registry and the call profile keep raw `MonoMethod *` for the process lifetime while IKVM generates
 dynamic types continuously, so such a pointer is not always dereferenceable by the time the emitter or
-admission consults it. This presents as `memory access out of bounds` inside `jit_mm_for_method` /
-`mono_interp_*_imethod`, or as an assertion in `mono_class_get_flags`. A range check cannot fix it (a freed
-pointer still lands in range); the fix is to stop retaining raw method pointers across a window in which IKVM
-can free them. **This crash mode is currently unguarded — know that it exists before diagnosing it fresh.**
+admission consults it. **It has three faces, not two**: `memory access out of bounds` inside
+`jit_mm_for_method` / `mono_interp_*_imethod`; an assertion in `mono_class_get_flags`
+(`class-accessors.c:90`, which arrives *inside* a mono assertion and so is easily misfiled as a managed
+cast failure); and a **misaligned `a_cas`** inside `mono_mem_manager_lock` — alignment is a hint for
+ordinary wasm loads but is ENFORCED for atomics, so a misaligned CAS means the mutex address was garbage.
+
+**`peek` does not protect against this, and two rounds treated it as though it did.**
+`mono_interp_peek_imethod` avoids CREATING an InterpMethod (a different hazard, an uninitialised
+`interp_code_hash`); its first statement is still `jit_mm_for_method (method)`, which dereferences the
+method and its class four times before any guard can run.
+
+What exists now, and what each thing is worth:
+
+* **`mono_wasm_jit_callee_perm_unjittable` no longer dereferences at all** (R282). It needed one bit, so
+  the bit is RECORDED where it becomes true — the five sites that write `wasm_jit_slot = -1` — into an
+  append-only pointer set and answered by lookup. **Hashing a pointer never dereferences it**, which is
+  the property a range check can never have. Read `[wasm-jit permset]`: `adds` is the liveness check (0
+  means the set is never populated and the rest of the line is meaningless), `full` must stay 0, `stale`
+  counts the one path that can falsify an entry.
+* **`mono_wasm_jit_method_usable`** (`MONO_WASM_JIT_BADMETH`, default 1) converts the DETECTABLE subset
+  into a counted refusal at four sites. It does **not** make retention safe — a freed-but-in-range
+  pointer still passes — and `WJC_BADMETH_SEEN` is its liveness check.
+* **Still open:** `WjRegEntry.body_method`/`.logical_method`, `WjProfSite.id_targets[]`,
+  `WjDepSet.method[]`, `wj_block_tab`, `wj_waiter_key` and `wj_sync_inner_canon` all still retain raw
+  pointers. `canon_subst` measures the last one at ~300/run. The root fix is to stop retaining, or to
+  purge on `mono_mem_manager_free`; neither is done.
+* **An instrumentation gap to fix before quoting those counters:** `WJC_BADMETH_SEEN` is an AGGREGATE
+  over all sites, so `registry=0 profile=0` cannot distinguish "ran and caught nothing" from "never ran".
+  Those two counters had no caller at all for months and read exactly the same then. A per-site
+  denominator is needed before either zero is evidence.
 
 ## How far off native we are, and what closes it
 
@@ -303,10 +366,31 @@ of GL stack, chromium and V8 that is out of scope. **Native's server tick is 90.
 decomposes cleanly. The rest of native's tick is JVM stubs (itable/vtable/i2c) 0.389, other 0.340,
 libjvm/native libs 0.239 -- **the 94% this said before counted the JVM's own stubs and native libs as
 Java**, which inflates the codegen term and deflates the machinery one.
-**Current SHIPPED build (2026-09-12, `ship-baseline`, R245 admission fix + `IKVM_LAZY_SIG=1` +
-`MONO_WASM_JIT_RELINK_JITTED=1`): whole thread 16.2x = 1.91x machinery x 8.45x codegen** -- 172.0 M/tick,
-real Java 76.35 against native's 9.642. (Stated as 2.3x x 7.6x before R269 re-derived the denominator.) The path there, same instrument and workload: **32.8x** (with the
-R244 admission regression) -> **18.2x** (fixed) -> **16.5x** (`LAZY_SIG`) -> **16.2x** (`RELINK_JITTED`).
+**The shipped-build figure has MOVED and the old one is stale.** 2026-09-12's `ship-baseline` read
+**172.0 M/tick = 16.2x** (1.91x machinery x 8.45x codegen, real Java 76.35 against native's 9.642; stated
+as 2.3x x 7.6x before R269 re-derived the denominator). The path to it, same instrument and workload:
+**32.8x** (with the R244 admission regression) -> **18.2x** (fixed) -> **16.5x** (`LAZY_SIG`) ->
+**16.2x** (`RELINK_JITTED`).
+
+**Since then IKVM's IN-PLACE RELINK landed and is the largest measured win of the line:**
+
+| build | M instr/tick | note |
+|---|---|---|
+| relink OFF (`IKVM_LAZY_RECOMPILE=0`) | 188.4 | R277, 2 captures |
+| **relink ON (shipped)** | **165.4** | **-12.2%**, non-overlapping both rows, = 15.6x native |
+| + the four defect fixes | 161.8 | R279 plateau |
+| current | **155.2 / 155.5** | R280h, both `IKVM_LAZY_CTORS` arms |
+
+The mechanism is far more robust than the timing total: the **IKVM lazy-link dispatch pool HALVED**
+(52.38 -> 25.24 M/tick, -51.8%) and the server **completed 2,405 ticks against 2,050 in the same window
+(+17.3%)** — the unconfounded comparison when tick counts differ. Four defect fixes took installs from
+2,250 with 1,978 failures to **4,500 with 0** (R276/R278). `IKVM_LAZY_INPLACE=1` and
+`IKVM_LAZY_RECOMPILE` (default on) are shipped; `IKVM_LAZY_RECOMPILE=0` is the one-knob A/B that takes
+the whole feature off the path.
+
+**Quote the number with its date and instrument.** These are cross-binary readings taken on a box whose
+same-arm spread on the lazy-link bucket is ~20%, so the ordering is solid and the individual figures are
+not to three digits.
 
 **Skipped ticks are the outcome metric to quote alongside it, and they moved further than the ratio did:
 519-527 per 120 s window -> 40.** M instr/tick divides by EXECUTED ticks, so it partly hides a server
@@ -512,6 +596,7 @@ with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A
 | `shadowNojit` as evidence about the AOT wall | the counter is a TAUTOLOGY: shadow collection walks `WASM_RELOC_CALL`, which only ever names an already-JITted callee, so `nojit` cannot fire. AOT callees emit `WASM_RELOC_AOT` and are never candidates |
 | "55% of real call sites target the main module" as a co-location ceiling | RETRACTED (R180) — that is a STATIC SITE COUNT. From 2,598,503 caller->callee edge instances, **93.66% of calls out of our tier land in our own tier** and only 6.24% in AOT code. The AOT wall is not what limits co-location reach |
 | **"process-wide modules cannot reach `__thread` state"** | RETRACTED — wrong, and it wrongly closed the monitor inline-CAS lever. See the imported-globals invariant above |
+| `IKVM_LAZY_CTORS` (relinking constructors) | **Ships 0, and do not re-run the A/B.** The mechanism is correct and clean -- +208 generation-2 bodies (4,293 -> 4,501), 0 failures, 0 faults over 4 healthy runs, `bad_offsets=0` -- but the server tick is a WASH (155.2 -> 155.5). The lazy-link bucket moved -14.4% in the predicted direction and at the predicted magnitude, and that is **not resolvable on this instrument**: the same-arm spread on that bucket is ~20% (R277's `a0`/`b0` were the same arm and read 27.37 vs 22.43). A ~1.8%-of-thread lever against a ~20% instrument spread is the closure, not the sample size. The durable result of that round is the RUNTIME fix it forced out (`clause_is_dead`) |
 | monitors / inflated locks as a mutex-traffic problem | every lock IS inflated (`monitor.c:1013`: an object whose identity hash has ever been taken can never use the thin lock again, and Java takes identity hashes constantly), but the recoverable part is NOT mutex traffic — `mono_monitor_try_enter_inflated` already has an uncontended CAS fast path. The ~3.2% is CALL OVERHEAD around one CAS. Synchronized wrappers ARE JITted, so an inline CAS has somewhere to attach. Unbuilt, ceiling ~1.5-2% |
 
 ## Building: the runtime and the app are two different builds
@@ -545,6 +630,14 @@ Before either, `scratchpad/wj/csyn.sh <file>` compiles one source file with the 
 second. It checks both compilation databases, which matters: `mini-wasm.c` builds twice, with and without
 `HOST_BROWSER`.
 
+**`csyn.sh` COMPILES BUT DOES NOT LINK, and that gap has now cost two builds.** `mini-wasm.c`,
+`interp.c`, `transform.c` and `tiering.c` are all linked into **`mono-aot-cross`** as well as the runtime,
+while most of the JIT lives inside `mini-wasm.c`'s `#ifdef HOST_BROWSER`. So a call added into that region
+from any of those files compiles cleanly in both databases and then fails the real build with
+`ld.lld: error: undefined symbol`, ~9 minutes in. **Guard the CALL SITE with `#if HOST_BROWSER`** —
+`interp.c` already carries a comment explaining this at its own probe site, three lines above the pattern
+that was copied without it.
+
 ## Build the product configuration: `make build AOT=true`
 
 **The shipped build is MIXED-AOT** — corlib and IKVM are AOT-compiled, the rest is JIT/interp. In
@@ -576,6 +669,23 @@ throttling; treat 2-3-core measurement arms as running at ~3.7 GHz. preflight's 
 therefore uninformative on this box rather than merely unactionable. Ambient desktop load is the
 confound that IS real — preflight refusing an arm for that is worth obeying.
 
+* **`mode=stall` is NOT a fault.** `worldGenMode` classifies world-generation DURATION (the documented
+  ~20%-incidence bimodality, ~19 s vs ~90 s); a `stall` run routinely completes with `faults=[]` and
+  `verdict=ok`. Read `verdict`, which is the one field that says whether a run counts against the build,
+  and which excludes `env` / `never-started` / `killed`. This session conflated the two once.
+* **`ok` is not a verdict either** — it is a progress flag set the instant `benchEnd` is seen, unaffected
+  by faults, so a run can be `ok:true` while trapping.
+* **`inplace ok=` is quantised to 250** (it prints at `n % 250 == 0`), so its last value is a FLOOR and a
+  change under 250 installs is invisible in it. Use `gen2 clean=`, which is exact. This nearly produced a
+  wrong delta twice.
+* **When a counter's total exceeds the sum of its attributed parts, the gap is the finding.** Three of
+  eight `InPlaceFailed` increments are bulk `Add(..., n)`, so only 336 of 1,978 failures reached the two
+  instrumented catch sites — and the amplifier was in the gap.
+* **A bucket named for what it EXCLUDES hides what it contains.** "Class has other bridges" was accurate
+  and was misread as "no bridge for this site"; it actually meant "a bridge for exactly this site, under a
+  different kind". One extra comparison was the whole answer.
+* **"Structural, stop here" needs a higher evidence bar than "keep going"**, because only one of them ends
+  the investigation. That framing closed a fixable 5% as structural for a day.
 * **fps is unusable on this box; composition SHARES are not.** Two control runs of an IDENTICAL config:
   `vcall_resolve_fslot` 4.723% / 4.683% (**0.8%**), `InstanceCheck` 2.642 / 2.658 (0.6%) — against **fps 15.10 /
   18.03 (19.4%)**. Client-thread instruction shares are ~20x more reproducible than frame rate. **Quote
@@ -603,6 +713,13 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
   MethodHandle/invokedynamic linking (103.5 -> 47.2 M/frame), chunk/world meshing (67.2 -> 27.7) and IC miss
   (33.4 -> 21.1). Native pays the identical transient and clears it in seconds. **Ramp length is a symptom of
   the 4-5x gap, not a separate warmup problem.**
+* **Read `verdict` first, then the three `[wasm-jit ...]` bound lines.** `[wasm-jit bounds]`
+  (`install_budget_out`, `rv_retry dropped/try_max`, `worker_slots full`), `[wasm-jit spin]`
+  (`pub_reraise_max`, the two lock spin high-waters) and `[wasm-jit permset]` (`adds` is the liveness
+  check; `full` must be 0). These are bumped UNGATED, so they are readable with `MONO_WASM_JIT_STATS=0`
+  at no measurement cost — and `mono_wasm_jit_liveness(14..17)` exposes the four that matter without
+  `--dumps` at all, which is the only way to read a wedged run whose main thread never returns from
+  `Runtime.evaluate`.
 * **Assert the tier is alive before reading any timing**: `registered` unchanged (~1,845-1,863 during
   world.generate on the current config), `tableExhausted 0`, `faults []`. A wrong functype on an import fails
   *instantiation*, not the call, so the method silently falls back to the interpreter — it looks like a
@@ -696,6 +813,29 @@ to completion. Put the WORK in the unit and use a direct sentinel check as the b
 written, and there is NO stall message. Do NOT diagnose it as an app or JIT fault. Three explanations were
 asserted here before the harness source was read and all are wrong: a duration limit, memory pressure, and
 "~30 minutes of user inactivity" (a selection effect — killed tasks have a median lifetime of 1.5 min).
+
+### The world-load hang is a SPIN, not a block
+
+Caught live (R275): two threads at **~92% CPU**, both `state=R` with `wchan=0`, concentrated on five
+addresses spanning ~22 bytes of `[anon:v8]`; a third worker in `__futex_wait`. `Debugger.pause` could not
+interrupt the page or any of 8 workers within 7 s. App-side it is total quiescence — `JIT_ADMIT
+registered` frozen, OPFS counts frozen, `faults=[]`, then nothing for 20 minutes.
+
+**Every earlier description of it as "stopped" or "blocked" was wrong about the mechanism**, and the two
+need opposite next instruments, so the driver now classifies them: `verdict=spin` (no app progress AND a
+thread running with `wchan=0`) versus `verdict=wedge` (no app progress, all threads asleep). On a spin it
+captures 12 s of perf automatically. That capture is only readable because `worldwait` now passes
+`--perf-basic-prof` by default — R275's own capture had no symbol map and its five addresses stayed
+nameless, which is the whole reason the round ended undiagnosed.
+
+**Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
+The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
+puts a full drain on every loop back-edge; and both CAS loops were unyielding busy spins (see the
+mono-on-wasm facts). On a healthy run all their counters read ~0, so **the arms are unexercised, not
+validated**. The reading that settles it has to come from a HANGING run. If one shows `pub_reraise_max`,
+`rv_retry try_max` and both `spin_max` small, neither is the cause — say so and read the capture rather
+than defending them. Four explanations for the earlier failures were each proposed before the evidence
+was gathered and all four were wrong.
 
 ### Debugging a wasm trap
 
@@ -797,21 +937,45 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 
 | tool | what it does |
 |---|---|
-| `csyn.sh` | One-file syntax check with the real build's command line, both compilation databases. Sub-second |
+| `csyn.sh` | One-file syntax check with the real build's command line, both compilation databases. Sub-second. **Does NOT link** — see the build section |
+| `lib/verdict.mjs` | **The fault taxonomy and the run verdict, shared by every driver.** 14 classes each with a STABLE KEY, so batches are comparable: a mono assert is `mono-assert:loader.c:1826`, not an anonymous `fault`. `selftest()` runs real signatures taken from archived logs |
+| `faultcensus.mjs` | Per-class fault census over the archived corpus (`--since`, `--json`). **`--disjoint` runs the disjointness invariant over all ~3,500 real logs**, which is what catches the classifier bugs a sample-based selftest cannot: the sample test passed while five were live |
+| `reap.sh` | Dead-pid `/tmp/perf-*.map`, orphaned profiles, v8 isolate logs. Refuses to run if the seed profile is missing. `--apply` to act; dry-run by default |
 | `enctest/run.sh` | Four host-side encoder gates in seconds. t1/t2 diff against frozen framers, t3 is the serializer round-trip, **t4 is structural** — it checks the assembler at `nexport < nmembers`, which t1/t2 cannot reach. Run it before believing anything else about the encoder |
 | `killdaemons.sh` | Kills leftover Roslyn/MSBuild build servers using preflight's own match, safely. Exit 0 = safe to measure. Run before every measurement |
 | `wjcsync.py` | Re-index the JS counter mirror after `WJC_*` entries change in the C enum. **Use this instead of hand-editing the mirror in `lib/mcdrive.mjs`** |
 | `lib/preflight.mjs` | Refuses to measure on a box that is unfit (thermal, CPU contention, build daemons). Obey the refusal |
 | `lib/` | `mcdrive.mjs` is the Minecraft driver (launch, seed, phases, counters, memory/partition sampling, knob plumbing); `browser.mjs` is chrome/CDP for the jbox2d-era tools; also `provenance.mjs`, `thermal.mjs`, `wasmnames.mjs`, `debuginfo.mjs` |
 
-**Known harness gap:** one MONO forced abort wedges a whole batch — the browser process is gone but the driver
-keeps waiting (observed at 886 s and 1,267 s). Every batch that hits such a fault loses its remaining runs.
+**That gap is CLOSED**: a `MONO_WASM: forcing abort` (and every other class `verdict.mjs` marks terminal —
+`js-oom`, `em-abort`, `renderer-crash`, `wasm-link`) now ends the run immediately instead of sitting out
+the 420/480 s budget, so one abort no longer takes the rest of the batch with it. A wasm TRAP deliberately
+still does not abort the run: a worker can die and the run go on to produce a complete window.
 
 ## Housekeeping
 
 `scratchpad/` is excluded via `.git/info/exclude`, not `.gitignore` — it holds tens of GB of captures and must
 never be added. **It is also not recoverable**: a deleted tool is gone. Chrome profile dumps are ~1 GB each and
 jitdumps ~4 GB; keep the newest of each kind and delete the rest. Do not commit `*.orig-backup` files.
+
+**`/tmp` is a 7.7 G tmpfs, i.e. RAM, and `--perf-basic-prof` writes a ~240 MB `/tmp/perf-<pid>.map` per
+run.** Nothing used to remove them: 100 stale maps = 4.9 GiB left 2.7 G free, and runs then died at PAGE
+LOAD — before any app code — so it read as a browser bug or a flaky deploy, and two arms were nearly
+blamed on the change under test (R280f). Now handled at three levels, and all three are needed:
+`runSession` drops its own renderer's map at teardown (before `game.kill()`, so the pid still resolves)
+unless a spin capture needs it; `scratchpad/wj/reap.sh` sweeps dead-pid maps, orphaned profiles and v8
+isolate logs, and **REFUSES TO RUN if `scratchpad/mcsr/seed` is missing**; and `preflight` gates on
+ABSOLUTE free bytes in `/tmp`, not a percentage — R280f happened at 64% full, under the old 70% threshold.
+
+**A diagnostic that is free per run is not free per batch.** This harness has produced that failure twice
+from two directions (jitdumps at ~4 GB, symbol maps at ~240 MB), and turning on `--perf-basic-prof` by
+default took `/tmp` from 62 MB to 741 MB in three runs before the teardown fix. Anything written per run
+into a RAM-backed filesystem needs an owner at teardown, not a periodic sweep — a sweep only helps if
+someone remembers, and the failure it prevents does not look like a disk problem.
+
+**Browser profiles:** ~1 GB per run, reflink-copied from the seed. `reapProfile` drops them on a clean
+run and **KEEPS them on a failure**, where they hold the OPFS save and the crash-time state and are the
+only copy. 340 of them (333 GB apparent) had accumulated in `mc-out` plus 40 in `/var/tmp`.
 
 `perf inject` is opt-in (`--inject`), not implied by `--jitdump`: every python reader here parses the raw
 jitdump directly, inject's success path DELETES those dumps, and it was measured still running at 8m20s on a
