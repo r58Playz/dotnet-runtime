@@ -83,11 +83,28 @@ against that tree rather than trusting this list.
   buffer-element load and an offset load (`compiler/turboshaft/wasm-lowering-reducer.h:1079-1110`) — against
   one hoisted load and a constant-offset access for a module-defined one (`:1129-1145`). `s.p`
   (`__stack_pointer`) is the only mutable import, and every framed method reads *and writes* it.
+* **A function may declare at most 50,000 PARAMS PLUS LOCALS.** `kV8MaxWasmFunctionLocals`
+  (`wasm/wasm-limits.h:50`); `num_locals_` is seeded from the signature's parameter count
+  (`wasm/function-body-decoder-impl.h:1880`), accumulated per local group (`:1938`), and a group that
+  crosses the cap is rejected with **`local count too large`** (`:1920-1921`). This is a `CompileError`
+  from `WebAssembly.Module()`, i.e. the module never instantiates. The emitter refuses such a method
+  before emitting (`WASM_MAX_FUNCTION_LOCALS`, counter `locals_overflow`); 1.16.1's
+  `BlockStateFlattening:.cctor` is the known member and emits 1.9 MB. Note this is the ONE place where
+  local COUNT is not purely a wire-size question -- see the local-ops fact above for everything else.
 * **V8's implicit null checks are WasmGC-only** (`null_checks_for_struct_op`, `wasm-lowering-reducer.h:405-425`).
 * **Classifier warning:** a case-insensitive match for "compile" hits the `-turbofan` SUFFIX on every symbol
   and reports ~88% of the window. Strip `-\d+-(turbofan|liftoff)$` before matching.
 
 ## Verified mono-on-wasm facts
+
+* **A deterministic compile failure must never be marked `retriable`.** `retriable` routes to
+  `WASM_JIT_COMPILE_BLOCKED` -> **PARKED with `wasm_jit_hits` reset** (`interp.c`), re-attempted a
+  threshold later -- and a long-running method re-accrues that threshold on its own back-edges in
+  ~1.5 s. So a condition that cannot clear recompiles forever: `BlockStateFlattening:.cctor` ran 15
+  full compiles of a 1.9 MB body back to back and ate **22.4 s of boot** with `registered` flat and no
+  fault logged (R289). The split that holds: **`CompileError` is deterministic** (re-emission produces
+  the same bytes) and is now permanent; **`LinkError` is per-worker** (imports are per-worker) and stays
+  retriable. Measured over the whole archived corpus: 20,499 CompileError vs 131 LinkError.
 
 * **`mono_thread_info_yield()` IS A NO-OP.** `mono_threads_platform_yield()` is `{ return TRUE; }`
   (`utils/mono-threads-wasm.c:169-172`). So any `while (CAS...) mono_thread_info_yield ();` in this tree
@@ -940,6 +957,7 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 | `csyn.sh` | One-file syntax check with the real build's command line, both compilation databases. Sub-second. **Does NOT link** — see the build section |
 | `lib/verdict.mjs` | **The fault taxonomy and the run verdict, shared by every driver.** 14 classes each with a STABLE KEY, so batches are comparable: a mono assert is `mono-assert:loader.c:1826`, not an anonymous `fault`. `selftest()` runs real signatures taken from archived logs |
 | `faultcensus.mjs` | Per-class fault census over the archived corpus (`--since`, `--json`). **`--disjoint` runs the disjointness invariant over all ~3,500 real logs**, which is what catches the classifier bugs a sample-based selftest cannot: the sample test passed while five were live |
+| `depcheck.py` | **The admission-contract gate.** `depcheck.py <graph.log> <dump.wat\|dir>` — every f-slot BAKED into a body against every f-slot a descriptor DECLARES. An undeclared one is unadmittable by construction and becomes a `function signature mismatch` on the first worker that reaches it (R285). **Both inputs must come from ONE run** — f-slot numbers are per-run — and it REFUSES below a 25% ownership ratio rather than reporting a cross-run pairing as clean. `wasmtier.mjs --depgraph` emits both from one run |
 | `reap.sh` | Dead-pid `/tmp/perf-*.map`, orphaned profiles, v8 isolate logs. Refuses to run if the seed profile is missing. `--apply` to act; dry-run by default |
 | `enctest/run.sh` | Four host-side encoder gates in seconds. t1/t2 diff against frozen framers, t3 is the serializer round-trip, **t4 is structural** — it checks the assembler at `nexport < nmembers`, which t1/t2 cannot reach. Run it before believing anything else about the encoder |
 | `killdaemons.sh` | Kills leftover Roslyn/MSBuild build servers using preflight's own match, safely. Exit 0 = safe to measure. Run before every measurement |

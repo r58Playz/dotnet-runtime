@@ -1069,6 +1069,30 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	groups [2].type = WASM_F32; groups [2].count = cnt [2];
 	groups [3].type = WASM_F64; groups [3].count = cnt [3];
 
+	/* V8 caps a function at kV8MaxWasmFunctionLocals = 50,000 (v8/src/wasm/wasm-limits.h:50), counted as
+	 * PARAMS PLUS declared locals: num_locals_ is seeded from the signature's parameter count
+	 * (function-body-decoder-impl.h:1880) and accumulated per local group (:1938), and the group whose
+	 * running total crosses the cap is rejected with "local count too large" (:1920-1921).
+	 *
+	 * Our count is the fixed ~22-local scaffolding block plus one per live vreg, so a large enough body
+	 * reaches it. 1.16.1's net.minecraft.class_3580 (datafixer.fix.BlockStateFlattening) .cctor does:
+	 * thousands of register() calls in one method, 1,885,636 bytes emitted.
+	 *
+	 * This MUST be refused here and not left to instantiation. The WASM_JIT_INVALID path below marks
+	 * every instantiation failure RETRIABLE on purpose -- a per-worker OOM is transient and must not
+	 * condemn a method process-wide (R245 Stage 2c). But a body that is invalid is invalid every time,
+	 * and re-emission is deterministic, so a deterministic failure routed into that path recompiles
+	 * forever: measured 15 attempts x ~1.5 s = 22.4 s of the boot window with `registered` perfectly
+	 * flat, which is CLAUDE.md's "decide whether the condition can ever clear" trap on a new path.
+	 * A `fail` string here is a PERMANENT bail (retriable is only set for "callee not jitted"), so the
+	 * method is condemned once and the interpreter runs it.R289. */
+	{ int _nloc = nwparams + cnt [0] + cnt [1] + cnt [2] + cnt [3];
+	  if (_nloc > WASM_MAX_FUNCTION_LOCALS) {
+		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_LOCALS_OVERFLOW);
+		fail = "declared locals exceed the V8 function-locals cap";
+		goto done;
+	  } }
+
 	lc.li = li; lc.nvreg = nvreg; lc.refslot = NULL; lc.ref_wt = NULL; lc.refbase = refbase_idx; lc.rtmp = rtmp_idx;
 	/* In lazy methods spentry is zero until materialization, then becomes the nonzero entry SP.
 	 * Reuse it as the active marker instead of reserving one extra i32 local in every JIT method. */
@@ -6355,11 +6379,65 @@ vcall_cold_miss_emit:
 			am [0].eh_tpool = eh_type_idx;
 			wj_asm_policy_init (&pol, FALSE /* keep self-recursion indirect, as it has always been */);
 			wasm_buf_init (&out);
-			/* out_deps NULL: a lone method's dependency set is the emit-time one from
-			 * wj_result_add_direct_dep, which also gates emission on direct_deps_truncated. Only a
-			 * re-framing needs the assembler to recompute it, because only a re-framing changes which
-			 * calls became module-local. */
+			/*
+			 * TAKE THE ASSEMBLER'S DEPENDENCY SET HERE TOO, and union it with the emit-time one.
+			 *
+			 * This used to pass out_deps NULL, on the reasoning that "a lone method's dependency set is
+			 * the emit-time one from wj_result_add_direct_dep ... only a re-framing changes which calls
+			 * became module-local". The first half of that does not hold: the emit-time set is recorded
+			 * by hand at the sites that happen to call the recorder, so it is only as complete as that
+			 * list, while the RELOCATIONS are what the bytes are actually built from. R285 caught the
+			 * difference in the act -- `i32.const 467053; call_indirect` baked into a live body with no
+			 * descriptor anywhere declaring slot 467053, so admission had nothing to install, the closure
+			 * walk completed clean (`install_budget_out=0`), and the first worker to reach that call
+			 * without having installed the callee for some other reason found
+			 * mono_jiterp_placeholder_jit_call in the table and trapped with `function signature
+			 * mismatch`.
+			 *
+			 * Deriving from relocs closes that by construction and needs no audit of which emitter site
+			 * remembered to record: every baked f-slot reaches the encoder as a reloc, because that is
+			 * how the constant is emitted at all (wasm-encoder.c's CALL arm writes
+			 * `i32.const r->table_index; call_indirect`). It is also the mechanism the BATCHED path has
+			 * always used, so this makes the two paths agree rather than introducing a third.
+			 *
+			 * THE SIG IS THE ASSEMBLER'S OWN, deliberately: wj_asm_deps_add stores
+			 * wj_functype_hash (&self_types [r->tpool]), the same value wj_result_add_direct_dep is given
+			 * at the emit sites -- so a slot recorded both ways DEDUPES rather than looking like one slot
+			 * under two ABIs, which is what would (correctly) reject the emission.
+			 *
+			 * COUNTED, because the interesting number is how many deps only the relocs knew about. A zero
+			 * would mean the emit-time recording was already complete and this is inert; a large number
+			 * is the size of the hole R285 found one instance of.
+			 */
+			/* HOST_BROWSER-ONLY, and structurally so: wj_result_add_direct_dep lives inside
+			 * mini-wasm-ir.inc's `#ifdef HOST_BROWSER` region, while this framing block also runs in the
+			 * offline cross-compiler dump path -- which has no admission and therefore no use for a
+			 * dependency set. An unguarded call here compiles in the browser database and fails the
+			 * cross LINK, the gap csyn.sh cannot see. */
+#if HOST_BROWSER
+			{
+				WjAsmDeps sdeps;
+				int di;
+				memset (&sdeps, 0, sizeof (sdeps));
+				wj_assemble (am, 1, 1, &pol, &out, NULL, &sdeps);
+				for (di = 0; di < sdeps.n; ++di) {
+					int before = cfg->wasm_jit_result.ndirect_deps;
+					wj_result_add_direct_dep (&cfg->wasm_jit_result, sdeps.slot [di],
+					                          sdeps.sig [di], sdeps.method [di]);
+					if (cfg->wasm_jit_result.ndirect_deps != before)
+						mono_wasm_jit_counters [WJC_DEPS_FROM_RELOCS]++;
+				}
+				wj_asm_deps_free (&sdeps);
+				/* Same gate the emit sites apply: an incomplete set must not reach registration, because
+				 * an undeclared baked slot is exactly the defect this block exists to remove. */
+				if (cfg->wasm_jit_result.direct_deps_truncated) {
+					fail = "too many direct dependencies (reloc-derived)";
+					goto done;
+				}
+			}
+#else
 			wj_assemble (am, 1, 1, &pol, &out, NULL, NULL);
+#endif
 			/* Keep the relocatable body. Framing consumed nothing -- the buffers still hold instruction
 			 * bytes and relocations, unresolved -- so this method can later be re-framed alongside others
 			 * without being compiled again. Attached to the registry on success below; freed at `done`
@@ -6498,7 +6576,22 @@ vcall_cold_miss_emit:
 				 * next attempt re-emits, and on a worker that is not under pressure it will instantiate.
 				 * The caller parks rather than condemns, and the hit counter or a waiter brings it back.
 				 * WJC_INVALID still counts the event, so the rate stays visible. */
-				cfg->wasm_jit_result.retriable = 1;
+				/* ... but ONLY when the failure can actually clear. A CompileError is V8 refusing to
+				 * VALIDATE the bytes: emission is deterministic, so the next attempt builds the same
+				 * module and gets the same error, forever. Routing that into the retry path is the
+				 * unbounded-refusal trap CLAUDE.md records for admission, on the instantiation path:
+				 * measured on class_3580:.cctor ("local count too large"), 15 recompiles of a ~1.5 s
+				 * method back to back = 22.4 s of the boot window with `registered` flat. The specific
+				 * cause of that one is now refused before emission (WASM_MAX_FUNCTION_LOCALS), but the
+				 * CLASS is closed here: any future codegen bug that emits invalid bytes costs ONE
+				 * compile, not an unbounded stall that reads as a hang.
+				 *
+				 * Everything else stays retriable, which is the case R245 Stage 2c added this for: an
+				 * OOM or a LinkError is a property of THIS worker at THIS moment (imports are per-worker,
+				 * memory pressure is transient), and re-emitting elsewhere succeeds.R289. */
+				{ gboolean _perm = ierr [0] && strstr (ierr, "CompileError") != NULL;
+				  cfg->wasm_jit_result.retriable = _perm ? 0 : 1;
+				  if (G_UNLIKELY (mono_wasm_jit_stats) && _perm) mono_wasm_jit_count (WJC_INVALID_PERM); }
 				g_free (cached);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_INVALID);
 				if (mono_wasm_jit_verbose >= 1) { printf ("WASM_JIT_INVALID %s e_slot=%d len=%u : %s\n", mname, e_slot, (unsigned) out.len, ierr); }

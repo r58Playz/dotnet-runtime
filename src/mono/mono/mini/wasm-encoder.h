@@ -357,6 +357,12 @@ typedef struct {
 
 /* A function type (for callee signatures referenced by call_indirect). */
 #define WASM_FUNCTYPE_MAX_PARAMS 16
+
+/* V8's hard cap on a single function's PARAMS + declared locals, enforced at validation and raised as
+ * "local count too large": kV8MaxWasmFunctionLocals, v8/src/wasm/wasm-limits.h:50, checked in
+ * function-body-decoder-impl.h:1920. Not a self-imposed budget -- exceeding it is a CompileError from
+ * WebAssembly.Module(), so the emitter must refuse the method instead of emitting bytes V8 will reject. */
+#define WASM_MAX_FUNCTION_LOCALS 50000
 typedef struct {
 	WasmValtype params [WASM_FUNCTYPE_MAX_PARAMS];
 	guint32     nparams;

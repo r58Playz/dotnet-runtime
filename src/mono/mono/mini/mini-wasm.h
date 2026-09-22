@@ -1096,6 +1096,25 @@ enum {
 	 * backend and names this the discriminating measurement: it says whether fixing the PREDICATE leaves
 	 * the real retainer in place, and it is far cheaper than the purge-on-teardown fix it would justify. */
 	WJC_CANON_SUBSTITUTED,
+
+	/* Dependencies that ONLY the relocations knew about -- added to a standalone method's depset by the
+	 * union in the framing block, on top of what the emit-time recorder had. The emit-time set is
+	 * recorded by hand at the sites that call wj_result_add_direct_dep, so it is only as complete as that
+	 * list; the relocs are what the bytes are built from. ZERO means the hand-recording was already
+	 * complete and the union is inert. NON-ZERO is the size of the hole R285 caught one instance of: a
+	 * baked f-slot no descriptor declared, hence never installed, hence a placeholder trap. */
+	WJC_DEPS_FROM_RELOCS,
+	/* Methods refused before emission because params + declared locals would exceed V8's
+	 * kV8MaxWasmFunctionLocals (v8/src/wasm/wasm-limits.h:50). Non-zero is expected and small: 1.16.1's
+	 * BlockStateFlattening:.cctor is the known member. See WJC_INVALID_PERM for why this is checked
+	 * HERE and not left to instantiation. */
+	WJC_LOCALS_OVERFLOW,
+	/* Instantiation failures refused PERMANENTLY because the error was a CompileError, i.e. the bytes
+	 * are invalid and re-emitting produces the same bytes. The rest of the WJC_INVALID population stays
+	 * retriable (a per-worker OOM is transient and re-emitting on an unloaded worker succeeds).
+	 * This split exists because routing a deterministic failure into the retry path is unbounded: one
+	 * method recompiled every dispatch cost 22.4 s of boot. See R289. */
+	WJC_INVALID_PERM,
 	WJC_MAX
 };
 

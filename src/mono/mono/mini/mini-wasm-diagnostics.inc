@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 284);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator */
+g_static_assert (WJC_MAX == 287);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -383,12 +383,23 @@ mono_wasm_jit_dump_stats (void)
 	 * degenerated back into the leak it replaced. */
 	printf ("[wasm-jit bounds] closure_max=%lld install_budget_out=%lld walk_gc_pending=%lld"
 		" | rv_retry ok=%lld maxn=%lld full=%lld dropped=%lld try_max=%lld"
-		" | worker_slots=%lld full=%lld | retired=%lld freed=%lld reclaims=%lld depth_max=%lld\n",
+		" | worker_slots=%lld full=%lld | retired=%lld freed=%lld reclaims=%lld depth_max=%lld"
+		" | deps_from_relocs=%lld | locals_overflow=%lld invalid_perm=%lld\n",
 		WJC_(WJC_SW_CLOSURE_MAX), WJC_(WJC_INSTALL_BUDGET_OUT), WJC_(WJC_ADMIT_WALK_GC_PENDING),
 		WJC_(WJC_RV_RETRY_OK), WJC_(WJC_RV_RETRY_MAXN), WJC_(WJC_RV_RETRY_FULL),
 		WJC_(WJC_RV_RETRY_DROPPED), WJC_(WJC_RV_RETRY_ATTEMPT_MAX),
 		WJC_(WJC_WORKER_SLOTS), WJC_(WJC_WORKER_SLOTS_FULL),
-		WJC_(WJC_RETIRED), WJC_(WJC_RETIRE_FREED), WJC_(WJC_RETIRE_RECLAIMS), WJC_(WJC_RETIRE_DEPTH_MAX));
+		WJC_(WJC_RETIRED), WJC_(WJC_RETIRE_FREED), WJC_(WJC_RETIRE_RECLAIMS), WJC_(WJC_RETIRE_DEPTH_MAX),
+		/* Deps only the RELOCATIONS knew about. Zero => the hand-recording at the emit sites was already
+		 * complete and the union is inert; non-zero is the size of the hole R285 caught one instance of. */
+		WJC_(WJC_DEPS_FROM_RELOCS),
+		/* Deterministic compile failures, both of which used to spin. locals_overflow: methods refused
+		 * before emission for exceeding V8's params+locals cap -- expected small and non-zero (1.16.1's
+		 * BlockStateFlattening:.cctor). invalid_perm: instantiation failures refused permanently because
+		 * V8 returned a CompileError, i.e. bytes that re-emission would reproduce exactly. A NON-ZERO
+		 * invalid_perm with locals_overflow zero means a DIFFERENT codegen bug is emitting invalid
+		 * modules -- read the WASM_JIT_INVALID line for the method and V8's message.R289. */
+		WJC_(WJC_LOCALS_OVERFLOW), WJC_(WJC_INVALID_PERM));
 	/*
 	 * WJ_SPIN_CENSUS -- the line to read first on a run that hung with a core pinned and `registered`
 	 * flat. Every quantity here was UNOBSERVABLE before: mono_thread_info_yield() is a no-op on wasm, so
