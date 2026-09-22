@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 271);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline */
+g_static_assert (WJC_MAX == 284);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -287,6 +287,37 @@ mono_wasm_jit_dump_stats (void)
 	printf ("[wasm-jit badmeth] seen=%lld (0 => guards never ran)  caught: peek=%lld registry=%lld profile=%lld canon=%lld\n",
 		WJC_(WJC_BADMETH_SEEN), WJC_(WJC_BADMETH_PEEK), WJC_(WJC_BADMETH_REGISTRY),
 		WJC_(WJC_BADMETH_PROFILE), WJC_(WJC_BADMETH_CANON));
+	/*
+	 * WJ_PERMSET -- the retained-MonoMethod* exposure, after removing the dereference rather than
+	 * guarding it.
+	 *
+	 * mono_wasm_jit_callee_perm_unjittable needed ONE BIT and reached it through four dereferences of a
+	 * pointer the emitter does not own; that site aborted the process twice, from two different hazards,
+	 * and `peek' fixed only the first. The bit is now RECORDED where it becomes true and answered by
+	 * pointer comparison, which never dereferences.
+	 *
+	 * HOW TO READ IT, in this order -- the first row is the liveness check and the rest are meaningless
+	 * without it:
+	 *   adds=0    the set is never populated: the insert is not where the fact becomes true. Everything
+	 *             else on this line is then uninterpretable, and this is the likely implementation error.
+	 *   hits      predicate answers served WITHOUT a dereference. Not a fault count -- most are live
+	 *             methods -- it is the size of the exposure that no longer exists.
+	 *   full      MUST be 0. Non-zero means the set stopped answering and the predicate silently fell
+	 *             back to "not permanently un-JITtable", i.e. a codegen difference presenting as a
+	 *             mysterious regression.
+	 *   stale     the append-only set handing out a false positive, from the one path that can clear a
+	 *             permanent bail (tiering.c's RELINK_BAIL_CLEARED arm, which R252 measured at 0). Costs
+	 *             one call edge an interp transition. Counted so the design rests on a reading rather
+	 *             than on someone else's measurement.
+	 *
+	 * canon_subst is the DISCRIMINATOR from DANGLING-MONOMETHOD.md: emit-time callees substituted out of
+	 * wj_sync_inner_canon, the process-lifetime table that never removes an entry. It says whether fixing
+	 * the predicate left the real retainer in place, and therefore whether the expensive fix (purging on
+	 * mono_mem_manager_free) is justified -- it is much cheaper than that fix and must be read first.
+	 */
+	printf ("[wasm-jit permset] adds=%lld (0 => never populated) hits=%lld full=%lld stale=%lld | canon_subst=%lld\n",
+		WJC_(WJC_PERM_SET_ADDS), WJC_(WJC_PERM_SET_HITS), WJC_(WJC_PERM_SET_FULL),
+		WJC_(WJC_PERM_SET_STALE), WJC_(WJC_CANON_SUBSTITUTED));
 	/* Separate line, separate mechanism: badmeth is a DEAD POINTER, this is a LIVE method whose clause
 	 * table is inconsistent with its own body. Non-zero means mark_bb_in_region declined a method that
 	 * would previously have aborted the process -- run with MONO_WASM_JIT_VERBOSE=1 to get the name. */
@@ -351,12 +382,32 @@ mono_wasm_jit_dump_stats (void)
 	 * inside the registry reader bracket, so a large depth with few reclaims means the grace period has
 	 * degenerated back into the leak it replaced. */
 	printf ("[wasm-jit bounds] closure_max=%lld install_budget_out=%lld walk_gc_pending=%lld"
-		" | rv_retry ok=%lld maxn=%lld full=%lld"
+		" | rv_retry ok=%lld maxn=%lld full=%lld dropped=%lld try_max=%lld"
 		" | worker_slots=%lld full=%lld | retired=%lld freed=%lld reclaims=%lld depth_max=%lld\n",
 		WJC_(WJC_SW_CLOSURE_MAX), WJC_(WJC_INSTALL_BUDGET_OUT), WJC_(WJC_ADMIT_WALK_GC_PENDING),
 		WJC_(WJC_RV_RETRY_OK), WJC_(WJC_RV_RETRY_MAXN), WJC_(WJC_RV_RETRY_FULL),
+		WJC_(WJC_RV_RETRY_DROPPED), WJC_(WJC_RV_RETRY_ATTEMPT_MAX),
 		WJC_(WJC_WORKER_SLOTS), WJC_(WJC_WORKER_SLOTS_FULL),
 		WJC_(WJC_RETIRED), WJC_(WJC_RETIRE_FREED), WJC_(WJC_RETIRE_RECLAIMS), WJC_(WJC_RETIRE_DEPTH_MAX));
+	/*
+	 * WJ_SPIN_CENSUS -- the line to read first on a run that hung with a core pinned and `registered`
+	 * flat. Every quantity here was UNOBSERVABLE before: mono_thread_info_yield() is a no-op on wasm, so
+	 * both CAS loops in this backend were unbounded busy spins that no counter could see, and R275's
+	 * 22-byte two-thread spin had to be diagnosed with perf after the fact.
+	 *
+	 * HOW TO READ IT, decided before the measurement so the answer cannot be fitted afterwards:
+	 *   pub_reraise_max large     a safepoint condition that never clears -- the drain runs at every loop
+	 *                             back-edge. Then rv_retry dropped/try_max and worker_slots full say
+	 *                             WHICH of the three documented causes it is.
+	 *   retire/reemit spin_max    contention on a JIT lock is where the cores went.
+	 *   ALL SMALL ON A HUNG RUN   neither mechanism is the hang. Say so and go back to the profile --
+	 *                             do not defend the hypothesis.
+	 */
+	printf ("[wasm-jit spin] pub_reraise_max=%lld | retire spins=%lld max=%lld trylock_miss=%lld"
+		" | reemitq spins=%lld max=%lld\n",
+		WJC_(WJC_ACT_PUB_RERAISE_MAX),
+		WJC_(WJC_RETIRE_SPINS), WJC_(WJC_RETIRE_SPIN_MAX), WJC_(WJC_RETIRE_TRYLOCK_MISS),
+		WJC_(WJC_REEMIT_Q_SPINS), WJC_(WJC_REEMIT_Q_SPIN_MAX));
 	/* The mandatory-replacement chain, end to end. Every step must be readable or "re-emission works" is
 	 * an assertion: requested (IKVM body swaps + profile triggers) -> compiled -> republished -> adopted,
 	 * with the three ways a mandatory one can be lost broken out. */

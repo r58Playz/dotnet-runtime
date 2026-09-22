@@ -69,8 +69,42 @@ static __thread int    wj_drained_ever;
  * a detour it is the patch silently not applied. Counted, so "the list never overflows" is a reading.
  */
 #define WJ_RV_RETRY_MAX 64
+/*
+ * AND AN ATTEMPT BOUND, because the list could not previously drop ANYTHING.
+ *
+ * An entry left this list on one condition only: mono_wasm_jit_admit succeeding. But admit has refusals
+ * that are permanent by construction -- re->orphaned, state 3 past WJ_PERMFAIL_MAX, an ABI/identity
+ * mismatch, install-budget exhaustion -- and none of them was filtered before the entry was parked here.
+ * One such entry keeps wj_rv_retry_n > 0 forever, and the consequences compound:
+ *
+ *   - mono_wasm_jit_rendezvous_drain can never take its fast-path early return;
+ *   - so the safepoint helper re-raises WJ_ACT_PUB on this worker at the bottom of every poll;
+ *   - so `global.get 9; i32.load; if` is TRUE at EVERY LOOP BACK-EDGE in every JITted method here;
+ *   - so each back-edge runs a full drain: up to 64 admits, each walking a DFS budgeted at
+ *     wj_reg_n + 256 -- tens of thousands of nodes on this workload.
+ *
+ * The thread then burns a core while `registered` never moves: R269's "admit shows no delta for the whole
+ * phase, faults=[]" and R275's two threads at 92% with nothing to show for it.
+ *
+ * This is CLAUDE.md's admission rule arriving from a fourth direction -- "a refusal that can never clear,
+ * fed by a retry path that cannot drop" -- and the comment ten lines below states the assumption it
+ * breaks: "the delay is bounded by the refusal clearing". The fix is not to enumerate the permanent
+ * refusals (admit's refusal set is large, and a new one would silently reopen this): it is to make the
+ * retry itself finite, so ANY non-clearing condition is survivable whether or not it was anticipated.
+ *
+ * 64 ATTEMPTS, and the bound is loose on purpose. Drains happen at safepoint rate -- microseconds apart
+ * under load -- so this is not a deadline in wall time and must not be read as one; it is "this worker
+ * tried hard and is now getting on with its life". Dropping costs THIS worker the newer body for THIS
+ * descriptor: it keeps calling its own instantiation of the previous module, which is self-consistent and
+ * correct, just missing the improvement. That is strictly better than the alternative, which is the whole
+ * tier on this thread running at safepoint-drain speed forever.
+ */
+#define WJ_RV_RETRY_ATTEMPTS 64
 static __thread gint32 wj_rv_retry [WJ_RV_RETRY_MAX];
+static __thread gint32 wj_rv_retry_tries [WJ_RV_RETRY_MAX];
 static __thread int    wj_rv_retry_n;
+/* Consecutive safepoint polls that ended with WJ_ACT_PUB still owed. See WJC_ACT_PUB_RERAISE_MAX. */
+static __thread gint32 wj_pub_reraise;
 
 /*
  * THE PER-WORKER SAFEPOINT ACTION WORD, and why the emitted check reads one word rather than two.
@@ -229,7 +263,18 @@ mono_wasm_jit_rendezvous_drain (void)
 		if (mono_wasm_jit_admit (wj_rv_retry [k])) {
 			mono_wasm_jit_counters [WJC_RV_RETRY_OK]++;
 			wj_rv_retry [k] = wj_rv_retry [--wj_rv_retry_n];
+			wj_rv_retry_tries [k] = wj_rv_retry_tries [wj_rv_retry_n];
+		} else if (++wj_rv_retry_tries [k] >= WJ_RV_RETRY_ATTEMPTS) {
+			/* Give up on this one. NON-ZERO HERE IS THE HEALTHY READING: it counts the workers that
+			 * did NOT get pinned into a permanent drain. Read it beside WJC_RV_RETRY_ATTEMPT_MAX --
+			 * a zero with a LOW attempt_max means nothing ever needed to retry, while a zero with
+			 * attempt_max at the bound would mean this arm is dead code. */
+			mono_wasm_jit_counters [WJC_RV_RETRY_DROPPED]++;
+			wj_rv_retry [k] = wj_rv_retry [--wj_rv_retry_n];
+			wj_rv_retry_tries [k] = wj_rv_retry_tries [wj_rv_retry_n];
 		} else {
+			if (wj_rv_retry_tries [k] > mono_wasm_jit_counters [WJC_RV_RETRY_ATTEMPT_MAX])
+				mono_wasm_jit_counters [WJC_RV_RETRY_ATTEMPT_MAX] = wj_rv_retry_tries [k];
 			++k;
 		}
 	}
@@ -340,6 +385,7 @@ mono_wasm_jit_rendezvous_drain (void)
 				if (k < wj_rv_retry_n) {
 					/* already owed */
 				} else if (wj_rv_retry_n < WJ_RV_RETRY_MAX) {
+					wj_rv_retry_tries [wj_rv_retry_n] = 0;
 					wj_rv_retry [wj_rv_retry_n++] = desc_id;
 				} else {
 					mono_wasm_jit_counters [WJC_RV_RETRY_FULL]++;
@@ -354,7 +400,11 @@ mono_wasm_jit_rendezvous_drain (void)
 	}
 	/* The epoch advances unless the carry list overflowed. An un-acknowledged generation is not
 	 * stale-code execution -- the owed descriptors are re-admitted above at every later safepoint -- it is
-	 * only a delay, and the delay is bounded by the refusal clearing. */
+	 * only a delay.
+	 *
+	 * This used to end "and the delay is bounded by the refusal clearing", which was an ASSUMPTION about
+	 * mono_wasm_jit_admit that is false for its permanent refusals. It is now bounded by
+	 * WJ_RV_RETRY_ATTEMPTS instead, i.e. by this code rather than by someone else's. See the note there. */
 	wj_local_epoch = pin ? completed : target;
 	if (wj_rv_retry_n > (int) mono_wasm_jit_counters [WJC_RV_RETRY_MAXN])
 		mono_wasm_jit_counters [WJC_RV_RETRY_MAXN] = wj_rv_retry_n;
@@ -397,8 +447,17 @@ mono_wasm_jit_safepoint_poll (void)
 	if (wj_my_action && wj_my_action != &wj_worker_action_overflow) {
 		if (mono_polling_required)
 			wj_action_or (wj_my_action, WJ_ACT_GC);
-		if (wj_local_epoch != wj_global_epoch || wj_rv_retry_n)
+		if (wj_local_epoch != wj_global_epoch || wj_rv_retry_n) {
 			wj_action_or (wj_my_action, WJ_ACT_PUB);
+			/* Leaving with PUB still owed. Consecutive, because ONE of these is normal (the work
+			 * arrived while we were servicing) and a THOUSAND means a condition that cannot clear --
+			 * which is the difference between a healthy worker and one paying a full drain at every
+			 * loop back-edge for the rest of the run. */
+			if (++wj_pub_reraise > mono_wasm_jit_counters [WJC_ACT_PUB_RERAISE_MAX])
+				mono_wasm_jit_counters [WJC_ACT_PUB_RERAISE_MAX] = wj_pub_reraise;
+		} else {
+			wj_pub_reraise = 0;
+		}
 	}
 }
 

@@ -322,6 +322,17 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 		mono_atomic_inc_i32 (&mono_interp_relink_refreshed);
 		mono_wasm_jit_count (WJC_RELINK_REFRESHED);
 	} else if (old_imethod->wasm_jit_slot == -1) {
+		/* The ONE path that can falsify an entry in the backend's append-only perm-unjittable pointer
+		 * set. Probe it so "the set never goes stale" is measured rather than inherited from R252.
+		 *
+		 * HOST_BROWSER-GUARDED, and structurally so: the probe lives in mini-wasm.c inside its
+		 * `#ifdef HOST_BROWSER` region, while BOTH files are linked into the offline cross-compiler as
+		 * well as the runtime -- so an unguarded call leaves mono-aot-cross with an undefined symbol.
+		 * csyn.sh CANNOT catch this (it compiles, it does not link) and it is the same failure interp.c
+		 * already documents at its own probe site. It cost a full build here. */
+#if HOST_BROWSER
+		{ extern void mono_wasm_jit_note_perm_cleared (MonoMethod *m); mono_wasm_jit_note_perm_cleared (old_imethod->method); }
+#endif
 		new_imethod->wasm_jit_slot = 0;
 		new_imethod->wasm_jit_bail = 0;
 		new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;

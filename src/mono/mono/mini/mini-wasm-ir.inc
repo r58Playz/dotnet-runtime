@@ -1111,6 +1111,21 @@ wj_canonical_callee (MonoMethod *m)
 	 * -- losing canonicalisation costs f-slot stability, not correctness. */
 	if (canon != m && G_UNLIKELY (!mono_wasm_jit_method_usable (canon, WJ_BADMETH_SITE_CANON)))
 		return m;
+	/*
+	 * THE DISCRIMINATING MEASUREMENT (DANGLING-MONOMETHOD.md). Fixing the emit-time predicate stops it
+	 * dereferencing a retained pointer, but it does NOT retire this table -- and the doc is explicit that
+	 * the cheap thing to do first is find out whether the crashing pointer came from here or from the
+	 * IR's own call->method, because that decides whether the expensive fix (purging retained pointers on
+	 * mono_mem_manager_free, which needs a reverse index and must be safe against lock-free readers) is
+	 * justified at all.
+	 *
+	 * This counter is that measurement: how many emit-time callees were SUBSTITUTED out of a table that
+	 * never removes an entry and whose values were captured on some earlier compile. A large number means
+	 * the exposure is broad and survives today's fix; a small one means the table is a narrow special
+	 * case and the IR's own pointer is the thing to chase.
+	 */
+	if (canon != m)
+		mono_wasm_jit_counters [WJC_CANON_SUBSTITUTED]++;
 	return canon;
 }
 

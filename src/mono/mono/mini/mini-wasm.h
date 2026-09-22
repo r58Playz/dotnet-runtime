@@ -1029,6 +1029,73 @@ enum {
 	 * malformed body that USED TO ABORT THE PROCESS -- so non-zero is the healthy reading only in the
 	 * sense that the run survived; the body itself is still a bug in whoever emitted it. */
 	WJC_BAD_EH_CLAUSE,
+
+	/* SPIN CENSUS. mono_thread_info_yield() is a NO-OP on wasm -- mono_threads_platform_yield() is
+	 * `{ return TRUE; }` (mono-threads-wasm.c:169-172) -- so every CAS retry loop in this backend was an
+	 * unbounded, unyielding, UNCOUNTED busy spin. Two threads hammering one lock word is also the only
+	 * thing that puts two DIFFERENT threads on the SAME ~22 bytes of generated code, which is exactly
+	 * what R275 measured on the world-load hang (5 addresses, 0x6b3f-0x6b55, both threads, wchan=0,
+	 * uninterruptible by Debugger.pause).
+	 *
+	 * THESE COUNTERS EXIST TO SETTLE THAT, and the reading that matters comes from a HANGING run:
+	 *   spin_max large   -> contention on this lock is real and worth attacking.
+	 *   spin_max small   -> the spin is NOT the hang, and the next instrument is a symbolised profile.
+	 * A high-water rather than a total, because a total cannot distinguish "briefly contended a million
+	 * times" from "one thread stuck". Both are recorded: _SPINS is the total, _SPIN_MAX the worst single
+	 * acquisition. */
+	WJC_RETIRE_SPINS, WJC_RETIRE_SPIN_MAX, WJC_RETIRE_TRYLOCK_MISS,
+	WJC_REEMIT_Q_SPINS, WJC_REEMIT_Q_SPIN_MAX,
+
+	/* THE CARRY LIST'S DROP CENSUS -- see wj_rv_retry in mini-wasm-publish.inc.
+	 *
+	 * An entry used to leave the list ONLY on admit success, while mono_wasm_jit_admit has refusals that
+	 * are permanent by construction. One such entry keeps wj_rv_retry_n > 0 forever, which re-raises
+	 * WJ_ACT_PUB at every safepoint, which makes EVERY LOOP BACK-EDGE in every JITted method on that
+	 * worker run a full drain. `registered` then stays flat while the thread burns a core -- the exact
+	 * signature R269/R275 recorded and could not explain.
+	 *
+	 * RETRY_DROPPED is the count of entries given up on after WJ_RV_RETRY_ATTEMPTS. Non-zero is the
+	 * HEALTHY reading: it is the number of workers that did NOT get stuck. A counter stuck at 0 means
+	 * either the condition never arises or the drop path is dead code -- and RETRY_ATTEMPT_MAX
+	 * distinguishes those, because it rises as soon as anything retries at all. */
+	WJC_RV_RETRY_DROPPED, WJC_RV_RETRY_ATTEMPT_MAX,
+
+	/* HOW OFTEN A WORKER LEAVES THE SAFEPOINT HELPER WITH WORK STILL OWED, consecutively.
+	 *
+	 * `s.g` is cleared by RE-DERIVING its two conditions, so a condition that is permanently true makes
+	 * the emitted `global.get 9; i32.load; if` fire on every loop back-edge forever. All three known ways
+	 * that happens are documented at their sites (a stuck carry list, the `pin` path leaving the epoch
+	 * behind, and the overflow word), and none of them was observable from outside: the tier simply looks
+	 * frozen while a core is busy.
+	 *
+	 * A HIGH-WATER OF CONSECUTIVE RE-RAISES IS THE DIRECT TEST, and it is cheap because it is per-worker
+	 * and unsynchronised. In health it stays in single digits -- a publication is adopted within a poll
+	 * or two. In the pathology it grows without bound. Read it beside rv_retry/worker_slots to say WHICH
+	 * of the three it is. */
+	WJC_ACT_PUB_RERAISE_MAX,
+
+	/* THE PERMANENTLY-UN-JITTABLE POINTER SET (mono_wasm_jit_note_perm_unjittable).
+	 *
+	 * `adds` is the LIVENESS CHECK, and reading the rest without it is meaningless: a zero `adds` means
+	 * the set is never populated -- i.e. the insert is not at the site where the fact becomes true --
+	 * and then `hits` reading 0 says nothing at all. That is the likely implementation error for this
+	 * shape, so it is the first thing to check.
+	 *
+	 * `hits` is how many predicate answers came from POINTER COMPARISON instead of from four
+	 * dereferences of a possibly-freed MonoMethod*. It is not a fault count: most hits are perfectly
+	 * live methods. It is the size of the exposure that no longer exists.
+	 *
+	 * `full` must stay 0. Non-zero means the table stopped answering and the predicate silently fell
+	 * back to "not permanently un-JITtable" -- a codegen difference, not a crash, which is exactly the
+	 * kind of thing that reads as a mysterious regression. */
+	WJC_PERM_SET_ADDS, WJC_PERM_SET_HITS, WJC_PERM_SET_FULL, WJC_PERM_SET_STALE,
+
+	/* Emit-time predicate calls whose callee was SUBSTITUTED by wj_canonical_callee, i.e. answered about
+	 * a pointer out of the process-lifetime wj_sync_inner_canon table rather than about the IR's own
+	 * call->method. DANGLING-MONOMETHOD.md ranks that table as the largest retention window in the
+	 * backend and names this the discriminating measurement: it says whether fixing the PREDICATE leaves
+	 * the real retainer in place, and it is far cheaper than the purge-on-teardown fix it would justify. */
+	WJC_CANON_SUBSTITUTED,
 	WJC_MAX
 };
 
