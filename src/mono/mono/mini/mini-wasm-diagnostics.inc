@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 287);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals */
+g_static_assert (WJC_MAX == 323);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -458,6 +458,64 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_REFBASES_EXTRA));
 	printf ("[wasm-jit gcpin] ref_slots=%lld wt_vregs=%lld slots_elided=%lld slot_zero_stores=%lld frame_bytes=%lld\n",
 		WJC_(WJC_REF_SLOTS), WJC_(WJC_REF_WT_VREGS), WJC_(WJC_SLOTS_ELIDED), WJC_(WJC_SLOT_ZERO_STORES), WJC_(WJC_FRAME_BYTES));
+	{
+		extern int mono_wasm_jit_lazy_cold;
+		printf ("[wasm-jit lazycold] gate=v2 methods=%lld new=%lld doomed=%lld (doomed_seen=%lld hot0=%lld) "
+			"(MONO_WASM_JIT_LAZY_COLD=%d) -- `new` is the reach: methods the LAZY_GCP gate alone left eager; `doomed` "
+			"needed level 2's throw-path discount\n",
+			WJC_(WJC_LAZY_COLD), WJC_(WJC_LAZY_COLD_NEW), WJC_(WJC_LAZY_COLD_DOOMED), WJC_(WJC_LAZY_DOOMED_SEEN),
+			WJC_(WJC_LAZY_DOOMED_HOT0), mono_wasm_jit_lazy_cold);
+	}
+	{
+		extern int mono_wasm_jit_frame_zero;
+		printf ("[wasm-jit framezero] skipped_bytes=%lld (MONO_WASM_JIT_FRAME_ZERO=%d) -- write-through ref-region bytes "
+			"no eager prologue zeroed, per method emitted\n", WJC_(WJC_FRAME_ZERO_SKIPPED), mono_wasm_jit_frame_zero);
+	}
+	{
+		extern int mono_wasm_jit_vcall_memo;
+		printf ("[wasm-jit vmemo] hit=%lld fill=%lld stale=%lld (MONO_WASM_JIT_VCALL_MEMO=%d) -- hits are vcall misses "
+			"served without a resolve; read against vcall ic_miss\n",
+			WJC_(WJC_VMEMO_HIT), WJC_(WJC_VMEMO_FILL), WJC_(WJC_VMEMO_STALE), mono_wasm_jit_vcall_memo);
+	}
+	{
+		extern int mono_wasm_jit_inline_leaf;
+		printf ("[wasm-jit inline-leaf] admitted=%lld (MONO_WASM_JIT_INLINE_LEAF=%d IL bytes) -- call-free callees past the "
+			"20-byte limit; counted at the gate, inline_method may still refuse\n",
+			WJC_(WJC_INLINE_LEAF_ADMIT), mono_wasm_jit_inline_leaf);
+	}
+	{
+		extern int mono_wasm_jit_deadset, mono_wasm_jit_retire_free, mono_wasm_jit_aot_entry;
+		printf ("[wasm-jit deadset] adds=%lld full=%lld revived=%lld | hits: island=%lld prof=%lld canon=%lld "
+			"(DEADSET=%d RETIRE_FREE=%d AOT_ENTRY=%d) -- adds 0 => the free hook never fired\n",
+			WJC_(WJC_DEADSET_ADDS), WJC_(WJC_DEADSET_FULL), WJC_(WJC_DEADSET_REVIVED),
+			WJC_(WJC_DEAD_HIT_ISLAND), WJC_(WJC_DEAD_HIT_PROF), WJC_(WJC_DEAD_HIT_CANON),
+			mono_wasm_jit_deadset, mono_wasm_jit_retire_free, mono_wasm_jit_aot_entry);
+		printf ("[wasm-jit fixedjit] dep=%lld eslot=%lld -- fixed-index relocs that named a JIT slot (R285's trap population)\n",
+			WJC_(WJC_FIXED_JIT_DEP), WJC_(WJC_FIXED_JIT_ESLOT));
+		{
+			extern gint32 mono_wasm_jit_min_stack_headroom (void);
+			printf ("[wasm-jit stackhead] min=%d low32k=%lld island_tls_bad=%lld -- linear-memory stack headroom at "
+				"JITted-EH-method entry, bytes, min over all threads (MONO_WASM_JIT_STATS runs only)\n", mono_wasm_jit_min_stack_headroom (),
+				WJC_(WJC_STACK_LOW), WJC_(WJC_ISLAND_TLS_BAD));
+		}
+		{
+			extern int mono_wasm_jit_reuse_reset;
+			printf ("[wasm-jit reuse] events=%lld tramps=%lld adapters=%lld slots=%lld foreign_scratch=%lld "
+				"slow_live=%lld (REUSE_RESET=%d, hook-silent) -- a worker taken up by a new pthread while holding code built "
+				"under the previous one; foreign_scratch > 0 = such code ran; slow_live = entries a trampoline "
+				"could have forwarded\n",
+				WJC_(WJC_REUSE_EVENTS), WJC_(WJC_REUSE_TRAMP), WJC_(WJC_REUSE_ADAPTER), WJC_(WJC_REUSE_SLOT),
+				WJC_(WJC_REUSE_FOREIGN_SCRATCH), WJC_(WJC_ENTRY_SLOW_LIVE), mono_wasm_jit_reuse_reset);
+			printf ("[wasm-jit entry-adopt] adopted=%lld refused=%lld -- interp-entry trampolines a worker took over from "
+				"the worker that created them (R293c)\n", WJC_(WJC_ENTRY_ADOPT), WJC_(WJC_ENTRY_ADOPT_FAIL));
+			printf ("[wasm-jit placeholder] stray=%lld -- calls into the slot placeholder from anything but do_jit_call; "
+				"each wrote 999 through an arbitrary pointer. Must read 0\n", WJC_(WJC_PLACEHOLDER_STRAY));
+		}
+		{
+			extern void mono_wasm_jit_edge_dump (void);
+			mono_wasm_jit_edge_dump ();
+		}
+	}
 	printf ("[wasm-jit callform] local=%lld import=%lld indirect=%lld (per module assembled, not per execution)\n",
 		WJC_(WJC_CALL_LOCAL), WJC_(WJC_CALL_IMPORT), WJC_(WJC_CALL_INDIRECT));
 	/* Read colocated_members against registered for the co-located fraction of the tier, and the local

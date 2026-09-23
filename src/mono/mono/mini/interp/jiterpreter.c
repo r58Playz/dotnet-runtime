@@ -557,6 +557,12 @@ mono_jiterp_wasm_jit_entry_ok (InterpMethod *rmethod)
 	/* MONO_WASM_JIT_AOT_ENTRY gated this and shipped 1. Trampolines are generated once and cached, so
 	 * this was also the kill switch -- a run with it off emitted no fast path at all, which made it a
 	 * clean A/B baseline. Settled; unconditional. */
+	/* MONO_WASM_JIT_AOT_ENTRY=0 is a DIAGNOSTIC: no direct forward, so every AOT->JIT entry takes the C
+	 * interp_entry boundary. It discriminates the out-of-bounds traps whose stacks all run AOT -> this
+	 * trampoline -> a co-located member (R290). Trampolines are cached, so it must be set at startup. */
+	extern int mono_wasm_jit_aot_entry;
+	if (!mono_wasm_jit_aot_entry)
+		return FALSE;
 	return rmethod && !rmethod->is_invoke && !rmethod->needs_thread_attach;
 }
 
@@ -1296,6 +1302,7 @@ enum {
 	JITERP_MEMBER_BACKWARD_BRANCH_TAKEN,
 	JITERP_MEMBER_BAILOUT_OPCODE_COUNT,
 	JITERP_MEMBER_WASM_JIT_FSLOT,
+	JITERP_MEMBER_IMETHOD_METHOD,
 };
 
 
@@ -1344,6 +1351,10 @@ mono_jiterp_get_member_offset (int member) {
 			return offsetof (JiterpreterCallInfo, bailout_opcode_count);
 		case JITERP_MEMBER_WASM_JIT_FSLOT:
 			return offsetof (InterpMethod, wasm_jit_fslot);
+		/* Lets the per-worker interp-entry infoTable prove an entry still describes the method now at that
+		 * InterpMethod address -- a freed DynamicMethod's InterpMethod memory is recycled (R291). */
+		case JITERP_MEMBER_IMETHOD_METHOD:
+			return offsetof (InterpMethod, method);
 		default:
 			g_assert_not_reached();
 	}

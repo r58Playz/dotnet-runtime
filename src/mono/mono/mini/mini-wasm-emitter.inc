@@ -189,6 +189,20 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean method_nogc G_GNUC_UNUSED = FALSE;        /* transitive direct-call effect published in WjRegEntry */
 	int effective_gcp_count G_GNUC_UNUSED = 0;         /* static returning GC points after direct no-GC resolution */
 	gboolean lazy_ref_frame = FALSE;     /* defer a pure ref frame until the first effective GC point */
+	/* MONO_WASM_JIT_LAZY_COLD: the lazy frame can only materialise in a raise or poll taken arm, so it is
+	 * never live on the hot path -- no mirrors, kill stores, exit restore, or hot ENSURE (see the knob). */
+	gboolean lazy_cold_frame = FALSE;
+	int hot_gcp_count G_GNUC_UNUSED = 0; /* effective GC points that are neither a raise nor OP_GC_SAFE_POINT */
+	/* LAZY_COLD=2 (R294): per-LAYOUT-INDEX flag, "this bb cannot reach the method exit" -- every path
+	 * through it ends in a throw, so its GC points run only on the exception path and are not counted in
+	 * hot_gcp_count (they go to doomed_gcp_count). The emission loop runs a cold frame as an ordinary lazy
+	 * frame (lazy_frame 1: conditional mirrors) inside these blocks: a GC point there materialises the
+	 * frame, and the refs defined after it must still reach their slots before the next one. Sound
+	 * because a doomed block's successors are all doomed -- once in, control never returns to a block
+	 * where the frame is assumed absent. NULL when not computed. */
+	guint8 *lazy_doomed = NULL;
+	int doomed_gcp_count G_GNUC_UNUSED = 0;
+	gboolean gcp_walked G_GNUC_UNUSED = FALSE;   /* the SLOTLIVE walk ran, so the two counts above are real */
 	MonoInst *terminal_vcall_ins G_GNUC_UNUSED = NULL; /* last GC point in an acyclic forwarding wrapper; owns root handoff + guarded specialization */
 	int terminal_vcall_ord G_GNUC_UNUSED = -1;         /* layout ordinal used to prove every elided reference dies at/before that handoff */
 	gboolean terminal_vcall_handoff G_GNUC_UNUSED = FALSE; /* all pre-call references die at the terminal vcall; poll-prefix frames may stay cold */
@@ -1429,6 +1443,54 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * frame-free class. Otherwise, every instruction must be locally pure or a direct
 				 * call to an already-published no-GC method. */
 				method_nogc = cfg->header->num_clauses == 0;
+#ifdef HOST_BROWSER
+				{
+					/* DOOMED blocks, for LAZY_COLD=2: backward reachability from the exit to a fixpoint. A bb
+					 * that ENDS IN A THROW never reaches the exit whatever its edges say -- method-to-ir links
+					 * every CEE_THROW block to end_bblock for liveness (method-to-ir.c, MONO_CEE_THROW), and
+					 * reading that edge as real made every throw path look live (R294: doomed=0). Otherwise a bb
+					 * reaches the exit if it IS the exit, is the last in layout (the emitter returns there when
+					 * it falls off the end), has no out-edge at all (a missing edge must read HOT, never cold),
+					 * or has a successor that does. Only without clauses: a handler resumes into this method,
+					 * so a throw is not an exit. */
+					extern int mono_wasm_jit_lazy_cold;
+					if (mono_wasm_jit_lazy_cold >= 2 && cfg->header->num_clauses == 0 && nbbs > 0) {
+						guint8 *reach = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nbbs);
+						gboolean changed = TRUE;
+						while (changed) {
+							changed = FALSE;
+							bbn = 0;
+							for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
+								int oi;
+								gboolean ends_throw;
+								if (reach [bbn])
+									continue;
+								ends_throw = bbl->last_ins && (bbl->last_ins->opcode == OP_NOT_REACHED ||
+									bbl->last_ins->opcode == OP_THROW || bbl->last_ins->opcode == OP_RETHROW);
+								if (ends_throw && bbl != cfg->bb_exit)
+									continue;      /* never reaches the exit; its end_bblock edge is liveness-only */
+								if (bbl == cfg->bb_exit || !bbl->next_bb || bbl->out_count == 0) {
+									reach [bbn] = 1; changed = TRUE;
+									continue;
+								}
+								for (oi = 0; oi < bbl->out_count; ++oi) {
+									MonoBasicBlock *out = bbl->out_bb [oi];
+									int outi = (out && out->block_num >= 0 && out->block_num <= (int) cfg->max_block_num) ?
+										sl_bbidx [out->block_num] : -1;
+									if (outi < 0 || reach [outi]) {   /* an edge we cannot index is HOT */
+										reach [bbn] = 1; changed = TRUE;
+										break;
+									}
+								}
+							}
+						}
+						lazy_doomed = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nbbs);
+						for (i = 0; i < nbbs; ++i)
+							lazy_doomed [i] = !reach [i];
+					}
+				}
+#endif
+				gcp_walked = TRUE;
 				bbn = 0;
 				for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
 					int gc_gen = 0;
@@ -1457,6 +1519,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						if (gcp_pub) {
 							method_nogc = FALSE;
 							effective_gcp_count++;
+							if (insl->opcode != OP_GC_SAFE_POINT && !wj_ins_is_raise (insl)) {
+								if (lazy_doomed && lazy_doomed [bbn])
+									doomed_gcp_count++;
+								else
+									hot_gcp_count++;
+							}
 							if (last_gcp_ins && last_gcp_ins->opcode != OP_GC_SAFE_POINT)
 								prior_gcps_are_polls = FALSE;
 							last_gcp_ins = insl;
@@ -1760,21 +1828,81 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 *
 		 * An intermediate value was NOT swept: at 2 or 3 only methods with exactly that many GC points become
 		 * lazy -- a small population -- and the gradient from 1 to unlimited is steeply negative. */
-		if (framebytes > 0 &&
-		    ((mono_wasm_jit_lazy_gcp <= 0 || effective_gcp_count <= mono_wasm_jit_lazy_gcp) ||
-		     (terminal_vcall_handoff && terminal_vcall_poll_prefix)) &&
-		    naddrbytes == 0 && !eh_on && lc.ref_wt &&
-		    !lc.storeguard && !lc.objguard) {
-			gboolean all_wt = TRUE;
-			for (i = 0; i < nvreg; ++i)
-				if (refslot [i] >= 0 && (!lc.ref_wt [i] || li [i] < 0)) {
-					all_wt = FALSE;
-					break;
+		{
+			extern int mono_wasm_jit_lazy_cold;
+			gboolean gcp_gate = (mono_wasm_jit_lazy_gcp <= 0 || effective_gcp_count <= mono_wasm_jit_lazy_gcp) ||
+				(terminal_vcall_handoff && terminal_vcall_poll_prefix);
+			/* Cold-only: every GC point is a raise (its taken arm ENSUREs: WJ_THROW_BR's shared blocks, OP_THROW,
+			 * LDIV_RAISE) or a conditional poll (ENSURE ... RELEASE inside its taken arm). The PRODUCT runs
+			 * RAISE_NOGC=1 (index.ts), under which a one-raise method is already lazy with no hot ENSURE; this
+			 * extends the same shape to methods with several raises and polls. Level 2 is the documented
+			 * unsound positive control and is never combined with it. */
+			gboolean cold_gate = mono_wasm_jit_lazy_cold && gcp_walked && hot_gcp_count == 0 &&
+				mono_wasm_jit_raise_nogc != 2 && cfg->header->num_clauses == 0;
+			if (framebytes > 0 && (gcp_gate || cold_gate) &&
+			    naddrbytes == 0 && !eh_on && lc.ref_wt &&
+			    !lc.storeguard && !lc.objguard) {
+				gboolean all_wt = TRUE;
+				for (i = 0; i < nvreg; ++i)
+					if (refslot [i] >= 0 && (!lc.ref_wt [i] || li [i] < 0)) {
+						all_wt = FALSE;
+						break;
+					}
+				if (all_wt) {
+					lazy_ref_frame = TRUE;
+					lc.lazy_frame = 1;
+					if (cold_gate) {
+						lazy_cold_frame = TRUE;
+						lc.lazy_frame = 2;
+						if (mono_wasm_jit_stats) {
+							mono_wasm_jit_count (WJC_LAZY_COLD);
+							if (!gcp_gate)
+								mono_wasm_jit_count (WJC_LAZY_COLD_NEW);
+							if (doomed_gcp_count > 0)
+								mono_wasm_jit_count (WJC_LAZY_COLD_DOOMED);
+						}
+					}
 				}
-			if (all_wt) {
-				lazy_ref_frame = TRUE;
-				lc.lazy_frame = 1;
 			}
+			/* LAZY_COLD=2's reach, split: methods whose doomed discount mattered at all, and of those the ones
+			 * with nothing hot left -- so a 0 in WJC_LAZY_COLD_DOOMED says WHICH gate term refused. */
+			if (mono_wasm_jit_stats && doomed_gcp_count > 0) {
+				mono_wasm_jit_count (WJC_LAZY_DOOMED_SEEN);
+				if (hot_gcp_count == 0)
+					mono_wasm_jit_count (WJC_LAZY_DOOMED_HOT0);
+			}
+#ifdef HOST_BROWSER
+			/* MONO_WASM_JIT_WATCH=<name substring>: every term of the lazy-frame gate, and per bb the doomed
+			 * flag, its out-edges, its last opcode and its published GC points. Field reads only. */
+			{
+				extern const char *mono_wasm_jit_watch;
+				if (G_UNLIKELY (mono_wasm_jit_watch) && cfg->method->name &&
+				    strstr (cfg->method->name, mono_wasm_jit_watch)) {
+					MonoBasicBlock *wb; MonoInst *wi; int wbn = 0;
+					gboolean w_all_wt = lc.ref_wt != NULL;
+					for (i = 0; w_all_wt && i < nvreg; ++i)
+						if (refslot [i] >= 0 && (!lc.ref_wt [i] || li [i] < 0))
+							w_all_wt = FALSE;
+					printf ("WASM_JIT_LAZY_GATE %s:%s framebytes=%d naddrbytes=%d eh_on=%d ref_wt=%d all_wt=%d "
+						"guards=%d/%d walked=%d gcp=%d hot=%d doomed=%d gcp_gate=%d cold_gate=%d -> lazy=%d cold=%d\n",
+						cfg->method->klass ? m_class_get_name (cfg->method->klass) : "?", cfg->method->name,
+						framebytes, naddrbytes, (int) eh_on, lc.ref_wt != NULL, (int) w_all_wt,
+						(int) lc.storeguard, (int) lc.objguard, (int) gcp_walked, effective_gcp_count,
+						hot_gcp_count, doomed_gcp_count, (int) gcp_gate, (int) cold_gate,
+						(int) lazy_ref_frame, (int) lazy_cold_frame);
+					for (wb = cfg->bb_entry; wb; wb = wb->next_bb, ++wbn) {
+						printf ("WASM_JIT_LAZY_GATE   bb%d idx=%d doomed=%d out=%d last=%s exit=%d gcps:", wb->block_num,
+							wbn, lazy_doomed ? (int) lazy_doomed [wbn] : -1, wb->out_count,
+							wb->last_ins ? wj_opname (wb->last_ins->opcode) : "-", wb == cfg->bb_exit);
+						MONO_BB_FOR_EACH_INS (wb, wi)
+							if (wj_ins_is_published_gcpoint (cfg, wi))
+								printf (" %s%s", wj_opname (wi->opcode),
+									wi->opcode == OP_GC_SAFE_POINT ? "(poll)" : wj_ins_is_raise (wi) ? "(raise)" : "");
+						printf ("\n");
+					}
+				}
+			}
+#endif
 		}
 		if (mono_wasm_jit_stats) {
 			mono_wasm_jit_add (WJC_REF_SLOTS, nrefslots);
@@ -1987,7 +2115,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #endif
 
 #ifdef HOST_BROWSER
-#define EMIT_REF_LEAVE() do { if (framebytes > 0) { \
+#define EMIT_REF_LEAVE() do { if (framebytes > 0 && !lazy_cold_frame) { \
 		if (lazy_ref_frame) { \
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
 			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
@@ -2327,12 +2455,30 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			/* memory.fill (refbase, 0, framebytes): the frame is above the SP now, so the GC scans it —
 			 * it must hold no garbage/stale pointers; .NET local zero-init falls out of the same fill */
 			{
-				extern int mono_wasm_jit_inline_zero;
-				if (framebytes <= mono_wasm_jit_inline_zero) {
-					/* framebytes is 16-aligned and a multiple of 16, so this is exactly framebytes/8 aligned
-					 * i64 stores — no remainder, no alignment fixup. */
-					int zo;
-					for (zo = 0; zo < framebytes; zo += 8) {
+				extern int mono_wasm_jit_inline_zero, mono_wasm_jit_frame_zero;
+				/* MONO_WASM_JIT_FRAME_ZERO=0 skips the REF region when every slot in it is write-through
+				 * (R294): such a slot is a mirror rewritten at each def with no GC point between, and zeroed
+				 * again at its kill point, so before its first def it can only hold a stale word -- which the
+				 * CONSERVATIVE scan of this C-stack region treats as at most a pin, and only while a GC runs
+				 * during this frame. Zero-init is still owed to the address region (.NET locals) and to any
+				 * slot-homed ref (addrslot -2), so either of those keeps the fill. */
+				int zfrom = 0, zo;
+				if (!mono_wasm_jit_frame_zero && lc.ref_wt) {
+					gboolean zall_wt = TRUE;
+					for (i = 0; i < nvreg; ++i)
+						if (refslot [i] >= 0 && !lc.ref_wt [i]) {
+							zall_wt = FALSE;
+							break;
+						}
+					if (zall_wt)
+						zfrom = refbytes_al;   /* 8-aligned, so the i64 stores below stay aligned */
+				}
+				if (zfrom >= framebytes) {
+					/* nothing owed */
+				} else if (framebytes - zfrom <= mono_wasm_jit_inline_zero) {
+					/* framebytes is a multiple of 16 and zfrom of 8, so these are aligned i64 stores with no
+					 * remainder and no alignment fixup. */
+					for (zo = zfrom; zo < framebytes; zo += 8) {
 						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
 						wasm_i64_const (&body, 0);
 						wasm_op (&body, WASM_OP_I64_STORE);
@@ -2340,10 +2486,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					}
 				} else {
 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+					if (zfrom > 0) {
+						wasm_i32_const (&body, zfrom);
+						wasm_op (&body, WASM_OP_I32_ADD);
+					}
 					wasm_i32_const (&body, 0);
-					wasm_i32_const (&body, framebytes);
+					wasm_i32_const (&body, framebytes - zfrom);
 					wasm_u8 (&body, 0xFC); wasm_uleb (&body, 11); wasm_u8 (&body, 0);   /* memory.fill mem 0 (bulk memory) */
 				}
+				if (zfrom > 0 && mono_wasm_jit_stats)
+					mono_wasm_jit_add (WJC_FRAME_ZERO_SKIPPED, zfrom);
 			}
 			for (i = 0; i < nargs; ++i) {
 				int av = cfg->args [i]->dreg;
@@ -2688,6 +2840,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
 		int loop_depth = N - 1 - i;
 		gboolean terminated = FALSE;
+		/* LAZY_COLD=2: inside a doomed bb a cold frame behaves as an ordinary lazy frame (see lazy_doomed). */
+		if (lazy_cold_frame)
+			lc.lazy_frame = (lazy_doomed && lazy_doomed [i]) ? 1 : 2;
 		int cmp_a = -1, cmp_b = -1;
 		gint32 cmp_imm = 0;
 		gint64 cmp_imm64 = 0;      /* the immediate for an i64 compare-imm (OP_LCOMPARE_IMM); cmp_imm holds the i32 one */
@@ -2809,14 +2964,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			 * from the wasm local, so a zeroed slot is never read. */
 			if (G_UNLIKELY (sl_kill_head != NULL)) {
 				int kv = sl_kill_head [my_ord];
-				if (lazy_ref_frame && kv >= 0) {
+				/* A cold-only lazy frame is never live at a kill point, so it emits no zero store -- but the
+				 * LCSE kill below is about the ANALYSIS, not the store, and must still run. */
+				if (lazy_ref_frame && !lazy_cold_frame && kv >= 0) {
 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx);
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 				}
 				while (kv >= 0) {
-					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
-					wasm_i32_const (&body, 0);
-					wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [kv] * 4));
+					if (!lazy_cold_frame) {
+						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+						wasm_i32_const (&body, 0);
+						wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [kv] * 4));
+					}
 					/* The pin is gone, so the value must not be reused past this point: LCSE's reuse
 					 * read is created here at emission and the liveness that decided this slot was dead
 					 * never saw it. Killing the entry keeps the two in agreement. */
@@ -2824,12 +2983,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						wj_lcse_kill (lcse, li, nvreg, kv);
 					kv = sl_kill_next [kv];
 				}
-				if (lazy_ref_frame && sl_kill_head [my_ord] >= 0)
+				if (lazy_ref_frame && !lazy_cold_frame && sl_kill_head [my_ord] >= 0)
 					wasm_op (&body, WASM_OP_END);
 			}
 #ifdef HOST_BROWSER
 			if (wj_ins_is_effective_gcpoint (cfg, ins) &&
 			    !(lazy_ref_frame && ins->opcode == OP_GC_SAFE_POINT) &&
+			    !(lazy_cold_frame && wj_ins_is_raise (ins)) &&
 			    !(lazy_ref_frame && terminal_vcall_handoff && ins == terminal_vcall_ins))
 				ENSURE_REF_FRAME ();
 #endif
@@ -3014,8 +3174,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 					/* Materialize roots inside the rare taken arm, not before the flag load. */
 					ENSURE_REF_FRAME ();
-					/* Direct import: a C function address in dotnet.native.wasm, fixed for the process. */
-					wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll, (guint32) pti);
+					/* Direct import: a C function address in dotnet.native.wasm, fixed for the process. The ENTRY
+					 * poll gets its own helper while edge sampling is on (R295), so a sample is a method entry. */
+					{
+						extern int mono_wasm_jit_edge_sample;
+						extern void mono_wasm_jit_safepoint_poll_entry (void);
+						if (mono_wasm_jit_edge_sample && bb == cfg->bb_entry)
+							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_entry, (guint32) pti);
+						else
+							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll, (guint32) pti);
+					}
 					RELEASE_LAZY_REF_FRAME ();
 					wasm_op (&body, WASM_OP_END);
 				}
@@ -6543,6 +6711,10 @@ vcall_cold_miss_emit:
 						WjBody *old_body = sre->body;
 						sre->body = wj_stored_body;
 						wj_stored_body = NULL;
+						{
+							extern void mono_wasm_jit_edge_note_name (int desc, const char *name);
+							mono_wasm_jit_edge_note_name (cfg->wasm_jit_result.desc_id, mname);
+						}
 						if (old_body && old_body != sre->body)
 							wj_retire_payload (old_body, WJ_RETIRED_BODY);
 					  } }

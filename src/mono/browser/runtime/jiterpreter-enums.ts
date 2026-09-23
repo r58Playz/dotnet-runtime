@@ -49,6 +49,7 @@ export const enum JiterpMember {
     BackwardBranchTaken,
     BailoutOpcodeCount,
     WasmJitFslot,
+    ImethodMethod,
 }
 
 // keep in sync with jiterpreter.c, see mono_jiterp_write_number_unaligned

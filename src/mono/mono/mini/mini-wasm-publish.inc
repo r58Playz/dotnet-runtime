@@ -135,6 +135,11 @@ static __thread gint32 wj_pub_reraise;
  */
 #define WJ_ACT_GC   1
 #define WJ_ACT_PUB  2
+/* MONO_WASM_JIT_EDGE_SAMPLE (R295): take one call-edge sample at this worker's next ENTRY poll. Raised by a
+ * main-thread timer, cleared by the owner like the other two; see mono_wasm_jit_safepoint_poll_entry. */
+#define WJ_ACT_SAMPLE 4
+static __thread int wj_sample_defer;   /* loop polls a pending sample request has survived; see the poll */
+static volatile double wj_edge_tick_ms;   /* emscripten_get_now () at the last sampling tick */
 #define WJ_WORKER_MAX 1024
 static volatile gint32 wj_worker_action [WJ_WORKER_MAX];
 static volatile gint32 wj_worker_n;
@@ -437,8 +442,9 @@ mono_wasm_jit_safepoint_poll (void)
 	 * raise concurrent with the servicing lands after the clear and survives it; the cost is at worst one
 	 * redundant trip through here. A plain store racing wj_action_or is safe for the same reason the OR is
 	 * a CAS loop: it simply retries and re-applies its bit to the cleared word. */
+	gint32 was = 0;
 	if (wj_my_action && wj_my_action != &wj_worker_action_overflow)
-		mono_atomic_store_i32 (wj_my_action, 0);
+		was = mono_atomic_xchg_i32 (wj_my_action, 0);
 
 	if (mono_polling_required)
 		mono_threads_state_poll ();
@@ -458,7 +464,269 @@ mono_wasm_jit_safepoint_poll (void)
 		} else {
 			wj_pub_reraise = 0;
 		}
+		/* A sample request reaching a LOOP poll is not taken here -- a back-edge is not a call edge -- but is
+		 * kept for the next entry poll, for a bounded number of polls: a call-free loop would otherwise take
+		 * this helper at every back-edge until it exits. */
+		if (was & WJ_ACT_SAMPLE) {
+			if (++wj_sample_defer < 64) {
+				wj_action_or (wj_my_action, WJ_ACT_SAMPLE);
+			} else {
+				wj_sample_defer = 0;
+				mono_wasm_jit_counters [WJC_EDGE_DROPPED]++;
+			}
+		}
 	}
+}
+
+/*
+ * EXECUTION-WEIGHTED CALL EDGES, ONLINE (MONO_WASM_JIT_EDGE_SAMPLE=<ms>, 0 = off; R295).
+ *
+ * The co-location planner partitions an unweighted graph; offline, an execution-weighted partition would
+ * capture ~92% of the residual constant-index call pool at 16 members (R294). This supplies the weights.
+ * A main-thread timer raises WJ_ACT_SAMPLE on every worker; the next ENTRY poll to take its helper -- the
+ * emitter points bb_entry's OP_GC_SAFE_POINT here, loop polls stay on mono_wasm_jit_safepoint_poll -- reads
+ * the JS stack, names the method whose entry this is and its caller, and counts the edge. Taking the NEXT
+ * method entry after a timer is a call-count-proportional sample, the same distribution as the PEBS
+ * prologue samples R294 used. Leaf methods without loops have no entry poll (insert_safepoints) and are
+ * never a sampled callee.
+ *
+ * Identity is by NAME HASH, never by pointer: the name is the WjBody.name the name section carries,
+ * hashed where the compiling thread attaches the body; the JS side hashes the name V8 prints. A collision
+ * misattributes one sample. Tables are fixed, append-only and ints-only, so a racing reader cannot fault.
+ */
+#define WJ_EDGE_NAME_BITS 17
+#define WJ_EDGE_BITS      16
+/* Allocated by mono_wasm_jit_edge_start, before any compile or sample, only when the knob is on; every user
+ * tests the pointer. Never freed. */
+static volatile gint32 *wj_edge_name_hash;
+static volatile gint32 *wj_edge_name_desc;
+static char **wj_edge_name_str;                /* for the dump only; owned, never freed */
+static volatile gint32 *wj_edge_caller;        /* desc, or -1 native (AOT/C), -2 entry thunk, -3 JS */
+static volatile gint32 *wj_edge_callee;
+static volatile gint32 *wj_edge_count;
+
+static guint32
+wj_edge_fnv (const char *s)
+{
+	guint32 h = 0x811c9dc5u;
+	for (; *s; ++s)
+		h = (h ^ (guint8) *s) * 0x01000193u;
+	return h ? h : 1;
+}
+
+/* Called by the compiling thread as a descriptor gets its body (the emitter's registration arm). */
+void
+mono_wasm_jit_edge_note_name (int desc, const char *name)
+{
+	extern int mono_wasm_jit_edge_sample;
+	guint32 h, i, k;
+	if (!mono_wasm_jit_edge_sample || !wj_edge_name_hash || desc <= 0 || !name)
+		return;
+	h = wj_edge_fnv (name);
+	for (k = 0; k < 16; ++k) {
+		i = (h + k) & ((1u << WJ_EDGE_NAME_BITS) - 1);
+		if (wj_edge_name_hash [i] == (gint32) h || mono_atomic_cas_i32 (&wj_edge_name_hash [i], (gint32) h, 0) == 0) {
+			wj_edge_name_desc [i] = desc;   /* a re-registration of the same name takes the newest descriptor */
+			if (!wj_edge_name_str [i])
+				wj_edge_name_str [i] = g_strndup (name, 96);
+			return;
+		}
+	}
+	mono_wasm_jit_counters [WJC_EDGE_NAME_FULL]++;
+}
+
+static int
+wj_edge_desc_of (guint32 h)
+{
+	guint32 i, k;
+	for (k = 0; k < 16; ++k) {
+		i = (h + k) & ((1u << WJ_EDGE_NAME_BITS) - 1);
+		if (wj_edge_name_hash [i] == (gint32) h)
+			return wj_edge_name_desc [i];
+		if (!wj_edge_name_hash [i])
+			return 0;
+	}
+	return 0;
+}
+
+static const char *
+wj_edge_name_of_desc (int desc)
+{
+	int i;
+	for (i = 0; i < (1 << WJ_EDGE_NAME_BITS); ++i)
+		if (wj_edge_name_hash [i] && wj_edge_name_desc [i] == desc)
+			return wj_edge_name_str [i] ? wj_edge_name_str [i] : "?";
+	return "?";
+}
+
+/* JS -> C, from the sample below: the callee's name hash, the caller's KIND (0 JIT, 1 native, 2 entry thunk,
+ * 3 JS) and, for a JIT caller, its name hash. Kind is separate because a hash is any 32-bit value. */
+WJ_KEEPALIVE void
+mono_wasm_jit_edge_record (gint32 callee_h, gint32 caller_kind, gint32 caller_h)
+{
+	int callee, caller;
+	guint32 key, i, k;
+	if (!wj_edge_callee)
+		return;
+	mono_wasm_jit_counters [WJC_EDGE_SAMPLES]++;
+	callee = wj_edge_desc_of ((guint32) callee_h);
+	if (callee <= 0)
+		return;
+	caller = caller_kind == 0 ? wj_edge_desc_of ((guint32) caller_h) : -caller_kind;
+	if (caller == 0)
+		return;
+	mono_wasm_jit_counters [WJC_EDGE_MATCHED]++;
+	key = ((guint32) caller * 0x9e3779b1u) ^ (guint32) callee;
+	for (k = 0; k < 32; ++k) {
+		i = (key + k) & ((1u << WJ_EDGE_BITS) - 1);
+		if (wj_edge_callee [i] == callee && wj_edge_caller [i] == caller) {
+			wj_edge_count [i]++;
+			return;
+		}
+		if (!wj_edge_callee [i] && mono_atomic_cas_i32 (&wj_edge_callee [i], callee, 0) == 0) {
+			wj_edge_caller [i] = caller;
+			wj_edge_count [i]++;
+			return;
+		}
+	}
+	mono_wasm_jit_counters [WJC_EDGE_TABLE_FULL]++;
+}
+
+static void
+wj_edge_sample (void)
+{
+	/* The top frames are this EM_ASM, wj_edge_sample and the entry-poll helper (all main module or JS), then
+	 * the JIT method whose entry this is, then its caller. V8 prints a wasm frame as
+	 * `at <module>.<function> (wasm://wasm/<module>-<hash>:wasm-function[N]:0xOFF)`; method names contain
+	 * " (" themselves, hence lastIndexOf. The limit is narrowed only around the capture. */
+	EM_ASM ({
+		var o = Error.stackTraceLimit;
+		Error.stackTraceLimit = 10;
+		var st = (new Error ()).stack || "";
+		Error.stackTraceLimit = o;
+		var ls = st.split ("\n");
+		var fr = [];
+		var fnv = function (x) {
+			var h = 0x811c9dc5 | 0;
+			for (var k = 0; k < x.length; k++)
+				h = Math.imul (h ^ (x.charCodeAt (k) & 0xff), 0x01000193);
+			return h || 1;
+		};
+		for (var i = 0; i < ls.length && fr.length < 2; i++) {
+			var l = ls [i];
+			var u = l.lastIndexOf (" (wasm://wasm/");
+			if (u < 0) {
+				if (fr.length && l.indexOf ("    at ") === 0)
+					fr.push ([3, 0]);
+				continue;
+			}
+			var url = l.slice (u + 14);
+			var c = url.indexOf (":wasm-function[");
+			if (c < 0)
+				continue;
+			var mh = url.slice (0, c);
+			var d = mh.lastIndexOf ("-");
+			var mod = d > 0 ? mh.slice (0, d) : mh;
+			if (mod === "dotnet.native.wasm") {
+				if (fr.length)
+					fr.push ([1, 0]);
+				continue;
+			}
+			var t = l.slice (l.indexOf ("at ") + 3, u);
+			var fn = t.indexOf (mod + ".") === 0 ? t.slice (mod.length + 1) : t;
+			if (fr.length && (fn === "entry" || fn.slice (-8) === " [entry]")) {
+				fr.push ([2, 0]);
+				continue;
+			}
+			fr.push ([0, fnv (fn)]);
+		}
+		if (fr.length === 2 && fr [0][0] === 0)
+			Module._mono_wasm_jit_edge_record (fr [0][1], fr [1][0], fr [1][1]);
+	});
+}
+
+/* The ENTRY poll's helper (bb_entry's OP_GC_SAFE_POINT, under MONO_WASM_JIT_EDGE_SAMPLE only). */
+void
+mono_wasm_jit_safepoint_poll_entry (void)
+{
+	if (wj_my_action && wj_my_action != &wj_worker_action_overflow &&
+	    (mono_atomic_load_i32 (wj_my_action) & WJ_ACT_SAMPLE)) {
+		gint32 old;
+		do {
+			old = mono_atomic_load_i32 (wj_my_action);
+		} while ((old & WJ_ACT_SAMPLE) && mono_atomic_cas_i32 (wj_my_action, old & ~WJ_ACT_SAMPLE, old) != old);
+		wj_sample_defer = 0;
+		/* ONLY A THREAD THAT WAS ALREADY RUNNING is a sample of execution. A worker that was blocked when the
+		 * tick fired takes its sample at its next wake-up, whenever that is, so every idle worker contributed
+		 * one "sample" per tick of its wake-up path and the table was dominated by wait loops and
+		 * interp-thunk entries (R295, p15 s1). A late sample is counted and dropped. */
+		if (emscripten_get_now () - wj_edge_tick_ms <= 2.0)
+			wj_edge_sample ();
+		else
+			mono_wasm_jit_counters [WJC_EDGE_LATE]++;
+	}
+	mono_wasm_jit_safepoint_poll ();
+}
+
+/* Main-thread timer body. */
+WJ_KEEPALIVE void
+mono_wasm_jit_edge_tick (void)
+{
+	mono_wasm_jit_counters [WJC_EDGE_TICKS]++;
+	wj_edge_tick_ms = emscripten_get_now ();
+	mono_memory_barrier ();
+	wj_worker_action_raise_all (WJ_ACT_SAMPLE);
+}
+
+void
+mono_wasm_jit_edge_start (void)
+{
+	extern int mono_wasm_jit_edge_sample;
+	if (mono_wasm_jit_edge_sample <= 0 || wj_edge_callee)
+		return;
+	wj_edge_name_hash = (volatile gint32 *) g_new0 (gint32, 1 << WJ_EDGE_NAME_BITS);
+	wj_edge_name_desc = (volatile gint32 *) g_new0 (gint32, 1 << WJ_EDGE_NAME_BITS);
+	wj_edge_name_str = g_new0 (char *, 1 << WJ_EDGE_NAME_BITS);
+	wj_edge_caller = (volatile gint32 *) g_new0 (gint32, 1 << WJ_EDGE_BITS);
+	wj_edge_count = (volatile gint32 *) g_new0 (gint32, 1 << WJ_EDGE_BITS);
+	mono_memory_barrier ();
+	wj_edge_callee = (volatile gint32 *) g_new0 (gint32, 1 << WJ_EDGE_BITS);   /* last: it is the "ready" test */
+	MAIN_THREAD_ASYNC_EM_ASM ({ setInterval (function () { Module._mono_wasm_jit_edge_tick (); }, $0); },
+		mono_wasm_jit_edge_sample);
+}
+
+/* The dump: totals and the heaviest edges with their names. Main thread; ints plus owned name copies only. */
+void
+mono_wasm_jit_edge_dump (void)
+{
+	extern int mono_wasm_jit_edge_sample;
+	int i, shown, n = 0;
+	if (!mono_wasm_jit_edge_sample || !wj_edge_callee)
+		return;
+	for (i = 0; i < (1 << WJ_EDGE_BITS); ++i)
+		if (wj_edge_callee [i])
+			n++;
+	printf ("[wasm-jit edges] late=%lld ticks=%lld samples=%lld matched=%lld distinct=%d dropped=%lld name_full=%lld table_full=%lld "
+		"(MONO_WASM_JIT_EDGE_SAMPLE=%d ms)\n", (long long) mono_wasm_jit_counters [WJC_EDGE_LATE],
+		(long long) mono_wasm_jit_counters [WJC_EDGE_TICKS],
+		(long long) mono_wasm_jit_counters [WJC_EDGE_SAMPLES], (long long) mono_wasm_jit_counters [WJC_EDGE_MATCHED], n,
+		(long long) mono_wasm_jit_counters [WJC_EDGE_DROPPED], (long long) mono_wasm_jit_counters [WJC_EDGE_NAME_FULL],
+		(long long) mono_wasm_jit_counters [WJC_EDGE_TABLE_FULL], mono_wasm_jit_edge_sample);
+	for (shown = 0; shown < 40; ++shown) {
+		int best = -1;
+		for (i = 0; i < (1 << WJ_EDGE_BITS); ++i)
+			if (wj_edge_callee [i] && wj_edge_count [i] > 0 && (best < 0 || wj_edge_count [i] > wj_edge_count [best]))
+				best = i;
+		if (best < 0 || wj_edge_count [best] <= 0)
+			break;
+		printf ("[wasm-jit edge] %6d  %s  <-  %s\n", wj_edge_count [best], wj_edge_name_of_desc (wj_edge_callee [best]),
+			wj_edge_caller [best] == -1 ? "(native)" : wj_edge_caller [best] == -2 ? "(entry thunk)" :
+			wj_edge_caller [best] == -3 ? "(JS)" : wj_edge_name_of_desc (wj_edge_caller [best]));
+		wj_edge_count [best] = -wj_edge_count [best];   /* mark printed; restored below */
+	}
+	for (i = 0; i < (1 << WJ_EDGE_BITS); ++i)
+		if (wj_edge_count [i] < 0)
+			wj_edge_count [i] = -wj_edge_count [i];
 }
 
 /*
