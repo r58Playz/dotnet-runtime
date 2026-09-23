@@ -1115,6 +1115,82 @@ enum {
 	 * This split exists because routing a deterministic failure into the retry path is unbounded: one
 	 * method recompiled every dispatch cost 22.4 s of boot. See R289. */
 	WJC_INVALID_PERM,
+	/* MONO_WASM_JIT_LAZY_COLD (R290). LAZY_COLD = methods compiled with a cold-only lazy ref frame (every GC
+	 * point a raise or a conditional poll); LAZY_COLD_NEW = those the LAZY_GCP gate alone would have left
+	 * EAGER, i.e. the knob's actual reach. Zero with the knob on means the gate never fires. */
+	WJC_LAZY_COLD,
+	WJC_LAZY_COLD_NEW,
+	/* MONO_WASM_JIT_VCALL_MEMO (R290): per-thread (site, vtable) -> f-slot memo on the vcall MISS path.
+	 * HIT = resolves served by it; FILL = entries written after a successful admission; STALE = keyed hits
+	 * that failed re-validation (tier-up, re-slot, or not admissible) and fell through. */
+	WJC_VMEMO_HIT,
+	WJC_VMEMO_FILL,
+	WJC_VMEMO_STALE,
+	/* MONO_WASM_JIT_INLINE_LEAF (R290): callees the size gate admitted ONLY because the leaf limit applied.
+	 * Counted at the gate, so it is an upper bound on inlines -- inline_method can still refuse. */
+	WJC_INLINE_LEAF_ADMIT,
+	/* The freed-method set (MONO_WASM_JIT_DEADSET, R290). ADDS = methods recorded at interp_free_method
+	 * (0 => the hook never fires and every HIT below is meaningless); FULL must stay 0; REVIVED = marks
+	 * cleared because an InterpMethod was created at a recycled address. HIT_* = retained pointers a
+	 * consumer was about to dereference that were known freed -- each one a crash that did not happen. */
+	WJC_DEADSET_ADDS,
+	WJC_DEADSET_FULL,
+	WJC_DEADSET_REVIVED,
+	WJC_DEAD_HIT_ISLAND,
+	WJC_DEAD_HIT_PROF,
+	WJC_DEAD_HIT_CANON,
+	/* Fixed-index relocs (HELPER / AOT / HELPER_CI) whose index turned out to be a JIT slot (R291): DEP = an
+	 * f-slot, now declared as a dependency; ESLOT = an e-slot, which cannot be. Either non-zero names the
+	 * R285 population; WASM_JIT_FIXED_JIT_SLOT (verbose) names the reloc kind. */
+	WJC_FIXED_JIT_DEP,
+	WJC_FIXED_JIT_ESLOT,
+	/* R292, ungated, at every JITted-EH-method entry: STACK_LOW = entries with < 32 KB of linear-memory
+	 * stack left; ISLAND_TLS_BAD = entries whose island thread-locals were already implausible. Either
+	 * non-zero before the recurring island-store OOB names its cause. */
+	WJC_STACK_LOW,
+	WJC_ISLAND_TLS_BAD,
+	/* R293, ungated: a JS worker taken up by a NEW pthread while still holding code built under the previous
+	 * one (mono_wasm_jit_worker_reuse). EVENTS = such take-ups; TRAMP / ADAPTER = interp-entry trampolines /
+	 * guard-free adapters found installed; SLOT = e/f slots found installed. All four are the hazard's
+	 * population, counted whether or not MONO_WASM_JIT_REUSE_RESET then reverts it. */
+	WJC_REUSE_EVENTS,
+	WJC_REUSE_TRAMP,
+	WJC_REUSE_ADAPTER,
+	WJC_REUSE_SLOT,
+	/* ...and the positive control: helpers handed a scratch buffer that belongs to another pthread, i.e. code
+	 * instantiated under a previous pthread executing on this one (wj_note_foreign_scratch). */
+	WJC_REUSE_FOREIGN_SCRATCH,
+	/* LAZY_COLD=2 (R294): cold frames that needed the doomed-block discount, i.e. had GC points only on
+	 * throw-only paths besides their raises and polls. The reach of level 2 over level 1. */
+	WJC_LAZY_COLD_DOOMED,
+	/* MONO_WASM_JIT_FRAME_ZERO=0 (R294): ref-region bytes the eager prologue no longer zeroes, summed per
+	 * method emitted. 0 with the knob off = the arm never ran. */
+	WJC_FRAME_ZERO_SKIPPED,
+	/* R293b, ungated: native->managed entries through the generic C interp_entry for a method whose JIT
+	 * f-slot is live on the entering thread (a trampoline could have forwarded it). */
+	WJC_ENTRY_SLOW_LIVE,
+	/* LAZY_COLD=2 reach, split (R294): methods with GC points only reachable on throw paths (DOOMED_SEEN), and
+	 * of those the ones with no HOT GC point left (DOOMED_HOT0). HOT0 - WJC_LAZY_COLD_DOOMED = refused by
+	 * another gate term (addr slots, a non-write-through ref, EH). */
+	WJC_LAZY_DOOMED_SEEN,
+	WJC_LAZY_DOOMED_HOT0,
+	/* R293c, ungated: interp-entry trampolines adopted by a worker that did not create them, and refusals
+	 * (no recorded index / an unsupported shape). */
+	WJC_ENTRY_ADOPT,
+	WJC_ENTRY_ADOPT_FAIL,
+	/* MONO_WASM_JIT_EDGE_SAMPLE (R295): timer ticks, samples taken, samples whose callee AND caller resolved,
+	 * requests dropped after 64 loop polls with no entry poll, and the two table-full refusals. */
+	WJC_EDGE_TICKS,
+	WJC_EDGE_SAMPLES,
+	WJC_EDGE_MATCHED,
+	WJC_EDGE_DROPPED,
+	WJC_EDGE_NAME_FULL,
+	WJC_EDGE_TABLE_FULL,
+	/* Calls into mono_jiterp_placeholder_jit_call from anything but do_jit_call: an e/f slot this thread never
+	 * installed was called, and 999 was written through an arbitrary pointer. Must read 0. */
+	WJC_PLACEHOLDER_STRAY,
+	/* Edge samples dropped because the entry poll came more than 2 ms after the tick (a blocked worker). */
+	WJC_EDGE_LATE,
 	WJC_MAX
 };
 

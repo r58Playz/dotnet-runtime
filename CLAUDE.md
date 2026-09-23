@@ -160,6 +160,32 @@ Three consequences, all load-bearing:
 * **INSTALLATION is per-worker, which is why admission gates entry** rather than the emitted code testing
   anything.
 
+### A JS worker outlives its pthreads — "per-worker" and "per-thread" are NOT the same thing (R293)
+
+Emscripten reuses workers: when a pthread exits, `returnWorkerToPool` frees its block — struct, TLS **and
+stack** — and the next `pthread_create` can hand the SAME worker (same wasm instance, same function table,
+same JS realm) to a new pthread with a new TLS block. A run takes up ~60-80 pthreads on a 16-worker pool
+(`[wasm-jit bounds] worker_slots`). So the function table, `infoTable`, `Module.__wjSlotFn` and every JIT
+instance are **per worker**, while `wj_slot_live`, the PICs, `wj_scratch` and the island state are
+**per pthread** — and every JIT instance imports the INSTANTIATING pthread's `__thread` addresses.
+
+The new pthread's own state starts empty, so anything it admits is re-instantiated correctly. What it can
+reach without admitting is whatever the worker kept: the jiterpreter's interp-entry trampolines (which bake
+`&wj_slot_live`) and guard-free adapters, and through them the old instances — running against FREED TLS.
+Measured with the reset off: **158,104 helper calls in one run were handed another pthread's scratch**
+(`foreign_scratch`), and R292's recurring OOB is the first `*s.i` store of exactly such code.
+`mono_jiterp_wasm_jit_worker_reuse` now runs as each pthread is set up on a worker
+(`MONO_WASM_JIT_REUSE_RESET`, `[wasm-jit reuse]`; `foreign_scratch` must read 0): the guarded trampoline
+reads the CURRENT pthread's bitmap through a per-worker cell it re-points, guard-free adapters are demoted to
+it, e/f slots go back to the placeholder. **Do not "fix" this by discarding trampolines** — the first version
+did, and a taken-up thread was then left on the C `interp_entry` boundary (~4 M instr/tick on the server
+thread in 2 of 3 runs, R293b), because the only adapter install that works is at flush time. `slow_live`
+counts exactly that cost.
+
+**Before storing anything per worker that code will consume, ask what happens when the pthread that
+built it has exited.** A `__thread` address baked into a module, a trampoline or a JS-side cache is a
+pointer into memory that will be freed while the thing holding it stays callable.
+
 ### Admission's contract, and why generated code carries no liveness check
 
 Generated code `call_indirect`s an f-slot with **no liveness check at all**. The entire job of the admission
@@ -190,10 +216,11 @@ callable function**: `mono_jiterp_placeholder_jit_call`, signature `(i32,i32,i32
 * **works** if the expected type happens to be that one common shape — writing 999 through the caller's
   fourth argument as a pointer. Silent heap corruption, no LinkError, no trap, no diagnostic.
 
-The authoritative test is the per-thread bitmap `mono_wasm_jit_slot_live()` (JS side: `Module.__wjSlotFn`).
-Both are per-thread because the function table is per-thread for dynamic entries; a process-wide bitmap
-cannot answer this. **Before binding, calling or trusting anything found at an f-slot, ask whether THIS
-thread put it there.**
+The authoritative test is the per-thread bitmap `mono_wasm_jit_slot_live()`. The function table is
+per-WORKER for dynamic entries, so a process-wide bitmap cannot answer this; the bitmap is per-PTHREAD,
+which is stricter than the table and is only correct because a worker take-up resets the table to match
+(R293, above). `Module.__wjSlotFn` is the worker's record of what it installed, not a liveness test.
+**Before binding, calling or trusting anything found at an f-slot, ask whether THIS thread put it there.**
 
 **The converse invariant is also load-bearing:** an f-slot only ever holds a JIT `f` from a module this
 emitter produced. AOT bodies are reached through their own table indices and their own `at`/`at_ne`
@@ -521,6 +548,15 @@ being in a browser costs a good wasm compiler ~1.02x. Both of those explanations
 INLINING unlocks. **The bottleneck is the call boundary**; guards, spills and memory traffic are downstream of
 it. Judge a proposed change by whether it removes calls, shortens prologues, or shortens live ranges across
 calls.
+
+**The call infrastructure, EXECUTED, on the server thread (R290, PEBS, 2026-09-22, 152.1 M instr/tick): 35.7%
+of the thread** -- our prologue band 10.6% (the `s.p` read chain, write-back, frame zeroing, first pin),
+dynamic-index `call_indirect` 9.4%, constant-index `call_indirect` 5.9%, V8 frame pro/epilogue 5.2%, near-call
+spills ~2.4%, import calls 1.9% -- plus 12.2% in the JIT tier's own helpers. `scratchpad/wj/callinfra.py` is the
+instrument (`--band-split` splits the prologue, `--edges` dumps callee/caller/form). Split of the prologue band
+on the all-levers build (R294): **the `s.p` imported-mutable-global chain alone is 8.3 M/tick = 6.1%**, frame
+zeroing 2.95 (plus `memory.fill` for frames over 64 B, outside the band). **Two corrections this made:** R269
+sized co-location's pool ~3x too small, and R240 add.5's "prologue: nothing to take" was a static count.
 
 ### The executed dispatch split, and the hard ceiling on direct calls
 

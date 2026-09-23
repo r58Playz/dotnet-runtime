@@ -671,7 +671,8 @@ typedef struct {
 	guint8 *ref_wt;
 	int refbase;   /* wasm local: ref-frame base address */
 	int rtmp;      /* wasm local: scratch i32 for ref stores */
-	int lazy_frame;       /* frame is absent until the first effective returning GC point */
+	int lazy_frame;       /* 0 eager; 1 absent until the first effective returning GC point; 2 cold-only:
+	                       * materialised solely inside raise/poll taken arms (MONO_WASM_JIT_LAZY_COLD) */
 	int frame_active;     /* wasm i32 local: lazy frame has been materialized */
 	/* OP_LDADDR support: address-taken SCALAR locals live in the per-thread addressable-locals frame
 	 * (linear memory) instead of a wasm local, so their address can be passed to callees. addrslot[vreg]
@@ -989,6 +990,11 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		 * — adjacent to the def, with no GC point in between — so the pin copy is always current. */
 		int stash = (c->ref_wt && c->ref_wt [vreg]) ? c->li [vreg] : c->rtmp;
 		wasm_op_local (b, WASM_OP_LOCAL_SET, (guint32) stash);
+		/* lazy_frame 2 (MONO_WASM_JIT_LAZY_COLD): the frame is only ever live inside a raise or poll taken
+		 * arm, never at a def, and the gate required every slotted ref to be write-through -- the local
+		 * just set IS the value home, and ENSURE_REF_FRAME copies it into the slot when a GC can happen. */
+		if (c->lazy_frame == 2)
+			return TRUE;
 		if (c->lazy_frame) {
 			/* Before materialization the wasm local is the sole value home and there is no valid
 			 * refbase to mirror into. Once active, retain ordinary write-through semantics. */
@@ -1109,8 +1115,15 @@ wj_canonical_callee (MonoMethod *m)
 	 * the largest retention window in the backend (DANGLING-MONOMETHOD.md ranks it first). Validate the
 	 * value at the point of USE and fall back to the caller's own method, which is live by construction
 	 * -- losing canonicalisation costs f-slot stability, not correctness. */
-	if (canon != m && G_UNLIKELY (!mono_wasm_jit_method_usable (canon, WJ_BADMETH_SITE_CANON)))
+	if (canon != m && G_UNLIKELY (!mono_wasm_jit_method_usable (canon, WJ_BADMETH_SITE_CANON))) {
+		/* Replace the dead value with this compile's live one, so the next lookup finds a usable entry
+		 * instead of re-detecting the same corpse. `wrapped` came from m's own wrapper info, i.e. is live. */
+		mono_loader_lock ();
+		if (g_hash_table_lookup (wj_sync_inner_canon, wrapped) == canon)
+			g_hash_table_insert (wj_sync_inner_canon, wrapped, m);
+		mono_loader_unlock ();
 		return m;
+	}
 	/*
 	 * THE DISCRIMINATING MEASUREMENT (DANGLING-MONOMETHOD.md). Fixing the emit-time predicate stops it
 	 * dereferencing a retained pointer, but it does NOT retire this table -- and the doc is explicit that
@@ -1148,6 +1161,35 @@ wj_fslot_is_nogc (int fslot)
 		return FALSE;
 	re = wj_reg_at (desc_id - 1);
 	return re && re->f == fslot && re->no_gc;
+}
+
+/* The descriptor whose f-slot (kind 0) or e-slot (kind 1) is `idx`, or 0 if `idx` is not a JIT slot at all
+ * -- e.g. a C helper's or an AOT body's table index, which is what a fixed-index reloc is supposed to name.
+ * Reads only the slot->descriptor map and the registry entry; nothing the index points AT. (R291) */
+static int
+wj_fixed_index_jit_desc (int idx, int *out_kind)
+{
+	int probe, k;
+	for (k = 0; k < 2; ++k) {
+		int ci, desc_id;
+		WjRegEntry *re;
+		probe = k == 0 ? idx : idx + 1;     /* an e-slot is allocated immediately before its f-slot */
+		if (probe <= 0)
+			continue;
+		ci = probe / WJ_SLOT_CHUNK;
+		if (ci < 0 || ci >= WJ_SLOT_NCHUNKS || !wj_fslot_desc_chunks [ci])
+			continue;
+		mono_memory_barrier ();
+		desc_id = wj_fslot_desc_chunks [ci][probe % WJ_SLOT_CHUNK];
+		if (desc_id <= 0 || desc_id > wj_reg_n)
+			continue;
+		re = wj_reg_at (desc_id - 1);
+		if (re && (k == 0 ? re->f == idx : re->e == idx)) {
+			*out_kind = k;
+			return desc_id;
+		}
+	}
+	return 0;
 }
 
 /* Return the admitted direct managed callee's f-slot, or zero for every shape whose dispatch can enter
@@ -2526,6 +2568,34 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			 * structure in a refactor that was supposed to change none. The kinds are the population
 			 * labels and the predicate is the behaviour -- keeping them separate is what makes this
 			 * arm's unification provably inert. */
+#ifdef HOST_BROWSER
+			/* A FIXED INDEX THAT IS A JIT SLOT (R291). These kinds are supposed to name C helpers and AOT
+			 * bodies, which need no admission -- so nothing declares them, and if the index is in fact a
+			 * JITted method's f-slot, admission can never install it and the first worker that reaches the
+			 * site without it calls the prefilled placeholder. That is R285's trap exactly (`i32.const
+			 * 467053; call_indirect`, owned by a batched descriptor and declared by nobody, and R287
+			 * measured the emit-time recorder complete). Declare it here, whatever produced it, and keep
+			 * it indirect: an import would bind the slot's CURRENT function by value at instantiation and
+			 * go stale the moment the descriptor is republished. The census names the population. */
+			{
+				int jkind = -1, jdesc = wj_fixed_index_jit_desc ((int) r->table_index, &jkind);
+				if (G_UNLIKELY (jdesc > 0)) {
+					WjRegEntry *jre = wj_reg_at (jdesc - 1);
+					if (jkind == 0) {
+						wj_asm_deps_add (dp, (int) r->table_index, wj_functype_hash (&self_types [r->tpool]),
+						                 jre ? jre->logical_method : NULL);
+						mono_wasm_jit_counters [WJC_FIXED_JIT_DEP]++;
+					} else {
+						mono_wasm_jit_counters [WJC_FIXED_JIT_ESLOT]++;   /* not expressible as a dep: counted */
+					}
+					if (mono_wasm_jit_verbose)
+						printf ("WASM_JIT_FIXED_JIT_SLOT kind=%d reloc=%d index=%d desc=%d\n",
+							jkind, (int) r->kind, (int) r->table_index, jdesc);
+					st->nindirect++;
+					continue;
+				}
+			}
+#endif
 			if (wj_reloc_fixed_importable ((WasmRelocKind) r->kind))
 				slot = wj_asm_intern_import (himp, nhimp, pol->max_fimports, r->table_index, ti, FALSE);
 			break;

@@ -642,6 +642,13 @@ mono_interp_get_imethod (MonoMethod *method)
 	else
 		imethod = (InterpMethod*)m_method_alloc0 (method, sizeof (InterpMethod));
 	imethod->method = method;
+#if HOST_BROWSER
+	{
+		/* A live method at this address: clear any freed-method mark a recycled address still carries. */
+		extern void mono_wasm_jit_note_method_live (MonoMethod *method);
+		mono_wasm_jit_note_method_live (method);
+	}
+#endif
 	imethod->param_count = sig->param_count;
 	imethod->hasthis = sig->hasthis;
 	imethod->vararg = sig->call_convention == MONO_CALL_VARARG;
@@ -3832,7 +3839,14 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 	 * So the compile-section rule is NOT "never call mono_interp_get_imethod here": it is that a
 	 * predicate whose ANSWER does not depend on creating one must not create one. This site's answer
 	 * does. The mono-internal-hash.c:47 abort it can still raise is UNFIXED and needs a different
-	 * shape -- most likely making the CREATION safe on a worker, not avoiding it. */
+	 * shape -- most likely making the CREATION safe on a worker, not avoiding it.
+	 *
+	 * R290 FOUND THE SHAPE. Both asserts caught on 2026-09-22 (hash.c:47 and loader.c:1826) were this
+	 * function calling get_imethod on a FREED method -- its blockers come partly from the call profile's
+	 * retained id_targets[]. Ask the freed-method set first; it never dereferences `m`. */
+	extern int mono_wasm_jit_method_known_dead (MonoMethod *method, int site);
+	if (mono_wasm_jit_method_known_dead (m, WJC_DEAD_HIT_ISLAND))
+		return 0;
 	InterpMethod *im = mono_interp_get_imethod (m);
 	int tries, spos, pushed = 0, ret = 0;
 	if (im->wasm_jit_fslot > 0) return 1;          /* already JITted */
@@ -3857,6 +3871,7 @@ wasm_jit_force_island (MonoMethod *m, int depth, int *budget, gboolean promoted_
 			InterpMethod *cim;
 			int _r, j, on_stack = -1;
 			if (callee == m) continue;                 /* self-recursion: handled by the emitter's self-slot reservation */
+			if (mono_wasm_jit_method_known_dead (callee, WJC_DEAD_HIT_ISLAND)) continue;   /* freed: see the note at the top */
 			cim = mono_interp_get_imethod (callee);
 			if (cim->wasm_jit_fslot > 0) continue;     /* already JITted (e.g. pulled via an earlier blocker's recursion) */
 			if (cim->wasm_jit_slot == -1) {
@@ -6005,6 +6020,16 @@ interp_entry (InterpEntryData *data)
 		data->rmethod = (InterpMethod*)(gpointer)((gsize)data->rmethod & ~1);
 	}
 	rmethod = data->rmethod;
+#if HOST_BROWSER
+	/* R293b: a native->managed entry that reached the GENERIC C boundary although this thread has the method's
+	 * JITted body live -- i.e. one an interp-entry trampoline could have forwarded. What a worker take-up must
+	 * not reintroduce; read it as `[wasm-jit reuse] slow_live=`. */
+	if (G_UNLIKELY (rmethod->wasm_jit_fslot > 0)) {
+		extern int mono_wasm_jit_slot_live (int slot);
+		if (mono_wasm_jit_slot_live (rmethod->wasm_jit_fslot))
+			mono_wasm_jit_counters [WJC_ENTRY_SLOW_LIVE]++;
+	}
+#endif
 
 	if (rmethod->needs_thread_attach)
 		orig_domain = mono_threads_attach_coop (mono_domain_get (), &attach_cookie);
@@ -6575,6 +6600,24 @@ mono_wasm_jit_scratch (void)
 	return wj_scratch;
 }
 
+/* R293's positive control. Emitted code passes helpers the scratch it imported as `s.b` -- the wj_scratch of the
+ * pthread that INSTANTIATED it -- so a scratch that is neither this thread's wj_scratch nor one of its own miss
+ * frames means a module instantiated under a different pthread is executing here: a worker taken up by a new
+ * pthread, reached through code it inherited (mono_wasm_jit_worker_reuse). One compare on the common path. */
+static void
+wj_note_foreign_scratch (guint8 *scratch)
+{
+	static int nprint;
+	gint32 i;
+	for (i = 0; i < wj_vcall_miss_frame_cap; ++i)
+		if (wj_vcall_miss_frames [i] == scratch)
+			return;
+	mono_wasm_jit_counters [WJC_REUSE_FOREIGN_SCRATCH]++;
+	if (nprint++ < 8)
+		printf ("WASM_JIT_FOREIGN_SCRATCH scratch=%p mine=%p\n", (void *) scratch, (void *) wj_scratch);
+}
+#define WJ_CHECK_SCRATCH(s) do { if (G_UNLIKELY ((guint8 *) (s) != wj_scratch)) wj_note_foreign_scratch ((guint8 *) (s)); } while (0)
+
 gpointer
 mono_wasm_jit_vcall_miss_frame_acquire (void)
 {
@@ -6859,6 +6902,7 @@ static int wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *
 int
 mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
 {
+	WJ_CHECK_SCRATCH (buf);
 	return wj_call_interp_inner (method, buf, NULL);
 }
 
@@ -7620,7 +7664,9 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 int
 mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 {
-	MonoDelegate *del = *(MonoDelegate **) (scratch + 0);
+	MonoDelegate *del;
+	WJ_CHECK_SCRATCH (scratch);
+	del = *(MonoDelegate **) (scratch + 0);
 	MonoMethod *target = *(MonoMethod **) (scratch + 204);
 	int shape = *(gint32 *) (scratch + 220);
 	int eslot = *(gint32 *) (scratch + 228);
@@ -7722,6 +7768,33 @@ mono_wasm_jit_call_delegate (MonoMethod *invoke, guint8 *scratch)
 	return wj_call_interp_inner (target, scratch, timethod);
 }
 
+/* PER-THREAD MISS MEMO (MONO_WASM_JIT_VCALL_MEMO, R290). The emitted IC and the resolve cache below are
+ * both one-way, so a site alternating between two receivers takes this whole function -- ~1,870 x86 and
+ * the #1 server-thread symbol -- on EVERY call. The memo remembers (site, vtable) -> the override's
+ * InterpMethod and f-slot, and is filled ONLY on the path that has just admitted the target on this
+ * worker. A hit re-checks the three facts that can change under it (tier-up forwarding, the f-slot,
+ * and admission/adoption on THIS worker via admit_live) and still publishes -- which is what records the
+ * observation in the one call profile, so the profile sees exactly the misses it saw before. Emitted
+ * code is unchanged. Per-thread because slot liveness is. Keyed by raw pointers exactly as `icp` is, so
+ * it carries the same (and no new) exposure to a vtable address being reused after an unload. */
+typedef struct {
+	gpointer ic;
+	MonoVTable *vt;
+	InterpMethod *imethod;
+	gint32 fslot;
+} WjVcallMemo;
+#define WJ_VCALL_MEMO_BITS 12   /* 4096 x 16 B = 64 KB per worker that runs JIT code */
+static __thread WjVcallMemo *wj_vcall_memo;
+
+static inline WjVcallMemo *
+wj_vcall_memo_at (gpointer ic, MonoVTable *vt)
+{
+	guint32 h = ((guint32) (gsize) ic * 0x9E3779B1u) ^ ((guint32) (gsize) vt * 0x85EBCA77u);
+	if (G_UNLIKELY (!wj_vcall_memo))
+		wj_vcall_memo = (WjVcallMemo *) g_malloc0 (sizeof (WjVcallMemo) << WJ_VCALL_MEMO_BITS);
+	return &wj_vcall_memo [h >> (32 - WJ_VCALL_MEMO_BITS)];
+}
+
 int
 mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic)
 {
@@ -7733,7 +7806,9 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	 * choose, and it is not free to get wrong: this runs on every trip through the vcall MISS path -- ~9% of
 	 * ~350M in-game dispatches (mini-wasm.c's IC-sizing note) -- and virtually none of those sites are
 	 * delegate invokes. Two loads and a pointer compare reject them; the strcmp then never runs. */
-	gboolean delegate_site = m_class_get_parent (base_method->klass) == mono_defaults.multicastdelegate_class &&
+	gboolean delegate_site;
+	WJ_CHECK_SCRATCH (scratch);
+	delegate_site = m_class_get_parent (base_method->klass) == mono_defaults.multicastdelegate_class &&
 		!strcmp (base_method->name, "Invoke");
 	/* Clear the direct-delegate recipe before any early return or re-entrant work. */
 	*(gint32 *) (scratch + 220) = WJ_DELEGATE_NONE;
@@ -7760,6 +7835,32 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 #endif
 	vt = this_obj->vtable;
 	if (G_UNLIKELY (mono_wasm_jit_arity)) wj_arity_record (ic, vt, delegate_site);   /* receiver-diversity histogram (MONO_WASM_JIT_ARITY=1) */
+	{
+		extern int mono_wasm_jit_vcall_memo, mono_wasm_jit_admit_live (int desc_id);
+		extern int mono_wasm_jit_stats;
+		if (mono_wasm_jit_vcall_memo && !delegate_site) {
+			WjVcallMemo *mm = wj_vcall_memo_at (ic, vt);
+			if (mm->ic == ic && mm->vt == vt) {
+				InterpMethod *mim = mm->imethod;
+				if (G_LIKELY (!mim->optimized_imethod && mim->wasm_jit_fslot == mm->fslot &&
+				              mono_wasm_jit_admit_live (mim->wasm_jit_desc))) {
+					*(MonoMethod **) (scratch + 200) = mim->method;
+					wj_vcall_pic_publish (ic, vt, mim->method, mm->fslot);
+					if (G_UNLIKELY (mono_wasm_jit_stats)) {
+						/* Still a fast vcall into an already-JITted target: keep FASTVCALL/VFAST_HAD whole. */
+						mono_wasm_jit_count (WJC_VMEMO_HIT);
+						mono_wasm_jit_count (WJC_FASTVCALL);
+						mono_wasm_jit_count (WJC_VFAST_HAD);
+					}
+					return mm->fslot;
+				}
+				/* Forwarded by tier-up, re-slotted, or not admissible here right now: take the full path,
+				 * which refills the entry if (and only if) it ends in a live f-slot again. */
+				mm->ic = NULL;
+				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VMEMO_STALE);
+			}
+		}
+	}
 	/* Read the (vtable | imethod<<32) pair ATOMICALLY. MC builds chunks on worker threads concurrently
 	 * with the render thread, so the same vcall site's IC is written by multiple threads. A non-atomic
 	 * i32-pair read can tear (match an old vtable but read a freshly-written imethod for a DIFFERENT
@@ -7962,6 +8063,16 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			/* Publish only after this worker admitted the target. Therefore a generated PIC hit can use
 			 * the cached fslot without a second liveness test or an InterpMethod load. */
 			wj_vcall_pic_publish (ic, vt, target, imethod->wasm_jit_fslot);
+			{
+				extern int mono_wasm_jit_vcall_memo;
+				/* target == imethod->method on every path that reaches here (the wrapper arms re-derive
+				 * imethod FROM target), so a hit can recover it; refuse to memoise if that ever breaks. */
+				if (mono_wasm_jit_vcall_memo && !delegate_site && imethod->method == target) {
+					WjVcallMemo *mm = wj_vcall_memo_at (ic, vt);
+					mm->ic = ic; mm->vt = vt; mm->imethod = imethod; mm->fslot = imethod->wasm_jit_fslot;
+					if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VMEMO_FILL);
+				}
+			}
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
 				mono_wasm_jit_count (WJC_FASTVCALL);
 				mono_wasm_jit_count (had_fslot ? WJC_VFAST_HAD : WJC_VFAST_NEW);
@@ -8637,12 +8748,53 @@ mono_wasm_jit_continue_unwind (void)
 
 /* Returns the MonoMethodILState this activation pushed, so a JITted prologue can keep it in a wasm local and
  * store its il_offset inline at each basic block instead of calling mono_wasm_jit_set_il_offset per bb. */
+/* LINEAR-MEMORY STACK HEADROOM + ISLAND-TLS SANITY at JITted-EH-method entry, under MONO_WASM_JIT_STATS only.
+ * It was ungated for R292's stack-overflow hypothesis, which it refuted (min headroom 8.3 MB of the 8 MB
+ * pthread stacks the app links, see the R292 addendum; the OOB was R293's worker reuse), and ungated it
+ * cost ~0.5 M instr/tick on the server thread (enter_island 0.99 -> 1.49, R294). */
+static gint32 wj_min_stack_headroom = G_MAXINT32;   /* racy min over all threads; a diagnostic */
+gint32 mono_wasm_jit_min_stack_headroom (void);
+gint32
+mono_wasm_jit_min_stack_headroom (void)
+{
+	return wj_min_stack_headroom;
+}
+
+static void
+wj_island_entry_probe (void)
+{
+	extern int mono_wasm_jit_ptr_plausible (gpointer p);
+	gsize cur = (gsize) emscripten_stack_get_current ();
+	gsize end = (gsize) emscripten_stack_get_end ();
+	gint32 head = cur >= end ? (gint32) (cur - end) : -(gint32) (end - cur);
+	if (G_UNLIKELY (head < wj_min_stack_headroom))
+		wj_min_stack_headroom = head;
+	if (G_UNLIKELY (head < 32768)) {
+		static int nlow;
+		mono_wasm_jit_counters [WJC_STACK_LOW]++;
+		if (nlow++ < 8)
+			printf ("WASM_JIT_STACK_LOW headroom=%d sp=0x%x end=0x%x base=0x%x island_sp=%d\n", head,
+				(unsigned) cur, (unsigned) end, (unsigned) emscripten_stack_get_base (), wj_island_sp);
+	}
+	if (G_UNLIKELY (wj_island_sp < 0 || wj_island_sp > (1 << 20) ||
+	                (mono_wasm_jit_cur_island_il_state &&
+	                 !mono_wasm_jit_ptr_plausible ((gpointer) mono_wasm_jit_cur_island_il_state)))) {
+		static int nbad;
+		mono_wasm_jit_counters [WJC_ISLAND_TLS_BAD]++;
+		if (nbad++ < 8)
+			printf ("WASM_JIT_ISLAND_TLS_BAD island_sp=%d nchunks=%d chunks=%p cur=%p headroom=%d\n", wj_island_sp,
+				wj_island_nchunks, (void *) wj_island_chunks, (void *) mono_wasm_jit_cur_island_il_state, head);
+	}
+}
+
 gpointer
 mono_wasm_jit_enter_island (MonoMethod *method, int ndata)
 {
 	WjIsland *is;
 	MonoMethodILState *il;
 	gsize zbytes;
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		wj_island_entry_probe ();
 	is = wj_island_at (wj_island_sp++);
 	il = (MonoMethodILState *) is->st;
 	/* ZERO ONLY WHAT THIS METHOD CAN USE. `st` is sized for WJ_ISLAND_DATA (256) args+locals, so the old
@@ -9431,6 +9583,12 @@ mono_jiterp_register_jit_call_thunk (void *cinfo, WasmJitCallThunk thunk) {
 #endif
 
 
+#if HOST_BROWSER
+/* do_jit_call's `&thrown` for the call in flight on this thread: mono_jiterp_placeholder_jit_call's
+ * legitimate-caller test. Set, never restored -- an unwind past it can only make a stray read as legitimate. */
+static __thread gboolean *wj_djc_thrown;
+#endif
+
 static MONO_NEVER_INLINE void
 do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame *frame, InterpMethod *rmethod, gboolean wj_residual G_GNUC_UNUSED, MonoError *error)
 {
@@ -9481,10 +9639,16 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 				// WASM EH is available or we are otherwise in a situation where we know
 				//  that the jiterpreter thunk was compiled with exception handling built-in
 				//  so we can just invoke it directly and errors will be handled
+#if HOST_BROWSER
+				wj_djc_thrown = &thrown;   /* the placeholder's legitimate caller (see mono_jiterp_placeholder_jit_call) */
+#endif
 				thunk (ret_sp, sp, &ftndesc, &thrown);
 			} else {
 				// Call a special JS function that will invoke the compiled jiterpreter thunk
 				//  and trap errors for us to set the thrown flag
+#if HOST_BROWSER
+				wj_djc_thrown = &thrown;
+#endif
 				mono_interp_invoke_wasm_jit_call_trampoline (
 					thunk, ret_sp, sp, &ftndesc, &thrown
 				);
@@ -10237,6 +10401,52 @@ no_llvmonly_interp_method_pointer (void)
  *
  *   Return an ftndesc for entering the interpreter and executing METHOD.
  */
+#if HOST_BROWSER
+/*
+ * An interp-entry trampoline's TrampolineInfo lives in the infoTable of the WORKER that created the method
+ * pointer, but the pointer (a process-wide table index) is called from every worker, whose tables hold the
+ * generic entry there. Those workers used to find no info and never generate a trampoline of their own, so
+ * their native->managed entries took the C interp_entry boundary for the process lifetime -- ~22M per run
+ * for methods already live (`slow_live`, R293c). This hands a worker what it needs to adopt the entry at the
+ * same index. Called only for a method being entered right now, so the method and its signature are live.
+ */
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_entry_adopt_info (InterpMethod *imethod, gint32 *out)
+{
+	extern int mono_wasm_jit_entry_adopt;
+	MonoMethodSignature *sig;
+	gpointer dflt;
+	int n;
+
+	if (!mono_wasm_jit_entry_adopt)
+		return 0;
+	if (!imethod || imethod->jiterp_entry_index <= 0 || !imethod->method || !out) {
+		mono_wasm_jit_counters [WJC_ENTRY_ADOPT_FAIL]++;
+		return 0;
+	}
+	sig = mono_method_signature_internal (imethod->method);
+	if (!sig || sig->param_count > MAX_INTERP_ENTRY_ARGS) {
+		mono_wasm_jit_counters [WJC_ENTRY_ADOPT_FAIL]++;
+		return 0;
+	}
+	n = sig->param_count;
+	/* the same shape selection interp_create_method_pointer_llvmonly makes */
+	if (sig->hasthis)
+		dflt = sig->ret->type == MONO_TYPE_VOID ? entry_funcs_instance [n] : entry_funcs_instance_ret [n];
+	else
+		dflt = sig->ret->type == MONO_TYPE_VOID ? entry_funcs_static [n] : entry_funcs_static_ret [n];
+	out [0] = (gint32) (gsize) imethod->method;
+	out [1] = n;
+	out [2] = (gint32) (gsize) sig->params;
+	out [3] = sig->hasthis ? 1 : 0;
+	out [4] = sig->ret->type != MONO_TYPE_VOID ? 1 : 0;
+	out [5] = (gint32) (gsize) dflt;
+	out [6] = imethod->jiterp_entry_index;
+	mono_wasm_jit_counters [WJC_ENTRY_ADOPT]++;
+	return 1;
+}
+#endif
+
 static MonoFtnDesc*
 interp_create_method_pointer_llvmonly (MonoMethod *method, gboolean unbox, MonoError *error)
 {
@@ -10308,8 +10518,13 @@ interp_create_method_pointer_llvmonly (MonoMethod *method, gboolean unbox, MonoE
 		);
 
 		// Compiling a trampoline can fail for various reasons, so in that case we will fall back to the pre-existing ones below
-		if (wasm_entry_func)
+		if (wasm_entry_func) {
 			entry_func = wasm_entry_func;
+			/* The index is process-wide and every worker's table holds the generic entry there, so any
+			 * worker can adopt it (mono_jiterp_entry_adopt_info). The unbox variant is not recorded. */
+			if (!unbox)
+				imethod->jiterp_entry_index = (gint32) (gsize) wasm_entry_func;
+		}
 	}
 #endif
 
@@ -10576,6 +10791,14 @@ interp_create_method_pointer (MonoMethod *method, gboolean compile, MonoError *e
 static void
 interp_free_method (MonoMethod *method)
 {
+#if HOST_BROWSER
+	/* Before anything is released: the wasm JIT retains raw MonoMethod * and must learn this one is dead
+	 * (mono_wasm_jit_note_method_freed, R290). Guarded -- this file also links into mono-aot-cross. */
+	{
+		extern void mono_wasm_jit_note_method_freed (MonoMethod *method);
+		mono_wasm_jit_note_method_freed (method);
+	}
+#endif
 	MonoJitMemoryManager *jit_mm = jit_mm_for_method (method);
 	MonoDynamicMethod *dmethod = (MonoDynamicMethod*)method;
 
@@ -16771,6 +16994,18 @@ EMSCRIPTEN_KEEPALIVE void
 mono_jiterp_placeholder_jit_call (void *ret_sp, void *sp, void *ftndesc, gboolean *thrown)
 {
 	// g_print ("mono_jiterp_placeholder_jit_call\n");
+#if HOST_BROWSER
+	/* Its one LEGITIMATE caller is do_jit_call on a thread with no thunk yet, which passes its own `&thrown`
+	 * and reads the 999 back. Anything else reached an e/f slot this thread never installed -- the R285 class,
+	 * made WORSE by R293's take-up reset, which turns a stale instance into this -- and the store below is then
+	 * a write of 999 through an arbitrary argument. Counted and, for the first few, named by JS stack. */
+	if (G_UNLIKELY (thrown != wj_djc_thrown)) {
+		static int nprint;
+		mono_wasm_jit_counters [WJC_PLACEHOLDER_STRAY]++;
+		if (nprint++ < 8)
+			EM_ASM ({ console.log ("WASM_JIT_PLACEHOLDER_STRAY " + (new Error ()).stack); });
+	}
+#endif
 	*thrown = 999;
 }
 

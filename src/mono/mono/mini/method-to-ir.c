@@ -90,6 +90,7 @@
  * InterpMethod as an opaque gpointer so mini/ files need not see interp-internals.h. */
 extern int mono_wasm_jit_guarded_inline;
 extern int mono_wasm_jit_guarded_inline_size;
+extern int mono_wasm_jit_inline_leaf;
 extern int mono_wasm_jit_stats;
 extern void mono_wasm_jit_count (int idx);
 extern gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
@@ -4322,6 +4323,35 @@ mono_method_check_inlining (MonoCompile *cfg, MonoMethod *method)
  * 1.205x stock, while MaxInlineSize=20 (mono's limit) is 1.132x -- so 13.2 of those 20.5 points need a
  * limit above 20 and are unreachable while this function caps everything at 20.
  */
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_INLINE_LEAF support: TRUE iff the IL makes no call and allocates nothing. Reads only the
+ * raw IL the header SUMMARY already located -- no locals signature is parsed, so nothing here can load a
+ * class (and through it reach IKVM's classloader) from inside a compile. Undecodable IL answers FALSE. */
+static gboolean
+wj_il_is_call_free (const unsigned char *code, guint32 size)
+{
+	const unsigned char *ip = code, *end = code + size;
+	while (ip < end) {
+		MonoOpcodeEnum op;
+		const unsigned char *p = ip;
+		int n = mono_opcode_value_and_size (&p, end, &op);
+		if (n <= 0)
+			return FALSE;
+		switch (op) {
+		case MONO_CEE_CALL: case MONO_CEE_CALLVIRT: case MONO_CEE_CALLI: case MONO_CEE_JMP:
+		case MONO_CEE_NEWOBJ: case MONO_CEE_NEWARR: case MONO_CEE_BOX: case MONO_CEE_LOCALLOC:
+		case MONO_CEE_THROW: case MONO_CEE_RETHROW: case MONO_CEE_LDFTN: case MONO_CEE_LDVIRTFTN:
+		case MONO_CEE_MKREFANY:
+			return FALSE;
+		default:
+			break;
+		}
+		ip += n;
+	}
+	return TRUE;
+}
+#endif
+
 static gboolean
 mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limit_override)
 {
@@ -4383,8 +4413,24 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 	if (limit_override > 0)
 		limit = limit_override;
 
-	if (header.code_size >= GINT_TO_UINT32(limit) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING))
-		return FALSE;
+	if (header.code_size >= GINT_TO_UINT32(limit) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING)) {
+		gboolean leaf_ok = FALSE;
+#ifdef HOST_BROWSER
+		/* MONO_WASM_JIT_INLINE_LEAF (R290): a larger limit, for the wasm JIT's ORDINARY inliner only
+		 * (limit_override is the guarded inliner's own cap), and only for callees whose IL makes no call.
+		 * R118 closed raising the global limit because an inlined callee drags its own call sites into the
+		 * caller; a call-free callee has none to drag. The population is the one R290 measured at the top
+		 * of the executed call_indirect ranking -- ChunkPos.toLong, HashCommon.mix: arithmetic statics a
+		 * pair of 9-byte ldc.i8 pushes past 20 IL bytes. */
+		leaf_ok = COMPILE_WASM (cfg) && limit_override <= 0 && mono_wasm_jit_inline_leaf > limit &&
+			header.code_size < GINT_TO_UINT32 (mono_wasm_jit_inline_leaf) && header.code &&
+			wj_il_is_call_free (header.code, header.code_size);
+		if (leaf_ok)
+			wj_gi_count (WJC_INLINE_LEAF_ADMIT);
+#endif
+		if (!leaf_ok)
+			return FALSE;
+	}
 
 	/*
 	 * if we can initialize the class of the method right away, we do,

@@ -566,6 +566,45 @@ int mono_wasm_jit_sweep = 0;
  * reset, so it cannot see the ~37k returns that decide tier-up. */
 
 int mono_wasm_jit_lazy_gcp = 1;
+/* MONO_WASM_JIT_LAZY_COLD: a method whose only GC points are RAISES and conditional SAFEPOINT POLLS gets a
+ * lazy ref frame that is materialised only inside those rare taken arms -- no `s.p` read, no zeroing, no
+ * ref-slot mirrors and no exit restore on the hot path. Such a frame can never be live at a ref def, a
+ * kill point or an exit: a raise never returns, and a poll RELEASEs the frame before falling through.
+ * The existing LAZY_GCP gate cannot reach these methods because every null/bounds check counts as a GC
+ * point, and the one sweep that removed its limit (the LAZY_GCP note at the emitter's lazy-frame gate)
+ * put an ENSURE in front of every HOT GC point. This counts only the GC points that are neither, and emits
+ * no hot-path ENSURE.
+ * Target: the getters/field binders that spend ~72% of their time in prologue/epilogue (R290).
+ * Level 2 also discounts GC points in blocks that cannot reach the exit -- an IKVM throw path allocates and
+ * constructs its exception before raising -- running the frame as an ordinary lazy one inside them
+ * (lazy_doomed in the emitter, R294). */
+int mono_wasm_jit_lazy_cold = 0;
+/* MONO_WASM_JIT_VCALL_MEMO: the per-thread miss memo in mono_wasm_jit_vcall_resolve_fslot (interp.c), which
+ * carries the design and its invariants. Off for the within-binary A/B. */
+int mono_wasm_jit_vcall_memo = 0;
+/* MONO_WASM_JIT_INLINE_LEAF: IL-byte limit for inlining a CALL-FREE callee, above mono's 20; 0 = off. See
+ * mono_method_check_inlining_limit in method-to-ir.c. */
+int mono_wasm_jit_inline_leaf = 0;
+/* MONO_WASM_JIT_DEADSET: consult the freed-method set (mono_wasm_jit_note_method_freed) before any site
+ * dereferences a RETAINED MonoMethod *. On: it is the fix for the island-DFS asserts (R290). 0 = the A/B. */
+int mono_wasm_jit_deadset = 1;
+/* MONO_WASM_JIT_RETIRE_FREE: 0 = never free a retired registry payload (leak it). A DIAGNOSTIC, the
+ * use-after-free discriminator for the reclamation scheme above wj_reclaim_retired. */
+int mono_wasm_jit_retire_free = 1;
+/* MONO_WASM_JIT_AOT_ENTRY: 0 = the jiterpreter's interp-entry trampolines never forward AOT callers
+ * straight into a JIT f-slot, so every AOT->JIT entry takes the C interp_entry boundary. A DIAGNOSTIC
+ * (it was once this switch's A/B baseline, then made unconditional); see mono_jiterp_wasm_jit_entry_ok. */
+int mono_wasm_jit_aot_entry = 1;
+/* MONO_WASM_JIT_REUSE_RESET: when a JS worker is taken up by a new pthread, demote or revert every table entry
+ * that assumed the previous pthread (mono_wasm_jit_worker_reuse). 1 is the fix (R293); 0 only counts -- a
+ * DIAGNOSTIC control, not a supported configuration. */
+int mono_wasm_jit_reuse_reset = 1;
+/* MONO_WASM_JIT_EDGE_SAMPLE: call-edge sampling period in ms, 0 = off (mono_wasm_jit_safepoint_poll_entry). */
+int mono_wasm_jit_edge_sample = 0;
+/* MONO_WASM_JIT_ENTRY_ADOPT: a worker adopts interp-entry trampolines another worker created (R293c,
+ * mono_jiterp_entry_adopt_info). UNSAFE as built: 4 of 5 runs with it on failed (signature-mismatch traps
+ * inside a trampoline, foreign_scratch back), 0 of 3 with it off (R293e). Kept for the diagnosis. */
+int mono_wasm_jit_entry_adopt = 0;
 int mono_wasm_jit_vcall_ways = 1; /* MONO_WASM_JIT_VCALL_WAYS: N-way inline vcall f-slot IC. Clamped [1,8].
  * DEFAULT 1, and that is measured, not conservative: on the plateau instrument (Minecraft, 2026-08, no-walk,
  * 240s cooldown per arm) 4 -> 2 -> 1 improves MONOTONICALLY -- 4 vs 1 is fps 23.7 -> 26.0, msFrame 42.2 -> 38.5 ms,
@@ -616,6 +655,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm) ? ((*nm != '0') ? 1 : 0) : mono_wasm_jit_names; }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
+	{ extern int mono_wasm_jit_frame_zero; const char *fz = g_getenv ("MONO_WASM_JIT_FRAME_ZERO"); if (fz && *fz) mono_wasm_jit_frame_zero = *fz != '0'; }
 	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = the ENTRY half of the per-worker census (mono_wasm_jit_liveness fields 6/9); adds a load+test to the interp->JIT boundary, so off while timing. The INSTANTIATION half (fields 5/7/8/10/13) is unconditional and needs no knob. */
 	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
@@ -631,6 +671,13 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_pred_pct; const char *pp = g_getenv ("MONO_WASM_JIT_PRED_PCT"); int v = (pp && *pp) ? atoi (pp) : 0; mono_wasm_jit_pred_pct = (v >= 0 && v <= 100) ? v : 0; }
 	{ extern int mono_wasm_jit_devirt_arm2_pct; const char *ap = g_getenv ("MONO_WASM_JIT_DEVIRT_ARM2_PCT"); int v = (ap && *ap) ? atoi (ap) : 15; mono_wasm_jit_devirt_arm2_pct = (v >= 0 && v <= 100) ? v : 15; }
 	{ extern int mono_wasm_jit_lazy_gcp; const char *lg = g_getenv ("MONO_WASM_JIT_LAZY_GCP"); mono_wasm_jit_lazy_gcp = (lg && *lg) ? atoi (lg) : 1; } /* GC points a method may have and still defer its ref frame; <=0 = unlimited */
+	{ extern int mono_wasm_jit_lazy_cold; const char *lc = g_getenv ("MONO_WASM_JIT_LAZY_COLD"); if (lc && *lc) { int v = atoi (lc); mono_wasm_jit_lazy_cold = (v >= 0 && v <= 2) ? v : 0; } }
+	{ extern int mono_wasm_jit_vcall_memo; const char *vm = g_getenv ("MONO_WASM_JIT_VCALL_MEMO"); if (vm && *vm) mono_wasm_jit_vcall_memo = *vm != '0'; }
+	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
+	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }
+	{ extern int mono_wasm_jit_retire_free; const char *rf = g_getenv ("MONO_WASM_JIT_RETIRE_FREE"); if (rf && *rf) mono_wasm_jit_retire_free = *rf != '0'; }
+	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); if (ae && *ae) mono_wasm_jit_aot_entry = *ae != '0'; }
+	{ extern int mono_wasm_jit_reuse_reset; const char *rr = g_getenv ("MONO_WASM_JIT_REUSE_RESET"); if (rr && *rr) mono_wasm_jit_reuse_reset = *rr != '0'; }
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
 	{ extern int mono_wasm_jit_vcall_aot_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_AOT_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_aot_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline AOT-vcall IC; clamp [1,8]; 1 = legacy first-wins */
 	/* Default 1, matching the initialiser. It read `: 0` here while the initialiser said 1 and the comment
@@ -687,6 +734,11 @@ mono_wasm_jit_auto_init (void)
 #endif
 	{ extern int mono_wasm_jit_missedref; const char *mr = g_getenv ("MONO_WASM_JIT_MISSEDREF"); mono_wasm_jit_missedref = (mr && *mr && *mr != '0') ? 1 : 0; } /* DIAG: names a missed ref. For every method, log any NONREF-classified i32 vreg used as a MEMBASE load/store base or virtual-call receiver (a stale one of these is the wild-deref corruptor), with its defining opcode -> pins which wj_opcode_is_nonref case is wrong. Bounded. default off */
 	{ extern int mono_wasm_jit_refverify; const char *rv = g_getenv ("MONO_WASM_JIT_REFVERIFY"); mono_wasm_jit_refverify = (rv && *rv) ? atoi (rv) : 0; } /* 1=log, 2=assert classification-vs-structural-marking violations; default off */
+	{ extern int mono_wasm_jit_entry_adopt; const char *ea = g_getenv ("MONO_WASM_JIT_ENTRY_ADOPT"); if (ea && *ea) mono_wasm_jit_entry_adopt = *ea != '0'; }
+	{ extern int mono_wasm_jit_edge_sample; const char *es = g_getenv ("MONO_WASM_JIT_EDGE_SAMPLE"); if (es && *es) { int v = atoi (es); mono_wasm_jit_edge_sample = (v >= 0 && v <= 10000) ? v : 0; } }
+#ifdef HOST_BROWSER
+	{ extern void mono_wasm_jit_edge_start (void); mono_wasm_jit_edge_start (); }
+#endif
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
 	/* DEFAULT 1. This is the single switch that turns the whole JIT tier off, so it keeps its knob where
@@ -807,6 +859,9 @@ mono_wasm_jit_note_bad_eh_clause (MonoMethod *method, guint32 off, guint32 code_
  * Note this creates NO new live value — refbase is already live and already the fill's first operand — so the
  * Round 110 failure mode (trading a call for a long live range) does not apply. */
 int mono_wasm_jit_inline_zero = 64;   /* max framebytes to zero inline; 0 disables (always memory.fill). */
+/* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
+ * prologue carries the argument; R294 measures it). */
+int mono_wasm_jit_frame_zero = 1;
 /* MONO_WASM_JIT_DELEGATE_OBJ_PIC is deleted -- the losing arm of a settled two-path choice, with
  * DELEGATE_LOCAL_PIC keeping the field.
  *
@@ -1307,6 +1362,43 @@ WJ_KEEPALIVE int *
 mono_wasm_jit_slot_live_cap_addr (void)
 {
 	return &wj_slot_live_cap;
+}
+
+/*
+ * A JS WORKER OUTLIVES THE PTHREADS IT HOSTS, and everything this file calls "per-thread" about the function
+ * table is really per-WORKER. When a pthread exits, emscripten returns its worker to the pool
+ * (returnWorkerToPool) and frees the pthread's block -- struct, TLS and stack -- in
+ * __emscripten_thread_free_data; the next pthread_create can hand that same worker, with its wasm instance,
+ * its table and its JS realm intact, to a new pthread with a NEW TLS block. A run takes up ~60-80 pthreads
+ * on a 16-worker pool (`worker_slots`), so this is routine, not a corner case.
+ *
+ * Every JIT instance imports the INSTANTIATING pthread's __thread addresses (s.l/c/v/n/d/m/b/i -- the
+ * slot-live bitmap, both PICs, the scratch buffer, the current island), and the jiterpreter's guarded
+ * interp-entry trampoline bakes &wj_slot_live / &wj_slot_live_cap as constants. After a take-up the new
+ * pthread's own state starts empty -- wj_slot_live is __thread -- so anything it ADMITS is re-instantiated
+ * correctly. What it can still reach without admitting anything is the old pthread's trampolines and
+ * guard-free adapters, installed at interp-entry indices that AOT code calls directly: they run the old
+ * instances against FREED TLS, i.e. read and write whatever now occupies it. That is R292's OOB (the first
+ * `*s.i` store in a method entered AOT -> trampoline -> JIT, on a ForkJoin worker) and, before the freed
+ * block is reused, a silent write into dead memory.
+ *
+ * Called from JS (jiterpreter-interp-entry.ts) as each pthread is set up on a worker, only when the worker
+ * holds such state. Counts it, and returns whether to revert it. The guarded trampoline reads the current
+ * pthread's bitmap through a per-worker cell the JS side re-points first, so it stays; guard-free adapters
+ * are demoted to it (their premise was the OLD pthread's liveness); e/f slots go back to the placeholder,
+ * exactly what the new pthread's empty bitmaps already say they hold. Reverting the trampolines to the
+ * generic C entry instead (R293's first version) stranded taken-up threads on the C boundary (R293b).
+ */
+WJ_KEEPALIVE int
+mono_wasm_jit_worker_reuse (int tramps, int adapters, int slots)
+{
+	/* NO printf HERE: this runs inside emscripten's threadInitTLS, before the new pthread has started, and stdout
+	 * may be proxied to the main thread. The counters carry everything the first eight prints did (R293h). */
+	mono_wasm_jit_counters [WJC_REUSE_EVENTS]++;
+	mono_wasm_jit_counters [WJC_REUSE_TRAMP] += tramps;
+	mono_wasm_jit_counters [WJC_REUSE_ADAPTER] += adapters;
+	mono_wasm_jit_counters [WJC_REUSE_SLOT] += slots;
+	return mono_wasm_jit_reuse_reset;
 }
 
 /* Instantiate a cached JITted module into the CURRENT thread's wasm function table. The table is
@@ -1840,6 +1932,11 @@ wj_reclaim_retired (void)
 
 	if (!wj_retired_pending)
 		return;
+	{
+		extern int mono_wasm_jit_retire_free;
+		if (!mono_wasm_jit_retire_free)
+			return;   /* MONO_WASM_JIT_RETIRE_FREE=0: keep every retired payload alive (the UAF discriminator) */
+	}
 	if (mono_atomic_load_i32 (&wj_reg_readers) != 0)
 		return;
 	/* TRY, do not spin. This is reached from wj_reg_read_leave, i.e. from the exit of every
@@ -4261,6 +4358,122 @@ mono_wasm_jit_note_perm_cleared (MonoMethod *method)
 }
 
 /*
+ * THE FREED-METHOD SET (MONO_WASM_JIT_DEADSET, R290). The backend retains raw MonoMethod * for the process
+ * lifetime -- the call profile's id_targets[], wj_sync_inner_canon, the island blocker lists built from
+ * them -- while IKVM frees dynamic methods continuously. Two stacks caught on 2026-09-22, both from
+ * wasm_jit_force_island -> mono_interp_get_imethod on such a pointer:
+ *     mono-internal-hash.c:47  `table->table != NULL'    (garbage jit-mm reached through the method)
+ *     loader.c:1826            `mono_metadata_token_table (m->token) == MONO_TABLE_METHOD'  (garbage token)
+ * A validity test cannot fix this (a freed pointer is still in range), so -- exactly as the perm set above
+ * -- the fact is RECORDED where it becomes true (interp_free_method, before the memory is released) and
+ * ANSWERED by pointer value, never by dereference.
+ *
+ * Unlike the perm set this one must forget: a freed address is soon recycled for a NEW method, and a
+ * stale mark would silently exclude it from island forcing and devirt prediction forever. Creating an
+ * InterpMethod for a pointer is proof that it names a live method, so mono_interp_get_imethod's creation
+ * path clears the mark (a tombstone, so probe chains stay intact and the read path stays lock-free).
+ *
+ * What it does not close: a method freed BETWEEN a consumer's check and its dereference. That window is
+ * the few instructions of one compile section, against the minutes-to-hours a retained pointer lives --
+ * and a caught free in that window still reads as today's crash, so the per-site hit counters are the
+ * measure of how much of the class this retires. FULL degrades to today's behaviour, counted.
+ */
+#define WJ_DEAD_SET_BITS  17
+#define WJ_DEAD_SET_SIZE  (1 << WJ_DEAD_SET_BITS)
+#define WJ_DEAD_SET_MASK  (WJ_DEAD_SET_SIZE - 1)
+#define WJ_DEAD_TOMB      ((gpointer) (gsize) 1)
+static gpointer wj_dead_set [WJ_DEAD_SET_SIZE];
+static volatile gint32 wj_dead_set_n;   /* occupied slots, tombstones included: tombstones still cost probes */
+
+static guint32
+wj_dead_hash (gpointer p)
+{
+	guint32 h = (guint32) (guintptr) p;
+	h ^= h >> 16;
+	h *= 0x45d9f3bu;
+	h ^= h >> 16;
+	return h & WJ_DEAD_SET_MASK;
+}
+
+void mono_wasm_jit_note_method_freed (MonoMethod *method);
+void
+mono_wasm_jit_note_method_freed (MonoMethod *method)
+{
+	guint32 i, h;
+	if (!method || !mono_wasm_jit_deadset)
+		return;
+	if (mono_atomic_load_i32 (&wj_dead_set_n) >= (WJ_DEAD_SET_SIZE / 2)) {
+		mono_wasm_jit_counters [WJC_DEADSET_FULL]++;
+		return;
+	}
+	h = wj_dead_hash (method);
+	for (i = 0; i < 64; ++i) {
+		guint32 k = (h + i) & WJ_DEAD_SET_MASK;
+		gpointer cur = wj_dead_set [k];
+		if (cur == method)
+			return;
+		if (!cur || cur == WJ_DEAD_TOMB) {
+			if (mono_atomic_cas_ptr (&wj_dead_set [k], method, cur) == cur) {
+				if (!cur)
+					mono_atomic_inc_i32 (&wj_dead_set_n);
+				mono_wasm_jit_counters [WJC_DEADSET_ADDS]++;
+				return;
+			}
+			--i;
+		}
+	}
+	mono_wasm_jit_counters [WJC_DEADSET_FULL]++;
+}
+
+/* Called where an InterpMethod is CREATED for `method`: the pointer names a live method again. */
+void mono_wasm_jit_note_method_live (MonoMethod *method);
+void
+mono_wasm_jit_note_method_live (MonoMethod *method)
+{
+	guint32 i, h;
+	if (!method || !mono_atomic_load_i32 (&wj_dead_set_n))
+		return;
+	h = wj_dead_hash (method);
+	for (i = 0; i < 64; ++i) {
+		guint32 k = (h + i) & WJ_DEAD_SET_MASK;
+		gpointer cur = wj_dead_set [k];
+		if (!cur)
+			return;
+		if (cur == method) {
+			if (mono_atomic_cas_ptr (&wj_dead_set [k], WJ_DEAD_TOMB, method) == method)
+				mono_wasm_jit_counters [WJC_DEADSET_REVIVED]++;
+			return;
+		}
+	}
+}
+
+/* Pointer comparison only: `method` is never dereferenced. `site` is the WJC_DEAD_HIT_* counter to bump. */
+/* Exported: the jiterpreter's per-worker infoTable (jiterpreter-interp-entry.ts) asks it before building
+ * a trampoline from an entry the freeing worker has already dropped -- that table is per worker, and
+ * mono_jiterp_free_method_data_interp_entry runs on the freeing thread only. */
+WJ_KEEPALIVE int mono_wasm_jit_method_known_dead (MonoMethod *method, int site);
+WJ_KEEPALIVE int
+mono_wasm_jit_method_known_dead (MonoMethod *method, int site)
+{
+	guint32 i, h;
+	if (!method || !mono_wasm_jit_deadset || !mono_atomic_load_i32 (&wj_dead_set_n))
+		return 0;
+	h = wj_dead_hash (method);
+	for (i = 0; i < 64; ++i) {
+		guint32 k = (h + i) & WJ_DEAD_SET_MASK;
+		gpointer cur = wj_dead_set [k];
+		if (!cur)
+			return 0;
+		if (cur == method) {
+			if (site >= 0)
+				mono_wasm_jit_counters [site]++;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
  * STACK HEADROOM PROBE (MONO_WASM_JIT_STACKPROBE). Diagnostic; default off.
  *
  * Two rounds have now been spent shaving C-stack arrays on the theory that
@@ -4372,6 +4585,11 @@ mono_wasm_jit_method_usable (MonoMethod *m, int site)
 
 	mono_wasm_jit_count (WJC_BADMETH_SEEN);
 
+	/* The AUTHORITATIVE answer first, and before anything below dereferences `m`: a method the free hook
+	 * recorded is dead however plausible its pointer still looks (R290). */
+	if (G_UNLIKELY (mono_wasm_jit_method_known_dead (m, site == WJ_BADMETH_SITE_PROFILE ? WJC_DEAD_HIT_PROF :
+	                                                     site == WJ_BADMETH_SITE_CANON ? WJC_DEAD_HIT_CANON : -1)))
+		goto dead;
 	if (G_UNLIKELY (!mono_wasm_jit_ptr_plausible (m)))
 		goto dead;
 

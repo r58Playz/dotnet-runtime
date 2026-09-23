@@ -3,9 +3,9 @@
 
 import { MonoMethod, MonoType, PThreadPtrNull } from "./types/internal";
 import { NativePointer, VoidPtr } from "./types/emscripten";
-import { mono_assert } from "./globals";
+import { Module, mono_assert } from "./globals";
 import {
-    getU32_unaligned,
+    getU32_unaligned, setU32,
     free, malloc, localHeapViewU8
 } from "./memory";
 import { WasmOpcode } from "./jiterpreter-opcodes";
@@ -232,9 +232,25 @@ const wjPatchStats: Record<string, number> = {
     // whether wrappers are simply never getting hot enough to be queued for compilation.
     recordCalls: 0, recordNoInfo: 0, recordNoPthread: 0, recordAdds: 0, maxHitCount: 0,
     queueDrained: 0, trampolinesCreated: 0, createdNoWjSig: 0,
+    // Queued entries dropped because their method was freed on another worker (R291).
+    deadDropped: 0,
+    reuseReverted: 0, tlsCell: 0, adopted: 0,
     bailBudget: 0, bailLimit: 0, bailBytes: 0, genAttempts: 0, genThrew: 0,
 };
 (globalThis as any).__wj_patch_stats = () => wjPatchStats;
+
+// Does this worker's entry still describe the method that now lives at info.imethod? infoTable is PER
+// WORKER, the free hook runs on the freeing thread only, and a freed DynamicMethod's InterpMethod memory is
+// recycled -- so an entry can outlive its method (generating from it reads freed memory: R291's
+// `interp_entry code generation failed: memory access out of bounds`) or be found for a DIFFERENT method at
+// a reused address. Reading linear memory cannot trap below the heap limit, so the compare is safe even on
+// a freed imethod; the freed-method set then catches a recycled MonoMethod address too.
+function wjInfoIsLive (info: TrampolineInfo, checkDeadSet: boolean): boolean {
+    const now = getU32_unaligned(<any>(info.imethod + getMemberOffset(JiterpMember.ImethodMethod))) >>> 0;
+    if (now !== ((<any>info.method) >>> 0))
+        return false;
+    return !checkDeadSet || !cwraps.mono_wasm_jit_method_known_dead(info.method, -1);
+}
 
 // Called by mono_wasm_jit_admit after the method's complete direct-call closure has been installed in
 // THIS worker's function table. Every worker owns a distinct table and a distinct infoTable, so this
@@ -244,6 +260,11 @@ export function mono_jiterp_wasm_jit_patch_interp_entry (imethod: number) {
     const info = infoTable[imethod];
     if (!info) {
         wjPatchStats.noInfo++;
+        return;
+    }
+    if (!wjInfoIsLive(info, false)) {
+        delete infoTable[imethod];
+        wjPatchStats.deadDropped++;
         return;
     }
     if (info.directInstalled) {
@@ -281,16 +302,120 @@ export function mono_jiterp_wasm_jit_unpatch_interp_entry (imethod: number) {
     wjPatchStats.unpatched++;
 }
 
+// A JS worker outlives the pthreads it hosts: emscripten hands the same worker -- this realm, infoTable and the
+// function table -- to a new pthread after freeing the old one's TLS (R293; the C side,
+// mono_wasm_jit_worker_reuse, carries the argument). Called for every pthread set up on this worker, before it
+// runs managed code.
+//
+// A trampoline must not bake a __thread address, because it outlives the pthread that generated it: the guarded
+// one reads this pthread's &wj_slot_live / &wj_slot_live_cap through wjTlsCell, which is re-pointed here, so it
+// stays valid and stays installed. What does NOT survive is a guard-free adapter -- its whole premise was that
+// ITS pthread had the f-slot live -- so it is demoted to the guarded trampoline (R293b: reverting trampolines to
+// the generic C entry instead left a taken-up thread on the C interp_entry boundary, since the only adapter
+// install that works is at flush time). e/f slots go back to the placeholder, matching the new pthread's empty
+// bitmaps.
+let wjTlsCell = 0;
+function wj_tls_cell_update () {
+    setU32(<any>wjTlsCell, cwraps.mono_wasm_jit_slot_live_cap_addr());
+    setU32(<any>(wjTlsCell + 4), cwraps.mono_wasm_jit_slot_live_ptr_addr());
+}
+// Allocated once per worker and never freed: every guarded trampoline on this worker points at it.
+function wj_tls_cell (): number {
+    if (!wjTlsCell) {
+        wjTlsCell = <any>malloc(8) as number;
+        wj_tls_cell_update();
+        wjPatchStats.tlsCell++;
+    }
+    return wjTlsCell;
+}
+
+export function mono_jiterp_wasm_jit_worker_reuse () {
+    if (wjTlsCell)
+        wj_tls_cell_update();
+    // Only a trampoline with the wasm-JIT fast path (wjNargs >= 0) reaches a JIT f-slot.
+    let tramps = 0, adapters = 0;
+    for (const k in infoTable) {
+        const info = infoTable[k];
+        if (info.wjNargs < 0)
+            continue;
+        if (info.guardedImplementation)
+            tramps++;
+        if (info.directInstalled)
+            adapters++;
+    }
+    const slotFn = (<any>Module).__wjSlotFn as Map<number, Function> | undefined;
+    const slots = slotFn ? slotFn.size : 0;
+    if (!tramps && !adapters && !slots)
+        return;
+    if (!cwraps.mono_wasm_jit_worker_reuse(tramps, adapters, slots))
+        return;
+    if (!fnTable)
+        fnTable = getWasmFunctionTable();
+    for (const k in infoTable) {
+        const info = infoTable[k];
+        if (info.wjNargs < 0 || !info.directInstalled)
+            continue;
+        if (info.result > 0)
+            fnTable.set(info.result, info.guardedImplementation || fnTable.get(info.defaultImplementation));
+        info.directInstalled = false;
+        wjPatchStats.reuseReverted++;
+    }
+    if (slotFn) {
+        // the fill every JIT_CALL slot starts with (jiterpreter_allocate_tables)
+        const placeholder = getRawCwrap("mono_jiterp_placeholder_jit_call");
+        for (const i of slotFn.keys())
+            fnTable.set(i, placeholder);
+        slotFn.clear();
+    }
+}
+
+// The TrampolineInfo for a method pointer lives only on the worker that created the pointer, but the pointer is
+// a process-wide table index every worker calls. Without an info a worker never generates a trampoline, and its
+// native->managed entries stay on the C interp_entry boundary for the process lifetime (R293c). Adopt the entry
+// here at the SAME index, which this worker's table already fills with the generic entry the info expects.
+// Unbox entries are not recorded C-side; a refusal is remembered so it costs one C call per method, not per entry.
+let wjAdoptScratch = 0;
+const wjAdoptRefused = new Set<number>();
+function wj_adopt_entry (imethod: number): TrampolineInfo | undefined {
+    if (wjAdoptRefused.has(imethod))
+        return undefined;
+    if (!wjAdoptScratch)
+        wjAdoptScratch = <any>malloc(4 * 8) as number;
+    if (!cwraps.mono_jiterp_entry_adopt_info(imethod, wjAdoptScratch)) {
+        wjAdoptRefused.add(imethod);
+        return undefined;
+    }
+    const at = (i: number) => getU32_unaligned(<any>(wjAdoptScratch + i * 4)) >>> 0;
+    if (!fnTable)
+        fnTable = getWasmFunctionTable();
+    const info = new TrampolineInfo(
+        imethod, <any>at(0), at(1), <any>at(2), false, at(3) !== 0, at(4) !== 0, at(5)
+    );
+    info.result = at(6);
+    infoTable[imethod] = info;
+    wjPatchStats.adopted++;
+    return info;
+}
+
 // FIXME: move this counter into C and make it thread safe
 export function mono_interp_record_interp_entry (imethod: number) {
     // clear the unbox bit
+    const unboxBit = imethod & 0x1;
     imethod = (imethod & ~0x1) >>> 0;
 
     wjPatchStats.recordCalls++;
-    const info = infoTable[imethod];
+    let info: TrampolineInfo | undefined = infoTable[imethod];
+    if (!info && !unboxBit)
+        info = wj_adopt_entry(imethod);
     // This shouldn't happen but it's not worth crashing over
     if (!info) {
         wjPatchStats.recordNoInfo++;
+        return;
+    }
+    // Memory compare only (no call out): this runs per entry until the wrapper is compiled.
+    if (!wjInfoIsLive(info, false)) {
+        delete infoTable[imethod];
+        wjPatchStats.deadDropped++;
         return;
     }
 
@@ -400,6 +525,13 @@ function flush_wasm_entry_trampoline_jit_queue () {
         const info = infoTable[<any>methodPtr];
         if (!info) {
             mono_log_info(`Failed to find corresponding info for method ptr ${methodPtr} from jit queue!`);
+            continue;
+        }
+        // A stale entry (see wjInfoIsLive) must not be generated from: doing so read freed memory, and the
+        // resulting OOB threw away every trampoline queued alongside it (R291).
+        if (!wjInfoIsLive(info, true)) {
+            delete infoTable[<any>methodPtr];
+            wjPatchStats.deadDropped++;
             continue;
         }
         jitQueue.push(info);
@@ -901,8 +1033,11 @@ function generate_wasm_body (
         //     valid (the old module is not freed) until that worker admits the new one itself.
         // Adding a generation probe here would therefore cost inline work on the guarded path to defend a
         // window that is closed by construction. If any of those three orderings changes, revisit this.
+        // Through wjTlsCell, never baked: the pthread this runs on need not be the one that generated it (R293b).
         builder.local("wj_fslot");
-        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_cap_addr());
+        builder.ptr_const(wj_tls_cell());
+        builder.appendU8(WasmOpcode.i32_load);
+        builder.appendMemarg(0, 2); // -> &wj_slot_live_cap of the CURRENT pthread
         builder.appendU8(WasmOpcode.i32_load);
         builder.appendMemarg(0, 2);
         builder.appendU8(WasmOpcode.i32_lt_u);
@@ -910,7 +1045,9 @@ function generate_wasm_body (
         builder.appendU8(WasmOpcode.br_if);
         builder.appendULeb(0);
 
-        builder.ptr_const(cwraps.mono_wasm_jit_slot_live_ptr_addr());
+        builder.ptr_const(wj_tls_cell());
+        builder.appendU8(WasmOpcode.i32_load);
+        builder.appendMemarg(4, 2); // -> &wj_slot_live of the CURRENT pthread
         builder.appendU8(WasmOpcode.i32_load);
         builder.appendMemarg(0, 2);
         builder.local("wj_fslot");

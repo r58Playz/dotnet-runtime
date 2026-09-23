@@ -19,6 +19,7 @@ import { mono_log_debug, mono_log_error } from "../logging";
 import { CharPtr } from "../types/emscripten";
 import { utf8ToString } from "../strings";
 import { forceThreadMemoryViewRefresh } from "../memory";
+import { mono_jiterp_wasm_jit_worker_reuse } from "../jiterpreter-interp-entry";
 
 // re-export some of the events types
 export {
@@ -85,6 +86,12 @@ export function mono_wasm_pthread_on_pthread_created (): void {
 
         monoThreadInfo.reuseCount++;
         monoThreadInfo.updateCount++;
+        // before this pthread runs anything: drop code the worker built under a previous one (R293)
+        try {
+            mono_jiterp_wasm_jit_worker_reuse();
+        } catch (err) {
+            mono_log_error("mono_jiterp_wasm_jit_worker_reuse () failed", err);
+        }
         monoThreadInfo.threadName = "pthread-assigned";
         update_thread_info();
 
