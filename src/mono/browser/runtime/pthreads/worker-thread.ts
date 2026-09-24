@@ -90,7 +90,7 @@ export function mono_wasm_pthread_on_pthread_created (): void {
         try {
             mono_jiterp_wasm_jit_worker_reuse();
         } catch (err) {
-            mono_log_error("mono_jiterp_wasm_jit_worker_reuse () failed", err);
+            mono_log_error("mono_jiterp_wasm_jit_worker_reuse () failed; the worker's JIT state still names the previous pthread", err);
         }
         monoThreadInfo.threadName = "pthread-assigned";
         update_thread_info();
