@@ -467,6 +467,14 @@ mono_wasm_jit_dump_stats (void)
 			WJC_(WJC_LAZY_DOOMED_HOT0), mono_wasm_jit_lazy_cold);
 	}
 	{
+		extern int mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
+			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero;
+		printf ("[wasm-jit levers] guarded_inline=%d inline_leaf=%d lazy_cold=%d vcall_memo=%d frame_zero=%d "
+			"-- the R299 call-pool levers IN EFFECT (runtime defaults unless overridden)\n",
+			mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
+			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero);
+	}
+	{
 		extern int mono_wasm_jit_frame_zero;
 		printf ("[wasm-jit framezero] skipped_bytes=%lld (MONO_WASM_JIT_FRAME_ZERO=%d) -- write-through ref-region bytes "
 			"no eager prologue zeroed, per method emitted\n", WJC_(WJC_FRAME_ZERO_SKIPPED), mono_wasm_jit_frame_zero);

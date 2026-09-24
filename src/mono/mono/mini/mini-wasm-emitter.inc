@@ -2460,7 +2460,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * (R294): such a slot is a mirror rewritten at each def with no GC point between, and zeroed
 				 * again at its kill point, so before its first def it can only hold a stale word -- which the
 				 * CONSERVATIVE scan of this C-stack region treats as at most a pin, and only while a GC runs
-				 * during this frame. Zero-init is still owed to the address region (.NET locals) and to any
+				 * during this frame (R300 measured that cost: +20% stack-pinned bytes per minor GC, no
+				 * heap growth). Zero-init is still owed to the address region (.NET locals) and to any
 				 * slot-homed ref (addrslot -2), so either of those keeps the fill. */
 				int zfrom = 0, zo;
 				if (!mono_wasm_jit_frame_zero && lc.ref_wt) {
