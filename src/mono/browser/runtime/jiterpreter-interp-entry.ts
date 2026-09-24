@@ -315,9 +315,11 @@ export function mono_jiterp_wasm_jit_unpatch_interp_entry (imethod: number) {
 // install that works is at flush time). e/f slots go back to the placeholder, matching the new pthread's empty
 // bitmaps.
 let wjTlsCell = 0;
+// `>>> 0`: a "number" cwrap returns an address as a SIGNED i32, so a TLS block above 2 GB arrives negative and
+// setU32's range assert throws -- which skipped the whole reset on that take-up, 1-19 times a run.
 function wj_tls_cell_update () {
-    setU32(<any>wjTlsCell, cwraps.mono_wasm_jit_slot_live_cap_addr());
-    setU32(<any>(wjTlsCell + 4), cwraps.mono_wasm_jit_slot_live_ptr_addr());
+    setU32(<any>wjTlsCell, cwraps.mono_wasm_jit_slot_live_cap_addr() >>> 0);
+    setU32(<any>(wjTlsCell + 4), cwraps.mono_wasm_jit_slot_live_ptr_addr() >>> 0);
 }
 // Allocated once per worker and never freed: every guarded trampoline on this worker points at it.
 function wj_tls_cell (): number {
