@@ -4658,6 +4658,15 @@ INTERP_BUILD_EXCEPTION_TYPE_FUNC_NAME(interp_get_exception, exception_type) (con
 	return ex; \
 }
 
+/* R302 cast-failure diagnostic, defined in mini-wasm-diagnostics.inc. That lives in mini-wasm.c's HOST_BROWSER
+ * region, which mono-aot-cross does not link although it links this file -- hence the guard at every call. */
+#if HOST_BROWSER
+void mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *klass, MonoMethod *method);
+#define WJ_NOTE_CAST(site, obj, klass, method) mono_wasm_jit_note_invalid_cast ((site), (MonoObject *) (obj), (klass), (method))
+#else
+#define WJ_NOTE_CAST(site, obj, klass, method) do { } while (0)
+#endif
+
 INTERP_GET_EXCEPTION(null_reference)
 INTERP_GET_EXCEPTION(divide_by_zero)
 INTERP_GET_EXCEPTION(overflow)
@@ -8334,7 +8343,7 @@ mono_wasm_jit_raise_corlib (int exc_id)
 	case 0:  ex = mono_get_exception_overflow (); break;
 	case 1:  ex = mono_get_exception_divide_by_zero (); break;
 	case 2:  ex = mono_get_exception_index_out_of_range (); break;
-	case 3:  ex = mono_get_exception_invalid_cast (); break;
+	case 3:  ex = mono_get_exception_invalid_cast (); WJ_NOTE_CAST ("jit-raise", NULL, NULL, NULL); break;
 	case 4:  ex = mono_get_exception_null_reference (); break;
 	case 5:  ex = mono_get_exception_arithmetic (); break;
 	case 6:  ex = mono_get_exception_array_type_mismatch (); break;
@@ -13640,8 +13649,10 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 					gboolean const isinst_instr = *ip == MINT_ISINST_INTERFACE;
 					if (isinst_instr)
 						LOCAL_VAR (ip [1], MonoObject*) = NULL;
-					else
+					else {
+						WJ_NOTE_CAST ("interp-castclass", o, c, frame->imethod->method);
 						THROW_EX (interp_get_exception_invalid_cast (frame, ip), ip);
+					}
 				} else {
 					LOCAL_VAR (ip [1], MonoObject*) = o;
 				}
@@ -13662,8 +13673,10 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 					gboolean const isinst_instr = *ip == MINT_ISINST_COMMON;
 					if (isinst_instr)
 						LOCAL_VAR (ip [1], MonoObject*) = NULL;
-					else
+					else {
+						WJ_NOTE_CAST ("interp-castclass", o, c, frame->imethod->method);
 						THROW_EX (interp_get_exception_invalid_cast (frame, ip), ip);
+					}
 				} else {
 					LOCAL_VAR (ip [1], MonoObject*) = o;
 				}
@@ -13683,8 +13696,10 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 					gboolean const isinst_instr = *ip == MINT_ISINST;
 					if (isinst_instr)
 						LOCAL_VAR (ip [1], MonoObject*) = NULL;
-					else
+					else {
+						WJ_NOTE_CAST ("interp-castclass", o, c, frame->imethod->method);
 						THROW_EX (interp_get_exception_invalid_cast (frame, ip), ip);
+					}
 				} else {
 					LOCAL_VAR (ip [1], MonoObject*) = o;
 				}
@@ -13707,8 +13722,10 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 			NULL_CHECK (o);
 			MonoClass *c = (MonoClass*)frame->imethod->data_items [ip [3]];
 
-			if (!(m_class_get_rank (o->vtable->klass) == 0 && m_class_get_element_class (o->vtable->klass) == m_class_get_element_class (c)))
+			if (!(m_class_get_rank (o->vtable->klass) == 0 && m_class_get_element_class (o->vtable->klass) == m_class_get_element_class (c))) {
+				WJ_NOTE_CAST ("interp-unbox", o, c, frame->imethod->method);
 				THROW_EX (interp_get_exception_invalid_cast (frame, ip), ip);
+			}
 
 			LOCAL_VAR (ip [1], gpointer) = mono_object_unbox_internal (o);
 			ip += 4;

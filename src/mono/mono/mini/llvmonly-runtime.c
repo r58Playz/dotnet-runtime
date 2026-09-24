@@ -1090,9 +1090,19 @@ mini_llvmonly_throw_index_out_of_range_exception (void)
 	mini_llvmonly_throw_corlib_exception (ex_token_index);
 }
 
+/* R302 cast-failure diagnostic, defined in mini-wasm-diagnostics.inc. That lives in mini-wasm.c's HOST_BROWSER
+ * region, which mono-aot-cross does not link although it links this file -- hence the guard at every call. */
+#if HOST_BROWSER
+void mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *klass, MonoMethod *method);
+#define WJ_NOTE_CAST(site, obj, klass, method) mono_wasm_jit_note_invalid_cast ((site), (MonoObject *) (obj), (klass), (method))
+#else
+#define WJ_NOTE_CAST(site, obj, klass, method) do { } while (0)
+#endif
+
 void
 mini_llvmonly_throw_invalid_cast_exception (void)
 {
+	WJ_NOTE_CAST ("aot-raise", NULL, NULL, NULL);
 	MonoClass *klass = mono_class_get_invalid_cast_class ();
 
 	guint32 ex_token_index = m_class_get_type_token (klass) - MONO_TOKEN_TYPE_DEF;
