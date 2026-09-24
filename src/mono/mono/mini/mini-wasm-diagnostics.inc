@@ -94,6 +94,107 @@ static gint32 wj_census_entered_total;/* distinct (thread, e-slot) pairs actuall
  * on a soak; mono_wasm_jit_liveness returns int and would need a millisecond field either way. */
 static gint32 wj_census_inst_us_total;/* microseconds spent instantiating, all threads */
 
+/*
+ * CAST-FAILURE DIAGNOSTIC (R302). `java.lang.ClassCastException: Arg_InvalidCastException` has been hitting ~3%
+ * of recent runs, and is in the archive back to 2026-08-09, at a different site every time (R301). It has never
+ * been diagnosed because the exception carries no type names: its message is a trimmed resource key. Every
+ * NATIVE raise of InvalidCastException now calls this -- the wasm JIT's raise_corlib, the interpreter's
+ * castclass/unbox failures, the castclass icalls, and llvmonly AOT's raise. Only the failure path pays.
+ * FIRST CATCH (p25/c8, R302): site=interp-castclass in `RegularImmutableAsList.listIterator(int)` (shaded Guava in
+ * an IKVM dynamic assembly) casting a correct `Iterators$10` to Mixin's `MixinCoprocessor$ProcessResult` -- the
+ * TARGET class in the interpreter's data_items was wrong, not the object.
+ *
+ * Where the raiser has the operands, each NEW (site, object class, target class) prints once with a JS stack,
+ * the object's real class, the target, the interp method, and whether `isinst` succeeds WHEN RE-ASKED: if it
+ * does, the check that failed was wrong (a miscompile or a bad cache); if it does not, a wrong object reached
+ * the cast. The JIT and AOT raises carry no operands, so the first 16 of those print by stack alone -- which
+ * still names the JIT method from its name section. A healthy run raises some casts on purpose (Java code
+ * that catches CCE), so a non-zero total is normal; read the classes.
+ *
+ * Pointers are range-checked before every dereference: the object may BE the bug (a stale reference), and a
+ * trap here would turn a diagnostic into a worker death.
+ */
+#define WJ_CASTFAIL_SIGS 64
+static gint32 wj_castfail_total, wj_castfail_sigs_used, wj_castfail_bare_printed;
+static gpointer wj_castfail_sig [WJ_CASTFAIL_SIGS];
+
+static gboolean
+wj_castfail_in_heap (const void *p)
+{
+	uintptr_t u = (uintptr_t) p;
+	return u >= 1024 && u < (uintptr_t) __builtin_wasm_memory_size (0) * 65536u;
+}
+
+static void
+wj_castfail_class_name (MonoClass *k, char *buf, int n)
+{
+	const char *ns, *nm, *an = "?";
+	MonoImage *img;
+	if (!k) { g_snprintf (buf, n, "(none)"); return; }
+	if (!wj_castfail_in_heap (k) || ((uintptr_t) k & 3)) { g_snprintf (buf, n, "(bad class %p)", k); return; }
+	ns = m_class_get_name_space (k);
+	nm = m_class_get_name (k);
+	img = m_class_get_image (k);
+	if (wj_castfail_in_heap (img) && wj_castfail_in_heap (img->assembly_name))
+		an = img->assembly_name;
+	g_snprintf (buf, n, "%s%s%s [%s] (%p)", wj_castfail_in_heap (ns) ? ns : "?",
+		(wj_castfail_in_heap (ns) && *ns) ? "." : "", wj_castfail_in_heap (nm) ? nm : "?", an, k);
+}
+
+WJ_KEEPALIVE void
+mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *klass, MonoMethod *method)
+{
+	MonoClass *from = NULL;
+	MonoVTable *vt = NULL;
+	gboolean print = FALSE;
+	const char *recheck = "n/a";
+	char fbuf [256], tbuf [256], line [1024];
+	char *mname = NULL;
+	int total = mono_atomic_inc_i32 (&wj_castfail_total);
+
+	if (obj && wj_castfail_in_heap (obj) && !((uintptr_t) obj & 3)) {
+		vt = obj->vtable;
+		if (wj_castfail_in_heap (vt) && !((uintptr_t) vt & 3))
+			from = vt->klass;
+	}
+	if (!obj && !klass) {
+		print = mono_atomic_inc_i32 (&wj_castfail_bare_printed) <= 16;
+	} else {
+		gpointer sig = (gpointer) ((uintptr_t) site ^ (uintptr_t) from ^ ((uintptr_t) klass << 1));
+		int i, n = MIN (mono_atomic_load_i32 (&wj_castfail_sigs_used), WJ_CASTFAIL_SIGS);
+		for (i = 0; i < n; ++i)
+			if (wj_castfail_sig [i] == sig)
+				break;
+		if (i == n) {
+			int slot = mono_atomic_inc_i32 (&wj_castfail_sigs_used) - 1;
+			if (slot < WJ_CASTFAIL_SIGS) {
+				wj_castfail_sig [slot] = sig;
+				print = TRUE;
+			}
+		}
+	}
+	if (!print)
+		return;
+
+	wj_castfail_class_name (from, fbuf, sizeof (fbuf));
+	wj_castfail_class_name (klass, tbuf, sizeof (tbuf));
+	if (method && wj_castfail_in_heap (method))
+		mname = mono_method_get_full_name (method);
+	g_snprintf (line, sizeof (line), "[wasm-jit castfail] #%d site=%s obj=%p vtable=%p from=%s to=%s method=%s",
+		total, site, obj, vt, fbuf, tbuf, mname ? mname : "(see stack)");
+	g_free (mname);
+	EM_ASM ({ var l = Error.stackTraceLimit; Error.stackTraceLimit = 40; var s = (new Error ()).stack; Error.stackTraceLimit = l; console.log (UTF8ToString ($0) + " " + s); }, line);
+	/* AFTER the line is out: isinst walks the object's class hierarchy, and if the object is stale that walk
+	 * can trap -- which must not take the line above with it. */
+	if (from && klass && wj_castfail_in_heap (from) && wj_castfail_in_heap (klass)) {
+		ERROR_DECL (error);
+		recheck = mono_object_isinst_checked (obj, klass, error) ? "isinst NOW SUCCEEDS -- the failed check was wrong" : "isinst fails -- the object is not a `to`: either a wrong object, or the cast names the wrong class (compare `to` with the method)";
+		mono_error_cleanup (error);
+		g_snprintf (line, sizeof (line), "[wasm-jit castfail] #%d recheck: %s", total, recheck);
+		EM_ASM ({ console.log (UTF8ToString ($0)); }, line);
+	}
+}
+
 /* One successful module instantiation on this thread, `ms` being the WebAssembly.Module+Instance time
  * the EM_ASM measured. Unconditional -- see the gate-split note above. A batched module counts ONCE,
  * not once per member: the WebAssembly.Instance and its export JSFunctions are what a batch amortizes,
@@ -474,6 +575,10 @@ mono_wasm_jit_dump_stats (void)
 			mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
 			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero);
 	}
+	printf ("[wasm-jit castfail] total=%d signatures=%d bare=%d -- native InvalidCastException raises (R302); each "
+		"new (site, from, to) and the first 16 operand-less JIT/AOT raises print once with a JS stack\n",
+		mono_atomic_load_i32 (&wj_castfail_total), mono_atomic_load_i32 (&wj_castfail_sigs_used),
+		mono_atomic_load_i32 (&wj_castfail_bare_printed));
 	{
 		extern int mono_wasm_jit_frame_zero;
 		printf ("[wasm-jit framezero] skipped_bytes=%lld (MONO_WASM_JIT_FRAME_ZERO=%d) -- write-through ref-region bytes "

@@ -1306,6 +1306,15 @@ mono_create_corlib_exception_2 (guint32 token, MonoString *arg1_raw, MonoString 
 	HANDLE_FUNCTION_RETURN_OBJ (ret);
 }
 
+/* R302 cast-failure diagnostic, defined in mini-wasm-diagnostics.inc. That lives in mini-wasm.c's HOST_BROWSER
+ * region, which mono-aot-cross does not link although it links this file -- hence the guard at every call. */
+#if HOST_BROWSER
+void mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *klass, MonoMethod *method);
+#define WJ_NOTE_CAST(site, obj, klass, method) mono_wasm_jit_note_invalid_cast ((site), (MonoObject *) (obj), (klass), (method))
+#else
+#define WJ_NOTE_CAST(site, obj, klass, method) do { } while (0)
+#endif
+
 MonoObject*
 mono_object_castclass_unbox (MonoObject *obj, MonoClass *klass)
 {
@@ -1334,6 +1343,7 @@ mono_object_castclass_unbox (MonoObject *obj, MonoClass *klass)
 		jit_tls->class_cast_to = klass;
 	}
 
+	WJ_NOTE_CAST ("icall-castclass", obj, klass, NULL);
 	mono_set_pending_exception (mono_exception_from_name (mono_defaults.corlib,
 					"System", "InvalidCastException"));
 
@@ -1373,6 +1383,7 @@ mono_object_castclass_with_cache (MonoObject *obj, MonoClass *klass, gpointer *c
 		jit_tls->class_cast_to = klass;
 	}
 
+	WJ_NOTE_CAST ("icall-castclass", obj, klass, NULL);
 	mono_set_pending_exception (mono_exception_from_name (mono_defaults.corlib,
 					"System", "InvalidCastException"));
 
