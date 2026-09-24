@@ -423,7 +423,14 @@ as 2.3x x 7.6x before R269 re-derived the denominator). The path to it, same ins
 | relink OFF (`IKVM_LAZY_RECOMPILE=0`) | 188.4 | R277, 2 captures |
 | **relink ON (shipped)** | **165.4** | **-12.2%**, non-overlapping both rows, = 15.6x native |
 | + the four defect fixes | 161.8 | R279 plateau |
-| current | **155.2 / 155.5** | R280h, both `IKVM_LAZY_CTORS` arms |
+| R280h | 155.2 / 155.5 | both `IKVM_LAZY_CTORS` arms |
+| control before the flip, 2026-09-23 | 149.1 / 158.1 | R299 D arms |
+| **current: the R299 levers ON by default** | **139.7 / 142.1** | R299 Z arms, **-8.3%**, same binary, 0 skipped ticks |
+
+The five levers (`GUARDED_INLINE`, `INLINE_LEAF=64`, `LAZY_COLD=1`, `VCALL_MEMO`, `FRAME_ZERO=0`) cut **our
+emitted code** (the real-Java bucket) 77.5 -> 64.6 M/tick, reproducing R292's figure for that bucket. The total's
+run-to-run spread comes from the JIT-helper and lazy-link buckets (+-3-5 M/tick), so quote the total as -6 to -8%.
+They were blocked for months by the recurring OOB, which was worker reuse (R293), not inlining.
 
 The mechanism is far more robust than the timing total: the **IKVM lazy-link dispatch pool HALVED**
 (52.38 -> 25.24 M/tick, -51.8%) and the server **completed 2,405 ticks against 2,050 in the same window

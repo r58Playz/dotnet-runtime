@@ -167,20 +167,18 @@ int mono_wasm_jit_devirt_force_max = 2;
  * behind the same vtable guard the emitter's predicted arm already uses, instead of a call. See the
  * long argument at the site in method-to-ir.c.
  *
- * DEFAULT 0, and it must stay 0 until R118's second bug is closed. That bug is still open:
- * MONO_INLINELIMIT=60 produced 4 intermittent `memory access out of bounds` traps with a captured
- * stack in a JITted __<>MHC1 stub during worldgen, at roughly 1 run in 2. Growing inlined bodies is
- * precisely what provoked it, and this grows them in a population that limit never reached. Fix it
- * before shipping, not after -- and note one clean run proves nothing at that incidence, so the gate
- * is >=4 full boot->world->in-game runs at each size limit.
+ * R118's "second bug" -- intermittent `memory access out of bounds` in a JITted __<>MHC stub as inlined
+ * bodies grow, ~1 run in 2 -- has the SAME stack as the recurring OOB (R291), which was worker reuse
+ * running code against a previous pthread's freed TLS (R293, R293j). Inlining only raised its rate. With
+ * the reset in, it has not recurred: 20/20 + 6/6 runs of this knob with the other R292 levers (R299).
+ * Worth -2.9% of the server tick alone (R290 add. 2) and part of R299's -8.3% together.
  *
  * Knob-off output must be BYTE-IDENTICAL, not merely close: tiershape.py at 0.00%. Do NOT compare
  * against an absolute noise floor here -- R241 measured the same-binary floor at 0.69% on the current
  * tier (158 of 22,816 methods), 4.6x the 0.15% this comment used to quote from a tier half the size.
  * Run a same-binary CONTROL pair alongside the A/B; an inherited constant is a coin flip, and this is
- * a gate-only change when off, so anything above 0.00% means the disjunct is firing when it should not. This is a gate-only change when off, so anything else means the disjunct is firing when it
- * should not. */
-int mono_wasm_jit_guarded_inline = 0;
+ * a gate-only change when off, so anything above 0.00% means the disjunct is firing when it should not. */
+int mono_wasm_jit_guarded_inline = 1;
 /* MONO_WASM_JIT_GUARDED_INLINE_SIZE: IL byte cap for a guarded inline candidate, SEPARATE from
  * INLINE_LENGTH_LIMIT (20) on purpose. R118 closed raising the GLOBAL limit on mechanism -- bodies
  * +3.5-4.4%, saturating by 60, and calls per method going UP 1.0%, because the caller absorbs the
@@ -577,14 +575,15 @@ int mono_wasm_jit_lazy_gcp = 1;
  * Target: the getters/field binders that spend ~72% of their time in prologue/epilogue (R290).
  * Level 2 also discounts GC points in blocks that cannot reach the exit -- an IKVM throw path allocates and
  * constructs its exception before raising -- running the frame as an ordinary lazy one inside them
- * (lazy_doomed in the emitter, R294). */
-int mono_wasm_jit_lazy_cold = 0;
+ * (lazy_doomed in the emitter, R294). Level 1 is what R292/R299 timed; level 2 reaches ~100 more methods
+ * (R294d) and has never been timed on the tick. */
+int mono_wasm_jit_lazy_cold = 1;
 /* MONO_WASM_JIT_VCALL_MEMO: the per-thread miss memo in mono_wasm_jit_vcall_resolve_fslot (interp.c), which
- * carries the design and its invariants. Off for the within-binary A/B. */
-int mono_wasm_jit_vcall_memo = 0;
+ * carries the design and its invariants. resolve_fslot self -41% in R292; timed with the other levers (R299). */
+int mono_wasm_jit_vcall_memo = 1;
 /* MONO_WASM_JIT_INLINE_LEAF: IL-byte limit for inlining a CALL-FREE callee, above mono's 20; 0 = off. See
- * mono_method_check_inlining_limit in method-to-ir.c. */
-int mono_wasm_jit_inline_leaf = 0;
+ * mono_method_check_inlining_limit in method-to-ir.c. 64 is the value R292/R299 timed; it was not swept. */
+int mono_wasm_jit_inline_leaf = 64;
 /* MONO_WASM_JIT_DEADSET: consult the freed-method set (mono_wasm_jit_note_method_freed) before any site
  * dereferences a RETAINED MonoMethod *. On: it is the fix for the island-DFS asserts (R290). 0 = the A/B. */
 int mono_wasm_jit_deadset = 1;
@@ -665,7 +664,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
 	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
-	{ extern int mono_wasm_jit_guarded_inline; const char *gi = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE"); mono_wasm_jit_guarded_inline = (gi && *gi && *gi != '0') ? 1 : 0; }
+	{ extern int mono_wasm_jit_guarded_inline; const char *gi = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE"); if (gi && *gi) mono_wasm_jit_guarded_inline = *gi != '0'; }
 	{ extern int mono_wasm_jit_guarded_inline_size; const char *gs = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE_SIZE"); int v = (gs && *gs) ? atoi (gs) : 60; mono_wasm_jit_guarded_inline_size = (v >= 0 && v <= 4096) ? v : 60; }
 	{ extern int mono_wasm_jit_delegate_devirt; const char *dd = g_getenv ("MONO_WASM_JIT_DELEGATE_DEVIRT"); int v = (dd && *dd) ? atoi (dd) : mono_wasm_jit_delegate_devirt; mono_wasm_jit_delegate_devirt = (v >= 0 && v <= 100) ? v : mono_wasm_jit_delegate_devirt; }
 	{ extern int mono_wasm_jit_pred_pct; const char *pp = g_getenv ("MONO_WASM_JIT_PRED_PCT"); int v = (pp && *pp) ? atoi (pp) : 0; mono_wasm_jit_pred_pct = (v >= 0 && v <= 100) ? v : 0; }
@@ -860,8 +859,9 @@ mono_wasm_jit_note_bad_eh_clause (MonoMethod *method, guint32 off, guint32 code_
  * Round 110 failure mode (trading a call for a long live range) does not apply. */
 int mono_wasm_jit_inline_zero = 64;   /* max framebytes to zero inline; 0 disables (always memory.fill). */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
- * prologue carries the argument; R294 measures it). */
-int mono_wasm_jit_frame_zero = 1;
+ * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,
+ * +20% stack-pinned bytes per minor GC with no measurable heap growth (R300). */
+int mono_wasm_jit_frame_zero = 0;
 /* MONO_WASM_JIT_DELEGATE_OBJ_PIC is deleted -- the losing arm of a settled two-path choice, with
  * DELEGATE_LOCAL_PIC keeping the field.
  *
