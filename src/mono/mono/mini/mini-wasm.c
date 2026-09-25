@@ -581,6 +581,35 @@ int mono_wasm_jit_lazy_cold = 1;
 /* MONO_WASM_JIT_VCALL_MEMO: the per-thread miss memo in mono_wasm_jit_vcall_resolve_fslot (interp.c), which
  * carries the design and its invariants. resolve_fslot self -41% in R292; timed with the other levers (R299). */
 int mono_wasm_jit_vcall_memo = 1;
+/* MONO_WASM_JIT_IC_MID: on a way-zero miss in the emitted inline IC, test whether the receiver's class holds
+ * the SAME method in the call's vtable slot as the entry's cached target, and reuse the entry's f-slot if so
+ * instead of entering the resolver. Class-virtual, non-generic sites only. See R311. */
+int mono_wasm_jit_ic_mid = 1;
+/* MONO_WASM_JIT_PRED_MID: METHOD-identity guards on the devirt arm and on guarded inlining, and predicting a
+ * site whose recorded receivers all resolve to one method. Class-virtual, non-generic sites only. See R311. */
+int mono_wasm_jit_pred_mid = 1;
+/* MONO_WASM_JIT_PROF_INLINEE: when the caller's profile cannot predict a GI site that came from an inlined
+ * callee, ask the callee's own profile -- the interpreter recorded that call under the callee. See R311. */
+int mono_wasm_jit_prof_inlinee = 1;
+/* MONO_WASM_JIT_PROF_BLOCKS: how many WJ_PROF_MAX_SITES-site profile blocks one caller may chain; 1 is the
+ * old fixed cap. See R311. */
+int mono_wasm_jit_prof_blocks = 4;
+
+/* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
+ * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
+ * metadata operation must not be added (CLAUDE.md). base->slot is final once the declaring class's vtable
+ * exists, and a generic or inflated method is refused because its slot is not the one klass->vtable holds. */
+int
+mono_wasm_jit_mid_slot (MonoMethod *base)
+{
+	if (!base || !(base->flags & METHOD_ATTRIBUTE_VIRTUAL) || base->is_inflated || base->is_generic)
+		return -1;
+	if (mono_class_is_interface (base->klass))
+		return -2;
+	if (!m_class_get_vtable (base->klass) || base->slot < 0)
+		return -1;
+	return base->slot;
+}
 /* MONO_WASM_JIT_INLINE_LEAF: IL-byte limit for inlining a CALL-FREE callee, above mono's 20; 0 = off. See
  * mono_method_check_inlining_limit in method-to-ir.c. 64 is the value R292/R299 timed; it was not swept. */
 int mono_wasm_jit_inline_leaf = 64;
@@ -673,6 +702,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_lazy_gcp; const char *lg = g_getenv ("MONO_WASM_JIT_LAZY_GCP"); mono_wasm_jit_lazy_gcp = (lg && *lg) ? atoi (lg) : 1; } /* GC points a method may have and still defer its ref frame; <=0 = unlimited */
 	{ extern int mono_wasm_jit_lazy_cold; const char *lc = g_getenv ("MONO_WASM_JIT_LAZY_COLD"); if (lc && *lc) { int v = atoi (lc); mono_wasm_jit_lazy_cold = (v >= 0 && v <= 2) ? v : 0; } }
 	{ extern int mono_wasm_jit_vcall_memo; const char *vm = g_getenv ("MONO_WASM_JIT_VCALL_MEMO"); if (vm && *vm) mono_wasm_jit_vcall_memo = *vm != '0'; }
+	{ extern int mono_wasm_jit_ic_mid; const char *v = g_getenv ("MONO_WASM_JIT_IC_MID"); if (v && *v) mono_wasm_jit_ic_mid = *v != '0'; }
+	{ extern int mono_wasm_jit_pred_mid; const char *v = g_getenv ("MONO_WASM_JIT_PRED_MID"); if (v && *v) mono_wasm_jit_pred_mid = *v != '0'; }
+	{ extern int mono_wasm_jit_prof_inlinee; const char *v = g_getenv ("MONO_WASM_JIT_PROF_INLINEE"); if (v && *v) mono_wasm_jit_prof_inlinee = *v != '0'; }
+	{ extern int mono_wasm_jit_prof_blocks; const char *v = g_getenv ("MONO_WASM_JIT_PROF_BLOCKS"); if (v && *v) { int n = atoi (v); mono_wasm_jit_prof_blocks = (n >= 1 && n <= 16) ? n : 1; } }
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }
 	{ extern int mono_wasm_jit_retire_free; const char *rf = g_getenv ("MONO_WASM_JIT_RETIRE_FREE"); if (rf && *rf) mono_wasm_jit_retire_free = *rf != '0'; }

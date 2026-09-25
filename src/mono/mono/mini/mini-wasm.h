@@ -1191,6 +1191,45 @@ enum {
 	WJC_PLACEHOLDER_STRAY,
 	/* Edge samples dropped because the entry poll came more than 2 ms after the tick (a blocked worker). */
 	WJC_EDGE_LATE,
+	/* R310 profile-delivery census, all stats-gated. The GI gate's `prof` refusal split by WHY
+	 * (NOREC + COLD + POLY + torn == WJC_GI_REFUSED_PROF), with two sub-splits: a no_rec whose caller's
+	 * profile is already full (WJ_PROF_MAX_SITES), and a poly site whose recorded receivers all resolve to
+	 * ONE method (a method-identity guard would take it). INL: the refused site came from an inlined
+	 * callee, whose calls the interpreter recorded under the CALLEE'S InterpMethod, not the caller's;
+	 * INL_REC = the callee's own record would have predicted, INL_NOIM = the callee has no InterpMethod. */
+	WJC_GI_PROF_NOREC,
+	WJC_GI_PROF_NOREC_FULL,
+	WJC_GI_PROF_COLD,
+	WJC_GI_PROF_POLY,
+	WJC_GI_PROF_POLY_SAMETGT,
+	WJC_GI_PROF_INL,
+	WJC_GI_PROF_INL_REC,
+	WJC_GI_PROF_INL_NOIM,
+	/* The same question weighted by EXECUTION, at the IC miss publish (wj_vcall_pic_publish). MISS ==
+	 * NOSITE + FIRST + SAME_ID + SAME_TGT + DIFF_TGT. NOSITE: the caller's profile was full, so the miss was
+	 * dropped. SAME_TGT: a receiver other than the site's front-runner that resolves to the SAME method.
+	 * RESOLVE counts every non-delegate entry to vcall_resolve_fslot, published or not (the denominator). */
+	WJC_PD_MISS,
+	WJC_PD_MISS_NOSITE,
+	WJC_PD_MISS_FIRST,
+	WJC_PD_MISS_SAME_ID,
+	WJC_PD_MISS_SAME_TGT,
+	WJC_PD_MISS_DIFF_TGT,
+	WJC_PD_RESOLVE,
+	/* R311 mechanism census, stats-gated. MID_IC_SITES: emitted inline ICs given the method-identity fallback;
+	 * MID_IC_SKIP_IFACE / _OTHER: IC sites refused it (interface slot / generic or no slot yet). MID_ARM /
+	 * MID_GI: devirt arms / GI guards emitted with a method-identity check. MID_PRED_GI / _ARM: predictions
+	 * that exist only because every recorded receiver resolves to one method; MID_PRED_INL: GI predictions
+	 * taken from the inlined callee's own record. PROF_BLOCK_GROW: profile blocks chained, at run time. */
+	WJC_MID_IC_SITES,
+	WJC_MID_IC_SKIP_IFACE,
+	WJC_MID_IC_SKIP_OTHER,
+	WJC_MID_ARM,
+	WJC_MID_GI,
+	WJC_MID_PRED_GI,
+	WJC_MID_PRED_ARM,
+	WJC_MID_PRED_INL,
+	WJC_PROF_BLOCK_GROW,
 	WJC_MAX
 };
 

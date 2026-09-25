@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 323);   /* + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
+g_static_assert (WJC_MAX == 347);   /* + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -569,11 +569,14 @@ mono_wasm_jit_dump_stats (void)
 	}
 	{
 		extern int mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
-			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero;
+			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero, mono_wasm_jit_ic_mid, mono_wasm_jit_pred_mid,
+			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks;
 		printf ("[wasm-jit levers] guarded_inline=%d inline_leaf=%d lazy_cold=%d vcall_memo=%d frame_zero=%d "
-			"-- the R299 call-pool levers IN EFFECT (runtime defaults unless overridden)\n",
+			"ic_mid=%d pred_mid=%d prof_inlinee=%d prof_blocks=%d "
+			"-- the R299/R311 call-pool levers IN EFFECT (runtime defaults unless overridden)\n",
 			mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
-			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero);
+			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero, mono_wasm_jit_ic_mid, mono_wasm_jit_pred_mid,
+			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks);
 	}
 	{
 		extern int mono_wasm_jit_inline_alloc;
@@ -823,12 +826,33 @@ mono_wasm_jit_dump_stats (void)
 		"  mono_method_check_inlining refuses any method with a clause; that reasoning is sound and the\n"
 		"  measurement still went the other way. `prof` is no_rec arriving here: 99.3%% of profile\n"
 		"  observations land AFTER the method is JITted, so a first compile usually has no record for the\n"
-		"  site at all -- which is why re-emission, not an EH change, is what would move this.\n",
+		"  site at all. R310 found part of it was the KEY, not timing (inlinee sites, the 12-site cap); see\n"
+		"  [wasm-jit profdiag] for the split and [wasm-jit mid] for what R311 recovers.\n",
 		WJC_(WJC_GI_SITE), WJC_(WJC_GI_CANDIDATE), WJC_(WJC_GI_ADMITTED), WJC_(WJC_GI_EMITTED),
 		WJC_(WJC_GI_REFUSED_PROF), WJC_(WJC_GI_REFUSED_CLAUSES), WJC_(WJC_GI_REFUSED_SIZE),
 		WJC_(WJC_GI_REFUSED_OTHER),
 		WJC_(WJC_GI_REFUSED_SIG), WJC_(WJC_GI_REFUSED_SELF), WJC_(WJC_GI_REFUSED_LATE),
 		mono_wasm_jit_guarded_inline, mono_wasm_jit_guarded_inline_size);
+	/* R310. Two readings of one question -- where does the profile fail to deliver -- one per SITE at the GI
+	 * gate and one per EXECUTION at the IC miss. Both identities are printed so a broken split is visible. */
+	printf ("[wasm-jit profdiag] gi prof=%lld: norec=%lld (caller full=%lld) cold=%lld poly=%lld (one target=%lld)"
+		" | in inlinee=%lld (inlinee record predicts=%lld, inlinee never prepared=%lld)\n"
+		"  ASSERT prof >= norec+cold+poly (the rest is torn reads).\n",
+		WJC_(WJC_GI_REFUSED_PROF), WJC_(WJC_GI_PROF_NOREC), WJC_(WJC_GI_PROF_NOREC_FULL),
+		WJC_(WJC_GI_PROF_COLD), WJC_(WJC_GI_PROF_POLY), WJC_(WJC_GI_PROF_POLY_SAMETGT),
+		WJC_(WJC_GI_PROF_INL), WJC_(WJC_GI_PROF_INL_REC), WJC_(WJC_GI_PROF_INL_NOIM));
+	printf ("[wasm-jit profdiag] ic miss: resolve=%lld published=%lld | nosite(cap)=%lld first=%lld"
+		" same_receiver=%lld other_receiver_same_method=%lld different_method=%lld\n"
+		"  ASSERT published == nosite+first+same_receiver+other_receiver_same_method+different_method.\n",
+		WJC_(WJC_PD_RESOLVE), WJC_(WJC_PD_MISS), WJC_(WJC_PD_MISS_NOSITE), WJC_(WJC_PD_MISS_FIRST),
+		WJC_(WJC_PD_MISS_SAME_ID), WJC_(WJC_PD_MISS_SAME_TGT), WJC_(WJC_PD_MISS_DIFF_TGT));
+	/* R311. Emit-time site counts, except block_grow (run time). With ic_mid ON, other_receiver_same_method
+	 * above should collapse -- that is the mechanism check, not these site counts. */
+	printf ("[wasm-jit mid] ic_sites=%lld skip_iface=%lld skip_other=%lld | arm_guards=%lld gi_guards=%lld"
+		" | new predictions: one-method gi=%lld arm=%lld, inlinee record gi=%lld | profile blocks chained=%lld\n",
+		WJC_(WJC_MID_IC_SITES), WJC_(WJC_MID_IC_SKIP_IFACE), WJC_(WJC_MID_IC_SKIP_OTHER),
+		WJC_(WJC_MID_ARM), WJC_(WJC_MID_GI), WJC_(WJC_MID_PRED_GI), WJC_(WJC_MID_PRED_ARM),
+		WJC_(WJC_MID_PRED_INL), WJC_(WJC_PROF_BLOCK_GROW));
 #ifdef HOST_BROWSER
 	/* ALL of them, not a top-N. The tail is 72%% of inlined sites, and a site count is not an execution
 	 * count -- a one-site callee can be white hot -- so a truncated list cannot answer the weighting

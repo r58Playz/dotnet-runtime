@@ -4691,6 +4691,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						gboolean slim_pred = FALSE;
 						gboolean is_delegate_invoke = !strcmp (call->method->name, "Invoke") &&
 							m_class_get_parent (call->method->klass) == mono_defaults.multicastdelegate_class;
+						/* R311: the vtable slot a METHOD-identity check may test at this site (< 0: none -- a
+						 * delegate, an interface or generic method, or a class whose vtable is not set up). */
+						extern int mono_wasm_jit_mid_slot (MonoMethod *base);
+						extern int mono_wasm_jit_class_vtable_off (void);
+						extern int mono_wasm_jit_ic_mid, mono_wasm_jit_pred_mid;
+						int vc_mid_slot = is_delegate_invoke ? -1 : mono_wasm_jit_mid_slot (call->method);
+						int vc_class_vtable_off = mono_wasm_jit_class_vtable_off ();
 						if (!csig->hasthis) { fail = "vcall not instance"; goto done; }
 						if (!call->call_info) { fail = "no captured vcall args"; goto done; }
 						this_vr = wj_arg_vreg (call, 0);
@@ -4855,8 +4862,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						    TRUE) {
 							int pred_why = 0;
 							guint32 pred_samples = 0;
-							if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod,
-							    call->method, &pred_vt, &pred_target, &pred_samples, &pred_why)) {
+							extern gboolean mono_wasm_jit_prof_predict_method (gpointer caller, MonoMethod *base,
+								MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
+							gboolean pred_ok = mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod,
+							    call->method, &pred_vt, &pred_target, &pred_samples, &pred_why);
+							/* R311: a POLY site whose recorded receivers all resolve to ONE method is predictable
+							 * behind the method-identity arm guard below. pred_why keeps the vtable verdict. */
+							if (!pred_ok && mono_wasm_jit_pred_mid && vc_mid_slot >= 0 && (pred_why == 3 || pred_why == 4) &&
+							    mono_wasm_jit_prof_predict_method (cfg->wasm_jit_caller_imethod, call->method,
+							                                       &pred_vt, &pred_target, &pred_samples)) {
+								pred_ok = TRUE;
+								wj_count (WJC_MID_PRED_ARM);
+							}
+							if (pred_ok) {
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
 								extern gboolean mono_interp_jit_call_supported (MonoMethod *method,
@@ -5308,9 +5326,27 @@ vcall_nullchk_done:
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_miss */
 									if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt this ld"; goto done; }
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
-									wasm_i32_const (&body, (gint32) (intptr_t) pred_vt);
-									wasm_op (&body, WASM_OP_I32_NE);
-									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									if (mono_wasm_jit_pred_mid && vc_mid_slot >= 0) {
+										/* R311 METHOD-IDENTITY ARM GUARD. The predicted receiver pays the one
+										 * compare it always did; any other receiver whose class holds pred_target
+										 * in this vtable slot (inherits it) takes the arm instead of the IC. */
+										wj_count (WJC_MID_ARM);
+										wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
+										wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_hit */
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+											wasm_i32_const (&body, (gint32) (intptr_t) pred_vt);
+											wasm_op (&body, WASM_OP_I32_EQ);
+											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* -> $pred_hit */
+											wj_emit_class_slot_method (&body, aic_vtab_idx, vc_class_vtable_off, vc_mid_slot);
+											wasm_i32_const (&body, (gint32) (intptr_t) pred_target);
+											wasm_op (&body, WASM_OP_I32_NE);
+											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1);   /* -> $pred_miss */
+										wasm_op (&body, WASM_OP_END); /* $pred_hit */
+									} else {
+										wasm_i32_const (&body, (gint32) (intptr_t) pred_vt);
+										wasm_op (&body, WASM_OP_I32_NE);
+										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+									}
 									/* The predicted arm was the ONE dispatch route with no execution counter,
 									 * so every "share of vcalls" figure so far has silently omitted it. */
 									wj_emit_fast_count (&body, WJC_FAST_DEVIRT);
@@ -5819,6 +5855,31 @@ vcall_nullchk_done:
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> exit $tail */
 							wasm_op (&body, WASM_OP_END);                            /* end $way_fail */
 							}   /* for each way */
+							if (vc_mid_slot >= 0 && mono_wasm_jit_ic_mid) {
+								/* R311 METHOD-IDENTITY FALLBACK. Way zero keyed on the receiver VTABLE missed; if the
+								 * receiver's class holds the entry's cached method (+8) in this call's vtable slot,
+								 * it is the same method, so the entry's f-slot is the right one -- and it is already
+								 * admitted on this thread, which is why it is in this thread's PIC. R310: two-thirds
+								 * of in-game IC misses are exactly this (another class inheriting the method). The
+								 * entry is left alone, so the front-runner keeps way zero. A zero f-slot (empty
+								 * entry whose +8 happens to compare equal) falls through to the resolver. */
+								wj_count (WJC_MID_IC_SITES);
+								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $mid_fail */
+									wj_emit_class_slot_method (&body, aic_vtab_idx, vc_class_vtable_off, vc_mid_slot);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) (vpic_site * mono_wasm_jit_vcall_ways * vpic_stride + 8));
+									wasm_op (&body, WASM_OP_I32_NE);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* -> $mid_fail */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
+									wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+									wasm_op (&body, WASM_OP_I32_EQZ);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* -> $mid_fail */
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);      /* hit -> exit $tail */
+								wasm_op (&body, WASM_OP_END);   /* $mid_fail */
+							} else if (!is_delegate_invoke && mono_wasm_jit_ic_mid) {
+								wj_count (vc_mid_slot == -2 ? WJC_MID_IC_SKIP_IFACE : WJC_MID_IC_SKIP_OTHER);
+							}
 							if (ic_ways > 1) {
 									/* Way zero missed: scan ways 1..N with one constant-size wasm loop. */
 									wasm_i32_const (&body, 0);
