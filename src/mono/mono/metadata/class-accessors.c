@@ -708,3 +708,12 @@ mono_class_set_inlinearray_value (MonoClass *klass, gint32 value)
 #undef MONO_CLASS_GETTER
 #undef MONO_CLASS_OFFSET
 #endif /* MONO_CLASS_DEF_PRIVATE */
+
+/* offsetof (MonoClass, vtable) for the wasm JIT's method-identity guard, which loads klass->vtable [slot] in
+ * emitted code (R311). A plain offsetof on purpose: a MONO_CLASS_OFFSET entry in class-getters.h would also
+ * enter the cross-compiler's offset tables, and only the runtime this file is compiled into ever asks. */
+int
+mono_wasm_jit_class_vtable_off (void)
+{
+	return (int) G_STRUCT_OFFSET (MonoClass, vtable);
+}

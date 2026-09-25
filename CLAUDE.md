@@ -299,8 +299,9 @@ Two things nearby are NOT profiles and must not be merged into it:
 * **`wj_vcall_pic` / `wj_delegate_pic`** are per-thread DISPATCH STATE, per-thread because f-slot installation
   is. Only the MISS path feeds the profile; keep the hit path a pure TLS load.
 * **`wj_entry_edges`** counts interp->JIT TRANSITIONS keyed (caller, callee) and caches method names at record
-  time so the main-thread JS dump never takes a lock. Folding it in would spend the profile's 12 bounded site
-  slots on a different question and change which sites survive eviction — i.e. change codegen.
+  time so the main-thread JS dump never takes a lock. Folding it in would spend the profile's bounded site
+  slots (12 per block, up to `MONO_WASM_JIT_PROF_BLOCKS` chained blocks, R311) on a different question and
+  change which sites survive eviction — i.e. change codegen.
 
 And one trap already paid for: **a stable inline-cache id is not the same granularity as a profile record.**
 The record is keyed by callee base method; an IC belongs to one call site. Reusing the record's id makes two
@@ -425,7 +426,8 @@ as 2.3x x 7.6x before R269 re-derived the denominator). The path to it, same ins
 | + the four defect fixes | 161.8 | R279 plateau |
 | R280h | 155.2 / 155.5 | both `IKVM_LAZY_CTORS` arms |
 | control before the flip, 2026-09-23 | 149.1 / 158.1 | R299 D arms |
-| **current: the R299 levers ON by default** | **139.7 / 142.1** | R299 Z arms, **-8.3%**, same binary, 0 skipped ticks |
+| the R299 levers ON by default | 139.7 / 142.1 | R299 Z arms, **-8.3%**, same binary, 0 skipped ticks |
+| **current: + R311 method identity & profile delivery** | **115.9 / 115.0** | R311, **-8.9%** raw G vs its OFF arms (128.0 / 125.3), same binary, equal ticks |
 
 The five levers (`GUARDED_INLINE`, `INLINE_LEAF=64`, `LAZY_COLD=1`, `VCALL_MEMO`, `FRAME_ZERO=0`) cut **our
 emitted code** (the real-Java bucket) 77.5 -> 64.6 M/tick, reproducing R292's figure for that bucket. The total's
@@ -609,6 +611,14 @@ own misses. **Re-emission can convert `no_rec`; the threshold structurally canno
 
 Where the hot IC volume is: polymorphic dispatch **63.2%** (alt-receiver 32.5% + poly 30.7%), re-emission
 **32.2%**, everything else 4.6%.
+
+**Most IC MISSES were not polymorphism but inheritance (R310), and are now absorbed (R311).** Classified against
+the site's front-runner, **~68% of in-game IC misses were another receiver class resolving to the SAME method**
+(Entity subclasses calling an inherited Entity method), ~21% a genuinely different method, ~5.5% dropped by the
+profile cap. The vtable-keyed 1-way PIC missed on every class change. R311's method-identity check
+(`vt->klass->vtable[slot]` against the cached method, class-virtual non-generic sites only) took published
+misses 119-128M -> 31-32M per window and the server tick -8.9%. "poly" and "alt-receiver" above are both keyed
+on the receiver VTABLE and so overstate true polymorphism; what remains is ~27M different-method misses.
 
 **Cost model for a guarded arm, counted off emitted code.** Arm hit = `i32.load; i32.ne; br_if` then
 `call <funcidx>` = **~3 x86 + 1**. IC hit = 2 loads + cmp + jne + unpack + `call_indirect` = **~21 x86**. An

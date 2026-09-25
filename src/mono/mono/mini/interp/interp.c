@@ -1154,7 +1154,7 @@ wj_slot_retriable (gint32 slot)
  * comment in interp-internals.h for why offsets and per-site indices were both rejected. A merged entry
  * costs prediction accuracy, never correctness -- the emitted guard re-checks the vtable every call.
  */
-#define WJ_PROF_MAX_SITES 12    /* per caller; linear scan, so keep it small. Hot methods have few distinct virtual callees. */
+#define WJ_PROF_MAX_SITES 12    /* per BLOCK; a caller chains up to mono_wasm_jit_prof_blocks of them (R311) */
 #define WJ_PROF_SATURATE  64    /* stop recording a site once the winner has this many samples: the answer is not going to change */
 #define WJ_PROF_WAYS      8     /* distinct identities tracked per site; matches the [1,8] clamp on MONO_WASM_JIT_VCALL_WAYS */
 
@@ -1244,8 +1244,10 @@ typedef struct {
 	guint16     id_counts [WJ_PROF_WAYS];
 } WjProfSite;
 
-typedef struct {
+typedef struct _WjCallProfile {
 	guint32 n;
+	guint32 evicted;       /* HEAD block only: observations dropped because every block was full (R310) */
+	struct _WjCallProfile *next;   /* R311: the next block of this caller's chain, NULL at the end */
 	WjProfSite sites [WJ_PROF_MAX_SITES];
 } WjCallProfile;
 
@@ -1335,29 +1337,71 @@ wj_prof_block (InterpMethod *caller)
  * This used to report via an `added` out-parameter whether it appended. Nothing needs it: the only
  * consumer was wj_prof_record's first-observation test, and `added` implies total == 0 there, so the
  * `total` test alone is equivalent. See wj_prof_record_at. */
+/* R310: WHICH callers the cap drops, weighted by what they drop. Stats-gated. Printed once per decade of
+ * dropped observations, so the highest line per caller ranks it. Names come from raw metadata fields
+ * (namespace, class name, method name) -- no signature walk, no type resolution -- and both methods are
+ * live: `caller` is executing or its JITted code is, and `base` is the callee at the site doing so. */
+static void
+wj_prof_note_capped (InterpMethod *caller, WjCallProfile *p, MonoMethod *base)
+{
+	extern int mono_wasm_jit_stats;
+	guint32 e = ++p->evicted;
+	MonoMethod *m;
+	if (G_LIKELY (!mono_wasm_jit_stats) ||
+	    (e != 1000 && e != 10000 && e != 100000 && e != 1000000 && e != 10000000))
+		return;
+	m = caller->method;
+	printf ("[wasm-jit profdiag] cap: %s.%s:%s dropped>=%u (this drop: %s.%s:%s)\n",
+		m_class_get_name_space (m->klass), m_class_get_name (m->klass), m->name, e,
+		m_class_get_name_space (base->klass), m_class_get_name (base->klass), base->name);
+}
+
 static WjProfSite *
 wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean create)
 {
-	WjCallProfile *p;
+	extern int mono_wasm_jit_prof_blocks;
+	WjCallProfile *head, *p, *last = NULL;
 	guint32 i, n;
+	int depth = 0;
 
 	if (!caller || !base)
 		return NULL;
-	p = create ? wj_prof_block (caller) : (WjCallProfile *) caller->wasm_jit_profile;
-	if (!p)
+	head = create ? wj_prof_block (caller) : (WjCallProfile *) caller->wasm_jit_profile;
+	if (!head)
 		return NULL;
-	mono_memory_barrier ();
-	n = p->n;
-	if (n > WJ_PROF_MAX_SITES)
-		n = WJ_PROF_MAX_SITES;
-	for (i = 0; i < n; ++i)
-		if (p->sites [i].base == base && p->sites [i].kind == (guint8) kind)
-			return &p->sites [i];
+	/* R311: blocks CHAIN rather than grow. The JIT miss path memoises a WjProfSite * (WjVcallSite.prof), so a
+	 * site must never move; a published block is never moved or freed. R310 measured the old single 12-site
+	 * block dropping the callees of the hottest entity methods for the whole process. */
+	for (p = head; p; p = p->next) {
+		mono_memory_barrier ();
+		n = p->n;
+		if (n > WJ_PROF_MAX_SITES)
+			n = WJ_PROF_MAX_SITES;
+		for (i = 0; i < n; ++i)
+			if (p->sites [i].base == base && p->sites [i].kind == (guint8) kind)
+				return &p->sites [i];
+		last = p;
+		depth++;
+	}
 	if (!create)
 		return NULL;
+	p = last;
 	if (p->n >= WJ_PROF_MAX_SITES) {
-		wj_prof_evicted++;                /* full: ignore further callees rather than thrash */
-		return NULL;
+		WjCallProfile *nb;
+		if (depth >= mono_wasm_jit_prof_blocks) {
+			wj_prof_evicted++;                /* every block full: ignore further callees rather than thrash */
+			wj_prof_note_capped (caller, head, base);
+			return NULL;
+		}
+		/* Same benign race as wj_prof_block: a losing block leaks into the method's mempool. */
+		nb = (WjCallProfile *) m_method_alloc0 (caller->method, sizeof (WjCallProfile));
+		if (mono_atomic_cas_ptr ((gpointer *) &p->next, nb, NULL) != NULL)
+			nb = p->next;
+		else if (G_UNLIKELY (mono_wasm_jit_stats))
+			mono_wasm_jit_count (WJC_PROF_BLOCK_GROW);
+		p = nb;
+		if (p->n >= WJ_PROF_MAX_SITES)
+			return NULL;                      /* a racing appender filled it first; a later observation walks on */
 	}
 	i = p->n;
 	wj_prof_sites++;
@@ -1743,6 +1787,88 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 		*out_why = WJ_PRED_OK;
 	*out_vt = (MonoVTable *) id1;
 	*out_target = target1;
+	if (out_samples)
+		*out_samples = total1;
+	return TRUE;
+}
+
+/* R310 census predicates for the GI gate's refusal split (method-to-ir.c). Read-only and racy: they
+ * classify a refusal that has already happened, and a torn read mis-files one site in a census. */
+
+/* TRUE if every receiver recorded at (caller, base) resolved to the SAME method: a site the vtable-keyed
+ * predictor reads as polymorphic but a method-identity guard would take whole. Needs >= 2 identities, all
+ * with a resolved target; an overflowed set is refused (more receivers than were tracked). */
+gboolean
+mono_wasm_jit_prof_same_target (gpointer caller_ptr, MonoMethod *base)
+{
+	WjProfSite *s = wj_prof_site ((InterpMethod *) caller_ptr, base, WJ_SITE_VIRTUAL, FALSE);
+	MonoMethod *t0 = NULL;
+	guint32 k, n;
+	if (!s || s->ids_overflow)
+		return FALSE;
+	n = s->nids;
+	if (n < 2)
+		return FALSE;
+	for (k = 0; k < n && k < WJ_PROF_WAYS; ++k) {
+		MonoMethod *t = s->id_targets [k];
+		if (!t || (t0 && t != t0))
+			return FALSE;
+		t0 = t;
+	}
+	return t0 != NULL;
+}
+
+/* TRUE if this caller's profile has no free site slot left in any block it may chain, so any callee not
+ * already recorded never will be. */
+gboolean
+mono_wasm_jit_prof_full (gpointer caller_ptr)
+{
+	extern int mono_wasm_jit_prof_blocks;
+	InterpMethod *caller = (InterpMethod *) caller_ptr;
+	WjCallProfile *p = caller ? (WjCallProfile *) caller->wasm_jit_profile : NULL;
+	int depth = 0;
+	for (; p; p = p->next) {
+		if (++depth >= mono_wasm_jit_prof_blocks && p->n >= WJ_PROF_MAX_SITES)
+			return TRUE;
+		if (!p->next)
+			return FALSE;
+	}
+	return FALSE;
+}
+
+/* R311: predict the METHOD rather than the receiver. TRUE when the site is warm (>= 8 observations, the
+ * same bar as mono_wasm_jit_prof_predict), its receiver set did not overflow, and every recorded receiver
+ * resolved to ONE method; *out_vt is the most frequent receiver (the guard's cheap first test) and
+ * *out_target that method. Only sound behind a METHOD-identity guard, which is the only caller: a
+ * vtable-keyed guard would still be correct, just capture less. Same double read as prof_predict. */
+gboolean
+mono_wasm_jit_prof_predict_method (gpointer caller_ptr, MonoMethod *base, MonoVTable **out_vt,
+	MonoMethod **out_target, guint32 *out_samples)
+{
+	WjProfSite *s = wj_prof_site ((InterpMethod *) caller_ptr, base, WJ_SITE_VIRTUAL, FALSE);
+	MonoMethod *t0 = NULL;
+	gpointer best_id = NULL;
+	guint32 k, n1, n2, total1, total2, best_c = 0;
+	if (!s || !out_vt || !out_target)
+		return FALSE;
+	n1 = s->nids; total1 = s->total;
+	mono_memory_barrier ();
+	if (s->ids_overflow || n1 == 0 || total1 < 8)
+		return FALSE;
+	for (k = 0; k < n1 && k < WJ_PROF_WAYS; ++k) {
+		gpointer id = s->ids [k];
+		MonoMethod *t = s->id_targets [k];
+		if (!id || !t || (t0 && t != t0) || G_UNLIKELY (!wj_method_usable_profile (t)))
+			return FALSE;
+		t0 = t;
+		if (s->id_counts [k] >= best_c) { best_c = s->id_counts [k]; best_id = id; }
+	}
+	mono_memory_barrier ();
+	n2 = s->nids; total2 = s->total;
+	if (n1 != n2 || total1 != total2 || s->ids_overflow || !t0 || !best_id)
+		return FALSE;
+	*out_vt = (MonoVTable *) best_id;
+	*out_target = t0;
 	if (out_samples)
 		*out_samples = total1;
 	return TRUE;
@@ -2302,6 +2428,21 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 				ps = wj_prof_site (site->caller_im, site->base, WJ_SITE_VIRTUAL, TRUE);
 				if (ps)
 					site->prof = ps;
+			}
+			if (G_UNLIKELY (mono_wasm_jit_stats)) {
+				/* R310: classify the miss against the site's front-runner BEFORE recording it. The parts
+				 * are disjoint and sum to WJC_PD_MISS. */
+				mono_wasm_jit_count (WJC_PD_MISS);
+				if (!ps)
+					mono_wasm_jit_count (WJC_PD_MISS_NOSITE);
+				else if (ps->total == 0 || !ps->target)
+					mono_wasm_jit_count (WJC_PD_MISS_FIRST);
+				else if (ps->identity == (gpointer) vt)
+					mono_wasm_jit_count (WJC_PD_MISS_SAME_ID);
+				else if (ps->target == target)
+					mono_wasm_jit_count (WJC_PD_MISS_SAME_TGT);
+				else
+					mono_wasm_jit_count (WJC_PD_MISS_DIFF_TGT);
 			}
 			if (ps)
 				wj_prof_record_at (ps, WJ_SITE_VIRTUAL, vt, target, TRUE);
@@ -7856,6 +7997,11 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 #endif
 	vt = this_obj->vtable;
 	if (G_UNLIKELY (mono_wasm_jit_arity)) wj_arity_record (ic, vt, delegate_site);   /* receiver-diversity histogram (MONO_WASM_JIT_ARITY=1) */
+	{
+		extern int mono_wasm_jit_stats;
+		if (G_UNLIKELY (mono_wasm_jit_stats) && !delegate_site)
+			mono_wasm_jit_count (WJC_PD_RESOLVE);   /* R310: the denominator for WJC_PD_MISS */
+	}
 	{
 		extern int mono_wasm_jit_vcall_memo, mono_wasm_jit_admit_live (int desc_id);
 		extern int mono_wasm_jit_stats;

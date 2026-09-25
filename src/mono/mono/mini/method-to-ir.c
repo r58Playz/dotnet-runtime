@@ -101,6 +101,85 @@ extern gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, M
  * branches. GI_ADMITTED == GI_EMITTED + GI_REFUSED_LATE is the identity to assert. */
 #define wj_gi_count(C) do { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (C); } while (0)
 
+/* R310: WHY the profile refused a GI site, and whether the answer existed somewhere the key did not look.
+ * Called only for a `prof` refusal and only under stats. `why` is mono_wasm_jit_prof_predict's out_why:
+ * 1 no_rec, 2 cold, 3 poly, 4 poly >= 90%, 5 torn (the WJ_PRED_* codes, interp.c). `method` is the method
+ * whose IL is being translated -- an INLINED callee when it differs from cfg->method, and the interpreter
+ * recorded that callee's calls under its own InterpMethod, which cfg->wasm_jit_caller_imethod is not. The
+ * peek is safe here: `method` is live (it is being compiled), and peek never creates an InterpMethod. */
+static void
+wj_gi_prof_census (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int why)
+{
+	extern gboolean mono_wasm_jit_prof_same_target (gpointer caller, MonoMethod *base);
+	extern gboolean mono_wasm_jit_prof_full (gpointer caller);
+	extern gpointer mono_interp_peek_imethod (MonoMethod *method);
+	switch (why) {
+	case 1:
+		mono_wasm_jit_count (WJC_GI_PROF_NOREC);
+		if (mono_wasm_jit_prof_full (cfg->wasm_jit_caller_imethod))
+			mono_wasm_jit_count (WJC_GI_PROF_NOREC_FULL);
+		break;
+	case 2:
+		mono_wasm_jit_count (WJC_GI_PROF_COLD);
+		break;
+	case 3: case 4:
+		mono_wasm_jit_count (WJC_GI_PROF_POLY);
+		if (mono_wasm_jit_prof_same_target (cfg->wasm_jit_caller_imethod, cmethod))
+			mono_wasm_jit_count (WJC_GI_PROF_POLY_SAMETGT);
+		break;
+	default:
+		break;
+	}
+	if (method && method != cfg->method) {
+		gpointer im = mono_interp_peek_imethod (method);
+		MonoVTable *vt = NULL;
+		MonoMethod *t = NULL;
+		guint32 n = 0;
+		int w = 0;
+		mono_wasm_jit_count (WJC_GI_PROF_INL);
+		if (!im)
+			mono_wasm_jit_count (WJC_GI_PROF_INL_NOIM);
+		else if (mono_wasm_jit_prof_predict (im, cmethod, &vt, &t, &n, &w))
+			mono_wasm_jit_count (WJC_GI_PROF_INL_REC);
+	}
+}
+
+/* R311: the GI gate's prediction, with the two fallbacks R310 sized. First the caller's own record, exactly as
+ * before. Then, for a class-virtual site (mid_slot >= 0) the vtable-keyed predictor refused as POLY, the
+ * METHOD: every recorded receiver resolving to one method is a site a method-identity guard takes whole.
+ * Then, for a site that came from an inlined callee, the callee's own record -- where the interpreter put
+ * it. *why keeps the CALLER's refusal reason, so wj_gi_prof_census still describes what the first key saw.
+ * The peek never creates an InterpMethod, and `method` is live because it is being compiled. */
+static gboolean
+wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mid_slot,
+               MonoVTable **vt, MonoMethod **target, guint32 *samples, int *why)
+{
+	extern int mono_wasm_jit_pred_mid, mono_wasm_jit_prof_inlinee;
+	extern gboolean mono_wasm_jit_prof_predict_method (gpointer caller, MonoMethod *base,
+		MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
+	extern gpointer mono_interp_peek_imethod (MonoMethod *method);
+	gboolean mid = mono_wasm_jit_pred_mid && mid_slot >= 0;
+	int why2 = 0;
+
+	if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples, why))
+		return TRUE;
+	if (mid && (*why == 3 || *why == 4) &&
+	    mono_wasm_jit_prof_predict_method (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples)) {
+		wj_gi_count (WJC_MID_PRED_GI);
+		return TRUE;
+	}
+	if (mono_wasm_jit_prof_inlinee && method && method != cfg->method) {
+		gpointer im = mono_interp_peek_imethod (method);
+		if (im && (mono_wasm_jit_prof_predict (im, cmethod, vt, target, samples, &why2) ||
+		           (mid && (why2 == 3 || why2 == 4) &&
+		            mono_wasm_jit_prof_predict_method (im, cmethod, vt, target, samples)))) {
+			wj_gi_count (WJC_MID_PRED_INL);
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 /* WHICH CALLEES WERE ACTUALLY INLINED, and at how many sites.
  *
  * This exists to answer the one question the census cannot: `sites` is an UNWEIGHTED site count, and
@@ -8588,12 +8667,14 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			 * mechanism (+3.5-4.4% bodies, calls/method UP 1.0%, saturating by 60), and this reaches a
 			 * population that limit could not: virtual sites, which the gate below refuses outright.
 			 *
-			 * KNOWN LIMIT ON DELIVERY, stated so it is not rediscovered as a surprise: 99.3% of call
-			 * profile observations arrive AFTER the method is JITted, so a site's first compile usually
-			 * reads `no_rec` and this arm never fires there. `no_rec` is 13,389 sites, 30.5% of all
-			 * sites and 32.2% of hot IC execution. Re-emission was its only collector and is deleted;
-			 * guarded CHA as a PREDICTION SOURCE is the candidate to replace it, and is sound for
-			 * exactly the reason above -- the guard stays, so CHA being wrong costs a fallthrough.
+			 * KNOWN LIMIT ON DELIVERY, stated so it is not rediscovered as a surprise: most call-profile
+			 * observations arrive AFTER the method is JITted, so a site's first compile often reads
+			 * `no_rec` and this arm never fires there. Part of that was not timing at all (R310): a site
+			 * from an inlined callee was looked up under the CALLER's record while the interpreter had
+			 * filed it under the callee, and a caller's 12-site profile dropped every later callee for
+			 * good. wj_gi_predict now asks the callee's record and the profile chains blocks, and a
+			 * poly site whose receivers share one method is predicted behind a METHOD-identity guard
+			 * (R311). The optional profile-driven re-emission (MONO_WASM_JIT_REEMIT) still ships 0.
 			 */
 			/*
 			 * THE CENSUS RUNS WITH THE KNOB OFF, the emission does not. Everything down to the
@@ -8615,15 +8696,21 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			    virtual_ && cmethod && (cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) &&
 			    !MONO_METHOD_IS_FINAL (cmethod) && fsig->hasthis && !cfg->gshared &&
 			    cfg->wasm_jit_caller_imethod && !delegate_invoke) {
+				extern int mono_wasm_jit_pred_mid;
+				extern int mono_wasm_jit_mid_slot (MonoMethod *base);
 				MonoVTable *gi_vt = NULL;
 				MonoMethod *gi_target = NULL;
 				guint32 gi_samples = 0;
 				int gi_why = 0;
+				/* R311: the vtable slot a method-identity guard tests, or < 0 for "vtable guard only". */
+				int gi_mid_slot = mono_wasm_jit_pred_mid ? mono_wasm_jit_mid_slot (cmethod) : -1;
 
 				wj_gi_count (WJC_GI_SITE);
-				if (!mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod, cmethod,
-				                                 &gi_vt, &gi_target, &gi_samples, &gi_why)) {
+				if (!wj_gi_predict (cfg, method, cmethod, gi_mid_slot,
+				                    &gi_vt, &gi_target, &gi_samples, &gi_why)) {
 					wj_gi_count (WJC_GI_REFUSED_PROF);
+					if (G_UNLIKELY (mono_wasm_jit_stats))
+						wj_gi_prof_census (cfg, method, cmethod, gi_why);
 				} else if (gi_target == cfg->method) {
 					/* Self-recursion: inline_method would recurse into the method being compiled. */
 					wj_gi_count (WJC_GI_REFUSED_SELF);
@@ -8696,8 +8783,30 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					/* COMPARE_IMM against the baked vtable, the same form the non-AOT array-store check
 					 * uses -- one fewer register than materialising a PCONST, and this is a runtime JIT
 					 * so compile_aot is never set on this path. */
-					MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi_vt);
-					MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi_fallback_bb);
+					if (gi_mid_slot >= 0) {
+						/* R311 METHOD-IDENTITY GUARD. The predicted receiver still pays one compare; any
+						 * other receiver whose class holds gi_target in the same vtable slot -- i.e.
+						 * inherits it -- takes the inlined body too, instead of the callvirt. Sound under
+						 * any later class loading: an override puts a different method in the slot and
+						 * falls back. klass->vtable [slot] is exactly what the interpreter's
+						 * get_virtual_method dispatches through for a class-virtual, non-generic method. */
+						extern int mono_wasm_jit_class_vtable_off (void);
+						MonoBasicBlock *gi_hot_bb;
+						int gi_kreg = alloc_preg (cfg), gi_mvreg = alloc_preg (cfg), gi_mreg = alloc_preg (cfg);
+						NEW_BBLOCK (cfg, gi_hot_bb);
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi_vt);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, gi_hot_bb);
+						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_kreg, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass));
+						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mvreg, gi_kreg, mono_wasm_jit_class_vtable_off ());
+						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mreg, gi_mvreg, gi_mid_slot * TARGET_SIZEOF_VOID_P);
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_mreg, (gssize) gi_target);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi_fallback_bb);
+						MONO_START_BB (cfg, gi_hot_bb);
+						wj_gi_count (WJC_MID_GI);
+					} else {
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi_vt);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi_fallback_bb);
+					}
 
 					/* HOT ARM. inline_method consumes its `sp` and writes the result back through it,
 					 * so it gets a COPY -- the fallback below needs the original argument list intact. */

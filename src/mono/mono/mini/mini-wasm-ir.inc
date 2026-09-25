@@ -2072,6 +2072,19 @@ wj_emit_fast_count (WasmBuf *body, int idx)
 	wasm_op (body, WASM_OP_DROP);
 }
 
+/* R311: push `((MonoVTable *) vt_local)->klass->vtable [slot]` -- the method the receiver's class holds in a
+ * class-virtual call's vtable slot, which is what the interpreter's get_virtual_method dispatches to. Every
+ * load is in bounds for a receiver the call is well-typed for: a subclass's vtable extends its parent's, so
+ * slot < vtable_size. MonoVTable.klass is offset 0 on every target, stated rather than assumed. */
+static G_GNUC_UNUSED void
+wj_emit_class_slot_method (WasmBuf *body, int vt_local, int class_vtable_off, int slot)
+{
+	wasm_op_local (body, WASM_OP_LOCAL_GET, (guint32) vt_local);
+	wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) MONO_STRUCT_OFFSET (MonoVTable, klass));
+	wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) class_vtable_off);
+	wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) (slot * 4));
+}
+
 /* Max distinct call_indirect callee functypes per JITted method (T0/T1 are the 2 base types; these are
  * the extras). Raised 32->128: big hot methods (class_1309:method_6091 LivingEntity, class_922:method_4054
  * entity render) have >32 distinct call signatures and were bailing "too many callee types". wasm allows
