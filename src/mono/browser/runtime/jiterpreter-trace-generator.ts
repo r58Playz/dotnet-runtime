@@ -48,7 +48,7 @@ import {
 } from "./jiterpreter";
 import {
     ldcTable, OpRec3, OpRec4,
-    floatToIntTable, unopTable,
+    unopTable,
     binopTable, intrinsicFpBinops,
     relopbranchTable, mathIntrinsicTable,
     simdCreateLoadOps, simdCreateSizes,
@@ -1454,40 +1454,12 @@ export function generateWasmBody (
                 break;
 
             /*
-             *  The native conversion opcodes for these are not specified for nan/inf, and v8
-             *  chooses to throw, so we have to do some tricks to identify non-finite values
-             *  and substitute INTnn_MIN, like clang would.
-             *  This attempts to reproduce what clang does in -O3 with no special flags set:
-             *
-             *  f64 -> i64
-             *
-             *  block
-             *  local.get       0
-             *  f64.abs
-             *  f64.const       0x1p63
-             *  f64.lt
-             *  i32.eqz
-             *  br_if           0                               # 0: down to label0
-             *  local.get       0
-             *  i64.trunc_f64_s
-             *  return
-             *  end_block                               # label0:
-             *  i64.const       -9223372036854775808
-             *
-             *  f32 -> i32
-             *
-             *  block
-             *  local.get       0
-             *  f32.abs
-             *  f32.const       0x1p31
-             *  f32.lt
-             *  i32.eqz
-             *  br_if           0                               # 0: down to label3
-             *  local.get       0
-             *  i32.trunc_f32_s
-             *  return
-             *  end_block                               # label3:
-             *  i32.const       -2147483648
+             *  SATURATING (NaN -> 0, clamp to the target's min/max), R305. This used to reproduce clang's
+             *  lowering with no feature flags -- trap-safe range check, INTnn_MIN on NaN/inf/out-of-range -- so
+             *  that a trace matched the C interpreter. The runtime is now built with -mnontrapping-fptoint, so
+             *  the C interpreter's casts ARE trunc_sat, as are the wasm JIT's (SAT_CONV) and the AOT image's
+             *  (llvm.fpto*i.sat); matching them means emitting the same instruction. Saturating is also exactly
+             *  Java's (int)/(long) conversion rule.
              */
             case MintOpcode.MINT_CONV_I4_R4:
             case MintOpcode.MINT_CONV_I4_R8:
@@ -1496,39 +1468,14 @@ export function generateWasmBody (
                 const isF32 = (opcode === MintOpcode.MINT_CONV_I4_R4) ||
                     (opcode === MintOpcode.MINT_CONV_I8_R4),
                     isI64 = (opcode === MintOpcode.MINT_CONV_I8_R4) ||
-                        (opcode === MintOpcode.MINT_CONV_I8_R8),
-                    limit = isI64
-                        ? 9223372036854775807 // this will round up to 0x1p63
-                        : 2147483648, // this is 0x1p31 exactly
-                    tempLocal = isF32 ? "temp_f32" : "temp_f64";
+                        (opcode === MintOpcode.MINT_CONV_I8_R8);
 
                 // Pre-load locals for the result store at the end
                 builder.local("pLocals");
-
-                // Load src
                 append_ldloc(builder, getArgU16(ip, 2), isF32 ? WasmOpcode.f32_load : WasmOpcode.f64_load);
-                builder.local(tempLocal, WasmOpcode.tee_local);
-
-                // Detect whether the value is within the representable range for the target type
-                builder.appendU8(isF32 ? WasmOpcode.f32_abs : WasmOpcode.f64_abs);
-                builder.appendU8(isF32 ? WasmOpcode.f32_const : WasmOpcode.f64_const);
-                if (isF32)
-                    builder.appendF32(limit);
-                else
-                    builder.appendF64(limit);
-                builder.appendU8(isF32 ? WasmOpcode.f32_lt : WasmOpcode.f64_lt);
-
-                // Select value via an if block that returns the result
-                builder.block(isI64 ? WasmValtype.i64 : WasmValtype.i32, WasmOpcode.if_);
-                // Value in range so truncate it to the appropriate type
-                builder.local(tempLocal);
-                builder.appendU8(floatToIntTable[opcode]);
-                builder.appendU8(WasmOpcode.else_);
-                // Value out of range so load the appropriate boundary value
-                builder.appendU8(isI64 ? WasmOpcode.i64_const : WasmOpcode.i32_const);
-                builder.appendBoundaryValue(isI64 ? 64 : 32, -1);
-                builder.endBlock();
-
+                // i32.trunc_sat_f32_s = 0, _f64_s = 2; i64.trunc_sat_f32_s = 4, _f64_s = 6
+                builder.appendU8(WasmOpcode.PREFIX_sat);
+                builder.appendU8(isI64 ? (isF32 ? 4 : 6) : (isF32 ? 0 : 2));
                 append_stloc_tail(builder, getArgU16(ip, 1), isI64 ? WasmOpcode.i64_store : WasmOpcode.i32_store);
 
                 break;

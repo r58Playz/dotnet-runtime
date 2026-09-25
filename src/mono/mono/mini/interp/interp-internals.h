@@ -302,6 +302,10 @@ struct InterpMethod {
 	 * marking candidates at CLASS FINISH, before any execution -- which is a different change, and one
 	 * that would have to price leaving every candidate un-JITtable for the window in between. */
 	unsigned int relink_pending : 1;
+	/* Set by the transform when this body calls IKVM's relink hook (ByteCodeHelper::RelinkBody): it is generation 1
+	 * of a method IKVM will swap in place, so it must not tier up first -- a tiered method cannot be swapped
+	 * (transform.c, R304). Generation 2 has no hook, so its InterpMethod starts with this clear. */
+	unsigned int relink_hook : 1;
 	unsigned int needs_thread_attach : 1;
 	// If set, this method is MulticastDelegate.Invoke
 	unsigned int is_invoke : 1;

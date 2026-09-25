@@ -1213,4 +1213,9 @@ void mono_wasm_jit_add (int idx, gint64 v);         /* atomic += v (bytes / micr
 extern int mono_wasm_jit_entry_census;
 void mono_wasm_jit_census_note_entry (int eslot);
 
+/* Offset, past the per-thread residual scratch (`s.b`, interp.c's wj_scratch), of the word holding the address of
+ * this thread's mono_wasm_sgen_tls_info -- read by OP_WASM_JIT_ALLOC_FAST (R305). interp.c asserts it equals
+ * WJ_SCRATCH_SIZE. */
+#define WJ_SCRATCH_TLAB_SLOT 256
+
 #endif /* __MONO_MINI_WASM_H__ */

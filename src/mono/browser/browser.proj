@@ -221,6 +221,9 @@
       <_EmccLinkFlags Include="-s INITIAL_MEMORY=$(EmccInitialHeapSize)" />
       <_EmccLinkFlags Include="-s STACK_SIZE=$(EmccStackSize)" />
       <_EmccCommonFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-pthread" />
+      <!-- R305: saturating float->int (trunc_sat); see the same flag in mono.proj. Default-on since emscripten 4; kept
+           explicit because the JIT's float->int lowering depends on it. -->
+      <_EmccCommonFlags Include="-mnontrapping-fptoint" />
       <_EmccLinkFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-Wno-pthreads-mem-growth" />
       <_EmccLinkFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-s PTHREAD_POOL_SIZE=0" />
       <_EmccLinkFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-s PTHREAD_POOL_SIZE_STRICT=0" />

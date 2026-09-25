@@ -185,6 +185,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int scratch_idx G_GNUC_UNUSED = 0; /* i32 local holding the per-thread interp-residual scratch ptr */
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int spentry_idx = 0;               /* i32 local: C-stack SP at entry (exit/landing-pad restore target) */
+	int alloc_tmp_idx = 0;             /* 3 i32 locals for OP_WASM_JIT_ALLOC_FAST, declared only if it occurs */
 	int framebytes G_GNUC_UNUSED = 0, refbytes_al G_GNUC_UNUSED = 0; /* C-stack frame size (16-aligned) / 8-aligned ref-slot bytes */
 	gboolean method_nogc G_GNUC_UNUSED = FALSE;        /* transitive direct-call effect published in WjRegEntry */
 	int effective_gcp_count G_GNUC_UNUSED = 0;         /* static returning GC points after direct no-GC resolution */
@@ -1000,6 +1001,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * absolute floor (R241: the same-binary floor is 0.69% on the current tier). An always-declared
 	 * local is free at run time (V8 lowers local ops to zero instructions) but it is not free in WIRE
 	 * SIZE, and wire size is what decides whether a body clears V8's 500-byte inlining cap. */
+	/* three i32 locals for OP_WASM_JIT_ALLOC_FAST (TLS address/SgenThreadInfo, object, new tlab_next). Declared
+	 * ONLY in a method that allocates inline, so every other method's output is unchanged. */
+	{
+		gboolean has_alloc_fast = FALSE;
+		for (bb = cfg->bb_entry; bb && !has_alloc_fast; bb = bb->next_bb)
+			MONO_BB_FOR_EACH_INS (bb, ins)
+				if (ins->opcode == OP_WASM_JIT_ALLOC_FAST) { has_alloc_fast = TRUE; break; }
+		if (has_alloc_fast) {
+			alloc_tmp_idx = nwparams + cnt [0];
+			cnt [0] += 3;
+		}
+	}
 	/* one more i32 local for the inline virtual-IC fast path's resolved f-slot (dead in methods with no
 	 * virtual call — a harmless unused declared local) */
 	vc_fslot_idx = nwparams + cnt [0];
@@ -3149,6 +3162,70 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				}
 				break;
 			}
+			case OP_WASM_JIT_ALLOC_FAST: {
+#ifdef HOST_BROWSER
+				/* Inline TLAB bump (handle_alloc in method-to-ir.c, R305) -- the managed allocator wrapper's fast
+				 * path without its call:
+				 *     a = *(s.b + WJ_SCRATCH_TLAB_SLOT)   address of this thread's mono_wasm_sgen_tls_info
+				 *     a = a ? *a : 0                      the current SgenThreadInfo, NULL while detached
+				 *     p = a->tlab_next;  n = p + size
+				 *     if (a && n < a->tlab_temp_end) { a->tlab_next = n; p->vtable = vt; result = p } else result = 0
+				 * and the caller's IR calls ves_icall_object_new_specific on 0. Needs no zeroing: sgen hands out
+				 * TLAB memory already cleared (mono_gc_wasm_inline_alloc_size refuses any other clear policy).
+				 * Not a GC point and makes no call, so under coop suspend the sequence cannot be interrupted by a
+				 * collection. No release fence after the vtable store: this emitter drops ACQ/REL barriers for the
+				 * reason given at OP_MEMORY_BARRIER, and the AOT'd managed allocator reaches wasm without one too. */
+				static int tlab_next_off = -1, tlab_temp_end_off = -1;
+				int a = alloc_tmp_idx, p = alloc_tmp_idx + 1, n = alloc_tmp_idx + 2;
+				if (G_UNLIKELY (tlab_next_off < 0)) {
+					extern void mono_gc_wasm_tlab_offsets (int *next_off, int *temp_end_off);
+					int no, eo;
+					mono_gc_wasm_tlab_offsets (&no, &eo);
+					tlab_temp_end_off = eo;
+					mono_memory_barrier ();
+					tlab_next_off = no;
+				}
+				if (!alloc_tmp_idx) { fail = "alloc_fast without temps"; goto done; }
+				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);                  /* s.b */
+				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_TLAB_SLOT);
+				wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);
+				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);                           /* (result i32) */
+				  wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				  wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
+				  wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);                     /* a = SgenThreadInfo */
+				  wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
+				    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				    wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_next_off);
+				    wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) p);
+				    wasm_i32_const (&body, (gint32) ins->inst_c1);
+				    wasm_op (&body, WASM_OP_I32_ADD);
+				    wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) n);
+				    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				    wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_temp_end_off);
+				    wasm_op (&body, WASM_OP_I32_LT_U);
+				    wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
+				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) n);
+				      wasm_op (&body, WASM_OP_I32_STORE); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_next_off);
+				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) p);
+				      wasm_i32_const (&body, (gint32) (intptr_t) ins->inst_p0);
+				      wasm_op (&body, WASM_OP_I32_STORE); wasm_uleb (&body, 2); wasm_uleb (&body, 0);   /* p->vtable */
+				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) p);
+				    wasm_op (&body, WASM_OP_ELSE);
+				      wasm_i32_const (&body, 0);
+				    wasm_op (&body, WASM_OP_END);
+				  wasm_op (&body, WASM_OP_ELSE);
+				    wasm_i32_const (&body, 0);
+				  wasm_op (&body, WASM_OP_END);
+				wasm_op (&body, WASM_OP_ELSE);
+				  wasm_i32_const (&body, 0);
+				wasm_op (&body, WASM_OP_END);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "alloc_fast dreg"; goto done; }
+#else
+				fail = "alloc_fast offline"; goto done;
+#endif
+				break;
+			}
 			case OP_GC_SAFE_POINT: {
 				/* Cooperative-GC and code-publication safepoint, in ONE load.
 				 *
@@ -3435,8 +3512,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			 * out-of-range, which would turn an ECMA-"unspecified" conversion into a hard abort. Saturating
 			 * clamps to min/max with NaN->0 -- precisely Java's (int)float rule, and the workload is
 			 * IKVM-translated Java. It also matches the interpreter, whose MINT_CONV_I4_R4 is a plain C
-			 * `(gint32) float` cast that clang lowers to trunc_sat on wasm, so a method cannot change
-			 * behaviour when it tiers from interp to JIT.
+			 * `(gint32) float` cast that clang lowers to trunc_sat on wasm -- BUT ONLY WITH
+			 * -mnontrapping-fptoint (mono.proj, R305). Without it emcc emits a range check plus INT_MIN, and
+			 * until R305 the interpreter and this tier disagreed on NaN/out-of-range, so a method could
+			 * change behaviour when it tiered from interp to JIT.
 			 *
 			 * Source precision comes from the SOURCE VREG's valtype, not the opcode's R/F prefix: with
 			 * MONO_OPT_FLOAT32 off an R4 value lives in an f64 vreg, and assuming f32 would emit a

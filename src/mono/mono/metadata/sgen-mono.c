@@ -1932,10 +1932,71 @@ mono_gc_thread_attach (SgenThreadInfo *info)
 	return sgen_thread_attach (info);
 }
 
+#ifdef HOST_BROWSER
+/*
+ * INLINE TLAB ALLOCATION FROM THE WASM JIT (R305). Emitted code bump-allocates from the current thread's TLAB
+ * the way the managed allocator wrapper does, minus the call -- see OP_WASM_JIT_ALLOC_FAST. It needs the CURRENT
+ * SgenThreadInfo, and MONO_KEYWORD_THREAD is off in this build, so mono_tls_sgen_thread_info lives behind a
+ * pthread key with no address to hand out. A real __thread does have one, constant for the thread's life:
+ * mono_wasm_jit_scratch () stores &mono_wasm_sgen_tls_info past the end of the thread's scratch, and emitted
+ * code reads it through the `s.b` import. Kept exactly in step with mono_tls_set_sgen_thread_info (set on
+ * attach, NULL on detach, on the owning thread), so a detached thread reads NULL and takes the slow path.
+ */
+__thread SgenThreadInfo *mono_wasm_sgen_tls_info;
+
+gpointer
+mono_wasm_sgen_tls_info_addr (void)
+{
+	return &mono_wasm_sgen_tls_info;
+}
+
+void
+mono_gc_wasm_tlab_offsets (int *next_off, int *temp_end_off)
+{
+	*next_off = MONO_STRUCT_OFFSET (SgenThreadInfo, tlab_next);
+	*temp_end_off = MONO_STRUCT_OFFSET (SgenThreadInfo, tlab_temp_end);
+}
+
+/*
+ * The aligned size the JIT may bump-allocate KLASS with inline, or 0 when it must call the allocator. The
+ * conditions are mono_gc_get_managed_allocator's (for a known instance size), plus the ones its IL checks at
+ * run time: no allocation profiler, no nursery canaries, and a clear policy that hands out ZEROED TLAB memory,
+ * since the fast path writes only the vtable word.
+ */
+int
+mono_gc_wasm_inline_alloc_size (MonoClass *klass)
+{
+#ifdef MANAGED_ALLOCATION
+	int size;
+	if (sgen_collect_before_allocs || mono_profiler_allocations_enabled () || sgen_nursery_canaries_enabled ())
+		return 0;
+	if (sgen_nursery_clear_policy != CLEAR_AT_TLAB_CREATION && sgen_nursery_clear_policy != CLEAR_AT_TLAB_CREATION_DEBUG &&
+	    sgen_nursery_clear_policy != CLEAR_AT_GC)
+		return 0;
+	if (mono_class_has_finalizer (klass) || m_class_has_weak_fields (klass) || m_class_get_rank (klass))
+		return 0;
+	if (m_class_get_byval_arg (klass)->type == MONO_TYPE_STRING)
+		return 0;
+	size = mono_class_instance_size (klass);
+	if (size < MONO_ABI_SIZEOF (MonoObject) || GINT_TO_UINT32 (size) > sgen_tlab_size)
+		return 0;
+	size = SGEN_ALIGN_UP (size);
+	if (size >= SGEN_MAX_SMALL_OBJ_SIZE)
+		return 0;
+	return size;
+#else
+	return 0;
+#endif
+}
+#endif
+
 void
 sgen_client_thread_attach (SgenThreadInfo* info)
 {
 	mono_tls_set_sgen_thread_info (info);
+#ifdef HOST_BROWSER
+	mono_wasm_sgen_tls_info = info;
+#endif
 
 	info->client_info.skip = FALSE;
 
@@ -1970,6 +2031,9 @@ sgen_client_thread_detach_with_lock (SgenThreadInfo *p)
 	MonoNativeThreadId tid;
 
 	mono_tls_set_sgen_thread_info (NULL);
+#ifdef HOST_BROWSER
+	mono_wasm_sgen_tls_info = NULL;
+#endif
 
 	sgen_increment_bytes_allocated_detached (p->total_bytes_allocated + (p->tlab_next - p->tlab_start));
 

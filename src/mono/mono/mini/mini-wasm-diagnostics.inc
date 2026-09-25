@@ -575,6 +575,13 @@ mono_wasm_jit_dump_stats (void)
 			mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
 			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero);
 	}
+	{
+		extern int mono_wasm_jit_inline_alloc;
+		extern gint32 mono_wasm_jit_inline_alloc_sites;
+		printf ("[wasm-jit inlinealloc] sites=%d (MONO_WASM_JIT_INLINE_ALLOC=%d) -- known-size `new` lowered to an "
+			"inline TLAB bump, emit-time count (R305)\n", mono_atomic_load_i32 (&mono_wasm_jit_inline_alloc_sites),
+			mono_wasm_jit_inline_alloc);
+	}
 	printf ("[wasm-jit castfail] total=%d signatures=%d bare=%d -- native InvalidCastException raises (R302); each "
 		"new (site, from, to) and the first 16 operand-less JIT/AOT raises print once with a JS stack\n",
 		mono_atomic_load_i32 (&wj_castfail_total), mono_atomic_load_i32 (&wj_castfail_sigs_used),
