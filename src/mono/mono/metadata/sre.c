@@ -4905,7 +4905,18 @@ ves_icall_ModuleBuilder_getToken (MonoReflectionModuleBuilderHandle mb, MonoObje
 		mono_error_set_argument_null (error, "obj", "");
 		return 0;
 	}
-	return mono_image_create_token (MONO_HANDLE_GETVAL (mb, dynamic_image), obj, create_open_instance, TRUE, error);
+	/* SERIALIZED (R302). mono_image_create_token allocates metadata rows by check-then-insert on unsynchronized
+	 * GHashTables followed by a bare `table->next_idx++` (create_typespec, the typeref/methodref/fieldref paths,
+	 * signature helpers). Two threads emitting into ONE ModuleBuilder -- IKVM defines classes concurrently, and
+	 * its relink worker emits scratch types into the same module -- could be handed the SAME token for two
+	 * different members. A RuntimeType collision registers with MONO_DYN_IMAGE_TOK_REPLACE, i.e. SILENTLY, and
+	 * the first thread's IL then resolves to the other type: the intermittent `castclass` to an unrelated class of
+	 * the same dynamic module (R301/R302). CoreCLR's ModuleBuilder is internally locked; this makes mono's match.
+	 * The loader lock is the one SRE already takes for dynamic-image mutation, and it is recursive. */
+	mono_loader_lock ();
+	gint32 token = mono_image_create_token (MONO_HANDLE_GETVAL (mb, dynamic_image), obj, create_open_instance, TRUE, error);
+	mono_loader_unlock ();
+	return token;
 }
 
 gint32
@@ -4919,7 +4930,11 @@ ves_icall_ModuleBuilder_getMethodToken (MonoReflectionModuleBuilderHandle mb,
 		return 0;
 	}
 
-	return mono_image_create_method_token (MONO_HANDLE_GETVAL (mb, dynamic_image), MONO_HANDLE_CAST (MonoObject, method), opt_param_types, error);
+	/* Serialized for the same reason as getToken above (R302). */
+	mono_loader_lock ();
+	gint32 token = mono_image_create_method_token (MONO_HANDLE_GETVAL (mb, dynamic_image), MONO_HANDLE_CAST (MonoObject, method), opt_param_types, error);
+	mono_loader_unlock ();
+	return token;
 }
 
 void

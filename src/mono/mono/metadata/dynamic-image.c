@@ -186,6 +186,15 @@ mono_dynamic_image_register_token (MonoDynamicImage *assembly, guint32 token, Mo
 			}
 			break;
 		case MONO_DYN_IMAGE_TOK_REPLACE:
+			/* REPLACE is legitimate when a TypeBuilder's token is re-pointed at the type it created, or for
+			 * interchangeable array methods. It is NOT legitimate for one RuntimeType to displace ANOTHER:
+			 * reflection types are cached per MonoType, so two distinct RuntimeType objects are two distinct
+			 * types, and that is one token handed to two types -- silently, which is why the resulting
+			 * castclass fault went undiagnosed for weeks (R302). */
+			if (prev && prev != MONO_HANDLE_RAW (obj) &&
+			    !strcmp (m_class_get_name (mono_object_class (prev)), "RuntimeType") &&
+			    !strcmp (m_class_get_name (mono_handle_class (obj)), "RuntimeType"))
+				g_warning ("%s: token 0x%08x handed to two different RuntimeTypes -- a dynamic-image token collision (R302)", __func__, token);
 			break;
 		default:
 			g_assert_not_reached ();

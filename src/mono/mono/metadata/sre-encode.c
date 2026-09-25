@@ -564,14 +564,22 @@ MonoArrayHandle
 ves_icall_SignatureHelper_get_signature_local (MonoReflectionSigHelperHandle sig, MonoError *error)
 {
 	error_init (error);
-	return reflection_sighelper_get_signature_local (sig, error);
+	/* Signature encoding allocates typespec/typeref rows through the same unsynchronized paths as
+	 * ModuleBuilder.getToken, so it takes the same lock (R302). */
+	mono_loader_lock ();
+	MonoArrayHandle res = reflection_sighelper_get_signature_local (sig, error);
+	mono_loader_unlock ();
+	return res;
 }
 
 MonoArrayHandle
 ves_icall_SignatureHelper_get_signature_field (MonoReflectionSigHelperHandle sig, MonoError *error)
 {
 	error_init (error);
-	return reflection_sighelper_get_signature_field (sig, error);
+	mono_loader_lock ();   /* see get_signature_local (R302) */
+	MonoArrayHandle res = reflection_sighelper_get_signature_field (sig, error);
+	mono_loader_unlock ();
+	return res;
 }
 #else /* DISABLE_REFLECTION_EMIT */
 MonoArrayHandle
