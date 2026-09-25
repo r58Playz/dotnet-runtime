@@ -3768,6 +3768,20 @@ interp_transform_call (TransformData *td, MonoMethod *method, MonoMethod *target
 		csignature = mono_method_signature_internal (target_method);
 	}
 
+	/* R304: IKVM's relink hook. A generation-1 body calls IKVM.Runtime.ByteCodeHelper::RelinkBody until its lazily
+	 * linked types load and its generation-2 body is swapped in -- and replace_method_body refuses a method the
+	 * interpreter has TIERED, for good ("late"). The hook only QUEUES once those types are loaded, so a hot method
+	 * with a loop tiered up during the wait: Lithium's selectTicks, Starlight's light engine and Sodium's chunk
+	 * render path were all among the 32 lates per run. Marking the method here keeps it from tiering while it
+	 * still carries the hook (interp.c's MINT_TIER_* gates); generation 2 has no hook and tiers normally, and a
+	 * hot method still reaches the wasm JIT, whose body the relink CAN replace. Only for a call in the method
+	 * itself, not in an inlinee, so a caller that inlined a hooked body is not held back. */
+	if (G_UNLIKELY (target_method && method == td->method && target_method->name && target_method->name [0] == 'R' &&
+	    !strcmp (target_method->name, "RelinkBody") &&
+	    !strcmp (m_class_get_name (target_method->klass), "ByteCodeHelper") &&
+	    !strcmp (m_class_get_name_space (target_method->klass), "IKVM.Runtime")))
+		td->rtm->relink_hook = 1;
+
 	if (calli && csignature->param_count == 0 && csignature->call_convention == MONO_CALL_THISCALL) {
 		mono_error_set_generic_error (error, "System", "InvalidProgramException", "thiscall with 0 arguments");
 		return FALSE;

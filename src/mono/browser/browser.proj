@@ -281,6 +281,8 @@
       <_EmccLinkFlags Include="-s INITIAL_MEMORY=$(EmccInitialHeapSize)" />
       <_EmccLinkFlags Include="-s STACK_SIZE=$(EmccStackSize)" />
       <_EmccCommonFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-s USE_PTHREADS=1" />
+      <!-- R305: saturating float->int (trunc_sat); see the same flag in mono.proj. -->
+      <_EmccCommonFlags Include="-mnontrapping-fptoint" />
       <_EmccLinkFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-Wno-pthreads-mem-growth" />
       <_EmccLinkFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-s PTHREAD_POOL_SIZE=0" />
       <_EmccLinkFlags Condition="'$(WasmEnableThreads)' == 'true'" Include="-s PTHREAD_POOL_SIZE_STRICT=0" />
@@ -307,7 +309,7 @@
     </ItemGroup>
 
     <ItemGroup Condition="'$(WasmEnableThreads)' == 'true'">
-      <WasmOptConfigurationFlags Include="--enable-threads;--enable-bulk-memory;--enable-sign-ext" />
+      <WasmOptConfigurationFlags Include="--enable-threads;--enable-bulk-memory;--enable-sign-ext;--enable-nontrapping-float-to-int" />
 
       <!-- workaround for https://github.com/emscripten-core/emscripten/issues/18034 -->
       <_EmccLinkFlags Include="-s TEXTDECODER=0"/>

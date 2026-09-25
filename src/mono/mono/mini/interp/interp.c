@@ -6508,7 +6508,11 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
  *  - the result slot is written then read in strict nested (LIFO) order across reentrancy.
  * Per-thread => MT-safe. The address can't be baked into the emitted module (a __thread address
  * differs per thread), so the JITted code fetches it via mono_wasm_jit_scratch() at each call site. */
-static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE];
+static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 8] __attribute__ ((aligned (8)));
+/* The 8 bytes past the marshalling area are NOT scratch: they hold the address of this thread's
+ * mono_wasm_sgen_tls_info (sgen-mono.c), for OP_WASM_JIT_ALLOC_FAST's inline TLAB bump (R305). The emitter reads
+ * it at WJ_SCRATCH_TLAB_SLOT; this pins the two together. */
+g_static_assert (WJ_SCRATCH_TLAB_SLOT == WJ_SCRATCH_SIZE);
 
 /*
  * Cold virtual misses need a marshalling frame whose reference slots remain valid while resolution
@@ -6606,6 +6610,14 @@ wj_argshape_ptr (guint8 shape, guint32 mask, MonoMethodSignature *sig, int i)
 gpointer
 mono_wasm_jit_scratch (void)
 {
+#if HOST_BROWSER
+	/* This is what supplies `s.b` to every instantiation, on the instantiating thread -- so the TLAB slot is
+	 * filled before any module that reads it can run here. The value is a per-thread CONSTANT (the address of
+	 * a __thread), and it is safe across detach/re-attach: the variable itself tracks the current
+	 * SgenThreadInfo and reads NULL while detached, which the emitted code sends to the slow path. */
+	extern gpointer mono_wasm_sgen_tls_info_addr (void);
+	*(gpointer *) (wj_scratch + WJ_SCRATCH_TLAB_SLOT) = mono_wasm_sgen_tls_info_addr ();
+#endif
 	return wj_scratch;
 }
 
@@ -15205,10 +15217,21 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 		 * mono_interp_replace_method_body) must not tier up, because tier-up maps a basic-block index
 		 * from this compilation into the registered one, and after a swap those are compilations of
 		 * DIFFERENT IL. The existing else-branch is already the correct behaviour -- just keep
-		 * interpreting -- so the gate costs one bit test on a path that already reads the same word. */
+		 * interpreting -- so the gate costs one bit test on a path that already reads the same word.
+		 *
+		 * `relink_hook` gates both (R304, set by the transform for a body that calls IKVM's relink hook): p29 showed
+		 * `relink_pending` alone is too late -- IKVM sets it only when the batch STARTS, and queues only after the
+		 * method's lazily linked types load, so every one of the 32 lates had tiered before either.
+		 * `relink_pending` gates both too (R304): a method IKVM has queued for an in-place body swap must
+		 * not tier up before the swap, because replace_method_body refuses a tiered method UNCONDITIONALLY
+		 * ("late") and it then keeps generation 1 -- its lazy-link stubs -- for the rest of the run. Hot
+		 * per-tick methods with loops tier up within the batch's quiet window, so the hottest candidates
+		 * were exactly the ones lost: Lithium's LithiumServerTickScheduler.selectTicks stayed on __<>MHC /
+		 * DynamicBinder stubs worth ~11 M instr/tick. IKVM clears the flag for every queued method on every
+		 * outcome, so the method interprets unoptimized only until its batch runs. */
 		MINT_IN_CASE(MINT_TIER_ENTER_METHOD) {
 			frame->imethod->entry_count++;
-			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired)
+			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired && !frame->imethod->relink_pending && !frame->imethod->relink_hook)
 				ip = mono_interp_tier_up_frame_enter (frame, context);
 			else
 				ip++;
@@ -15216,7 +15239,7 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 		}
 		MINT_IN_CASE(MINT_TIER_PATCHPOINT) {
 			frame->imethod->entry_count++;
-			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired)
+			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired && !frame->imethod->relink_pending && !frame->imethod->relink_hook)
 				ip = mono_interp_tier_up_frame_patchpoint (frame, context, ip [1]);
 			else
 				ip += 2;

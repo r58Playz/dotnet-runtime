@@ -3620,6 +3620,49 @@ handle_alloc (MonoCompile *cfg, MonoClass *klass, gboolean for_box, int context_
 			return NULL;
 		}
 
+#if HOST_BROWSER
+		/* wasm JIT, R305: bump-allocate inline from the thread's TLAB (OP_WASM_JIT_ALLOC_FAST), and call the
+		 * allocator icall only when the op yields 0 -- TLAB exhausted, or the thread detached. This is the
+		 * managed allocator wrapper's fast path without the wrapper, which a JIT call cannot reach anyway (see
+		 * the comment above: it resolves to the interpreter, which cannot run its TLS opcodes). The op DEFINES
+		 * the result vreg and the slow block overwrites it, so the fast path adds no second ref definition.
+		 *
+		 * NOT after method_to_ir: mono_decompose_vtype_opts lowers OP_BOX through mini_emit_box -> here and asserts
+		 * the replacement stays in ONE basic block (decompose.c `cfg->cbb == first_bb`), which the slow block breaks
+		 * -- it aborted boot in p28. Those late boxes take the plain icall, as they did before. The same reason is why
+		 * decompose sets disable_inline_rgctx_fetch, which the inline rgctx fetch honours for its own blocks. */
+		if (COMPILE_WASM (cfg) && !cfg->after_method_to_ir && !cfg->disable_inline_rgctx_fetch) {
+			extern int mono_wasm_jit_inline_alloc;
+			extern gint32 mono_wasm_jit_inline_alloc_sites;
+			extern int mono_gc_wasm_inline_alloc_size (MonoClass *klass);
+			int isize = mono_wasm_jit_inline_alloc ? mono_gc_wasm_inline_alloc_size (klass) : 0;
+			if (isize > 0) {
+				MonoBasicBlock *slow_bb, *end_bb;
+				MonoInst *fast, *vt_arg, *call;
+				NEW_BBLOCK (cfg, slow_bb);
+				NEW_BBLOCK (cfg, end_bb);
+				MONO_INST_NEW (cfg, fast, OP_WASM_JIT_ALLOC_FAST);
+				fast->dreg = alloc_ireg_ref (cfg);
+				fast->inst_p0 = vtable;
+				fast->inst_c1 = isize;
+				fast->type = STACK_OBJ;
+				fast->klass = klass;
+				MONO_ADD_INS (cfg->cbb, fast);
+				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, fast->dreg, 0);
+				MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, slow_bb);
+				MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, end_bb);
+				MONO_START_BB (cfg, slow_bb);
+				slow_bb->out_of_line = TRUE;
+				EMIT_NEW_VTABLECONST (cfg, vt_arg, vtable);
+				call = mono_emit_jit_icall_id (cfg, MONO_JIT_ICALL_ves_icall_object_new_specific, &vt_arg);
+				MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, fast->dreg, call->dreg);
+				MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, end_bb);
+				MONO_START_BB (cfg, end_bb);
+				mono_atomic_inc_i32 (&mono_wasm_jit_inline_alloc_sites);
+				return fast;
+			}
+		}
+#endif
 		/* wasm JIT: skip the managed allocator wrapper (see above), use the alloc icall. */
 		MonoMethod *managed_alloc = COMPILE_WASM (cfg) ? NULL : mono_gc_get_managed_allocator (klass, for_box, TRUE);
 

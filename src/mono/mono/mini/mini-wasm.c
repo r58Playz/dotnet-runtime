@@ -655,6 +655,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm) ? ((*nm != '0') ? 1 : 0) : mono_wasm_jit_names; }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
 	{ extern int mono_wasm_jit_frame_zero; const char *fz = g_getenv ("MONO_WASM_JIT_FRAME_ZERO"); if (fz && *fz) mono_wasm_jit_frame_zero = *fz != '0'; }
+	{ extern int mono_wasm_jit_inline_alloc; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_ALLOC"); if (ia && *ia) mono_wasm_jit_inline_alloc = *ia != '0'; }
 	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = the ENTRY half of the per-worker census (mono_wasm_jit_liveness fields 6/9); adds a load+test to the interp->JIT boundary, so off while timing. The INSTANTIATION half (fields 5/7/8/10/13) is unconditional and needs no knob. */
 	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
@@ -858,6 +859,15 @@ mono_wasm_jit_note_bad_eh_clause (MonoMethod *method, guint32 off, guint32 code_
  * Note this creates NO new live value — refbase is already live and already the fill's first operand — so the
  * Round 110 failure mode (trading a call for a long live range) does not apply. */
 int mono_wasm_jit_inline_zero = 64;   /* max framebytes to zero inline; 0 disables (always memory.fill). */
+/* MONO_WASM_JIT_INLINE_ALLOC: known-size `new` bump-allocates from the thread's TLAB in emitted code
+ * (OP_WASM_JIT_ALLOC_FAST), calling ves_icall_object_new_specific only when the TLAB is exhausted or the thread
+ * is detached. The allocator call it replaces went through the whole C path -- ves_icall_object_new_specific,
+ * mono_object_new_specific_checked, sgen_alloc_obj, sgen_try_alloc_obj_nolock, object_new_common_tail -- ~3.2 M
+ * instr/tick of self time on the server thread (p22 z1, 2026-09-24) before counting the call. 0 = the A/B arm.
+ * The managed allocator wrapper that would have done this is unusable from here: a JIT call resolves it to the
+ * interpreter, which cannot run its TLS opcodes (handle_alloc in method-to-ir.c). R305. */
+int mono_wasm_jit_inline_alloc = 1;
+gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,
  * +20% stack-pinned bytes per minor GC with no measurable heap growth (R300). */

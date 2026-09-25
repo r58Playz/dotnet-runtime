@@ -54,6 +54,7 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_ICONST: case OP_MOVE: case OP_AOTCONST:   /* AOTCONST bakes a resolved pointer -> i32 on wasm32 */
 	case OP_LDADDR:       /* address of an address-taken local -> i32 (frame base + slot offset) on wasm32 */
 	case OP_GET_EX_OBJ:   /* caught exception object -> i32 (ref) on wasm32 */
+	case OP_WASM_JIT_ALLOC_FAST:   /* new object or 0 -> i32 (ref) on wasm32 */
 	case OP_IADD: case OP_ISUB: case OP_IMUL:
 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
 	case OP_IAND: case OP_IOR: case OP_IXOR:

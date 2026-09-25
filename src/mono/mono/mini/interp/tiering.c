@@ -168,6 +168,19 @@ patch_imethod_refs (InterpMethod *old_imethod, InterpMethod *new_imethod)
 	mono_os_mutex_unlock (&tiering_mutex);
 }
 
+/* A "late" refusal leaves the method on generation 1 -- its lazy-link stubs -- for the rest of the run, so which
+ * methods land here is worth more than the count: the first few are named. Counted as before. */
+static void
+relink_note_late (MonoMethod *target, const char *why)
+{
+	int n = mono_atomic_inc_i32 (&mono_interp_relink_late);
+	if (n <= 32) {
+		char *name = mono_method_get_full_name (target);
+		g_print ("[wasm-jit relink] late #%d (%s, past the relink_hook gate): %s\n", n, why, name);
+		g_free (name);
+	}
+}
+
 /* True when the method keeps its IL header on the wrapper, which is the only shape whose body can be
  * swapped: mono_method_get_header_internal returns mw->header directly for these and reads it fresh on
  * every transform. Everything else resolves its header from image metadata, which is immutable. */
@@ -232,7 +245,7 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	 * no version of that which is merely slow, so this half is not knob-able. */
 	if (old_imethod->optimized || old_imethod->optimized_imethod) {
 		jit_mm_unlock (jit_mm);
-		mono_atomic_inc_i32 (&mono_interp_relink_late);
+		relink_note_late (target, "interp tier-up");
 		return 0;
 	}
 
@@ -253,7 +266,7 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	if ((old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0) &&
 	    !mono_wasm_jit_relink_jitted) {
 		jit_mm_unlock (jit_mm);
-		mono_atomic_inc_i32 (&mono_interp_relink_late);
+		relink_note_late (target, "wasm-JITted");
 		return 0;
 	}
 	replace_live_generation = (old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0);

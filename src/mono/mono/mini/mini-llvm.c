@@ -5836,6 +5836,28 @@ call_intrins (EmitContext *ctx, int id, LLVMValueRef *args, const char *name)
 	return call_overloaded_intrins (ctx, id, 0, args, name);
 }
 
+#ifdef TARGET_WASM
+/*
+ * Saturating float->int for the AOT image: llvm.fpto[su]i.sat, which lowers to wasm's 0xFC-prefixed trunc_sat.
+ * A plain fptosi is POISON on NaN or out-of-range input, so the optimizer may assume the input was in range,
+ * and whatever the program saw was undefined. Saturating is defined everywhere -- clamp to min/max, NaN -> 0 --
+ * which is what the wasm JIT already emits (mini-wasm-emitter.inc, SAT_CONV), what .NET 9 made CoreCLR do,
+ * and exactly Java's (int)/(long) conversion rule, so IKVM needs no range-check helper around it. Same
+ * instruction as before at run time; only the undefinedness goes.
+ */
+static LLVMValueRef
+emit_fconv_sat (EmitContext *ctx, LLVMValueRef v, gboolean to_i64, gboolean is_unsigned, const char *name)
+{
+	gboolean f32 = LLVMGetTypeKind (LLVMTypeOf (v)) == LLVMFloatTypeKind;
+	int id;
+	if (to_i64)
+		id = is_unsigned ? (f32 ? INTRINS_WASM_SAT_U8_R4 : INTRINS_WASM_SAT_U8_R8) : (f32 ? INTRINS_WASM_SAT_I8_R4 : INTRINS_WASM_SAT_I8_R8);
+	else
+		id = is_unsigned ? (f32 ? INTRINS_WASM_SAT_U4_R4 : INTRINS_WASM_SAT_U4_R8) : (f32 ? INTRINS_WASM_SAT_I4_R4 : INTRINS_WASM_SAT_I4_R8);
+	return call_intrins (ctx, id, &v, name);
+}
+#endif
+
 static LLVMValueRef
 fcmp_and_select(LLVMBuilderRef builder, MonoInst* ins, LLVMValueRef l, LLVMValueRef r)
 {
@@ -6965,6 +6987,43 @@ MONO_RESTORE_WARNING
 		case OP_ICONV_TO_U8:
 			values [ins->dreg] = LLVMBuildZExt (builder, lhs, LLVMInt64Type (), dname);
 			break;
+#ifdef TARGET_WASM
+		/* Saturating on wasm (emit_fconv_sat). Sub-word: saturate to i32 SIGNED, then narrow -- bit-for-bit the
+		 * wasm JIT's SAT_EXT8/SAT_EXT16/SAT_MASK8/SAT_MASK16, so a method cannot change behaviour between the
+		 * AOT image and the runtime tier. */
+		case OP_FCONV_TO_I4:
+		case OP_RCONV_TO_I4:
+			values [ins->dreg] = emit_fconv_sat (ctx, lhs, FALSE, FALSE, dname);
+			break;
+		case OP_FCONV_TO_I1:
+		case OP_RCONV_TO_I1:
+			values [ins->dreg] = LLVMBuildSExt (builder, LLVMBuildTrunc (builder, emit_fconv_sat (ctx, lhs, FALSE, FALSE, dname), LLVMInt8Type (), ""), LLVMInt32Type (), "");
+			break;
+		case OP_FCONV_TO_U1:
+		case OP_RCONV_TO_U1:
+			values [ins->dreg] = LLVMBuildZExt (builder, LLVMBuildTrunc (builder, emit_fconv_sat (ctx, lhs, FALSE, FALSE, dname), LLVMInt8Type (), ""), LLVMInt32Type (), "");
+			break;
+		case OP_FCONV_TO_I2:
+		case OP_RCONV_TO_I2:
+			values [ins->dreg] = LLVMBuildSExt (builder, LLVMBuildTrunc (builder, emit_fconv_sat (ctx, lhs, FALSE, FALSE, dname), LLVMInt16Type (), ""), LLVMInt32Type (), "");
+			break;
+		case OP_FCONV_TO_U2:
+		case OP_RCONV_TO_U2:
+			values [ins->dreg] = LLVMBuildZExt (builder, LLVMBuildTrunc (builder, emit_fconv_sat (ctx, lhs, FALSE, FALSE, dname), LLVMInt16Type (), ""), LLVMInt32Type (), "");
+			break;
+		case OP_FCONV_TO_U4:
+		case OP_RCONV_TO_U4:
+			values [ins->dreg] = emit_fconv_sat (ctx, lhs, FALSE, TRUE, dname);
+			break;
+		case OP_FCONV_TO_U8:
+		case OP_RCONV_TO_U8:
+			values [ins->dreg] = emit_fconv_sat (ctx, lhs, TRUE, TRUE, dname);
+			break;
+		case OP_FCONV_TO_I8:
+		case OP_RCONV_TO_I8:
+			values [ins->dreg] = emit_fconv_sat (ctx, lhs, TRUE, FALSE, dname);
+			break;
+#else
 		case OP_FCONV_TO_I4:
 		case OP_RCONV_TO_I4:
 			values [ins->dreg] = LLVMBuildFPToSI (builder, lhs, LLVMInt32Type (), dname);
@@ -6997,6 +7056,7 @@ MONO_RESTORE_WARNING
 		case OP_RCONV_TO_I8:
 			values [ins->dreg] = LLVMBuildFPToSI (builder, lhs, LLVMInt64Type (), dname);
 			break;
+#endif
 		case OP_ICONV_TO_R8:
 		case OP_LCONV_TO_R8:
 			values [ins->dreg] = LLVMBuildSIToFP (builder, lhs, LLVMDoubleType (), dname);

@@ -855,6 +855,9 @@ MINI_OP(OP_EXPAND_R8, "expand_r8", XREG, FREG, NONE)
 // wasm specific SIMD v128
 
 #if defined(TARGET_WASM)
+/* Runtime wasm JIT: inline TLAB bump for a known-size object. dreg = the new object, or 0 when the caller must
+ * take the allocator call; inst_p0 = the MonoVTable, inst_c1 = the aligned size (handle_alloc, R305). */
+MINI_OP(OP_WASM_JIT_ALLOC_FAST, "wasm_jit_alloc_fast", IREG, NONE, NONE)
 MINI_OP(OP_WASM_SIMD_BITMASK, "wasm_bitmask", IREG, XREG, NONE)
 MINI_OP3(OP_WASM_BITSELECT, "wasm_bitselect", XREG, XREG, XREG, XREG)
 MINI_OP3(OP_WASM_SIMD_SHUFFLE, "wasm_shuffle", XREG, XREG, XREG, XREG)
