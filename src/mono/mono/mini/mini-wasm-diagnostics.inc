@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 347);   /* + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
+g_static_assert (WJC_MAX == 383);   /* + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -853,11 +853,51 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_MID_IC_SITES), WJC_(WJC_MID_IC_SKIP_IFACE), WJC_(WJC_MID_IC_SKIP_OTHER),
 		WJC_(WJC_MID_ARM), WJC_(WJC_MID_GI), WJC_(WJC_MID_PRED_GI), WJC_(WJC_MID_PRED_ARM),
 		WJC_(WJC_MID_PRED_INL), WJC_(WJC_PROF_BLOCK_GROW));
+	/* R314 (L1). Knob off: the four retired counters size the stale-cache population. Knob on: forwarded should
+	 * track their sum and fwd_live the part that became a direct f-slot call; resid_live_callee is what is left
+	 * of the boundary pool. */
+	{
+		extern int mono_wasm_jit_forward_retired;
+		printf ("[wasm-jit retired] ic_hit=%lld fastmiss=%lld late_fslot=%lld delegate=%lld | forwarded=%lld fwd_live=%lld"
+			" | resid_live_callee=%lld (forward_retired=%d)\n",
+			WJC_(WJC_RETIRED_IC_HIT), WJC_(WJC_RETIRED_FASTMISS), WJC_(WJC_RETIRED_LATE_FSLOT),
+			WJC_(WJC_RETIRED_DELEGATE), WJC_(WJC_RETIRED_FORWARDED), WJC_(WJC_RETIRED_FWD_LIVE),
+			WJC_(WJC_RESID_LIVE_CALLEE), mono_wasm_jit_forward_retired);
+	}
+	{
+		extern int mono_wasm_jit_inline_calls, mono_wasm_jit_inline_calls_limit, mono_wasm_jit_inline_calls_cost,
+			mono_wasm_jit_inline_calls_depth;
+		extern int mono_wasm_jit_inline_cold_throw;
+		printf ("[wasm-jit inline-policy] accepted=%lld calls_lifted=%lld refused: relink_hook=%lld stack_walk=%lld"
+			" clause_recheck=%lld | downgrade=%lld ok=%lld | cold_throw_admit=%lld bfi_uninit_admit=%lld (inline_calls=%d limit=%d cost=%d"
+			" depth=%d cold_throw=%d)\n",
+			WJC_(WJC_INLINE_ACCEPTED), WJC_(WJC_INLINE_CALLS_LIFTED), WJC_(WJC_INLINE_RELINK_REFUSED),
+			WJC_(WJC_INLINE_STACKWALK_REFUSED), WJC_(WJC_INLINE_CLAUSE_RECHECK), WJC_(WJC_INLINE_DOWNGRADE),
+			WJC_(WJC_INLINE_DOWNGRADE_OK), WJC_(WJC_INLINE_COLD_THROW_ADMIT), WJC_(WJC_INLINE_BFI_UNINIT), mono_wasm_jit_inline_calls,
+			mono_wasm_jit_inline_calls_limit, mono_wasm_jit_inline_calls_cost, mono_wasm_jit_inline_calls_depth,
+			mono_wasm_jit_inline_cold_throw);
+	}
+	{
+		extern int mono_wasm_jit_t2, mono_wasm_jit_t2_threshold, mono_wasm_jit_t2_max;
+		extern int mono_wasm_jit_prof_origin, mono_wasm_jit_fast_tls;
+		printf ("[wasm-jit fasttls] sites=%lld (fast_tls=%d)\n", WJC_(WJC_FAST_TLS_SITE), mono_wasm_jit_fast_tls);
+		printf ("[wasm-jit t2] samples=%lld requested=%lld compiled=%lld failed=%lld refused=%lld"
+			" giveup=%lld | gi emitted=%lld nopred=%lld (norec %lld [canon has it %lld] cold %lld poly %lld; root %lld, inlinee: no-im %lld norec %lld cold %lld poly %lld) | prof_origin used=%lld fallback=%lld (t2=%d threshold=%d max=%d origin=%d)\n",
+			WJC_(WJC_T2_SAMPLES), WJC_(WJC_T2_REQUESTED), WJC_(WJC_T2_COMPILED), WJC_(WJC_T2_FAILED),
+			WJC_(WJC_T2_REFUSED), WJC_(WJC_T2_GIVEUP), WJC_(WJC_T2_GI_EMITTED), WJC_(WJC_T2_GI_NOPRED),
+			WJC_(WJC_T2_GI_NOREC), WJC_(WJC_T2_GI_NOREC_CANON), WJC_(WJC_T2_GI_COLD), WJC_(WJC_T2_GI_POLY),
+			WJC_(WJC_T2_GI_SITE_ROOT), WJC_(WJC_T2_GI_INL_NOIM), WJC_(WJC_T2_GI_INL_NOREC), WJC_(WJC_T2_GI_INL_COLD),
+			WJC_(WJC_T2_GI_INL_POLY),
+			WJC_(WJC_PROF_ORIGIN_USED), WJC_(WJC_PROF_ORIGIN_FALLBACK),
+			mono_wasm_jit_t2, mono_wasm_jit_t2_threshold, mono_wasm_jit_t2_max, mono_wasm_jit_prof_origin);
+	}
 #ifdef HOST_BROWSER
 	/* ALL of them, not a top-N. The tail is 72%% of inlined sites, and a site count is not an execution
 	 * count -- a one-site callee can be white hot -- so a truncated list cannot answer the weighting
 	 * question it exists for. */
 	{ extern void mono_wasm_jit_dump_guarded_inlines (int topn); mono_wasm_jit_dump_guarded_inlines (1024); }
+	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2 (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2 (120); }
+	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2_refusals (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2_refusals (60); }
 #endif
 	printf ("[wasm-jit lcse] loads_seen=%lld adds=%lld hits=%lld evict=%lld\n",
 		WJC_(WJC_LCSE_LOADS_SEEN), WJC_(WJC_LCSE_ADDS), WJC_(WJC_LCSE_HITS), WJC_(WJC_LCSE_EVICT));

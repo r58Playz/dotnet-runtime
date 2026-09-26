@@ -3236,6 +3236,10 @@ mini_get_rgctx_access_for_method (MonoMethod *method)
  * opcode it doesn't know only costs JIT coverage (method -> interp); with MONO_WASM_JIT_STATS=1,
  * mono_wasm_jit_dump_bail_hist() then names the top newly-bailed opcodes for bisection.
  */
+/* R315 (plan Phase 3.3): set by mono_wasm_force_compile's downgrade retry so the compile_wasm block below uses the
+ * ordinary inline policy. Thread-local: compiles are per thread and force_compile is non-reentrant. */
+static __thread gboolean wasm_jit_policy_t1_only;
+
 static guint32
 wasm_jit_extra_opt (void)
 {
@@ -3514,6 +3518,36 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 			 * everything beyond that is opted into through MONO_WASM_JIT_OPT.
 			 */
 			cfg->opt = WASM_JIT_OPT_BASE | wasm_jit_extra_opt ();
+			/* R315 (plan Phase 3): the per-compile inline policy. MONO_WASM_JIT_INLINE_CALLS is a diagnostic knob
+			 * for the whole tier; mono_wasm_force_compile's downgrade retry forces the ordinary policy. */
+			{
+				extern int mono_wasm_jit_inline_calls, mono_wasm_jit_inline_calls_limit,
+					mono_wasm_jit_inline_calls_cost, mono_wasm_jit_inline_calls_depth;
+				if (mono_wasm_jit_inline_calls && !wasm_jit_policy_t1_only) {
+					cfg->wasm_inline_allow_calls = TRUE;
+					cfg->wasm_inline_limit = mono_wasm_jit_inline_calls_limit;
+					cfg->wasm_inline_cost_cap = mono_wasm_jit_inline_calls_cost;
+					cfg->wasm_inline_depth_cap = mono_wasm_jit_inline_calls_depth;
+				}
+			}
+#ifdef HOST_BROWSER
+			/* R316 (plan Phase 4): a tier-2 recompile requested by the sampler (mono_wasm_jit_t2_sample). The
+			 * downgrade retry forces the ordinary policy, and marks nothing: the broker records the attempt. */
+			{
+				extern int mono_wasm_jit_t2, mono_wasm_jit_t2_limit, mono_wasm_jit_t2_cost, mono_wasm_jit_t2_depth,
+					mono_wasm_jit_t2_gi_size;
+				extern int mono_wasm_jit_imethod_tier_want (gpointer im);
+				if (mono_wasm_jit_t2 && !wasm_jit_policy_t1_only && cfg->wasm_jit_caller_imethod &&
+				    mono_wasm_jit_imethod_tier_want (cfg->wasm_jit_caller_imethod) >= 2) {
+					cfg->wasm_jit_tier = 2;
+					cfg->wasm_inline_allow_calls = TRUE;
+					cfg->wasm_inline_limit = mono_wasm_jit_t2_limit;
+					cfg->wasm_inline_cost_cap = mono_wasm_jit_t2_cost;
+					cfg->wasm_inline_depth_cap = mono_wasm_jit_t2_depth;
+					cfg->wasm_gi_size = mono_wasm_jit_t2_gi_size;
+				}
+			}
+#endif
 			/* Opt-in: emit llvmonly indirect-dispatch IR (ftndesc) for virtual/interp calls.
 			 * Required for virtual dispatch on wasm (the normal vtable-slot dispatch calls a
 			 * fixed-signature trampoline → call_indirect mismatch). The codegen fork still routes
@@ -4485,6 +4519,7 @@ void
 mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 {
 	static __thread gboolean reent;
+	gboolean downgraded = FALSE;
 	MonoCompile *cfg;
 	ERROR_DECL (error);
 
@@ -4523,10 +4558,44 @@ mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 	}
 	reent = TRUE;
 	cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+	/* R315 (plan Phase 3.3): a compile that inlined bodies keeping their calls and then bailed PERMANENTLY may have
+	 * failed only because of what it inlined (a new rgctx site, too many callee types or direct deps, an
+	 * unsupported opcode). Recompile ONCE at the ordinary policy -- a deterministic downgrade, never a retry of the
+	 * same compile, so it cannot loop (CLAUDE.md: a deterministic failure must never be marked retriable). */
+	if (cfg && cfg->wasm_inline_used_calls && cfg->wasm_jit_result.e_slot <= 0 && !cfg->wasm_jit_result.retriable) {
+		const char *down_reason = cfg->wasm_jit_result.fail_reason;   /* R316h: a static literal, survives the destroy */
+		int down_bail = cfg->wasm_jit_result.bail;
+		mono_destroy_compile (cfg);
+		wasm_jit_policy_t1_only = TRUE;
+		cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+		wasm_jit_policy_t1_only = FALSE;
+		downgraded = TRUE;
+		if (cfg) {
+			cfg->wasm_jit_result.t2_down_reason = down_reason;
+			cfg->wasm_jit_result.t2_down_bail = down_bail;
+		}
+	}
 #ifdef HOST_BROWSER
 	{ extern void mono_wasm_jit_set_resv_owner (MonoMethod *m); mono_wasm_jit_set_resv_owner (NULL); }
+	if (downgraded) {
+		extern void mono_wasm_jit_note_inline_downgrade (gboolean ok);
+		mono_wasm_jit_note_inline_downgrade (cfg && cfg->wasm_jit_result.e_slot > 0);
+	}
 #endif
 	if (cfg) {
+		/* R316d: the calls a tier-2 compile left standing, read off the final IR before it is freed. */
+		if (cfg->wasm_jit_tier >= 2) {
+			MonoBasicBlock *bb;
+			MonoInst *ins;
+			cfg->wasm_jit_result.t2_tier = cfg->wasm_jit_tier;
+			for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+				for (ins = bb->code; ins; ins = ins->next)
+					if (MONO_IS_CALL (ins)) {
+						cfg->wasm_jit_result.t2_calls_left++;
+						if (((MonoCallInst *) ins)->is_virtual)
+							cfg->wasm_jit_result.t2_calls_left_virt++;
+					}
+		}
 		if (out)
 			*out = cfg->wasm_jit_result;
 		mono_destroy_compile (cfg);

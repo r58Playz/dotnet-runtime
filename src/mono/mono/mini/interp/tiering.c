@@ -70,7 +70,22 @@ get_tier_up_imethod (InterpMethod *imethod)
 		 * method's call sites, not one tier's bytecode, and the whole point is to still have them when
 		 * the wasm JIT compiles later. Losing them here would reset the evidence exactly when a method
 		 * gets hot enough to matter. */
+#if HOST_BROWSER
+		/* R316j (MONO_WASM_JIT_PROF_SHARE): allocate the old generation's block now if it has none, so the generations
+		 * SHARE one profile instead of each growing its own after a NULL was copied. */
+		{
+			extern int mono_wasm_jit_prof_share;
+			extern gpointer mono_wasm_jit_prof_ensure (InterpMethod *im);
+			new_imethod->wasm_jit_profile = mono_wasm_jit_prof_share ? mono_wasm_jit_prof_ensure (old_imethod)
+			                                                         : old_imethod->wasm_jit_profile;
+		}
+#else
 		new_imethod->wasm_jit_profile = old_imethod->wasm_jit_profile;
+#endif
+		/* R316: tier-2 state is the METHOD's, not one interpreter tier's (same IL). */
+		new_imethod->wasm_jit_t2_samples = old_imethod->wasm_jit_t2_samples;
+		new_imethod->wasm_jit_tier = old_imethod->wasm_jit_tier;
+		new_imethod->wasm_jit_t2_want = old_imethod->wasm_jit_t2_want;
 		mono_internal_hash_table_remove (&jit_mm->interp_code_hash, method);
 		mono_internal_hash_table_insert (&jit_mm->interp_code_hash, method, new_imethod);
 	}
@@ -366,8 +381,27 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	new_imethod->wasm_jit_resv_fslot = old_imethod->wasm_jit_resv_fslot;
 	new_imethod->wasm_jit_self_resv_eslot = old_imethod->wasm_jit_self_resv_eslot;
 	new_imethod->wasm_jit_self_resv_fslot = old_imethod->wasm_jit_self_resv_fslot;
+#if HOST_BROWSER
+	/* R316j (MONO_WASM_JIT_PROF_SHARE): allocate the old generation's block now if it has none, so the generations
+	 * SHARE one profile instead of each growing its own after a NULL was copied. */
+	{
+		extern int mono_wasm_jit_prof_share;
+		extern gpointer mono_wasm_jit_prof_ensure (InterpMethod *im);
+		new_imethod->wasm_jit_profile = mono_wasm_jit_prof_share ? mono_wasm_jit_prof_ensure (old_imethod)
+		                                                         : old_imethod->wasm_jit_profile;
+	}
+#else
 	new_imethod->wasm_jit_profile = old_imethod->wasm_jit_profile;
+#endif
+	/* R316: a NEW body (different IL) starts at tier 1 again; its hotness history carries over. */
+	new_imethod->wasm_jit_t2_samples = old_imethod->wasm_jit_t2_samples;
 
+	/* Link the displaced body to its replacement for caches the swap cannot re-point (interp_imethod_current;
+	 * patch_imethod_refs below only reaches REGISTERED data items). Barrier first: a reader that sees the link
+	 * must see a fully initialised new_imethod. Written unconditionally; readers follow it only under
+	 * MONO_WASM_JIT_FORWARD_RETIRED. */
+	mono_memory_barrier ();
+	old_imethod->replaced_by = new_imethod;
 	/* Retire the displaced body BEFORE publishing the new one. Frames already inside it keep running it
 	 * to completion, which is what makes the swap safe -- but they must not tier up out of it. */
 	old_imethod->retired = 1;

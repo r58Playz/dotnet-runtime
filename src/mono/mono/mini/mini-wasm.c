@@ -594,6 +594,50 @@ int mono_wasm_jit_prof_inlinee = 1;
 /* MONO_WASM_JIT_PROF_BLOCKS: how many WJ_PROF_MAX_SITES-site profile blocks one caller may chain; 1 is the
  * old fixed cap. See R311. */
 int mono_wasm_jit_prof_blocks = 4;
+/* MONO_WASM_JIT_FORWARD_RETIRED: caches holding an InterpMethod that an IKVM body swap retired follow its
+ * replaced_by link to the current generation (interp_imethod_current). Off, a vcall resolve-cache entry cached
+ * on a never-compiled generation 1 reads f-slot 0 forever and crosses into the interpreter on every call (R314:
+ * 6.37 M such crossings per run -> 22; -3.6% server instructions/tick, ON/OFF/OFF/ON), and a delegate recipe on
+ * a retired imethod runs generation-1 IL. The [wasm-jit retired] counters are the mechanism check. */
+int mono_wasm_jit_forward_retired = 1;
+/* MONO_WASM_JIT_LEAN_TRY_INVOKE: the interpreter's call hook (WASM_JIT_TRY_INVOKE) calls wasm_jit_maybe_compile only
+ * when the callee is still compile-eligible or JIT work is pending, instead of on every interpreted call. */
+int mono_wasm_jit_lean_try_invoke = 0;
+/* MONO_WASM_JIT_IC_REMAT: IC sites read the PIC pointer/capacity imports at each use instead of four prologue locals
+ * live across the body (EMIT_IC_VPIC_PTR in the emitter). */
+int mono_wasm_jit_ic_remat = 0;
+/* MONO_WASM_JIT_INLINE_CALLS (R315, plan Phase 3): inlinees may keep non-inlined calls and ctor calls, under the
+ * per-compile policy below. A DIAGNOSTIC for the whole tier; it is meant to ship only as tier-2 policy (in tier 1
+ * every call an inlinee keeps becomes a root direct callee that islands pull in at one hit). */
+int mono_wasm_jit_inline_calls = 0;
+int mono_wasm_jit_inline_calls_limit = 35;   /* MONO_WASM_JIT_INLINE_CALLS_LIMIT: IL bytes */
+int mono_wasm_jit_inline_calls_cost = 120;   /* MONO_WASM_JIT_INLINE_CALLS_COST: replaces inline_method's 60 */
+int mono_wasm_jit_inline_calls_depth = 6;    /* MONO_WASM_JIT_INLINE_CALLS_DEPTH: replaces the depth cap of 10 */
+/* MONO_WASM_JIT_T2 (R316, plan Phase 4): sampled tier-2 recompiles of the hot set through the re-emission broker. */
+int mono_wasm_jit_t2 = 0;
+int mono_wasm_jit_t2_sample_ms = 2;      /* MONO_WASM_JIT_T2_SAMPLE_MS: sampling timer period */
+int mono_wasm_jit_t2_threshold = 48;     /* MONO_WASM_JIT_T2_THRESHOLD: samples before a method is queued */
+int mono_wasm_jit_t2_max = 2000;         /* MONO_WASM_JIT_T2_MAX: tier-2 requests per process */
+int mono_wasm_jit_t2_limit = 35;         /* MONO_WASM_JIT_T2_LIMIT: inline IL-size limit at tier 2 */
+int mono_wasm_jit_t2_cost = 200;         /* MONO_WASM_JIT_T2_COST: inline cost cap at tier 2 */
+int mono_wasm_jit_t2_depth = 9;          /* MONO_WASM_JIT_T2_DEPTH: inline depth cap at tier 2 */
+int mono_wasm_jit_t2_gi_size = 120;      /* MONO_WASM_JIT_T2_GI_SIZE: guarded-inline size cap at tier 2 */
+/* MONO_WASM_JIT_PROF_ORIGIN (R316b, plan Phase 3.5): the emitter's devirt / delegate / IC-width reads at a call site
+ * that came from an inlinee ask the INLINEE's record first, then the compiled method's. Affects only compiles under
+ * the per-compile inline policy (tier 2, INLINE_CALLS); a tier-1 inlinee has no call sites to read for. */
+int mono_wasm_jit_prof_origin = 0;
+/* MONO_WASM_JIT_FAST_TLS (R317, plan M3): mono_tls_get_thread_extern emitted as two loads through `s.b`. */
+int mono_wasm_jit_fast_tls = 0;
+/* MONO_WASM_JIT_INLINE_COLD_THROW (R318, plan Phase 3.4): throw-terminated IL segments are not counted toward the inline
+ * size limit, under the per-compile policy only (tier 2, INLINE_CALLS). */
+int mono_wasm_jit_inline_cold_throw = 0;
+/* MONO_WASM_JIT_INLINE_BFI (R319): inline a method of a BeforeFieldInit class whose cctor has not run, without running it.
+ * BeforeFieldInit only requires the cctor before a static FIELD access, and such an access inside the inlinee is still
+ * guarded (method-to-ir's ldsfld path: a runtime init check, or INLINE_FAILURE "class init"). */
+int mono_wasm_jit_inline_bfi = 0;
+/* MONO_WASM_JIT_PROF_SHARE (R316j): tier-up and IKVM's body swap SHARE the call profile with the new generation, allocating
+ * it at that moment if the method has recorded nothing yet (interp/tiering.c). */
+int mono_wasm_jit_prof_share = 0;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -706,6 +750,28 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_pred_mid; const char *v = g_getenv ("MONO_WASM_JIT_PRED_MID"); if (v && *v) mono_wasm_jit_pred_mid = *v != '0'; }
 	{ extern int mono_wasm_jit_prof_inlinee; const char *v = g_getenv ("MONO_WASM_JIT_PROF_INLINEE"); if (v && *v) mono_wasm_jit_prof_inlinee = *v != '0'; }
 	{ extern int mono_wasm_jit_prof_blocks; const char *v = g_getenv ("MONO_WASM_JIT_PROF_BLOCKS"); if (v && *v) { int n = atoi (v); mono_wasm_jit_prof_blocks = (n >= 1 && n <= 16) ? n : 1; } }
+	{ extern int mono_wasm_jit_forward_retired; const char *v = g_getenv ("MONO_WASM_JIT_FORWARD_RETIRED"); if (v && *v) mono_wasm_jit_forward_retired = *v != '0'; }
+	{ extern int mono_wasm_jit_lean_try_invoke; const char *v = g_getenv ("MONO_WASM_JIT_LEAN_TRY_INVOKE"); if (v && *v) mono_wasm_jit_lean_try_invoke = *v != '0'; }
+	{ extern int mono_wasm_jit_ic_remat; const char *v = g_getenv ("MONO_WASM_JIT_IC_REMAT"); if (v && *v) mono_wasm_jit_ic_remat = *v != '0'; }
+	{ extern int mono_wasm_jit_inline_calls; const char *v = g_getenv ("MONO_WASM_JIT_INLINE_CALLS"); if (v && *v) mono_wasm_jit_inline_calls = *v != '0'; }
+	{ extern int mono_wasm_jit_inline_calls_limit; const char *v = g_getenv ("MONO_WASM_JIT_INLINE_CALLS_LIMIT"); if (v && *v) { int n = atoi (v); if (n > 0 && n <= 1000) mono_wasm_jit_inline_calls_limit = n; } }
+	{ extern int mono_wasm_jit_inline_calls_cost; const char *v = g_getenv ("MONO_WASM_JIT_INLINE_CALLS_COST"); if (v && *v) { int n = atoi (v); if (n > 0 && n <= 100000) mono_wasm_jit_inline_calls_cost = n; } }
+	{ extern int mono_wasm_jit_inline_calls_depth; const char *v = g_getenv ("MONO_WASM_JIT_INLINE_CALLS_DEPTH"); if (v && *v) { int n = atoi (v); if (n > 0 && n <= 32) mono_wasm_jit_inline_calls_depth = n; } }
+#define WJ_T2_KNOB(var, name, lo, hi) { extern int var; const char *v = g_getenv (name); if (v && *v) { int n = atoi (v); if (n >= (lo) && n <= (hi)) var = n; } }
+	WJ_T2_KNOB (mono_wasm_jit_t2, "MONO_WASM_JIT_T2", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_t2_sample_ms, "MONO_WASM_JIT_T2_SAMPLE_MS", 1, 1000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_threshold, "MONO_WASM_JIT_T2_THRESHOLD", 1, 1000000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_max, "MONO_WASM_JIT_T2_MAX", 0, 100000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_limit, "MONO_WASM_JIT_T2_LIMIT", 1, 1000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_cost, "MONO_WASM_JIT_T2_COST", 1, 100000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_depth, "MONO_WASM_JIT_T2_DEPTH", 1, 32)
+	WJ_T2_KNOB (mono_wasm_jit_t2_gi_size, "MONO_WASM_JIT_T2_GI_SIZE", 0, 4096)
+	WJ_T2_KNOB (mono_wasm_jit_prof_origin, "MONO_WASM_JIT_PROF_ORIGIN", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_fast_tls, "MONO_WASM_JIT_FAST_TLS", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
+#undef WJ_T2_KNOB
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }
 	{ extern int mono_wasm_jit_retire_free; const char *rf = g_getenv ("MONO_WASM_JIT_RETIRE_FREE"); if (rf && *rf) mono_wasm_jit_retire_free = *rf != '0'; }
@@ -771,6 +837,7 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_edge_sample; const char *es = g_getenv ("MONO_WASM_JIT_EDGE_SAMPLE"); if (es && *es) { int v = atoi (es); mono_wasm_jit_edge_sample = (v >= 0 && v <= 10000) ? v : 0; } }
 #ifdef HOST_BROWSER
 	{ extern void mono_wasm_jit_edge_start (void); mono_wasm_jit_edge_start (); }
+	{ extern void mono_wasm_jit_t2_start (void); mono_wasm_jit_t2_start (); }
 #endif
 	e = g_getenv ("MONO_WASM_JIT_AUTO");
 	mono_memory_barrier ();
@@ -4389,6 +4456,18 @@ mono_wasm_jit_perm_unjittable_known (MonoMethod *method)
  * zero means the staleness window this design accepts has never once opened. Either way it is a reading,
  * and the alternative -- a removable entry -- would need tombstones and would cost the lock-free read.
  */
+/* R315: mini.c's downgrade retry (mono_wasm_force_compile) cannot see the WJC_* enum; count through here. */
+void mono_wasm_jit_note_inline_downgrade (gboolean ok);
+void
+mono_wasm_jit_note_inline_downgrade (gboolean ok)
+{
+	if (G_UNLIKELY (mono_wasm_jit_stats)) {
+		mono_wasm_jit_count (WJC_INLINE_DOWNGRADE);
+		if (ok)
+			mono_wasm_jit_count (WJC_INLINE_DOWNGRADE_OK);
+	}
+}
+
 void mono_wasm_jit_note_perm_cleared (MonoMethod *method);
 void
 mono_wasm_jit_note_perm_cleared (MonoMethod *method)

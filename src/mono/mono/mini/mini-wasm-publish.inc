@@ -668,6 +668,40 @@ mono_wasm_jit_safepoint_poll_entry (void)
 	mono_wasm_jit_safepoint_poll ();
 }
 
+/* R316 tier 2: every poll of a tier-1 body (emitter OP_GC_SAFE_POINT under MONO_WASM_JIT_T2). Consumes a pending
+ * WJ_ACT_SAMPLE the same way the entry poll does, including the "only a thread that was already running" filter,
+ * and credits the sample to the method whose body this is. Then the ordinary poll. */
+void
+mono_wasm_jit_safepoint_poll_t2 (gpointer imethod)
+{
+	if (wj_my_action && wj_my_action != &wj_worker_action_overflow &&
+	    (mono_atomic_load_i32 (wj_my_action) & WJ_ACT_SAMPLE)) {
+		gint32 old;
+		do {
+			old = mono_atomic_load_i32 (wj_my_action);
+		} while ((old & WJ_ACT_SAMPLE) && mono_atomic_cas_i32 (wj_my_action, old & ~WJ_ACT_SAMPLE, old) != old);
+		wj_sample_defer = 0;
+		if (emscripten_get_now () - wj_edge_tick_ms <= 2.0) {
+			extern void mono_wasm_jit_t2_sample (gpointer p);
+			mono_wasm_jit_t2_sample (imethod);
+		} else {
+			mono_wasm_jit_counters [WJC_EDGE_LATE]++;
+		}
+	}
+	mono_wasm_jit_safepoint_poll ();
+}
+
+/* R316: the sampling timer for tier 2 when the edge sampler is not already running one. */
+void
+mono_wasm_jit_t2_start (void)
+{
+	extern int mono_wasm_jit_t2, mono_wasm_jit_t2_sample_ms, mono_wasm_jit_edge_sample;
+	if (!mono_wasm_jit_t2 || mono_wasm_jit_edge_sample > 0)
+		return;
+	MAIN_THREAD_ASYNC_EM_ASM ({ setInterval (function () { Module._mono_wasm_jit_edge_tick (); }, $0); },
+		mono_wasm_jit_t2_sample_ms);
+}
+
 /* Main-thread timer body. */
 WJ_KEEPALIVE void
 mono_wasm_jit_edge_tick (void)

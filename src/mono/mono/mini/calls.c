@@ -187,6 +187,7 @@ mini_emit_call_args (MonoCompile *cfg, MonoMethodSignature *sig,
 	call->args = args;
 	call->signature = sig;
 	call->rgctx_reg = rgctx;
+	call->wasm_prof_im = cfg->wasm_cur_inline_im;
 	sig_ret = mini_get_underlying_type (sig->ret);
 
 	mini_type_to_eval_stack_type ((cfg), sig_ret, &call->inst);
