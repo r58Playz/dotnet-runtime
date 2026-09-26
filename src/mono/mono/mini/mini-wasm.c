@@ -638,6 +638,11 @@ int mono_wasm_jit_inline_bfi = 0;
 /* MONO_WASM_JIT_PROF_SHARE (R316j): tier-up and IKVM's body swap SHARE the call profile with the new generation, allocating
  * it at that moment if the method has recorded nothing yet (interp/tiering.c). */
 int mono_wasm_jit_prof_share = 0;
+/* MONO_WASM_JIT_LDADDR_REF (R321): OP_LDADDR of a ref/byref scalar local, homed in its ref-shadow slot (addrslot -2). */
+int mono_wasm_jit_ldaddr_ref = 0;
+/* MONO_WASM_JIT_REEMIT_VALIDATE (R322): a re-emit into a slot the compiling thread installed is validated there, not
+ * published there (0 = the old install-on-validate, the positive control for the trap it removes). */
+int mono_wasm_jit_reemit_validate = 1;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -771,6 +776,8 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_ldaddr_ref, "MONO_WASM_JIT_LDADDR_REF", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_reemit_validate, "MONO_WASM_JIT_REEMIT_VALIDATE", 0, 1)
 #undef WJ_T2_KNOB
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }
@@ -1606,9 +1613,12 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			 * accident. Both are deleted rather than left as a trap for the next reader to reason
 			 * about -- an f-slot whose arity does not match the caller's baked type is the
 			 * `function signature mismatch` failure this file has paid for repeatedly. */
-			wasmTable.set ($0, inst.exports.e); /* entry thunk: interp entry */
-			wasmTable.set ($1, inst.exports.f); /* scalar method: call_indirect target */
-			if (Module.__wjSlotFn) { Module.__wjSlotFn.set ($0, inst.exports.e); Module.__wjSlotFn.set ($1, inst.exports.f); }
+			/* R322: slots <= 0 = VALIDATE ONLY -- the module compiled and every import bound, nothing published. */
+			if ($0 > 0 && $1 > 0) {
+				wasmTable.set ($0, inst.exports.e); /* entry thunk: interp entry */
+				wasmTable.set ($1, inst.exports.f); /* scalar method: call_indirect target */
+				if (Module.__wjSlotFn) { Module.__wjSlotFn.set ($0, inst.exports.e); Module.__wjSlotFn.set ($1, inst.exports.f); }
+			}
 			return 1;
 		} catch (e) {
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
@@ -1631,7 +1641,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 	   (int) (intptr_t) mono_wasm_jit_scratch (),
 	   (int) (intptr_t) mono_wasm_jit_cur_island_il_state_addr ());
 	WJ_JS_BLOCKING_END (__wj_cookie, __wj_sd, __wj_entered);
-	if (_ok) {
+	if (_ok && e_slot > 0 && f_slot > 0) {   /* R322: a validate-only call installed nothing */
 		/* Physical installation is not dispatch admission. A freshly compiled module can have unchecked
 		 * direct dependencies that are still placeholders on this thread; only mono_wasm_jit_admit marks
 		 * e/f live after recursively admitting the complete closure. */

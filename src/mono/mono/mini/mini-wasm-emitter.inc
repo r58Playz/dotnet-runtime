@@ -607,7 +607,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (addrslot [vv] == -3)
 					continue;   /* by-addr vtype ARG: the wasm param already holds the address; OP_LDADDR re-pushes it */
 				if (li [vv] >= 0) { fail = "ldaddr of arg local"; fail_op = OP_LDADDR; goto done; }   /* scalar arg: in a wasm param, no address */
-				if (m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype)) { fail = "ldaddr of ref/byref local"; fail_op = OP_LDADDR; goto done; }
+				if (m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype)) {
+					/* R321 (MONO_WASM_JIT_LDADDR_REF): home it in its ref-shadow slot, as the scalar-ref vtype below.
+					 * vt[vv] keeps its scalar valtype: plain moves of the local still happen, through the slot. */
+					extern int mono_wasm_jit_ldaddr_ref;
+					if (mono_wasm_jit_ldaddr_ref) {
+						addrslot [vv] = -2;
+						wj_count (WJC_LDADDR_REF_LOCAL);
+						continue;
+					}
+					fail = "ldaddr of ref/byref local"; fail_op = OP_LDADDR; goto done;
+				}
 				lvt = wasm_valtype_of_type (var->inst_vtype);
 				if (lvt == 0 || lvt == WASM_VOID || wasm_valtype_group (lvt) < 0) {
 					/* Non-scalar (valuetype) address-taken local. DEFAULT: bail. MONO_WASM_JIT_LDADDR_VTYPE=1
@@ -1773,6 +1783,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							sl_kill_next [i] = -1;
 							if (!(li [i] >= 0 && isref [i] && needs_slot [i] && !sl_elide [i]))
 								continue;   /* only slotted vregs have anything to zero */
+							if (addrslot [i] == -2)
+								continue;   /* R321: the slot is the HOME, and its address may be live (OP_LDADDR's var is inst_p0, invisible to last_use_ord) */
 							if (sl_multi [i] || !sl_def_first [i] || last_use_ord [i] < 0)
 								continue;
 							if (ev_bb [i] < 0 || ev_bb [i] >= nbbs || bb_last_gcp [ev_bb [i]] <= last_use_ord [i])
@@ -1796,7 +1808,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		/* ref-etype scalar-vtype locals (addrslot==-2 from the ldaddr pre-pass): each gets a GC-scanned
 		 * ref-shadow slot so its single ref field is a tracked/pinning root (VTYPE_SCALAR_REF). */
 		for (i = 0; i < nvreg; ++i)
-			if (addrslot [i] == -2) {
+			if (addrslot [i] == -2 && refslot [i] < 0) {   /* R321: a scalar ref local may have one already */
 				refslot [i] = nrefslots++;
 			}
 		if (nrefslots > 0)
@@ -6877,7 +6889,15 @@ vcall_cold_miss_emit:
 			 * here rather than letting another thread trap on a placeholder slot at invoke time. */
 			/* The imports this module is about to bind were chosen against the REGISTRY, which is
 			 * process-wide; whether they are instantiated is per-thread. Make them live here first. */
-			if (mono_wasm_jit_instantiate_local (e_slot, f_slot, cached, (int) out.len, ierr, (int) sizeof (ierr), &wj_inst_ms)) {
+			/* R322: a RE-EMIT into a slot this thread already installed must not replace the body here before the new
+			 * body's dependencies are installed here -- callers that baked the slot would reach it at once. Validate
+			 * only; the republication makes this thread re-admit, walking the new depset first. */
+			extern int mono_wasm_jit_reemit_validate;
+			gboolean reemit_live = mono_wasm_jit_reemit_validate && (wj_slot_is_installed (f_slot) || wj_slot_is_installed (e_slot));
+			if (reemit_live)
+				wj_count (WJC_REEMIT_VALIDATE_ONLY);
+			if (mono_wasm_jit_instantiate_local (reemit_live ? -1 : e_slot, reemit_live ? -1 : f_slot, cached, (int) out.len,
+			                                     ierr, (int) sizeof (ierr), &wj_inst_ms)) {
 				/* The compile result is written onto cfg->wasm_jit_result (below). It's per-compile, so a
 				 * re-entrant nested compile (cctors / AOT-target init) has its OWN cfg and can't clobber it —
 				 * no per-thread-relay ordering dance needed. We still write the e_slot gate AFTER

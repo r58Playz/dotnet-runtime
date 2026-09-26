@@ -1282,6 +1282,8 @@ enum {
 	WJC_T2_GI_INL_COLD,        /* ... ... an entry with fewer than 8 observations */
 	WJC_T2_GI_INL_POLY,        /* ... ... warm but polymorphic (or torn) */
 	WJC_ADMIT_PAYLOAD_TORN,    /* R320: admission read {batch,bytes,len,depset} mid-replacement and refused (transient) */
+	WJC_LDADDR_REF_LOCAL,      /* R321: address-taken ref/byref scalar locals homed in their ref-shadow slot */
+	WJC_REEMIT_VALIDATE_ONLY,  /* R322: re-emits into a slot the compiling thread had installed: validated, not published there */
 	WJC_MAX
 };
 
