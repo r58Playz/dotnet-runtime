@@ -809,6 +809,9 @@ struct MonoCallInst {
 	GSList *out_freg_args;
 	GSList *outarg_vts;
 	CallInfo *call_info;
+	/* wasm JIT (R316b): the InterpMethod whose call profile describes this site when it was IR'd inside an inlinee
+	 * under the per-compile policy, else NULL (= the compiled method's own record). */
+	gpointer wasm_prof_im;
 #ifdef ENABLE_LLVM
 	LLVMCallInfo *cinfo;
 	int rgctx_arg_reg, imt_arg_reg;
@@ -1390,6 +1393,12 @@ typedef struct {
 	int          ndirect_deps;       /* exact f-slots reached by unchecked direct calls in this module */
 	guint8       direct_deps_truncated;
 	int          direct_deps [MONO_WASM_JIT_MAX_DIRECT_DEPS];
+	/* R316d: what a tier-2 compile did with its calls (0 for every other compile). calls_left counts every call in the
+	 * final IR -- helpers included -- and calls_left_virt the virtual ones among them. */
+	guint8       t2_tier;
+	int          t2_inlined, t2_gi, t2_nopred, t2_calls_left, t2_calls_left_virt;
+	const char  *t2_down_reason;     /* R316h: the fail string of the tier-2 compile a downgrade replaced (static literal) */
+	int          t2_down_bail;
 	guint32      direct_dep_sig [MONO_WASM_JIT_MAX_DIRECT_DEPS];
 	MonoMethod  *direct_dep_method [MONO_WASM_JIT_MAX_DIRECT_DEPS]; /* callee behind each dep f-slot (diagnostics: names the method when an ABI/registration mismatch is caught at admit) */
 	/* MONO_WASM_JIT_HEAL_WAIT's heal_callees[] carried out of here: the callees this body emitted a
@@ -1423,6 +1432,21 @@ typedef struct {
 	 *
 	 * gpointer, not InterpMethod *: mini.h is included by files that do not see interp-internals.h. */
 	gpointer         wasm_jit_caller_imethod;
+	/* Per-compile inline policy for the wasm tier (R315, plan Phase 3). All zero = today's inliner exactly.
+	 * limit / cost_cap / depth_cap replace INLINE_LENGTH_LIMIT (or MONO_INLINELIMIT), inline_method's `costs < 60`
+	 * and `inline_depth > 10` when > 0. allow_calls lifts INLINE_FAILURE("call"/"ctor call") inside inlinees.
+	 * used_calls records that an accepted inline relied on it, so a permanent bail can be downgraded. */
+	int              wasm_inline_limit;
+	int              wasm_inline_cost_cap;
+	int              wasm_inline_depth_cap;
+	guint8           wasm_inline_allow_calls;
+	guint8           wasm_inline_used_calls;
+	guint8           wasm_jit_tier;          /* R316: 2 = tier-2 compile (policy below; no T2 sampling emitted) */
+	int              wasm_gi_size;           /* R316: guarded-inline size cap when > 0 (else the global knob) */
+	gpointer         wasm_cur_inline_im;     /* R316b: the inlinee being IR'd, for MonoCallInst.wasm_prof_im */
+	const char      *wasm_inline_fail_msg;   /* R316f: the last INLINE_FAILURE message (a static literal) */
+	guint8           wasm_t2r_noted;         /* R316f: the size gate already recorded this refusal */
+	const char      *wasm_t2r_why;           /* R316g: which check_inlining gate refused (a static literal) */
 	MonoInst       **varinfo;
 	MonoMethodVar   *vars;
 	MonoInst        *ret;

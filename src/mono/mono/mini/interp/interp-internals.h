@@ -266,6 +266,18 @@ struct InterpMethod {
 #endif
 	gint32 entry_count;
 	InterpMethod *optimized_imethod;
+	/* Set when an IKVM body swap (tiering.c replace_method_body_locked) RETIRES this InterpMethod: the newer
+	 * generation of the same MonoMethod now registered in interp_code_hash. Only data items registered as
+	 * patch sites are re-pointed by the swap, so any other cache that kept this pointer (the vcall resolve
+	 * cache, heal-site late_im, delegate recipes) would otherwise read this object's wasm_jit_fslot -- 0 for
+	 * a never-compiled generation -- forever. Follow it with interp_imethod_current (). */
+	InterpMethod *replaced_by;
+	/* Tier 2 (R316, MONO_WASM_JIT_T2). Full-width fields, not bitfields: the sample count is bumped racily from
+	 * every worker, and a bitfield write would clobber its neighbours. */
+	gint32 wasm_jit_t2_samples;   /* safepoint samples taken inside this method's tier-1 body */
+	guint8 wasm_jit_tier;         /* 2 = its body was compiled at tier-2 policy (a same-IL re-emission keeps it); 3 = a tier-2
+	                               * attempt failed, was refused or given up. Either way never re-requested (R316c). */
+	guint8 wasm_jit_t2_want;      /* queued for a tier-2 recompile; read by mini.c through mono_wasm_jit_imethod_tier_want */
 	// This data is used to resolve native offsets from unoptimized method to native offsets
 	// in the optimized method. We rely on keys identifying a certain logical execution point
 	// to be equal between unoptimized and optimized method. In unoptimized method we map from
@@ -319,6 +331,24 @@ struct InterpMethod {
 	long opcounts;
 #endif
 };
+
+/* The CURRENT InterpMethod for a cached one: follow interpreter tier-up (optimized_imethod, same IL) and, when
+ * follow_replaced, IKVM body swaps (replaced_by, a newer generation of the same MonoMethod -- same signature,
+ * and it inherits the descriptor and slot pair). Both links are written once, after the target is fully
+ * initialised (tier_up_method under tiering_mutex; replace_method_body_locked behind a barrier), and chains
+ * can form (gen 1 -> gen 2 -> gen 2 tiered), hence the loop. follow_replaced is MONO_WASM_JIT_FORWARD_RETIRED. */
+static inline InterpMethod *
+interp_imethod_current (InterpMethod *im, gboolean follow_replaced)
+{
+	for (;;) {
+		if (im->optimized_imethod)
+			im = im->optimized_imethod;
+		else if (follow_replaced && im->replaced_by)
+			im = im->replaced_by;
+		else
+			return im;
+	}
+}
 
 /* Used for localloc memory allocation */
 typedef struct _FrameDataFragment FrameDataFragment;

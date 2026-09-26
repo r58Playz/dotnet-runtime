@@ -1230,6 +1230,57 @@ enum {
 	WJC_MID_PRED_ARM,
 	WJC_MID_PRED_INL,
 	WJC_PROF_BLOCK_GROW,
+	/* R314 (L1) census, stats-gated: a cache handed back an InterpMethod that an IKVM body swap retired.
+	 * RETIRED_IC_HIT: the vcall resolve cache (resolve_fslot's IC words); RETIRED_FASTMISS: get_virtual_method_fast;
+	 * RETIRED_LATE_FSLOT: a heal site's baked late_im; RETIRED_DELEGATE: a delegate recipe. Each is counted
+	 * whether or not MONO_WASM_JIT_FORWARD_RETIRED is on, so the knob-off run sizes the population.
+	 * RETIRED_FORWARDED: forwards actually taken (knob on); RETIRED_FWD_LIVE: of those, the call returned a live
+	 * f-slot. RESID_LIVE_CALLEE: a call_interp crossing whose canonical callee is JIT-live on this thread --
+	 * the residual pool neither retired-cache route explains. */
+	WJC_RETIRED_IC_HIT,
+	WJC_RETIRED_FASTMISS,
+	WJC_RETIRED_LATE_FSLOT,
+	WJC_RETIRED_DELEGATE,
+	WJC_RETIRED_FORWARDED,
+	WJC_RETIRED_FWD_LIVE,
+	WJC_RESID_LIVE_CALLEE,
+	/* R315 (plan Phase 3) inline-policy census, stats-gated. ACCEPTED: inlines accepted in wasm compiles (at
+	 * inline_method's accepted return, every policy). CALLS_LIFTED: call/ctor-call gates the policy let through
+	 * inside inlinees (a decision; ACCEPTED moving is the action). RELINK_/STACKWALK_REFUSED: the two refusals kept.
+	 * CLAUSE_RECHECK: inlinee header had clauses at inline time. DOWNGRADE(_OK): permanent bails recompiled at the
+	 * ordinary policy (and how many of those then succeeded). */
+	WJC_INLINE_ACCEPTED,
+	WJC_INLINE_CALLS_LIFTED,
+	WJC_INLINE_RELINK_REFUSED,
+	WJC_INLINE_STACKWALK_REFUSED,
+	WJC_INLINE_CLAUSE_RECHECK,
+	WJC_INLINE_DOWNGRADE,
+	WJC_INLINE_DOWNGRADE_OK,
+	/* R316 tier 2, stats-gated: SAMPLES taken in tier-1 bodies; REQUESTED queued; COMPILED / FAILED the broker's
+	 * outcome for a tier-2 request (FAILED includes a downgraded compile that then bailed too); REFUSED dropped at
+	 * the broker's canonical-imethod gate. */
+	WJC_T2_SAMPLES,
+	WJC_T2_REQUESTED,
+	WJC_T2_COMPILED,
+	WJC_T2_FAILED,
+	WJC_T2_REFUSED,
+	WJC_PROF_ORIGIN_USED,      /* R316b: a profile read at an inlined site answered from the inlinee's record */
+	WJC_PROF_ORIGIN_FALLBACK,  /* ... the site had an origin whose record has no entry for it: the root's was read */
+	WJC_FAST_TLS_SITE,         /* R317: mono_tls_get_thread_extern sites emitted as loads (MONO_WASM_JIT_FAST_TLS) */
+	WJC_T2_GIVEUP,             /* R316c: a tier-2 request released on the broker's BUSY budget */
+	WJC_T2_GI_EMITTED,         /* R316c: guarded inlines emitted by tier-2 compiles */
+	WJC_T2_GI_NOPRED,          /* R316c: guarded-inline sites in tier-2 compiles refused for want of a prediction */
+	WJC_INLINE_COLD_THROW_ADMIT, /* R318: callees under the size limit only once their cold throw segments are discounted */
+	WJC_T2_GI_NOREC,           /* R316i: tier-2 GI no-prediction, split: the caller record has no entry for the site */
+	WJC_T2_GI_COLD,            /* ... an entry with fewer than 8 observations */
+	WJC_T2_GI_POLY,            /* ... warm but polymorphic (incl. torn reads) */
+	WJC_INLINE_BFI_UNINIT,     /* R319: inlinees admitted although their BeforeFieldInit class is uninitialized */
+	WJC_T2_GI_NOREC_CANON,     /* R316j: tier-2 GI "no record" whose canonical generation does hold a record */
+	WJC_T2_GI_SITE_ROOT,       /* R316k: tier-2 GI no-prediction at a site of the compiled method itself */
+	WJC_T2_GI_INL_NOIM,        /* ... at an inlinee's site, the inlinee having no InterpMethod */
+	WJC_T2_GI_INL_NOREC,       /* ... at an inlinee's site, the inlinee's record has no entry */
+	WJC_T2_GI_INL_COLD,        /* ... ... an entry with fewer than 8 observations */
+	WJC_T2_GI_INL_POLY,        /* ... ... warm but polymorphic (or torn) */
 	WJC_MAX
 };
 
@@ -1256,5 +1307,8 @@ void mono_wasm_jit_census_note_entry (int eslot);
  * this thread's mono_wasm_sgen_tls_info -- read by OP_WASM_JIT_ALLOC_FAST (R305). interp.c asserts it equals
  * WJ_SCRATCH_SIZE. */
 #define WJ_SCRATCH_TLAB_SLOT 256
+/* The next word: the address of this thread's mono_wasm_tls_thread (threads.c), read by the MONO_WASM_JIT_FAST_TLS
+ * form of mono_tls_get_thread_extern (R317). */
+#define WJ_SCRATCH_THREAD_SLOT (WJ_SCRATCH_TLAB_SLOT + 8)
 
 #endif /* __MONO_MINI_WASM_H__ */

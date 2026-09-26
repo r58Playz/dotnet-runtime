@@ -192,7 +192,35 @@ static void threads_add_pending_joinable_runtime_thread (MonoThreadInfo *mono_th
 static gboolean threads_wait_pending_joinable_threads (uint32_t timeout);
 static gchar* thread_dump_dir = NULL;
 
+#ifdef HOST_BROWSER
+/*
+ * THE CURRENT MonoInternalThread, WHERE WASM-JITTED CODE CAN REACH IT (R317, plan M3). Every ThreadStatic access --
+ * IKVM's Thread.currentThread among them -- calls mono_tls_get_thread_extern, which with MONO_KEYWORD_THREAD off
+ * is a pthread key lookup behind a call. A real __thread has an address, constant for the pthread's life:
+ * mono_wasm_jit_scratch () stores &mono_wasm_tls_thread past the thread's scratch, and emitted code reads it through
+ * the `s.b` import (MONO_WASM_JIT_FAST_TLS), exactly as R305 reaches SgenThreadInfo. Kept in step with the pthread
+ * key at its only setter, on the owning thread, NULL on detach. The object is pinned whenever the GC moves
+ * (init_thread_object's thread_pinning_ref), which is what lets mono's own TLS hold it raw too.
+ */
+__thread MonoInternalThread *mono_wasm_tls_thread;
+
+gpointer mono_wasm_tls_thread_addr (void);
+gpointer
+mono_wasm_tls_thread_addr (void)
+{
+	return &mono_wasm_tls_thread;
+}
+
+static inline void
+wj_set_current_object (MonoInternalThread *value)
+{
+	mono_tls_set_thread (value);
+	mono_wasm_tls_thread = value;
+}
+#define SET_CURRENT_OBJECT   wj_set_current_object
+#else
 #define SET_CURRENT_OBJECT   mono_tls_set_thread
+#endif
 #define GET_CURRENT_OBJECT   mono_tls_get_thread
 
 /* function called at thread start */

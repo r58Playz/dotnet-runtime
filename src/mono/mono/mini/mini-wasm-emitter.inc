@@ -151,6 +151,26 @@ wj_structured_outer_depth (int kind, int h, int l, int n, int from)
 
 
 
+#ifdef HOST_BROWSER
+/* R316b (MONO_WASM_JIT_PROF_ORIGIN): which record a profile read at this call site consults. A site IR'd inside an
+ * inlinee asks that inlinee's record first -- where the interpreter and its own tier-1 IC misses filed the site --
+ * and the compiled method's when that record has nothing for it. Counted per READ, not per site. */
+static gpointer
+wj_call_prof_im (MonoCompile *cfg, MonoCallInst *call)
+{
+	extern int mono_wasm_jit_prof_origin;
+	extern gboolean mono_wasm_jit_prof_has_site (gpointer caller, MonoMethod *base);
+	if (!mono_wasm_jit_prof_origin || !call->wasm_prof_im || call->wasm_prof_im == cfg->wasm_jit_caller_imethod)
+		return cfg->wasm_jit_caller_imethod;
+	if (mono_wasm_jit_prof_has_site (call->wasm_prof_im, call->method)) {
+		wj_count (WJC_PROF_ORIGIN_USED);
+		return call->wasm_prof_im;
+	}
+	wj_count (WJC_PROF_ORIGIN_FALLBACK);
+	return cfg->wasm_jit_caller_imethod;
+}
+#endif
+
 void
 mono_wasm_emit_method (MonoCompile *cfg)
 {
@@ -2127,6 +2147,21 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define WJ_CONTINUE_UNWIND_ADDR ((gpointer) (intptr_t) 0x7ff8)   /* offline dump: placeholder table index */
 #endif
 
+/* MONO_WASM_JIT_IC_REMAT (R314, plan L7/M5): read the per-thread PIC pointers and capacities from their IMMUTABLE
+ * imports at each IC site (global.get s.v/s.n/s.d/s.m, one instance load) instead of holding four prologue values
+ * live across the whole body, where V8 spills them after the prologue and reloads them after every call (R312:
+ * ~60% of our stores are V8 stack traffic). The PICs are per-thread and grow only on their owning thread inside a
+ * miss helper, so an at-use read is never staler than the prologue copy it replaces. */
+#define EMIT_IC_VPIC_PTR() do { if (mono_wasm_jit_ic_remat) { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 3); } \
+	else wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_ptr_idx); } while (0)
+#define EMIT_IC_VPIC_CAPVAL() do { if (mono_wasm_jit_ic_remat) { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 4); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); } \
+	else wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_capval_idx); } while (0)
+#define EMIT_IC_DPIC_PTR() do { if (mono_wasm_jit_ic_remat) { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 5); } \
+	else wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dpic_ptr_idx); } while (0)
+#define EMIT_IC_DPIC_CAPVAL() do { if (mono_wasm_jit_ic_remat) { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 6); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); } \
+	else wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dpic_capval_idx); } while (0)
 #ifdef HOST_BROWSER
 #define EMIT_REF_LEAVE() do { if (framebytes > 0 && !lazy_cold_frame) { \
 		if (lazy_ref_frame) { \
@@ -2547,7 +2582,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * the cached module is instantiated, so two global.get operations replace the former two C-boundary
 	 * address-helper calls per invocation. Each IC hit still loads THROUGH these stable addresses, making
 	 * a later bitmap realloc/capacity growth visible with no stale-pointer window. */
-	if (has_vcall) {
+	if (has_vcall && !mono_wasm_jit_ic_remat) {   /* IC_REMAT: nothing preloaded, see EMIT_IC_VPIC_PTR */
 		/* METHOD-LONG LIVE RANGES ARE NOT FREE -- the LOCALS are.
 		 *
 		 * Be precise about which, because the two suggest opposite work. A wasm local is free: V8's
@@ -3255,9 +3290,20 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* Direct import: a C function address in dotnet.native.wasm, fixed for the process. The ENTRY
 					 * poll gets its own helper while edge sampling is on (R295), so a sample is a method entry. */
 					{
-						extern int mono_wasm_jit_edge_sample;
+						extern int mono_wasm_jit_edge_sample, mono_wasm_jit_t2;
 						extern void mono_wasm_jit_safepoint_poll_entry (void);
-						if (mono_wasm_jit_edge_sample && bb == cfg->bb_entry)
+						extern void mono_wasm_jit_safepoint_poll_t2 (gpointer imethod);
+						/* (R316e: tier-2 bodies too -- they only feed the per-method heat the t2 dump ranks by.) */
+						if (mono_wasm_jit_t2 && cfg->wasm_jit_caller_imethod) {
+							/* R316 tier-2 hotness: every poll of a tier-1 body names its method, INSIDE this
+							 * rare arm -- the common path is unchanged. The InterpMethod* is process-wide. */
+							WasmFuncType pt1; int pt1i = -1, pk1;
+							memset (&pt1, 0, sizeof (pt1)); pt1.ret = WASM_VOID; pt1.nparams = 1; pt1.params [0] = WASM_I32;
+							for (pk1 = 0; pk1 < nextra; ++pk1) if (functype_eq (&extra_types [pk1], &pt1)) { pt1i = ti_base + pk1; break; }
+							if (pt1i < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt1; pt1i = ti_base + nextra++; }
+							wasm_i32_const (&body, (gint32) (intptr_t) cfg->wasm_jit_caller_imethod);
+							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_t2, (guint32) pt1i);
+						} else if (mono_wasm_jit_edge_sample && bb == cfg->bb_entry)
 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_entry, (guint32) pti);
 						else
 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll, (guint32) pti);
@@ -4100,6 +4146,21 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					 * captured args, so the cold path resolves the slot instead of trapping. */
 					gint32 ifptr;
 #ifdef HOST_BROWSER
+					/* R317 (MONO_WASM_JIT_FAST_TLS): the current MonoInternalThread without the call --
+					 *     *(*(s.b + WJ_SCRATCH_THREAD_SLOT))   this thread's mono_wasm_tls_thread (threads.c)
+					 * NULL while detached, as the pthread key reads. No call, so not a GC point: the call it
+					 * replaces was only one because it was a call. */
+					{
+						extern int mono_wasm_jit_fast_tls;
+						if (mono_wasm_jit_fast_tls && call->jit_icall_id == MONO_JIT_ICALL_mono_tls_get_thread_extern) {
+							wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);                  /* s.b */
+							wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_THREAD_SLOT);
+							wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
+							if (!wasm_st (&body, &lc, ins->dreg)) { fail = "fast_tls dreg"; goto done; }
+							wj_count (WJC_FAST_TLS_SITE);
+							break;
+						}
+					}
 					/* Use the RAW icall C function (info->func), a wasm table index callable with
 					 * the icall's C signature directly. NOT call->fptr (= mono_icall_get_wrapper,
 					 * which on wasm is the fixed-signature mono_wasm_specific_trampoline stub →
@@ -4799,7 +4860,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
 							MonoMethod *dt = NULL;
 							guint32 dpct = 0;
-							gboolean dgot = mono_wasm_jit_prof_predict_delegate (cfg->wasm_jit_caller_imethod,
+							gboolean dgot = mono_wasm_jit_prof_predict_delegate (wj_call_prof_im (cfg, call),
 								call->method, &dt, &dpct);
 							if (!dgot)
 								wj_count (WJC_DELEGATE_DEVIRT_NOREC);   /* no usable record -- NOT "thin" */
@@ -4864,12 +4925,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							guint32 pred_samples = 0;
 							extern gboolean mono_wasm_jit_prof_predict_method (gpointer caller, MonoMethod *base,
 								MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
-							gboolean pred_ok = mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod,
+							gpointer pred_im = wj_call_prof_im (cfg, call);
+							gboolean pred_ok = mono_wasm_jit_prof_predict (pred_im,
 							    call->method, &pred_vt, &pred_target, &pred_samples, &pred_why);
 							/* R311: a POLY site whose recorded receivers all resolve to ONE method is predictable
 							 * behind the method-identity arm guard below. pred_why keeps the vtable verdict. */
 							if (!pred_ok && mono_wasm_jit_pred_mid && vc_mid_slot >= 0 && (pred_why == 3 || pred_why == 4) &&
-							    mono_wasm_jit_prof_predict_method (cfg->wasm_jit_caller_imethod, call->method,
+							    mono_wasm_jit_prof_predict_method (pred_im, call->method,
 							                                       &pred_vt, &pred_target, &pred_samples)) {
 								pred_ok = TRUE;
 								wj_count (WJC_MID_PRED_ARM);
@@ -5125,7 +5187,7 @@ vcall_nullchk_done:
 							 * emitted code re-checks the receiver. Settled; unconditional. */
 							if (ic_ways > 1) {
 								extern guint32 mono_wasm_jit_prof_arity (gpointer caller, MonoMethod *base);
-								guint32 ar = mono_wasm_jit_prof_arity (cfg->wasm_jit_caller_imethod, call->method);
+								guint32 ar = mono_wasm_jit_prof_arity (wj_call_prof_im (cfg, call), call->method);
 								/* arity + 1, not arity. The profile now also observes this site AFTER the caller is
 								 * compiled (the IC-miss path feeds it), but the width is fixed at THIS emit, so it
 								 * still cannot see receivers that first appear later -- and the counters say that is exactly what happens: the
@@ -5182,7 +5244,7 @@ vcall_nullchk_done:
 									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
-								gpointer im = cfg->wasm_jit_caller_imethod;
+								gpointer im = wj_call_prof_im (cfg, call);
 								MonoVTable *v1 = NULL, *v2 = NULL;
 								MonoMethod *t1 = NULL, *t2 = NULL;
 								guint32 p1 = 0, p2 = 0;
@@ -5392,11 +5454,11 @@ vcall_nullchk_done:
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $slim_pic_miss */
 									/* site < *TLS-cap, otherwise the worker has not allocated this PIC yet */
 									wasm_i32_const (&body, (gint32) vpic_site);
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_capval_idx);
+									EMIT_IC_VPIC_CAPVAL ();
 									wasm_op (&body, WASM_OP_I32_GE_U);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									/* entry = *TLS-ptr + site * ways * stride */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_ptr_idx);
+									EMIT_IC_VPIC_PTR ();
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 									wasm_i32_const (&body, (gint32) (vpic_site * mono_wasm_jit_vcall_ways * vpic_stride));
 									wasm_op (&body, WASM_OP_I32_ADD);
@@ -5471,13 +5533,13 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_list_off);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									wasm_i32_const (&body, (gint32) vpic_site);
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dpic_capval_idx);
+									EMIT_IC_DPIC_CAPVAL ();
 									wasm_op (&body, WASM_OP_I32_GE_U);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									/* Array BASE only — the site displacement folds into each way's load immediate
 									 * below, exactly as for the fslot IC, so the `i32.const; i32.add` disappears from
 									 * every delegate dispatch (~1015M per window). */
-									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dpic_ptr_idx);
+									EMIT_IC_DPIC_PTR ();
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dic_base_idx);
 								}
@@ -5809,7 +5871,7 @@ vcall_nullchk_done:
 								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
 								/* Bounds-check before dereferencing the TLS PIC pointer. */
 								wasm_i32_const (&body, (gint32) vpic_site);
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_capval_idx);
+								EMIT_IC_VPIC_CAPVAL ();
 								wasm_op (&body, WASM_OP_I32_GE_U);
 								wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1); /* miss -> $slow */
 								/* Keep the ARRAY BASE in the local and fold `site * ways * stride` into way zero's
@@ -5818,7 +5880,7 @@ vcall_nullchk_done:
 								 * every HIT — and a hit is the overwhelming case. The cold ways still need a real
 								 * moving cursor, so it is computed inside $way_fail below, i.e. only when way zero
 								 * misses. Net: 2 fewer ops per dispatch on ~822M fslot-IC dispatches per window. */
-								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_ptr_idx);
+								EMIT_IC_VPIC_PTR ();
 								wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 								wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);
 								/* Only the monomorphic/MRU way is emitted straight-line. */
@@ -5921,7 +5983,7 @@ vcall_nullchk_done:
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
 										wasm_i32_const (&body, vpic_stride); wasm_op (&body, WASM_OP_I32_ADD);
 										wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_ti_idx);
-										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vpic_ptr_idx);
+										EMIT_IC_VPIC_PTR ();
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 										/* End of the ways this site actually checks. The site's REGION is still
 										 * global-width (stride unchanged), so this is base + ic_ways entries, not

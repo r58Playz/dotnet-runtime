@@ -150,6 +150,10 @@ wj_gi_prof_census (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, in
  * Then, for a site that came from an inlined callee, the callee's own record -- where the interpreter put
  * it. *why keeps the CALLER's refusal reason, so wj_gi_prof_census still describes what the first key saw.
  * The peek never creates an InterpMethod, and `method` is live because it is being compiled. */
+/* R316k: the inlinee-record verdict of the last wj_gi_predict: -1 = the site is the root's own, 0 = inlinee site but the
+ * inlinee has no InterpMethod, else 10 + the inlinee record's WJ_PRED_* (11 no record, 12 cold, 13/14 poly, 15 torn). */
+static __thread int wj_gi_last_inl;
+
 static gboolean
 wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mid_slot,
                MonoVTable **vt, MonoMethod **target, guint32 *samples, int *why)
@@ -161,6 +165,7 @@ wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mi
 	gboolean mid = mono_wasm_jit_pred_mid && mid_slot >= 0;
 	int why2 = 0;
 
+	wj_gi_last_inl = (method && method != cfg->method) ? 0 : -1;
 	if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples, why))
 		return TRUE;
 	if (mid && (*why == 3 || *why == 4) &&
@@ -176,6 +181,8 @@ wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mi
 			wj_gi_count (WJC_MID_PRED_INL);
 			return TRUE;
 		}
+		if (im)
+			wj_gi_last_inl = 10 + why2;
 	}
 	return FALSE;
 }
@@ -329,6 +336,150 @@ wj_gi_note_refused (MonoMethod *m)
 	}
 	/* Probe full: drop it. The cost is that this callee keeps re-paying its own guard, which is exactly
 	 * the pre-memo behaviour, so a full table degrades to the old cost rather than to anything worse. */
+}
+#endif
+
+/* The R315 counters, usable from code compiled into both the runtime and mono-aot-cross (wj_gi_count lives in the
+ * HOST_BROWSER region above). */
+#ifdef HOST_BROWSER
+#define wj_p3_count(C) wj_gi_count (C)
+#else
+#define wj_p3_count(C) do { } while (0)
+#endif
+
+/* R315 (plan Phase 3.2): may the inlinee being IR'd keep this ordinary call / ctor call instead of aborting the
+ * inline? Only under the per-compile policy, and only inside an inlinee (at the root INLINE_FAILURE is a no-op
+ * anyway). Refused, and counted: IKVM's relink hook (a generation-1 body -- semantically safe to inline, but it
+ * would freeze the lazy-link body into the caller; matched exactly as transform.c's R304 check) and a callee that
+ * needs a stack walk (REQSECOBJ / StackCrawlMark, the interpreter's own rule, transform.c:4028). Plain field reads
+ * only: this runs inside the compile section, where no metadata operation may be added (CLAUDE.md). */
+static gboolean
+wj_inline_call_allowed (MonoCompile *cfg, MonoMethod *cmethod)
+{
+	if (!COMPILE_WASM (cfg) || !cfg->wasm_inline_allow_calls || cfg->method == cfg->current_method || !cmethod)
+		return FALSE;
+	if (cmethod->name && cmethod->name [0] == 'R' && !strcmp (cmethod->name, "RelinkBody") &&
+	    !strcmp (m_class_get_name (cmethod->klass), "ByteCodeHelper") &&
+	    !strcmp (m_class_get_name_space (cmethod->klass), "IKVM.Runtime")) {
+		wj_p3_count (WJC_INLINE_RELINK_REFUSED);
+		return FALSE;
+	}
+	if (cmethod->flags & METHOD_ATTRIBUTE_REQSECOBJ) {
+		wj_p3_count (WJC_INLINE_STACKWALK_REFUSED);
+		return FALSE;
+	}
+	cfg->wasm_inline_used_calls = TRUE;
+	wj_p3_count (WJC_INLINE_CALLS_LIFTED);
+	return TRUE;
+}
+
+/* R316b (plan Phase 3.5): the InterpMethod whose call profile describes the call sites IR'd inside the inlinee being
+ * entered -- where the interpreter, and that method's own tier-1 IC misses, filed them. Only under the per-compile
+ * policy: a tier-1 inlinee keeps no calls. The peek never creates, and `cmethod` is live because it is being
+ * inlined; it is the same lookup wj_gi_predict already makes in this compile section. */
+static gpointer
+wj_inline_origin_imethod (MonoCompile *cfg, MonoMethod *cmethod)
+{
+#ifdef HOST_BROWSER
+	extern int mono_wasm_jit_prof_origin;
+	extern gpointer mono_interp_peek_imethod (MonoMethod *method);
+	if (COMPILE_WASM (cfg) && cfg->wasm_inline_allow_calls && mono_wasm_jit_prof_origin && cmethod)
+		return mono_interp_peek_imethod (cmethod);
+#endif
+	return NULL;
+}
+
+/* R316f: per-callee inline refusals in TIER-2 compiles, by gate -- SIZE (IL, with the cold-throw-discounted size),
+ * COST (inline_method's cost cap, with the largest cost seen), ABORT (an INLINE_FAILURE inside the inlinee, with its
+ * message), OTHER (any other check_inlining gate: clauses, NOINLINING, class init, depth, ...). A SITE count over tier-2
+ * compiles, not an execution count: read it against the callee census. Names are field reads (as wj_gi_note_inlined).
+ * Tier-2 compiles are serialized by the broker's compile lock, so the slot claim does not race in practice; a lost
+ * race would only mislabel a diagnostic row. */
+enum { WJ_T2R_SIZE, WJ_T2R_COST, WJ_T2R_ABORT, WJ_T2R_OTHER, WJ_T2R_N };
+#ifdef HOST_BROWSER
+#define WJ_T2R_SLOTS 2048
+typedef struct {
+	MonoMethod *m;
+	const char *cls, *mth, *abort_msg, *other_msg;
+	gint32 n [WJ_T2R_N];
+	gint32 code_size, hot_size, max_cost;
+} WjT2Refusal;
+static WjT2Refusal wj_t2r [WJ_T2R_SLOTS];
+
+static void
+wj_t2_refuse (MonoCompile *cfg, MonoMethod *m, int reason, int a, int b, const char *msg)
+{
+	gsize h;
+	int i;
+	if (!COMPILE_WASM (cfg) || cfg->wasm_jit_tier < 2 || !m)
+		return;
+	h = ((gsize) m >> 4) & (WJ_T2R_SLOTS - 1);
+	for (i = 0; i < 8; ++i) {
+		WjT2Refusal *r = &wj_t2r [(h + i) & (WJ_T2R_SLOTS - 1)];
+		if (r->m != m && r->m)
+			continue;
+		if (!r->m) {
+			r->cls = m->klass ? m_class_get_name (m->klass) : "?";
+			r->mth = m->name ? m->name : "?";
+			mono_memory_barrier ();
+			r->m = m;
+		}
+		r->n [reason]++;
+		if (reason == WJ_T2R_SIZE) {
+			r->code_size = a;
+			r->hot_size = b;
+		} else if (reason == WJ_T2R_COST && a > r->max_cost) {
+			r->max_cost = a;
+		} else if (reason == WJ_T2R_ABORT && msg) {
+			r->abort_msg = msg;
+		} else if (reason == WJ_T2R_OTHER && msg) {
+			r->other_msg = msg;
+		}
+		return;
+	}
+}
+
+void mono_wasm_jit_dump_t2_refusals (int topn);
+void
+mono_wasm_jit_dump_t2_refusals (int topn)
+{
+	guint8 *done = g_new0 (guint8, WJ_T2R_SLOTS);
+	gint64 tot [WJ_T2R_N] = { 0 };
+	int k, j, shown = 0, distinct = 0;
+	for (k = 0; k < WJ_T2R_SLOTS; ++k) {
+		if (!wj_t2r [k].m)
+			continue;
+		distinct++;
+		for (j = 0; j < WJ_T2R_N; ++j)
+			tot [j] += wj_t2r [k].n [j];
+	}
+	printf ("[wasm-jit t2 refused] %d callees, site refusals in tier-2 compiles: size %lld cost %lld abort %lld other %lld\n",
+		distinct, (long long) tot [WJ_T2R_SIZE], (long long) tot [WJ_T2R_COST], (long long) tot [WJ_T2R_ABORT],
+		(long long) tot [WJ_T2R_OTHER]);
+	while (shown < topn) {
+		int best = -1, bestn = 0;
+		for (k = 0; k < WJ_T2R_SLOTS; ++k) {
+			int n;
+			if (done [k] || !wj_t2r [k].m)
+				continue;
+			n = wj_t2r [k].n [0] + wj_t2r [k].n [1] + wj_t2r [k].n [2] + wj_t2r [k].n [3];
+			if (best < 0 || n > bestn) {
+				best = k;
+				bestn = n;
+			}
+		}
+		if (best < 0)
+			break;
+		done [best] = 1;
+		{
+			WjT2Refusal *r = &wj_t2r [best];
+			printf ("  %5d  size %4d (IL %4d hot %4d)  cost %4d (max %4d)  abort %4d (%s)  other %4d (%s)  %s:%s\n", bestn,
+				r->n [WJ_T2R_SIZE], r->code_size, r->hot_size, r->n [WJ_T2R_COST], r->max_cost, r->n [WJ_T2R_ABORT],
+				r->abort_msg ? r->abort_msg : "-", r->n [WJ_T2R_OTHER], r->other_msg ? r->other_msg : "-", r->cls, r->mth);
+		}
+		shown++;
+	}
+	g_free (done);
 }
 #endif
 
@@ -662,6 +813,7 @@ field_access_failure (MonoCompile *cfg, MonoMethod *method, MonoClassField *fiel
 static MONO_NEVER_INLINE void
 inline_failure (MonoCompile *cfg, const char *msg)
 {
+	cfg->wasm_inline_fail_msg = msg;   /* R316f: every INLINE_FAILURE passes a string literal */
 	if (cfg->verbose_level >= 2)
 		printf ("inline failed: %s\n", msg);
 	mono_cfg_set_exception (cfg, MONO_EXCEPTION_INLINE_FAILED);
@@ -4428,6 +4580,21 @@ mono_method_check_inlining (MonoCompile *cfg, MonoMethod *method)
 	return mono_method_check_inlining_limit (cfg, method, 0);
 }
 
+/* R316f: the ordinary inliner's gate, with a refusal the size gate did not already record counted as OTHER. */
+static gboolean
+wj_check_inlining_t2 (MonoCompile *cfg, MonoMethod *method)
+{
+	gboolean ok;
+	cfg->wasm_t2r_noted = FALSE;
+	cfg->wasm_t2r_why = NULL;
+	ok = mono_method_check_inlining (cfg, method);
+#ifdef HOST_BROWSER
+	if (!ok && !cfg->wasm_t2r_noted)
+		wj_t2_refuse (cfg, method, WJ_T2R_OTHER, 0, 0, cfg->wasm_t2r_why);
+#endif
+	return ok;
+}
+
 /*
  * As mono_method_check_inlining, but with an optional IL-size LIMIT OVERRIDE (0 = use the global one).
  *
@@ -4472,8 +4639,89 @@ wj_il_is_call_free (const unsigned char *code, guint32 size)
 	}
 	return TRUE;
 }
+
+/* R318 (plan Phase 3.4, MONO_WASM_JIT_INLINE_COLD_THROW): the callee's IL size NOT counting straight-line segments
+ * that end in `throw`. Such a segment has no branch inside it, so every execution that enters it throws: its bytes
+ * only run on a failing path -- Java's `if (bad) throw new X(String.format(...))`, whose message building is what
+ * pushes a two-comparison bounds check such as commons-lang3's Validate.inclusiveBetween (14 k calls/tick left
+ * standing in tier-2 bodies, R316) past the limit. A segment starts at 0, at every branch target and after every
+ * unconditional transfer. Pure IL decoding, as wj_il_is_call_free: nothing here resolves a token. Anything
+ * undecodable, out of range or longer than the scan bound answers the full size, i.e. changes nothing. */
+#define WJ_HOT_SCAN_MAX 1024
+static guint32
+wj_il_hot_size (const unsigned char *code, guint32 size)
+{
+	guint8 seg [WJ_HOT_SCAN_MAX + 1];
+	const unsigned char *ip, *end = code + size;
+	guint32 cold = 0, begin = 0;
+	int last_op = -1;
+
+	if (!code || size > WJ_HOT_SCAN_MAX)
+		return size;
+	memset (seg, 0, size + 1);
+	seg [0] = 1;
+	for (ip = code; ip < end;) {
+		const unsigned char *p = ip;
+		MonoOpcodeEnum op;
+		int n = mono_opcode_value_and_size (&p, end, &op);
+		gint64 next, t;
+		if (n <= 0 || ip + n > end)
+			return size;
+		next = (gint64) (ip - code) + n;
+		switch (mono_opcodes [op].argument) {
+		case MonoShortInlineBrTarget:
+			t = next + (gint8) ip [n - 1];
+			if (t < 0 || t > (gint64) size)
+				return size;
+			seg [t] = 1;
+			break;
+		case MonoInlineBrTarget:
+			t = next + (gint32) read32 (ip + n - 4);
+			if (t < 0 || t > (gint64) size)
+				return size;
+			seg [t] = 1;
+			break;
+		case MonoInlineSwitch: {
+			guint32 cnt = read32 (ip + 1), j;
+			if ((gint64) 5 + 4 * (gint64) cnt != n)
+				return size;
+			for (j = 0; j < cnt; ++j) {
+				t = next + (gint32) read32 (ip + 5 + 4 * j);
+				if (t < 0 || t > (gint64) size)
+					return size;
+				seg [t] = 1;
+			}
+			break;
+		}
+		default:
+			break;
+		}
+		if (mono_opcodes [op].flow_type == MONO_FLOW_BRANCH || mono_opcodes [op].flow_type == MONO_FLOW_RETURN ||
+		    mono_opcodes [op].flow_type == MONO_FLOW_ERROR)
+			seg [next] = 1;
+		ip += n;
+	}
+	for (ip = code; ip < end;) {
+		const unsigned char *p = ip;
+		MonoOpcodeEnum op;
+		int n = mono_opcode_value_and_size (&p, end, &op);
+		guint32 off = (guint32) (ip - code);
+		if (off != begin && seg [off]) {
+			if (last_op == MONO_CEE_THROW)
+				cold += off - begin;
+			begin = off;
+		}
+		last_op = op;
+		ip += n;
+	}
+	if (last_op == MONO_CEE_THROW)
+		cold += size - begin;
+	return size - cold;
+}
 #endif
 
+/* R316g: every refusal below names its gate for `[wasm-jit t2 refused]` (read only by wj_check_inlining_t2). */
+#define WJ_T2R_WHY(msg) do { cfg->wasm_t2r_why = (msg); return FALSE; } while (0)
 static gboolean
 mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limit_override)
 {
@@ -4486,25 +4734,27 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 #endif
 
 	if (cfg->disable_inline)
-		return FALSE;
+		WJ_T2R_WHY ("disable_inline");
 	if (cfg->gsharedvt)
-		return FALSE;
+		WJ_T2R_WHY ("gsharedvt");
 
-	if (cfg->inline_depth > 10)
-		return FALSE;
+	if (cfg->inline_depth > (cfg->wasm_inline_depth_cap > 0 ? cfg->wasm_inline_depth_cap : 10))
+		WJ_T2R_WHY ("depth");
 
 	if (!mono_method_get_header_summary (method, &header))
-		return FALSE;
+		WJ_T2R_WHY ("no header summary");
 
 	/*runtime, icall and pinvoke are checked by summary call*/
-	if ((method->iflags & METHOD_IMPL_ATTRIBUTE_NOINLINING) ||
-	    (method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED) ||
-	    header.has_clauses)
-		return FALSE;
+	if (method->iflags & METHOD_IMPL_ATTRIBUTE_NOINLINING)
+		WJ_T2R_WHY ("NoInlining");
+	if (method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)
+		WJ_T2R_WHY ("synchronized");
+	if (header.has_clauses)
+		WJ_T2R_WHY ("clauses");
 
 	if (method->flags & METHOD_ATTRIBUTE_REQSECOBJ)
 		/* Used to mark methods containing StackCrawlMark locals */
-		return FALSE;
+		WJ_T2R_WHY ("REQSECOBJ");
 
 	/* also consider num_locals? */
 	/* Do the size check early to avoid creating vtables */
@@ -4532,10 +4782,29 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 		limit = inline_limit;
 	}
 
+	/* R315: the wasm tier's per-compile limit. Only set together with allow_calls -- raising the limit alone is a
+	 * closed lead (an inlinee with a call was refused regardless of its size). */
+	if (COMPILE_WASM (cfg) && cfg->wasm_inline_limit > 0)
+		limit = cfg->wasm_inline_limit;
+
 	if (limit_override > 0)
 		limit = limit_override;
 
-	if (header.code_size >= GINT_TO_UINT32(limit) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING)) {
+	guint32 eff_size = header.code_size;
+#ifdef HOST_BROWSER
+	/* R318: cold throw segments do not count -- only where their calls may stay (the per-compile policy); at tier 1
+	 * a call in the cold segment aborts the inline anyway, so discounting it there would only waste the attempt. */
+	{
+		extern int mono_wasm_jit_inline_cold_throw;
+		if (COMPILE_WASM (cfg) && cfg->wasm_inline_allow_calls && mono_wasm_jit_inline_cold_throw &&
+		    header.code_size >= GINT_TO_UINT32 (limit) && header.code) {
+			eff_size = wj_il_hot_size (header.code, header.code_size);
+			if (eff_size < GINT_TO_UINT32 (limit))
+				wj_gi_count (WJC_INLINE_COLD_THROW_ADMIT);
+		}
+	}
+#endif
+	if (eff_size >= GINT_TO_UINT32(limit) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING)) {
 		gboolean leaf_ok = FALSE;
 #ifdef HOST_BROWSER
 		/* MONO_WASM_JIT_INLINE_LEAF (R290): a larger limit, for the wasm JIT's ORDINARY inliner only
@@ -4549,9 +4818,13 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 			wj_il_is_call_free (header.code, header.code_size);
 		if (leaf_ok)
 			wj_gi_count (WJC_INLINE_LEAF_ADMIT);
+		if (!leaf_ok) {
+			wj_t2_refuse (cfg, method, WJ_T2R_SIZE, (int) header.code_size, (int) eff_size, NULL);   /* R316f */
+			cfg->wasm_t2r_noted = TRUE;
+		}
 #endif
 		if (!leaf_ok)
-			return FALSE;
+			WJ_T2R_WHY ("size");
 	}
 
 	/*
@@ -4561,7 +4834,7 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 	 * inside the inlined code
 	 */
 	if (cfg->gshared && m_class_has_cctor (method->klass) && mini_class_check_context_used (cfg, method->klass))
-		return FALSE;
+		WJ_T2R_WHY ("gshared cctor context");
 
 	{
 		/* The AggressiveInlining hint is a good excuse to force that cctor to run. */
@@ -4571,12 +4844,12 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 				vtable = mono_class_vtable_checked (method->klass, error);
 				if (!is_ok (error)) {
 					mono_error_cleanup (error);
-					return FALSE;
+					WJ_T2R_WHY ("aggressive: vtable error");
 				}
 				if (!cfg->compile_aot) {
 					if (!mono_runtime_class_init_full (vtable, error)) {
 						mono_error_cleanup (error);
-						return FALSE;
+						WJ_T2R_WHY ("aggressive: class init failed");
 					}
 				}
 			}
@@ -4586,34 +4859,42 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 				/*FIXME it would easier and lazier to just use mono_class_try_get_vtable */
 				if (!m_class_get_runtime_vtable (method->klass))
 					/* No vtable created yet */
-					return FALSE;
+					WJ_T2R_WHY ("bfi: no vtable yet");
 				vtable = mono_class_vtable_checked (method->klass, error);
 				if (!is_ok (error)) {
 					mono_error_cleanup (error);
-					return FALSE;
+					WJ_T2R_WHY ("bfi: vtable error");
 				}
 				/* This makes so that inline cannot trigger */
 				/* .cctors: too many apps depend on them */
 				/* running with a specific order... */
-				if (! vtable->initialized)
-					return FALSE;
-				if (!mono_runtime_class_init_full (vtable, error)) {
+				if (! vtable->initialized) {
+#ifdef HOST_BROWSER
+					/* R319: see MONO_WASM_JIT_INLINE_BFI (mini-wasm.c). Admitted WITHOUT running the cctor; a static
+					 * field access inside the inlinee still aborts the inline ("class init") or gets its own check. */
+					extern int mono_wasm_jit_inline_bfi;
+					if (COMPILE_WASM (cfg) && mono_wasm_jit_inline_bfi)
+						wj_gi_count (WJC_INLINE_BFI_UNINIT);
+					else
+#endif
+					WJ_T2R_WHY ("bfi: class not initialized");
+				} else if (!mono_runtime_class_init_full (vtable, error)) {
 					mono_error_cleanup (error);
-					return FALSE;
+					WJ_T2R_WHY ("bfi: class init failed");
 				}
 			}
 		} else if (mono_class_needs_cctor_run (method->klass, NULL)) {
 			ERROR_DECL (error);
 			if (!m_class_get_runtime_vtable (method->klass))
 				/* No vtable created yet */
-				return FALSE;
+				WJ_T2R_WHY ("cctor: no vtable yet");
 			vtable = mono_class_vtable_checked (method->klass, error);
 			if (!is_ok (error)) {
 				mono_error_cleanup (error);
-				return FALSE;
+				WJ_T2R_WHY ("cctor: vtable error");
 			}
 			if (!vtable->initialized)
-				return FALSE;
+				WJ_T2R_WHY ("cctor: class not initialized");
 		}
 	}
 
@@ -4621,24 +4902,24 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 	if (mono_arch_is_soft_float ()) {
 		/* FIXME: */
 		if (sig->ret && sig->ret->type == MONO_TYPE_R4)
-			return FALSE;
+			WJ_T2R_WHY ("soft-float ret");
 		for (i = 0; i < sig->param_count; ++i)
 			if (!m_type_is_byref (sig->params [i]) && sig->params [i]->type == MONO_TYPE_R4)
-				return FALSE;
+				WJ_T2R_WHY ("soft-float arg");
 	}
 #endif
 
 	if (g_list_find (cfg->dont_inline, method))
-		return FALSE;
+		WJ_T2R_WHY ("dont_inline list");
 
 	if (mono_profiler_get_call_instrumentation_flags (method))
-		return FALSE;
+		WJ_T2R_WHY ("profiler call instrumentation");
 
 	if (mono_profiler_coverage_instrumentation_enabled (method))
-		return FALSE;
+		WJ_T2R_WHY ("coverage");
 
 	if (method_does_not_return (method))
-		return FALSE;
+		WJ_T2R_WHY ("does not return");
 
 	MonoAotModule *amodule = m_class_get_image (method->klass)->aot_module;
 	// If method is present in aot image compiled with llvm and it uses hw intrinsics we don't inline it,
@@ -4650,7 +4931,7 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 		if (addr && is_ok (error)) {
 			MonoAotMethodFlags flags = mono_aot_get_method_flags (addr);
                         if (flags & MONO_AOT_METHOD_FLAG_HAS_LLVM_INTRINSICS)
-                                return FALSE;
+                                WJ_T2R_WHY ("llvm intrinsics");
 		}
 	}
 
@@ -5321,6 +5602,7 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	MonoMethod *prev_current_method;
 	MonoGenericContext *prev_generic_context;
 	gboolean ret_var_set, prev_ret_var_set, prev_disable_inline, virtual_ = FALSE;
+	gpointer prev_wasm_inline_im;
 
 	g_assert (cfg->exception_type == MONO_EXCEPTION_NONE);
 
@@ -5359,6 +5641,16 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 		return 0;
 	}
 
+	/* R315: re-check clauses on the header actually being inlined. check_inlining read a header SUMMARY; an IKVM
+	 * in-place body swap (tiering.c replace_method_body_locked) can install a generation-2 header in between, and
+	 * inlinee clauses are never imported (only the root's are), so a clause here would be silently dropped. Only
+	 * reachable in practice once generation-1 bodies stop being excluded by their calls (MONO_WASM_JIT_INLINE_CALLS). */
+	if (COMPILE_WASM (cfg) && !inline_always && cheader->num_clauses) {
+		wj_p3_count (WJC_INLINE_CLAUSE_RECHECK);
+		mono_metadata_free_mh (cheader);
+		return 0;
+	}
+
 	if (is_empty && cheader->code_size == 1 && cheader->code [0] == CEE_RET)
 		*is_empty = TRUE;
 
@@ -5394,9 +5686,11 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	prev_current_method = cfg->current_method;
 	prev_generic_context = cfg->generic_context;
 	prev_disable_inline = cfg->disable_inline;
+	prev_wasm_inline_im = cfg->wasm_cur_inline_im;
 
 	cfg->ret_var_set = FALSE;
 	cfg->inline_depth ++;
+	cfg->wasm_cur_inline_im = wj_inline_origin_imethod (cfg, cmethod);
 
 	if (ip && *ip == CEE_CALLVIRT && !(cmethod->flags & METHOD_ATTRIBUTE_STATIC))
 		virtual_ = TRUE;
@@ -5418,11 +5712,18 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	cfg->generic_context = prev_generic_context;
 	cfg->ret_var_set = prev_ret_var_set;
 	cfg->disable_inline = prev_disable_inline;
+	cfg->wasm_cur_inline_im = prev_wasm_inline_im;
 	cfg->inline_depth --;
 
-	if ((costs >= 0 && costs < 60) || inline_always || (costs >= 0 && aggressive_inline_method (cfg, cmethod))) {
+	if ((costs >= 0 && costs < (COMPILE_WASM (cfg) && cfg->wasm_inline_cost_cap > 0 ? cfg->wasm_inline_cost_cap : 60)) ||
+	    inline_always || (costs >= 0 && aggressive_inline_method (cfg, cmethod))) {
 		if (cfg->verbose_level > 2)
 			printf ("INLINE END %s -> %s\n", mono_method_full_name (cfg->method, TRUE), mono_method_full_name (cmethod, TRUE));
+		if (COMPILE_WASM (cfg)) {
+			wj_p3_count (WJC_INLINE_ACCEPTED);   /* the ACTION: counted at the accepted return (R315) */
+			if (cfg->wasm_jit_tier >= 2)
+				cfg->wasm_jit_result.t2_inlined++;   /* R316d */
+		}
 
 		mono_error_assert_ok (cfg->error);
 
@@ -5495,6 +5796,13 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 		cfg->headers_to_free = g_slist_prepend_mempool (cfg->mempool, cfg->headers_to_free, cheader);
 		return costs + 1;
 	} else {
+#ifdef HOST_BROWSER
+		/* R316f: costs < 0 is an INLINE_FAILURE inside the inlinee, otherwise the cost cap refused it */
+		if (costs < 0)
+			wj_t2_refuse (cfg, cmethod, WJ_T2R_ABORT, 0, 0, cfg->wasm_inline_fail_msg);
+		else
+			wj_t2_refuse (cfg, cmethod, WJ_T2R_COST, costs, 0, NULL);
+#endif
 		if (cfg->verbose_level > 2) {
 			const char *msg = mono_error_get_message (cfg->error);
 			printf ("INLINE ABORTED %s (cost %d) %s\n", mono_method_full_name (cmethod, TRUE), costs, msg ? msg : "");
@@ -6370,7 +6678,7 @@ handle_ctor_call (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fs
 		return;
 	}
 
-	if ((cfg->opt & MONO_OPT_INLINE) && mono_method_check_inlining (cfg, cmethod) &&
+	if ((cfg->opt & MONO_OPT_INLINE) && wj_check_inlining_t2 (cfg, cmethod) &&
 			   !mono_class_is_subclass_of_internal (cmethod->klass, mono_defaults.exception_class, FALSE)) {
 		int costs;
 
@@ -6396,7 +6704,8 @@ handle_ctor_call (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fs
 
 	/* Avoid virtual calls to ctors if possible */
 	if (!context_used && !rgctx_arg) {
-		if (!m_method_is_aggressive_inlining (cfg->current_method) && !m_method_is_aggressive_inlining (cmethod))
+		if (!m_method_is_aggressive_inlining (cfg->current_method) && !m_method_is_aggressive_inlining (cmethod) &&
+		    !wj_inline_call_allowed (cfg, cmethod))
 			INLINE_FAILURE ("ctor call");
 		// FIXME-VT: Clean this up
 		if (cfg->gsharedvt && mini_is_gsharedvt_signature (fsig))
@@ -6435,7 +6744,8 @@ handle_ctor_call (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fs
 			mini_emit_calli (cfg, fsig, sp, cmethod_addr, NULL, rgctx_arg);
 		}
 	} else {
-		INLINE_FAILURE ("ctor call");
+		if (!wj_inline_call_allowed (cfg, cmethod))
+			INLINE_FAILURE ("ctor call");
 		ins = mini_emit_method_call_full (cfg, cmethod, fsig, FALSE, sp,
 						  callvirt_this_arg, NULL, rgctx_arg);
 	}
@@ -8709,12 +9019,32 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				if (!wj_gi_predict (cfg, method, cmethod, gi_mid_slot,
 				                    &gi_vt, &gi_target, &gi_samples, &gi_why)) {
 					wj_gi_count (WJC_GI_REFUSED_PROF);
+					if (cfg->wasm_jit_tier >= 2) {
+						wj_gi_count (WJC_T2_GI_NOPRED);   /* R316c: the same refusal, tier-2 compiles only */
+						cfg->wasm_jit_result.t2_nopred++;
+						/* R316i: by the caller record's verdict (interp.c WJ_PRED_*: 1 no record, 2 cold, 3/4 poly) */
+						wj_gi_count (gi_why == 1 ? WJC_T2_GI_NOREC : gi_why == 2 ? WJC_T2_GI_COLD : WJC_T2_GI_POLY);
+						/* R316k: root site, or inlinee site and the inlinee record's verdict */
+						wj_gi_count (wj_gi_last_inl < 0 ? WJC_T2_GI_SITE_ROOT : wj_gi_last_inl == 0 ? WJC_T2_GI_INL_NOIM :
+						             wj_gi_last_inl == 11 ? WJC_T2_GI_INL_NOREC : wj_gi_last_inl == 12 ? WJC_T2_GI_INL_COLD :
+						             WJC_T2_GI_INL_POLY);
+						/* R316j: a "no record" whose canonical generation DOES have one is the split-profile case */
+						if (gi_why == 1) {
+							extern gpointer mono_interp_peek_imethod (MonoMethod *method);
+							extern gboolean mono_wasm_jit_prof_has_site (gpointer caller, MonoMethod *base);
+							gpointer canon = mono_interp_peek_imethod (cfg->method);
+							if (canon && canon != cfg->wasm_jit_caller_imethod && mono_wasm_jit_prof_has_site (canon, cmethod))
+								wj_gi_count (WJC_T2_GI_NOREC_CANON);
+						}
+					}
 					if (G_UNLIKELY (mono_wasm_jit_stats))
 						wj_gi_prof_census (cfg, method, cmethod, gi_why);
 				} else if (gi_target == cfg->method) {
 					/* Self-recursion: inline_method would recurse into the method being compiled. */
 					wj_gi_count (WJC_GI_REFUSED_SELF);
-				} else if (wj_gi_refused_before (gi_target)) {
+				} else if (cfg->wasm_jit_tier < 2 && wj_gi_refused_before (gi_target)) {
+					/* (R316: a tier-2 compile has a bigger budget and lifted call gates, so a tier-1 refusal
+					 * says nothing about it; the memo is bypassed there and not written from there.) */
 					/* inline_method has already refused this callee at another site. Skip before emitting
 					 * a guard we would then have to abandon; counted as OTHER so the parts still sum. */
 					wj_gi_count (WJC_GI_REFUSED_OTHER);
@@ -8727,7 +9057,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					/* Census only: the population is sized, and nothing below this point runs. */
 					wj_gi_count (WJC_GI_CANDIDATE);
 				} else if (!mono_method_check_inlining_limit (cfg, gi_target,
-				                                             mono_wasm_jit_guarded_inline_size)) {
+				                                             cfg->wasm_gi_size > 0 ? cfg->wasm_gi_size : mono_wasm_jit_guarded_inline_size)) {
 					/* ATTRIBUTE THE REFUSAL, do not lump it. check_inlining says no for at least seven
 					 * distinct reasons (EH clauses, NOINLINING, SYNCHRONIZED, gsharedvt, depth, size,
 					 * cctor-needs-context), and a single bucket covering all of them is the "a counter
@@ -8819,7 +9149,8 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						 * folds the empty block away. Counted, because "admitted" and "emitted" being
 						 * different populations is exactly the accounting failure R215 cost a round to. */
 						wj_gi_count (WJC_GI_REFUSED_LATE);
-						wj_gi_note_refused (gi_target);
+						if (cfg->wasm_jit_tier < 2)
+							wj_gi_note_refused (gi_target);
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_fallback_bb);
 						gi_ret_var = NULL;
 						gi_active = TRUE;
@@ -8835,6 +9166,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_end_bb);
 						gi_active = TRUE;
 						wj_gi_count (WJC_GI_EMITTED);
+						if (cfg->wasm_jit_tier >= 2) {
+							wj_gi_count (WJC_T2_GI_EMITTED);
+							cfg->wasm_jit_result.t2_gi++;
+						}
 						if (G_UNLIKELY (mono_wasm_jit_stats))
 							wj_gi_note_inlined (gi_target);
 					}
@@ -8847,7 +9182,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			/* Inlining */
 			if ((cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual &&
 				(!virtual_ || !(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) || MONO_METHOD_IS_FINAL (cmethod)) &&
-			    mono_method_check_inlining (cfg, cmethod)) {
+			    wj_check_inlining_t2 (cfg, cmethod)) {
 				int costs;
 				gboolean always = FALSE;
 				gboolean is_empty = FALSE;
@@ -9328,8 +9663,12 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			}
 
 			/* Common call */
-			if (!(cfg->opt & MONO_OPT_AGGRESSIVE_INLINING) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING) && !(cmethod->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING) && !method_does_not_return (cmethod))
-				INLINE_FAILURE ("call");
+			if (!(cfg->opt & MONO_OPT_AGGRESSIVE_INLINING) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING) && !(cmethod->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING) && !method_does_not_return (cmethod)) {
+				if (wj_inline_call_allowed (cfg, cmethod))
+					;   /* R315: the inlinee keeps this call (MONO_WASM_JIT_INLINE_CALLS) */
+				else
+					INLINE_FAILURE ("call");
+			}
 			common_call = TRUE;
 
 #ifdef TARGET_WASM
