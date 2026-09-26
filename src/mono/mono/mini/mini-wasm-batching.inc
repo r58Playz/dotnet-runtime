@@ -221,6 +221,7 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 		 * it no longer claims membership of. */
 		if (saved [i].batch && G_UNLIKELY (mono_wasm_jit_stats))
 			mono_wasm_jit_count (WJC_COLOCATE_MERGE_ROLLBACK);
+		wj_pub_begin (re);   /* R320: restored as one unit; ended after the depset */
 		re->batch = saved [i].batch;
 		/* ONCE ONLY. Without this the method rejoins the candidate pool and the next publish regroups it,
 		 * fails the same way and rolls back again -- churn that wedges boot. */
@@ -231,7 +232,7 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 		 * walking re->deps[0..ndeps) without a lock. */
 		mono_memory_barrier ();
 		re->depset = saved [i].depset;
-		mono_memory_barrier ();
+		wj_pub_end (re);
 		/* This set belonged only to the generation being rolled back.  Retire it after
 		 * restoring the saved pointer; freeing the saved set before rollback made the
 		 * restored registry entry point at released storage. */
@@ -373,6 +374,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			saved [i].generation = re->generation;
 			saved [i].batch = re->batch;   /* NULL for a fresh group; the absorbed group on a merge */
 		}
+		wj_pub_begin (re);   /* R320: batch/bytes/depset change as one unit for admission; ended after the depset */
 		re->batch = bd;
 		/* Do NOT publish re->generation here. It is set below, AFTER mono_memory_barrier() and after
 		 * re->imports has been republished, and that ordering is the point: a worker that sees the new
@@ -437,6 +439,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			mono_memory_barrier ();
 			re->depset = nds;
 		}
+		wj_pub_end (re);
 		/* The new generation imports a different set, and this is true whether or not the members were
 		 * re-emitted: co-locating a callee turns its import into a module-local call and removes it.
 		 * OUTSIDE the `bm` guard for that reason -- mono_wasm_jit_rebatch frames stored bodies with no
