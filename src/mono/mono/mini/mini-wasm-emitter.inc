@@ -854,6 +854,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_STORER8_MEMBASE_REG:
 					case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM:
 					case OP_STOREI2_MEMBASE_IMM:
+					case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 						dreg_is_base = TRUE; break;
 					default: break;
 					}
@@ -1326,6 +1327,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 						case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 						case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
+						case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 							b = insf->dreg; break;
 						case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
 							b = insf->sreg1; break;
@@ -1577,6 +1579,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 						case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 						case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
+						case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 							dreg_is_base = TRUE; break;
 						default: break;
 						}
@@ -1982,6 +1985,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 					case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 					case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
+					case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 						base = insr->dreg; knd = "store"; break;
 					case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
 						base = insr->sreg1; knd = "callrecv"; break;
@@ -2764,6 +2768,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
 					want [4] = TRUE;   /* NullReferenceException: explicit checks + vcall receiver check */
 					break;
+				case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:
+					want [0] = TRUE;   /* R323: OverflowException */
+					break;
 				default:
 					if (MONO_IS_COND_EXC (ti)) {
 						int id = wj_exc_id_for_name ((const char *) ti->inst_p1);
@@ -3151,10 +3158,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 *
 				 * Why dropping ACQ/REL is sound, in order of how load-bearing it is:
 				 *
-				 * 1. This emitter has no OP_ATOMIC_LOAD / OP_ATOMIC_STORE cases at all -- the only wasm
-				 *    atomics it emits are for its own inline caches. So a method containing a managed
-				 *    volatile or Interlocked access bails and runs in the interpreter or AOT'd code.
-				 *    Every OP_MEMORY_BARRIER we actually emit therefore orders ORDINARY, non-atomic
+				 * 1. The only managed atomic this emitter lowers is the 1-byte OP_ATOMIC_STORE (R323b), a
+				 *    seq-cst wasm atomic that orders itself (point 2); its other wasm atomics are for its own
+				 *    inline caches, and a method containing any other volatile or Interlocked access bails.
+				 *    Every other OP_MEMORY_BARRIER we emit therefore orders ORDINARY, non-atomic
 				 *    accesses. Per the wasm relaxed-memory model that is a data race with or without
 				 *    the fence: atomic.fence does not make an ordinary store a synchronising one, so it
 				 *    never conferred the ordering it looked like it did.
@@ -3557,6 +3564,28 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			case OP_ICONV_TO_U2: MASK (0xFFFF); break;                   /* (ushort) */
 			case OP_LCONV_TO_I4: case OP_LCONV_TO_U4:
 			case OP_LCONV_TO_I: case OP_LCONV_TO_U: UN (WASM_OP_I32_WRAP_I64); break;  /* i64 -> i32/native-int (truncate) */
+			case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN: {
+				/* R323: checked i64 -> i32. Signed: out of range iff x != sext (wrap (x)); unsigned (_UN, the source
+				 * read as u64): out of range iff x >u 0x7fffffff -- decompose.c's two comparisons, one each. */
+				gboolean _un = ins->opcode == OP_LCONV_TO_OVF_I4_UN || ins->opcode == OP_LCONV_TO_OVF_I_UN;
+				if (!WJ_HAS_THROW (0)) { fail = "no shared throw block for ovf conv"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "ovf conv sreg"; goto done; }
+				if (_un) {
+					wasm_i64_const (&body, 0x7fffffff);
+					wasm_op (&body, WASM_OP_I64_GT_U);
+				} else {
+					if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "ovf conv sreg"; goto done; }
+					wasm_op (&body, WASM_OP_I32_WRAP_I64);
+					wasm_op (&body, WASM_OP_I64_EXTEND_I32_S);
+					wasm_op (&body, WASM_OP_I64_NE);
+				}
+				WJ_THROW_BR (0, 0);
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "ovf conv sreg"; goto done; }
+				wasm_op (&body, WASM_OP_I32_WRAP_I64);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "ovf conv dreg"; goto done; }
+				wj_count (WJC_OVF_CONV_LOWERED);
+				break;
+			}
 			case OP_LCONV_TO_R8: UN (WASM_OP_F64_CONVERT_I64_S); break;  /* i64 -> f64 */
 			case OP_LCONV_TO_R4: UN (WASM_OP_F32_CONVERT_I64_S); break;  /* i64 -> f32 */
 
@@ -3762,7 +3791,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #undef WJ_LCSE_UNPINNED
 /* membase store: *(dreg[=inst_destbasereg] + inst_offset) = sreg1. (A reference value still needs its
  * GC write barrier, which mono emits as a separate IR call before the store — so the store is raw.) */
-#define STOREM(WOP, AL) do { \
+#define STOREM(WOP, AL) STOREM_PFX (0, WOP, AL)
+#define STOREM_PFX(PFX, WOP, AL) do { \
 		gboolean _og_valref = lc.refslot && ins->sreg1 >= 0 && ins->sreg1 < nvreg && lc.refslot [ins->sreg1] >= 0; \
 		gboolean _og_baseref = lc.refslot && ins->dreg >= 0 && ins->dreg < nvreg && lc.refslot [ins->dreg] >= 0; \
 		if (G_UNLIKELY (lc.objguard) && (_og_valref || _og_baseref)) { \
@@ -3786,14 +3816,24 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_check_store, (guint32) lc.check_ti); \
 		} \
 		if (!wasm_guard_memaddr (&body, &lc, ins->dreg, (gint32) ins->inst_offset)) { fail = "store addr guard"; goto done; } \
-		if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store base"; goto done; } if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "store val"; goto done; } wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
+		if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store base"; goto done; } if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "store val"; goto done; } \
+		if (PFX) wasm_u8 (&body, (PFX)); \
+		wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
 			case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: STOREM (WASM_OP_I32_STORE, 2); break;
 			case OP_STOREI1_MEMBASE_REG: STOREM (WASM_OP_I32_STORE8, 0); break;
 			case OP_STOREI2_MEMBASE_REG: STOREM (WASM_OP_I32_STORE16, 1); break;
 			case OP_STOREI8_MEMBASE_REG: STOREM (WASM_OP_I64_STORE, 3); break;
 			case OP_STORER4_MEMBASE_REG: STOREM (WASM_OP_F32_STORE, 2); break;
 			case OP_STORER8_MEMBASE_REG: STOREM (WASM_OP_F64_STORE, 3); break;
+			/* R323b: Volatile.Write of a byte. seq-cst, so it carries its own release ordering (the barrier kind
+			 * mono attaches needs no separate fence -- see OP_MEMORY_BARRIER); a byte is never misaligned, which
+			 * is why only this width is lowered (a misaligned atomic traps). */
+			case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:
+				STOREM_PFX (WASM_OP_ATOMIC_PREFIX, 0x19 /* i32.atomic.store8 */, 0);
+				wj_count (WJC_ATOMIC_STORE8_LOWERED);
+				break;
 #undef STOREM
+#undef STOREM_PFX
 /* membase store of an immediate: *(dreg[=inst_destbasereg] + inst_offset) = inst_imm. dreg aliases
  * inst_destbasereg (the base); inst_imm is the constant. Sub-word stores truncate via i32.store8/16. */
 #define STOREMI(WOP, AL) do { \

@@ -72,6 +72,7 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_SHL_IMM: case OP_SHR_IMM: case OP_SHR_UN_IMM:
 	case OP_INEG: case OP_INOT:
 	case OP_LCONV_TO_I4: case OP_LCONV_TO_U4:   /* i64 -> i32 (i32.wrap_i64) */
+	case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:   /* R323 */
 	case OP_LCONV_TO_I: case OP_LCONV_TO_U:     /* i64 -> native int/uint = i32 on wasm32 (wrap) */
 	case OP_ICEQ: case OP_ICNEQ: case OP_ICLT: case OP_ICLT_UN: case OP_ICGT: case OP_ICGT_UN:
 	case OP_ICLE: case OP_ICLE_UN: case OP_ICGE: case OP_ICGE_UN:
@@ -179,6 +180,7 @@ wj_opcode_is_nonref (MonoInst *ins)
 	case OP_SHL_IMM: case OP_SHR_IMM: case OP_SHR_UN_IMM:
 	case OP_ICONV_TO_U1: case OP_ICONV_TO_I1: case OP_ICONV_TO_U2: case OP_ICONV_TO_I2:
 	case OP_LCONV_TO_I4: case OP_LCONV_TO_U4:
+	case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:   /* R323 */
 	case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE:
 	case OP_LOADU1_MEMBASE: case OP_LOADI1_MEMBASE: case OP_LOADU2_MEMBASE: case OP_LOADI2_MEMBASE:
 	case OP_MOVE_F_TO_I4:
@@ -440,6 +442,7 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 	case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 	case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
+	case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 	case OP_LDADDR:
 	case OP_SETRET:
 	/* the emitter's no-op set */

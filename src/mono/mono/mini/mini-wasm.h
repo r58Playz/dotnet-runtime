@@ -1284,6 +1284,8 @@ enum {
 	WJC_ADMIT_PAYLOAD_TORN,    /* R320: admission read {batch,bytes,len,depset} mid-replacement and refused (transient) */
 	WJC_LDADDR_REF_LOCAL,      /* R321: address-taken ref/byref scalar locals homed in their ref-shadow slot */
 	WJC_REEMIT_VALIDATE_ONLY,  /* R322: re-emits into a slot the compiling thread had installed: validated, not published there */
+	WJC_OVF_CONV_LOWERED,      /* R323: checked i64 -> i32 conversions emitted (were "unsupported opcode") */
+	WJC_ATOMIC_STORE8_LOWERED, /* R323b: 1-byte OP_ATOMIC_STOREs emitted as i32.atomic.store8 (were "unsupported opcode") */
 	WJC_MAX
 };
 
