@@ -2174,6 +2174,11 @@ typedef struct {
 	 * it then reads belongs to one generation. Superseded sets are deliberately NOT freed -- another
 	 * worker may still be walking one -- which is the same policy the individual arrays already had. */
 	WjDepSet *depset;
+	/* R320: seqlock over {batch, bytes, len, depset}. ODD while a writer is replacing them (wj_pub_begin/_end);
+	 * admission snapshots all of them inside one even, unchanged window (wj_pub_snapshot) so it can never install
+	 * one generation's bytes over another's dependency closure. Each field alone was already published safely; the
+	 * PAIR was not. */
+	volatile gint32 pub_seq;
 	/* The f-slots this module BINDS AT INSTANTIATION -- its method imports. NULL/0 when none, which is
 	 * the default and the whole tier until MONO_WASM_JIT_DIRECT_IMPORT is on.
 	 *
@@ -2212,6 +2217,38 @@ typedef struct {
 	 * and the emitted call_indirect traps. That is R267 addendum 10's root cause. */
 	guint8 orphaned;
 } WjRegEntry;
+
+/* R320: writers of an entry's {batch, bytes, len, depset} bracket the stores with these (see WjRegEntry.pub_seq). */
+static inline void
+wj_pub_begin (WjRegEntry *re)
+{
+	mono_atomic_inc_i32 (&re->pub_seq);
+	mono_memory_barrier ();
+}
+
+static inline void
+wj_pub_end (WjRegEntry *re)
+{
+	mono_memory_barrier ();
+	mono_atomic_inc_i32 (&re->pub_seq);
+}
+
+/* R320: one consistent reading of {batch, bytes, len, depset}, or FALSE if a writer was mid-replacement -- a
+ * TRANSIENT condition (it clears when the writer's wj_pub_end lands), so the caller refuses with state 0, never 3. */
+static gboolean
+wj_pub_snapshot (WjRegEntry *re, WjBatchDesc **batch, void **bytes, int *len, WjDepSet **ds)
+{
+	gint32 s1 = mono_atomic_load_i32 (&re->pub_seq);
+	if (s1 & 1)
+		return FALSE;
+	mono_memory_barrier ();
+	*batch = re->batch;
+	*bytes = re->bytes;
+	*len = re->len;
+	*ds = re->depset;
+	mono_memory_barrier ();
+	return mono_atomic_load_i32 (&re->pub_seq) == s1;
+}
 #define WJ_REG_CHUNK   8192
 #define WJ_REG_NCHUNKS 1024      /* up to 8M JITted methods; the 4KB top-level pointer array never moves */
 static WjRegEntry *wj_reg_chunks [WJ_REG_NCHUNKS];
@@ -2296,12 +2333,15 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			if (same_method && old_re && !old_re->batch) {
 				void *old_bytes = old_re->bytes;
 				WjDepSet *old_depset = old_re->depset;
+				WjDepSet *new_depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
+				wj_pub_begin (old_re);   /* R320: bytes and depset change as ONE unit for admission */
 				old_re->bytes = bytes;
 				old_re->len = len;
 				old_re->body_len = len;
 				old_re->f_sig_id = f_sig_id;
 				old_re->no_gc = no_gc ? 1 : 0;
-				old_re->depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
+				old_re->depset = new_depset;
+				wj_pub_end (old_re);
 				mono_memory_barrier ();
 				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 				mono_wasm_jit_counters [WJC_FSLOT_REUSED]++;
@@ -2906,12 +2946,11 @@ mono_wasm_jit_admit_live (int desc_id)
 static __thread int wj_admit_depth;
 
 static int
-wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
+wj_admit_dependencies (WjRegEntry *re, WjDepSet *ds, int desc_id, gboolean watch)
 {
-	WjDepSet *ds;
 	int i;
-	/* ONE snapshot for the whole walk -- see WjRegEntry.depset. */
-	ds = re->depset;
+	/* `ds` is the caller's snapshot, taken together with the bytes it will instantiate (R320, wj_pub_snapshot):
+	 * ONE snapshot for the whole walk -- see WjRegEntry.depset. */
 	for (i = 0; ds && i < ds->n; ++i) {
 		int dep_id = wj_desc_for_fslot (ds->slot [i]);
 		WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
@@ -3081,7 +3120,7 @@ wj_admit_dependencies (WjRegEntry *re, int desc_id, gboolean watch)
  * live method can call_indirect is installed by the time it goes live.
  */
 static gboolean
-wj_admit_install_only (int desc_id, WjRegEntry *re)
+wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, void *snap_bytes, int snap_len)
 {
 	char eb [192];
 	double ms = 0;
@@ -3113,7 +3152,8 @@ wj_admit_install_only (int desc_id, WjRegEntry *re)
 	/* ONE SNAPSHOT. mono_wasm_jit_rebatch publishes a FRESH WjBatchDesc, so re-reading `re->batch`
 	 * across these arguments can hand the instantiate one module's bytes with another's slot list --
 	 * see WJC_ADMIT_BATCH_SWAPPED. */
-	WjBatchDesc *ibatch = re->batch;
+	/* R320: the caller's snapshot -- the same reading of the entry whose depset its walk installed. */
+	WjBatchDesc *ibatch = snap_batch;
 	if (ibatch) {
 		extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
 		if (!mono_wasm_jit_instantiate_batch_local (ibatch->e, ibatch->f, ibatch->n,
@@ -3123,7 +3163,7 @@ wj_admit_install_only (int desc_id, WjRegEntry *re)
 				printf ("WASM_JIT_CYCLE_INSTALL_FAIL desc=%d (batch n=%d) : %s\n", desc_id, ibatch->n, eb);
 			return FALSE;
 		}
-	} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len, eb, (int) sizeof (eb), &ms)) {
+	} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, snap_bytes, snap_len, eb, (int) sizeof (eb), &ms)) {
 		static int _n = 0;
 		if (_n++ < 20)
 			printf ("WASM_JIT_CYCLE_INSTALL_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
@@ -3253,8 +3293,18 @@ wj_install_closure (int desc_id)
 	re = wj_reg_at (desc_id - 1);
 	if (!re)
 		return FALSE;
+	/* R320: ONE reading of {batch, bytes, len, depset} for this node -- the closure walked below is the closure of
+	 * the bytes installed at the end, or the pass refuses (transient: the next pass retries a settled entry). */
+	WjBatchDesc *snap_b = NULL;
+	void *snap_bytes = NULL;
+	int snap_len = 0;
+	WjDepSet *snap_ds = NULL;
+	if (!wj_pub_snapshot (re, &snap_b, &snap_bytes, &snap_len, &snap_ds)) {
+		mono_wasm_jit_counters [WJC_ADMIT_PAYLOAD_TORN]++;
+		return FALSE;
+	}
 	{
-		WjDepSet *ds = re->depset;
+		WjDepSet *ds = snap_ds;
 		for (i = 0; ds && i < ds->n; ++i) {
 			int d = wj_desc_for_fslot (ds->slot [i]);
 			if (d > 0 && !wj_install_closure (d))
@@ -3275,7 +3325,7 @@ wj_install_closure (int desc_id)
 	 *
 	 * Terminates because every member is stamped on entry, so each descriptor is walked once per pass. */
 	{
-		WjBatchDesc *mb = re->batch;          /* one snapshot -- see WJC_ADMIT_BATCH_SWAPPED */
+		WjBatchDesc *mb = snap_b;             /* one snapshot (R320) -- see WJC_ADMIT_BATCH_SWAPPED */
 		if (mb) {
 			int bi;
 			for (bi = 0; bi < mb->n; ++bi) {
@@ -3285,7 +3335,7 @@ wj_install_closure (int desc_id)
 			}
 		}
 	}
-	if (!wj_admit_install_only (desc_id, re))
+	if (!wj_admit_install_only (desc_id, re, snap_b, snap_bytes, snap_len))
 		ok = FALSE;
 	return ok;
 }
@@ -3873,7 +3923,15 @@ wj_admit_impl (int desc_id)
 		return 0;
 	}
 	wj_desc_state [desc_id] = 1;
-	batch = re->batch;
+	/* R320: the bytes and depset this admission uses, read in ONE consistent window. */
+	void *snap_bytes = NULL;
+	int snap_len = 0;
+	WjDepSet *snap_ds = NULL;
+	if (!wj_pub_snapshot (re, &batch, &snap_bytes, &snap_len, &snap_ds)) {
+		mono_wasm_jit_counters [WJC_ADMIT_PAYLOAD_TORN]++;   /* ungated: a race catch; non-zero is healthy */
+		batch = NULL;   /* no sibling was premarked yet: the fail path must not reset any */
+		goto fail;
+	}
 	if (batch) {
 		/* Instantiating any member installs every export, but that does NOT make every sibling
 		 * dispatchable: each sibling can have different unchecked external call_indirect targets.
@@ -3907,12 +3965,21 @@ wj_admit_impl (int desc_id)
 		for (i = 0; i < batch->n; ++i) {
 			int sibling = batch->desc [i];
 			WjRegEntry *sre = wj_reg_at (sibling - 1);
-			int r = wj_admit_dependencies (sre, sibling, watch && sibling == desc_id);
+			WjBatchDesc *sb = NULL;
+			void *sbytes = NULL;
+			int slen = 0, r;
+			WjDepSet *sds = NULL;
+			/* R320: this member's depset must belong to THIS group generation -- the one whose bytes are installed below. */
+			if (!wj_pub_snapshot (sre, &sb, &sbytes, &slen, &sds) || sb != batch) {
+				mono_wasm_jit_counters [WJC_ADMIT_PAYLOAD_TORN]++;
+				goto fail;
+			}
+			r = wj_admit_dependencies (sre, sds, sibling, watch && sibling == desc_id);
 			if (!r)
 				goto fail;
 		}
 	} else {
-		int r = wj_admit_dependencies (re, desc_id, watch);
+		int r = wj_admit_dependencies (re, snap_ds, desc_id, watch);
 		if (!r)
 			goto fail;
 	}
@@ -3946,7 +4013,7 @@ wj_admit_impl (int desc_id)
 			 * marked PERMANENTLY bad on bytes that were merely read at the wrong moment. */
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_BATCH_RACED);
 			goto fail;
-		} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, re->bytes, re->len, eb, (int) sizeof (eb), &ms)) {
+		} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, snap_bytes, snap_len, eb, (int) sizeof (eb), &ms)) {
 			printf ("WASM_JIT_ADMIT_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
 			fail_perm = TRUE;   /* as above: bad bytes, not a transient ordering miss */
 			/* A LinkError here should be impossible: admission refuses to instantiate until every
@@ -3998,7 +4065,7 @@ wj_admit_impl (int desc_id)
 		extern int mono_wasm_jit_verify_deps;
 		if (G_UNLIKELY (mono_wasm_jit_verify_deps)) {
 			int di;
-			WjDepSet *vds = re->depset;
+			WjDepSet *vds = batch ? re->depset : snap_ds;   /* R320: the set this admission walked */
 			for (di = 0; vds && di < vds->n; ++di) {
 				int dd = wj_desc_for_fslot (vds->slot [di]);
 				WjRegEntry *dre = dd > 0 ? wj_reg_at (dd - 1) : NULL;

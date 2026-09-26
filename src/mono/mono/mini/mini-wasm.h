@@ -1281,6 +1281,7 @@ enum {
 	WJC_T2_GI_INL_NOREC,       /* ... at an inlinee's site, the inlinee's record has no entry */
 	WJC_T2_GI_INL_COLD,        /* ... ... an entry with fewer than 8 observations */
 	WJC_T2_GI_INL_POLY,        /* ... ... warm but polymorphic (or torn) */
+	WJC_ADMIT_PAYLOAD_TORN,    /* R320: admission read {batch,bytes,len,depset} mid-replacement and refused (transient) */
 	WJC_MAX
 };
 
