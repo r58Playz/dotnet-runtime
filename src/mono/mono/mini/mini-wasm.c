@@ -646,6 +646,9 @@ int mono_wasm_jit_reemit_validate = 1;
 /* MONO_WASM_JIT_T2_RETRY (R327): how many times a BLOCKED tier-2 attempt is parked on its blockers and retried before
  * it is recorded FAIL (0 = the old single attempt). */
 int mono_wasm_jit_t2_retry = 3;
+/* MONO_WASM_JIT_T2_STATIC_PRED (R329): a tier-2 GI site with no profile record predicts the callvirt's own method behind
+ * the method-identity guard. */
+int mono_wasm_jit_t2_static_pred = 0;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -782,6 +785,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_ldaddr_ref, "MONO_WASM_JIT_LDADDR_REF", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_reemit_validate, "MONO_WASM_JIT_REEMIT_VALIDATE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_retry, "MONO_WASM_JIT_T2_RETRY", 0, 8)
+	WJ_T2_KNOB (mono_wasm_jit_t2_static_pred, "MONO_WASM_JIT_T2_STATIC_PRED", 0, 1)
 #undef WJ_T2_KNOB
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }

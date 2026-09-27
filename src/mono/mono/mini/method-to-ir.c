@@ -153,6 +153,8 @@ wj_gi_prof_census (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, in
 /* R316k: the inlinee-record verdict of the last wj_gi_predict: -1 = the site is the root's own, 0 = inlinee site but the
  * inlinee has no InterpMethod, else 10 + the inlinee record's WJ_PRED_* (11 no record, 12 cold, 13/14 poly, 15 torn). */
 static __thread int wj_gi_last_inl;
+/* R329: TRUE iff the last wj_gi_predict answered from the static fallback (so the emission can count the ACTION). */
+static __thread gboolean wj_gi_static;
 
 static gboolean
 wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mid_slot,
@@ -166,6 +168,7 @@ wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mi
 	int why2 = 0;
 
 	wj_gi_last_inl = (method && method != cfg->method) ? 0 : -1;
+	wj_gi_static = FALSE;
 	if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples, why))
 		return TRUE;
 	if (mid && (*why == 3 || *why == 4) &&
@@ -183,6 +186,24 @@ wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mi
 		}
 		if (im)
 			wj_gi_last_inl = 10 + why2;
+	}
+	/* R329: nothing observed at all (the caller's record, and an inlinee's, say NO RECORD) -- predict the method the
+	 * callvirt names. Only behind a method-identity guard (mid): any receiver that inherits it takes the inlined body,
+	 * an override falls back, whatever loads later. Never for a cold or polymorphic verdict: those are observations
+	 * that the static guess would contradict. Tier 2 only: its bodies are the sampled hot set. */
+	{
+		extern int mono_wasm_jit_t2_static_pred;
+		if (mono_wasm_jit_t2_static_pred && cfg->wasm_jit_tier >= 2 && mid && *why == 1 &&
+		    (wj_gi_last_inl < 0 || wj_gi_last_inl == 0 || wj_gi_last_inl == 11) &&
+		    !(cmethod->flags & (METHOD_ATTRIBUTE_ABSTRACT | METHOD_ATTRIBUTE_PINVOKE_IMPL)) &&
+		    !(cmethod->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME))) {
+			*vt = NULL;   /* no vtable to compare first: the guard goes straight to the method identity */
+			*target = cmethod;
+			*samples = 0;
+			wj_gi_static = TRUE;
+			wj_gi_count (WJC_T2_GI_STATIC_PRED);
+			return TRUE;
+		}
 	}
 	return FALSE;
 }
@@ -9124,8 +9145,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						MonoBasicBlock *gi_hot_bb;
 						int gi_kreg = alloc_preg (cfg), gi_mvreg = alloc_preg (cfg), gi_mreg = alloc_preg (cfg);
 						NEW_BBLOCK (cfg, gi_hot_bb);
-						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi_vt);
-						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, gi_hot_bb);
+						if (gi_vt) {   /* R329: a static prediction has no receiver vtable to try first */
+							MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi_vt);
+							MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, gi_hot_bb);
+						}
 						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_kreg, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass));
 						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mvreg, gi_kreg, mono_wasm_jit_class_vtable_off ());
 						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mreg, gi_mvreg, gi_mid_slot * TARGET_SIZEOF_VOID_P);
@@ -9169,6 +9192,8 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						if (cfg->wasm_jit_tier >= 2) {
 							wj_gi_count (WJC_T2_GI_EMITTED);
 							cfg->wasm_jit_result.t2_gi++;
+							if (wj_gi_static)
+								wj_gi_count (WJC_T2_GI_STATIC_EMITTED);   /* R329: the action, not the decision */
 						}
 						if (G_UNLIKELY (mono_wasm_jit_stats))
 							wj_gi_note_inlined (gi_target);
