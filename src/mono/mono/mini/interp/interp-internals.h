@@ -279,6 +279,7 @@ struct InterpMethod {
 	                               * attempt failed, was refused or given up. Either way never re-requested (R316c). */
 	guint8 wasm_jit_t2_want;      /* queued for a tier-2 recompile; read by mini.c through mono_wasm_jit_imethod_tier_want */
 	guint8 wasm_jit_t2_retries;   /* R327: BLOCKED tier-2 attempts parked on their blockers so far (bounded by MONO_WASM_JIT_T2_RETRY) */
+	guint8 wasm_jit_t2_rearms;    /* R332: tier-2 requests re-armed after a BUSY give-up so far (bounded by MONO_WASM_JIT_T2_REARM) */
 	// This data is used to resolve native offsets from unoptimized method to native offsets
 	// in the optimized method. We rely on keys identifying a certain logical execution point
 	// to be equal between unoptimized and optimized method. In unoptimized method we map from

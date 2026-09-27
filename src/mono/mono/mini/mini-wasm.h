@@ -1291,6 +1291,7 @@ enum {
 	WJC_T2_RETRY_GIVEUP,       /* R327: ... that exhausted MONO_WASM_JIT_T2_RETRY and were recorded FAIL (ungated) */
 	WJC_T2_GI_STATIC_PRED,     /* R329: tier-2 GI sites with no record predicted from the callvirt's own method (decision) */
 	WJC_T2_GI_STATIC_EMITTED,  /* R329: ... of which the guarded inline was emitted (action) */
+	WJC_T2_REARMED,            /* R332: tier-2 requests re-armed after a BUSY give-up (ungated) */
 	WJC_MAX
 };
 

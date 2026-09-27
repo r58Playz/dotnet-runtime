@@ -3653,7 +3653,18 @@ wj_reemit_drain_one (void)
 				mono_wasm_jit_counters [WJC_REEMIT_REQUIRED_GIVEUP]++;
 			}
 			if (im->wasm_jit_t2_want) {   /* R316c: release the request, and say so */
+				extern int mono_wasm_jit_t2_rearm;
+				res.fail_reason = "BUSY give-up";   /* R331: a released request leaves a row, not nothing */
+				wj_t2_note (im, &res, FALSE);
 				im->wasm_jit_t2_want = 0;
+				if (im->wasm_jit_t2_rearms < mono_wasm_jit_t2_rearm) {
+					/* R332: a lost compile-lock race says nothing about the method. Back to tier 1 with a fresh sample
+					 * count and BUSY budget: the sampler asks again only after another threshold of samples. */
+					im->wasm_jit_t2_rearms++;
+					im->wasm_jit_t2_samples = 0;
+					im->wasm_jit_reemit_busy = 0;
+					mono_wasm_jit_counters [WJC_T2_REARMED]++;   /* ungated */
+				} else
 				im->wasm_jit_tier = 3;
 				if (G_UNLIKELY (mono_wasm_jit_stats))
 					mono_wasm_jit_count (WJC_T2_GIVEUP);

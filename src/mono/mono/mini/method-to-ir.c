@@ -193,8 +193,11 @@ wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mi
 	 * that the static guess would contradict. Tier 2 only: its bodies are the sampled hot set. */
 	{
 		extern int mono_wasm_jit_t2_static_pred;
-		if (mono_wasm_jit_t2_static_pred && cfg->wasm_jit_tier >= 2 && mid && *why == 1 &&
-		    (wj_gi_last_inl < 0 || wj_gi_last_inl == 0 || wj_gi_last_inl == 11) &&
+		/* R333: =2 also takes a COLD verdict -- at an IC-cached site one observation (the first miss) is all a hot
+		 * monomorphic site ever records. */
+		gboolean cold_ok = mono_wasm_jit_t2_static_pred >= 2;
+		if (mono_wasm_jit_t2_static_pred && cfg->wasm_jit_tier >= 2 && mid && (*why == 1 || (cold_ok && *why == 2)) &&
+		    (wj_gi_last_inl < 0 || wj_gi_last_inl == 0 || wj_gi_last_inl == 11 || (cold_ok && wj_gi_last_inl == 12)) &&
 		    !(cmethod->flags & (METHOD_ATTRIBUTE_ABSTRACT | METHOD_ATTRIBUTE_PINVOKE_IMPL)) &&
 		    !(cmethod->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME))) {
 			*vt = NULL;   /* no vtable to compare first: the guard goes straight to the method identity */
