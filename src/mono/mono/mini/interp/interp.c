@@ -2454,11 +2454,18 @@ mono_wasm_jit_t2_sample (gpointer p)
 	extern int mono_wasm_jit_t2_threshold, mono_wasm_jit_t2_max;
 	static volatile gint32 t2_requested;
 	InterpMethod *im;
+	gboolean t2body = ((gsize) p & 1) != 0;   /* R336: a tier-2 body's poll */
+	p = (gpointer) ((gsize) p & ~(gsize) 1);
 	if (!p)
 		return;
 	im = interp_imethod_current ((InterpMethod *) p, TRUE);
 	if (G_UNLIKELY (mono_wasm_jit_stats))
 		mono_wasm_jit_count (WJC_T2_SAMPLES);
+	if (t2body) {
+		if (im->wasm_jit_t2_body_samples < G_MAXINT32)
+			im->wasm_jit_t2_body_samples++;
+		return;
+	}
 	if (im->wasm_jit_tier >= 2 || im->wasm_jit_t2_want) {
 		/* R316e: keep counting past the request. Nothing decides on it any more; `[wasm-jit t2 top]` ranks by it, and a
 		 * count frozen at the threshold made every row read ~48 and the dump list whatever was requested first. */
@@ -2487,6 +2494,8 @@ typedef struct {
 	InterpMethod *im;   /* R316e: read at dump time for the CURRENT count. Diagnostic-only retention: InterpMethods are
 	                     * never freed on this workload (no collectible ALC), and only the stats dump reads it. */
 	gint32 samples, inlined, gi, nopred, left, left_virt, ok, bytes;
+	gint32 body_samples;   /* R336 */
+	gint32 refresh;        /* R337: 0 standalone, >0 group re-framed, <0 failed, -9 not a re-emit */
 	gint64 t_ms;
 	const char *down_reason;   /* R316h; for a FAIL row (R325), the failed compile's own reason */
 	gint32 down_bail;
@@ -2516,6 +2525,7 @@ wj_t2_note (InterpMethod *im, const MonoWasmJitResult *res, gboolean ok)
 	r->bytes = res->bytes_len;
 	r->down_reason = res->t2_down_reason;
 	r->down_bail = res->t2_down_bail;
+	r->refresh = res->t2_refresh;
 	if (!ok) {   /* R325: no body at all -- keep the compile's own reason (retriable skips the downgrade) */
 		r->down_reason = res->fail_reason;
 		r->down_bail = res->bail;
@@ -2540,7 +2550,11 @@ mono_wasm_jit_dump_t2 (int topn)
 		if (!r->cls)
 			continue;
 		if (r->im)
-			r->samples = interp_imethod_current (r->im, TRUE)->wasm_jit_t2_samples;
+		{
+			InterpMethod *cur = interp_imethod_current (r->im, TRUE);
+			r->samples = cur->wasm_jit_t2_samples;
+			r->body_samples = cur->wasm_jit_t2_body_samples;   /* R336 */
+		}
 		if (r->t_ms < t0)
 			t0 = r->t_ms;
 	}
@@ -2567,9 +2581,10 @@ mono_wasm_jit_dump_t2 (int topn)
 		done [best] = 1;
 		{
 			WjT2Row *r = &wj_t2_rows [best];
-			printf ("  %7d smp  +%6.1fs  %s  inl %3d gi %3d nopred %3d left %4d (virt %4d) %7d B  %s:%s\n", r->samples,
+			printf ("  %7d smp  +%6.1fs  %s  inl %3d gi %3d nopred %3d left %4d (virt %4d) %7d B  t2smp %6d  %s  %s:%s\n", r->samples,
 				(double) (r->t_ms - t0) / 1000.0, r->ok == 1 ? "t2  " : r->ok == 2 ? "down" : "FAIL", r->inlined, r->gi,
-				r->nopred, r->left, r->left_virt, r->bytes, r->cls, r->mth);
+				r->nopred, r->left, r->left_virt, r->bytes, r->body_samples,
+				r->refresh == 0 ? "solo" : r->refresh > 0 ? "grp+" : r->refresh == -9 ? "----" : "grp-", r->cls, r->mth);
 			if (r->ok == 2)
 				printf ("           down: tier-2 compile failed at \"%s\" (bail %d)\n",
 					r->down_reason ? r->down_reason : "?", r->down_bail);
@@ -3258,11 +3273,13 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 			mono_wasm_force_compile (im->method, &r);
 		}
 	}
+	r.t2_refresh = -9;
 	if (reemit && r.e_slot > 0 && r.desc_id > 0) {
 		extern int mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len);
 		void *batch_bytes = NULL;
 		int batch_len = 0;
 		int br = mono_wasm_jit_refresh_batch (r.desc_id, &batch_bytes, &batch_len);
+		r.t2_refresh = br;   /* R337 */
 		if (br < 0) {
 			/* Keep the old shared batch canonical and retry the replacement. The temporary standalone
 			 * instance may exist on this worker, but no generation exposes it to other workers.

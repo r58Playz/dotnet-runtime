@@ -3324,7 +3324,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							memset (&pt1, 0, sizeof (pt1)); pt1.ret = WASM_VOID; pt1.nparams = 1; pt1.params [0] = WASM_I32;
 							for (pk1 = 0; pk1 < nextra; ++pk1) if (functype_eq (&extra_types [pk1], &pt1)) { pt1i = ti_base + pk1; break; }
 							if (pt1i < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt1; pt1i = ti_base + nextra++; }
-							wasm_i32_const (&body, (gint32) (intptr_t) cfg->wasm_jit_caller_imethod);
+							/* R336: bit 0 marks a TIER-2 body's poll (InterpMethod* is aligned), so the sampler can tell
+							 * whether the tier-2 generation is the one executing. */
+							wasm_i32_const (&body, (gint32) ((intptr_t) cfg->wasm_jit_caller_imethod | (cfg->wasm_jit_tier >= 2 ? 1 : 0)));
 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_t2, (guint32) pt1i);
 						} else if (mono_wasm_jit_edge_sample && bb == cfg->bb_entry)
 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_entry, (guint32) pti);

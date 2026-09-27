@@ -903,6 +903,15 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	 * mono_wasm_force_compile; with relocatable bodies it costs a memcpy. */
 	if (desc_id <= 0)
 		return 0;
+	{
+		/* R338: under tier 2, no automatic co-location -- a re-framed group's old instance outlives any frame
+		 * that never returns, and its module-local calls keep reaching the old member copies (R336/R337). */
+		extern int mono_wasm_jit_t2, mono_wasm_jit_t2_colocate;
+		if (mono_wasm_jit_t2 && !mono_wasm_jit_t2_colocate) {
+			mono_wasm_jit_counters [WJC_COLOCATE_T2_SKIP]++;   /* ungated */
+			return 0;
+		}
+	}
 	/* THE BRACKET, and it is not decoration: `rds` below is re->depset, it is dereferenced for the whole
 	 * body of this function -- across wj_asm_reaches walking OTHER descriptors' depsets, across a rebatch,
 	 * across wj_assemble and a JS WebAssembly.Module compile -- and a concurrent re-registration retires

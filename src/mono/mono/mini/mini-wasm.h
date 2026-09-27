@@ -1292,6 +1292,7 @@ enum {
 	WJC_T2_GI_STATIC_PRED,     /* R329: tier-2 GI sites with no record predicted from the callvirt's own method (decision) */
 	WJC_T2_GI_STATIC_EMITTED,  /* R329: ... of which the guarded inline was emitted (action) */
 	WJC_T2_REARMED,            /* R332: tier-2 requests re-armed after a BUSY give-up (ungated) */
+	WJC_COLOCATE_T2_SKIP,      /* R338: automatic co-location attempts skipped because tier 2 is on (ungated) */
 	WJC_MAX
 };
 
