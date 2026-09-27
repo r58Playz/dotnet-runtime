@@ -253,7 +253,16 @@ typedef struct {
 	/* Relocations recorded in this buffer, or NULL for a buffer that carries none (every buffer used to
 	 * build a SECTION). Only function bodies carry relocs. See WasmRelocs below. */
 	struct _WasmRelocs *relocs;
+	/* Branch hints (R339): (offset of an `if`/`br_if` opcode in this buffer, 0 = unlikely / 1 = likely), or NULL.
+	 * Carried like relocs; the serializer translates them, the module assembler emits them. */
+	struct _WasmHints *hints;
 } WasmBuf;
+
+typedef struct _WasmHints {
+	guint32 *off;
+	guint8  *val;
+	guint32  n, cap;
+} WasmHints;
 
 void wasm_buf_init  (WasmBuf *b);
 void wasm_buf_free  (WasmBuf *b);
@@ -332,6 +341,8 @@ typedef struct { guint8 form; guint32 idx; } WasmRelocFix;
 
 /* Attach a reloc list to a body buffer. Must be called before any wasm_reloc on it. */
 void wasm_buf_init_relocs (WasmBuf *b);
+/* R339: hint the `if`/`br_if` opcode about to be appended (1 = likely taken, 0 = unlikely). */
+void wasm_hint (WasmBuf *b, guint8 likely);
 
 /*
  * Record a hole at the current end of `b`.

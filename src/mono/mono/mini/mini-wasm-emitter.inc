@@ -2857,10 +2857,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
  * EXTRA is the same in-bb nesting count GOTO takes. WJ_HAS_THROW guards the (never expected) case where
  * the prescan did not reserve a block for this id, so the caller can fall back to the inline form. */
 #define WJ_HAS_THROW(EXC_ID) ((EXC_ID) >= 0 && (EXC_ID) < WJ_EXC_IDS && wj_throw_slot [(EXC_ID)] >= 0)
+/* R339: hint the `if`/`br_if` about to be emitted (1 likely, 0 unlikely) when MONO_WASM_JIT_BRANCH_HINTS is on. */
+#define WJ_HINT(V) do { extern int mono_wasm_jit_branch_hints; if (mono_wasm_jit_branch_hints) wasm_hint (&body, (V)); } while (0)
 #define WJ_THROW_BR(EXC_ID, EXTRA) do { \
 		int _od = structured_cfg ? wj_structured_outer_depth (structured_cfg_kind, structured_loop_h, \
 			structured_loop_l, N, i) : ((N - 1 - i) + (skip_dispatch ? 0 : 1)); \
 		if (_od < 0) { fail = "structured throw depth"; goto done; } \
+		WJ_HINT (0); \
 		wasm_op (&body, WASM_OP_BR_IF); \
 		wasm_uleb (&body, (guint32) (_od + wj_throw_slot [(EXC_ID)] + (EXTRA))); \
 	} while (0)
@@ -3243,10 +3246,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);                  /* s.b */
 				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_TLAB_SLOT);
 				wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);
+				WJ_HINT (1);   /* R339: attached */
 				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);                           /* (result i32) */
 				  wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
 				  wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
 				  wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);                     /* a = SgenThreadInfo */
+				  WJ_HINT (1);
 				  wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
 				    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
 				    wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_next_off);
@@ -3257,6 +3262,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
 				    wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_temp_end_off);
 				    wasm_op (&body, WASM_OP_I32_LT_U);
+				    WJ_HINT (1);   /* R339: the TLAB has room */
 				    wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
 				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
 				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) n);
@@ -3303,6 +3309,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					uses_calls = TRUE;
 					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = this worker's action word */
 					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+					WJ_HINT (0);   /* R339: the action word is almost always 0 */
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 					/* Materialize roots inside the rare taken arm, not before the flag load. */
 					ENSURE_REF_FRAME ();
@@ -4689,6 +4696,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* call_interp returns 1 if the callee threw: the result slot is stale AND an exception
 					 * is armed. Continue the native unwind (never a normal return -- that skipped this
 					 * frame's own landing pad and delivered the exception late; FINDINGS Finding 15). */
+					WJ_HINT (0);   /* R339 */
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 					/* threw: continue the native unwind; do NOT return and do NOT pop roots first. */
 					EMIT_RESIDUAL_THROW_CONTINUATION ();
@@ -6427,6 +6435,7 @@ vcall_cold_miss_emit:
 							wj_emit_dynamic_call (&body, (guint32) vtdi);
 							/* call_interp returns 1 if the vcall fallback threw. Continue the native unwind
 							 * instead of reading the stale scratch result; mirrors the direct residual path. */
+							WJ_HINT (0);   /* R339 */
 							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 								/* threw: continue the native unwind; do NOT return and do NOT pop roots first. */
 								EMIT_RESIDUAL_THROW_CONTINUATION ();
