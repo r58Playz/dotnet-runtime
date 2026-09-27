@@ -6933,9 +6933,20 @@ vcall_cold_miss_emit:
 			 * body's dependencies are installed here -- callers that baked the slot would reach it at once. Validate
 			 * only; the republication makes this thread re-admit, walking the new depset first. */
 			extern int mono_wasm_jit_reemit_validate;
-			gboolean reemit_live = mono_wasm_jit_reemit_validate && (wj_slot_is_installed (f_slot) || wj_slot_is_installed (e_slot));
+			gboolean slot_live_here = wj_slot_is_installed (f_slot) || wj_slot_is_installed (e_slot);
+			gboolean reemit_live = mono_wasm_jit_reemit_validate && slot_live_here;
 			if (reemit_live)
 				wj_count (WJC_REEMIT_VALIDATE_ONLY);
+			if (slot_live_here) {
+				int k;
+				for (k = 0; k < cfg->wasm_jit_result.ndirect_deps; ++k) {
+					int ds = cfg->wasm_jit_result.direct_deps [k];
+					if (ds > 0 && ds != f_slot && !wj_slot_is_installed (ds)) {
+						mono_wasm_jit_counters [WJC_REEMIT_HAZARD]++;   /* ungated: the window, prevented or not */
+						break;
+					}
+				}
+			}
 			if (mono_wasm_jit_instantiate_local (reemit_live ? -1 : e_slot, reemit_live ? -1 : f_slot, cached, (int) out.len,
 			                                     ierr, (int) sizeof (ierr), &wj_inst_ms)) {
 				/* The compile result is written onto cfg->wasm_jit_result (below). It's per-compile, so a

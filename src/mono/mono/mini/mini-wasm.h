@@ -1286,6 +1286,7 @@ enum {
 	WJC_REEMIT_VALIDATE_ONLY,  /* R322: re-emits into a slot the compiling thread had installed: validated, not published there */
 	WJC_OVF_CONV_LOWERED,      /* R323: checked i64 -> i32 conversions emitted (were "unsupported opcode") */
 	WJC_ATOMIC_STORE8_LOWERED, /* R323b: 1-byte OP_ATOMIC_STOREs emitted as i32.atomic.store8 (were "unsupported opcode") */
+	WJC_REEMIT_HAZARD,         /* R322 probe: re-emits into a slot installed here whose body bakes a dep NOT installed here (ungated) */
 	WJC_MAX
 };
 
