@@ -1289,6 +1289,8 @@ enum {
 	WJC_REEMIT_HAZARD,         /* R322 probe: re-emits into a slot installed here whose body bakes a dep NOT installed here (ungated) */
 	WJC_T2_RETRY_PARKED,       /* R327: BLOCKED tier-2 attempts parked on their blockers instead of failing (ungated) */
 	WJC_T2_RETRY_GIVEUP,       /* R327: ... that exhausted MONO_WASM_JIT_T2_RETRY and were recorded FAIL (ungated) */
+	WJC_T2_GI_STATIC_PRED,     /* R329: tier-2 GI sites with no record predicted from the callvirt's own method (decision) */
+	WJC_T2_GI_STATIC_EMITTED,  /* R329: ... of which the guarded inline was emitted (action) */
 	WJC_MAX
 };
 
