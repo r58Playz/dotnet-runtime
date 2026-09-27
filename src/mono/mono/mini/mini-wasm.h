@@ -1287,6 +1287,8 @@ enum {
 	WJC_OVF_CONV_LOWERED,      /* R323: checked i64 -> i32 conversions emitted (were "unsupported opcode") */
 	WJC_ATOMIC_STORE8_LOWERED, /* R323b: 1-byte OP_ATOMIC_STOREs emitted as i32.atomic.store8 (were "unsupported opcode") */
 	WJC_REEMIT_HAZARD,         /* R322 probe: re-emits into a slot installed here whose body bakes a dep NOT installed here (ungated) */
+	WJC_T2_RETRY_PARKED,       /* R327: BLOCKED tier-2 attempts parked on their blockers instead of failing (ungated) */
+	WJC_T2_RETRY_GIVEUP,       /* R327: ... that exhausted MONO_WASM_JIT_T2_RETRY and were recorded FAIL (ungated) */
 	WJC_MAX
 };
 
