@@ -3309,11 +3309,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* Direct import: a C function address in dotnet.native.wasm, fixed for the process. The ENTRY
 					 * poll gets its own helper while edge sampling is on (R295), so a sample is a method entry. */
 					{
-						extern int mono_wasm_jit_edge_sample, mono_wasm_jit_t2;
+						extern int mono_wasm_jit_edge_sample, mono_wasm_jit_t2, mono_wasm_jit_t2_sample_loop;
 						extern void mono_wasm_jit_safepoint_poll_entry (void);
 						extern void mono_wasm_jit_safepoint_poll_t2 (gpointer imethod);
-						/* (R316e: tier-2 bodies too -- they only feed the per-method heat the t2 dump ranks by.) */
-						if (mono_wasm_jit_t2 && cfg->wasm_jit_caller_imethod) {
+						/* (R316e: tier-2 bodies too -- they only feed the per-method heat the t2 dump ranks by.)
+						 * R335: under T2_SAMPLE_LOOP the ENTRY poll does not take a sample -- the time since the tick
+						 * was spent in the caller -- so it falls to the plain poll below, which defers the sample
+						 * to the next loop back-edge. */
+						if (mono_wasm_jit_t2 && cfg->wasm_jit_caller_imethod &&
+						    !(mono_wasm_jit_t2_sample_loop && bb == cfg->bb_entry)) {
 							/* R316 tier-2 hotness: every poll of a tier-1 body names its method, INSIDE this
 							 * rare arm -- the common path is unchanged. The InterpMethod* is process-wide. */
 							WasmFuncType pt1; int pt1i = -1, pk1;

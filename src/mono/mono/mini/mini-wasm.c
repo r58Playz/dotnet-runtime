@@ -651,6 +651,9 @@ int mono_wasm_jit_t2_retry = 3;
 int mono_wasm_jit_t2_static_pred = 0;
 /* MONO_WASM_JIT_T2_REARM (R332): how many times a tier-2 request released on BUSY give-up is re-armed (0 = retire it). */
 int mono_wasm_jit_t2_rearm = 3;
+/* MONO_WASM_JIT_T2_SAMPLE_LOOP (R335): tier-2 samples are credited at loop polls only; an entry poll defers a pending
+ * sample to the next back-edge (0 = every poll credits its own method). */
+int mono_wasm_jit_t2_sample_loop = 0;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -789,6 +792,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_retry, "MONO_WASM_JIT_T2_RETRY", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_static_pred, "MONO_WASM_JIT_T2_STATIC_PRED", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_t2_rearm, "MONO_WASM_JIT_T2_REARM", 0, 8)
+	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 1)
 #undef WJ_T2_KNOB
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }
