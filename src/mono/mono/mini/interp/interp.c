@@ -2487,8 +2487,9 @@ typedef struct {
 	                     * never freed on this workload (no collectible ALC), and only the stats dump reads it. */
 	gint32 samples, inlined, gi, nopred, left, left_virt, ok, bytes;
 	gint64 t_ms;
-	const char *down_reason;   /* R316h */
-	gint32 down_bail;        /* R316e: when the tier-2 compile finished (mono_msec_ticks), to tell boot from plateau */
+	const char *down_reason;   /* R316h; for a FAIL row (R325), the failed compile's own reason */
+	gint32 down_bail;
+	gint32 retriable;          /* R325: FAIL rows -- the compile's `retriable` (a "callee not jitted" bail) */        /* R316e: when the tier-2 compile finished (mono_msec_ticks), to tell boot from plateau */
 } WjT2Row;
 static WjT2Row wj_t2_rows [WJ_T2_ROWS];
 static volatile gint32 wj_t2_nrows;
@@ -2514,6 +2515,11 @@ wj_t2_note (InterpMethod *im, const MonoWasmJitResult *res, gboolean ok)
 	r->bytes = res->bytes_len;
 	r->down_reason = res->t2_down_reason;
 	r->down_bail = res->t2_down_bail;
+	if (!ok) {   /* R325: no body at all -- keep the compile's own reason (retriable skips the downgrade) */
+		r->down_reason = res->fail_reason;
+		r->down_bail = res->bail;
+		r->retriable = res->retriable;
+	}
 	r->mth = m->name ? m->name : "?";
 	mono_memory_barrier ();
 	r->cls = m->klass ? m_class_get_name (m->klass) : "?";   /* published last: the dump skips a row without it */
@@ -2566,6 +2572,9 @@ mono_wasm_jit_dump_t2 (int topn)
 			if (r->ok == 2)
 				printf ("           down: tier-2 compile failed at \"%s\" (bail %d)\n",
 					r->down_reason ? r->down_reason : "?", r->down_bail);
+			else if (r->ok == 0)
+				printf ("           fail: tier-2 compile failed at \"%s\" (bail %d, retriable %d)\n",
+					r->down_reason ? r->down_reason : "?", r->down_bail, r->retriable);
 		}
 		shown++;
 	}
