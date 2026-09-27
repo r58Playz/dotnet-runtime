@@ -1980,7 +1980,8 @@ static void
 wj_waiter_wake (MonoMethod *waiter)
 {
 	InterpMethod *im = mono_interp_peek_imethod (waiter);
-	if (im && im->wasm_jit_reemit_required && im->wasm_jit_desc > 0)
+	/* R327: a tier-2 request parked on a blocker is a re-emit too (same broker, same mandatory queue). */
+	if (im && (im->wasm_jit_reemit_required || im->wasm_jit_t2_want) && im->wasm_jit_desc > 0)
 		mono_wasm_jit_request_reemit (im->wasm_jit_desc);
 	else
 		wj_promote_push (waiter);
@@ -3590,8 +3591,29 @@ wj_reemit_drain_one (void)
 		r = wasm_jit_compile_publish (im, &res, TRUE);
 		mono_wasm_jit_reemit_inflight = 0;
 	}
-	/* R316: one tier-2 attempt per method, whatever the outcome (a lost CAS keeps the request for the re-queue). */
+	/* R316: one tier-2 attempt per method, whatever the outcome (a lost CAS keeps the request for the re-queue) --
+	 * except R327's bounded retry of a BLOCKED attempt below. */
 	if (im->wasm_jit_t2_want && r != WASM_JIT_COMPILE_BUSY) {
+		extern int mono_wasm_jit_t2_retry;
+		/* R327: BLOCKED names un-JITted, non-cold direct callees (an inlinee's calls). Do what tier 1's island does
+		 * for the same bail -- force the blockers -- but asynchronously: park this method on each, push each to the
+		 * promote queue, and let the first publication wake the request (wj_waiter_wake routes a pending tier-2
+		 * method back here). The request stays pending; the row is recorded only at the final outcome. */
+		if (r == WASM_JIT_COMPILE_BLOCKED && res.nblockers > 0 && im->wasm_jit_t2_retries < mono_wasm_jit_t2_retry) {
+			int b;
+			im->wasm_jit_t2_retries++;
+			mono_wasm_jit_counters [WJC_T2_RETRY_PARKED]++;   /* ungated: the mechanism's liveness check */
+			for (b = 0; b < res.nblockers; ++b) {
+				MonoMethod *blocker = res.blockers [b];
+				if (blocker && blocker != im->method) {
+					wj_waiter_register (blocker, im->method);
+					wj_promote_push (blocker);
+				}
+			}
+			goto out;
+		}
+		if (r == WASM_JIT_COMPILE_BLOCKED && res.nblockers > 0 && mono_wasm_jit_t2_retry > 0)
+			mono_wasm_jit_counters [WJC_T2_RETRY_GIVEUP]++;   /* budget spent: falls through to FAIL */
 		wj_t2_note (im, &res, r == WASM_JIT_COMPILE_JITTED);   /* R316d */
 		im->wasm_jit_t2_want = 0;
 		im->wasm_jit_tier = r == WASM_JIT_COMPILE_JITTED ? 2 : 3;
