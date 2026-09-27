@@ -904,6 +904,15 @@ mono_wasm_jit_dump_stats (void)
 				extern int mono_wasm_jit_t2_rearm;
 				printf ("[wasm-jit t2-rearm] rearmed=%lld (t2_rearm=%d)\n", WJC_(WJC_T2_REARMED), mono_wasm_jit_t2_rearm);
 			}
+			{
+				/* R335: the sampler's own losses. Under T2_SAMPLE_LOOP an entry poll defers a sample to the next loop
+				 * back-edge; `dropped` is a sample no back-edge took within 64 polls, `late` one taken > 2 ms after
+				 * its tick. Ungated counters (the edge sampler's), printed here because its own dump needs EDGE_SAMPLE. */
+				extern int mono_wasm_jit_t2_sample_loop;
+				printf ("[wasm-jit t2-sampler] ticks=%lld late=%lld dropped=%lld (t2_sample_loop=%d)\n",
+					(long long) mono_wasm_jit_counters [WJC_EDGE_TICKS], (long long) mono_wasm_jit_counters [WJC_EDGE_LATE],
+					(long long) mono_wasm_jit_counters [WJC_EDGE_DROPPED], mono_wasm_jit_t2_sample_loop);
+			}
 		}
 		printf ("[wasm-jit t2] samples=%lld requested=%lld compiled=%lld failed=%lld refused=%lld"
 			" giveup=%lld | gi emitted=%lld nopred=%lld (norec %lld [canon has it %lld] cold %lld poly %lld; root %lld, inlinee: no-im %lld norec %lld cold %lld poly %lld) | prof_origin used=%lld fallback=%lld (t2=%d threshold=%d max=%d origin=%d)\n",
