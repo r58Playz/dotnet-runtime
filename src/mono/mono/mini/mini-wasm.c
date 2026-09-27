@@ -656,6 +656,9 @@ int mono_wasm_jit_t2_rearm = 3;
 int mono_wasm_jit_t2_sample_loop = 0;
 /* MONO_WASM_JIT_T2_COLOCATE (R338): 1 keeps automatic co-location running while tier 2 is on (0 = off under tier 2). */
 int mono_wasm_jit_t2_colocate = 0;
+/* MONO_WASM_JIT_BRANCH_HINTS (R339): emit a metadata.code.branch_hint section for the branches whose direction the
+ * emitter knows (poll arms, throws, threw-checks unlikely; the TLAB fast path likely). */
+int mono_wasm_jit_branch_hints = 0;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -796,6 +799,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_rearm, "MONO_WASM_JIT_T2_REARM", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_colocate, "MONO_WASM_JIT_T2_COLOCATE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 1)
 #undef WJ_T2_KNOB
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }

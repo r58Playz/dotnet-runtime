@@ -23,6 +23,27 @@ wasm_buf_init (WasmBuf *b)
 	b->tee_end = 0;
 	b->tee_idx = 0;
 	b->relocs = NULL;
+	b->hints = NULL;
+}
+
+void
+wasm_hint (WasmBuf *b, guint8 likely)
+{
+	WasmHints *h = b->hints;
+	if (!h)
+		h = b->hints = g_new0 (WasmHints, 1);
+	/* Offsets must be strictly increasing in the section; an emitter that rolled the buffer back and re-emitted
+	 * could otherwise record a smaller one. Drop any hint at or past the current end first. */
+	while (h->n && h->off [h->n - 1] >= b->len)
+		h->n--;
+	if (h->n == h->cap) {
+		h->cap = h->cap ? h->cap * 2 : 16;
+		h->off = (guint32 *) g_realloc (h->off, sizeof (guint32) * (gsize) h->cap);
+		h->val = (guint8 *) g_realloc (h->val, (gsize) h->cap);
+	}
+	h->off [h->n] = b->len;
+	h->val [h->n] = likely ? 1 : 0;
+	h->n++;
 }
 
 void
@@ -41,6 +62,12 @@ wasm_buf_free (WasmBuf *b)
 		g_free (b->relocs->r);
 		g_free (b->relocs);
 		b->relocs = NULL;
+	}
+	if (b->hints) {
+		g_free (b->hints->off);
+		g_free (b->hints->val);
+		g_free (b->hints);
+		b->hints = NULL;
 	}
 }
 
@@ -87,16 +114,45 @@ emit_call_site (WasmBuf *out, const WasmReloc *r, const WasmRelocFix *fix, guint
 	}
 }
 
+static void
+wasm_hint_at (WasmHints *h, guint32 off, guint8 val)
+{
+	if (h->n && h->off [h->n - 1] >= off)
+		return;   /* keep strictly increasing */
+	if (h->n == h->cap) {
+		h->cap = h->cap ? h->cap * 2 : 16;
+		h->off = (guint32 *) g_realloc (h->off, sizeof (guint32) * (gsize) h->cap);
+		h->val = (guint8 *) g_realloc (h->val, (gsize) h->cap);
+	}
+	h->off [h->n] = off;
+	h->val [h->n] = val;
+	h->n++;
+}
+
 void
 wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_base, WasmBuf *out)
 {
 	const WasmRelocs *rl = src->relocs;
-	guint32 k, prev = 0, n = rl ? rl->n : 0;
+	const WasmHints *hs = src->hints;
+	guint32 k, prev = 0, n = rl ? rl->n : 0, hi = 0, nh = hs ? hs->n : 0, base = out->len;
+	/* R339: a hint at source offset o lands at (out offset of the span holding o) + (o - span start). A hole at
+	 * exactly o is inserted BEFORE the byte at o, so such a hint belongs to the span that starts at the hole. */
+#define WASM_FLUSH_HINTS(LIMIT) do { \
+		guint32 _span_out = out->len; \
+		while (hi < nh && hs->off [hi] < (LIMIT)) { \
+			if (hs->off [hi] >= prev) { \
+				if (!out->hints) out->hints = g_new0 (WasmHints, 1); \
+				wasm_hint_at (out->hints, _span_out - base + (hs->off [hi] - prev), hs->val [hi]); \
+			} \
+			hi++; \
+		} \
+	} while (0)
 
 	for (k = 0; k < n; ++k) {
 		const WasmReloc *r = &rl->r [k];
 		guint32 ti = ti_base + r->tpool;
 		g_assert (r->off >= prev && r->off <= src->len);   /* relocs are sorted and in range */
+		WASM_FLUSH_HINTS (r->off);
 		wasm_bytes (out, src->data + prev, r->off - prev);
 		prev = r->off;
 		switch ((WasmRelocKind) r->kind) {
@@ -122,6 +178,8 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 			break;
 		}
 	}
+	WASM_FLUSH_HINTS (src->len);
+#undef WASM_FLUSH_HINTS
 	wasm_bytes (out, src->data + prev, src->len - prev);
 	/* Serializing must never disturb the peephole state of a buffer that is still being appended to. */
 	out->tee_end = 0;
@@ -528,6 +586,49 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 	}
 	emit_section (out, 7, &sec);
 	wasm_buf_free (&sec);
+
+	/* R339: branch hints (custom section "metadata.code.branch_hint"), before the code section. Offsets are relative
+	 * to the start of each function's LOCAL DECLARATIONS (V8: pc_offset - locals_offset_), so add that length. */
+	{
+		guint32 nf = 0;
+		for (i = 0; i < nmembers; ++i)
+			if (members [i].f_body->hints && members [i].f_body->hints->n)
+				nf++;
+		if (nf) {
+			WasmBuf hsec;
+			wasm_buf_init (&hsec);
+			wasm_name (&hsec, "metadata.code.branch_hint");
+			wasm_uleb (&hsec, nf);
+			for (i = 0; i < nmembers; ++i) {
+				const WasmHints *h = members [i].f_body->hints;
+				WasmBuf ld;
+				guint32 j, g, ngroups = 0;
+				if (!h || !h->n)
+					continue;
+				wasm_buf_init (&ld);
+				for (g = 0; g < members [i].nlocal_groups; ++g)
+					if (members [i].locals [g].count > 0)
+						ngroups++;
+				wasm_uleb (&ld, ngroups);
+				for (g = 0; g < members [i].nlocal_groups; ++g) {
+					if (members [i].locals [g].count == 0)
+						continue;
+					wasm_uleb (&ld, members [i].locals [g].count);
+					wasm_u8 (&ld, (guint8) members [i].locals [g].type);
+				}
+				wasm_uleb (&hsec, nfimports + i);   /* methods precede the thunks */
+				wasm_uleb (&hsec, h->n);
+				for (j = 0; j < h->n; ++j) {
+					wasm_uleb (&hsec, ld.len + h->off [j]);
+					wasm_uleb (&hsec, 1);
+					wasm_u8 (&hsec, h->val [j]);
+				}
+				wasm_buf_free (&ld);
+			}
+			emit_section (out, 0, &hsec);
+			wasm_buf_free (&hsec);
+		}
+	}
 
 	/* Code section (10): same order as the function section. */
 	wasm_buf_init (&sec);
