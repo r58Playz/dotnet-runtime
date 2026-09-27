@@ -275,6 +275,7 @@ struct InterpMethod {
 	/* Tier 2 (R316, MONO_WASM_JIT_T2). Full-width fields, not bitfields: the sample count is bumped racily from
 	 * every worker, and a bitfield write would clobber its neighbours. */
 	gint32 wasm_jit_t2_samples;   /* safepoint samples taken inside this method's tier-1 body */
+	gint32 wasm_jit_t2_body_samples;   /* R336: samples taken inside its TIER-2 body -- 0 after promotion means it never runs */
 	guint8 wasm_jit_tier;         /* 2 = its body was compiled at tier-2 policy (a same-IL re-emission keeps it); 3 = a tier-2
 	                               * attempt failed, was refused or given up. Either way never re-requested (R316c). */
 	guint8 wasm_jit_t2_want;      /* queued for a tier-2 recompile; read by mini.c through mono_wasm_jit_imethod_tier_want */

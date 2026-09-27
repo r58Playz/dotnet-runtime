@@ -1399,6 +1399,7 @@ typedef struct {
 	int          t2_inlined, t2_gi, t2_nopred, t2_calls_left, t2_calls_left_virt;
 	const char  *t2_down_reason;     /* R316h: the fail string of the tier-2 compile a downgrade replaced (static literal) */
 	int          t2_down_bail;
+	int          t2_refresh;         /* R337: mono_wasm_jit_refresh_batch's verdict on a re-emit: 0 standalone, >0 group re-framed, <0 failed; -9 = not a re-emit */
 	guint32      direct_dep_sig [MONO_WASM_JIT_MAX_DIRECT_DEPS];
 	MonoMethod  *direct_dep_method [MONO_WASM_JIT_MAX_DIRECT_DEPS]; /* callee behind each dep f-slot (diagnostics: names the method when an ABI/registration mismatch is caught at admit) */
 	/* MONO_WASM_JIT_HEAL_WAIT's heal_callees[] carried out of here: the callees this body emitted a
