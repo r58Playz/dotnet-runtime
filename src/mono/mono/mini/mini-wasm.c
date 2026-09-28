@@ -469,8 +469,8 @@ int mono_wasm_jit_reemit_misses = 64;
  * replacements bypass the optional rate limit but still use the same queue and publication chokepoint.
  * Clamped to [1, 64] -- 64 is
  * WJ_REEMIT_BATCH_MAX in interp.c and overrunning it would be a stack write past the array. */
-int mono_wasm_jit_reemit_batch = 16;
-int mono_wasm_jit_reemit_interval = 1000;
+int mono_wasm_jit_reemit_batch = 64;       /* 64 / 250 ms: the tier-2 broker's rate, shipped with tier 2 (R348) */
+int mono_wasm_jit_reemit_interval = 250;
 /* MONO_WASM_JIT_REEMIT_MAX: re-emissions per process, a ceiling the rate limit cannot be talked out of. */
 int mono_wasm_jit_reemit_max = 200;
 int mono_wasm_jit_rendezvous_test = 0;
@@ -602,10 +602,10 @@ int mono_wasm_jit_prof_blocks = 4;
 int mono_wasm_jit_forward_retired = 1;
 /* MONO_WASM_JIT_LEAN_TRY_INVOKE: the interpreter's call hook (WASM_JIT_TRY_INVOKE) calls wasm_jit_maybe_compile only
  * when the callee is still compile-eligible or JIT work is pending, instead of on every interpreted call. */
-int mono_wasm_jit_lean_try_invoke = 0;
+int mono_wasm_jit_lean_try_invoke = 1;
 /* MONO_WASM_JIT_IC_REMAT: IC sites read the PIC pointer/capacity imports at each use instead of four prologue locals
  * live across the body (EMIT_IC_VPIC_PTR in the emitter). */
-int mono_wasm_jit_ic_remat = 0;
+int mono_wasm_jit_ic_remat = 1;
 /* MONO_WASM_JIT_INLINE_CALLS (R315, plan Phase 3): inlinees may keep non-inlined calls and ctor calls, under the
  * per-compile policy below. A DIAGNOSTIC for the whole tier; it is meant to ship only as tier-2 policy (in tier 1
  * every call an inlinee keeps becomes a root direct callee that islands pull in at one hit). */
@@ -613,8 +613,12 @@ int mono_wasm_jit_inline_calls = 0;
 int mono_wasm_jit_inline_calls_limit = 35;   /* MONO_WASM_JIT_INLINE_CALLS_LIMIT: IL bytes */
 int mono_wasm_jit_inline_calls_cost = 120;   /* MONO_WASM_JIT_INLINE_CALLS_COST: replaces inline_method's 60 */
 int mono_wasm_jit_inline_calls_depth = 6;    /* MONO_WASM_JIT_INLINE_CALLS_DEPTH: replaces the depth cap of 10 */
-/* MONO_WASM_JIT_T2 (R316, plan Phase 4): sampled tier-2 recompiles of the hot set through the re-emission broker. */
-int mono_wasm_jit_t2 = 0;
+/* MONO_WASM_JIT_T2 (R316, plan Phase 4): sampled tier-2 recompiles of the hot set through the re-emission broker.
+ * On by default together with the bundle it was measured in -- LEAN_TRY_INVOKE, IC_REMAT, REEMIT_BATCH/INTERVAL,
+ * INLINE_COLD_THROW, PROF_ORIGIN, FAST_TLS, LDADDR_REF, T2_STATIC_PRED=2, all set at their initialisers: Minecraft
+ * server tick, with branch hints level 2, -8.6% P-core cycles and -23.6% calls against tier 2 off (R348, p70,
+ * b s o p p o s b). Needs MONO_WASM_JIT_T2_MAX_BODY (R349): without it tier 2 can hand TurboFan a ~320 KB body. */
+int mono_wasm_jit_t2 = 1;
 int mono_wasm_jit_t2_sample_ms = 2;      /* MONO_WASM_JIT_T2_SAMPLE_MS: sampling timer period */
 int mono_wasm_jit_t2_threshold = 48;     /* MONO_WASM_JIT_T2_THRESHOLD: samples before a method is queued */
 int mono_wasm_jit_t2_max = 2000;         /* MONO_WASM_JIT_T2_MAX: tier-2 requests per process */
@@ -625,12 +629,12 @@ int mono_wasm_jit_t2_gi_size = 120;      /* MONO_WASM_JIT_T2_GI_SIZE: guarded-in
 /* MONO_WASM_JIT_PROF_ORIGIN (R316b, plan Phase 3.5): the emitter's devirt / delegate / IC-width reads at a call site
  * that came from an inlinee ask the INLINEE's record first, then the compiled method's. Affects only compiles under
  * the per-compile inline policy (tier 2, INLINE_CALLS); a tier-1 inlinee has no call sites to read for. */
-int mono_wasm_jit_prof_origin = 0;
+int mono_wasm_jit_prof_origin = 1;
 /* MONO_WASM_JIT_FAST_TLS (R317, plan M3): mono_tls_get_thread_extern emitted as two loads through `s.b`. */
-int mono_wasm_jit_fast_tls = 0;
+int mono_wasm_jit_fast_tls = 1;
 /* MONO_WASM_JIT_INLINE_COLD_THROW (R318, plan Phase 3.4): throw-terminated IL segments are not counted toward the inline
  * size limit, under the per-compile policy only (tier 2, INLINE_CALLS). */
-int mono_wasm_jit_inline_cold_throw = 0;
+int mono_wasm_jit_inline_cold_throw = 1;
 /* MONO_WASM_JIT_INLINE_BFI (R319): inline a method of a BeforeFieldInit class whose cctor has not run, without running it.
  * BeforeFieldInit only requires the cctor before a static FIELD access, and such an access inside the inlinee is still
  * guarded (method-to-ir's ldsfld path: a runtime init check, or INLINE_FAILURE "class init"). */
@@ -639,7 +643,7 @@ int mono_wasm_jit_inline_bfi = 0;
  * it at that moment if the method has recorded nothing yet (interp/tiering.c). */
 int mono_wasm_jit_prof_share = 0;
 /* MONO_WASM_JIT_LDADDR_REF (R321): OP_LDADDR of a ref/byref scalar local, homed in its ref-shadow slot (addrslot -2). */
-int mono_wasm_jit_ldaddr_ref = 0;
+int mono_wasm_jit_ldaddr_ref = 1;
 /* MONO_WASM_JIT_REEMIT_VALIDATE (R322): a re-emit into a slot the compiling thread installed is validated there, not
  * published there (0 = the old install-on-validate, the positive control for the trap it removes). */
 int mono_wasm_jit_reemit_validate = 1;
@@ -647,8 +651,8 @@ int mono_wasm_jit_reemit_validate = 1;
  * it is recorded FAIL (0 = the old single attempt). */
 int mono_wasm_jit_t2_retry = 3;
 /* MONO_WASM_JIT_T2_STATIC_PRED (R329): a tier-2 GI site with no profile record predicts the callvirt's own method behind
- * the method-identity guard. */
-int mono_wasm_jit_t2_static_pred = 0;
+ * the method-identity guard; 2 (R333) also on a COLD verdict (a hot monomorphic IC site records one observation). */
+int mono_wasm_jit_t2_static_pred = 2;
 /* MONO_WASM_JIT_T2_REARM (R332): how many times a tier-2 request released on BUSY give-up is re-armed (0 = retire it). */
 int mono_wasm_jit_t2_rearm = 3;
 /* MONO_WASM_JIT_T2_SAMPLE_LOOP (R335): tier-2 samples are credited at loop polls only; an entry poll defers a pending
