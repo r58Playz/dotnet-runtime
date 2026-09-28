@@ -1326,6 +1326,12 @@ enum {
 	WJC_LAZY_REFUSE_REFLECT,   /* refused: System.Reflection (split out of SHAPE) */
 	WJC_LAZY_REFUSE_UNUSABLE,  /* refused: mono_wasm_jit_method_usable said no (split out of SHAPE) */
 	WJC_LAZY_RESIDUAL,         /* LAZY_T1=4: refused callees routed through the residual instead of blocking */
+	/* R371 census (ungated, changes nothing emitted): the wire bytes emitted per basic block and the call sites in it, by
+	 * the kind of block -- OTHER, a catch/filter/fault HANDLER, or a block that THROWS -- so the order +0/+1/+2 is fixed. */
+	WJC_COLD_BYTES_OTHER, WJC_COLD_BYTES_HANDLER, WJC_COLD_BYTES_THROW,
+	WJC_COLD_CALLS_OTHER, WJC_COLD_CALLS_HANDLER, WJC_COLD_CALLS_THROW,
+	WJC_COLD_T2_BYTES_COLD,    /* ... handler + throw bytes of tier-2 compiles */
+	WJC_COLD_T2_BYTES_ALL,     /* ... all block bytes of tier-2 compiles */
 	WJC_MAX
 };
 
