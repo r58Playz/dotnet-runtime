@@ -3431,7 +3431,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					if (pti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt; pti = ti_base + nextra++; }
 					uses_calls = TRUE;
 					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = this worker's action word */
-					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+					{
+						extern int mono_wasm_jit_t2, mono_wasm_jit_t2_sample_loop;
+						/* R355: under T2_SAMPLE_LOOP=2 an ENTRY poll reads only the low byte, so the loop-owed
+						 * sample bit (WJ_ACT_LOOP_SAMPLE, 0x100) never takes it into the helper. Same cost. */
+						if (mono_wasm_jit_t2 && mono_wasm_jit_t2_sample_loop == 2 && bb == cfg->bb_entry) {
+							wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, 0);
+						} else {
+							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+						}
+					}
 					WJ_HINT (0);   /* R339: the action word is almost always 0 */
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 					/* Materialize roots inside the rare taken arm, not before the flag load. */
@@ -3447,7 +3456,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * was spent in the caller -- so it falls to the plain poll below, which defers the sample
 						 * to the next loop back-edge. */
 						if (mono_wasm_jit_t2 && cfg->wasm_jit_caller_imethod &&
-						    !(mono_wasm_jit_t2_sample_loop && bb == cfg->bb_entry)) {
+						    !(mono_wasm_jit_t2_sample_loop == 1 && bb == cfg->bb_entry)) {   /* mode 2 samples at entry too (R355) */
 							/* R316 tier-2 hotness: every poll of a tier-1 body names its method, INSIDE this
 							 * rare arm -- the common path is unchanged. The InterpMethod* is process-wide. */
 							WasmFuncType pt1; int pt1i = -1, pk1;
@@ -3456,7 +3465,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							if (pt1i < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt1; pt1i = ti_base + nextra++; }
 							/* R336: bit 0 marks a TIER-2 body's poll (InterpMethod* is aligned), so the sampler can tell
 							 * whether the tier-2 generation is the one executing. */
-							wasm_i32_const (&body, (gint32) ((intptr_t) cfg->wasm_jit_caller_imethod | (cfg->wasm_jit_tier >= 2 ? 1 : 0)));
+							/* R355: bit 1 marks a LOOP poll, under T2_SAMPLE_LOOP=2 only (so other modes emit the same bytes) */
+							wasm_i32_const (&body, (gint32) ((intptr_t) cfg->wasm_jit_caller_imethod | (cfg->wasm_jit_tier >= 2 ? 1 : 0) |
+								(mono_wasm_jit_t2_sample_loop == 2 && bb != cfg->bb_entry ? 2 : 0)));
 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_t2, (guint32) pt1i);
 						} else if (mono_wasm_jit_edge_sample && bb == cfg->bb_entry)
 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_entry, (guint32) pti);
@@ -4507,8 +4518,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * the full residual marshal. Settled. */
 						gboolean aot_ok = !m_type_is_byref (csig->ret)
 							&& !call->rgctx_reg && !call->need_unbox_trampoline && !cci.vret_byaddr;
-						for (k = 0; k < (int) csig->param_count && aot_ok; ++k)
-							if (m_type_is_byref (csig->params [k])) aot_ok = FALSE;
+						/* R356: MONO_WASM_JIT_AOT_BYREF lets byref PARAMS through. A byref is an i32 address in the call
+						 * info (wasm_valtype_of_type), passed exactly as it is to a JIT callee, and the native AOT ABI
+						 * takes the same pointer; the object it points into is kept by the caller's shadow frame, as for
+						 * a JIT callee. A byref RETURN still bails. */
+						{
+							extern int mono_wasm_jit_aot_byref;
+							if (!mono_wasm_jit_aot_byref)
+								for (k = 0; k < (int) csig->param_count && aot_ok; ++k)
+									if (m_type_is_byref (csig->params [k])) aot_ok = FALSE;
+						}
 						if (aot_ok && mono_wasm_jit_aot_call_target (call_method, &aot_addr, &aot_rgctx, &aot_has_extra)) {
 							/* FROM cci.ftype, NOT ct. `ct` is the JIT-callee functype and carries the
 							 * trailing threaded frame base under MONO_WASM_JIT_THREAD_SP; an AOT body has
@@ -4556,6 +4575,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							}
 							{ extern int mono_wasm_jit_verbose; static int n_il = 0; if (mono_wasm_jit_verbose >= 2 && n_il++ < 128) { char *cn = mono_method_get_full_name (call->method); printf ("WASM_JIT_INLINE_AOT[%d] %s -> %s\n", n_il, mname, cn); g_free (cn); } }
 							break;
+						}
+						/* R356: which condition sent this direct call site to the residual, for the aroute dump.
+						 * Stats only; a pointer-keyed note, no metadata walk. */
+						if (G_UNLIKELY (mono_wasm_jit_stats)) {
+							extern void mono_wasm_jit_resid_emit_note (MonoMethod *m, const char *why);
+							mono_wasm_jit_resid_emit_note (call_method,
+								m_type_is_byref (csig->ret) ? "byref-ret" : call->rgctx_reg ? "rgctx" :
+								call->need_unbox_trampoline ? "unbox" : cci.vret_byaddr ? "vret" :
+								!aot_ok ? "byref-arg" : "aot-target-at-emit");
 						}
 					}
 					/* Callee NOT wasm-JITted (no f-slot): route just this call through the interpreter

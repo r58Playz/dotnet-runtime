@@ -289,6 +289,18 @@ Two corollaries:
 * **A guard that catches a race must COUNT its catches, and non-zero is then the healthy reading.** A catch
   counter stuck at 0 forever means the guard is dead code, not that the race is impossible.
 
+### An EH method's LMF record lives in its own frame (R353)
+
+With `MONO_WASM_JIT_EH_REC=1` (the default) an EH-bearing method links a `WjEhRec` -- a MonoLMFExt plus its
+il_state -- from its OWN C-stack frame into the thread's LMF chain, where the island design used a per-thread
+chunk array. So **an exit that skips the unlink leaves the chain pointing into dead stack**, which the next
+frame overwrites; the island equivalent pointed into stable memory and only went stale. Every exit therefore
+unlinks: EMIT_REF_LEAVE and the landing pad's no-handler rethrow, inline when the record is the head, else through
+`mono_wasm_jit_ehrec_unlink`, which unlinks through a stale INNER LMF but leaves a head pass 1 rewound PAST the
+record (restoring that resurrects retired frames). The interp->JIT boundary pops records of frames below its saved
+C SP. **Before adding an exit path to an EH method, or a way out of one that is not a C++ unwind through its
+landing pad, decide how it unlinks the record.** `[wasm-jit ehrec] dispatch_norec` must read 0.
+
 ### Ownership: publish before you free, and prefer leaking to freeing
 
 Registry entries, depsets and batch descriptors are read **lock-free by other workers**. A pointer published

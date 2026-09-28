@@ -1303,6 +1303,9 @@ enum {
 	WJC_EHREC_DISPATCH_NOREC,  /* R353: landing-pad dispatches whose cur_island was not the method's record; must be 0 */
 	WJC_EHREC_UNLINK_INNER,    /* R353: record exits that unlinked through a stale inner LMF left at the head */
 	WJC_EHREC_UNLINK_OUTER,    /* R353: record exits that found the head rewound past them (pass 1) and left it */
+	WJC_T2_LOOP_OWED,          /* R355: entry-poll samples that owed the next back-edge a second one (ungated) */
+	WJC_T2_LOOP_CREDIT,        /* R355: owed samples a back-edge took */
+	WJC_T2_LOOP_LATE,          /* R355: owed samples a back-edge reached more than 2 ms after the tick (dropped) */
 	WJC_MAX
 };
 
