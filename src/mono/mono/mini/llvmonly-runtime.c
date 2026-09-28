@@ -1061,6 +1061,20 @@ static GENERATE_GET_CLASS_WITH_CACHE (nullref, "System", "NullReferenceException
 static GENERATE_GET_CLASS_WITH_CACHE (index_out_of_range, "System", "IndexOutOfRangeException")
 static GENERATE_GET_CLASS_WITH_CACHE (invalid_cast, "System", "InvalidCastException")
 
+/*
+ * mono_wasm_seq_fence:
+ *
+ *   The llvm-only AOT's lowering of a SEQ OP_MEMORY_BARRIER on wasm (mini-llvm.c). LLVM's `fence seq_cst` becomes
+ * atomic.fence, which Binaryen's --precompute deletes at link; mono_memory_barrier () is an atomic exchange on
+ * wasm, which it cannot (mono-memory-model.h, R343). Without this, IKVM's Thread.MemoryBarrier around every Java
+ * volatile access in the AOT'd class library compiled to nothing.
+ */
+void
+mono_wasm_seq_fence (void)
+{
+	mono_memory_barrier ();
+}
+
 void
 mini_llvmonly_throw_nullref_exception (void)
 {

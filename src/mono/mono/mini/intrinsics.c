@@ -1731,6 +1731,17 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 				opcode = OP_ATOMIC_CAS_I4;
 				cfg->has_atomic_cas_i4 = TRUE;
 			}
+#ifdef TARGET_WASM
+			/* wasm32 has a native i64.atomic.rmw.cmpxchg, and the LLVM path keeps longs whole
+			 * (COMPILE_METHODIR skips mono_decompose_long_opts), so a 64-bit CAS need not go through the
+			 * icall wrapper -- which the Minecraft server tick spends ~1.1% in (AtomicLong.compareAndSet,
+			 * Random.next). The icall already does the same native cmpxchg (C11 atomics, ATOMIC_LLONG_LOCK_FREE
+			 * asserted in atomic.h), so alignment requirements are unchanged. Not for the wasm JIT: its
+			 * emitter does not lower OP_ATOMIC_CAS_* and would bail the caller instead of calling the icall. */
+			else if (COMPILE_LLVM (cfg) && param1_type->type == MONO_TYPE_I8) {
+				opcode = OP_ATOMIC_CAS_I8;
+			}
+#endif
 #endif
 			else
 				return NULL;
@@ -1770,7 +1781,8 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 
 			MONO_EMIT_NULL_CHECK (cfg, args [0]->dreg, FALSE);
 			MONO_INST_NEW (cfg, ins, opcode);
-			ins->dreg = is_ref ? alloc_ireg_ref (cfg) : alloc_ireg (cfg);
+			/* A 64-bit result on a 32-bit target is a long vreg (only reachable via the TARGET_WASM arm above). */
+			ins->dreg = is_ref ? alloc_ireg_ref (cfg) : (SIZEOF_REGISTER == 4 && opcode == OP_ATOMIC_CAS_I8) ? alloc_lreg (cfg) : alloc_ireg (cfg);
 			ins->sreg1 = args [0]->dreg;
 			if (is_float) {
 				ins->sreg2 = f2i_new->dreg;

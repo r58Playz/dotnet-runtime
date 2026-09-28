@@ -7747,6 +7747,21 @@ MONO_RESTORE_WARNING
 			break;
 		}
 		case OP_MEMORY_BARRIER: {
+#ifdef TARGET_WASM
+			/* R343: a `fence seq_cst` becomes atomic.fence, and Binaryen's --precompute (emcc -O2 link) deletes every
+			 * one of them, so a SEQ barrier around ordinary accesses (IKVM's Thread.MemoryBarrier before/after each Java
+			 * volatile access) reached the binary as NOTHING and x86 could reorder the store before a later load --
+			 * the AQS lost-unpark wedge (R340). Call a runtime barrier it cannot delete. ACQ/REL stay fences: x86
+			 * orders those physically, and wasm has no weaker atomics to express them with anyway. */
+			if (ctx->llvm_only && ins->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_SEQ) {
+				LLVMTypeRef fsig = LLVMFunctionType0 (LLVMVoidType (), FALSE);
+				LLVMValueRef fcallee = get_callee (ctx, fsig, MONO_PATCH_INFO_JIT_ICALL_ADDR, GUINT_TO_POINTER (MONO_JIT_ICALL_mono_wasm_seq_fence));
+				/* A plain call, not emit_call: the barrier cannot throw, so inside a try region an invoke or an
+				 * unwind-flag check would be pure overhead. */
+				LLVMBuildCall2 (builder, fsig, fcallee, NULL, 0, "");
+				break;
+			}
+#endif
 			mono_llvm_build_fence (builder, (BarrierKind) ins->backend.memory_barrier_kind);
 			break;
 		}

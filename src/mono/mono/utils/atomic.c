@@ -13,6 +13,15 @@
 #include <glib.h>
 
 #include <mono/utils/atomic.h>
+#include <mono/utils/mono-memory-model.h>
+
+#if defined(HOST_WASM) && defined(__wasm_atomics__)
+/* mono_memory_barrier's exchange target (mono-memory-model.h, R343): per thread, so the barrier never bounces a
+ * shared cache line between cores. MONO_WASM_HW_FENCE (read with the wasm JIT knobs) selects it; 0 = the old
+ * atomic.fence, which wasm-opt deletes. */
+__thread int mono_wasm_fence_word;
+int mono_wasm_hw_fence = 1;
+#endif
 
 #if defined (WAPI_NO_ATOMIC_ASM) || defined (BROKEN_64BIT_ATOMICS_INTRINSIC)
 #define NEED_64BIT_CMPXCHG_FALLBACK

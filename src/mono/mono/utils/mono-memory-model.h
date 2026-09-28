@@ -36,6 +36,34 @@ mono_memory_barrier (void)
 
 #define mono_compiler_barrier() _ReadWriteBarrier ()
 
+#elif defined(HOST_WASM) && defined(__wasm_atomics__)
+
+/* __sync_synchronize() is an atomic.fence, and Binaryen's --precompute (run by `emcc -O2` at link) deletes every
+ * atomic.fence in the binary: all wasm atomics are seq-cst, so it treats a fence as redundant. Around ORDINARY
+ * accesses it is not -- on x86 a later load may then pass an earlier store, and every StoreLoad protocol here
+ * (hazard pointers, Dekker-style handshakes) silently loses its barrier. An atomic read-modify-write cannot be
+ * deleted and V8 lowers it to a locked instruction, a full barrier. MONO_WASM_HW_FENCE=0 restores the strippable
+ * fence (the positive control). See MINECRAFT-FINDINGS R343. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern __thread int mono_wasm_fence_word;
+extern int mono_wasm_hw_fence;
+#ifdef __cplusplus
+}
+#endif
+
+static inline void
+mono_memory_barrier (void)
+{
+	if (__builtin_expect (mono_wasm_hw_fence, 1))
+		(void) __atomic_exchange_n (&mono_wasm_fence_word, 0, __ATOMIC_SEQ_CST);
+	else
+		__sync_synchronize ();
+}
+
+#define mono_compiler_barrier() asm volatile("": : :"memory")
+
 #elif defined(USE_GCC_ATOMIC_OPS) || defined(HOST_WASM)
 
 static inline void

@@ -32,6 +32,8 @@ G_EXTERN_C void mini_llvmonly_init_delegate (MonoDelegate *del, MonoDelegateTram
 G_EXTERN_C void mini_llvm_init_method (MonoAotFileInfo *info, gpointer aot_module, gpointer method_info, MonoVTable *vtable);
 
 G_EXTERN_C void mini_llvmonly_throw_nullref_exception (void);
+/* R343: a seq-cst barrier wasm-opt cannot delete; the llvm-only AOT lowers OP_MEMORY_BARRIER (SEQ) to a call. */
+G_EXTERN_C void mono_wasm_seq_fence (void);
 G_EXTERN_C void mini_llvmonly_throw_index_out_of_range_exception (void);
 G_EXTERN_C void mini_llvmonly_throw_invalid_cast_exception (void);
 
