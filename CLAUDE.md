@@ -284,8 +284,8 @@ Two corollaries:
   `mono_method_signature_internal`) under the jit-mm lock, and its lookup asserts on an uninitialised
   `interp_code_hash`. Use `mono_interp_peek_imethod` for a predicate. **But the rule is not "never call
   get_imethod here":** it is *a predicate whose ANSWER does not depend on creating one must not create one*.
-  Sites whose job is to bring a blocker up (the island DFS) genuinely need the creation, and peeking there
-  wedges boot.
+  The lazy pool's reservation (`mono_wasm_jit_lazy_im`) genuinely needs the creation -- the reservation lives on
+  the InterpMethod -- as the island DFS did before it was deleted (R366), where peeking wedged boot.
 * **A guard that catches a race must COUNT its catches, and non-zero is then the healthy reading.** A catch
   counter stuck at 0 forever means the guard is dead code, not that the race is impossible.
 
@@ -300,6 +300,36 @@ unlinks: EMIT_REF_LEAVE and the landing pad's no-handler rethrow, inline when th
 record (restoring that resurrects retired frames). The interp->JIT boundary pops records of frames below its saved
 C SP. **Before adding an exit path to an EH method, or a way out of one that is not a C++ unwind through its
 landing pad, decide how it unlinks the record.** `[wasm-jit ehrec] dispatch_norec` must read 0.
+
+### Lazy tier-1 f-slots: a pool slot is callable before its callee exists (R361-R365)
+
+A direct call to a callee that is not JITted and not AOT-backed does not fail the compile (the island machinery that
+used to force-compile such callees is deleted, R366): the emitter RESERVES the callee an e/f pair from a per-functype pool
+(`mini-wasm-lazy.inc`), and the f-slot holds, on every worker that instantiated its BANK, a stub of that functype
+(`wasm_module_lazy_bank`) that binds the real callee through `mono_wasm_jit_late_fslot` or runs it in the
+interpreter. This turns three of the invariants above around, so before touching admission, installation or no-GC
+credit:
+
+* **A pool slot's real f is written only by admission, after its dependency walk.** Callers go live against the
+  STUB, so the moment a real f lands in the slot every caller on that worker calls it. The compiling worker therefore
+  validates without installing (the R322 path), `mono_wasm_jit_instantiate_local`/`_batch_local` instantiate the
+  slot's bank BEFORE any real f in it (a later bank instantiation would write the stub back, and admission's cache
+  would then hand the stub its own slot to tail-call forever), and bind checks the table holds what this worker
+  installed (`WJC_LAZY_REPAIR` counts a violation instead of hanging).
+* **Admission never descends into a pool dep**; it ensures the bank. The one exception is a callee registered no-GC
+  AT that slot, which is admitted for real so a caller may be credited for it (`wj_lazy_dep_needs_real`).
+* **A pool slot is not credited no-GC otherwise** -- bind can compile, instantiate and run a cctor. Because callers
+  now compile BEFORE their callees, that credit is mostly unavailable at tier 1 (pin elision 96% -> 85%, R362);
+  tier 2 re-emits after the callees exist and gets it back.
+* **"Bank instantiated" is per pthread** (a worker take-up re-applies every stub, R293), and a bank bakes no TLS:
+  the stub gets its scratch from a helper, never `s.b`.
+
+A callee the pool refuses (AOT-backed, permanently un-JITtable, a wrapper other than synchronized/dynamic-method, a
+functype it cannot stub) takes the residual -- nothing brings it up by force any more, and a devirt arm whose target
+cannot be reserved is simply dropped. Must read 0: `[wasm-jit lazy]` orphan, bank_fail, repair, notreal, drift, dead.
+`bind` is the liveness check, `residual` counts the refusals routed through the interpreter. Against the island
+path: registered -39%, instantiations -43%, peak VmData -700 to -900 MiB (first config under the sandboxed 8 GiB in
+every soak run), boot not worse, server tick neutral over four batches (R361-R365).
 
 ### Ownership: publish before you free, and prefer leaking to freeing
 
@@ -359,10 +389,11 @@ What exists now, and what each thing is worth:
 * **`mono_wasm_jit_method_usable`** (`MONO_WASM_JIT_BADMETH`, default 1) converts the DETECTABLE subset
   into a counted refusal at four sites. It does **not** make retention safe — a freed-but-in-range
   pointer still passes — and `WJC_BADMETH_SEEN` is its liveness check.
-* **Still open:** `WjRegEntry.body_method`/`.logical_method`, `WjProfSite.id_targets[]`,
-  `WjDepSet.method[]`, `wj_block_tab`, `wj_waiter_key` and `wj_sync_inner_canon` all still retain raw
-  pointers. `canon_subst` measures the last one at ~300/run. The root fix is to stop retaining, or to
-  purge on `mono_mem_manager_free`; neither is done.
+* **Still open:** `WjRegEntry.body_method`/`.logical_method`, `WjProfSite.id_targets[]`, `WjDepSet.method[]`,
+  `wj_sync_inner_canon` and the lazy pool's `WjLazySlot.method` all still retain raw pointers (`wj_block_tab` and
+  `wj_waiter_key` went with the islands, R367). `canon_subst` measures `wj_sync_inner_canon` at ~300/run; bind and
+  the interpreter leg test `WjLazySlot.method` with `mono_wasm_jit_method_known_dead` first (`[wasm-jit lazy]
+  dead=` must read 0). The root fix is to stop retaining, or to purge on `mono_mem_manager_free`; neither is done.
 * **An instrumentation gap to fix before quoting those counters:** `WJC_BADMETH_SEEN` is an AGGREGATE
   over all sites, so `registry=0 profile=0` cannot distinguish "ran and caught nothing" from "never ran".
   Those two counters had no caller at all for months and read exactly the same then. A per-site
@@ -664,7 +695,7 @@ point of it.
 | **WasmGC as a redesign target** | CLOSED ON EVIDENCE, not feasibility (R180). TeaVM ships both backends, same source/V8/machine: **wasm-gc 0.430 vs linear memory 0.415 — wasm-gc is SLOWER.** The reachability objection (mono's heap, metadata, GC and the AOT half all share linear-memory objects with JIT'd code) is the second reason, not the first |
 | exception handling as a cost | 0.240% of window in self time across 37 EH symbols; ALL interpretation is 0.749%. `mono_llvm_cpp_catch_exception` sits on 92.5% of stacks but is a STRUCTURAL wrapper frame around protected regions, not an exception in flight. Frames meaning an exception is actually in flight are **0.08-0.19% of stacks**. The real EH cost is that `mono_method_check_inlining` refuses ANY method with a clause |
 | interpreter in the hot path | `mono_interp_exec_method` occurs 1.12x per stack; 72% of stacks have exactly the one thread-entry frame |
-| Liftoff / V8 tiering | 59.3% of our self time is `turbofan`, 0.41% `liftoff`; **98.41% of our tier's executed time is already TurboFan-tiered**, so tier-up is not what blocks inlining — callee LOCALITY is |
+| Liftoff / V8 tiering | 59.3% of our self time is `turbofan`, 0.41% `liftoff`; **98.41% of our tier's executed time is already TurboFan-tiered**, so tier-up is not what blocks inlining — callee LOCALITY is. The plateau residue is ~1.8% of server cycles (425 warm functions' Liftoff bodies plus `WasmLiftoffFrameSetup`, which every Liftoff entry calls under `wasm_inlining`), and the `compilationPriority` section that could release it is an EXPERIMENTAL V8 feature the product's Chrome skips (R370) |
 | local renaming, coalescing, `local.tee`, copy-chain elimination as *runtime* levers | V8 source proves local ops are free; these are wire-size only |
 | helper-import cap | not binding: max 30 declared in any hot module, median 3, cap 192 |
 | `IKVM_LAZY_BODIES=0` | 11.2% WORSE; the shipped setting is already optimal |
@@ -687,7 +718,7 @@ with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A
 | module batching **as it was originally built** | measured negative four times (-26.6%, -35.7%, -13.0%, regression) for two mechanical reasons, and BOTH are now gone: producing a batched body cost a full `mini_method_compile` per member (bodies are now relocatable and re-framing is a memcpy), and the planner planned a plateau ONCE, on a quiescence this workload never reaches. Do not re-run the OLD arms or re-tune `batch_max`/`batch_bytes` (measured non-binding). **Co-location is UNCONDITIONAL** — R245 verified there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no variable behind it, so the `=1`/`=0` arms this file used to describe are not performable. Same for `MONO_WASM_JIT_SCC_COLOCATE`, which several comments still offer as an in-binary A/B. `COLOCATE_MERGE` and `COLOCATE_MAX` are real |
 | **raising co-location's STATIC capture** | **R258's CLOSURE IS RETRACTED (R269) -- the measurement stands, the conclusion does not.** R258 read the tick at **-1.2% against a control arm whose own spread was 5.0%**, i.e. it could not have resolved its own lever: sized independently, converting the ~27.4% of dispatch that is a devirt arm still going indirect is worth **~2.5-3.7 M/tick = 1.5-2.2% of the thread**, under half that spread. CLAUDE.md's own rule -- under ~12%, measure the MECHANISM, not the outcome -- was not applied to R258 itself. **And co-location is NOT independent of re-emission**: `WASM_RELOC_CALL` is only emitted when the callee already has an f-slot, so only re-emission creates the holes co-location fills (REEMIT=0 -> 1 measured **+1,077 devirt arms, +1,258 absolute module-local calls**). Never A/B the two separately again. The original R258 text follows, still true as measurement: **CLOSED ON OUTCOME (R258)** `MONO_WASM_JIT_COLOCATE_MERGE=1` moved captured call edges **32.4% -> 44.2%** and `callform local` **+126%** -- and the server tick did not move: OFF mean 167.0 (spread 8.4 = 5.0%), ON mean 165.1, a difference of **-1.2%, one quarter of the control arm's own spread**. The reason is that execution-weighted co-residency only went **4.47% -> 6.53%**, and 2.1 points against a ~5% IC-miss share of dispatch is ~0.1% of dispatch. Ships 0. **Static capture is not the binding constraint; execution weight is.** If this is revisited the target is a profile-weighted global partitioner -- `partreach.py` puts the cap-16 ceiling at 96.4% and a global agglomerative partition at 51.5% of the residual, and an offline seed-and-grow reaches 79% of call edges internal at 16 members, 85.5% execution-weighted |
 | **co-location as a route to "most dispatch is a direct call"** | CLOSED ON STRUCTURE (R195). The reachable set is only the devirt predicted arms — both `WASM_RELOC_CALL` sites are gated on the callee already having an f-slot, so a callee un-JITted at emit time has NO hole and only RE-EMISSION can convert it. Arm-local plateaus ~30% because **co-location is a PARTITION and the arm graph is not partitionable**: if two callers hold arms on the same target, only one can have it co-resident. Proof it is the partition and not tuning: surviving refusals are **100% caps, 0 rules**, and doubling `COLOCATE_MAX` bought **+1.5 points**. `max=64`+`bytes=131072` also CRASHES (undiagnosed); `max=32` is clean. The mechanism that bypasses a partition is DUPLICATION — shadow copies |
-| **SCC co-location as a source of reach** | 7 modules / 24 members per boot against a ~24,000-method tier. Cycles are rare on this workload. Kept as a CORRECTNESS mechanism (an intra-cycle import cannot be ordered), never as a performance lever |
+| **SCC co-location as a source of reach** | 7 modules / 24 members per boot against a ~24,000-method tier. Cycles are rare on this workload. It was kept as a correctness mechanism until R366 deleted it with the islands: a lazy pool slot lets cycle members bake each other's f-slot before either exists, so nothing needs ordering. Never a performance lever |
 | shadow copies — cap sweeps (`WJ_SHADOW_MAX`, `MONO_WASM_JIT_SHADOW_BYTES`) | **CLOSED after ranking, R201/R202.** SELECTION ORDER was the real variable: ranking candidates by **sites/bytes descending** gives 63.7% arm-local with 2.8% FEWER bodies than encounter order at identical caps. After that, raising the caps drove `ShadowCap` to 0 and conversion did **not** move — with ranked selection the candidate SUPPLY is exhausted. **A cap closed as "non-binding" is closed only for the population it was measured on** — an earlier sweep saw 169 shadows where the current stack has 23,202, and its closure had to be retracted. Ships `MONO_WASM_JIT_SHADOW=0`; plateau is ~63% arm-local ≈ ~54% of executed dispatch direct, at **+50% bodies**, and the timing cost of that is still unpriced |
 | `shadowNojit` as evidence about the AOT wall | the counter is a TAUTOLOGY: shadow collection walks `WASM_RELOC_CALL`, which only ever names an already-JITted callee, so `nojit` cannot fire. AOT callees emit `WASM_RELOC_AOT` and are never candidates |
 | "55% of real call sites target the main module" as a co-location ceiling | RETRACTED (R180) — that is a STATIC SITE COUNT. From 2,598,503 caller->callee edge instances, **93.66% of calls out of our tier land in our own tier** and only 6.24% in AOT code. The AOT wall is not what limits co-location reach |
@@ -1038,7 +1069,7 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 | `faultcensus.mjs` | Per-class fault census over the archived corpus (`--since`, `--json`). **`--disjoint` runs the disjointness invariant over all ~3,500 real logs**, which is what catches the classifier bugs a sample-based selftest cannot: the sample test passed while five were live |
 | `depcheck.py` | **The admission-contract gate.** `depcheck.py <graph.log> <dump.wat\|dir>` — every f-slot BAKED into a body against every f-slot a descriptor DECLARES. An undeclared one is unadmittable by construction and becomes a `function signature mismatch` on the first worker that reaches it (R285). **Both inputs must come from ONE run** — f-slot numbers are per-run — and it REFUSES below a 25% ownership ratio rather than reporting a cross-run pairing as clean. `wasmtier.mjs --depgraph` emits both from one run |
 | `reap.sh` | Dead-pid `/tmp/perf-*.map`, orphaned profiles, v8 isolate logs. Refuses to run if the seed profile is missing. `--apply` to act; dry-run by default |
-| `enctest/run.sh` | Four host-side encoder gates in seconds. t1/t2 diff against frozen framers, t3 is the serializer round-trip, **t4 is structural** — it checks the assembler at `nexport < nmembers`, which t1/t2 cannot reach. Run it before believing anything else about the encoder |
+| `enctest/run.sh` | Host-side encoder gates in seconds. t1/t2 diff against frozen framers, t3 is the serializer round-trip, **t4 is structural** — it checks the assembler at `nexport < nmembers`, which t1/t2 cannot reach; t5 re-framing, t6 branch hints, **t7 frames lazy stub banks and EXECUTES them in node** (tail-call bind, interpreter leg, throw, the i32 pin frame). Run it before believing anything else about the encoder |
 | `killdaemons.sh` | Kills leftover Roslyn/MSBuild build servers using preflight's own match, safely. Exit 0 = safe to measure. Run before every measurement |
 | `wjcsync.py` | Re-index the JS counter mirror after `WJC_*` entries change in the C enum. **Use this instead of hand-editing the mirror in `lib/mcdrive.mjs`** |
 | `lib/preflight.mjs` | Refuses to measure on a box that is unfit (thermal, CPU contention, build daemons). Obey the refusal |

@@ -1370,12 +1370,11 @@ typedef struct {
  * (cfg->wasm_jit_result) instead of thread-local relays. Per-compile => re-entrancy-safe by
  * construction: a nested cctor/AOT-init compile gets its own cfg and cannot clobber the outer result.
  * Read back by mono_wasm_force_compile (which gets cfg from mini_method_compile), copied BY VALUE into a
- * caller stack local before cfg is destroyed. The blockers array is therefore INLINE (not mempool/heap):
+ * caller stack local before cfg is destroyed. Its arrays are therefore INLINE (not mempool/heap):
  * a cfg->mempool pointer would dangle after mono_destroy_compile, and `bytes` is the only field whose
  * ownership transfers out (g_malloc'd). Defined unconditionally (mono_wasm_force_compile compiles into
  * the cross-compiler too).
  */
-#define MONO_WASM_JIT_MAX_BLOCKERS 32
 #define MONO_WASM_JIT_MAX_DIRECT_DEPS 128
 typedef struct {
 	int          desc_id;            /* immutable centralized descriptor; published atomically on InterpMethod */
@@ -1386,10 +1385,7 @@ typedef struct {
 	int          bytes_len;
 	int          bail;               /* bail category: 0=ok; -2..-12; >0 unsupported opcode */
 	const char  *fail_reason;        /* the emitter's fail string (a static literal, or NULL on success) — carried to InterpMethod.wasm_jit_fail so the weighted vperm dump can name the exact gate, not just the category */
-	int          retriable;          /* 1 iff bail was "callee not jitted" (un-JITted direct callee) */
-	int          nblockers;          /* # entries in blockers[] (residual=0 island pre-scan) */
-	guint8       blockers_truncated; /* 1 if more than MONO_WASM_JIT_MAX_BLOCKERS distinct blockers existed */
-	MonoMethod  *blockers [MONO_WASM_JIT_MAX_BLOCKERS]; /* un-JITted direct callees; inline so it survives the by-value copy out of cfg */
+	int          retriable;          /* 1 iff the bail can clear: "callee not jitted", or a per-worker instantiate failure */
 	int          ndirect_deps;       /* exact f-slots reached by unchecked direct calls in this module */
 	guint8       direct_deps_truncated;
 	int          direct_deps [MONO_WASM_JIT_MAX_DIRECT_DEPS];

@@ -10149,41 +10149,9 @@ mono_wasm_jit_get_callee_fslot (MonoMethod *method)
 {
 	/* PEEK, not get: this runs on a worker inside the compile section. See mono_interp_peek_imethod. */
 	InterpMethod *im = mono_interp_peek_imethod (method);
-	/* Prefer the published (live) f-slot; else the reserved-but-unpublished slot of an SCC member currently
-	 * being batch-compiled, so mutually-recursive cycle members bake each other's f-slot at emit time. */
-	int fs = im ? (im->wasm_jit_fslot > 0 ? im->wasm_jit_fslot : im->wasm_jit_resv_fslot) : 0;
+	/* The published f-slot only. A callee without one gets a lazy pool slot at the call site (wj_lazy_reserve). */
+	int fs = im ? im->wasm_jit_fslot : 0;
 	wj_note_callee_resolution (im, fs);
-	return fs;
-}
-
-/* A callee's f-slot, where an UNPUBLISHED reservation is visible only to a FELLOW BATCH MEMBER.
- *
- * R245 Stage 2d shipped `published only` for the devirt/delegate arms and it cost 2 of 10 SCC batches
- * (sccNoProgress 0 -> 2, 20 members spared instead of published). The audit behind it said those arms
- * "each have a correct <= 0 path", which was true and beside the point: correct meant *does not crash*,
- * not *does not change the outcome*. Inside a call cycle a devirt target can legitimately BE a fellow
- * member holding only a reservation -- that is the exact case reservations exist for -- so cutting the
- * arms off from reservations entirely removed the thing that lets a cycle close.
- *
- * The right scope is neither "everyone" nor "nobody": a reservation is a promise made BY a batch, and it
- * is safe exactly for the members of that batch, because the batch either publishes all of them or aborts
- * and none of them ever goes live. `self` holding a reservation is what identifies a caller as a member.
- * An unrelated compile still sees 0 and falls back to its IC, which is what Stage 2d was actually for. */
-int
-mono_wasm_jit_get_callee_fslot_batchlocal (MonoMethod *callee, MonoMethod *self)
-{
-	InterpMethod *cim = mono_interp_peek_imethod (callee);
-	InterpMethod *sim;
-	int fs = 0;
-	if (cim) {
-		if (cim->wasm_jit_fslot > 0)
-			fs = cim->wasm_jit_fslot;
-		else if (cim->wasm_jit_resv_fslot > 0) {
-			sim = self ? mono_interp_peek_imethod (self) : NULL;
-			fs = (sim && sim->wasm_jit_resv_fslot > 0) ? cim->wasm_jit_resv_fslot : 0;
-		}
-	}
-	wj_note_callee_resolution (cim, fs);
 	return fs;
 }
 
@@ -10196,40 +10164,15 @@ mono_wasm_jit_get_callee_imethod (MonoMethod *method)
 	return mono_interp_get_imethod (method);
 }
 
-/* runtime wasm JIT: the synchronized-inner substitution in mono_wasm_force_compile compiles the WRAPPED
- * body under its own MonoMethod, while the SCC batch reserved the slot pair on the INNER wrapper's
- * imethod (the batch member — and the f-slot key fellow members bake via get_callee_fslot). Carry the
- * original (pre-substitution) method across that compile so the registration's reservation lookup below
- * still finds it. Without this the inner registered into a FRESH pair and the outer synchronized
- * wrapper's baked dep f-slot never registered -> admit ABI_MISMATCH (fslot-unregistered) -> both
- * wrappers permanently interp-pinned per thread (live: the recursive synchronized
- * Field/Executable:declaredAnnotations pair). Thread-local + reentrancy-guarded force_compile => at
- * most one owner per thread, no cross-compile bleed. */
-static __thread MonoMethod *wj_resv_owner;
-
-void
-mono_wasm_jit_set_resv_owner (MonoMethod *method)
-{
-	wj_resv_owner = method;
-}
-
-/* runtime wasm JIT: the slot pair this compile must instantiate INTO, if one is already reserved. 0 = none,
- * allocate fresh.
- *
- * Checked in priority order:
- *  1. a live SCC batch reservation on this method — fellow cycle members have already baked this f-slot into
- *     their modules, so it MUST win over anything else;
- *  2. the same, on the reservation OWNER (the synchronized-inner wrapper this compile was substituted from);
- *  3. this method's private self-recursion reservation, which unlike (1) survives a failed emit.
- */
+/* runtime wasm JIT: the slot pair this compile must instantiate INTO, if one is already reserved (a self-recursion
+ * pair or a lazy pool pair, see wasm_jit_self_resv_* in interp-internals.h). 0 = none, allocate fresh. */
 int
 mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
 {
 	/* PEEK, NOT GET (R245 Stage 2d). This is a pure QUERY -- "is a pair already reserved for this
 	 * method" -- and mono_interp_get_imethod is not a lookup: on a miss it CREATES an InterpMethod
 	 * (m_method_alloc0 + mono_method_signature_internal) under the jit-mm lock. This function runs on a
-	 * WORKER inside the compile section, on every emit, and via wj_resv_owner it can be asked about a
-	 * method that is not cfg->method at all. That is precisely the crash class R238/R239 chased --
+	 * WORKER inside the compile section, on every emit. That is precisely the crash class R238/R239 chased --
 	 * `memory access out of bounds` in mono-internal-hash.c, and boot wedges -- and every neighbouring
 	 * predicate (get_callee_fslot, callee_too_cold, callee_perm_unjittable) was switched to peek for it.
 	 * This one was missed.
@@ -10240,21 +10183,7 @@ mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
 	/* An R170 RE-EMIT PIN was checked FIRST here, keyed on the MonoMethod rather than the InterpMethod
 	 * because compile_publish re-looks-up the InterpMethod under the jit-mm lock after compiling, so an
 	 * InterpMethod-keyed seed was read from the wrong object and every re-emit landed on a fresh pair
-	 * (WASM_JIT_REEMIT_SLOT_MOVED x20). Gone with re-emission; the three reservations below are the
-	 * remaining sources and none of them needs to survive an InterpMethod replacement. */
-	if (im && im->wasm_jit_resv_fslot > 0) {
-		*e_out = im->wasm_jit_resv_eslot;
-		*f_out = im->wasm_jit_resv_fslot;
-		return 1;
-	}
-	if (wj_resv_owner && wj_resv_owner != method) {
-		InterpMethod *oim = mono_interp_peek_imethod (wj_resv_owner);   /* peek: see the note above */
-		if (oim && oim->wasm_jit_resv_fslot > 0) {
-			*e_out = oim->wasm_jit_resv_eslot;
-			*f_out = oim->wasm_jit_resv_fslot;
-			return 1;
-		}
-	}
+	 * (WASM_JIT_REEMIT_SLOT_MOVED x20). Gone with re-emission. */
 	if (im && im->wasm_jit_self_resv_fslot > 0) {
 		*e_out = im->wasm_jit_self_resv_eslot;
 		*f_out = im->wasm_jit_self_resv_fslot;
@@ -10268,13 +10197,12 @@ mono_wasm_jit_self_reserved (MonoMethod *method, int *e_out, int *f_out)
  * burning a fresh pair out of a bump allocator that has no free (see wasm_jit_self_resv_* in
  * interp-internals.h for why that mattered).
  *
- * Takes an existing batch/owner reservation if there is one rather than minting a second — a duplicate would
- * both leak and trip the RESV_BYPASS identity check in wasm_jit_compile_scc.
+ * Takes an existing reservation (a lazy pool pair) if there is one rather than minting a second, which would leak.
  *
- * Serialized by the caller: every path into mono_wasm_emit_method holds wj_compiling (compile_publish takes
- * it; the SCC batch takes it around force_compile), so the read-test-write below is not racy.
+ * Serialized by the caller: every path into mono_wasm_emit_method holds wj_compiling, so the read-test-write
+ * below is not racy.
  *
- * Returns 1 with *e_out/*f_out set, or 0 if the function table is exhausted. */
+ * Returns 1 with *e_out and *f_out set, or 0 if the function table is exhausted. */
 int
 mono_wasm_jit_reserve_self (MonoMethod *method, int *e_out, int *f_out)
 {
@@ -10301,6 +10229,32 @@ mono_wasm_jit_reserve_self (MonoMethod *method, int *e_out, int *f_out)
 	*e_out = e;
 	*f_out = f;
 	return 1;
+}
+
+/* Phase 5 (MONO_WASM_JIT_LAZY_T1, mini-wasm-lazy.inc): the reservation state of `method`'s InterpMethod, created if
+ * missing -- the pool logic lives in mini-wasm.c, where InterpMethod is opaque. Creation is what a reservation needs,
+ * so this is get, not peek. Called only from the compile section, which wj_compiling serialises, like reserve_self. */
+gpointer mono_wasm_jit_lazy_im (MonoMethod *method, int *fslot, int *self_resv_f);
+gpointer
+mono_wasm_jit_lazy_im (MonoMethod *method, int *fslot, int *self_resv_f)
+{
+	InterpMethod *im = mono_interp_get_imethod (method);
+	if (!im)
+		return NULL;
+	*fslot = im->wasm_jit_fslot;
+	*self_resv_f = im->wasm_jit_self_resv_fslot;
+	return im;
+}
+
+/* ... and the pool pair it was handed, stored where mono_wasm_jit_self_reserved will find it when the
+ * method compiles, so it instantiates INTO the slot its callers baked. */
+void mono_wasm_jit_lazy_im_reserve (gpointer imp, int e, int f);
+void
+mono_wasm_jit_lazy_im_reserve (gpointer imp, int e, int f)
+{
+	InterpMethod *im = (InterpMethod *) imp;
+	im->wasm_jit_self_resv_eslot = e;
+	im->wasm_jit_self_resv_fslot = f;
 }
 
 /*
@@ -10380,48 +10334,6 @@ mono_wasm_jit_callee_perm_unjittable (MonoMethod *method)
 #endif
 }
 
-/* runtime wasm JIT (cold-leaf residual, MONO_WASM_JIT_RESIDUAL_COLD): 1 if this un-JITted DIRECT callee is
- * genuinely COLD — i.e. the island cold-gate (wj_blocker_too_cold) would refuse to pull it in: it is still
- * COUNTING hits (slot==0, never crossed the auto-JIT threshold), its hit count is below thresh/cold_div, and
- * it has NOT block-promoted (blocked >= block_promote islands). Such a callee is a cold branch — an IKVM
- * lambda factory (__<GetInstance>), a one-shot cctor/init, an error path — reached rarely from a hot caller.
- * Under residual=0 the emitter routes JUST this edge through the interp residual instead of bailing the whole
- * (hot) caller, so the hot method JITs while paying ~1 JIT->interp transition per cold call — NOT a per-
- * iteration storm on the hot path. Deliberately returns 0 for: an already-f-slotted callee (fslot>0: not a
- * blocker); a parked/retry callee (slot -2/-3: it CROSSED the hotness threshold = hot-but-blocked, so
- * residual-routing it WOULD storm — the island must close it instead); and a permanent callee (slot -1: that
- * is RESIDUAL_PERM's axis).
- *
- * IT DOES NOT MIRROR wj_blocker_too_cold, and the claim that it did was wrong (R245 Stage 2d). The two
- * differ on three axes, all of which change the verdict:
- *   - promoted_root: wj_blocker_too_cold takes it and sets cold_thresh to 0 below depth 8 (admit anything)
- *     and thresh/16 above; this has no such parameter. Every force_island entry passes promoted_root=TRUE,
- *     so that branch is the live one, not the fallback.
- *   - slot != 0: this returns 0 early for parked/retry/perm; wj_blocker_too_cold does not test slot at all
- *     and still applies its cold test to them.
- *   - the divisor: shipped ISLAND_COLD_DIV equals the threshold, so this computes cold_thresh = 1, while
- *     the island's promoted path computes 0 or 31.
- * The sets are therefore NOT equal at any depth. This is currently masked because the emitter's use of
- * this predicate is gated behind mono_wasm_jit_residual_cold, which ships 0 -- so today there is one live
- * answer to the question, not two. Reconciling them is only worth doing if that gate ever opens; until
- * then the honest statement is that a second implementation exists and is dormant. */
-int
-mono_wasm_jit_callee_too_cold (MonoMethod *method)
-{
-	extern int mono_wasm_jit_thresh, mono_wasm_jit_block_promote, mono_wasm_jit_island_cold_div;
-	/* PEEK, not get -- same compile-section rule as mono_wasm_jit_callee_perm_unjittable. The existing
-	 * `!im -> definitively cold' arm below is already the right answer for a method with no imethod. */
-	InterpMethod *im = mono_interp_peek_imethod (method);
-	int cold_div, cold_thresh;
-	if (!im)
-		return 1;                          /* never executed -> definitively cold (one-shot residual) */
-	if (im->wasm_jit_fslot > 0 || im->wasm_jit_slot != 0)
-		return 0;                          /* JITted / parked / retry / perm -> not a cold-counting leaf */
-	cold_div = mono_wasm_jit_island_cold_div > 0 ? mono_wasm_jit_island_cold_div : 4;
-	cold_thresh = mono_wasm_jit_thresh / cold_div;
-	return im->wasm_jit_hits < cold_thresh
-		&& !(mono_wasm_jit_block_promote > 0 && im->wasm_jit_block_n >= mono_wasm_jit_block_promote);
-}
 #endif
 
 void

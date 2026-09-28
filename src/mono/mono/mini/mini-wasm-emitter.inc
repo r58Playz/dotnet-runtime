@@ -169,6 +169,59 @@ wj_call_prof_im (MonoCompile *cfg, MonoCallInst *call)
 	wj_count (WJC_PROF_ORIGIN_FALLBACK);
 	return cfg->wasm_jit_caller_imethod;
 }
+
+/* R358 (MONO_WASM_JIT_T2_UNIT=2): the tier-2 unit SUPPLY census. Walk a finished tier-2 body's direct-call holes
+ * (WASM_RELOC_CALL: every call it kept to another JITted method) and put each distinct callee in one bucket --
+ * which of them a unit could carry as a private copy, and how big and how hot those are. Changes nothing emitted. */
+static void
+wj_t2u_census (MonoMethod *root, WjBody *b)
+{
+	extern int mono_wasm_jit_t2u_classify (MonoMethod *root, MonoMethod *callee, int *samples, int *desc);
+	extern int mono_wasm_jit_desc_body_len (int desc);
+	WasmRelocs *rs = b->f_body.relocs;
+	MonoMethod *seen [256];
+	int bucket [256];
+	int nseen = 0, i, j;
+	if (!rs)
+		return;
+	mono_wasm_jit_count (WJC_T2U_ROOTS);
+	for (i = 0; i < (int) rs->n; ++i) {
+		WasmReloc *r = &rs->r [i];
+		MonoMethod *c;
+		int samples = 0, desc = 0, bk;
+		if (r->kind != WASM_RELOC_CALL || !r->sym)
+			continue;
+		mono_wasm_jit_count (WJC_T2U_SITES);
+		c = (MonoMethod *) r->sym;
+		for (j = 0; j < nseen && seen [j] != c; ++j)
+			;
+		if (j < nseen) {
+			if (bucket [j] == WJC_T2U_ELIGIBLE)
+				mono_wasm_jit_count (WJC_T2U_ELIG_SITES);
+			continue;
+		}
+		if (nseen >= 256) {
+			mono_wasm_jit_count (WJC_T2U_OVERFLOW);
+			continue;
+		}
+		bk = mono_wasm_jit_t2u_classify (root, c, &samples, &desc);
+		if (bk == WJC_T2U_ELIGIBLE) {
+			int len = mono_wasm_jit_desc_body_len (desc);
+			if (len > 8192) {
+				bk = WJC_T2U_BIG;
+			} else {
+				mono_wasm_jit_count (WJC_T2U_ELIG_SITES);
+				mono_wasm_jit_add (WJC_T2U_ELIG_BYTES, len);
+				if (samples >= 8)
+					mono_wasm_jit_count (WJC_T2U_ELIG_HOT);
+			}
+		}
+		seen [nseen] = c;
+		bucket [nseen++] = bk;
+		mono_wasm_jit_count (WJC_T2U_CALLEES);
+		mono_wasm_jit_count (bk);
+	}
+}
 #endif
 
 void
@@ -858,6 +911,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM:
 					case OP_STOREI2_MEMBASE_IMM:
 					case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
+					case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+					case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
 						dreg_is_base = TRUE; break;
 					default: break;
 					}
@@ -1336,11 +1391,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE:
 						case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE: case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE:
 						case OP_LOADI8_MEMBASE: case OP_LOADR4_MEMBASE: case OP_LOADR8_MEMBASE:
+						case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
+						case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
+						case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
+						case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:   /* R360 */
 							b = insf->sreg1; break;
 						case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 						case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 						case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
 						case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
+						case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+						case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
 							b = insf->dreg; break;
 						case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
 							b = insf->sreg1; break;
@@ -1593,6 +1654,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 						case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
 						case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
+						case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+						case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
 							dreg_is_base = TRUE; break;
 						default: break;
 						}
@@ -2002,11 +2065,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE:
 					case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE: case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE:
 					case OP_LOADI8_MEMBASE: case OP_LOADR4_MEMBASE: case OP_LOADR8_MEMBASE:
+					case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
+					case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
+					case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
+					case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:   /* R360 */
 						base = insr->sreg1; knd = "load"; break;
 					case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 					case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 					case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
 					case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
+					case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+					case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
 						base = insr->dreg; knd = "store"; break;
 					case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
 						base = insr->sreg1; knd = "callrecv"; break;
@@ -3016,11 +3085,6 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		} \
 	} while (0)
 
-#ifdef HOST_BROWSER
-	/* Islands (residual=0): enumerate the full un-JITted-callee blocker set up front so the auto-JIT trigger
-	 * forms the whole island in ONE emit cycle (see wj_prescan_blockers). No-op under residual!=0. */
-	{ extern int mono_wasm_jit_residual_mode; if (mono_wasm_jit_residual_mode == 0) wj_prescan_blockers (cfg); }
-#endif
 	i = 0;
 	int sl_ord = 0;   /* running ins ordinal, mirroring the SLOTLIVE walk exactly (same bb/ins iteration) */
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
@@ -3282,13 +3346,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 *
 				 * Why dropping ACQ/REL is sound, in order of how load-bearing it is:
 				 *
-				 * 1. The only managed atomic this emitter lowers is the 1-byte OP_ATOMIC_STORE (R323b), a
-				 *    seq-cst wasm atomic that orders itself (point 2); its other wasm atomics are for its own
-				 *    inline caches, and a method containing any other volatile or Interlocked access bails.
-				 *    Every other OP_MEMORY_BARRIER we emit therefore orders ORDINARY, non-atomic
-				 *    accesses. Per the wasm relaxed-memory model that is a data race with or without
-				 *    the fence: atomic.fence does not make an ordinary store a synchronising one, so it
-				 *    never conferred the ordering it looked like it did.
+				 * 1. Every managed atomic this emitter lowers (the byte store, R323b; the 16/32-bit loads,
+				 *    stores, CAS, exchange and add, R360) is a seq-cst wasm atomic that orders itself
+				 *    (point 2), so the ACQ/REL barrier mono attaches to one adds nothing. Any other
+				 *    OP_MEMORY_BARRIER orders ORDINARY, non-atomic accesses. Per the wasm relaxed-memory
+				 *    model that is a data race with or without the fence: atomic.fence does not make an
+				 *    ordinary store a synchronising one, so it never conferred the ordering it looked like
+				 *    it did.
 				 * 2. Where synchronisation does go through wasm atomics, all wasm atomics are currently
 				 *    seq-cst, so the ordering is carried by the atomic access itself -- same-thread
 				 *    accesses are happens-before ordered and an atomic read-from establishes cross-thread
@@ -3979,6 +4043,107 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				STOREM_PFX (WASM_OP_ATOMIC_PREFIX, 0x19 /* i32.atomic.store8 */, 0);
 				wj_count (WJC_ATOMIC_STORE8_LOWERED);
 				break;
+			/* R360: the wider atomics -- Volatile.Read/Write, Interlocked.CompareExchange/Exchange/Add/Increment on
+			 * 8/16/32-bit and pointer-sized (so reference) locations; p81's deeper tier-2 inlining lost 19 bodies
+			 * to CAS_I4/EXCHANGE_I4/LOAD_U4 reaching the default case (R359). Every one is a seq-cst wasm atomic, so like
+			 * the byte store it orders itself (see OP_MEMORY_BARRIER). A wasm atomic TRAPS on a misaligned address
+			 * where x86 would not; that is not a new failure mode, because the interpreter's and the AOT'd
+			 * Interlocked/Volatile are the same wasm atomics (C11 atomics under emscripten) on the same address.
+			 * The memarg alignment must be EXACTLY the natural one for an atomic, or the module fails validation.
+			 * 64-bit variants are not here: SIZEOF_REGISTER == 4 keeps intrinsics.c from producing them for this
+			 * backend. A reference-sized CAS/exchange/load result is a reference (alloc_ireg_ref); wasm_st
+			 * routes it like any ref def, and its write barrier is separate IR. */
+			case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2:
+				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
+				STOREM_PFX (WASM_OP_ATOMIC_PREFIX, 0x1a /* i32.atomic.store16 */, 1);
+				wj_count (WJC_ATOMIC_LOWERED);
+				break;
+			case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
+				STOREM_PFX (WASM_OP_ATOMIC_PREFIX, 0x17 /* i32.atomic.store */, 2);
+				wj_count (WJC_ATOMIC_LOWERED);
+				break;
+			case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8: {
+				/* no float atomics in wasm: store the bits */
+				gboolean r8 = ins->opcode == OP_ATOMIC_STORE_R8;
+				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
+				if (!wasm_guard_memaddr (&body, &lc, ins->dreg, (gint32) ins->inst_offset)) { fail = "store addr guard"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store base"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "store val"; goto done; }
+				wasm_op (&body, r8 ? WASM_OP_I64_REINTERPRET_F64 : WASM_OP_I32_REINTERPRET_F32);
+				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX);
+				wasm_u8 (&body, r8 ? 0x18 /* i64.atomic.store */ : 0x17 /* i32.atomic.store */);
+				wasm_memarg (&body, r8 ? 3 : 2, (guint32) ins->inst_offset);
+				wj_count (WJC_ATOMIC_LOWERED);
+				break;
+			}
+			case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
+			case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8: {
+				/* Never an LCSE hit or entry: a volatile read must re-read, and wj_ins_clobbers_mem clears the table
+				 * here (an acquire must not be satisfied from a load cached before it). */
+				int sub, al, post = -1;
+				switch (ins->opcode) {
+				case OP_ATOMIC_LOAD_I1: sub = 0x12; al = 0; post = WASM_OP_I32_EXTEND8_S; break;   /* i32.atomic.load8_u */
+				case OP_ATOMIC_LOAD_U1: sub = 0x12; al = 0; break;
+				case OP_ATOMIC_LOAD_I2: sub = 0x13; al = 1; post = WASM_OP_I32_EXTEND16_S; break;  /* i32.atomic.load16_u */
+				case OP_ATOMIC_LOAD_U2: sub = 0x13; al = 1; break;
+				case OP_ATOMIC_LOAD_R4: sub = 0x10; al = 2; post = WASM_OP_F32_REINTERPRET_I32; break;
+				case OP_ATOMIC_LOAD_R8: sub = 0x11; al = 3; post = WASM_OP_F64_REINTERPRET_I64; break;   /* i64.atomic.load */
+				default:                sub = 0x10; al = 2; break;   /* i32.atomic.load */
+				}
+				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
+				if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; }
+				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
+				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
+				if (post >= 0) wasm_op (&body, post);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; }
+				wj_count (WJC_ATOMIC_LOWERED);
+				break;
+			}
+			case OP_ATOMIC_ADD_I4:
+			case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4: {
+				/* rmw returns the OLD value; mono's OP_ATOMIC_ADD returns the NEW one (mini-x86.c: lock xadd, then
+				 * add), so ADD re-adds sreg2. The sub-word exchanges zero-extend, which is what intrinsics.c's
+				 * trailing ICONV_TO_{I,U}{1,2} expects. */
+				int sub, al;
+				switch (ins->opcode) {
+				case OP_ATOMIC_ADD_I4:      sub = 0x1e; al = 2; break;   /* i32.atomic.rmw.add */
+				case OP_ATOMIC_EXCHANGE_U1: sub = 0x43; al = 0; break;   /* i32.atomic.rmw8.xchg_u */
+				case OP_ATOMIC_EXCHANGE_U2: sub = 0x44; al = 1; break;   /* i32.atomic.rmw16.xchg_u */
+				default:                    sub = 0x41; al = 2; break;   /* i32.atomic.rmw.xchg */
+				}
+				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
+				if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "rmw addr guard"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "rmw base"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "rmw val"; goto done; }
+				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
+				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
+				if (ins->opcode == OP_ATOMIC_ADD_I4) {
+					if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "rmw val"; goto done; }
+					wasm_op (&body, WASM_OP_I32_ADD);
+				}
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "rmw dreg"; goto done; }
+				wj_count (WJC_ATOMIC_LOWERED);
+				break;
+			}
+			case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4: {
+				/* dreg = cmpxchg (*(sreg1 + off), expected = sreg3, replacement = sreg2) -> the old value. The
+				 * sub-word forms wrap the expected value to their width before comparing and zero-extend the
+				 * result, matching intrinsics.c's zero-extended comparand. */
+				int sub = ins->opcode == OP_ATOMIC_CAS_U1 ? 0x4a : ins->opcode == OP_ATOMIC_CAS_U2 ? 0x4b : 0x48;
+				int al = ins->opcode == OP_ATOMIC_CAS_U1 ? 0 : ins->opcode == OP_ATOMIC_CAS_U2 ? 1 : 2;
+				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
+				if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "cas addr guard"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "cas base"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg3)) { fail = "cas cmp"; goto done; }
+				if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "cas val"; goto done; }
+				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
+				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "cas dreg"; goto done; }
+				wj_count (WJC_ATOMIC_LOWERED);
+				break;
+			}
 #undef STOREM
 #undef STOREM_PFX
 /* membase store of an immediate: *(dreg[=inst_destbasereg] + inst_offset) = inst_imm. dreg aliases
@@ -4440,6 +4605,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				} else {
 					extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 					call_fslot = mono_wasm_jit_get_callee_fslot (call_method);
+					/* Phase 5: a callee with no f-slot gets a pool one behind a stub (mini-wasm-lazy.inc) -- the
+					 * direct path below then emits an ordinary call through it. A refusal takes the residual. */
+					if (call_fslot <= 0) {
+						call_fslot = wj_lazy_reserve (call_method, csig, call->rgctx_reg != 0, &ct);
+						if (call_fslot > 0)
+							mono_wasm_jit_counters [WJC_LAZY_SITES]++;
+					}
 				}
 #else
 				call_fslot = 0x7fff; /* offline dump: placeholder slot for encoder validation */
@@ -4516,8 +4688,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						 * frame, no LMF) instead of the residual, for AOT'd callees. It is HOT -- ~90k
 						 * inline-AOT calls per frame -- and its off-arm routed every one of them through
 						 * the full residual marshal. Settled. */
+						/* R356: need_unbox_trampoline is set for EVERY method declared on an interface or on Object
+						 * (calls.c:531), static ones included -- IKVM's default-interface helpers
+						 * (`Map.<default>getOrDefault(Map,...)`) and Java static interface methods. It concerns `this`, so
+						 * MONO_WASM_JIT_AOT_STATIC_UNBOX ignores it for a callee that has none. */
+						extern int mono_wasm_jit_aot_static_unbox;
+						gboolean unbox_bars = call->need_unbox_trampoline && !(mono_wasm_jit_aot_static_unbox && !csig->hasthis);
 						gboolean aot_ok = !m_type_is_byref (csig->ret)
-							&& !call->rgctx_reg && !call->need_unbox_trampoline && !cci.vret_byaddr;
+							&& !call->rgctx_reg && !unbox_bars && !cci.vret_byaddr;
 						/* R356: MONO_WASM_JIT_AOT_BYREF lets byref PARAMS through. A byref is an i32 address in the call
 						 * info (wasm_valtype_of_type), passed exactly as it is to a JIT callee, and the native AOT ABI
 						 * takes the same pointer; the object it points into is kept by the caller's shadow frame, as for
@@ -4582,7 +4760,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							extern void mono_wasm_jit_resid_emit_note (MonoMethod *m, const char *why);
 							mono_wasm_jit_resid_emit_note (call_method,
 								m_type_is_byref (csig->ret) ? "byref-ret" : call->rgctx_reg ? "rgctx" :
-								call->need_unbox_trampoline ? "unbox" : cci.vret_byaddr ? "vret" :
+								unbox_bars ? "unbox" : cci.vret_byaddr ? "vret" :
 								!aot_ok ? "byref-arg" : "aot-target-at-emit");
 						}
 					}
@@ -4600,53 +4778,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					{
 						extern int mono_wasm_jit_residual_mode;
 						int rm = mono_wasm_jit_residual_mode;
-						/* record the blocking callee on the cfg result so the trigger can eagerly form the island */
-						/* rgctx calls: if INLINE_AOT couldn't take it (gsharedvt-variable, or
-						 * inline-aot off/byref), keep the method JITted by routing this one call through the residual
-						 * (mono_wasm_jit_call_interp derives the context from the concrete callee) rather than bailing
-						 * the whole method at the RESIDUAL=0 gate. The rgctx call is the cold catch-block edge; the hot
-						 * try-body still JITs. */
+						/* A direct callee with no f-slot reaches here only if the lazy pool refused it (mini-wasm-lazy.inc:
+						 * AOT-backed, permanently un-JITtable, a wrapper or flag shape, a functype it cannot stub). Nothing
+						 * force-compiles a callee any more (R366), so the call takes the residual: AOT-routed for an AOT'd
+						 * callee, interp_entry otherwise. Counted when it is neither of those, i.e. a refusal. */
 						if (rm == 0 && !((MonoCallInst*)ins)->rgctx_reg) {
-							/* jit->AOT fastpath: an AOT-compiled callee with no f-slot is STILL directly callable
-							 * via its native AOT body — so don't bail the whole method. Fall through to the
-							 * residual emit, which routes through interp_entry->do_jit_call to the AOT body.
-							 * This breaks the RESIDUAL=0 cascade at the
-							 * AOT'd java.* leaves (Math.sqrt, base ctors, java.util.*) that nearly every MC
-							 * call-tree bottoms out in (94% of all bails). Interp-only callees with no f-slot
-							 * still bail, so the island force-JITs them bottom-up as before. */
 							extern gboolean mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig);
-							if (!mono_interp_jit_call_supported (call_method, csig)) {
-								/* Lever B (MONO_WASM_JIT_RESIDUAL_PERM): if the blocker is PERMANENTLY un-JITtable
-								 * (slot==-1: EH/opcode/sig — it will NEVER get an f-slot, so the island can never
-								 * close around it), route just this edge through the interp residual instead of
-								 * bailing the whole caller. Keeps a hot island JITted around a cold perm-blocker.
-								 * A not-yet-jitted callee still bails (the island should pull it in bottom-up). */
-								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
-								if (!mono_wasm_jit_callee_perm_unjittable (call_method)) {
-									/* Lever B' (MONO_WASM_JIT_RESIDUAL_COLD): the blocker is genuinely COLD — the
-									 * island cold-gate would refuse to pull it in (still counting hits, below
-									 * thresh/cold_div, not block-promoted). A cold branch (IKVM __<GetInstance>
-									 * lambda factory, one-shot init, error path) reached rarely from this hot caller.
-									 * Route just this edge through the interp residual so the hot method JITs, paying
-									 * ~1 transition per cold call rather than bailing the whole (hot) method. Hot/parked
-									 * callees are NOT cold -> they still bail here and the island force-JITs them, so no
-									 * per-iteration residual storm on the hot path (the user's transition-cost constraint). */
-									extern int mono_wasm_jit_residual_cold;
-									extern int mono_wasm_jit_callee_too_cold (MonoMethod *m);
-									if (!(mono_wasm_jit_residual_cold && mono_wasm_jit_callee_too_cold (call_method))) {
-										/* The residual=0 pre-scan (wj_prescan_blockers) already enumerated the full
-										 * blocker set; record this one too (deduped) so the list head is correct even
-										 * if the pre-scan predicate ever drifts from this site. */
-										wj_result_add_blocker (&cfg->wasm_jit_result, call_method);
-										fail = "callee not jitted (residual off)";
-										goto done;
-									}
-									{ extern int mono_wasm_jit_verbose; static int n_cl = 0; if (mono_wasm_jit_verbose >= 2 && n_cl++ < 128) { char *cn = mono_method_get_full_name (call_method); printf ("WASM_JIT_RESIDUAL_COLD[%d] %s -> %s\n", n_cl, mname, cn); g_free (cn); } }
-									/* else: cold-leaf blocker + RESIDUAL_COLD -> fall through, emit interp residual */
-								}
-								/* else: perm-unjittable blocker + RESIDUAL_PERM -> fall through, emit interp residual */
-							}
-							/* else: AOT'd callee -> fall through and emit the (AOT-routed) residual call */
+							extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
+							if (!mono_interp_jit_call_supported (call_method, csig) && !mono_wasm_jit_callee_perm_unjittable (call_method))
+								mono_wasm_jit_counters [WJC_LAZY_RESIDUAL]++;
 						}
 						/* bisection gates (see mono_wasm_jit_residual_mode): isolate which marshalling axis
 						 * breaks real code by restricting which call shapes the residual handles */
@@ -5083,7 +5223,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								wj_count (WJC_DELEGATE_DEVIRT_NOREC);   /* no usable record -- NOT "thin" */
 							else if (dgot && (int) dpct >= mono_wasm_jit_delegate_devirt &&
 							    dt && dt != cfg->method && !mono_wasm_jit_callee_perm_unjittable (dt)) {
-								int df = mono_wasm_jit_get_callee_fslot_batchlocal (dt, cfg->method);
+								int df = wj_lazy_arm_fslot (dt, cfg->method, &ftd);
 								/* The direct call goes through the SAME functype as the indirect one it
 								 * replaces, so a target whose lowered signature differs is a trap rather
 								 * than a miss -- exactly as for the vtable arms. */
@@ -5098,24 +5238,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									ddevirt_fslot = df;
 									wj_count (WJC_DELEGATE_DEVIRT_ARM);
 								} else {
-									/* Keep REFUSED as the sum so earlier readings stay comparable, and split
-									 * it: these two lead to OPPOSITE decisions. NO_FSLOT is the ordering
-									 * artifact a DEVIRT_FORCE-style blocker fixes; SIG is permanent. */
+									/* REFUSED = NO_FSLOT + SIG. With a pool slot for any target that can take one
+									 * (wj_lazy_arm_fslot), NO_FSLOT is a pool refusal; the arm is dropped, never
+									 * forced (R366). */
 									wj_count (WJC_DELEGATE_DEVIRT_REFUSED);
-									if (df <= 0) {
+									if (df <= 0)
 										wj_count (WJC_DELEGATE_DEVIRT_NO_FSLOT);
-										/* Only the f-slot is missing, so this is retriable: block on the
-										 * target and re-emit once it publishes. The bail string MUST contain
-										 * "callee not jitted" -- that substring is what marks the result
-										 * retriable in wasm_jit_compile_publish; different wording turns a
-										 * deliberate deferral into a permanent bail. */
-										if (cfg->wasm_jit_result.nblockers < mono_wasm_jit_devirt_force_max) {
-											wj_count (WJC_DEVIRT_FORCED);
-											wj_result_add_blocker (&cfg->wasm_jit_result, dt);
-											fail = "callee not jitted (delegate devirt force)";
-											goto done;
-										}
-									} else wj_count (WJC_DELEGATE_DEVIRT_SIG);
+									else
+										wj_count (WJC_DELEGATE_DEVIRT_SIG);
 								}
 							} else if (dgot) {
 								wj_count (WJC_DELEGATE_DEVIRT_THIN);   /* had a record, below the bar */
@@ -5168,41 +5298,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									pred_target = NULL;
 									pred_fslot = 0;
 								} else {
-									pred_fslot = mono_wasm_jit_get_callee_fslot_batchlocal (pred_target, cfg->method);
+									pred_fslot = wj_lazy_arm_fslot (pred_target, cfg->method, &ftd);
 									if (pred_fslot <= 0) {
-										if (terminal_vcall_handoff && terminal_vcall_ins == ins &&
-										    pred_target != cfg->method &&
-										    !mono_wasm_jit_callee_perm_unjittable (pred_target) &&
-										    !mono_interp_jit_call_supported (pred_target, pred_sig)) {
-											wj_result_add_blocker (&cfg->wasm_jit_result, pred_target);
-											fail = "callee not jitted (terminal devirt)";
-											goto done;
-										}
-										/* MONO_WASM_JIT_DEVIRT_FORCE: the same treatment for an ORDINARY site
-										 * whose prediction is definitively warm. The bail string MUST contain
-										 * "callee not jitted" -- that substring is what marks the result
-										 * retriable and gets the method re-emitted once the blocker publishes
-										 * (see wasm_jit_compile_publish); a different wording would turn a
-										 * deliberate deferral into a permanent bail.
-										 *
-										 * Deliberately NOT gated on !mono_interp_jit_call_supported the way
-										 * the terminal case is. There, a supported jit-call is a cheap enough
-										 * fallback that waiting is not worth it; here the whole point is to
-										 * obtain the direct arm, which the fallback never provides. */
-										extern int mono_wasm_jit_devirt_force, mono_wasm_jit_devirt_force_min,
-											mono_wasm_jit_devirt_force_max;
-										if (mono_wasm_jit_devirt_force &&
-										    pred_samples >= (guint32) mono_wasm_jit_devirt_force_min &&
-										    pred_target != cfg->method &&
-										    !mono_wasm_jit_callee_perm_unjittable (pred_target)) {
-											if (cfg->wasm_jit_result.nblockers < mono_wasm_jit_devirt_force_max) {
-												wj_count (WJC_DEVIRT_FORCED);
-												wj_result_add_blocker (&cfg->wasm_jit_result, pred_target);
-												fail = "callee not jitted (devirt force)";
-												goto done;
-											}
-											wj_count (WJC_DEVIRT_FORCE_CAPPED);
-										}
+										/* The target could not take a pool slot (wj_lazy_arm_fslot): no arm. The
+										 * terminal-handoff and DEVIRT_FORCE bails that forced the target through an
+										 * island here are gone with the islands (R366). */
 										wj_count (WJC_DEVIRT_NO_FSLOT); WJ_REEMIT_SCOPED (WJC_REEMIT_NO_FSLOT); ic_tag = 6;
 										pred_vt = NULL;
 										pred_target = NULL;
@@ -5473,7 +5573,7 @@ vcall_nullchk_done:
 								#define WJ_ARM_OK(vt, t, pct, fs) ( \
 									(vt) && (t) && (int) (pct) >= mono_wasm_jit_devirt_arm2_pct && \
 									(t) != cfg->method && !mono_wasm_jit_callee_perm_unjittable (t) && \
-									((fs) = mono_wasm_jit_get_callee_fslot_batchlocal (t, cfg->method)) > 0 && \
+									((fs) = wj_lazy_arm_fslot ((t), cfg->method, &ftd)) > 0 && \
 									wj_arm_abi_ok ((t), &ftd))
 								/* NOTE the f-slot test above is not merely "is it compiled": it is what makes the
 								 * direct-dep registration below meaningful, since a dep is keyed by slot. */
@@ -5511,16 +5611,7 @@ vcall_nullchk_done:
 												else if (t2 == cfg->method) wj_count (WJC_DEVIRT_ARM2_SELF);
 												else if (mono_wasm_jit_callee_perm_unjittable (t2)) wj_count (WJC_ARM_UNJITTABLE);
 												else {
-													wj_count (WJC_DEVIRT_ARM2_NO_FSLOT);   /* by elimination -- see below */
-													/* Same ordering artifact as the primary path's no-fslot:
-													 * the runner-up was named by the profile and simply has
-													 * not compiled. Retriable bail, same required substring. */
-													if (cfg->wasm_jit_result.nblockers < mono_wasm_jit_devirt_force_max) {
-														wj_count (WJC_DEVIRT_FORCED);
-														wj_result_add_blocker (&cfg->wasm_jit_result, t2);
-														fail = "callee not jitted (arm2 devirt force)";
-														goto done;
-													}
+													wj_count (WJC_DEVIRT_ARM2_NO_FSLOT);   /* by elimination: a pool refusal (R366) */
 												}
 											}
 										} else {
@@ -5568,7 +5659,7 @@ vcall_nullchk_done:
 									if ((int) a2pct < mono_wasm_jit_devirt_arm2_pct) {
 										wj_count (WJC_DEVIRT_ARM2_THIN);   /* below break-even; an arm here LOSES */
 									} else {
-										int f2 = mono_wasm_jit_get_callee_fslot_batchlocal (a2t, cfg->method);
+										int f2 = mono_wasm_jit_get_callee_fslot (a2t);
 										if (f2 <= 0) {
 											wj_count (WJC_DEVIRT_ARM2_NO_FSLOT);
 										} else if (a2t == cfg->method) {
@@ -7063,6 +7154,12 @@ vcall_cold_miss_emit:
 		wasm_buf_free (&out);   /* freed before `done:` on the normal path (below), so free it here */
 		goto done;
 	  } }
+#ifdef HOST_BROWSER
+	{ extern int mono_wasm_jit_t2_unit;
+	  if (G_UNLIKELY (mono_wasm_jit_t2_unit == 2) && !fail && cfg->wasm_jit_tier >= 2 && wj_stored_body)
+		wj_t2u_census (cfg->method, wj_stored_body);
+	}
+#endif
 
 #ifdef HOST_BROWSER
 	{
@@ -7112,6 +7209,16 @@ vcall_cold_miss_emit:
 				mono_wasm_jit_note_table_exhausted ();
 			}
 		  } }
+#ifdef HOST_BROWSER
+		/* Phase 5: a pool pair's stubs are of the functype the callers reserved it under. A body compiled to any
+		 * other type must not go in behind them; take a fresh pair and let the stubs route to the interpreter. */
+		{ WasmFuncType pft;
+		  if (f_slot > 0 && wj_lazy_pool_ft (f_slot, &pft) && !functype_eq (&pft, &self_ci.ftype)) {
+			mono_wasm_jit_counters [WJC_LAZY_SIG_DRIFT]++;
+			e_slot = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+			f_slot = mono_jiterp_allocate_table_entry (1 /* JITERPRETER_TABLE_JIT_CALL */);
+		  } }
+#endif
 		if (e_slot > 0 && f_slot > 0) {
 			void *cached = g_malloc ((gsize) out.len);
 			char ierr [192]; ierr [0] = 0;
@@ -7129,6 +7236,12 @@ vcall_cold_miss_emit:
 			gboolean reemit_live = mono_wasm_jit_reemit_validate && slot_live_here;
 			if (reemit_live)
 				wj_count (WJC_REEMIT_VALIDATE_ONLY);
+			/* Phase 5, invariant 1: callers may already call a pool f-slot through its stub, so the real f goes in
+			 * only after its dependencies are installed here -- which is admission's job, not this validation's. */
+			if (!reemit_live && wj_lazy_is_pool_slot (f_slot)) {
+				reemit_live = TRUE;
+				mono_wasm_jit_counters [WJC_LAZY_VALIDATE_ONLY]++;
+			}
 			if (slot_live_here) {
 				int k;
 				for (k = 0; k < cfg->wasm_jit_result.ndirect_deps; ++k) {
@@ -7320,18 +7433,10 @@ done:
 				wj_bail_hist [cat]++;
 		}
 		if (mono_wasm_jit_verbose >= 2) {
-			/* Name the FIRST recorded blocker + the blocker count. A retriable "callee not jitted" bail with
-			 * nblk=0 is the smoking gun for the retry storm: compile_publish can't block_note anything, so
-			 * force_island returns BUSY -> SLOT_RETRY -> re-attempt every threshold (never parks). */
-			int _nblk = cfg->wasm_jit_result.nblockers;
-			char *_cn = _nblk > 0 ? mono_method_get_full_name (cfg->wasm_jit_result.blockers [0]) : NULL;
-			printf ("WASM_JIT_BAIL %s : %s (op=%d %s) [nblk=%d%s%s]", mname, fail, fail_op,
-				fail_op >= 0 ? wj_opname (fail_op) : "-", _nblk,
-				_cn ? " blocker=" : "", _cn ? _cn : "");
+			printf ("WASM_JIT_BAIL %s : %s (op=%d %s)", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-");
 			if (fail_sig_site)
 				wj_print_bail_sig (fail_sig_site, fail_sig_callee, fail_sig, fail_sig_arg);
 			printf ("\n");
-			g_free (_cn);
 		}
 	}
 	g_free (mname);

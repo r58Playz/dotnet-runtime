@@ -28,10 +28,7 @@ static int mono_wasm_debug_level = 0;
 #include "cpu-wasm.h"
 #include "wasm-encoder.h"
 #include <stdlib.h>
-/* A callee's f-slot where an unpublished RESERVATION is visible only to a fellow batch member. The
- * devirt/delegate arms use this; the direct-call lowering keeps the unrestricted accessor because a call
- * cycle has no leaf. See the definition in interp/transform.c for why neither extreme is right. */
-int mono_wasm_jit_get_callee_fslot_batchlocal (MonoMethod *callee, MonoMethod *self); /* interp/transform.c */
+int mono_wasm_jit_get_callee_fslot (MonoMethod *m); /* interp/transform.c */
 #ifdef HOST_BROWSER
 #include <emscripten.h>
 int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
@@ -130,39 +127,6 @@ int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 
  * ineligible at their hotness threshold" rule and keep the AOT body as fallback -- and the thing to fix
  * first is the boot stall, not the policy. */
 int mono_wasm_jit_arity = 0;      /* MONO_WASM_JIT_ARITY=1: per-call-site receiver-arity histogram for the vcall miss population (N-way IC capture curve). Diagnostic — perturbs timing (like PROFILE_FAST); default off */
-/* MONO_WASM_JIT_DEVIRT_FORCE — when the call profile predicts a target but that target owns no admitted
- * f-slot yet, make it an ISLAND BLOCKER and re-emit after it publishes, instead of silently dropping the
- * prediction and leaving the site on the inline cache.
- *
- * The mechanism already existed for TERMINAL forwarding calls only (see the vcall lowering); this widens
- * it to ordinary sites. R157 measured that exit at 22.3% of all virtual sites offered to the gate -- the
- * largest actionable refusal bucket, and the only one that is a pure ORDERING artifact: the profile was
- * right, the callee simply had not compiled yet.
- *
- * DEFAULT 0 because the cost is real and has bitten: blocking ordinary callers on speculative dependencies
- * grows islands and parks methods, and R153's world-load stall was methods that could not clear their
- * blockers running interpreted. Turn it on with the island counters in view, not the frame rate.
- *
- * FORCE_MIN is the site's observation count (mono_wasm_jit_prof_predict's out_samples). 64 is
- * WJ_PROF_SATURATE: a monomorphic site stops recording once its margin reaches it, so `samples >= 64`
- * is exactly "this site saturated while staying monomorphic", i.e. definitively warm. It is a BINARY
- * warm flag and not a hotness ranking -- every hot monomorphic site reads ~64 and they are
- * indistinguishable, which is why there is no finer threshold to tune here.
- *
- * FORCE_MAX bounds how blocked a method may already be before it is allowed to add a speculative blocker.
- * The emit bails at the FIRST blocker and the island driver re-emits, so a method can still accumulate
- * several forced deps across passes; this stops one caller from piling speculation on top of a method that
- * is already waiting on real direct callees. */
-int mono_wasm_jit_devirt_force = 0;
-int mono_wasm_jit_devirt_force_min = 64;
-int mono_wasm_jit_devirt_force_max = 2;
-/* MONO_WASM_JIT_DEVIRT_FORCE_ALT is deleted. It extended DEVIRT_FORCE's "block on the target and
- * re-emit once it publishes" to the two populations DEVIRT_FORCE never covered -- a delegate site's
- * dominant target and a poly site's runner-up -- both refusing for the identical reason (the profile
- * named a target that had not compiled yet). MEASURED NET +7.5%% client-thread instructions per frame,
- * i.e. worse. The blocker mechanism it reuses is what R153's world-load stall came from: methods that
- * cannot clear their blockers run interpreted, so the cost lands in the island/parked counters rather
- * than anywhere it was being read. DEVIRT_FORCE itself, which is measured good, is untouched. */
 /* MONO_WASM_JIT_GUARDED_INLINE: at a virtual call site the profile can predict, emit an INLINED body
  * behind the same vtable guard the emitter's predicted arm already uses, instead of a call. See the
  * long argument at the site in method-to-ir.c.
@@ -622,8 +586,12 @@ int mono_wasm_jit_t2 = 1;
 int mono_wasm_jit_t2_sample_ms = 2;      /* MONO_WASM_JIT_T2_SAMPLE_MS: sampling timer period */
 int mono_wasm_jit_t2_threshold = 48;     /* MONO_WASM_JIT_T2_THRESHOLD: samples before a method is queued */
 int mono_wasm_jit_t2_max = 2000;         /* MONO_WASM_JIT_T2_MAX: tier-2 requests per process */
-int mono_wasm_jit_t2_limit = 35;         /* MONO_WASM_JIT_T2_LIMIT: inline IL-size limit at tier 2 */
-int mono_wasm_jit_t2_cost = 200;         /* MONO_WASM_JIT_T2_COST: inline cost cap at tier 2 */
+/* MONO_WASM_JIT_T2_LIMIT / _COST: tier 2's inline IL-size limit and cost cap. 60 / 400 against the old 35 / 200 on
+ * the Minecraft server tick (R359/R360, p82 b t t b, one binary, equal ticks): cycles -2.1% (ranges clear), instructions
+ * -4.6%, calls -12%; peak VmData +113 MiB, inside the control's own spread. Needs R360's atomics lowering, without which
+ * the deeper bodies downgraded 42 roots to tier 1. */
+int mono_wasm_jit_t2_limit = 60;
+int mono_wasm_jit_t2_cost = 400;
 int mono_wasm_jit_t2_depth = 9;          /* MONO_WASM_JIT_T2_DEPTH: inline depth cap at tier 2 */
 int mono_wasm_jit_t2_gi_size = 120;      /* MONO_WASM_JIT_T2_GI_SIZE: guarded-inline size cap at tier 2 */
 /* MONO_WASM_JIT_PROF_ORIGIN (R316b, plan Phase 3.5): the emitter's devirt / delegate / IC-width reads at a call site
@@ -647,9 +615,6 @@ int mono_wasm_jit_ldaddr_ref = 1;
 /* MONO_WASM_JIT_REEMIT_VALIDATE (R322): a re-emit into a slot the compiling thread installed is validated there, not
  * published there (0 = the old install-on-validate, the positive control for the trap it removes). */
 int mono_wasm_jit_reemit_validate = 1;
-/* MONO_WASM_JIT_T2_RETRY (R327): how many times a BLOCKED tier-2 attempt is parked on its blockers and retried before
- * it is recorded FAIL (0 = the old single attempt). */
-int mono_wasm_jit_t2_retry = 3;
 /* MONO_WASM_JIT_T2_STATIC_PRED (R329): a tier-2 GI site with no profile record predicts the callvirt's own method behind
  * the method-identity guard; 2 (R333) also on a COLD verdict (a hot monomorphic IC site records one observation). */
 int mono_wasm_jit_t2_static_pred = 2;
@@ -683,8 +648,18 @@ int mono_wasm_jit_t2_max_body = 98304;
 int mono_wasm_jit_eh_rec = 1;
 /* MONO_WASM_JIT_AOT_BYREF (R356): the emitter's inline direct-AOT call also takes callees with byref PARAMETERS (the
  * ByteCodeHelper volatile/CAS helpers IKVM emits for every Java volatile/atomic access), instead of routing them
- * through the JIT->interp residual. */
-int mono_wasm_jit_aot_byref = 0;
+ * through the JIT->interp residual. p79 b t t b, server tick: the residual route 1.99 -> 0.58 M instr and 2.18 ->
+ * 1.13 M cycles per tick, calls -3.8%, totals -0.7% (inside the spread). 0 = route them through the residual. */
+int mono_wasm_jit_aot_byref = 1;
+/* MONO_WASM_JIT_AOT_STATIC_UNBOX (R356): the same gate ignores need_unbox_trampoline for a callee without `this`. p80
+ * b t t b, server tick: the residual route 0.92/0.69 -> 0.13/0.15 M instr and 1.44/1.20 -> 0.33/0.30 M cycles per tick. */
+int mono_wasm_jit_aot_static_unbox = 1;
+/* MONO_WASM_JIT_T2_UNIT (Track C, tier-2 units; scratchpad/wj/track-c-brief.md): 2 = supply census only -- classify
+ * each tier-2 root's remaining direct callees ([wasm-jit t2u]); nothing about the emitted code changes. */
+int mono_wasm_jit_t2_unit = 0;
+/* MONO_WASM_JIT_LAZY_NOGC: credit a pool slot no-GC when a no-GC callee is registered at it, admitting that callee for
+ * real instead of trusting its stub (0 = never credit a pool slot, the R361 m1 shape). */
+int mono_wasm_jit_lazy_nogc = 1;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -782,9 +757,6 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_guard_keep_slotlive; const char *gk = g_getenv ("MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE"); mono_wasm_jit_guard_keep_slotlive = (gk && *gk && *gk != '0') ? 1 : 0; } /* 1 = keep elision on under STOREGUARD/OBJGUARD (partial guard coverage, real configuration) */
 	{ extern int mono_wasm_jit_residual_mode; const char *r = g_getenv ("MONO_WASM_JIT_RESIDUAL"); mono_wasm_jit_residual_mode = (r && *r) ? atoi (r) : mono_wasm_jit_residual_mode; }
 	{ extern int mono_wasm_jit_arity; const char *ar = g_getenv ("MONO_WASM_JIT_ARITY"); mono_wasm_jit_arity = (ar && *ar && *ar != '0') ? 1 : 0; } /* 1 = record per-call-site receiver-arity histogram (vcall miss population); diagnostic, perturbs timing */
-	{ extern int mono_wasm_jit_devirt_force; const char *df = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE"); mono_wasm_jit_devirt_force = (df && *df && *df != '0') ? 1 : 0; }
-	{ extern int mono_wasm_jit_devirt_force_min; const char *fm = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MIN"); mono_wasm_jit_devirt_force_min = (fm && *fm && atoi (fm) > 0) ? atoi (fm) : 64; }
-	{ extern int mono_wasm_jit_devirt_force_max; const char *fx = g_getenv ("MONO_WASM_JIT_DEVIRT_FORCE_MAX"); mono_wasm_jit_devirt_force_max = (fx && *fx && atoi (fx) >= 0) ? atoi (fx) : 2; }
 	{ extern int mono_wasm_jit_guarded_inline; const char *gi = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE"); if (gi && *gi) mono_wasm_jit_guarded_inline = *gi != '0'; }
 	{ extern int mono_wasm_jit_guarded_inline_size; const char *gs = g_getenv ("MONO_WASM_JIT_GUARDED_INLINE_SIZE"); int v = (gs && *gs) ? atoi (gs) : 60; mono_wasm_jit_guarded_inline_size = (v >= 0 && v <= 4096) ? v : 60; }
 	{ extern int mono_wasm_jit_delegate_devirt; const char *dd = g_getenv ("MONO_WASM_JIT_DELEGATE_DEVIRT"); int v = (dd && *dd) ? atoi (dd) : mono_wasm_jit_delegate_devirt; mono_wasm_jit_delegate_devirt = (v >= 0 && v <= 100) ? v : mono_wasm_jit_delegate_devirt; }
@@ -820,7 +792,6 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_ldaddr_ref, "MONO_WASM_JIT_LDADDR_REF", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_reemit_validate, "MONO_WASM_JIT_REEMIT_VALIDATE", 0, 1)
-	WJ_T2_KNOB (mono_wasm_jit_t2_retry, "MONO_WASM_JIT_T2_RETRY", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_static_pred, "MONO_WASM_JIT_T2_STATIC_PRED", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_t2_rearm, "MONO_WASM_JIT_T2_REARM", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 2)
@@ -830,6 +801,9 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aot_byref, "MONO_WASM_JIT_AOT_BYREF", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_aot_static_unbox, "MONO_WASM_JIT_AOT_STATIC_UNBOX", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_t2_unit, "MONO_WASM_JIT_T2_UNIT", 0, 2)
+	WJ_T2_KNOB (mono_wasm_jit_lazy_nogc, "MONO_WASM_JIT_LAZY_NOGC", 0, 1)
 #if defined(HOST_WASM) && defined(__wasm_atomics__)
 	/* mono_wasm_hw_fence lives in utils/atomic.c and exists only in the threaded wasm runtime, not in mono-aot-cross. */
 	WJ_T2_KNOB (mono_wasm_hw_fence, "MONO_WASM_HW_FENCE", 0, 1)
@@ -867,16 +841,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
 	/* Island heuristic levers (Part 5), all default off. */
 	{ extern int mono_wasm_jit_entry_promote; const char *ep = g_getenv ("MONO_WASM_JIT_ENTRY_PROMOTE"); mono_wasm_jit_entry_promote = (ep && *ep) ? atoi (ep) : mono_wasm_jit_entry_promote; }      /* Lever A: 0=off */
-	{ extern int mono_wasm_jit_residual_cold; const char *rc = g_getenv ("MONO_WASM_JIT_RESIDUAL_COLD"); mono_wasm_jit_residual_cold = (rc && *rc) ? ((*rc != '0') ? 1 : 0) : mono_wasm_jit_residual_cold; } /* Lever B': cold-leaf residual, 0=off */
 	{ extern int mono_wasm_jit_profile_fast; const char *pf = g_getenv ("MONO_WASM_JIT_PROFILE_FAST"); mono_wasm_jit_profile_fast = (pf && *pf && *pf != '0') ? 1 : 0; } /* emit fast-path volume counters, 0=off */
-	{ extern int mono_wasm_jit_island_depth; const char *id = g_getenv ("MONO_WASM_JIT_ISLAND_DEPTH"); mono_wasm_jit_island_depth = (id && *id && atoi (id) > 0) ? atoi (id) : mono_wasm_jit_island_depth; }   /* Lever C. Default at the initialiser, not here. */
-	{ extern int mono_wasm_jit_island_budget; const char *ib = g_getenv ("MONO_WASM_JIT_ISLAND_BUDGET"); mono_wasm_jit_island_budget = (ib && *ib && atoi (ib) > 0) ? atoi (ib) : mono_wasm_jit_island_budget; } /* Lever C. Default at the initialiser, not here. */
-	{ extern int mono_wasm_jit_block_promote; const char *bp = g_getenv ("MONO_WASM_JIT_BLOCK_PROMOTE"); mono_wasm_jit_block_promote = (bp && *bp) ? atoi (bp) : mono_wasm_jit_block_promote; } /* Lever C; 0 disables. Default at the initialiser, not here. */
 	{ extern int mono_wasm_jit_promotion_drain; const char *pd = g_getenv ("MONO_WASM_JIT_PROMOTION_DRAIN"); mono_wasm_jit_promotion_drain = (pd && *pd && atoi (pd) > 0) ? atoi (pd) : mono_wasm_jit_promotion_drain; }
-	{ extern int mono_wasm_jit_island_cold_div; const char *cd = g_getenv ("MONO_WASM_JIT_ISLAND_COLD_DIV"); mono_wasm_jit_island_cold_div = (cd && *cd && atoi (cd) > 0) ? atoi (cd) : mono_wasm_jit_island_cold_div; }
-	{ extern int mono_wasm_jit_promoted_cold_div; const char *pc = g_getenv ("MONO_WASM_JIT_PROMOTED_COLD_DIV"); mono_wasm_jit_promoted_cold_div = (pc && *pc && atoi (pc) > 0) ? atoi (pc) : mono_wasm_jit_promoted_cold_div; }
-	{ extern int mono_wasm_jit_promoted_root_uncold_depth; const char *pu = g_getenv ("MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH"); mono_wasm_jit_promoted_root_uncold_depth = (pu && *pu && atoi (pu) >= 0) ? atoi (pu) : mono_wasm_jit_promoted_root_uncold_depth; }
-	{ extern int mono_wasm_jit_block_force; const char *bf = g_getenv ("MONO_WASM_JIT_BLOCK_FORCE"); mono_wasm_jit_block_force = (bf && *bf) ? atoi (bf) : mono_wasm_jit_block_force; }
 #ifdef HOST_BROWSER
 	/* These three are DEBUG store/GC guards whose globals + runtime-check emission are HOST_BROWSER-only
 	 * (they insert per-store checks that only do anything when the JITted code actually RUNS). The offline
@@ -1199,22 +1165,8 @@ const char *mono_wasm_jit_dump_ir = NULL;  /* MONO_WASM_JIT_DUMP_IR=<substr>: du
 /* Island heuristic levers (Part 5), all default-OFF so the baseline is unchanged and each can be A/B'd. */
 int mono_wasm_jit_entry_promote = 96;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
 /* Lever A: interp->JIT crossings before the CALLER is queued for upward island growth. 0 disabled it entirely. */   /* Lever A: MONO_WASM_JIT_ENTRY_PROMOTE=N — after a hot interp caller invokes JITted callees N times, force-JIT the caller (grow the island UPWARD). 0 = off. */
-int mono_wasm_jit_residual_cold = 0;   /* Lever B': MONO_WASM_JIT_RESIDUAL_COLD=1 — under residual=0, residual-route a blocker the island cold-gate would refuse to pull in (still counting hits, below thresh/cold_div, not block-promoted): a cold branch (IKVM __<GetInstance> lambda factory, one-shot init, error path) reached rarely from a hot caller. Lets the hot method JIT while paying ~1 transition per cold call, NOT a per-iteration storm; hot/parked callees still bail so the island force-JITs them. 0 = off. NOTE: jit34 showed this misclassifies hot-via-JITted-caller callees as cold -> 2M residuals/frame -> 1.5fps. Keep OFF until residuals self-heal to the callee's f-slot. */
 int mono_wasm_jit_profile_fast = 0;    /* MONO_WASM_JIT_PROFILE_FAST=1 — emit inline volume counters into the fast dispatch paths (INLINE_AOT direct, inline f-slot IC hit, inline AOT-IC hit) which otherwise call no counting helper. Adds hot-path overhead, so OFF by default (only for a dedicated cost-attribution run). Feeds WJC_FAST_*. */
-int mono_wasm_jit_island_depth = 24;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
-/* max island DFS depth. */   /* Lever C: MONO_WASM_JIT_ISLAND_DEPTH — max island DFS depth (was a fixed 10). */
-int mono_wasm_jit_island_budget = 192;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
-/* max force-compiles per island attempt. */  /* Lever C: MONO_WASM_JIT_ISLAND_BUDGET — max force-compiles per island attempt (was a fixed 64). */
-int mono_wasm_jit_block_promote = 4;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
-/* blocked-callee count that promotes a root. */  /* Lever C: MONO_WASM_JIT_BLOCK_PROMOTE — pull a cold callee into an island once it has BLOCKED >= N island attempts (block_n), even if its own hit count is low (it's hot via JITted callers). 0 = disable (cold gate is hits-only). The bench showed top blockers ~100, so the old thresh/4 (=500) never fired — 16 catches the hot ctors. */
 int mono_wasm_jit_promotion_drain = 8; /* MONO_WASM_JIT_PROMOTION_DRAIN — max queued promotions (Lever A callers, block-promote callees, and woken waiters) drained per safe point. */
-int mono_wasm_jit_island_cold_div = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
-/* cold gate divisor for island members. */ /* MONO_WASM_JIT_ISLAND_COLD_DIV — normal cold gate divisor for eager island callees; thresh/div is the minimum retained hit count. */
-int mono_wasm_jit_promoted_cold_div = 16; /* MONO_WASM_JIT_PROMOTED_COLD_DIV — looser cold gate divisor when force-JITing an upward-promoted caller. */
-int mono_wasm_jit_promoted_root_uncold_depth = 8;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
-/* how deep a promoted root relaxes the cold gate. */ /* MONO_WASM_JIT_PROMOTED_ROOT_UNCOLD_DEPTH — for promoted roots, skip the cold gate entirely through this DFS depth. */
-int mono_wasm_jit_block_force = 5;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
-/* blocked-callee count that forces an island. */ /* MONO_WASM_JIT_BLOCK_FORCE — queue a blocking callee for direct promotion once it has blocked this many island attempts. 0 disables. */
 
 static gboolean
 wj_method_raise_exempt (MonoCompile *cfg)
@@ -1417,6 +1369,18 @@ mono_wasm_jit_llvmonly_enabled (void)
 	return cached;
 }
 
+/* Phase 5 (mini-wasm-lazy.inc, included at the end of this file). The first two compile in both builds. */
+static gboolean wj_lazy_is_pool_slot (int slot);
+static gboolean wj_lazy_dep_needs_real (int slot);
+#ifdef HOST_BROWSER
+static gboolean wj_lazy_dep_ok (int slot);
+static void wj_lazy_ensure_bank_of_slot (int slot);
+static gboolean wj_lazy_pool_ft (int slot, WasmFuncType *out);
+static const char *wj_lazy_refusal (MonoMethod *m, MonoMethodSignature *csig, gboolean rgctx, const WasmFuncType *ct, int *counter);
+static int wj_lazy_reserve (MonoMethod *m, MonoMethodSignature *csig, gboolean rgctx, const WasmFuncType *ct);
+static int wj_lazy_arm_fslot (MonoMethod *target, MonoMethod *self, const WasmFuncType *ftd);
+#endif
+
 #ifdef HOST_BROWSER
 #include "mini-wasm-diagnostics.inc"
 /* Per-thread record of which function-table slots THIS thread actually instantiated (instantiate_local
@@ -1588,6 +1552,8 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 	extern gint32 *mono_wasm_jit_delegate_pic_cap_addr (void);
 	extern gpointer mono_wasm_jit_scratch (void);
 	extern gpointer mono_wasm_jit_cur_island_il_state_addr (void);
+	if (f_slot > 0)
+		wj_lazy_ensure_bank_of_slot (f_slot);   /* Phase 5: a pool slot's bank goes in before its real f, never after */
 	/* $2/$4/$6 below are pointers passed as 32-bit ints; a g_malloc buffer above 2GB (MC's heap grows past
 	 * it) arrives NEGATIVE in JS, and HEAPU8.slice(negative,..) reads the wrong region -> garbage module
 	 * bytes -> a magic-word CompileError. Re-add 2^32 to recover the real unsigned address. (Use a C-valid
@@ -1734,6 +1700,9 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 	 * clang tokenises this body as C, so it must stay parseable as such: `var x = ...;` at statement
 	 * level is tolerated, but a declaration in a for-initialiser (`for (var k = 0; ...)`) is not, and
 	 * neither is `>>>`. Hence the hoisted `var` + while loop below. */
+	for (i = 0; i < n; ++i)
+		if (f_slots [i] > 0)
+			wj_lazy_ensure_bank_of_slot (f_slots [i]);   /* Phase 5: as in instantiate_local */
 	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
 	_ok = EM_ASM_INT ({
 		var es = $0 < 0 ? $0 + 4294967296 : $0;
@@ -2336,6 +2305,20 @@ wj_reg_at (int i)
 	return chunk ? &chunk [i % WJ_REG_CHUNK] : NULL;
 }
 
+/* R358 (MONO_WASM_JIT_T2_UNIT census): the registered wire length of descriptor `desc` (1-based), 0 if none. */
+int mono_wasm_jit_desc_body_len (int desc);
+int
+mono_wasm_jit_desc_body_len (int desc)
+{
+	int len = 0;
+	WjRegEntry *re;
+	wj_reg_read_enter ();
+	if (desc > 0 && desc <= wj_reg_n && (re = wj_reg_at (desc - 1)))
+		len = (int) re->body_len;
+	wj_reg_read_leave ();
+	return len;
+}
+
 int
 mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, gboolean no_gc, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps)
 {
@@ -2486,6 +2469,9 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			chunk [n % WJ_REG_CHUNK].logical_imethod = method ? mono_interp_get_imethod (method) : NULL;
 			chunk [n % WJ_REG_CHUNK].f_sig_id = f_sig_id;
 			chunk [n % WJ_REG_CHUNK].no_gc = no_gc ? 1 : 0;
+			/* Phase 5: a re-framed batch is installed on the rebatching thread before its admission, which a pool
+			 * slot's callers cannot wait for (invariant 1). */
+			chunk [n % WJ_REG_CHUNK].colocate_refused = wj_lazy_is_pool_slot (f_slot) ? 1 : 0;
 			chunk [n % WJ_REG_CHUNK].depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
 			/* The imported slots. Written HERE, inside the critical section, and not by a follow-up call
 			 * after registration returns -- the barrier and the wj_reg_n bump below are what make this
@@ -3018,6 +3004,15 @@ wj_admit_dependencies (WjRegEntry *re, WjDepSet *ds, int desc_id, gboolean watch
 	/* `ds` is the caller's snapshot, taken together with the bytes it will instantiate (R320, wj_pub_snapshot):
 	 * ONE snapshot for the whole walk -- see WjRegEntry.depset. */
 	for (i = 0; ds && i < ds->n; ++i) {
+		/* Phase 5, invariant 1 (mini-wasm-lazy.inc): a pool dep is callable here once its stub bank is, and is never
+		 * descended into -- its stub binds the real callee, through that callee's own admission, when first called. */
+		if (wj_lazy_is_pool_slot (ds->slot [i])) {
+			if (!wj_lazy_dep_ok (ds->slot [i]))
+				return 0;
+			if (!wj_lazy_dep_needs_real (ds->slot [i]))
+				continue;
+			/* a registered no-GC callee: a caller may have been credited for it, so it is admitted for real below */
+		}
 		int dep_id = wj_desc_for_fslot (ds->slot [i]);
 		WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
 		if (watch)
@@ -3372,7 +3367,13 @@ wj_install_closure (int desc_id)
 	{
 		WjDepSet *ds = snap_ds;
 		for (i = 0; ds && i < ds->n; ++i) {
-			int d = wj_desc_for_fslot (ds->slot [i]);
+			int d;
+			if (wj_lazy_is_pool_slot (ds->slot [i]) && !wj_lazy_dep_needs_real (ds->slot [i])) {   /* Phase 5: the stub (invariant 1) */
+				if (!wj_lazy_dep_ok (ds->slot [i]))
+					ok = FALSE;
+				continue;
+			}
+			d = wj_desc_for_fslot (ds->slot [i]);
 			if (d > 0 && !wj_install_closure (d))
 				ok = FALSE;
 		}
@@ -5284,6 +5285,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 #include "mini-wasm-ir.inc"
 #include "mini-wasm-batching.inc"
 #include "mini-wasm-emitter.inc"
+#include "mini-wasm-lazy.inc"
 
 #endif // DISABLE_JIT
 

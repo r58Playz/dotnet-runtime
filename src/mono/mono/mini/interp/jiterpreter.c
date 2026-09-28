@@ -1723,6 +1723,34 @@ mono_jiterp_allocate_table_entry (int type) {
 	return index;
 }
 
+/* N CONTIGUOUS entries in one atomic step, for a wasm-JIT lazy stub bank (mini-wasm-lazy.inc): its e/f pairs must be
+ * adjacent, because every reader of a JIT slot pair assumes the e-slot is the f-slot minus one (wj_fixed_index_jit_desc),
+ * and two single allocations can be split by another thread's. Returns the first index, or 0 if the block does not fit
+ * (the entries are burned, as a failed single allocation's is). */
+EMSCRIPTEN_KEEPALIVE int
+mono_jiterp_allocate_table_entries (int type, int n)
+{
+	g_assert ((type >= 0) && (type <= JITERPRETER_TABLE_LAST) && n > 0);
+	JiterpreterTableInfo *table = &tables[type];
+	if (table->first_index <= 0)
+		return 0;
+#ifdef DISABLE_THREADS
+	if (table->next_index == 0)
+		table->next_index = table->first_index;
+	int index = table->next_index;
+	table->next_index += n;
+#else
+	gint32 expected = 0;
+	atomic_compare_exchange_strong ((atomic_int *)&table->next_index, &expected, table->first_index);
+	int index = atomic_fetch_add ((atomic_int *)&table->next_index, n);
+#endif
+	if (index + n - 1 > table->last_index) {
+		{ extern void mono_wasm_jit_note_table_exhausted_quiet (void); mono_wasm_jit_note_table_exhausted_quiet (); }
+		return 0;
+	}
+	return index;
+}
+
 /* Entries still available in `type`'s table. Advisory: another thread can consume some between the read and
  * the caller's allocation, so it is only sound for "is there room for N" checks that tolerate losing a race
  * (the allocation itself still has to be checked). Used by the wasm JIT's SCC batch to avoid half-reserving

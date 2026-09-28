@@ -87,13 +87,18 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_RCONV_TO_I1: case OP_FCONV_TO_I1: case OP_RCONV_TO_U1: case OP_FCONV_TO_U1:
 	case OP_RCONV_TO_I2: case OP_FCONV_TO_I2: case OP_RCONV_TO_U2: case OP_FCONV_TO_U2:
 	case OP_LZCNT32: case OP_POPCNT32:
+	/* R360: the lowered atomics (all 32-bit or narrower; a pointer-sized one is i32 on wasm32) */
+	case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
+	case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4:
+	case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
+	case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:
 		return WASM_I32;
 	case OP_ICONV_TO_I8: case OP_ICONV_TO_U8:
 	case OP_LOADI8_MEMBASE:
 		return WASM_I64;
-	case OP_LOADR8_MEMBASE:
+	case OP_LOADR8_MEMBASE: case OP_ATOMIC_LOAD_R8:
 		return WASM_F64;
-	case OP_LOADR4_MEMBASE:
+	case OP_LOADR4_MEMBASE: case OP_ATOMIC_LOAD_R4:
 		return WASM_F32;
 	case OP_I8CONST: case OP_LMOVE:
 	case OP_LADD: case OP_LSUB: case OP_LMUL:
@@ -183,6 +188,11 @@ wj_opcode_is_nonref (MonoInst *ins)
 	case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:   /* R323 */
 	case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE:
 	case OP_LOADU1_MEMBASE: case OP_LOADI1_MEMBASE: case OP_LOADU2_MEMBASE: case OP_LOADI2_MEMBASE:
+	/* R360: sub-word atomics and the add can never hold a pointer. The 32-bit load/CAS/exchange are also how
+	 * a REFERENCE is read or swapped on wasm32, so they stay unproven like OP_LOAD_MEMBASE. */
+	case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
+	case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2:
+	case OP_ATOMIC_ADD_I4:
 	case OP_MOVE_F_TO_I4:
 	case OP_ICEQ: case OP_ICNEQ: case OP_ICLT: case OP_ICLT_UN: case OP_ICGT: case OP_ICGT_UN:
 	case OP_ICLE: case OP_ICLE_UN: case OP_ICGE: case OP_ICGE_UN:
@@ -221,10 +231,16 @@ wj_exc_id_for_name (const char *en)
 	if (!strcmp (en, "NullReferenceException")) return 4;
 	if (!strcmp (en, "ArithmeticException")) return 5;
 	if (!strcmp (en, "ArrayTypeMismatchException")) return 6;
+	/* R360: the three names left that refused a whole method (20 of p81's 42 deeper-inlining downgrades): the
+	 * delegate-ctor null-target check (method-to-ir.c, ArgumentException), the SIMD element-index checks
+	 * (simd-intrinsics.c) and the stack-imbalance check (calls.c) */
+	if (!strcmp (en, "ArgumentException")) return 7;
+	if (!strcmp (en, "ArgumentOutOfRangeException")) return 8;
+	if (!strcmp (en, "ExecutionEngineException")) return 9;
 	return -1;
 }
 
-#define WJ_EXC_IDS 7
+#define WJ_EXC_IDS 10
 
 /* The instructions MONO_WASM_JIT_RAISE_NOGC exempts: everything whose only way to reach the collector is
  * by raising, i.e. by allocating an exception and never returning to this frame. Factored out of
@@ -443,6 +459,14 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
 	case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
 	case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
+	/* R360: the lowered atomics make no call and cannot allocate. wj_ins_clobbers_mem, which otherwise
+	 * reuses this list as "does not write memory", tests the loads and RMWs itself first. */
+	case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+	case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:
+	case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
+	case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
+	case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
+	case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:
 	case OP_LDADDR:
 	case OP_SETRET:
 	/* the emitter's no-op set */
@@ -621,12 +645,32 @@ wj_lcse_find (WjLcse *t, int wop, int align, int base, gint32 off)
 	return -1;
 }
 
+/* R360: the atomics the emitter lowers, other than stores (MONO_IS_STORE_MEMBASE already covers those) */
+static gboolean
+wj_ins_is_atomic_rmw_or_load (MonoInst *ins)
+{
+	switch (ins->opcode) {
+	case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
+	case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
+	case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
+	case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
 /* Could this instruction change memory that a cached load already read? */
 static gboolean
 wj_ins_clobbers_mem (MonoInst *ins)
 {
 	/* Stores write it; OP_LDADDR hands its address to code we cannot see. */
 	if (MONO_IS_STORE_MEMBASE (ins) || ins->opcode == OP_LDADDR)
+		return TRUE;
+	/* R360: an atomic RMW writes memory, and an atomic LOAD is an acquire that a load cached before it must
+	 * not satisfy. Both are in the GC-point classifier's FALSE set (they cannot reach the collector), so they
+	 * have to be answered here, before the fallback below. */
+	if (wj_ins_is_atomic_rmw_or_load (ins))
 		return TRUE;
 	/* A raise never returns, so nothing later in this method observes anything it did. Decided here
 	 * rather than by asking wj_ins_is_gcpoint with clause_free=TRUE, because that answer is gated on
@@ -1156,6 +1200,14 @@ wj_fslot_is_nogc (int fslot)
 	WjRegEntry *re;
 	if (fslot <= 0)
 		return FALSE;
+	/* Phase 5, invariant 3: a pool slot may still be a stub on the worker that runs this call, and a stub's bind
+	 * can collect. "Registered before their callers", the premise above, does not hold for it -- unless the callee
+	 * IS registered there, no-GC, and admission installs it for real before any caller goes live
+	 * (wj_lazy_dep_needs_real, MONO_WASM_JIT_LAZY_NOGC), which is what makes crediting it sound. */
+	if (wj_lazy_is_pool_slot (fslot) && !wj_lazy_dep_needs_real (fslot)) {
+		mono_wasm_jit_counters [WJC_LAZY_NOGC_REFUSED]++;
+		return FALSE;
+	}
 	ci = fslot / WJ_SLOT_CHUNK;
 	if (ci < 0 || ci >= WJ_SLOT_NCHUNKS || !wj_fslot_desc_chunks [ci])
 		return FALSE;
@@ -1319,31 +1371,6 @@ wj_ins_is_pinned_vcall_forward (MonoInst *ins)
 		call->signature && call->signature->hasthis && call->call_info;
 }
 
-/* Append a blocking callee to the cfg result, deduped + capped. Shared by the residual=0 pre-scan
- * (enumerates the full set) and the emit bail site (records the first blocker it hits) so the two can't
- * disagree on the head of the list. */
-static void
-wj_result_add_blocker (MonoWasmJitResult *res, MonoMethod *m)
-{
-	int i;
-	for (i = 0; i < res->nblockers; ++i)
-		if (res->blockers [i] == m)
-			return;
-	if (res->nblockers < MONO_WASM_JIT_MAX_BLOCKERS)
-		res->blockers [res->nblockers++] = m;
-	else {
-		/* The closure handed to the island/SCC drivers is now INCOMPLETE. MONO_WASM_JIT_MAX_BLOCKERS is
-		 * 32 against WJ_SCC_MAX 64, so a member with more distinct blockers than the array holds gives the
-		 * batcher a set it cannot close -- it folds what it can see, fails to reach a fixpoint, hits
-		 * !progress and condemns EVERY member permanently. A truncation silently becoming a terminal
-		 * verdict. `blockers_truncated` has been set here and read by nothing; this counts it so the rate
-		 * is known before Stage 2 makes truncation a transient refusal. */
-		if (G_UNLIKELY (mono_wasm_jit_stats) && !res->blockers_truncated)
-			mono_wasm_jit_count (WJC_BLOCKERS_TRUNCATED);
-		res->blockers_truncated = 1;
-	}
-}
-
 static void
 wj_result_add_direct_dep (MonoWasmJitResult *res, int fslot, guint32 sig_id, MonoMethod *callee)
 {
@@ -1365,63 +1392,6 @@ wj_result_add_direct_dep (MonoWasmJitResult *res, int fslot, guint32 sig_id, Mon
 		res->direct_deps_truncated = 1;
 }
 
-/* Pre-scan (residual=0 / islands only): enumerate ALL direct un-JITted callees that would HARD-BLOCK this
- * method's compile, into cfg->wasm_jit_result.blockers — so wasm_jit_force_island can pull them all in one
- * emit cycle instead of re-emitting the method once per blocker (the emit itself still bails at the FIRST
- * blocker; this just hands the island builder the full set up front). The predicate MUST mirror the bail
- * site in the OP_CALL lowering below: a direct OP_CALL-family call, method!=NULL, callee has no f-slot, not
- * an rgctx call, not AOT-residual-eligible, not (residual_perm && perm-unjittable). INLINE_AOT (default
- * off) is not modelled — when on it can only REMOVE a blocker (inlines an AOT callee), so the worst case is
- * force_island wasting a little budget on a callee that would actually inline; never a correctness issue. */
-static void
-wj_prescan_blockers (MonoCompile *cfg)
-{
-	extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
-	extern gboolean mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig);
-	extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
-	extern int mono_wasm_jit_callee_too_cold (MonoMethod *m);
-	extern int mono_wasm_jit_residual_cold;
-	extern MonoMethod *mono_marshal_get_synchronized_wrapper (MonoMethod *enter_method);
-	MonoBasicBlock *bb;
-	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
-		MonoInst *ins;
-		MONO_BB_FOR_EACH_INS (bb, ins) {
-			MonoCallInst *call;
-			MonoMethod *call_method;
-			MonoMethodSignature *csig;
-			switch (ins->opcode) {
-			case OP_CALL: case OP_VOIDCALL: case OP_FCALL: case OP_LCALL: case OP_RCALL: case OP_VCALL2:
-				break;
-			default:
-				continue;
-			}
-			call = (MonoCallInst *) ins;
-			call_method = call->method;
-			csig = call->signature;
-			if (!call_method || !csig)        /* method==NULL = JIT-icall (never a managed blocker); no sig handled by emit */
-				continue;
-			if (call->rgctx_reg)              /* rgctx call -> routed through residual, never a hard blocker */
-				continue;
-			if (call_method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)
-				call_method = mono_marshal_get_synchronized_wrapper (call_method);
-			call_method = wj_canonical_callee (call_method);   /* stabilize the per-compile synchronized-inner wrapper */
-			if (call_method == cfg->method)                                                        /* self-recursion: baked via self-slot reservation, not a blocker */
-				continue;
-			if (mono_wasm_jit_get_callee_fslot (call_method) > 0)                                   /* already JITted */
-				continue;
-			if (mono_interp_jit_call_supported (call_method, csig))    /* AOT-routed residual */
-				continue;
-			/* MONO_WASM_JIT_RESIDUAL_PERM (Lever B) ships 1: under residual=0, residual-route ONLY a
-			 * permanently-un-JITtable callee rather than treating it as an island blocker. A permanent
-			 * blocker cannot ever be cleared, so parking the caller on it parks it forever. */
-			if (mono_wasm_jit_callee_perm_unjittable (call_method))   /* perm-unjittable -> residual */
-				continue;
-			if (mono_wasm_jit_residual_cold && mono_wasm_jit_callee_too_cold (call_method))          /* cold leaf -> residual, not a hard blocker */
-				continue;
-			wj_result_add_blocker (&cfg->wasm_jit_result, call_method);
-		}
-	}
-}
 #endif
 
 /* Scalar-vtype call ABI (MONO_WASM_JIT_VTYPE_SCALAR / _REF). A struct mini_wasm_is_scalar_vtype accepts

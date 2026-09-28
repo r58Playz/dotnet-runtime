@@ -641,6 +641,159 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 	wasm_buf_free (&sec);
 }
 
+/*
+ * A LAZY STUB BANK (MONO_WASM_JIT_LAZY_T1, mini-wasm-lazy.inc): k functions of the one functype `ft`, stub i
+ * written into table slot f_slots [i] by an ACTIVE element segment -- so instantiating the bank on a worker is
+ * exactly what makes those f-slots callable there, and nothing else ever has to install a stub.
+ *
+ * The four function imports are runtime helpers named by table index, like every JIT module's:
+ *   [0] bind   (i32 slot)->i32     the f-slot to tail-call through, or 0 = run the callee in the interpreter
+ *   [1] scratch ()->i32            THIS pthread's scratch (never s.b: a bank outlives the pthread that made it, R293)
+ *   [2] interp (i32 slot, i32 buf)->i32   1 if the callee threw
+ *   [3] continue_unwind ()->void   never returns
+ * Of the ten s.* globals only s.p (0) is used; all ten are declared because emit_import_section is the one
+ * definition of that section. Stub body, n params, locals old/sp/r at n, n+1, n+2:
+ *   frame: every i32 param stored in a C-stack frame, i.e. under sgen's conservative stack scan, because bind
+ *          can compile, instantiate, take GC-safe transitions and run a cctor -- all of which can collect
+ *   r = bind (N); if r { pop; return_call_indirect ft (params..., r) }
+ *   r = scratch (); params -> r + 8*j; if interp (N, r) { continue_unwind; unreachable }
+ *   [ret = load r + 192]; pop
+ */
+void
+wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, const guint32 *helper_idx, WasmBuf *out)
+{
+	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+	WasmFuncImport fim [4];
+	WasmValtype p1 [1] = { WASM_I32 }, p2 [2] = { WASM_I32, WASM_I32 };
+	WasmLocalGroup lg [1] = { { WASM_I32, 3 } };
+	WasmBuf sec;
+	guint32 i, j, n = ft->nparams, ni32 = 0, frame;
+	guint32 l_old = n, l_sp = n + 1, l_r = n + 2;
+
+	for (j = 0; j < n; ++j)
+		if (ft->params [j] == WASM_I32)
+			ni32++;
+	frame = (ni32 * 4 + 15) & ~15u;
+
+	wasm_bytes (out, header, 8);
+	/* types: 0 = the stub, 1..4 = the helpers in import order */
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, 5);
+	emit_functype (&sec, ft->params, ft->nparams, ft->ret);
+	emit_functype (&sec, p1, 1, WASM_I32);
+	emit_functype (&sec, NULL, 0, WASM_I32);
+	emit_functype (&sec, p2, 2, WASM_I32);
+	emit_functype (&sec, NULL, 0, WASM_VOID);
+	emit_section (out, 1, &sec);
+	wasm_buf_free (&sec);
+
+	for (i = 0; i < 4; ++i) {
+		fim [i].table_index = helper_idx [i];
+		fim [i].type_idx = 1 + i;
+		fim [i].method = 0;
+	}
+	emit_import_section (out, TRUE, FALSE, 0, fim, 4);
+
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, k);
+	for (i = 0; i < k; ++i)
+		wasm_uleb (&sec, 0);
+	emit_section (out, 3, &sec);
+	wasm_buf_free (&sec);
+
+	/* element: one active segment per stub, table 0 (the imported f.f), offset = its f-slot */
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, k);
+	for (i = 0; i < k; ++i) {
+		wasm_uleb (&sec, 0);                     /* flags 0: active, table 0, funcidx vector */
+		wasm_op (&sec, WASM_OP_I32_CONST); wasm_sleb (&sec, f_slots [i]); wasm_op (&sec, WASM_OP_END);
+		wasm_uleb (&sec, 1);
+		wasm_uleb (&sec, 4 + i);                 /* after the four imported helpers */
+	}
+	emit_section (out, 9, &sec);
+	wasm_buf_free (&sec);
+
+	wasm_buf_init (&sec);
+	wasm_uleb (&sec, k);
+	for (i = 0; i < k; ++i) {
+		WasmBuf body;
+		guint32 kth = 0;
+		wasm_buf_init (&body);
+		if (frame) {
+			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
+			wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_old);
+			wasm_i32_const (&body, (gint32) frame);
+			wasm_op (&body, WASM_OP_I32_SUB);
+			wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_sp);
+			wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
+			for (j = 0; j < n; ++j) {
+				if (ft->params [j] != WASM_I32)
+					continue;
+				wasm_op_local (&body, WASM_OP_LOCAL_GET, l_sp);
+				wasm_op_local (&body, WASM_OP_LOCAL_GET, j);
+				wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 4 * kth++);
+			}
+		}
+		wasm_i32_const (&body, f_slots [i]);
+		wasm_op (&body, WASM_OP_CALL); wasm_uleb (&body, 0);
+		wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_r);
+		wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+		if (frame) {
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, l_old);
+			wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
+		}
+		for (j = 0; j < n; ++j)
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, j);
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, l_r);
+		wasm_u8 (&body, 0x13);                  /* return_call_indirect */
+		wasm_uleb (&body, 0);                    /* type 0 */
+		wasm_uleb (&body, 0);                    /* table 0 */
+		wasm_op (&body, WASM_OP_END);
+		wasm_op (&body, WASM_OP_CALL); wasm_uleb (&body, 1);
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, l_r);
+		for (j = 0; j < n; ++j) {
+			WasmOpcode sop;
+			guint32 al;
+			switch (ft->params [j]) {
+			case WASM_I64: sop = WASM_OP_I64_STORE; al = 3; break;
+			case WASM_F32: sop = WASM_OP_F32_STORE; al = 2; break;
+			case WASM_F64: sop = WASM_OP_F64_STORE; al = 3; break;
+			default:       sop = WASM_OP_I32_STORE; al = 2; break;
+			}
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, l_r);
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, j);
+			wasm_op (&body, sop); wasm_memarg (&body, al, 8 * j);
+		}
+		wasm_i32_const (&body, f_slots [i]);
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, l_r);
+		wasm_op (&body, WASM_OP_CALL); wasm_uleb (&body, 2);
+		wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+		wasm_op (&body, WASM_OP_CALL); wasm_uleb (&body, 3);
+		wasm_op (&body, WASM_OP_UNREACHABLE);
+		wasm_op (&body, WASM_OP_END);
+		if (ft->ret != WASM_VOID) {
+			WasmOpcode lop;
+			guint32 al;
+			switch (ft->ret) {
+			case WASM_I64: lop = WASM_OP_I64_LOAD; al = 3; break;
+			case WASM_F32: lop = WASM_OP_F32_LOAD; al = 2; break;
+			case WASM_F64: lop = WASM_OP_F64_LOAD; al = 3; break;
+			default:       lop = WASM_OP_I32_LOAD; al = 2; break;
+			}
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, l_r);
+			wasm_op (&body, lop); wasm_memarg (&body, al, 192);   /* WJ_SCRATCH_RET_OFF */
+		}
+		if (frame) {
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, l_old);
+			wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
+		}
+		emit_code_entry (&sec, lg, 1, &body);
+		wasm_buf_free (&body);
+	}
+	emit_section (out, 10, &sec);
+	wasm_buf_free (&sec);
+}
+
 void
 wasm_module_append_name_section (WasmBuf *out, const char *module_name, const char *func0_name, guint32 nfimports)
 {
