@@ -1297,6 +1297,12 @@ enum {
 	WJC_BRANCH_HINT_IC,        /* R341: vcall IC / devirt-guard miss exits hinted, per emission */
 	WJC_MATH_INTRINS_LOWERED,  /* R346: System.Math/MathF Sqrt/Floor/Ceiling call sites lowered to a wasm opcode */
 	WJC_T2_BODY_CAPPED,        /* R349: tier-2 bodies refused for exceeding MONO_WASM_JIT_T2_MAX_BODY (ungated) */
+	WJC_EHREC_EMITTED,         /* R353: EH methods emitted with an inline frame record (MONO_WASM_JIT_EH_REC) */
+	WJC_EHREC_TRIM,            /* R353: record exits that found the finally-save depth moved and called the trim */
+	WJC_EHREC_BOUNDARY_POP,    /* R353: dead-frame records the interp->JIT boundary popped off the LMF head */
+	WJC_EHREC_DISPATCH_NOREC,  /* R353: landing-pad dispatches whose cur_island was not the method's record; must be 0 */
+	WJC_EHREC_UNLINK_INNER,    /* R353: record exits that unlinked through a stale inner LMF left at the head */
+	WJC_EHREC_UNLINK_OUTER,    /* R353: record exits that found the head rewound past them (pass 1) and left it */
 	WJC_MAX
 };
 
@@ -1326,5 +1332,17 @@ void mono_wasm_jit_census_note_entry (int eslot);
 /* The next word: the address of this thread's mono_wasm_tls_thread (threads.c), read by the MONO_WASM_JIT_FAST_TLS
  * form of mono_tls_get_thread_extern (R317). */
 #define WJ_SCRATCH_THREAD_SLOT (WJ_SCRATCH_TLAB_SLOT + 8)
+/* R353 (MONO_WASM_JIT_EH_REC): the address of this thread's LMF-address mirror (mini-runtime.c), and of its
+ * finally-save depth (interp.c). */
+#define WJ_SCRATCH_LMFADDR_SLOT (WJ_SCRATCH_THREAD_SLOT + 8)
+#define WJ_SCRATCH_FINSP_SLOT (WJ_SCRATCH_LMFADDR_SLOT + 8)
+
+/* Byte offsets of interp.c's WjEhRec (R353), for the emitter, which cannot see MonoLMFExt from here. */
+typedef struct {
+	int size, previous_lmf, lmf_addr, lmf_method, kind, il_state, magic, prev, finally_sp, il, il_method, il_offset;
+	guint32 magic_key;
+	int kind_il_state;
+} WjEhRecLayout;
+const WjEhRecLayout *mono_wasm_jit_ehrec_layout (void);
 
 #endif /* __MONO_MINI_WASM_H__ */

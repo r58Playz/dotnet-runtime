@@ -674,6 +674,11 @@ int mono_wasm_jit_math_intrins = 1;
 /* MONO_WASM_JIT_T2_MAX_BODY (R349): largest tier-2 module, in bytes, the emitter will hand to V8; a bigger one fails
  * permanently and the method keeps its tier-1 body (or takes the tier-1-policy downgrade). 0 = no cap. */
 int mono_wasm_jit_t2_max_body = 98304;
+/* MONO_WASM_JIT_EH_REC (R353): an EH method keeps its IL_STATE LMFExt in a record inside its OWN C-stack frame and
+ * links/unlinks it inline, instead of calling mono_wasm_jit_enter_island / leave_island (interp.c, WjEhRec). p75, b t t b
+ * on the Minecraft server tick: the island helpers 2.98 -> 0.08 M instr/tick, all instructions -3.6%, calls -9.6%;
+ * cycles unresolved on that instrument (the helpers were ~1 M cycles/tick). 0 = the island calls. */
+int mono_wasm_jit_eh_rec = 1;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -817,6 +822,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_math_intrins, "MONO_WASM_JIT_MATH_INTRINS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
+	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 #if defined(HOST_WASM) && defined(__wasm_atomics__)
 	/* mono_wasm_hw_fence lives in utils/atomic.c and exists only in the threaded wasm runtime, not in mono-aot-cross. */
 	WJ_T2_KNOB (mono_wasm_hw_fence, "MONO_WASM_HW_FENCE", 0, 1)

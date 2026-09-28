@@ -253,6 +253,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean eh_has_finally = FALSE;   /* TRUE: method has >=1 FINALLY clause (milestone 2c) */
 	WasmEhTable *eh_table = NULL;      /* in-method EH clause table (built below, baked into the catch landing pad) */
 	gboolean eh_on = FALSE;            /* TRUE: emit the in-method try/catch wrapper for this method */
+	gboolean ehrec_on G_GNUC_UNUSED = FALSE;   /* eh_on + MONO_WASM_JIT_EH_REC: inline frame record instead of the island calls (R353) */
+	int ehrec_off G_GNUC_UNUSED = 0;           /* the record's byte offset in the frame, from refbase */
+	int ehlmf_idx G_GNUC_UNUSED = 0;           /* i32 local: this thread's LMF address, re-derived at each push/pop */
 	int eh_dispatch_ti = -1, eh_endcatch_ti = -1;  /* functype indices: (i32,i32)->i32 dispatch + ()->void end_catch */
 	int resid_void_ti = -1;            /* ()->void: mono_wasm_jit_continue_unwind. Registered UNCONDITIONALLY --
 	                                    * the residual/vcall/delegate threw==1 sites occur in non-EH methods too,
@@ -1091,6 +1094,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	cnt [0] += 1;
 	eh_h_idx = nwparams + cnt [0];
 	cnt [0] += 1;
+#ifdef HOST_BROWSER
+	{
+		extern int mono_wasm_jit_eh_rec;
+		ehrec_on = eh_on && mono_wasm_jit_eh_rec;
+		if (ehrec_on) {
+			ehlmf_idx = nwparams + cnt [0];
+			cnt [0] += 1;
+		}
+	}
+#endif
 	/* Only when the method actually has EH: a non-EH method never calls enter_island, so reserving this would
 	 * cost every JITted method a local for nothing. */
 	{
@@ -1840,6 +1853,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		/* C-stack frame size: ref slots first (4-byte), then the 8-aligned addr slots; whole frame
 		 * 16-aligned per the emscripten SP ABI. */
 		refbytes_al = (nrefslots * 4 + 7) & ~7;
+#ifdef HOST_BROWSER
+		/* R353: in record mode an EH method's WjEhRec sits after the address slots, so every EH method now has a
+		 * frame. The prologue writes every field it uses and the zeroing below stops short of it. */
+		if (ehrec_on) {
+			ehrec_off = (refbytes_al + naddrbytes + 7) & ~7;
+			framebytes = (ehrec_off + mono_wasm_jit_ehrec_layout ()->size + 15) & ~15;
+		} else
+#endif
 		framebytes = (refbytes_al + naddrbytes + 15) & ~15;
 		/* Lazy materialization is restricted to the representation where every root has a wasm-local
 		 * value home. Address frames and EH need a valid frame from entry; slot-homed ref-vtype
@@ -2179,7 +2200,84 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); } \
 	else wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dpic_capval_idx); } while (0)
 #ifdef HOST_BROWSER
-#define EMIT_REF_LEAVE() do { if (framebytes > 0 && !lazy_cold_frame) { \
+/* R353 (MONO_WASM_JIT_EH_REC): the EH record's push and pop, inline. The record is at refbase + ehrec_off
+ * (interp.c's WjEhRec, offsets from mono_wasm_jit_ehrec_layout). The LMF address is re-derived from the scratch at
+ * each use -- s.b + WJ_SCRATCH_LMFADDR_SLOT holds the address of this thread's mirror -- so nothing new is live
+ * across the body's calls (the INLINE_ILOFS lesson, see wasm-encoder.c's s.i note). */
+#define EHREC_I32_STORE(off) do { wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (ehrec_off + (off))); } while (0)
+#define EHREC_I32_LOAD(off) do { wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) (ehrec_off + (off))); } while (0)
+#define EHREC_ADDR(off) do { wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	wasm_i32_const (&body, ehrec_off + (off)); wasm_op (&body, WASM_OP_I32_ADD); } while (0)
+#define EHREC_LOAD_LMF_ADDR() do { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_LMFADDR_SLOT); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) ehlmf_idx); } while (0)
+#define EMIT_EHREC_PUSH() do { const WjEhRecLayout *_L = mono_wasm_jit_ehrec_layout (); \
+	EHREC_LOAD_LMF_ADDR (); \
+	/* previous_lmf = *lmf_addr | 2 (the ext tag, as mono_push_lmf writes it) */ \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+	wasm_i32_const (&body, 2); wasm_op (&body, WASM_OP_I32_OR); \
+	EHREC_I32_STORE (_L->previous_lmf); \
+	/* the plain-LMF fields are unused for an ext; zero them, as interp_push_lmf does */ \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, 0); EHREC_I32_STORE (_L->lmf_addr); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, 0); EHREC_I32_STORE (_L->lmf_method); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, _L->kind_il_state); EHREC_I32_STORE (_L->kind); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); EHREC_I32_STORE (_L->il_state); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); \
+	wasm_i32_const (&body, (gint32) _L->magic_key); wasm_op (&body, WASM_OP_I32_XOR); EHREC_I32_STORE (_L->magic); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, (gint32) (intptr_t) cfg->method); EHREC_I32_STORE (_L->il_method); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, -1); EHREC_I32_STORE (_L->il_offset); \
+	/* prev = cur_island_il_state; finally_sp = the finally-save depth */ \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+	EHREC_I32_STORE (_L->prev); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_FINSP_SLOT); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+	EHREC_I32_STORE (_L->finally_sp); \
+	/* publish: cur_island_il_state = &rec.il, then the chain head = &rec.ext, last */ \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); EHREC_ADDR (_L->il); \
+	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); EHREC_ADDR (0); \
+	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
+	} while (0)
+/* The head is normally this record: unlink it inline. Otherwise mono_wasm_jit_ehrec_unlink decides (cold): a stale
+ * inner LMF above it goes with it, a head that pass 1 rewound past it stays (see leave_island). */
+#define EMIT_EHREC_POP() do { const WjEhRecLayout *_L = mono_wasm_jit_ehrec_layout (); \
+	extern void mono_wasm_jit_finally_trim_to (int baseline); \
+	extern void mono_wasm_jit_ehrec_unlink (gpointer rec); \
+	EHREC_LOAD_LMF_ADDR (); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+	EHREC_ADDR (0); wasm_op (&body, WASM_OP_I32_EQ); \
+	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->previous_lmf); \
+	wasm_i32_const (&body, -4); wasm_op (&body, WASM_OP_I32_AND); \
+	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
+	wasm_op (&body, WASM_OP_ELSE); \
+	EHREC_ADDR (0); \
+	wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_ehrec_unlink, (guint32) eh_type_idx); \
+	wasm_op (&body, WASM_OP_END); \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->prev); \
+	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
+	/* a finally body on this frame's exception path threw and escaped: free what it left (cold) */ \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_FINSP_SLOT); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->finally_sp); \
+	wasm_op (&body, WASM_OP_I32_NE); \
+	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->finally_sp); \
+	wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_finally_trim_to, (guint32) eh_type_idx); \
+	wasm_op (&body, WASM_OP_END); \
+	} while (0)
+#define EMIT_REF_LEAVE() do { if (ehrec_on) EMIT_EHREC_POP (); \
+	if (framebytes > 0 && !lazy_cold_frame) { \
 		if (lazy_ref_frame) { \
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
 			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
@@ -2188,7 +2286,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); \
 		if (lazy_ref_frame) wasm_op (&body, WASM_OP_END); \
 	} \
-	if (eh_on) {   /* pop this EH method's il_state island (pushed by enter_island in the prologue) */ \
+	if (eh_on && !ehrec_on) {   /* pop this EH method's il_state island (pushed by enter_island in the prologue) */ \
 		extern void mono_wasm_jit_leave_island (void); \
 		/* Direct import, not `i32.const <addr>; call_indirect`: V8 does not fold a constant index into a \
 		 * direct call, so the indirect form pays a table bounds check, a canonical-type check, index->code \
@@ -2528,6 +2626,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * heap growth). Zero-init is still owed to the address region (.NET locals) and to any
 				 * slot-homed ref (addrslot -2), so either of those keeps the fill. */
 				int zfrom = 0, zo;
+				int zend = ehrec_on ? ehrec_off : framebytes;   /* R353: the EH record is written, never zeroed */
 				if (!mono_wasm_jit_frame_zero && lc.ref_wt) {
 					gboolean zall_wt = TRUE;
 					for (i = 0; i < nvreg; ++i)
@@ -2538,12 +2637,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					if (zall_wt)
 						zfrom = refbytes_al;   /* 8-aligned, so the i64 stores below stay aligned */
 				}
-				if (zfrom >= framebytes) {
+				if (zfrom >= zend) {
 					/* nothing owed */
-				} else if (framebytes - zfrom <= mono_wasm_jit_inline_zero) {
+				} else if (zend - zfrom <= mono_wasm_jit_inline_zero) {
 					/* framebytes is a multiple of 16 and zfrom of 8, so these are aligned i64 stores with no
-					 * remainder and no alignment fixup. */
-					for (zo = zfrom; zo < framebytes; zo += 8) {
+					 * remainder and no alignment fixup (zend is framebytes, or the 8-aligned record offset). */
+					for (zo = zfrom; zo < zend; zo += 8) {
 						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
 						wasm_i64_const (&body, 0);
 						wasm_op (&body, WASM_OP_I64_STORE);
@@ -2556,7 +2655,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						wasm_op (&body, WASM_OP_I32_ADD);
 					}
 					wasm_i32_const (&body, 0);
-					wasm_i32_const (&body, framebytes - zfrom);
+					wasm_i32_const (&body, zend - zfrom);
 					wasm_u8 (&body, 0xFC); wasm_uleb (&body, 11); wasm_u8 (&body, 0);   /* memory.fill mem 0 (bulk memory) */
 				}
 				if (zfrom > 0 && mono_wasm_jit_stats)
@@ -2683,9 +2782,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		uses_eh_tag = TRUE;
 		/* PROLOGUE: push this EH method's il_state island so mono's exception pass-1 sees it on ANY entry
 		 * (interp->JIT boundary OR direct JIT->JIT f-slot call). method ptr baked; (i32)->void = eh_type_idx.
-		 * Popped at every exit by EMIT_REF_LEAVE + the rethrow paths. */
-		wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+		 * Popped at every exit by EMIT_REF_LEAVE + the rethrow paths. In record mode (R353) the push is inline and
+		 * the island call is not emitted at all. */
 #ifdef HOST_BROWSER
+		if (ehrec_on) {
+			EMIT_EHREC_PUSH ();
+			mono_wasm_jit_count (WJC_EHREC_EMITTED);
+		} else {
+		wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
 		{
 			extern gpointer mono_wasm_jit_enter_island (MonoMethod *m, int ndata);
 			/* args+locals this method can address, for the island's partial zeroing. Same expression the
@@ -2710,7 +2814,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_enter_island, (guint32) ilofs_ti);
 			wasm_op (&body, WASM_OP_DROP);
 		}
+		}
 #else
+		wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff6, (guint32) eh_type_idx);
 #endif
 		wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);   /* $outer: catch re-dispatch loop */
@@ -2993,7 +3099,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * It works where INLINE_ILOFS failed, for a specific reason: it `global.get`s the il_state
 				 * pointer at each store site instead of caching it in a method-long local, so it leaves
 				 * NOTHING live across the method's calls. */
-				{
+				if (ehrec_on) {
+					/* R353: straight into this frame's own record through refbase, which is live for the
+					 * landing pad anyway -- no load of the current island at all */
+					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+					wasm_i32_const (&body, eh_table->il_offsets [i]);
+					EHREC_I32_STORE (mono_wasm_jit_ehrec_layout ()->il_offset);
+				} else {
 					/* il_state->il_offset = <offset>, through imported global s.i, no call and nothing
 					 * left live: global.get &cur_island_il_state; load it; push the offset; store. */
 					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); /* s.i = &mono_wasm_jit_cur_island_il_state */
@@ -6635,6 +6747,13 @@ vcall_cold_miss_emit:
 		wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0);   /* tag 0 = x.e */
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
 #ifdef HOST_BROWSER
+		/* R353: this frame is the one resuming, so its record is the current island (dispatch and
+		 * wj_eh_restore_lmf read cur_island_il_state in record mode; WJC_EHREC_DISPATCH_NOREC checks it). */
+		if (ehrec_on) {
+			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8);
+			EHREC_ADDR (mono_wasm_jit_ehrec_layout ()->il);
+			wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0);
+		}
 		wasm_i32_const (&body, (gint32) (intptr_t) eh_table);
 #else
 		wasm_i32_const (&body, 0x7ff0);   /* offline: placeholder EH-table addr */
@@ -6651,6 +6770,9 @@ vcall_cold_miss_emit:
 		wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);     /* h < 0: no local handler */
 		/* the method escapes via rethrow -> pop its il_state island first */
 #ifdef HOST_BROWSER
+		if (ehrec_on)
+			EMIT_EHREC_POP ();
+		else
 		{ extern void mono_wasm_jit_leave_island (void); wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_leave_island, eh_endcatch_ti); }
 #else
 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff7, (guint32) eh_endcatch_ti);   /* leave_island ()->void */

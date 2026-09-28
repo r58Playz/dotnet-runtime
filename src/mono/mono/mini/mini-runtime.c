@@ -819,6 +819,21 @@ mono_set_jit_tls (MonoJitTlsData *jit_tls)
 		mono_thread_info_tls_set (info, TLS_KEY_JIT_TLS, jit_tls);
 }
 
+#if defined (TARGET_WASM) && defined (HOST_BROWSER)
+/* R353: this thread's LMF address as a real __thread, so emitted code can reach the LMF chain head without a
+ * pthread-key call: interp.c puts &mono_wasm_lmf_addr_mirror in the per-thread scratch (WJ_SCRATCH_LMFADDR_SLOT),
+ * exactly as R317 does for the current thread object. Kept in step with the pthread key at its only setter,
+ * below, on the owning thread; NULL while detached. */
+__thread MonoLMF **mono_wasm_lmf_addr_mirror;
+
+gpointer mono_wasm_lmf_addr_mirror_addr (void);
+gpointer
+mono_wasm_lmf_addr_mirror_addr (void)
+{
+	return &mono_wasm_lmf_addr_mirror;
+}
+#endif
+
 static void
 mono_set_lmf_addr (MonoLMF **lmf_addr)
 {
@@ -847,6 +862,7 @@ mono_set_lmf_addr (MonoLMF **lmf_addr)
 					cur ? "NOT &jit_tls->lmf" : "no jit_tls yet");
 		}
 	}
+	mono_wasm_lmf_addr_mirror = lmf_addr;
 #endif
 	mono_tls_set_lmf_addr (lmf_addr);
 
