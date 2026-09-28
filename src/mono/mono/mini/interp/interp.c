@@ -6955,8 +6955,9 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
  *  - the result slot is written then read in strict nested (LIFO) order across reentrancy.
  * Per-thread => MT-safe. The address can't be baked into the emitted module (a __thread address
  * differs per thread), so the JITted code fetches it via mono_wasm_jit_scratch() at each call site. */
-static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 16] __attribute__ ((aligned (8)));   /* + the TLAB and thread slots */
-g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 16);
+static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 32] __attribute__ ((aligned (8)));   /* + the TLAB, thread, LMF-address and finally-depth slots */
+g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 32);
+g_static_assert (WJ_SCRATCH_FINSP_SLOT + 8 <= WJ_SCRATCH_SIZE + 32);
 /* The 8 bytes past the marshalling area are NOT scratch: they hold the address of this thread's
  * mono_wasm_sgen_tls_info (sgen-mono.c), for OP_WASM_JIT_ALLOC_FAST's inline TLAB bump (R305). The emitter reads
  * it at WJ_SCRATCH_TLAB_SLOT; this pins the two together. */
@@ -7067,6 +7068,14 @@ mono_wasm_jit_scratch (void)
 	extern gpointer mono_wasm_tls_thread_addr (void);
 	*(gpointer *) (wj_scratch + WJ_SCRATCH_TLAB_SLOT) = mono_wasm_sgen_tls_info_addr ();
 	*(gpointer *) (wj_scratch + WJ_SCRATCH_THREAD_SLOT) = mono_wasm_tls_thread_addr ();   /* R317, same reasoning */
+	/* R353's EH records: the address of this thread's LMF-address mirror (mini-runtime.c, NULL while detached,
+	 * like the thread slot) and of its finally-save depth. Both are __thread, so both addresses are constant. */
+	{
+		extern gpointer mono_wasm_lmf_addr_mirror_addr (void);
+		extern gpointer mono_wasm_jit_finally_sp_addr (void);
+		*(gpointer *) (wj_scratch + WJ_SCRATCH_LMFADDR_SLOT) = mono_wasm_lmf_addr_mirror_addr ();
+		*(gpointer *) (wj_scratch + WJ_SCRATCH_FINSP_SLOT) = mono_wasm_jit_finally_sp_addr ();
+	}
 #endif
 	return wj_scratch;
 }
@@ -9023,6 +9032,9 @@ wj_shadow_balance_warn_m (const char *method, int leak)
  * exceptions-wasm.c validates before compiling, which is what stops the crash meanwhile.
  */
 
+static void wj_ehrec_boundary_save (MonoMethodILState **cur, int *finally_sp);
+static void wj_ehrec_boundary_restore (MonoMethodILState *cur_saved, int finally_sp_saved, uintptr_t c_sp_saved);
+
 void
 mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpointer ret)
 {
@@ -9080,12 +9092,19 @@ mono_wasm_jit_invoke_caught (MonoMethod *method, gint32 slot, gpointer args, gpo
 	extern int mono_wasm_jit_island_sp_save (void);
 	extern void mono_wasm_jit_island_sp_restore (int sp);
 	int island_sp_saved = mono_wasm_jit_island_sp_save ();
+	extern int mono_wasm_jit_eh_rec;
+	MonoMethodILState *ehrec_cur_saved = NULL;
+	int ehrec_finsp_saved = 0;
+	if (mono_wasm_jit_eh_rec)
+		wj_ehrec_boundary_save (&ehrec_cur_saved, &ehrec_finsp_saved);
 
 	WJ_LMF_BRACKET ("wj-enter");
 	mono_llvm_catch_exception (wasm_jit_ethunk_cb, &a, &thrown);
 	WJ_LMF_BRACKET ("wj-exit");
 
 	mono_wasm_jit_island_sp_restore (island_sp_saved);
+	if (mono_wasm_jit_eh_rec)
+		wj_ehrec_boundary_restore (ehrec_cur_saved, ehrec_finsp_saved, c_sp_saved);
 	WJ_LMF_BRACKET ("wj-island-restored");
 	/* DIAG (loot-NPE bisection): on a catch-taken, non-thrown return, log the return value + the C-stack
 	 * balance. bal!=0 => a JIT frame's EMIT_REF_LEAVE didn't restore the SP across the catch. Bounded. */
@@ -9254,6 +9273,143 @@ wj_finally_trim (int baseline)
 		if (h)
 			mono_gchandle_free_internal (h);
 	}
+}
+
+/* --- EH frame records (MONO_WASM_JIT_EH_REC, R353) -------------------------------------------------------
+ * The island's job, done by the method itself: its prologue fills a WjEhRec IN ITS OWN C-stack frame and links
+ * rec.ext into the LMF chain inline, every exit unlinks it inline, and the per-bb IL offset is stored straight
+ * into rec.il. No enter/leave call, no island stack, no per-entry zeroing. What each island consumer uses
+ * instead:
+ *   - pass 1 (mono_wasm_jit_is_island): the magic word, keyed to the record's own address;
+ *   - the landing pad (dispatch, wj_eh_restore_lmf): cur_island_il_state, which the pad re-points at its own
+ *     record before dispatching;
+ *   - the interp->JIT boundary: pops records of DEAD frames (below its saved C SP) off the head of the chain,
+ *     and puts cur_island_il_state and the finally-save depth back to their entry values.
+ * The record has no il_state data[]: nothing reads it for an island, because pass 1 stops at every island
+ * clause (mini-exceptions.c) and filter clauses bail at the emitter gate. */
+typedef struct {
+	MonoLMFExt ext;
+	guint32 magic;                  /* WJ_EHREC_MAGIC ^ (guint32) &il */
+	MonoMethodILState *prev;        /* the cur_island_il_state this record shadows */
+	gint32 finally_sp;              /* wj_finally_exc_sp at entry */
+	MonoMethodILState il;           /* method + il_offset only */
+} WjEhRec;
+
+#define WJ_EHREC_MAGIC 0x5AE4C0DEu
+/* the emitter addresses &rec.ext as the record's base */
+g_static_assert (G_STRUCT_OFFSET (WjEhRec, ext) == 0);
+
+static inline WjEhRec *
+wj_ehrec_of_il (MonoMethodILState *il)
+{
+	return (WjEhRec *) ((guint8 *) il - G_STRUCT_OFFSET (WjEhRec, il));
+}
+
+/* TRUE if `il` is the il_state of an EH record. A record always carries its magic and always points its ext at
+ * its own il, so a match needs both; an AOT il_state has neither at those offsets. The reads stay in bounds:
+ * every candidate is a live il_state pointer from the LMF chain. */
+static gboolean
+wj_ehrec_is_record_il (MonoMethodILState *il)
+{
+	WjEhRec *r;
+	if (!il || ((gsize) il & 3))
+		return FALSE;
+	r = wj_ehrec_of_il (il);
+	return r->magic == (WJ_EHREC_MAGIC ^ (guint32) (gsize) il) && r->ext.il_state == il && r->ext.kind == MONO_LMFEXT_IL_STATE;
+}
+
+static WjEhRec *
+wj_ehrec_of_lmf (gpointer lmf)
+{
+	MonoLMFExt *ext = (MonoLMFExt *) lmf;
+	if (!ext || ((gsize) ext & 3) || !(((gsize) ext->lmf.previous_lmf) & 2) || ext->kind != MONO_LMFEXT_IL_STATE)
+		return NULL;
+	if ((guint8 *) ext->il_state != (guint8 *) ext + G_STRUCT_OFFSET (WjEhRec, il) || !wj_ehrec_is_record_il (ext->il_state))
+		return NULL;
+	return (WjEhRec *) ext;
+}
+
+static const WjEhRecLayout wj_ehrec_layout = {
+	sizeof (WjEhRec),
+	G_STRUCT_OFFSET (WjEhRec, ext.lmf.previous_lmf),
+	G_STRUCT_OFFSET (WjEhRec, ext.lmf.lmf_addr),
+	G_STRUCT_OFFSET (WjEhRec, ext.lmf.method),
+	G_STRUCT_OFFSET (WjEhRec, ext.kind),
+	G_STRUCT_OFFSET (WjEhRec, ext.il_state),
+	G_STRUCT_OFFSET (WjEhRec, magic),
+	G_STRUCT_OFFSET (WjEhRec, prev),
+	G_STRUCT_OFFSET (WjEhRec, finally_sp),
+	G_STRUCT_OFFSET (WjEhRec, il),
+	G_STRUCT_OFFSET (WjEhRec, il) + G_STRUCT_OFFSET (MonoMethodILState, method),
+	G_STRUCT_OFFSET (WjEhRec, il) + G_STRUCT_OFFSET (MonoMethodILState, il_offset),
+	WJ_EHREC_MAGIC,
+	MONO_LMFEXT_IL_STATE
+};
+
+const WjEhRecLayout *
+mono_wasm_jit_ehrec_layout (void)
+{
+	return &wj_ehrec_layout;
+}
+
+gpointer mono_wasm_jit_finally_sp_addr (void);
+gpointer
+mono_wasm_jit_finally_sp_addr (void)
+{
+	return &wj_finally_exc_sp;
+}
+
+/* The one call a record exit makes, and only when a finally body on this frame's exception path threw and
+ * escaped (the depth moved). (i32)->void. */
+void mono_wasm_jit_finally_trim_to (int baseline);
+void
+mono_wasm_jit_finally_trim_to (int baseline)
+{
+	mono_wasm_jit_count (WJC_EHREC_TRIM);
+	wj_finally_trim (baseline);
+}
+
+static void
+wj_ehrec_boundary_save (MonoMethodILState **cur, int *finally_sp)
+{
+	*cur = mono_wasm_jit_cur_island_il_state;
+	*finally_sp = wj_finally_exc_sp;
+}
+
+/* A record exit that found some other LMF at the head -- the cold arm of the inline pop, (i32)->void. Two cases:
+ *  - the head is on this thread's stack BELOW the record: an LMF of a frame the native unwind tore through (the
+ *    stale head wj_eh_restore_lmf exists for). This record is under it, and its frame is about to die, so both
+ *    go: the head becomes the record's predecessor, exactly what an orderly unwind would have left;
+ *  - anything else: pass 1 rewound the chain past this record to an outer handler (leave_island's case), and
+ *    restoring it would resurrect frames the unwinder retired. Leave it. */
+void mono_wasm_jit_ehrec_unlink (gpointer rec);
+void
+mono_wasm_jit_ehrec_unlink (gpointer rec)
+{
+	WjEhRec *r = (WjEhRec *) rec;
+	gsize head = (gsize) mono_get_lmf ();
+	if (head >= (gsize) emscripten_stack_get_end () && head < (gsize) r) {
+		mono_wasm_jit_count (WJC_EHREC_UNLINK_INNER);
+		mono_set_lmf ((MonoLMF *) (((gsize) r->ext.lmf.previous_lmf) & ~3));
+	} else {
+		mono_wasm_jit_count (WJC_EHREC_UNLINK_OUTER);
+	}
+}
+
+/* Boundary side (mono_wasm_jit_invoke_caught). Only records of frames BELOW the boundary's entry SP are dead;
+ * a record above it belongs to a caller, and pass 1 may legitimately have left the head there. */
+static void
+wj_ehrec_boundary_restore (MonoMethodILState *cur_saved, int finally_sp_saved, uintptr_t c_sp_saved)
+{
+	WjEhRec *r;
+	while ((r = wj_ehrec_of_lmf (mono_get_lmf ())) && (uintptr_t) r < c_sp_saved) {
+		mono_wasm_jit_count (WJC_EHREC_BOUNDARY_POP);
+		mono_set_lmf ((MonoLMF *) (((gsize) r->ext.lmf.previous_lmf) & ~3));
+	}
+	if (mono_wasm_jit_cur_island_il_state != cur_saved)
+		mono_wasm_jit_cur_island_il_state = cur_saved;
+	if (wj_finally_exc_sp > finally_sp_saved)
+		wj_finally_trim (finally_sp_saved);
 }
 
 /*
@@ -9483,8 +9639,20 @@ wj_island_for_method (MonoMethod *method)
 static void
 wj_eh_restore_lmf (MonoMethod *method)
 {
-	WjIsland *is = wj_island_for_method (method);
+	WjIsland *is;
 
+	{
+		extern int mono_wasm_jit_eh_rec;
+		if (mono_wasm_jit_eh_rec) {
+			/* the landing pad has just re-pointed cur_island_il_state at its own record */
+			MonoMethodILState *cur = mono_wasm_jit_cur_island_il_state;
+			WjEhRec *r = (cur && cur->method == method && wj_ehrec_is_record_il (cur)) ? wj_ehrec_of_il (cur) : NULL;
+			if (r && mono_get_lmf () != &r->ext.lmf)
+				mono_set_lmf (&r->ext.lmf);
+			return;
+		}
+	}
+	is = wj_island_for_method (method);
 	if (!is)
 		return;
 	if (mono_get_lmf () == &is->ext.lmf)
@@ -9513,6 +9681,8 @@ int
 mono_wasm_jit_is_island (MonoMethodILState *il_state)
 {
 	int i, total;
+	if (wj_ehrec_is_record_il (il_state))
+		return 1;
 	if (!il_state || !wj_island_chunks)
 		return 0;
 	/* FIX (finally-codegen wild store): scan ALL allocated island slots, not just [0, wj_island_sp).
@@ -9555,6 +9725,12 @@ MonoMethod *
 mono_wasm_jit_island_lmf_method (gpointer lmf)
 {
 	int i, total;
+	/* an EH record: keyed on the magic alone, so a record whose tag bit was clobbered is still named */
+	if (lmf && !((gsize) lmf & 3)) {
+		WjEhRec *r = (WjEhRec *) lmf;
+		if (r->magic == (WJ_EHREC_MAGIC ^ (guint32) (gsize) &r->il))
+			return r->il.method;
+	}
 	if (!wj_island_chunks)
 		return NULL;
 	total = wj_island_nchunks * WJ_ISLAND_CHUNK;
@@ -9609,7 +9785,20 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 	/* Mono's exception pass 1 already consumes the active island's IL offset. Use that same authoritative
 	 * position for the landing-pad clause walk, retaining the bb mapping only as a defensive fallback. */
 	blk_il = (blk >= 0 && blk < t->nbbs) ? t->il_offsets [blk] : -1;
-	island_il = wj_island_il_offset_for_method (t->method);
+	{
+		extern int mono_wasm_jit_eh_rec;
+		if (mono_wasm_jit_eh_rec) {
+			MonoMethodILState *cur = mono_wasm_jit_cur_island_il_state;
+			if (G_LIKELY (cur && cur->method == t->method)) {
+				island_il = cur->il_offset;
+			} else {
+				island_il = -1;
+				mono_wasm_jit_count (WJC_EHREC_DISPATCH_NOREC);   /* must read 0: the pad re-points cur first */
+			}
+		} else {
+			island_il = wj_island_il_offset_for_method (t->method);
+		}
+	}
 	il = island_il >= 0 ? island_il : blk_il;
 	if (il < 0)
 		return -1;
