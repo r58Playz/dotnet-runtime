@@ -1293,6 +1293,10 @@ enum {
 	WJC_T2_GI_STATIC_EMITTED,  /* R329: ... of which the guarded inline was emitted (action) */
 	WJC_T2_REARMED,            /* R332: tier-2 requests re-armed after a BUSY give-up (ungated) */
 	WJC_COLOCATE_T2_SKIP,      /* R338: automatic co-location attempts skipped because tier 2 is on (ungated) */
+	WJC_BRANCH_HINT_OOL,       /* R341: IR branches hinted from bb->out_of_line, per emission */
+	WJC_BRANCH_HINT_IC,        /* R341: vcall IC / devirt-guard miss exits hinted, per emission */
+	WJC_MATH_INTRINS_LOWERED,  /* R346: System.Math/MathF Sqrt/Floor/Ceiling call sites lowered to a wasm opcode */
+	WJC_T2_BODY_CAPPED,        /* R349: tier-2 bodies refused for exceeding MONO_WASM_JIT_T2_MAX_BODY (ungated) */
 	WJC_MAX
 };
 

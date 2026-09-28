@@ -58,8 +58,17 @@ comment that misleads.
 
 ## Verified V8 facts — do not re-derive, do not guess
 
-Checked against `~/Documents/chromium/src/v8` (V8 15.4.77). If something surprising turns up, re-check
-against that tree rather than trusting this list.
+Checked against `~/Documents/chromium/src/v8`. The facts below were verified on V8 15.4.77; the tree is now
+**15.5.35** (`include/v8-version.h`), so a cited line number may have drifted, and the INSTALLED browser is a third
+version (R233 add.4). If something surprising turns up, re-check against that tree rather than trusting this list.
+
+* **Every `WebAssembly.Module` is its own code space, and every worker re-validates it** (R345). `NewNativeModule`
+  reserves a fresh RWX region per module (`wasm/wasm-code-manager.cc:2617-2654`), at least 2 x
+  `OverheadPerCodeSpace` (a far jump table of ~153 builtins x 16 B) ≈ 8 KB after page rounding, all of it counted
+  in VmData. Large RWX VMAs do NOT show pooling: V8 places reservations back to back (a sequential
+  `next_code_space_hint_`, `:2335-2336`) and the kernel merges them into one VMA. And `SyncCompile`
+  decodes and validates every function body BEFORE the NativeModuleCache lookup (`wasm/wasm-engine.cc:615-640`,
+  lookup at `module-compiler.cc:2079`), so a cache hit saves compilation, not validation.
 
 * **`local.get` / `local.set` / `local.tee` emit zero instructions.** `LocalGet` is
   `result->op = ssa_env_[imm.index]` (`wasm/turboshaft-graph-interface.cc:1030-1043`). Local count, reuse and

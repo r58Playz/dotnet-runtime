@@ -2859,6 +2859,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define WJ_HAS_THROW(EXC_ID) ((EXC_ID) >= 0 && (EXC_ID) < WJ_EXC_IDS && wj_throw_slot [(EXC_ID)] >= 0)
 /* R339: hint the `if`/`br_if` about to be emitted (1 likely, 0 unlikely) when MONO_WASM_JIT_BRANCH_HINTS is on. */
 #define WJ_HINT(V) do { extern int mono_wasm_jit_branch_hints; if (mono_wasm_jit_branch_hints) wasm_hint (&body, (V)); } while (0)
+/* R341: level-2 hints (MONO_WASM_JIT_BRANCH_HINTS=2), counted per site kind as they are emitted. */
+#define WJ_HINT2(V, CTR) do { extern int mono_wasm_jit_branch_hints; if (mono_wasm_jit_branch_hints >= 2) { wasm_hint (&body, (V)); wj_count (CTR); } } while (0)
+/* R341: an IR branch whose successors differ in out_of_line -- the cold one is the unlikely one. */
+#define WJ_COND_HINT() do { \
+		gboolean _tc = ins->inst_true_bb->out_of_line, _fc = ins->inst_false_bb && ins->inst_false_bb->out_of_line; \
+		if (_tc != _fc) WJ_HINT2 (_tc ? 0 : 1, WJC_BRANCH_HINT_OOL); \
+	} while (0)
 #define WJ_THROW_BR(EXC_ID, EXTRA) do { \
 		int _od = structured_cfg ? wj_structured_outer_depth (structured_cfg_kind, structured_loop_h, \
 			structured_loop_l, N, i) : ((N - 1 - i) + (skip_dispatch ? 0 : 1)); \
@@ -2889,10 +2896,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			int _cd = structured_cfg ? wj_structured_branch_depth (structured_cfg_kind, structured_loop_h, \
 				structured_loop_l, N, i, _ct) : (_ct - i - 1); \
 			if (_cd < 0) { fail = "structured conditional edge escaped verifier"; goto done; } \
+			WJ_COND_HINT (); \
 			wasm_op (&body, WASM_OP_BR_IF); \
 			wasm_uleb (&body, (guint32) _cd); \
 			GOTO (ins->inst_false_bb, 0); \
 		} else { \
+			WJ_COND_HINT (); \
 			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
 			GOTO (ins->inst_true_bb, 1); \
 			wasm_op (&body, WASM_OP_ELSE); \
@@ -3174,13 +3183,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 *    happens-before. A separate ACQ/REL fence cannot strengthen that. Binaryen encodes
 				 *    exactly this: visitAtomicFence lowers atomic.fence to nothing while only seq-cst
 				 *    atomics exist.
-				 * 3. Corroboration, not justification: the 210 MB AOT'd dotnet.native.wasm contains ZERO
-				 *    atomic.fence. mini-llvm.c does pass the kind to mono_llvm_build_fence and LLVM does
-				 *    emit a fence for every ordering -- wasm-opt then strips them all, for reason (2).
+				 * 3. The AOT'd half never had ANY fence: Binaryen's --precompute (emcc -O2 link) deletes every
+				 *    atomic.fence, for reason (2). For ACQ/REL that is harmless on x86. For SEQ it was a bug:
+				 *    IKVM's Thread.MemoryBarrier around each Java volatile access vanished from the AOT'd class
+				 *    library and x86 reordered AQS's store-then-load (the lost-unpark wedge, R340/R343). The
+				 *    AOT now calls mono_wasm_seq_fence, an atomic exchange wasm-opt cannot delete.
 				 *
-				 * SEQ keeps a real fence deliberately: .NET permits low-level patterns that expect
-				 * Thread.MemoryBarrier to be a physical full barrier, and those sites are rare enough
-				 * that the mfence costs nothing measurable. */
+				 * SEQ keeps a real fence here deliberately: Java volatile (IKVM emits Thread.MemoryBarrier)
+				 * needs StoreLoad, and so do .NET patterns that expect a physical full barrier. These
+				 * modules never pass through wasm-opt, so this atomic.fence survives to V8's mfence. */
 				if (ins->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_SEQ) {
 					wasm_u8 (&body, 0xfe);  /* atomic prefix */
 					wasm_u8 (&body, 0x03);  /* atomic.fence */
@@ -5468,11 +5479,13 @@ vcall_nullchk_done:
 											wj_emit_class_slot_method (&body, aic_vtab_idx, vc_class_vtable_off, vc_mid_slot);
 											wasm_i32_const (&body, (gint32) (intptr_t) pred_target);
 											wasm_op (&body, WASM_OP_I32_NE);
+											WJ_HINT2 (0, WJC_BRANCH_HINT_IC);   /* R341 */
 											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1);   /* -> $pred_miss */
 										wasm_op (&body, WASM_OP_END); /* $pred_hit */
 									} else {
 										wasm_i32_const (&body, (gint32) (intptr_t) pred_vt);
 										wasm_op (&body, WASM_OP_I32_NE);
+										WJ_HINT2 (0, WJC_BRANCH_HINT_IC);   /* R341 */
 										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									}
 									/* The predicted arm was the ONE dispatch route with no execution counter,
@@ -5939,6 +5952,7 @@ vcall_nullchk_done:
 								wasm_i32_const (&body, (gint32) vpic_site);
 								EMIT_IC_VPIC_CAPVAL ();
 								wasm_op (&body, WASM_OP_I32_GE_U);
+								WJ_HINT2 (0, WJC_BRANCH_HINT_IC);   /* R341 */
 								wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1); /* miss -> $slow */
 								/* Keep the ARRAY BASE in the local and fold `site * ways * stride` into way zero's
 								 * load immediate, instead of materialising a cursor. A wasm load already carries a
@@ -5959,6 +5973,7 @@ vcall_nullchk_done:
 							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
 							wasm_op (&body, WASM_OP_I32_WRAP_I64);
 							wasm_op (&body, WASM_OP_I32_NE);
+							WJ_HINT2 (0, WJC_BRANCH_HINT_IC);   /* R341: way 0 misses a few % of dispatches since R311 */
 							wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 								/* fslot = high32. A matching real vtable implies a nonzero admitted fslot. */
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
@@ -6886,6 +6901,18 @@ vcall_cold_miss_emit:
 		}
 		wasm_buf_free (&ethunk);
 	}
+	/* R349: a tier-2 body over the cap is refused here, before V8 ever sees it. TurboFan compiling one
+	 * ~300 KB function (WorldRenderer.render with ~1,500 inlines) transiently committed 5-6 GB of chromium's
+	 * C++ heap -- a 14-16 GB VmData peak in every run that promoted it -- while no run whose largest tier-2 body
+	 * was <= ~101 KB spiked. A permanent (non-retriable) fail: a re-emit leaves the method's tier-1 body live, and
+	 * mono_wasm_force_compile's downgrade retries once at the ordinary policy when lifted call inlining was used. */
+	{ extern int mono_wasm_jit_t2_max_body;
+	  if (!fail && cfg->wasm_jit_tier >= 2 && mono_wasm_jit_t2_max_body > 0 && out.len > (guint32) mono_wasm_jit_t2_max_body) {
+		mono_wasm_jit_count (WJC_T2_BODY_CAPPED);
+		fail = "tier-2 body over MONO_WASM_JIT_T2_MAX_BODY";
+		wasm_buf_free (&out);   /* freed before `done:` on the normal path (below), so free it here */
+		goto done;
+	  } }
 
 #ifdef HOST_BROWSER
 	{
@@ -7342,10 +7369,49 @@ mono_arch_emit_exceptions (MonoCompile *cfg)
 	g_error ("mono_arch_emit_exceptions");
 }
 
+/* R346. System.Math/MathF Sqrt, Floor and Ceiling are InternalCalls in mono's corlib (Math.Mono.cs, MathF.Mono.cs),
+ * and mono maps them to opcodes only for LLVM (llvm_emit_inst_for_method, reached under COMPILE_LLVM alone), so a
+ * wasm-JIT body kept them as CALLS -- and JIT code reaches an icall only through the interpreter (call_interp ->
+ * interp_entry -> exec_method -> ves_pinvoke_method): R346 measured Math.Sqrt from MathHelper.sqrt and the Entity
+ * body tier 2 inlines it into at ~1.8% of the server tick. Each has an exact IEEE wasm opcode, and the emitter
+ * already lowers and types all six (f64/f32 sqrt, floor, ceil). The transcendentals have no wasm opcode and stay calls.
+ * COMPILE_WASM only: the LLVM AOT reaches this hook after llvm_emit_inst_for_method, and must not change. */
 MonoInst*
 mono_arch_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig, MonoInst **args)
 {
-	return NULL;
+	extern int mono_wasm_jit_math_intrins;
+	MonoClass *k = cmethod->klass;
+	const char *cn;
+	gboolean r8, r4;
+	int opcode = 0;
+	MonoInst *ins;
+
+	if (!COMPILE_WASM (cfg) || !mono_wasm_jit_math_intrins)
+		return NULL;
+	if (fsig->param_count != 1 || fsig->hasthis || m_class_get_image (k) != mono_defaults.corlib ||
+	    strcmp (m_class_get_name_space (k), "System"))
+		return NULL;
+	cn = m_class_get_name (k);
+	r8 = !strcmp (cn, "Math") && fsig->params [0]->type == MONO_TYPE_R8 && fsig->ret->type == MONO_TYPE_R8;
+	/* MathF only with r4fp (MONO_OPT_FLOAT32, in WASM_JIT_OPT_BASE): otherwise an R4 argument is an f64 vreg. */
+	r4 = !strcmp (cn, "MathF") && cfg->r4fp && fsig->params [0]->type == MONO_TYPE_R4 && fsig->ret->type == MONO_TYPE_R4;
+	if (!r8 && !r4)
+		return NULL;
+	if (!strcmp (cmethod->name, "Sqrt"))
+		opcode = r8 ? OP_SQRT : OP_SQRTF;
+	else if (!strcmp (cmethod->name, "Floor"))
+		opcode = r8 ? OP_FLOOR : OP_FLOORF;
+	else if (!strcmp (cmethod->name, "Ceiling"))
+		opcode = r8 ? OP_CEIL : OP_CEILF;
+	if (!opcode)
+		return NULL;
+	MONO_INST_NEW (cfg, ins, opcode);
+	ins->type = r8 ? STACK_R8 : STACK_R4;
+	ins->dreg = mono_alloc_dreg (cfg, (MonoStackType) ins->type);
+	ins->sreg1 = args [0]->dreg;
+	MONO_ADD_INS (cfg->cbb, ins);
+	wj_count (WJC_MATH_INTRINS_LOWERED);
+	return ins;
 }
 
 void
