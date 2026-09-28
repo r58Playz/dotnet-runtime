@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 395);   /* + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
+g_static_assert (WJC_MAX == 399);   /* + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -891,6 +891,12 @@ mono_wasm_jit_dump_stats (void)
 				WJC_(WJC_REEMIT_HAZARD), mono_wasm_jit_reemit_validate);
 			printf ("[wasm-jit r323-lower] ovf_conv=%lld atomic_store8=%lld\n", WJC_(WJC_OVF_CONV_LOWERED), WJC_(WJC_ATOMIC_STORE8_LOWERED));
 			{
+				extern int mono_wasm_jit_math_intrins;
+				printf ("[wasm-jit math-intrins] lowered=%lld (math_intrins=%d)\n", WJC_(WJC_MATH_INTRINS_LOWERED), mono_wasm_jit_math_intrins);
+				{ extern int mono_wasm_jit_t2_max_body;
+				  printf ("[wasm-jit t2-cap] capped=%lld (t2_max_body=%d)\n", WJC_(WJC_T2_BODY_CAPPED), mono_wasm_jit_t2_max_body); }
+			}
+			{
 				extern int mono_wasm_jit_t2_retry;
 				printf ("[wasm-jit t2-retry] parked=%lld giveup=%lld (t2_retry=%d)\n", WJC_(WJC_T2_RETRY_PARKED),
 					WJC_(WJC_T2_RETRY_GIVEUP), mono_wasm_jit_t2_retry);
@@ -907,6 +913,10 @@ mono_wasm_jit_dump_stats (void)
 			{
 				extern int mono_wasm_jit_t2_colocate;
 				printf ("[wasm-jit t2-colocate] skipped=%lld (t2_colocate=%d)\n", WJC_(WJC_COLOCATE_T2_SKIP), mono_wasm_jit_t2_colocate);
+				{
+					extern int mono_wasm_jit_branch_hints;
+					printf ("[wasm-jit hints] ool=%lld ic=%lld (branch_hints=%d)\n", WJC_(WJC_BRANCH_HINT_OOL), WJC_(WJC_BRANCH_HINT_IC), mono_wasm_jit_branch_hints);
+				}
 			}
 			{
 				/* R335: the sampler's own losses. Under T2_SAMPLE_LOOP an entry poll defers a sample to the next loop

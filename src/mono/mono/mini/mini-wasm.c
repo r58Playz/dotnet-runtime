@@ -657,8 +657,19 @@ int mono_wasm_jit_t2_sample_loop = 0;
 /* MONO_WASM_JIT_T2_COLOCATE (R338): 1 keeps automatic co-location running while tier 2 is on (0 = off under tier 2). */
 int mono_wasm_jit_t2_colocate = 0;
 /* MONO_WASM_JIT_BRANCH_HINTS (R339): emit a metadata.code.branch_hint section for the branches whose direction the
- * emitter knows (poll arms, throws, threw-checks unlikely; the TLAB fast path likely). */
-int mono_wasm_jit_branch_hints = 0;
+ * emitter knows (poll arms, throws, threw-checks unlikely; the TLAB fast path likely). 2 (R341) adds every IR branch
+ * into an out_of_line block and the vcall IC / devirt-guard miss exits. Layout only: V8 moves the unlikely successor
+ * out of line, no instruction is added. Minecraft server tick: 1 vs 0 -2.9% cycles/instruction (R339), 2 vs 1 -7.4%
+ * P-core cycles (R341, p69, b t t b); soaked in p70 (15 runs, no fault). 0 = no hint section. */
+int mono_wasm_jit_branch_hints = 2;
+/* MONO_WASM_JIT_MATH_INTRINS (R346): lower System.Math/MathF Sqrt, Floor, Ceiling to the wasm opcode in the JIT
+ * (mono_arch_emit_inst_for_method). 0 leaves them as InternalCall calls, which JIT code reaches only through the
+ * interpreter: p71 measured that route at 3.9-4.0% of the Minecraft server tick with the knob off and 1.9-2.2% with
+ * it on (b t t b), the Math pinvoke path at 0. */
+int mono_wasm_jit_math_intrins = 1;
+/* MONO_WASM_JIT_T2_MAX_BODY (R349): largest tier-2 module, in bytes, the emitter will hand to V8; a bigger one fails
+ * permanently and the method keeps its tier-1 body (or takes the tier-1-policy downgrade). 0 = no cap. */
+int mono_wasm_jit_t2_max_body = 98304;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -799,7 +810,13 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_rearm, "MONO_WASM_JIT_T2_REARM", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_colocate, "MONO_WASM_JIT_T2_COLOCATE", 0, 1)
-	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 2)
+	WJ_T2_KNOB (mono_wasm_jit_math_intrins, "MONO_WASM_JIT_MATH_INTRINS", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
+#if defined(HOST_WASM) && defined(__wasm_atomics__)
+	/* mono_wasm_hw_fence lives in utils/atomic.c and exists only in the threaded wasm runtime, not in mono-aot-cross. */
+	WJ_T2_KNOB (mono_wasm_hw_fence, "MONO_WASM_HW_FENCE", 0, 1)
+#endif
 #undef WJ_T2_KNOB
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }
@@ -1105,7 +1122,7 @@ mono_wasm_jit_freeze_ring (void)
  * a bisection knob to isolate which residual call SHAPE mis-marshals/corrupts, by restricting which
  * shapes take the residual vs bail the whole method to the interpreter):
  *   0 = off  (a JITted method bails to interp when it calls an un-JITted callee; pre-residual behaviour)
- *   1 = full (residual every supported direct call; default when the env is unset)
+ *   1 = full (residual every supported direct call)
  *   2 = only calls with a VOID return   (skips return-value marshalling)
  *   3 = only calls with NO params       (skips param marshalling; `this` still allowed)
  *   4 = only STATIC calls (no `this`)   (skips this marshalling; params/return allowed)
