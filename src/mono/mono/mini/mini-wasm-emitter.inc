@@ -170,6 +170,28 @@ wj_call_prof_im (MonoCompile *cfg, MonoCallInst *call)
 	return cfg->wasm_jit_caller_imethod;
 }
 
+/* R371: a basic block's kind for the cold-block census -- 0 other, 1 a catch/filter/fault handler, 2 a block that
+ * throws. A finally block runs on the normal path as well, so it is "other". Also counts the block's call sites. */
+static int
+wj_bb_cold_class (MonoBasicBlock *bb)
+{
+	MonoInst *ins;
+	int cls = 0, ncalls = 0;
+	if (bb->region != -1) {
+		int k = bb->region & (0xf << 4);
+		if (k == MONO_REGION_CATCH || k == MONO_REGION_FILTER || k == MONO_REGION_FAULT)
+			cls = 1;
+	}
+	MONO_BB_FOR_EACH_INS (bb, ins) {
+		if (MONO_IS_CALL (ins))
+			ncalls++;
+		if (!cls && (ins->opcode == OP_THROW || ins->opcode == OP_RETHROW))
+			cls = 2;
+	}
+	mono_wasm_jit_counters [WJC_COLD_CALLS_OTHER + cls] += ncalls;
+	return cls;
+}
+
 /* R358 (MONO_WASM_JIT_T2_UNIT=2): the tier-2 unit SUPPLY census. Walk a finished tier-2 body's direct-call holes
  * (WASM_RELOC_CALL: every call it kept to another JITted method) and put each distinct callee in one bucket --
  * which of them a unit could carry as a private copy, and how big and how hot those are. Changes nothing emitted. */
@@ -3087,9 +3109,25 @@ mono_wasm_emit_method (MonoCompile *cfg)
 
 	i = 0;
 	int sl_ord = 0;   /* running ins ordinal, mirroring the SLOTLIVE walk exactly (same bb/ins iteration) */
+#ifdef HOST_BROWSER
+	/* R371 census: each block's bytes are attributed at the NEXT block's start (and after the loop), so no `continue`
+	 * inside a block can skip the accounting. */
+	guint32 wj_cold_start = body.len, wj_cold_mark = body.len;
+	int wj_cold_cls = 0;
+#define WJ_COLD_ACCOUNT() do { \
+		mono_wasm_jit_counters [WJC_COLD_BYTES_OTHER + wj_cold_cls] += body.len - wj_cold_mark; \
+		if (wj_cold_cls && cfg->wasm_jit_tier >= 2) \
+			mono_wasm_jit_counters [WJC_COLD_T2_BYTES_COLD] += body.len - wj_cold_mark; \
+		wj_cold_mark = body.len; \
+	} while (0)
+#endif
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
 		int loop_depth = N - 1 - i;
 		gboolean terminated = FALSE;
+#ifdef HOST_BROWSER
+		WJ_COLD_ACCOUNT ();
+		wj_cold_cls = wj_bb_cold_class (bb);
+#endif
 		/* LAZY_COLD=2: inside a doomed bb a cold frame behaves as an ordinary lazy frame (see lazy_doomed). */
 		if (lazy_cold_frame)
 			lc.lazy_frame = (lazy_doomed && lazy_doomed [i]) ? 1 : 2;
@@ -6804,6 +6842,12 @@ vcall_cold_miss_emit:
 		if (lcse && lcse_exit && i < N && lcse_exit [i])
 			*lcse_exit [i] = *lcse;
 	}
+#ifdef HOST_BROWSER
+	WJ_COLD_ACCOUNT ();
+	if (cfg->wasm_jit_tier >= 2)
+		mono_wasm_jit_counters [WJC_COLD_T2_BYTES_ALL] += body.len - wj_cold_start;
+#undef WJ_COLD_ACCOUNT
+#endif
 
 	if (G_UNLIKELY (lcse != NULL)) {
 		extern gboolean mono_wasm_jit_refdiag_name (const char *);
