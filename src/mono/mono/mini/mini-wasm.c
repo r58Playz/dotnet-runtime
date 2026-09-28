@@ -655,9 +655,11 @@ int mono_wasm_jit_t2_retry = 3;
 int mono_wasm_jit_t2_static_pred = 2;
 /* MONO_WASM_JIT_T2_REARM (R332): how many times a tier-2 request released on BUSY give-up is re-armed (0 = retire it). */
 int mono_wasm_jit_t2_rearm = 3;
-/* MONO_WASM_JIT_T2_SAMPLE_LOOP (R335): tier-2 samples are credited at loop polls only; an entry poll defers a pending
- * sample to the next back-edge (0 = every poll credits its own method). */
-int mono_wasm_jit_t2_sample_loop = 0;
+/* MONO_WASM_JIT_T2_SAMPLE_LOOP: 0 = every poll credits its own method; 1 (R335) = loop polls only, an entry poll
+ * defers a pending sample to the next back-edge (R348: +10% server cycles); 2 (R355) = both -- an entry poll credits
+ * its method and the next back-edge takes a second sample for its own. Mode 2, p78 b t t b on the Minecraft server
+ * tick: tier-2 requests +54%, cycles -3.2% (ranges just clear), instructions -2.2% (overlapping). */
+int mono_wasm_jit_t2_sample_loop = 2;
 /* MONO_WASM_JIT_T2_COLOCATE (R338): 1 keeps automatic co-location running while tier 2 is on (0 = off under tier 2). */
 int mono_wasm_jit_t2_colocate = 0;
 /* MONO_WASM_JIT_BRANCH_HINTS (R339): emit a metadata.code.branch_hint section for the branches whose direction the
@@ -679,6 +681,10 @@ int mono_wasm_jit_t2_max_body = 98304;
  * on the Minecraft server tick: the island helpers 2.98 -> 0.08 M instr/tick, all instructions -3.6%, calls -9.6%;
  * cycles unresolved on that instrument (the helpers were ~1 M cycles/tick). 0 = the island calls. */
 int mono_wasm_jit_eh_rec = 1;
+/* MONO_WASM_JIT_AOT_BYREF (R356): the emitter's inline direct-AOT call also takes callees with byref PARAMETERS (the
+ * ByteCodeHelper volatile/CAS helpers IKVM emits for every Java volatile/atomic access), instead of routing them
+ * through the JIT->interp residual. */
+int mono_wasm_jit_aot_byref = 0;
 
 /* The vtable slot a METHOD-identity guard may test for a call to `base`, -2 for an interface method (its slot
  * is receiver-dependent), -1 otherwise. Plain field reads only: this runs inside the compile section, where a
@@ -817,12 +823,13 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_retry, "MONO_WASM_JIT_T2_RETRY", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_static_pred, "MONO_WASM_JIT_T2_STATIC_PRED", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_t2_rearm, "MONO_WASM_JIT_T2_REARM", 0, 8)
-	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_t2_colocate, "MONO_WASM_JIT_T2_COLOCATE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_math_intrins, "MONO_WASM_JIT_MATH_INTRINS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_aot_byref, "MONO_WASM_JIT_AOT_BYREF", 0, 1)
 #if defined(HOST_WASM) && defined(__wasm_atomics__)
 	/* mono_wasm_hw_fence lives in utils/atomic.c and exists only in the threaded wasm runtime, not in mono-aot-cross. */
 	WJ_T2_KNOB (mono_wasm_hw_fence, "MONO_WASM_HW_FENCE", 0, 1)

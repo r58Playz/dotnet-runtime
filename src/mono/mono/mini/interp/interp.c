@@ -973,6 +973,82 @@ wj_retry_note (InterpMethod *im)
 	}
 }
 
+/* R356: the same table for the AOT-ROUTED population -- residual calls whose callee HAS AOT code, entered through
+ * wasm_jit_aot_call_lean -> do_jit_call. That branch only fed the 128-entry ring, so the in-game route (~1.8 M
+ * instr/server tick on p74, nearly all AOT-routed) had no weighted census and iroute showed boot-era callees. */
+static InterpMethod *wj_aroute_im [WJ_IROUTE_SLOTS];
+static gint64 wj_aroute_w [WJ_IROUTE_SLOTS];
+static char *wj_aroute_name [WJ_IROUTE_SLOTS];
+static const char *wj_aroute_why [WJ_IROUTE_SLOTS];
+static volatile gint32 wj_aroute_state [WJ_IROUTE_SLOTS];
+
+static const char *wj_aroute_reason (InterpMethod *im);   /* defined next to mono_wasm_jit_aot_call_target */
+
+/* R356: emit-time reason a DIRECT call site to this callee became a residual (mini-wasm-emitter.inc, after the inline
+ * AOT attempt). Keyed by MonoMethod*, first reason wins; a callee without one reached the residual from another path
+ * (virtual/delegate fallback). Stats only. */
+static MonoMethod *wj_resid_emit_m [WJ_IROUTE_SLOTS];
+static const char *wj_resid_emit_why [WJ_IROUTE_SLOTS];
+static volatile gint32 wj_resid_emit_state [WJ_IROUTE_SLOTS];
+
+void mono_wasm_jit_resid_emit_note (MonoMethod *m, const char *why);
+void
+mono_wasm_jit_resid_emit_note (MonoMethod *m, const char *why)
+{
+	gsize h = ((gsize) m >> 4) & (WJ_IROUTE_SLOTS - 1);
+	int i;
+	for (i = 0; i < WJ_EDGE_PROBE; ++i) {
+		int idx = (h + i) & (WJ_IROUTE_SLOTS - 1);
+		if (wj_resid_emit_state [idx] == 2 && wj_resid_emit_m [idx] == m)
+			return;
+		if (wj_resid_emit_state [idx] == 0 && mono_atomic_cas_i32 (&wj_resid_emit_state [idx], 1, 0) == 0) {
+			wj_resid_emit_why [idx] = why;
+			wj_resid_emit_m [idx] = m;
+			mono_atomic_xchg_i32 (&wj_resid_emit_state [idx], 2);
+			return;
+		}
+		if (wj_resid_emit_state [idx] == 1)
+			return;
+	}
+}
+
+static const char *
+wj_resid_emit_lookup (MonoMethod *m)
+{
+	gsize h = ((gsize) m >> 4) & (WJ_IROUTE_SLOTS - 1);
+	int i;
+	for (i = 0; i < WJ_EDGE_PROBE; ++i) {
+		int idx = (h + i) & (WJ_IROUTE_SLOTS - 1);
+		if (wj_resid_emit_state [idx] == 0)
+			return NULL;
+		if (wj_resid_emit_state [idx] == 2 && wj_resid_emit_m [idx] == m)
+			return wj_resid_emit_why [idx];
+	}
+	return NULL;
+}
+
+static void
+wj_aroute_note (InterpMethod *im)
+{
+	gsize h = ((gsize) im >> 4) & (WJ_IROUTE_SLOTS - 1);
+	int i;
+	for (i = 0; i < WJ_EDGE_PROBE; ++i) {
+		int idx = (h + i) & (WJ_IROUTE_SLOTS - 1);
+		if (wj_aroute_state [idx] == 2 && wj_aroute_im [idx] == im) { mono_atomic_inc_i64 (&wj_aroute_w [idx]); return; }
+		if (wj_aroute_state [idx] == 0 && mono_atomic_cas_i32 (&wj_aroute_state [idx], 1, 0) == 0) {
+			char *name = mono_method_get_full_name (im->method);
+			wj_aroute_w [idx] = 1;
+			wj_aroute_name [idx] = name;
+			wj_aroute_why [idx] = wj_aroute_reason (im);
+			wj_aroute_im [idx] = im;
+			mono_atomic_xchg_i32 (&wj_aroute_state [idx], 2);
+			return;
+		}
+		if (wj_aroute_state [idx] == 1)
+			return;
+	}
+}
+
 static void
 wj_iroute_note (InterpMethod *im)
 {
@@ -2455,7 +2531,7 @@ mono_wasm_jit_t2_sample (gpointer p)
 	static volatile gint32 t2_requested;
 	InterpMethod *im;
 	gboolean t2body = ((gsize) p & 1) != 0;   /* R336: a tier-2 body's poll */
-	p = (gpointer) ((gsize) p & ~(gsize) 1);
+	p = (gpointer) ((gsize) p & ~(gsize) 3);   /* bit 1: R355's loop-poll tag, consumed by the poll helper */
 	if (!p)
 		return;
 	im = interp_imethod_current ((InterpMethod *) p, TRUE);
@@ -3163,6 +3239,29 @@ mono_wasm_jit_dump_blockers (int topn)
 				printf ("  %10lld  %-18s (slot=%d fslot=%d bail=%d%s%s) %s\n", (long long) bestw,
 					wj_bail_word (bail, im->wasm_jit_slot), im->wasm_jit_slot, im->wasm_jit_fslot, bail,
 					gate ? " gate=" : "", gate ? gate : "", wj_iroute_name [best] ? wj_iroute_name [best] : "?");
+			}
+			lastw = bestw; lastk = best; shown++;
+		}
+	}
+	printf ("[wasm-jit aroute top] AOT-routed residual callees by executed count:\n");
+	{
+		gint64 lastw = G_MAXINT64; int lastk = -1;
+		shown = 0;
+		while (shown < topn) {
+			int best = -1, k; gint64 bestw = 0;
+			for (k = 0; k < WJ_IROUTE_SLOTS; ++k) {
+				gint64 w;
+				if (wj_aroute_state [k] != 2) continue;
+				w = wj_aroute_w [k];
+				if (!w || !wj_aroute_im [k] || w > lastw || (w == lastw && k <= lastk)) continue;
+				if (best < 0 || w > bestw || (w == bestw && k < best)) { best = k; bestw = w; }
+			}
+			if (best < 0) break;
+			{
+				const char *ew = wj_resid_emit_lookup (wj_aroute_im [best]->method);
+				printf ("  %10lld  %-22s emit=%-18s (slot=%d fslot=%d) %s\n", (long long) bestw, wj_aroute_why [best] ? wj_aroute_why [best] : "?",
+					ew ? ew : "(not direct)", wj_aroute_im [best]->wasm_jit_slot, wj_aroute_im [best]->wasm_jit_fslot,
+					wj_aroute_name [best] ? wj_aroute_name [best] : "?");
 			}
 			lastw = bestw; lastk = best; shown++;
 		}
@@ -7557,6 +7656,7 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
 				mono_wasm_jit_count (WJC_RESIDUAL);
 				mono_wasm_jit_count (WJC_AOT_ROUTED);
+				wj_aroute_note (imethod);
 				if (!mono_wasm_jit_ring_frozen) { mono_wasm_jit_ring [mono_wasm_jit_ring_count & 127] = method; mono_wasm_jit_ring_count++; }
 			}
 			return wasm_jit_aot_call_lean (imethod, sig, buf);
@@ -10693,6 +10793,37 @@ mono_wasm_jit_aot_call_target (MonoMethod *method, gpointer *out_addr, gpointer 
 			*out_rgctx = mini_method_get_rgctx (rgctx_method);
 	}
 	return TRUE;
+}
+
+/* Why the emitter's INLINE direct-AOT call (mini-wasm-emitter.inc, the aot_ok gate) could not take this callee, so
+ * the JIT routed it through the residual: re-derived here from the callee alone, once per table entry. "rgctx?" is
+ * the call site's generic context, which this side cannot see, inferred from the callee being generic-shared. */
+static const char *
+wj_aroute_reason (InterpMethod *im)
+{
+	MonoMethod *m = im->method;
+	MonoMethodSignature *sig = mono_method_signature_internal (m);
+	gpointer a = NULL, r = NULL;
+	gboolean extra = TRUE;
+	int k;
+	if (!sig)
+		return "nosig";
+	if (m_type_is_byref (sig->ret))
+		return "byref-ret";
+	for (k = 0; k < (int) sig->param_count; ++k)
+		if (m_type_is_byref (sig->params [k]))
+			return "byref-arg";
+	if (m->is_inflated && mono_method_is_generic_sharable (m, FALSE))
+		return "rgctx?";
+	if (!mono_wasm_jit_aot_call_target (m, &a, &r, &extra)) {
+		JitCallInfo *ci = (JitCallInfo *) im->jit_call_info;
+		if (ci && ci->addr && (mono_aot_get_method_flags ((guint8 *) ci->addr) & MONO_AOT_METHOD_FLAG_INTERP_ENTRY_ONLY))
+			return "interp-entry-only";
+		if (ci && ci->no_wrapper)
+			return "no-wrapper";
+		return "no-aot-target";
+	}
+	return "other(vret/unbox/site)";
 }
 
 #endif

@@ -138,6 +138,10 @@ static __thread gint32 wj_pub_reraise;
 /* MONO_WASM_JIT_EDGE_SAMPLE (R295): take one call-edge sample at this worker's next ENTRY poll. Raised by a
  * main-thread timer, cleared by the owner like the other two; see mono_wasm_jit_safepoint_poll_entry. */
 #define WJ_ACT_SAMPLE 4
+/* R355 (MONO_WASM_JIT_T2_SAMPLE_LOOP=2): the tier-2 sample an entry poll took is followed by a second one at this
+ * worker's next LOOP poll. Above the low byte on purpose: in that mode entry polls read the word with i32.load8_u,
+ * so the owed sample never sends an entry poll to its helper; only back-edges see it. Raised by the owner. */
+#define WJ_ACT_LOOP_SAMPLE 0x100
 static __thread int wj_sample_defer;   /* loop polls a pending sample request has survived; see the poll */
 static volatile double wj_edge_tick_ms;   /* emscripten_get_now () at the last sampling tick */
 #define WJ_WORKER_MAX 1024
@@ -674,21 +678,44 @@ mono_wasm_jit_safepoint_poll_entry (void)
 void
 mono_wasm_jit_safepoint_poll_t2 (gpointer imethod)
 {
-	if (wj_my_action && wj_my_action != &wj_worker_action_overflow &&
-	    (mono_atomic_load_i32 (wj_my_action) & WJ_ACT_SAMPLE)) {
-		gint32 old;
-		do {
-			old = mono_atomic_load_i32 (wj_my_action);
-		} while ((old & WJ_ACT_SAMPLE) && mono_atomic_cas_i32 (wj_my_action, old & ~WJ_ACT_SAMPLE, old) != old);
-		wj_sample_defer = 0;
-		if (emscripten_get_now () - wj_edge_tick_ms <= 2.0) {
-			extern void mono_wasm_jit_t2_sample (gpointer p);
-			mono_wasm_jit_t2_sample (imethod);
-		} else {
-			mono_wasm_jit_counters [WJC_EDGE_LATE]++;
+	extern int mono_wasm_jit_t2_sample_loop;
+	extern void mono_wasm_jit_t2_sample (gpointer p);
+	/* R355: bit 1 tags a LOOP poll (the emitter sets it only under T2_SAMPLE_LOOP=2; InterpMethod* is aligned) */
+	gboolean loop_poll = ((gsize) imethod & 2) != 0;
+	gboolean owe_loop = FALSE;
+	imethod = (gpointer) ((gsize) imethod & ~(gsize) 2);
+	if (wj_my_action && wj_my_action != &wj_worker_action_overflow) {
+		gint32 cur = mono_atomic_load_i32 (wj_my_action), old;
+		if (cur & WJ_ACT_SAMPLE) {
+			do {
+				old = mono_atomic_load_i32 (wj_my_action);
+			} while ((old & WJ_ACT_SAMPLE) && mono_atomic_cas_i32 (wj_my_action, old & ~WJ_ACT_SAMPLE, old) != old);
+			wj_sample_defer = 0;
+			if (emscripten_get_now () - wj_edge_tick_ms <= 2.0) {
+				mono_wasm_jit_t2_sample (imethod);
+				owe_loop = mono_wasm_jit_t2_sample_loop == 2 && !loop_poll;
+			} else {
+				mono_wasm_jit_counters [WJC_EDGE_LATE]++;
+			}
+		} else if (loop_poll && (cur & WJ_ACT_LOOP_SAMPLE)) {
+			do {
+				old = mono_atomic_load_i32 (wj_my_action);
+			} while ((old & WJ_ACT_LOOP_SAMPLE) && mono_atomic_cas_i32 (wj_my_action, old & ~WJ_ACT_LOOP_SAMPLE, old) != old);
+			/* the same "only a thread that was running" rule, measured from the tick the owed sample came from */
+			if (emscripten_get_now () - wj_edge_tick_ms <= 2.0) {
+				mono_wasm_jit_counters [WJC_T2_LOOP_CREDIT]++;
+				mono_wasm_jit_t2_sample (imethod);
+			} else {
+				mono_wasm_jit_counters [WJC_T2_LOOP_LATE]++;
+			}
 		}
 	}
 	mono_wasm_jit_safepoint_poll ();
+	/* after the poll, which clears the whole word and re-derives only GC/PUB */
+	if (owe_loop && wj_my_action && wj_my_action != &wj_worker_action_overflow) {
+		mono_wasm_jit_counters [WJC_T2_LOOP_OWED]++;
+		wj_action_or (wj_my_action, WJ_ACT_LOOP_SAMPLE);
+	}
 }
 
 /* R316: the sampling timer for tier 2 when the edge sampler is not already running one. */
