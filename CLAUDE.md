@@ -76,7 +76,11 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
 * **V8 can never inline anything this emitter produces.** Inlining candidates come from a module's own call
   sites, and an imported function has `wire_byte_size_ == 0` so its score is 0 (`wasm/inlining-tree.h:79-85`).
   One method per module ⇒ every cross-method call is a real call, permanently. **mono's own inliner is the
-  only inliner in the pipeline.** Relevant flags: `wasm_inlining_max_size` **500** wire bytes, budget 5000 TF
+  only inliner in the pipeline.** The one qualification (R351): V8 collects `call_indirect` feedback and
+  speculatively inlines SAME-INSTANCE targets (`CallIndirectIC`, `builtins/wasm.tq:821-835`;
+  `wasm_inlining_call_indirect` defaults true); cross-instance calls are marked and never inlined. Every f-slot
+  call crosses instances today, so this changes nothing yet -- but co-locating an IC's hot target in the same
+  module makes that IC call inlinable too, not just the calls converted to `call <funcidx>`. Relevant flags: `wasm_inlining_max_size` **500** wire bytes, budget 5000 TF
   nodes (`flags/flag-definitions.h:2170-2192`).
 * **The three call forms, by cost** (verified by reading emitted x86, not inferred):
   * `call <funcidx>` (module-local) — a real direct `call rel32`, and the **only** form V8 can inline through.
