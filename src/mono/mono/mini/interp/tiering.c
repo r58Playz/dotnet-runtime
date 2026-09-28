@@ -57,11 +57,8 @@ get_tier_up_imethod (InterpMethod *imethod)
 		new_imethod->wasm_jit_bytes = old_imethod->wasm_jit_bytes;
 		new_imethod->wasm_jit_bail = old_imethod->wasm_jit_bail;
 		new_imethod->wasm_jit_invoke_in = old_imethod->wasm_jit_invoke_in;
-		new_imethod->wasm_jit_block_n = old_imethod->wasm_jit_block_n;
 		new_imethod->wasm_jit_invoke_out = old_imethod->wasm_jit_invoke_out;
-		new_imethod->wasm_jit_resv_eslot = old_imethod->wasm_jit_resv_eslot;
-		new_imethod->wasm_jit_resv_fslot = old_imethod->wasm_jit_resv_fslot;
-		/* Carry the parked slot pair too. The function-table allocator has no free, so dropping these on
+		/* Carry the reserved slot pair too. The function-table allocator has no free, so dropping these on
 		 * tier-up would leak two entries for every method that reserved and then tiered — silently, and
 		 * exactly for the hot methods that tier. */
 		new_imethod->wasm_jit_self_resv_eslot = old_imethod->wasm_jit_self_resv_eslot;
@@ -304,9 +301,9 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	new_imethod->relink_pending = 0;
 
 	/* Carry the wasm-JIT identity exactly as get_tier_up_imethod does. The code-bearing members are
-	 * provably 0 here (refused above), but the hotness counter, the call profile and BOTH reservation
-	 * pairs must survive: the function-table allocator has no free, so dropping a parked pair leaks two
-	 * entries per method, silently, for exactly the methods that were about to get hot. */
+	 * provably 0 here (refused above), but the hotness counter, the call profile and the reservation
+	 * pair must survive: the function-table allocator has no free, so dropping it leaks two entries per
+	 * method, and a lazy pool pair is the f-slot callers already baked. */
 	/* A PERMANENT BAIL DOES NOT SURVIVE A BODY SWAP. wasm_jit_slot == -1 is a verdict the emitter
 	 * reached about generation 1's IL, and generation 1's IL is precisely what this function is
 	 * replacing -- so carrying it forward condemns a body the emitter has never seen, permanently
@@ -316,11 +313,10 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	 * the most to gain from being re-judged.
 	 *
 	 * Only the permanent verdict is dropped, and only here -- get_tier_up_imethod's copy above is a
-	 * compilation of the SAME IL, where the verdict still binds. PARKED/RETRY are kept too: they
-	 * describe the callee graph, not this body's compilability. The hotness counter, the call profile
-	 * and BOTH reservation pairs below are properties of the METHOD rather than of a compilation and
-	 * must survive regardless; the function-table allocator has no free, so dropping a parked pair
-	 * leaks two entries per method.
+	 * compilation of the SAME IL, where the verdict still binds. RETRY is kept too: it describes a
+	 * transient condition, not this body's compilability. The hotness counter, the call profile
+	 * and the reservation pair below are properties of the METHOD rather than of a compilation and
+	 * must survive regardless (see above).
 	 *
 	 * Safe to reset the pair together: the refusal above guarantees wasm_jit_fslot <= 0 here, and
 	 * wasm_jit_desc is only ever written alongside a successful registration (interp.c:2502, :2896,
@@ -376,9 +372,6 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	new_imethod->wasm_jit_hits = old_imethod->wasm_jit_hits;
 	new_imethod->wasm_jit_invoke_in = old_imethod->wasm_jit_invoke_in;
 	new_imethod->wasm_jit_invoke_out = old_imethod->wasm_jit_invoke_out;
-	new_imethod->wasm_jit_block_n = old_imethod->wasm_jit_block_n;
-	new_imethod->wasm_jit_resv_eslot = old_imethod->wasm_jit_resv_eslot;
-	new_imethod->wasm_jit_resv_fslot = old_imethod->wasm_jit_resv_fslot;
 	new_imethod->wasm_jit_self_resv_eslot = old_imethod->wasm_jit_self_resv_eslot;
 	new_imethod->wasm_jit_self_resv_fslot = old_imethod->wasm_jit_self_resv_fslot;
 #if HOST_BROWSER

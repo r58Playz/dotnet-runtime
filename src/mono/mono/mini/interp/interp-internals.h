@@ -177,23 +177,17 @@ struct InterpMethod {
 	/* R208's per-method IC-MISS count lived here (wasm_jit_ic_misses): the re-emission trigger that
 	 * selected methods hot INSIDE compiled code rather than at the interp->JIT boundary, which is what
 	 * made it the right selector and R179's `invoke_in` the wrong one. Gone with re-emission. */
-	gint32 wasm_jit_block_n;   // runtime wasm JIT (Part 3a / Lever C): times this (un-JITted) method BLOCKED a caller's island. Always counted (cheap, compile-time): also a stats-independent "hot at the island boundary" signal for the cold gate.
 	gint32 wasm_jit_invoke_out; // runtime wasm JIT (Lever A): times THIS (interp) method invoked a JITted callee. Drives MONO_WASM_JIT_ENTRY_PROMOTE upward island growth.
-	gint32 wasm_jit_resv_eslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished entry-thunk slot while this method's SCC is being batch-compiled (0 = none)
-	gint32 wasm_jit_resv_fslot; // runtime wasm JIT (multi-method cycle batch): reserved-but-unpublished fn slot; get_callee_fslot returns it so cycle members bake each other's f-slot before any member is published/invocable. Because OTHER methods can bake it, it must be cleared the moment the batch ends (wj_park_reservation) — otherwise a caller could bake a slot nothing instantiates into.
-	/* runtime wasm JIT (self-recursion): this method's OWN e/f pair, reserved at the first emit that needs to
-	 * bake a self-call and then held ACROSS re-emits. Deliberately separate from wasm_jit_resv_* above, which
-	 * is a live-batch reservation that get_callee_fslot publishes to other methods: the batch always clears it
-	 * on both the success and abort paths, so a slot other methods can bake is guaranteed to be instantiated.
-	 * A self reservation has to outlive a FAILED emit (that is the whole point — see below), so it must stay
-	 * invisible to get_callee_fslot or an unrelated caller could bake an f-slot nothing ever installs into.
-	 * Only mono_wasm_jit_self_reserved reads these, and only for the method being emitted.
+	/* runtime wasm JIT: this method's OWN e/f pair before it registers, held ACROSS re-emits. Two sources: the
+	 * first emit that bakes a self-call (mono_wasm_jit_reserve_self), or a caller's lazy pool reservation
+	 * (mono_wasm_jit_lazy_im_reserve), whose stub already sits at the f-slot callers baked. It stays invisible
+	 * to get_callee_fslot: a self-recursion pair has no stub behind it, so a caller baking it would call a
+	 * slot nothing installs into until this method registers. Only mono_wasm_jit_self_reserved and the pool's
+	 * reuse check read these.
 	 *
 	 * Why hold it across re-emits: mono_jiterp_allocate_table_entry is a bump allocator with NO free, and
-	 * these used to be locals of mono_wasm_emit_method — so every failed emit orphaned two table entries and
-	 * the next attempt allocated a fresh pair. The drivers re-emit hard (wasm_jit_force_island up to 10 passes,
-	 * wasm_jit_compile_scc phase 1 up to WJ_SCC_MAX*2), so the leak scaled with re-emission count rather than
-	 * method count — which is exactly the axis module batching increases. */
+	 * these used to be locals of mono_wasm_emit_method -- so every failed emit orphaned two table entries and
+	 * the next attempt allocated a fresh pair, and the leak scaled with re-emission count. */
 	gint32 wasm_jit_self_resv_eslot;
 	gint32 wasm_jit_self_resv_fslot;
 	/* Three re-emission state bytes lived here -- reemit_state (0 never considered / 1 queued / 3 in
@@ -279,7 +273,6 @@ struct InterpMethod {
 	guint8 wasm_jit_tier;         /* 2 = its body was compiled at tier-2 policy (a same-IL re-emission keeps it); 3 = a tier-2
 	                               * attempt failed, was refused or given up. Either way never re-requested (R316c). */
 	guint8 wasm_jit_t2_want;      /* queued for a tier-2 recompile; read by mini.c through mono_wasm_jit_imethod_tier_want */
-	guint8 wasm_jit_t2_retries;   /* R327: BLOCKED tier-2 attempts parked on their blockers so far (bounded by MONO_WASM_JIT_T2_RETRY) */
 	guint8 wasm_jit_t2_rearms;    /* R332: tier-2 requests re-armed after a BUSY give-up so far (bounded by MONO_WASM_JIT_T2_REARM) */
 	// This data is used to resolve native offsets from unoptimized method to native offsets
 	// in the optimized method. We rely on keys identifying a certain logical execution point

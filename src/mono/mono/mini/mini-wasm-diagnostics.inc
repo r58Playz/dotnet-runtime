@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 408);   /* + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
+g_static_assert (WJC_MAX == 455);   /* + the Phase 5 lazy-slot census (32), + the R360 atomic lowering count, + the R358 tier-2 unit census (14), + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -290,27 +290,26 @@ mono_wasm_jit_dump_stats (void)
 		(double) WJC_(WJC_ELAPSED_GENERATION) / 1000.0, (double) WJC_(WJC_ELAPSED_INSTANTIATION) / 1000.0,
 		(double) wj_census_inst_us_total / 1000.0, wj_census_inst_total,
 		WJC_(WJC_COMPILE_ATTEMPTS), WJC_(WJC_BYTES_GENERATED));
-	printf ("[wasm-jit island] attempt=%lld completed=%lld budget_exhausted=%lld depth_exceeded=%lld blocked_cold=%lld promoted_up=%lld promoted_down=%lld\n",
-		WJC_(WJC_ISLAND_ATTEMPT), WJC_(WJC_ISLAND_COMPLETED), WJC_(WJC_ISLAND_BUDGET_EXHAUSTED), WJC_(WJC_ISLAND_DEPTH_EXCEEDED),
-		WJC_(WJC_ISLAND_BLOCKED_COLD), WJC_(WJC_PROMOTED_UP), WJC_(WJC_PROMOTED_DOWN));
-	/* Event-driven blocker waiting (the island driver's alternative to poll-retrying a cold callee).
-	 * woken/parked is the mean number of re-queues each park eventually produced. */
-	printf ("[wasm-jit park] parked=%lld waiters_woken=%lld\n",
-		WJC_(WJC_PARKED), WJC_(WJC_WAITER_WOKEN));
+	/* "island" is the name the threshold compile keeps from before R366: attempt/completed are threshold-reached roots
+	 * compiled ALONE now, promoted_up the promote queue's (Lever A); nothing is pulled down into a caller any more. */
+	printf ("[wasm-jit island] attempt=%lld completed=%lld promoted_up=%lld\n",
+		WJC_(WJC_ISLAND_ATTEMPT), WJC_(WJC_ISLAND_COMPLETED), WJC_(WJC_PROMOTED_UP));
+	/* A retriable compile result retries a full threshold later (WJC_PARKED kept its name; nothing parks on a callee
+	 * since R367). Should be small: nothing blocks on a callee any more. */
+	printf ("[wasm-jit retry] retriable=%lld\n", WJC_(WJC_PARKED));
 	printf ("[wasm-jit vcall] ic_hit=%lld ic_miss=%lld vfast_had=%lld vfast_new=%lld vfb_thresh=%lld vfb_perm=%lld\n",
 		WJC_(WJC_VIC_HIT), WJC_(WJC_VIC_MISS), WJC_(WJC_VFAST_HAD), WJC_(WJC_VFAST_NEW),
 		WJC_(WJC_VFB_THRESH), WJC_(WJC_VFB_PERM));
 	/* vfb_thresh split by the target's slot state. cold = still counting (interp is the right answer);
-	 * parked = crossed the threshold but its island won't close, i.e. interpreted on EVERY call and the
-	 * real interp-residual driver; retry = transient compile-lock contention; notlive = compiled, but
-	 * admit_live said no on THIS worker.
+	 * retry = a retriable result or compile-lock contention; notlive = compiled, but admit_live said no on
+	 * THIS worker. (A fourth arm, parked, went with the islands, R368.)
 	 *
 	 * THE FOURTH ARM IS LOAD-BEARING AND USED TO BE MISSING HERE. WJC_VFB_NOTLIVE was added after this
 	 * line and only reached the R166 split further down, so this printf advertised a three-way identity
 	 * that stopped holding the day the fourth arm appeared -- and notlive is the arm that carried R244's
 	 * 14-23M/run regression. Keep all four here, or delete the "sum should equal" claim. */
-	printf ("[wasm-jit vfb] cold=%lld parked=%lld retry=%lld notlive=%lld (sum should equal vfb_thresh=%lld)\n",
-		WJC_(WJC_VFB_COLD), WJC_(WJC_VFB_PARKED), WJC_(WJC_VFB_RETRY), WJC_(WJC_VFB_NOTLIVE),
+	printf ("[wasm-jit vfb] cold=%lld retry=%lld notlive=%lld (sum should equal vfb_thresh=%lld)\n",
+		WJC_(WJC_VFB_COLD), WJC_(WJC_VFB_RETRY), WJC_(WJC_VFB_NOTLIVE),
 		WJC_(WJC_VFB_THRESH));
 	printf ("[wasm-jit vperm] aot=%lld eh=%lld ldaddr=%lld lcompare=%lld sig=%lld byref=%lld gshared=%lld rgctx=%lld sync=%lld eh_other=%lld other_opcode=%lld other=%lld\n",
 		WJC_(WJC_VPERM_AOT), WJC_(WJC_VPERM_EH), WJC_(WJC_VPERM_LDADDR), WJC_(WJC_VPERM_LCMP),
@@ -337,27 +336,9 @@ mono_wasm_jit_dump_stats (void)
 	 * the admit0 propagation count is wildly larger than the sum of the root causes, a route has been
 	 * added without a counter again -- which is exactly how R244's regression stayed invisible. */
 	printf ("[wasm-jit admitroutes] dep_admit0=%lld bad_id=%lld no_entry=%lld permfail=%lld state3=%lld"
-		" blockers_truncated=%lld batch_raced=%lld\n",
+		" batch_raced=%lld\n",
 		WJC_(WJC_ADMIT_DEP_ADMIT0), WJC_(WJC_ADMIT_BAD_ID), WJC_(WJC_ADMIT_NO_ENTRY),
-		WJC_(WJC_ADMIT_PERMFAIL), WJC_(WJC_ADMIT_STATE3), WJC_(WJC_BLOCKERS_TRUNCATED),
-		WJC_(WJC_ADMIT_BATCH_RACED));
-	/* R245: the SCC batcher, which had ZERO counters until now -- every outcome was a verbose-only
-	 * printf, so its distribution was unobservable in a --stats run.
-	 *
-	 * READ `condemned` FIRST. It counts members marked permanently bailed by a give_up abort, INCLUDING
-	 * members that compiled fine. The island driver fails the one callee and residual-routes the edge;
-	 * this driver condemns the whole group. attempt = ok + busy + table + budget + alloc_fail +
-	 * seed_perm + too_large + no_progress + iter_cap; if it does not, an exit is uncounted. */
-	printf ("[wasm-jit scc] attempt=%lld ok=%lld members=%lld condemned=%lld resv_bypass=%lld colocate_ok=%lld colocate_fail=%lld\n",
-		WJC_(WJC_SCC_ATTEMPT), WJC_(WJC_SCC_OK), WJC_(WJC_SCC_MEMBERS), WJC_(WJC_SCC_CONDEMNED),
-		WJC_(WJC_SCC_RESV_BYPASS), WJC_(WJC_SCC_COLOCATE_OK), WJC_(WJC_SCC_COLOCATE_FAIL));
-	printf ("[wasm-jit sccfail] busy=%lld table=%lld budget=%lld alloc=%lld seed_perm=%lld too_large=%lld no_progress=%lld iter_cap=%lld\n",
-		WJC_(WJC_SCC_BUSY), WJC_(WJC_SCC_TABLE), WJC_(WJC_SCC_BUDGET), WJC_(WJC_SCC_ALLOC_FAIL),
-		WJC_(WJC_SCC_SEED_PERM), WJC_(WJC_SCC_TOO_LARGE), WJC_(WJC_SCC_NO_PROGRESS), WJC_(WJC_SCC_ITER_CAP));
-	/* spared + condemned == every member of every aborted batch. park_no_waiter NON-ZERO IS A PROBLEM:
-	 * a spared member with nothing to wait on is parked forever, because PARKED stops the hit counter. */
-	printf ("[wasm-jit sccfail2] spared=%lld condemned=%lld park_no_waiter=%lld\n",
-		WJC_(WJC_SCC_SPARED), WJC_(WJC_SCC_CONDEMNED), WJC_(WJC_SCC_PARK_NO_WAITER));
+		WJC_(WJC_ADMIT_PERMFAIL), WJC_(WJC_ADMIT_STATE3), WJC_(WJC_ADMIT_BATCH_RACED));
 	/* The IKVM body-swap edge. relink counters live in tiering.c and had NO reporting surface at all
 	 * until R249 -- they were incremented and never read, which is how "generation 1's permanent bail
 	 * is inherited by generation 2" survived. bail_cleared counts methods that got a second verdict. */
@@ -712,10 +693,10 @@ mono_wasm_jit_dump_stats (void)
 	/* R166_ADMIT_RETRY_SPLIT. Admission failures by retriability, and the vcall fallback arm that had no
 	 * counter until R166. vfb_notlive is the one to watch: it is a virtual call to a method that IS
 	 * compiled and simply is not dispatchable on the calling worker, and 109.6M of them in a 120 s window
-	 * was the whole of co-location's 1.62x regression. Its three siblings must sum with it to vfb_thresh. */
-	printf ("[wasm-jit admit] R166_ADMIT_RETRY_SPLIT fail_perm=%lld fail_retry=%lld | vfb_thresh=%lld = cold %lld + parked %lld + retry %lld + notlive %lld\n",
+	 * was the whole of co-location's 1.62x regression. Its two siblings must sum with it to vfb_thresh. */
+	printf ("[wasm-jit admit] R166_ADMIT_RETRY_SPLIT fail_perm=%lld fail_retry=%lld | vfb_thresh=%lld = cold %lld + retry %lld + notlive %lld\n",
 		WJC_(WJC_ADMIT_FAIL_PERM), WJC_(WJC_ADMIT_FAIL_RETRY), WJC_(WJC_VFB_THRESH),
-		WJC_(WJC_VFB_COLD), WJC_(WJC_VFB_PARKED), WJC_(WJC_VFB_RETRY), WJC_(WJC_VFB_NOTLIVE));
+		WJC_(WJC_VFB_COLD), WJC_(WJC_VFB_RETRY), WJC_(WJC_VFB_NOTLIVE));
 	/* R166_ADMIT_LIVE_SPLIT: which half of `admit() && desc_admitted()` refused, and why. */
 	printf ("[wasm-jit admit] R166_PREMARK_UNDO admit_live_split admit0=%lld state=%lld gen=%lld e_notlive=%lld f_notlive=%lld\n",
 		WJC_(WJC_AL_ADMIT0), WJC_(WJC_AL_STATE), WJC_(WJC_AL_GEN),
@@ -809,10 +790,6 @@ mono_wasm_jit_dump_stats (void)
 		"  no_rec=%lld cold=%lld poly=%lld no_fslot=%lld other=%lld  <- sites coverage could reach\n",
 		WJC_(WJC_FAST_VIC_PRED), WJC_(WJC_FAST_VIC_NO_REC), WJC_(WJC_FAST_VIC_COLD),
 		WJC_(WJC_FAST_VIC_POLY), WJC_(WJC_FAST_VIC_NO_FSLOT), WJC_(WJC_FAST_VIC_OTHER));
-	printf ("[wasm-jit devirt-force] forced=%lld capped=%lld (MONO_WASM_JIT_DEVIRT_FORCE=%d min=%d max=%d) -- read against no_fslot above and parked=%lld\n",
-		WJC_(WJC_DEVIRT_FORCED), WJC_(WJC_DEVIRT_FORCE_CAPPED),
-		mono_wasm_jit_devirt_force, mono_wasm_jit_devirt_force_min, mono_wasm_jit_devirt_force_max,
-		WJC_(WJC_PARKED));
 	/* LCSE reach. hits/loads_seen is the elimination RATE; evict>0 says the load table is the binding
 	 * constraint (raise WJ_LCSE_LOADS) rather than the kill policy. Requires MONO_WASM_JIT_LCSE=1. */
 	printf ("[wasm-jit guarded-inline] sites=%lld candidates=%lld admitted=%lld emitted=%lld"
@@ -889,21 +866,37 @@ mono_wasm_jit_dump_stats (void)
 			printf ("[wasm-jit ldaddr-ref] locals=%lld (ldaddr_ref=%d)\n", WJC_(WJC_LDADDR_REF_LOCAL), mono_wasm_jit_ldaddr_ref);
 			printf ("[wasm-jit reemit-validate] validate_only=%lld hazard=%lld (reemit_validate=%d)\n", WJC_(WJC_REEMIT_VALIDATE_ONLY),
 				WJC_(WJC_REEMIT_HAZARD), mono_wasm_jit_reemit_validate);
-			printf ("[wasm-jit r323-lower] ovf_conv=%lld atomic_store8=%lld\n", WJC_(WJC_OVF_CONV_LOWERED), WJC_(WJC_ATOMIC_STORE8_LOWERED));
+			printf ("[wasm-jit r323-lower] ovf_conv=%lld atomic_store8=%lld atomic_wide=%lld\n", WJC_(WJC_OVF_CONV_LOWERED),
+				WJC_(WJC_ATOMIC_STORE8_LOWERED), WJC_(WJC_ATOMIC_LOWERED));
+			{
+				/* Phase 5 (mini-wasm-lazy.inc). orphan, bank_fail, repair, notreal, drift and dead must read 0; bind is the
+				 * liveness check. */
+				printf ("[wasm-jit lazy] sites=%lld reserve=%lld reuse=%lld refuse wrapper=%lld shape=%lld reflect=%lld unusable=%lld aot=%lld perm=%lld sig=%lld resv=%lld full=%lld"
+					" | banks=%lld slots=%lld inst=%lld bank_fail=%lld dep_stub=%lld validate_only=%lld drift=%lld nogc_refused=%lld"
+					" | bind=%lld real=%lld alias=%lld othersig=%lld notreal=%lld repair=%lld orphan=%lld dead=%lld | interp=%lld threw=%lld | arms=%lld residual=%lld\n",
+					WJC_(WJC_LAZY_SITES), WJC_(WJC_LAZY_RESERVE), WJC_(WJC_LAZY_REUSE), WJC_(WJC_LAZY_REFUSE_WRAPPER), WJC_(WJC_LAZY_REFUSE_SHAPE), WJC_(WJC_LAZY_REFUSE_REFLECT), WJC_(WJC_LAZY_REFUSE_UNUSABLE),
+					WJC_(WJC_LAZY_REFUSE_AOT), WJC_(WJC_LAZY_REFUSE_PERM), WJC_(WJC_LAZY_REFUSE_SIG), WJC_(WJC_LAZY_REFUSE_RESV),
+					WJC_(WJC_LAZY_REFUSE_FULL), WJC_(WJC_LAZY_BANKS), WJC_(WJC_LAZY_POOL_SLOTS), WJC_(WJC_LAZY_BANK_INST),
+					WJC_(WJC_LAZY_BANK_FAIL), WJC_(WJC_LAZY_DEP_STUB), WJC_(WJC_LAZY_VALIDATE_ONLY), WJC_(WJC_LAZY_SIG_DRIFT),
+					WJC_(WJC_LAZY_NOGC_REFUSED), WJC_(WJC_LAZY_BIND), WJC_(WJC_LAZY_BIND_REAL), WJC_(WJC_LAZY_BIND_ALIAS),
+					WJC_(WJC_LAZY_BIND_OTHER_SIG), WJC_(WJC_LAZY_BIND_NOTREAL), WJC_(WJC_LAZY_REPAIR), WJC_(WJC_LAZY_ORPHAN), WJC_(WJC_LAZY_DEAD),
+					WJC_(WJC_LAZY_INTERP), WJC_(WJC_LAZY_INTERP_THREW), WJC_(WJC_LAZY_ARM), WJC_(WJC_LAZY_RESIDUAL));
+			}
 			{
 				extern int mono_wasm_jit_math_intrins;
 				printf ("[wasm-jit math-intrins] lowered=%lld (math_intrins=%d)\n", WJC_(WJC_MATH_INTRINS_LOWERED), mono_wasm_jit_math_intrins);
 				{ extern int mono_wasm_jit_t2_max_body;
 				  printf ("[wasm-jit t2-cap] capped=%lld (t2_max_body=%d)\n", WJC_(WJC_T2_BODY_CAPPED), mono_wasm_jit_t2_max_body); }
+				{ extern int mono_wasm_jit_t2_unit;
+				  if (mono_wasm_jit_t2_unit)
+					printf ("[wasm-jit t2u] roots=%lld sites=%lld callees=%lld | self=%lld wrapper=%lld notjit=%lld unstable=%lld eh=%lld big=%lld eligible=%lld (hot=%lld sites=%lld bytes=%lld) overflow=%lld (t2_unit=%d)\n",
+						WJC_(WJC_T2U_ROOTS), WJC_(WJC_T2U_SITES), WJC_(WJC_T2U_CALLEES), WJC_(WJC_T2U_SELF), WJC_(WJC_T2U_WRAPPER),
+						WJC_(WJC_T2U_NOTJIT), WJC_(WJC_T2U_UNSTABLE), WJC_(WJC_T2U_EH), WJC_(WJC_T2U_BIG), WJC_(WJC_T2U_ELIGIBLE),
+						WJC_(WJC_T2U_ELIG_HOT), WJC_(WJC_T2U_ELIG_SITES), WJC_(WJC_T2U_ELIG_BYTES), WJC_(WJC_T2U_OVERFLOW), mono_wasm_jit_t2_unit); }
 				{ extern int mono_wasm_jit_eh_rec;
 				  printf ("[wasm-jit ehrec] emitted=%lld trim=%lld boundary_pop=%lld dispatch_norec=%lld unlink_inner=%lld unlink_outer=%lld (eh_rec=%d)\n",
 					WJC_(WJC_EHREC_EMITTED), WJC_(WJC_EHREC_TRIM), WJC_(WJC_EHREC_BOUNDARY_POP), WJC_(WJC_EHREC_DISPATCH_NOREC),
 					WJC_(WJC_EHREC_UNLINK_INNER), WJC_(WJC_EHREC_UNLINK_OUTER), mono_wasm_jit_eh_rec); }
-			}
-			{
-				extern int mono_wasm_jit_t2_retry;
-				printf ("[wasm-jit t2-retry] parked=%lld giveup=%lld (t2_retry=%d)\n", WJC_(WJC_T2_RETRY_PARKED),
-					WJC_(WJC_T2_RETRY_GIVEUP), mono_wasm_jit_t2_retry);
 			}
 			{
 				extern int mono_wasm_jit_t2_static_pred;

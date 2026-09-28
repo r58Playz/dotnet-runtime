@@ -149,7 +149,8 @@ enum {
 	 * one-time cost of renumbering the harness mirror alongside it. */
 	/* compile-time accounting (Part 2) */
 	WJC_BYTES_GENERATED, WJC_ELAPSED_GENERATION, WJC_ELAPSED_INSTANTIATION, WJC_COMPILE_ATTEMPTS,
-	/* island formation outcomes (Part 3b/5) */
+	/* Root compiles (ATTEMPT/COMPLETED) and Lever A's upward promotions (PROMOTED_UP). The other four were island
+	 * outcomes; nothing writes them since R366 and their slots stay so the by-index mirrors do not shift. */
 	WJC_ISLAND_ATTEMPT, WJC_ISLAND_COMPLETED, WJC_ISLAND_BUDGET_EXHAUSTED, WJC_ISLAND_DEPTH_EXCEEDED,
 	WJC_ISLAND_BLOCKED_COLD, WJC_PROMOTED_UP, WJC_PROMOTED_DOWN,
 	/* finer split of the perm-unjittable vcall residual (was lumped into WJC_VPERM_OTHER): which override
@@ -159,13 +160,13 @@ enum {
 	WJC_VPERM_SIG, WJC_VPERM_BYREF, WJC_VPERM_GSHARED, WJC_VPERM_SYNC, WJC_VPERM_EHOTHER, WJC_VPERM_AOT,
 	/* vcalls that took the fast AOT dispatch (MONO_WASM_JIT_VCALL_AOT) instead of the residual */
 	WJC_VCALL_AOT_FAST,
-	/* event-driven blocker waiting (Part 3 revamp): WJC_PARKED = times a method parked on cold blocker(s)
-	 * instead of poll-retrying; WJC_WAITER_WOKEN = total waiters re-queued when a blocker JITted. */
+	/* WJC_PARKED = retriable compile results, printed as `[wasm-jit retry] retriable=`; the name predates R367,
+	 * when a BLOCKED result parked on its blockers. WAITER_WOKEN is a retired slot (no writer since R367). */
 	WJC_PARKED, WJC_WAITER_WOKEN,
 	/* below-threshold vcall fallback (WJC_VFB_THRESH) split by the target's wasm_jit_slot state, so we can
 	 * tell "cold callee, interp is fine" apart from "hot method whose island won't close" (the real interp-
-	 * residual driver): VFB_COLD = slot 0 (still counting), VFB_PARKED = slot -2 (crossed thresh, island
-	 * blocked on a cold callee), VFB_RETRY = slot -3 (transient compile-lock contention). Sum == VFB_THRESH. */
+	 * residual driver): VFB_COLD = slot 0 (still counting), VFB_RETRY = slot -3 (a retriable result or compile-lock
+	 * contention). VFB_PARKED (slot -2) is a retired slot: nothing writes -2 since R367. */
 	WJC_VFB_COLD, WJC_VFB_PARKED, WJC_VFB_RETRY,
 	/* fast-path VOLUME counters, emitted INTO the JITted wasm (gated by MONO_WASM_JIT_PROFILE_FAST, OFF by
 	 * default so normal STATS runs are unperturbed). The dispatch fast paths call NO counting helper, so
@@ -252,14 +253,8 @@ enum {
 	 * 79% of a pool that structurally could not contain the thing it was compared against. */
 	WJC_DEVIRT_SITE, WJC_DEVIRT_NO_REC, WJC_DEVIRT_COLD, WJC_DEVIRT_POLY, WJC_DEVIRT_POLY_90,
 	WJC_DEVIRT_SIG, WJC_DEVIRT_NO_FSLOT, WJC_DEVIRT_EMITTED, WJC_DELEGATE_SITE, WJC_FAST_DEVIRT,
-	/* MONO_WASM_JIT_DEVIRT_FORCE (default 0). FORCED = a NO_FSLOT site whose predicted target was turned
-	 * into an island blocker instead of being dropped, so the caller re-emits once the callee publishes.
-	 * CAPPED = the same site declined because the method already carried DEVIRT_FORCE_MAX blockers.
-	 *
-	 * Read FORCED against the fall in DEVIRT_NO_FSLOT and the rise in DEVIRT_EMITTED for reach, and
-	 * against WJC_PARKED / WJC_ISLAND_DEPTH_EXCEEDED / WJC_ISLAND_BUDGET_EXHAUSTED for the cost. The cost
-	 * side is the whole reason this is a knob: R153's world-load stall came from methods that could not
-	 * clear their blockers and ran interpreted, and this deliberately creates more blockers. */
+	/* Retired slots: MONO_WASM_JIT_DEVIRT_FORCE went with the islands (R366; a NO_FSLOT arm now takes a lazy pool
+	 * slot, WJC_LAZY_ARM). Kept so the by-index mirrors do not shift. */
 	WJC_DEVIRT_FORCED, WJC_DEVIRT_FORCE_CAPPED,
 	/* THE CAPTURED-EDGE COUNT, and the only place it is recorded. Dependency entries dropped when a re-framed module's dependency
 	 * set was recomputed from the assembler instead of inherited from the generation each member was
@@ -290,7 +285,7 @@ enum {
 	 * the target has slot > 0 (it IS JIT-compiled) but mono_wasm_jit_admit_live returned 0, so this worker
 	 * cannot dispatch to it and the call goes to the interpreter. Every other slot state had a counter, so
 	 * this route showed up not as a gap but as VFB_THRESH being 9,243x larger with no explanation.
-	 * VFB_COLD + VFB_PARKED + VFB_RETRY + VFB_NOTLIVE == VFB_THRESH; check that before trusting a share. */
+	 * VFB_COLD + VFB_RETRY + VFB_NOTLIVE == VFB_THRESH; check that before trusting a share. */
 	WJC_VFB_NOTLIVE,
 	/* mono_wasm_jit_admit_live's failure routes, one counter each. R166's first fix targeted the four
 	 * state-1/state-3 leaks in mono_wasm_jit_admit's `fail:` label and moved VFB_NOTLIVE by 2.6% (109.6M ->
@@ -590,31 +585,13 @@ enum {
 	 * to make visible. PENDING = the ordinary transient case, a dep not yet installed here, which the
 	 * next dispatch genuinely can clear. If CYCLE dominates, the fix is structural, not a retry bound. */
 	WJC_ADMIT_DEP_NOT_LIVE_CYCLE, WJC_ADMIT_DEP_NOT_LIVE_PENDING,
-	/* Blocker list overflowed MONO_WASM_JIT_MAX_BLOCKERS (32) while the SCC member cap is 64, so the
-	 * closure handed to the batcher is INCOMPLETE. It then cannot close, hits !progress, and converts a
-	 * truncation into a permanent verdict for every member. blockers_truncated was written and read by
-	 * nobody before this. */
+	/* Retired slots, BLOCKERS_TRUNCATED through SCC_COLOCATE_FAIL: the island blocker list and the SCC batcher
+	 * went with the islands (R366/R367). Kept so the by-index mirrors do not shift. */
 	WJC_BLOCKERS_TRUNCATED,
-	/* --- the SCC batcher, which had ZERO counters -------------------------------------------------
-	 * Every outcome was a printf behind mono_wasm_jit_verbose, so its distribution was unobservable in
-	 * a --stats run and the whole-group condemnation below was never quantified. One per real exit. */
 	WJC_SCC_ATTEMPT, WJC_SCC_OK, WJC_SCC_MEMBERS,
-	WJC_SCC_BUSY,          /* lost the wj_compiling CAS; the caller retries                          */
-	WJC_SCC_TABLE,         /* all-or-nothing capacity gate refused (transient)                       */
-	WJC_SCC_BUDGET,        /* island budget exhausted mid-batch (transient)                          */
-	WJC_SCC_ALLOC_FAIL,    /* allocate_table_entry returned 0 (phase 0 or the phase-1 fold)          */
-	WJC_SCC_SEED_PERM,     /* a seed member was already permanently bailed                           */
-	WJC_SCC_TOO_LARGE,     /* closure exceeded WJ_SCC_MAX                                            */
-	WJC_SCC_NO_PROGRESS,   /* a member bailed with no growable blocker                               */
-	WJC_SCC_ITER_CAP,      /* fold loop hit its iteration cap without closing (transient)            */
-	/* MEMBERS MARKED PERMANENTLY BAILED BY A give_up ABORT -- including members that compiled fine.
-	 * The island driver fails the one callee and residual-routes the edge; the SCC condemns the whole
-	 * group. This is R166's "admit condemned whole groups" in a different function, and this counter is
-	 * how the two policies get compared before either is changed. */
+	WJC_SCC_BUSY, WJC_SCC_TABLE, WJC_SCC_BUDGET, WJC_SCC_ALLOC_FAIL,
+	WJC_SCC_SEED_PERM, WJC_SCC_TOO_LARGE, WJC_SCC_NO_PROGRESS, WJC_SCC_ITER_CAP,
 	WJC_SCC_CONDEMNED,
-	/* The compile registered into a DIFFERENT pair than the one reserved for it, so fellow members have
-	 * baked an f-slot that nothing will instantiate. Detected and printed unconditionally before this;
-	 * never counted, so its rate was unknown. */
 	WJC_SCC_RESV_BYPASS,
 	WJC_SCC_COLOCATE_OK, WJC_SCC_COLOCATE_FAIL,
 	/* Islands driven off the promotion queue rather than a threshold crossing. WJC_ISLAND_ATTEMPT /
@@ -631,14 +608,7 @@ enum {
 	 * generated code actually needs and what this path does provide. Read against ADMIT_DEP_NOT_LIVE:
 	 * cycle breaks should be common, and refusals should no longer follow from them. */
 	WJC_CYCLE_BREAK_INSTALL,
-	/* R245 Stage 2a. SPARED = members an SCC give_up abort did NOT condemn, because their own compile did
-	 * not fail permanently -- the population the old whole-group policy removed from the tier. Read it
-	 * against SCC_CONDEMNED: spared+condemned is every member of every aborted batch.
-	 *
-	 * PARK_NO_WAITER is the one that needs watching. A spared member is parked and PARKED is excluded
-	 * from wj_slot_hot_retry_eligible, so it never retries on its own -- it wakes only when a blocker
-	 * JITs. If it had no blockers to register on, nothing will ever wake it: a silent never-retry. This
-	 * counts exactly that case. NON-ZERO IS A PROBLEM, unlike most counters here. */
+	/* Retired slots (the SCC batcher, R366). */
 	WJC_SCC_SPARED, WJC_SCC_PARK_NO_WAITER,
 	/* IKVM replaced this method's IL and generation 1 had permanently bailed; the -1 was dropped so the
 	 * emitter judges the NEW body (tiering.c). Non-zero is the healthy reading -- zero means either that
@@ -1287,8 +1257,8 @@ enum {
 	WJC_OVF_CONV_LOWERED,      /* R323: checked i64 -> i32 conversions emitted (were "unsupported opcode") */
 	WJC_ATOMIC_STORE8_LOWERED, /* R323b: 1-byte OP_ATOMIC_STOREs emitted as i32.atomic.store8 (were "unsupported opcode") */
 	WJC_REEMIT_HAZARD,         /* R322 probe: re-emits into a slot installed here whose body bakes a dep NOT installed here (ungated) */
-	WJC_T2_RETRY_PARKED,       /* R327: BLOCKED tier-2 attempts parked on their blockers instead of failing (ungated) */
-	WJC_T2_RETRY_GIVEUP,       /* R327: ... that exhausted MONO_WASM_JIT_T2_RETRY and were recorded FAIL (ungated) */
+	WJC_T2_RETRY_PARKED,       /* retired slot: R327's BLOCKED tier-2 retry went with the islands (R367) */
+	WJC_T2_RETRY_GIVEUP,       /* retired slot, as above */
 	WJC_T2_GI_STATIC_PRED,     /* R329: tier-2 GI sites with no record predicted from the callvirt's own method (decision) */
 	WJC_T2_GI_STATIC_EMITTED,  /* R329: ... of which the guarded inline was emitted (action) */
 	WJC_T2_REARMED,            /* R332: tier-2 requests re-armed after a BUSY give-up (ungated) */
@@ -1306,6 +1276,56 @@ enum {
 	WJC_T2_LOOP_OWED,          /* R355: entry-poll samples that owed the next back-edge a second one (ungated) */
 	WJC_T2_LOOP_CREDIT,        /* R355: owed samples a back-edge took */
 	WJC_T2_LOOP_LATE,          /* R355: owed samples a back-edge reached more than 2 ms after the tick (dropped) */
+	/* R358: the tier-2 unit SUPPLY census (MONO_WASM_JIT_T2_UNIT=2). Per root: its distinct direct (RELOC_CALL) callees,
+	 * each in exactly one bucket; CALLEES == SELF+WRAPPER+NOTJIT+UNSTABLE+EH+BIG+ELIGIBLE (+OVERFLOW, uncounted). */
+	WJC_T2U_ROOTS,
+	WJC_T2U_SITES,
+	WJC_T2U_CALLEES,
+	WJC_T2U_SELF,
+	WJC_T2U_WRAPPER,
+	WJC_T2U_NOTJIT,
+	WJC_T2U_UNSTABLE,
+	WJC_T2U_EH,
+	WJC_T2U_BIG,
+	WJC_T2U_ELIGIBLE,
+	WJC_T2U_ELIG_HOT,          /* eligible callees with >= 8 tier-2 samples of their own */
+	WJC_T2U_ELIG_SITES,
+	WJC_T2U_ELIG_BYTES,
+	WJC_T2U_OVERFLOW,          /* distinct callees past the 256 a root is scanned for */
+	WJC_ATOMIC_LOWERED,        /* R360: 16/32-bit atomic loads/stores, CAS, exchange and add emitted inline */
+	/* Phase 5, MONO_WASM_JIT_LAZY_T1 (mini-wasm-lazy.inc). Ungated. Must read 0: ORPHAN, BANK_FAIL, REPAIR. */
+	WJC_LAZY_SITES,            /* direct call sites emitted through a pool f-slot */
+	WJC_LAZY_RESERVE,          /* pool pairs handed out (one per callee) */
+	WJC_LAZY_REUSE,            /* ... a callee that already had one */
+	WJC_LAZY_REFUSE_SHAPE,     /* refused: rgctx, wrapper/synchronized, icall/runtime/pinvoke/abstract, reflection, unusable */
+	WJC_LAZY_REFUSE_AOT,       /* refused: AOT-backed (keeps its inline direct AOT call) */
+	WJC_LAZY_REFUSE_PERM,      /* refused: permanently un-JITtable */
+	WJC_LAZY_REFUSE_SIG,       /* refused: call-site functype is not the callee's own (or not resolved yet) */
+	WJC_LAZY_REFUSE_RESV,      /* refused: the callee holds a non-pool reservation (SCC batch, self-recursion) */
+	WJC_LAZY_REFUSE_FULL,      /* refused: table, pool or bank space exhausted */
+	WJC_LAZY_BANKS,            /* stub banks framed */
+	WJC_LAZY_POOL_SLOTS,       /* table entries they took (2 per pair, reserved or not) */
+	WJC_LAZY_BANK_INST,        /* bank instantiations (per pthread) */
+	WJC_LAZY_BANK_FAIL,        /* ... that V8 refused */
+	WJC_LAZY_DEP_STUB,         /* admission deps satisfied by a stub */
+	WJC_LAZY_VALIDATE_ONLY,    /* compile-time installs of a pool pair left to admission (invariant 1) */
+	WJC_LAZY_SIG_DRIFT,        /* a pool-reserved method compiled to another functype: fresh pair instead */
+	WJC_LAZY_NOGC_REFUSED,     /* no-GC credit refused because the callee is a pool slot */
+	WJC_LAZY_BIND,             /* stub binds */
+	WJC_LAZY_BIND_REAL,        /* ... to the callee's own slot */
+	WJC_LAZY_BIND_ALIAS,       /* ... to the callee's live f under another pair */
+	WJC_LAZY_BIND_OTHER_SIG,   /* ... callee live under another functype: interpreter */
+	WJC_LAZY_BIND_NOTREAL,     /* ... late_fslot's slot did not hold a function this worker installed */
+	WJC_LAZY_REPAIR,           /* table slots found overwritten and restored (the ordering rule broken) */
+	WJC_LAZY_ORPHAN,           /* a stub with no owner */
+	WJC_LAZY_INTERP,           /* interpreter legs */
+	WJC_LAZY_INTERP_THREW,     /* ... that threw */
+	WJC_LAZY_REFUSE_WRAPPER,   /* refused: a wrapper (synchronized ones only below LAZY_T1=2) -- split out of SHAPE */
+	WJC_LAZY_ARM,              /* devirt/delegate arms given a pool slot for their predicted target (LAZY_T1=3) */
+	WJC_LAZY_DEAD,             /* a stub whose owner was freed or changed functype (aborts; must be 0) */
+	WJC_LAZY_REFUSE_REFLECT,   /* refused: System.Reflection (split out of SHAPE) */
+	WJC_LAZY_REFUSE_UNUSABLE,  /* refused: mono_wasm_jit_method_usable said no (split out of SHAPE) */
+	WJC_LAZY_RESIDUAL,         /* LAZY_T1=4: refused callees routed through the residual instead of blocking */
 	WJC_MAX
 };
 

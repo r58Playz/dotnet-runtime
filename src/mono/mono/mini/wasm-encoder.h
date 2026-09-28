@@ -466,6 +466,10 @@ typedef struct {
  * Nothing is patched afterwards and nothing is asserted about what the caller baked, because the caller
  * bakes nothing: every index a body needs arrived as a relocation.
  */
+/* A lazy stub bank (MONO_WASM_JIT_LAZY_T1): k stubs of functype ft at table slots f_slots[], see wasm-encoder.c.
+ * helper_idx = table indices of bind, scratch, interp, continue_unwind. */
+void wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, const guint32 *helper_idx, WasmBuf *out);
+
 void wasm_module_assemble (
 	const WasmAsmMember *members, guint32 nmembers, guint32 nexport,
 	gboolean import_table,
