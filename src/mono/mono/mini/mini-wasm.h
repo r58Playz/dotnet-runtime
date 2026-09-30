@@ -1334,6 +1334,7 @@ enum {
 	WJC_COLD_T2_BYTES_ALL,     /* ... all block bytes of tier-2 compiles */
 	WJC_ATOMIC_I8_LOWERED,     /* J1c: 64-bit atomic loads/stores, CAS, exchange and add emitted inline (MONO_WASM_JIT_ATOMIC_I8) */
 	WJC_DEVIRT_VALUETYPE,      /* R376: a devirt arm / guarded inline refused because its profile target is a VALUETYPE method */
+	WJC_AGGR_INLINE_CAPPED,    /* R376: an [AggressiveInlining] exemption refused because the compile passed MONO_WASM_JIT_AGGR_INLINE_BLOCKS */
 	WJC_MAX
 };
 

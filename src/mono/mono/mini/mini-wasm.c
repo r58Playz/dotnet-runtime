@@ -648,6 +648,11 @@ int mono_wasm_jit_atomic_i8 = 0;
 /* MONO_WASM_JIT_TRACE_COMPILE=1 (R376, diagnostic): print "[wasm-jit] compile-begin <ns>.<class>:<method>" as each
  * wasm-JIT compile starts (mono_wasm_force_compile). */
 int mono_wasm_jit_trace_compile = 0;
+/* MONO_WASM_JIT_AGGR_INLINE_BLOCKS (R376): a wasm-JIT compile honours [AggressiveInlining] only while it has at most this
+ * many basic blocks (method-to-ir.c wj_aggr_inline). Without a bound the no-AOT build never finished compiling
+ * IKVM.ByteCode Instruction.TryRead (121,577 blocks into mono_optimize_branches). The largest method that got
+ * through that pass in the same trace had 5,834. 0 = no bound. */
+int mono_wasm_jit_aggr_inline_blocks = 3000;
 /* MONO_WASM_JIT_T2_MAX_BODY (R349): largest tier-2 module, in bytes, the emitter will hand to V8; a bigger one fails
  * permanently and the method keeps its tier-1 body (or takes the tier-1-policy downgrade). 0 = no cap. */
 int mono_wasm_jit_t2_max_body = 98304;
@@ -810,6 +815,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_math_intrins, "MONO_WASM_JIT_MATH_INTRINS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_atomic_i8, "MONO_WASM_JIT_ATOMIC_I8", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_trace_compile, "MONO_WASM_JIT_TRACE_COMPILE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_aggr_inline_blocks, "MONO_WASM_JIT_AGGR_INLINE_BLOCKS", 0, 10000000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aot_byref, "MONO_WASM_JIT_AOT_BYREF", 0, 1)
@@ -1244,12 +1250,120 @@ mono_wasm_jit_residual_name_skipped (const char *name)
  * class-qualified segments too -- "Class:name" or "Ns.Class:name" -- which makes the set bisectable down to a
  * single method. Segments without a ':' keep the original simple-name meaning, so existing denylists behave
  * identically. */
+/* R376: MONO_WASM_JIT_NO_IMAGE=<assembly>[:<namespace prefix>][,...] leaves every method of those assemblies (or of the
+ * classes in them whose namespace starts with the prefix; "-" matches the empty namespace, "=Ns" exactly Ns) in the interpreter -- the
+ * coarse cuts of a bisection when a whole build (the no-AOT W0) miscompiles and the suspect is "code it JITs for the
+ * first time". The assembly name matches exactly. Field reads only; the class used is the outermost declaring class,
+ * so nested types go with their parent's namespace. */
+static gboolean
+wj_image_denied (MonoMethod *m)
+{
+	const char *t = g_getenv ("MONO_WASM_JIT_NO_IMAGE");
+	const char *an, *p, *ns;
+	MonoClass *k;
+	size_t n;
+	if (!t || !*t || !m->klass)
+		return FALSE;
+	an = m_class_get_image (m->klass) ? m_class_get_image (m->klass)->assembly_name : NULL;
+	if (!an)
+		return FALSE;
+	for (k = m->klass; m_class_get_nested_in (k); k = m_class_get_nested_in (k))
+		;
+	ns = m_class_get_name_space (k);
+	if (!ns)
+		ns = "";
+	n = strlen (an);
+	for (p = t; *p; ) {
+		const char *c = strchr (p, ',');
+		size_t len = c ? (size_t) (c - p) : strlen (p);
+		const char *colon = memchr (p, ':', len);
+		size_t alen = colon ? (size_t) (colon - p) : len;
+		if (alen == n && !strncmp (p, an, n)) {
+			if (!colon)
+				return TRUE;
+			{
+				const char *pre = colon + 1;
+				size_t plen = len - alen - 1;
+				if (plen == 1 && *pre == '-') {
+					if (!*ns)
+						return TRUE;
+				} else if (plen > 1 && *pre == '=') {   /* "=Ns": exactly that namespace */
+					if (strlen (ns) == plen - 1 && !strncmp (ns, pre + 1, plen - 1))
+						return TRUE;
+				} else if (!strncmp (ns, pre, plen))
+					return TRUE;
+			}
+		}
+		if (!c)
+			break;
+		p = c + 1;
+	}
+	return FALSE;
+}
+
+/* R376: MONO_WASM_JIT_BISECT=<assembly>:<lo>-<hi> denies the methods of that assembly whose ORDINAL -- the order in
+ * which they first reach this check, i.e. roughly compile order -- is in [lo, hi). Halving that range bisects a
+ * miscompile the namespace cuts cannot isolate. The ordinal lives in an append-only pointer-keyed table (hashing a
+ * pointer never dereferences it); a full table stops numbering, and unnumbered methods are not denied. */
+#define WJ_BISECT_SLOTS 65536
+static MonoMethod *wj_bisect_m [WJ_BISECT_SLOTS];
+static gint32 wj_bisect_ord [WJ_BISECT_SLOTS];
+static volatile gint32 wj_bisect_state [WJ_BISECT_SLOTS];
+static volatile gint32 wj_bisect_next;
+
+static gboolean
+wj_bisect_denied (MonoMethod *m)
+{
+	static int parsed = 0, lo = 0, hi = 0;
+	static char asmname [128];
+	const char *an;
+	gint32 ord = -1;
+	gsize h;
+	int i;
+	if (!parsed) {
+		const char *t = g_getenv ("MONO_WASM_JIT_BISECT");
+		const char *colon = t ? strrchr (t, ':') : NULL;
+		if (colon && (size_t) (colon - t) < sizeof (asmname) && sscanf (colon + 1, "%d-%d", &lo, &hi) == 2) {
+			memcpy (asmname, t, colon - t);
+			asmname [colon - t] = 0;
+			parsed = 1;
+		} else
+			parsed = -1;
+	}
+	if (parsed < 0 || !m->klass || !m_class_get_image (m->klass))
+		return FALSE;
+	an = m_class_get_image (m->klass)->assembly_name;
+	if (!an || strcmp (an, asmname))
+		return FALSE;
+	h = ((gsize) m >> 3) & (WJ_BISECT_SLOTS - 1);
+	for (i = 0; i < 64; ++i) {
+		int idx = (h + i) & (WJ_BISECT_SLOTS - 1);
+		if (wj_bisect_state [idx] == 2 && wj_bisect_m [idx] == m) { ord = wj_bisect_ord [idx]; break; }
+		if (wj_bisect_state [idx] == 0 && mono_atomic_cas_i32 (&wj_bisect_state [idx], 1, 0) == 0) {
+			wj_bisect_m [idx] = m;
+			wj_bisect_ord [idx] = ord = mono_atomic_fetch_add_i32 (&wj_bisect_next, 1);
+			mono_memory_barrier ();
+			wj_bisect_state [idx] = 2;
+			if (hi - lo <= 16 && ord >= lo && ord < hi) {   /* the last steps: name what is denied */
+				printf ("[wasm-jit] bisect-deny %d %s.%s:%s\n", ord, m_class_get_name_space (m->klass), m_class_get_name (m->klass), m->name);
+				fflush (stdout);
+			}
+			break;
+		}
+	}
+	return ord >= lo && ord < hi;
+}
+
 gboolean
 mono_wasm_jit_method_denied (MonoMethod *m)
 {
 	const char *t = g_getenv ("MONO_WASM_JIT_NO_METHOD");
 	const char *p;
 	const char *name, *kn, *ns;
+	if (m && wj_image_denied (m))
+		return TRUE;
+	if (m && wj_bisect_denied (m))
+		return TRUE;
 	if (!t || !m || !m->name)
 		return FALSE;
 	name = m->name;

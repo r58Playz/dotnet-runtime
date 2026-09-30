@@ -1260,6 +1260,17 @@ mono_optimize_branches (MonoCompile *cfg)
 		niterations = cfg->num_bblocks * 2;
 	else
 		niterations = 1000;
+#ifdef TARGET_WASM
+	{
+		extern int mono_wasm_jit_trace_compile;
+		/* R376: with the compile trace on, name the big ones -- the pass is O(blocks^2) in the worst case, and a
+		 * wasm-JIT compile once reached it with 121,577 blocks (see wj_aggr_inline in method-to-ir.c) */
+		if (COMPILE_WASM (cfg) && G_UNLIKELY (mono_wasm_jit_trace_compile) && cfg->num_bblocks > 500) {
+			printf ("[wasm-jit] optimize_branches %s:%s num_bblocks=%d\n", m_class_get_name (cfg->method->klass), cfg->method->name, cfg->num_bblocks);
+			fflush (stdout);
+		}
+	}
+#endif
 
 	do {
 		MonoBasicBlock *previous_bb;

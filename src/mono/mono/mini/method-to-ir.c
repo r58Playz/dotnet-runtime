@@ -371,6 +371,28 @@ wj_gi_note_refused (MonoMethod *m)
 #define wj_p3_count(C) do { } while (0)
 #endif
 
+/* R376: [AggressiveInlining] lifts the inline size limit, the "an inlinee keeps no calls" rule and the cost test, with
+ * no budget at all, so a tree of such methods inlines without bound -- IKVM.ByteCode Instruction.TryRead (TryPeekOpCode
+ * + TryMeasure -> a 200-way switch over 200 aggressive TryMeasure bodies -> SequenceReader) reached 121,577 basic blocks
+ * and mono_optimize_branches, O(blocks^2), never returned. A wasm-JIT compile honours the attribute only while it has at
+ * most mono_wasm_jit_aggr_inline_blocks blocks; past that an aggressive callee is an ordinary one. */
+static gboolean
+wj_aggr_inline (MonoCompile *cfg, MonoMethod *m)
+{
+	if (!m_method_is_aggressive_inlining (m))
+		return FALSE;
+#ifdef TARGET_WASM
+	{
+		extern int mono_wasm_jit_aggr_inline_blocks;
+		if (COMPILE_WASM (cfg) && mono_wasm_jit_aggr_inline_blocks > 0 && cfg->num_bblocks > mono_wasm_jit_aggr_inline_blocks) {
+			wj_p3_count (WJC_AGGR_INLINE_CAPPED);
+			return FALSE;
+		}
+	}
+#endif
+	return TRUE;
+}
+
 /* R315 (plan Phase 3.2): may the inlinee being IR'd keep this ordinary call / ctor call instead of aborting the
  * inline? Only under the per-compile policy, and only inside an inlinee (at the root INLINE_FAILURE is a no-op
  * anyway). Refused, and counted: IKVM's relink hook (a generation-1 body -- semantically safe to inline, but it
@@ -4837,7 +4859,7 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 		}
 	}
 #endif
-	if (eff_size >= GINT_TO_UINT32(limit) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING)) {
+	if (eff_size >= GINT_TO_UINT32(limit) && !wj_aggr_inline (cfg, method)) {
 		gboolean leaf_ok = FALSE;
 #ifdef HOST_BROWSER
 		/* MONO_WASM_JIT_INLINE_LEAF (R290): a larger limit, for the wasm JIT's ORDINARY inliner only
@@ -5603,7 +5625,7 @@ mini_inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *
 static gboolean
 aggressive_inline_method (MonoCompile *cfg, MonoMethod *cmethod)
 {
-	gboolean aggressive_inline = m_method_is_aggressive_inlining (cmethod);
+	gboolean aggressive_inline = wj_aggr_inline (cfg, cmethod);
 	if (aggressive_inline)
 		aggressive_inline = !mono_simd_unsupported_aggressive_inline_intrinsic_type (cfg, cmethod);
 	return aggressive_inline;
@@ -6737,7 +6759,7 @@ handle_ctor_call (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fs
 
 	/* Avoid virtual calls to ctors if possible */
 	if (!context_used && !rgctx_arg) {
-		if (!m_method_is_aggressive_inlining (cfg->current_method) && !m_method_is_aggressive_inlining (cmethod) &&
+		if (!wj_aggr_inline (cfg, cfg->current_method) && !wj_aggr_inline (cfg, cmethod) &&
 		    !wj_inline_call_allowed (cfg, cmethod))
 			INLINE_FAILURE ("ctor call");
 		// FIXME-VT: Clean this up
@@ -9705,7 +9727,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			}
 
 			/* Common call */
-			if (!(cfg->opt & MONO_OPT_AGGRESSIVE_INLINING) && !(method->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING) && !(cmethod->iflags & METHOD_IMPL_ATTRIBUTE_AGGRESSIVE_INLINING) && !method_does_not_return (cmethod)) {
+			if (!(cfg->opt & MONO_OPT_AGGRESSIVE_INLINING) && !wj_aggr_inline (cfg, method) && !wj_aggr_inline (cfg, cmethod) && !method_does_not_return (cmethod)) {
 				if (wj_inline_call_allowed (cfg, cmethod))
 					;   /* R315: the inlinee keeps this call (MONO_WASM_JIT_INLINE_CALLS) */
 				else
