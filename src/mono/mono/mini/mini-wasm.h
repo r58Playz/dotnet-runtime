@@ -1335,6 +1335,10 @@ enum {
 	WJC_ATOMIC_I8_LOWERED,     /* J1c: 64-bit atomic loads/stores, CAS, exchange and add emitted inline (MONO_WASM_JIT_ATOMIC_I8) */
 	WJC_DEVIRT_VALUETYPE,      /* R376: a devirt arm / guarded inline refused because its profile target is a VALUETYPE method */
 	WJC_AGGR_INLINE_CAPPED,    /* R376: an [AggressiveInlining] exemption refused because the compile passed MONO_WASM_JIT_AGGR_INLINE_BLOCKS */
+	WJC_VCALL2_BYADDR,         /* J1e: an OP_VCALL2_MEMBASE site lowered with a hidden-vret result (MONO_WASM_JIT_VCALL_VRET) */
+	WJC_VCALL2_SCALAR,         /* J1e: an OP_VCALL2_MEMBASE site lowered with a single-field (scalar) value-type result */
+	WJC_ICALL_AOT_SITE,        /* J1a: a direct InternalCall site emitted as an inline-AOT call of its native wrapper (MONO_WASM_JIT_ICALL_AOT) */
+	WJC_LDADDR_ARG,            /* R377: an address-taken scalar argument homed in an addr-frame slot (MONO_WASM_JIT_LDADDR_ARG) */
 	WJC_MAX
 };
 

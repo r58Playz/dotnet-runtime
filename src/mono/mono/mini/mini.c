@@ -266,21 +266,46 @@ mono_find_spvar_for_region (MonoCompile *cfg, int region)
 	return (MonoInst *)g_hash_table_lookup (cfg->spvars, GINT_TO_POINTER (region));
 }
 
+/*
+ * Depth-first numbering, iteratively: the recursive form went one native frame deeper per block on the DFS path and
+ * overflowed a web worker's stack on a large CFG ("Maximum call stack size exceeded" in df_visit, R377: a wasm-JIT
+ * compile of an IKVM.ByteCode decoder). Same order as the recursion -- a block's successors in out_bb order, each
+ * one's subtree finished before the next -- so dfn, df_parent and the array are unchanged. Every pushed block takes
+ * a fresh dfn, so the explicit stack never holds more than num_bblocks + 1 frames.
+ */
+typedef struct {
+	MonoBasicBlock *bb;
+	int next;
+} DfVisitFrame;
+
 static void
-df_visit (MonoBasicBlock *start, int *dfn, MonoBasicBlock **array)
+df_visit (MonoCompile *cfg, MonoBasicBlock *start, int *dfn, MonoBasicBlock **array)
 {
-	int i;
+	DfVisitFrame *stack = (DfVisitFrame *)mono_mempool_alloc (cfg->mempool, sizeof (DfVisitFrame) * (cfg->num_bblocks + 2));
+	int sp = 0;
 
 	array [*dfn] = start;
-	/* g_print ("visit %d at %p (BB%ld)\n", *dfn, start->cil_code, start->block_num); */
-	for (i = 0; i < start->out_count; ++i) {
-		if (start->out_bb [i]->dfn)
+	stack [sp].bb = start;
+	stack [sp].next = 0;
+	sp++;
+	while (sp > 0) {
+		DfVisitFrame *f = &stack [sp - 1];
+		MonoBasicBlock *child;
+		if (f->next >= f->bb->out_count) {
+			sp--;
+			continue;
+		}
+		child = f->bb->out_bb [f->next++];
+		if (child->dfn)
 			continue;
 		(*dfn)++;
-		start->out_bb [i]->dfn = *dfn;
-		start->out_bb [i]->df_parent = start;
-		array [*dfn] = start->out_bb [i];
-		df_visit (start->out_bb [i], dfn, array);
+		child->dfn = *dfn;
+		child->df_parent = f->bb;
+		array [*dfn] = child;
+		g_assert (sp < cfg->num_bblocks + 2);
+		stack [sp].bb = child;
+		stack [sp].next = 0;
+		sp++;
 	}
 }
 
@@ -2270,7 +2295,7 @@ static void mono_bb_ordering (MonoCompile *cfg)
 
 	cfg->max_block_num = cfg->num_bblocks;
 
-	df_visit (cfg->bb_entry, &dfn, cfg->bblocks);
+	df_visit (cfg, cfg->bb_entry, &dfn, cfg->bblocks);
 
 #if defined(__GNUC__) && __GNUC__ == 7 && defined(__x86_64__)
 	/* workaround for an AMD specific issue that only happens on GCC 7 so far,

@@ -1375,7 +1375,8 @@ typedef struct {
  * ownership transfers out (g_malloc'd). Defined unconditionally (mono_wasm_force_compile compiles into
  * the cross-compiler too).
  */
-#define MONO_WASM_JIT_MAX_DIRECT_DEPS 128
+/* The arrays' size; the cap a compile actually applies is MONO_WASM_JIT_DIRECT_DEPS (mini-wasm.c), at most this. */
+#define MONO_WASM_JIT_MAX_DIRECT_DEPS 512
 typedef struct {
 	int          desc_id;            /* immutable centralized descriptor; published atomically on InterpMethod */
 	guint32      f_sig_id;           /* stable hash of the emitted scalar wasm ABI */

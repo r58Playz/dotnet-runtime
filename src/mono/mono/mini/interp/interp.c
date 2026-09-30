@@ -9995,6 +9995,37 @@ aot_method_has_extra_arg (MonoMethod *method)
 	return TRUE;
 }
 
+/* J1a (MONO_WASM_JIT_ICALL_AOT): an InternalCall has no body of its own. llvm-only code reaches it through its
+ * AOT-compiled managed-to-native wrapper (the INTERNAL_CALL arm of mono_jit_compile_method_with_opt, mini-runtime.c),
+ * which does the handle frame, the GC transition and the exception check; hand the emitter that wrapper's body so an
+ * icall call site takes the inline-AOT route instead of the residual. The wrapper is looked up at EMIT time, on the
+ * compiling worker: mono_marshal_get_native_wrapper is a metadata operation (icall lookup, wrapper creation under the
+ * marshal lock), which is why this is a knob. No AOT'd wrapper (a NO_WRAPPER icall, one the AOT image left out) keeps
+ * the residual. Array Get/Set/Address icalls are excluded by the caller: the JIT expands those inline. */
+static gboolean
+wj_icall_aot_target (MonoMethod *method, gpointer *out_addr, gpointer *out_rgctx, gboolean *out_has_extra_arg)
+{
+	ERROR_DECL (error);
+	MonoMethod *nm;
+	gpointer code;
+	if (!mono_aot_only || !mono_llvm_only)
+		return FALSE;
+	nm = mono_marshal_get_native_wrapper (method, TRUE, TRUE);
+	if (!nm)
+		return FALSE;
+	code = mono_jit_compile_method_jit_only (nm, error);
+	if (!is_ok (error) || !code) {
+		mono_error_cleanup (error);
+		return FALSE;
+	}
+	if (mono_aot_get_method_flags ((guint8 *) code) & (MONO_AOT_METHOD_FLAG_INTERP_ENTRY_ONLY | MONO_AOT_METHOD_FLAG_GSHAREDVT_VARIABLE))
+		return FALSE;
+	*out_addr = mini_llvmonly_add_method_wrappers (nm, code, FALSE, FALSE, out_rgctx);
+	if (out_has_extra_arg)
+		*out_has_extra_arg = aot_method_has_extra_arg (nm);
+	return TRUE;
+}
+
 /* Mirror mini_llvmonly_add_method_wrappers() when recovering a static rgctx outside the usual llvm_only
  * wrapper path: these wrapper kinds borrow the wrapped method's generic context rather than their own. */
 static MonoMethod *
@@ -10029,6 +10060,12 @@ mono_wasm_jit_aot_call_target (MonoMethod *method, gpointer *out_addr, gpointer 
 {
 	MonoMethodSignature *sig = mono_method_signature_internal (method);
 	MonoMethod *rgctx_method;
+	{
+		extern int mono_wasm_jit_icall_aot;
+		if (mono_wasm_jit_icall_aot && (method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) &&
+		    !(method->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL) && !m_class_get_rank (method->klass))
+			return wj_icall_aot_target (method, out_addr, out_rgctx, out_has_extra_arg);
+	}
 	if (!mono_interp_jit_call_supported (method, sig))
 		return FALSE;
 	InterpMethod *imethod = mono_interp_get_imethod (method);

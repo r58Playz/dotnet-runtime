@@ -645,6 +645,29 @@ int mono_wasm_jit_math_intrins = 1;
  * them to i64 wasm atomics. 0 leaves them as calls: the icall, which JIT code reaches through the interpreter unless an
  * AOT'd wrapper exists (R326/R328 priced the AOT'd CAS_long / VolatileRead_long at 0.87 + 0.69 M instr per server tick). */
 int mono_wasm_jit_atomic_i8 = 0;
+/* MONO_WASM_JIT_VCALL_VRET (J1e, the no-AOT plan): lower OP_VCALL2_MEMBASE -- a virtual call whose result is a value
+ * type -- instead of bailing the whole caller with "unsupported opcode". A multi-field result goes through the trailing
+ * hidden-vret pointer (the internal JIT ABI) on the IC and f-slot routes and through scratch+232 on the residual; a
+ * single-field one comes back as its scalar and is stored through the result temp. The AOT routes are skipped for a
+ * hidden-vret site (the native ABI puts the vret FIRST), and Delegate.Invoke sites still bail. With IKVM.ByteCode off
+ * AOT it is what keeps its readers JIT'd: 0 left 106 methods interpreted and cost the Minecraft server tick +4.0%
+ * instructions (R377 batch 19, n=2 per arm); 1 (with DIRECT_DEPS 512) reads inside M2's own range (batch 25,
+ * A B C D D C B A, n=2). 0 = bail the caller, as before. */
+int mono_wasm_jit_vcall_vret = 1;
+/* MONO_WASM_JIT_DIRECT_DEPS (R377): the most distinct f-slots one body may call directly (devirt arms and direct calls,
+ * each an admission dependency); one more fails the compile with "too many direct dependencies". At 128,
+ * IKVM.ByteCode's Instruction.TryMeasureInstruction -- a switch over ~200 opcodes' TryMeasure -- never compiles once
+ * IKVM.ByteCode is off AOT, and its ~200 callees are entered interp->JIT 3.3 M times a run (R377); 512 lets it compile.
+ * At most MONO_WASM_JIT_MAX_DIRECT_DEPS (mini.h). */
+int mono_wasm_jit_direct_deps = 512;
+/* MONO_WASM_JIT_ICALL_AOT (J1a, the no-AOT plan): a direct call to an InternalCall takes the inline-AOT route to the
+ * icall's AOT-compiled managed-to-native wrapper (interp.c wj_icall_aot_target) instead of the residual, which enters
+ * the interpreter to run that wrapper's IL. */
+int mono_wasm_jit_icall_aot = 0;
+/* MONO_WASM_JIT_LDADDR_ARG (R377): an address-taken scalar ARGUMENT (ldarga, e.g. Unsafe.As<TEnum,int>(ref value) in
+ * Enum.IsDefined<TEnum>) is homed in an addr-frame slot the prologue fills, instead of failing the compile with "ldaddr
+ * of arg local". Clause-free methods and ref-free scalars only. */
+int mono_wasm_jit_ldaddr_arg = 0;
 /* MONO_WASM_JIT_TRACE_COMPILE=1 (R376, diagnostic): print "[wasm-jit] compile-begin <ns>.<class>:<method>" as each
  * wasm-JIT compile starts (mono_wasm_force_compile). */
 int mono_wasm_jit_trace_compile = 0;
@@ -814,6 +837,10 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_math_intrins, "MONO_WASM_JIT_MATH_INTRINS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_atomic_i8, "MONO_WASM_JIT_ATOMIC_I8", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_vcall_vret, "MONO_WASM_JIT_VCALL_VRET", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_direct_deps, "MONO_WASM_JIT_DIRECT_DEPS", 1, MONO_WASM_JIT_MAX_DIRECT_DEPS)
+	WJ_T2_KNOB (mono_wasm_jit_icall_aot, "MONO_WASM_JIT_ICALL_AOT", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_ldaddr_arg, "MONO_WASM_JIT_LDADDR_ARG", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_trace_compile, "MONO_WASM_JIT_TRACE_COMPILE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aggr_inline_blocks, "MONO_WASM_JIT_AGGR_INLINE_BLOCKS", 0, 10000000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
