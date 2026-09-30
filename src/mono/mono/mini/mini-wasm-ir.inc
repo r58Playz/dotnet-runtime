@@ -1387,7 +1387,7 @@ wj_result_add_direct_dep (MonoWasmJitResult *res, int fslot, guint32 sig_id, Mon
 				res->direct_deps_truncated = 1; /* same slot observed with two ABIs: reject emission */
 			return;
 		}
-	if (res->ndirect_deps < MONO_WASM_JIT_MAX_DIRECT_DEPS) {
+	if (res->ndirect_deps < MIN (mono_wasm_jit_direct_deps, MONO_WASM_JIT_MAX_DIRECT_DEPS)) {
 		res->direct_deps [res->ndirect_deps] = fslot;
 		res->direct_dep_method [res->ndirect_deps] = callee;
 		res->direct_dep_sig [res->ndirect_deps++] = sig_id;
@@ -1967,6 +1967,18 @@ wj_arg_vreg (MonoCallInst *call, int ai)
 	if (!c)
 		return -1;
 	return c->dreg >= 0 ? c->dreg : w->capvreg [ai];
+}
+
+/* The result store of a virtual call (J1e). An OP_VCALL2_MEMBASE site has no scalar dreg: its single-field value-type
+ * result, on the wasm stack, goes through the result temp's address at WjCallArgs position nargs. A hidden-vret site
+ * never gets here (its wasm ret is void). */
+static gboolean
+wj_vc_store_result (WasmBuf *body, WjCtx *c, MonoInst *ins, gboolean is_vcall2, const WasmCallInfo *ci, WasmValtype rv)
+{
+	if (is_vcall2)
+		return ci->ret.kind == WJ_ARG_VTYPE_SCALAR &&
+			wj_store_scalar_vtype_result (body, c, rv, wj_arg_vreg ((MonoCallInst *) ins, ci->nargs));
+	return wasm_st (body, c, ins->dreg);
 }
 
 /* Emit one managed-call arg (index ai over the managed args, incl. `this` at 0 when hasthis).

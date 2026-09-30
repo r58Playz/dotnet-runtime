@@ -265,6 +265,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int *refslot = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg); /* ref vreg -> shadow-stack slot, else -1 */
 	int *addrslot = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg); /* address-taken local vreg -> byte offset in the addr frame, else -1 */
 	signed char *addr_ldkind = (signed char *) mono_mempool_alloc0 (cfg->mempool, sizeof (signed char) * nvreg); /* sub-word read-back kind (0=full), see WjCtx.addr_ldkind */
+	guint8 *arg_spill = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nargs + 1);   /* [nargs]: 1 = an address-taken scalar arg the prologue copies into its addr slot */
 	WasmValtype *param_types = (WasmValtype *) mono_mempool_alloc0 (cfg->mempool, sizeof (WasmValtype) * (nargs + 2)); /* +2: trailing hidden-vret param, then the trailing threaded frame base (MONO_WASM_JIT_THREAD_SP) */
 	WasmValtype ret_vt;
 	WasmCallInfo self_ci;              /* the method's OWN callee ABI (self-sig); also the registered f_sig_id, so callers' baked dep_sig and our registration can never disagree */
@@ -684,7 +685,37 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					continue;   /* already assigned (same local addressed at multiple sites) */
 				if (addrslot [vv] == -3)
 					continue;   /* by-addr vtype ARG: the wasm param already holds the address; OP_LDADDR re-pushes it */
-				if (li [vv] >= 0) { fail = "ldaddr of arg local"; fail_op = OP_LDADDR; goto done; }   /* scalar arg: in a wasm param, no address */
+				if (li [vv] >= 0) {
+					/* A scalar ARGUMENT lives in a wasm param, which has no address. MONO_WASM_JIT_LDADDR_ARG homes
+					 * it in an 8-byte addr-frame slot instead, exactly like the scalar-vtype params above: li goes
+					 * to -1, so every body access goes through the slot (wasm_ld/wasm_st test addrslot first), and
+					 * the prologue's param reconstruction loop copies wasm param ai into it (arg_spill). Kept to
+					 * clause-free methods and ref-free scalars. */
+					int ai2;
+					for (ai2 = 0; ai2 < nargs; ++ai2)
+						if (cfg->args [ai2] && cfg->args [ai2]->dreg == vv)
+							break;
+					if (!mono_wasm_jit_ldaddr_arg || ai2 >= nargs || cfg->header->num_clauses ||
+					    self_ci.args [ai2].kind != WJ_ARG_SCALAR ||
+					    m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype) ||
+					    wasm_valtype_group (vt [vv]) < 0) {
+						fail = "ldaddr of arg local"; fail_op = OP_LDADDR; goto done;
+					}
+					li [vv] = -1;
+					naddrbytes = (naddrbytes + 7) & ~7;
+					addrslot [vv] = naddrbytes;
+					naddrbytes += 8;
+					arg_spill [ai2] = 1;
+					switch (mini_get_underlying_type (var->inst_vtype)->type) {
+					case MONO_TYPE_I1:                         addr_ldkind [vv] = 1; break;
+					case MONO_TYPE_U1: case MONO_TYPE_BOOLEAN: addr_ldkind [vv] = 2; break;
+					case MONO_TYPE_I2:                         addr_ldkind [vv] = 3; break;
+					case MONO_TYPE_U2: case MONO_TYPE_CHAR:    addr_ldkind [vv] = 4; break;
+					default: break;
+					}
+					wj_count (WJC_LDADDR_ARG);
+					continue;
+				}
 				if (m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype)) {
 					/* R321 (MONO_WASM_JIT_LDADDR_REF): home it in its ref-shadow slot, as the scalar-ref vtype below.
 					 * vt[vv] keeps its scalar valtype: plain moves of the local still happen, through the slot. */
@@ -774,6 +805,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			case OP_CALL: case OP_VOIDCALL: case OP_FCALL: case OP_LCALL: case OP_RCALL: case OP_VCALL2:
 			case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
 			case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
+				break;
+			case OP_VCALL2_MEMBASE:
+				if (!mono_wasm_jit_vcall_vret)
+					continue;
 				break;
 			default:
 				continue;
@@ -1429,7 +1464,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:   /* J1c, MONO_WASM_JIT_ATOMIC_I8 */
 							b = insf->dreg; break;
 						case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
-							b = insf->sreg1; break;
+						case OP_VCALL2_MEMBASE:
+							b = mono_wasm_jit_vcall_vret ? insf->sreg1 : -1; break;
 						default: break;
 						}
 						/* Skip bases proven to be an addr-frame pointer (OP_LDADDR result = addrbase+slot, linear
@@ -2106,7 +2142,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:   /* J1c, MONO_WASM_JIT_ATOMIC_I8 */
 						base = insr->dreg; knd = "store"; break;
 					case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
-						base = insr->sreg1; knd = "callrecv"; break;
+					case OP_VCALL2_MEMBASE:
+						if (mono_wasm_jit_vcall_vret) { base = insr->sreg1; knd = "callrecv"; }
+						break;
 					default: break;
 					}
 					if (base < 0 || base >= nvreg || vt [base] != WASM_I32 || isref [base])
@@ -2673,6 +2711,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
 				case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
 					has_vcall = TRUE; break;
+				case OP_VCALL2_MEMBASE:
+					has_vcall = mono_wasm_jit_vcall_vret != 0; break;
 				default: break;
 				}
 				if (has_vcall) break;
@@ -2772,11 +2812,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_op (&body, WASM_OP_I32_ADD);
 				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) addrbase_idx);
 			}
-			/* Reconstruct ref-free scalar-vtype parameters in their address-frame slots. Ref-bearing
-			 * scalar structs were copied to ref slots by the loop above. */
+			/* Reconstruct ref-free scalar-vtype parameters, and address-taken scalar ones (arg_spill,
+			 * MONO_WASM_JIT_LDADDR_ARG), in their address-frame slots. Ref-bearing scalar structs were copied
+			 * to ref slots by the loop above. */
 			for (i = 0; i < nargs; ++i) {
 				int av = cfg->args [i]->dreg;
-				if (self_ci.args [i].kind == WJ_ARG_VTYPE_SCALAR && av >= 0 && av < nvreg && addrslot [av] >= 0) {
+				if ((self_ci.args [i].kind == WJ_ARG_VTYPE_SCALAR || arg_spill [i]) && av >= 0 && av < nvreg && addrslot [av] >= 0) {
 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) i);
 					if (!wasm_addr_st (&body, &lc, av)) { fail = "scalar-vtype arg store"; goto done; }
 				}
@@ -2970,6 +3011,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE:
 				case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
 					want [4] = TRUE;   /* NullReferenceException: explicit checks + vcall receiver check */
+					break;
+				case OP_VCALL2_MEMBASE:
+					if (mono_wasm_jit_vcall_vret)
+						want [4] = TRUE;
 					break;
 				case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:
 					want [0] = TRUE;   /* R323: OverflowException */
@@ -4763,6 +4808,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 									if (m_type_is_byref (csig->params [k])) aot_ok = FALSE;
 						}
 						if (aot_ok && mono_wasm_jit_aot_call_target (call_method, &aot_addr, &aot_rgctx, &aot_has_extra)) {
+							if (call_method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL)
+								wj_count (WJC_ICALL_AOT_SITE);   /* J1a: only reachable with MONO_WASM_JIT_ICALL_AOT */
 							/* FROM cci.ftype, NOT ct. `ct` is the JIT-callee functype and carries the
 							 * trailing threaded frame base under MONO_WASM_JIT_THREAD_SP; an AOT body has
 							 * no such parameter and this site never pushes one, so copying `ct` here
@@ -5097,7 +5144,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				break;
 			}
 			case OP_CALL_REG: case OP_VOIDCALL_REG: case OP_FCALL_REG: case OP_LCALL_REG: case OP_RCALL_REG:
-				case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE: {
+				case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
+				case OP_VCALL2_MEMBASE: {
 				/* Indirect/virtual call: call_indirect through the target in sreg1 (a wasm table
 				 * index = ftndesc.addr); rgctx (ftndesc.arg) passed as a trailing i32 param. The
 				 * slot holds the receiver's entry, so the dispatch is JITted even if the callee
@@ -5106,7 +5154,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				MonoMethodSignature *csig = call->signature;
 				WasmFuncType ct;
 				int type_idx = -1, k, ai, nmeth;
-				gboolean is_membase = ins->opcode == OP_CALL_MEMBASE || ins->opcode == OP_VOIDCALL_MEMBASE || ins->opcode == OP_FCALL_MEMBASE || ins->opcode == OP_LCALL_MEMBASE || ins->opcode == OP_RCALL_MEMBASE;
+				gboolean is_membase = ins->opcode == OP_CALL_MEMBASE || ins->opcode == OP_VOIDCALL_MEMBASE || ins->opcode == OP_FCALL_MEMBASE || ins->opcode == OP_LCALL_MEMBASE || ins->opcode == OP_RCALL_MEMBASE ||
+					ins->opcode == OP_VCALL2_MEMBASE;
+				/* J1e: a value-type result. Only the virtual branch below lowers it; a raw indirect one still bails. */
+				gboolean is_vcall2 = ins->opcode == OP_VCALL2_MEMBASE;
+				if (is_vcall2 && !mono_wasm_jit_vcall_vret) { fail = "unsupported opcode"; fail_op = ins->opcode; goto done; }
 				if (!csig) { fail = "callreg null sig"; goto done; }
 				/* Do not reject an rgctx-bearing virtual call here. The virtual path resolves the
 				 * concrete override first: its JIT f-slot uses our canonical concrete ABI, its AOT
@@ -5148,6 +5200,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							extern int mono_wasm_jit_call_delegate (MonoMethod *m, guint8 *buf);
 						WasmFuncType vts, vtrf, vtd, ftd, dftd; WasmCallInfo vci; int vtsi = -1, vtrfi = -1, vtdi = -1, ftdi = -1, dftdi = -1, vk, ai, n2, this_vr; int aic_ati = -1, aic_ati_ne = -1;
 						WasmValtype pp [WASM_FUNCTYPE_MAX_PARAMS], rv; int npp = 0; gpointer vic;
+						/* J1e: vc_vret = an OP_VCALL2_MEMBASE site with a hidden-vret result; n2c = the JIT-`f` argument
+						 * count, n2 plus that trailing vret pointer. */
+						gboolean vc_vret = FALSE; int n2c;
 						MonoVTable *pred_vt = NULL;
 						MonoMethod *pred_target = NULL;
 						int pred_fslot = 0;
@@ -5210,9 +5265,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								fail_sig_site = "vcall"; fail_sig_callee = call->method; fail_sig = csig; fail_sig_arg = vci.fail_arg;
 								goto done;
 							}
-							/* hidden vret is now valid under MONO_WASM_JIT_VRET, but the vcall-IC lowering for it
-							 * is deferred (Stage 2.4) — explicit bail since valid no longer implies a scalar ret */
-							if (vci.vret_byaddr) {
+							/* A hidden-vret result is lowered only for OP_VCALL2_MEMBASE (J1e); valid no longer implies a
+							 * scalar ret, so anything else with one bails. */
+							if (vci.vret_byaddr && !is_vcall2) {
 								fail = "vcall ret type";
 								fail_sig_site = "vcall"; fail_sig_callee = call->method; fail_sig = csig; fail_sig_arg = -1;
 								goto done;
@@ -5220,10 +5275,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							for (ai = 0; ai < vci.nargs; ++ai)
 								if (vci.args [ai].kind != WJ_ARG_SCALAR && vci.args [ai].kind != WJ_ARG_VTYPE_SCALAR &&
 								    vci.args [ai].kind != WJ_ARG_VTYPE_BYADDR) { fail = "vcall arg type"; goto done; }
+							if (is_vcall2 && !vci.vret_byaddr && vci.ret.kind != WJ_ARG_VTYPE_SCALAR) { fail = "vcall2 ret kind"; goto done; }
 							for (ai = 0; ai < (int) vci.ftype.nparams; ++ai) pp [ai] = vci.ftype.params [ai];
 							npp = (int) vci.ftype.nparams;
 							rv = vci.ftype.ret;
 						}
+						vc_vret = is_vcall2 && vci.vret_byaddr;
+						/* The delegate routes (recipes, open/closed shapes, dftd) have no value-type result lowering. */
+						if (is_vcall2 && is_delegate_invoke) { fail = "vcall2 delegate"; goto done; }
 						/* functypes: vts ()->i32 (scratch); vtrf (i32,i32,i32,i32)->i32 (resolve_fslot: this,base,scratch,ic);
 						 * vtd (i32,i32)->i32 (call_interp fallback); ftd this+params->ret (the override's scalar `f`). */
 						memset (&vts, 0, sizeof (vts)); vts.nparams = 0; vts.ret = WASM_I32;
@@ -5419,6 +5478,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						}
 						uses_calls = TRUE;
 						n2 = csig->param_count + 1; /* this + params */
+						n2c = n2 + (vc_vret ? 1 : 0);
 						/* per-call-site AOT-vcall IC cell (VCALL_AOT_IC): 20B, see mono_wasm_jit_alloc_aot_ic */
 						gpointer aic = NULL;
 						{
@@ -5431,7 +5491,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						   * call resolves to an AOT-backed override, dispatch it through the AOT body's own
 						   * native ABI instead of the interp residual. Its off-arm sent every such call
 						   * through ~1,360 instructions of marshalling. Settled. */
-						  if (!slim_pred && !is_delegate_invoke) {
+						  if (!slim_pred && !is_delegate_invoke && !vc_vret) {
 #ifdef HOST_BROWSER
 							extern gpointer mono_wasm_jit_alloc_aot_ic (void); aic = mono_wasm_jit_alloc_aot_ic ();
 #else
@@ -5788,7 +5848,7 @@ vcall_nullchk_done:
 									/* The predicted arm was the ONE dispatch route with no execution counter,
 									 * so every "share of vcalls" figure so far has silently omitted it. */
 									wj_emit_fast_count (&body, WJC_FAST_DEVIRT);
-									for (ai = 0; ai < n2; ++ai)
+									for (ai = 0; ai < n2c; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "devirt arg ld"; goto done; }
 									/* Same single hole as an ordinary direct call. The prediction is already
 									 * guarded (this->vtable == pred_vt), so if the assembler can co-locate
@@ -5797,7 +5857,7 @@ vcall_nullchk_done:
 									 * (method-to-ir.c:8199 admits a candidate only when the site or the target is
 									 * non-virtual, or the target is final). */
 									wj_emit_method_call (&body, pred_target, pred_fslot, (guint32) ftdi);
-									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "devirt dreg"; goto done; }
+									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "devirt dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred_miss */
 							}
@@ -5814,10 +5874,10 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_I32_NE);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
 									wj_emit_fast_count (&body, WJC_FAST_DEVIRT2);
-									for (ai = 0; ai < n2; ++ai)
+									for (ai = 0; ai < n2c; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "devirt2 arg ld"; goto done; }
 									wj_emit_method_call (&body, pred2_target, pred2_fslot, (guint32) ftdi);
-									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "devirt2 dreg"; goto done; }
+									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "devirt2 dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred2_miss */
 							}
@@ -5862,11 +5922,11 @@ vcall_nullchk_done:
 											wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 12);
 										}
 									}
-									for (ai = 0; ai < n2; ++ai)
+									for (ai = 0; ai < n2c; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "slim pic arg ld"; goto done; }
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 									wj_emit_dynamic_call (&body, (guint32) ftdi);
-									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "slim pic dreg"; goto done; }
+									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "slim pic dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $slim_pic_miss */
 								goto vcall_cold_miss_emit;
@@ -6022,7 +6082,7 @@ vcall_nullchk_done:
 										for (ai = 1; ai < n2; ++ai)
 											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "ddevirt closed arg ld"; goto done; }
 										wj_emit_method_call (&body, ddevirt_target, ddevirt_fslot, (guint32) ftdi);
-										if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "ddevirt dreg"; goto done; }
+										if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "ddevirt dreg"; goto done; }
 										wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 2); /* -> $after */
 										wasm_op (&body, WASM_OP_END); /* $ddevirt_miss */
 									}
@@ -6045,7 +6105,7 @@ vcall_nullchk_done:
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 										wj_emit_dynamic_call (&body, (guint32) dftdi);
 									wasm_op (&body, WASM_OP_END);
-									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "delegate obj dreg"; goto done; }
+									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "delegate obj dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> $after */
 									wasm_op (&body, WASM_OP_END); /* $delegate_obj_fail */
 								}
@@ -6199,7 +6259,7 @@ vcall_nullchk_done:
 										for (ai = 1; ai < n2; ++ai)
 											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "ddevirt ic arg ld"; goto done; }
 										wj_emit_method_call (&body, ddevirt_target, ddevirt_fslot, (guint32) ftdi);
-										if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "ddevirt ic dreg"; goto done; }
+										if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "ddevirt ic dreg"; goto done; }
 										/* One deeper than the way tail's own exit: $ddevirt_miss sits inside
 										 * $delegate_way_fail, which sits inside $delegate_ic_done when the
 										 * worker-local PIC is on. */
@@ -6225,7 +6285,7 @@ vcall_nullchk_done:
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 										wj_emit_dynamic_call (&body, (guint32) dftdi);
 									wasm_op (&body, WASM_OP_END);
-									if (rv != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "delegate ic dreg"; goto done; }
+									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "delegate ic dreg"; goto done; }
 									/* One level deeper in the local-PIC arm: the ways sit inside the shared
 									 * $delegate_ic_done block that carries the hoisted multicast/bounds tests. */
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, dpic_local ? 2 : 1); /* -> outer $after */
@@ -6395,11 +6455,11 @@ vcall_nullchk_done:
 							case 6:  wj_emit_fast_count (&body, WJC_FAST_VIC_NO_FSLOT); break;
 							default: wj_emit_fast_count (&body, WJC_FAST_VIC_OTHER); break;
 							}
-							for (ai = 0; ai < n2; ++ai)
+							for (ai = 0; ai < n2c; ++ai)
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "ic fast arg ld"; goto done; }
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 							wj_emit_dynamic_call (&body, (guint32) ftdi);
-							if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "ic fast dreg"; goto done; } }
+							if (rv != WASM_VOID) { if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "ic fast dreg"; goto done; } }
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> $after (skip the C-helper slow path) */
 							wasm_op (&body, WASM_OP_END);                            /* end $slow */
 							/* falls through to the AOT-IC / resolve_fslot slow path, at its ORIGINAL nesting */
@@ -6462,7 +6522,7 @@ vcall_nullchk_done:
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);
 									wj_emit_dynamic_call (&body, (guint32) aic_ati);
 								wasm_op (&body, WASM_OP_END);   /* end kind if/else */
-								if (rv != WASM_VOID) { if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret); if (!wasm_st (&body, &lc, ins->dreg)) { fail = "aot ic dreg"; goto done; } }
+								if (rv != WASM_VOID) { if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret); if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "aot ic dreg"; goto done; } }
 								wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* hit -> $after */
 									wasm_op (&body, WASM_OP_END);   /* selected entry invalid/absent -> resolve */
 								}
@@ -6522,12 +6582,12 @@ vcall_cold_miss_emit:
 						wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 							/* FAST PATH: push this + args fresh from their vregs (GC-scanned shadow stack; resolve_fslot did
 							 * not spill, so no GC-invisible window), then the f-slot table index, call_indirect(ftd). */
-							for (ai = 0; ai < n2; ++ai)
+							for (ai = 0; ai < n2c; ++ai)
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vcall fast arg ld"; goto done; }
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 208);            /* f-slot = table index */
 							wj_emit_dynamic_call (&body, (guint32) ftdi);
-							if (rv != WASM_VOID) { if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall fast dreg"; goto done; } }
+							if (rv != WASM_VOID) { if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vcall fast dreg"; goto done; } }
 						wasm_op (&body, WASM_OP_ELSE);
 							/* Fast AOT-vcall (MONO_WASM_JIT_VCALL_AOT, gated, default off): if the resolved override
 							 * (target@200, stashed by resolve_fslot) is AOT-backed, call its AOT body DIRECTLY with the
@@ -6535,7 +6595,9 @@ vcall_cold_miss_emit:
 							 * frame. Wrapped in a $no_aot block: if the helper says "not AOT" we br to $no_aot and fall
 							 * into the (shared, unchanged) residual below; if AOT we call + br past the residual. */
 							{
-								{
+								/* not for a hidden-vret site: at/at_ne below put the vret nowhere, and the native ABI wants
+								 * it FIRST. A vret override that is AOT-backed takes the residual. */
+								if (!vc_vret) {
 									extern int mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj, gpointer aic);
 									WasmFuncType at, at_ne, aott; int ati = -1, ati_ne = -1, aotti = -1;
 									if (n2 + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "vcall aot nparams"; goto done; }
@@ -6594,7 +6656,7 @@ vcall_cold_miss_emit:
 									wasm_op (&body, WASM_OP_END);   /* end variant if/else */
 									if (rv != WASM_VOID) {
 										if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret);   /* raw AOT body: dirty upper bits */
-										if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall aot dreg"; goto done; }
+										if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vcall aot dreg"; goto done; }
 									}
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* AOT done -> exit fslot-IF, skip residual */
 									wasm_op (&body, WASM_OP_END);   /* end $no_aot */
@@ -6613,6 +6675,13 @@ vcall_cold_miss_emit:
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vcall arg ld"; goto done; }
 								wasm_op (&body, sop); wasm_memarg (&body, al2, (guint32) (ai * 8));
+							}
+							/* hidden vret: the caller's return-buffer address at scratch+232, as at the direct residual.
+							 * After resolve_fslot, which can run managed code that reuses this scratch. */
+							if (vc_vret) {
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+								if (!wasm_ld (&body, &lc, wj_arg_vreg (call, vci.nargs))) { fail = "vcall vret ld"; goto done; }
+								wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 232 /* WJ_SCRATCH_VRET_OFF */);
 							}
 							/* INLINE DELEGATE RECIPE HIT. resolve_fslot/prepare_delegate_call published a
 							 * thread-admitted target f-slot at +244 only for scalar-compatible recipes.
@@ -6781,12 +6850,14 @@ vcall_cold_miss_emit:
 									default: break;
 									}
 								}
-								if (!wasm_st (&body, &lc, ins->dreg)) { fail = "vcall dreg"; goto done; }
+								if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vcall dreg"; goto done; }
 							}
 							wasm_op (&body, WASM_OP_END);   /* end the fslot if/else (slow path) */
 							}
 							if (1)
 							wasm_op (&body, WASM_OP_END);   /* end $after (only emitted when the inline-IC fast path is on) */
+						if (is_vcall2)
+							wj_count (vc_vret ? WJC_VCALL2_BYADDR : WJC_VCALL2_SCALAR);
 						break;
 					}
 				/* Raw indirect call (callreg / non-virtual membase): the target in sreg1 is a runtime
@@ -6797,6 +6868,7 @@ vcall_cold_miss_emit:
 				{
 					if (cfg->wasm_jit_forced) { fail = "raw indirect call under auto-JIT"; goto done; }
 				}
+				if (is_vcall2) { fail = "vcall2 raw indirect"; goto done; }
 				/* rgctx (ftndesc.arg) is folded into csig as a trailing param + call->args, so it's
 				 * handled like any other arg — no separate rgctx_arg_reg (that field is LLVM-only). */
 				memset (&ct, 0, sizeof (ct));
