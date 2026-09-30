@@ -112,7 +112,7 @@ static MonoAssembly* _mono_wasm_assembly_load (char *assembly_name)
 	return res;
 }
 
-void SystemInteropJS_AssemblyGetEntryPoint (char *assembly_name, int auto_insert_breakpoint, MonoMethod **method_out)
+static void SystemInteropJS_AssemblyGetEntryPoint_unsafe (char *assembly_name, int auto_insert_breakpoint, MonoMethod **method_out)
 {
 	assert (assembly_name);
 	*method_out = NULL;
@@ -178,7 +178,18 @@ end:
 	*method_out = method;
 }
 
-void SystemInteropJS_BindAssemblyExports (char *assembly_name)
+/* Registered with mono_add_internal_call, i.e. FOREIGN: its wrapper calls it GC-SAFE, and the embedding APIs
+ * below (mono_get_method, mono_class_from_name, ...) take runtime locks that must be taken GC-unsafe --
+ * mono_loader_lock's contended path enters GC-safe itself and aborts "Cannot transition thread ... from
+ * STATE_BLOCKING with DO_BLOCKING" (R376: the no-AOT build, whose interpreted startup contends that lock). */
+void SystemInteropJS_AssemblyGetEntryPoint (char *assembly_name, int auto_insert_breakpoint, MonoMethod **method_out)
+{
+	MONO_ENTER_GC_UNSAFE;
+	SystemInteropJS_AssemblyGetEntryPoint_unsafe (assembly_name, auto_insert_breakpoint, method_out);
+	MONO_EXIT_GC_UNSAFE;
+}
+
+static void SystemInteropJS_BindAssemblyExports_unsafe (char *assembly_name)
 {
 	MonoError error;
 	MonoAssembly* assembly;
@@ -215,7 +226,18 @@ void SystemInteropJS_BindAssemblyExports (char *assembly_name)
 	}
 }
 
-void SystemInteropJS_GetAssemblyExport (char *assembly_name, char *namespace, char *classname, char *methodname, int signature_hash, MonoMethod **method_out)
+/* Registered with mono_add_internal_call, i.e. FOREIGN: its wrapper calls it GC-SAFE, and the embedding APIs
+ * below (mono_get_method, mono_class_from_name, ...) take runtime locks that must be taken GC-unsafe --
+ * mono_loader_lock's contended path enters GC-safe itself and aborts "Cannot transition thread ... from
+ * STATE_BLOCKING with DO_BLOCKING" (R376: the no-AOT build, whose interpreted startup contends that lock). */
+void SystemInteropJS_BindAssemblyExports (char *assembly_name)
+{
+	MONO_ENTER_GC_UNSAFE;
+	SystemInteropJS_BindAssemblyExports_unsafe (assembly_name);
+	MONO_EXIT_GC_UNSAFE;
+}
+
+static void SystemInteropJS_GetAssemblyExport_unsafe (char *assembly_name, char *namespace, char *classname, char *methodname, int signature_hash, MonoMethod **method_out)
 {
 	MonoError error;
 	MonoAssembly* assembly;
@@ -245,6 +267,17 @@ void SystemInteropJS_GetAssemblyExport (char *assembly_name, char *namespace, ch
 	free (namespace);
 	free (classname);
 	free (methodname);
+}
+
+/* Registered with mono_add_internal_call, i.e. FOREIGN: its wrapper calls it GC-SAFE, and the embedding APIs
+ * below (mono_get_method, mono_class_from_name, ...) take runtime locks that must be taken GC-unsafe --
+ * mono_loader_lock's contended path enters GC-safe itself and aborts "Cannot transition thread ... from
+ * STATE_BLOCKING with DO_BLOCKING" (R376: the no-AOT build, whose interpreted startup contends that lock). */
+void SystemInteropJS_GetAssemblyExport (char *assembly_name, char *namespace, char *classname, char *methodname, int signature_hash, MonoMethod **method_out)
+{
+	MONO_ENTER_GC_UNSAFE;
+	SystemInteropJS_GetAssemblyExport_unsafe (assembly_name, namespace, classname, methodname, signature_hash, method_out);
+	MONO_EXIT_GC_UNSAFE;
 }
 
 #ifndef DISABLE_THREADS

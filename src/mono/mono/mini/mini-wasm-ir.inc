@@ -95,6 +95,7 @@ wasm_valtype_of_opcode (int opcode)
 		return WASM_I32;
 	case OP_ICONV_TO_I8: case OP_ICONV_TO_U8:
 	case OP_LOADI8_MEMBASE:
+	case OP_ATOMIC_LOAD_I8: case OP_ATOMIC_LOAD_U8: case OP_ATOMIC_ADD_I8: case OP_ATOMIC_EXCHANGE_I8: case OP_ATOMIC_CAS_I8:   /* J1c */
 		return WASM_I64;
 	case OP_LOADR8_MEMBASE: case OP_ATOMIC_LOAD_R8:
 		return WASM_F64;
@@ -467,6 +468,8 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
 	case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
 	case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:
+	case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:   /* J1c */
+	case OP_ATOMIC_LOAD_I8: case OP_ATOMIC_LOAD_U8: case OP_ATOMIC_ADD_I8: case OP_ATOMIC_EXCHANGE_I8: case OP_ATOMIC_CAS_I8:
 	case OP_LDADDR:
 	case OP_SETRET:
 	/* the emitter's no-op set */
@@ -654,6 +657,7 @@ wj_ins_is_atomic_rmw_or_load (MonoInst *ins)
 	case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
 	case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
 	case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:
+	case OP_ATOMIC_LOAD_I8: case OP_ATOMIC_LOAD_U8: case OP_ATOMIC_ADD_I8: case OP_ATOMIC_EXCHANGE_I8: case OP_ATOMIC_CAS_I8:   /* J1c */
 		return TRUE;
 	default:
 		return FALSE;
@@ -2423,6 +2427,11 @@ wj_arm_abi_ok (MonoMethod *target, const WasmFuncType *want)
 
 	if (!target || !want)
 		return FALSE;
+	/* A valuetype override takes an UNBOXED `this`; the arm passes the site's boxed receiver (R376). */
+	if (m_class_is_valuetype (target->klass)) {
+		wj_count (WJC_DEVIRT_VALUETYPE);
+		return FALSE;
+	}
 	sig = mono_method_signature_internal (target);
 	if (!sig)
 		return FALSE;

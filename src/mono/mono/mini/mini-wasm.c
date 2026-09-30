@@ -114,8 +114,10 @@ int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 
  * publication or per-thread admission fell back to the AOT entry -- which is what made it safer than a
  * whitelist or an aotprofile trim, where an emitter-refused method drops to the INTERPRETER instead).
  *
- * Deleted because it STALLS AT BOOT, i.e. it has never been usable, and a knob that cannot be turned on
- * is not an experiment. Recording what it was aimed at, because that pool is real and this is now its
+ * Deleted because it STALLED AT BOOT, i.e. it has never been usable, and a knob that cannot be turned on
+ * is not an experiment. The stall was a JIT-created delegate trapping in an AOT delegate-invoke wrapper
+ * (perf-overaot/game.log, the same stack R376 hit), fixed in handle_delegate_ctor (R376) -- so the boot stall is
+ * no longer a reason. Recording what it was aimed at, because that pool is real and this is now its
  * only trace: the "AOT image" bucket is not one thing, and 12.63%% of the in-game window is AOT-compiled
  * MANAGED code (IKVM_*, System_*, corlib_*) -- the same managed program, AOT'd because the emitter
  * bailed or AOT measured better, so addressable in principle. R173 also retracted "AOT is better
@@ -638,6 +640,14 @@ int mono_wasm_jit_branch_hints = 2;
  * interpreter: p71 measured that route at 3.9-4.0% of the Minecraft server tick with the knob off and 1.9-2.2% with
  * it on (b t t b), the Math pinvoke path at 0. */
 int mono_wasm_jit_math_intrins = 1;
+/* MONO_WASM_JIT_ATOMIC_I8 (J1c, the no-AOT plan): intrinsics.c turns 64-bit Interlocked.Read/Increment/Decrement/Add/
+ * Exchange/CompareExchange and Volatile.Read/Write into OP_ATOMIC_*_I8 for a wasm-JIT compile, and the emitter lowers
+ * them to i64 wasm atomics. 0 leaves them as calls: the icall, which JIT code reaches through the interpreter unless an
+ * AOT'd wrapper exists (R326/R328 priced the AOT'd CAS_long / VolatileRead_long at 0.87 + 0.69 M instr per server tick). */
+int mono_wasm_jit_atomic_i8 = 0;
+/* MONO_WASM_JIT_TRACE_COMPILE=1 (R376, diagnostic): print "[wasm-jit] compile-begin <ns>.<class>:<method>" as each
+ * wasm-JIT compile starts (mono_wasm_force_compile). */
+int mono_wasm_jit_trace_compile = 0;
 /* MONO_WASM_JIT_T2_MAX_BODY (R349): largest tier-2 module, in bytes, the emitter will hand to V8; a bigger one fails
  * permanently and the method keeps its tier-1 body (or takes the tier-1-policy downgrade). 0 = no cap. */
 int mono_wasm_jit_t2_max_body = 98304;
@@ -798,6 +808,8 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_colocate, "MONO_WASM_JIT_T2_COLOCATE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_math_intrins, "MONO_WASM_JIT_MATH_INTRINS", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_atomic_i8, "MONO_WASM_JIT_ATOMIC_I8", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_trace_compile, "MONO_WASM_JIT_TRACE_COMPILE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aot_byref, "MONO_WASM_JIT_AOT_BYREF", 0, 1)

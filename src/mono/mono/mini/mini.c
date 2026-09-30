@@ -4547,6 +4547,15 @@ mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 		}
 	}
 	reent = TRUE;
+	{
+		extern int mono_wasm_jit_trace_compile;
+		/* R376: names the method a compile is working on BEFORE it runs, so a compile that never returns (W0's
+		 * mono_optimize_branches spin) can be attributed. Field reads only -- no signature walk in a compile section. */
+		if (G_UNLIKELY (mono_wasm_jit_trace_compile)) {
+			printf ("[wasm-jit] compile-begin %s.%s:%s\n", m_class_get_name_space (method->klass), m_class_get_name (method->klass), method->name);
+			fflush (stdout);
+		}
+	}
 	cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
 	/* R315 (plan Phase 3.3): a compile that inlined bodies keeping their calls and then bailed PERMANENTLY may have
 	 * failed only because of what it inlined (a new rgctx site, too many callee types or direct deps, an

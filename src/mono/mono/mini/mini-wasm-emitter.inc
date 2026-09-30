@@ -935,6 +935,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 					case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
 					case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
+					case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:   /* J1c, MONO_WASM_JIT_ATOMIC_I8 */
 						dreg_is_base = TRUE; break;
 					default: break;
 					}
@@ -1417,6 +1418,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
 						case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
 						case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:   /* R360 */
+						case OP_ATOMIC_LOAD_I8: case OP_ATOMIC_LOAD_U8: case OP_ATOMIC_ADD_I8: case OP_ATOMIC_EXCHANGE_I8: case OP_ATOMIC_CAS_I8:   /* J1c */
 							b = insf->sreg1; break;
 						case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 						case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
@@ -1424,6 +1426,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 						case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
 						case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
+						case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:   /* J1c, MONO_WASM_JIT_ATOMIC_I8 */
 							b = insf->dreg; break;
 						case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
 							b = insf->sreg1; break;
@@ -1678,6 +1681,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 						case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
 						case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
+						case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:   /* J1c, MONO_WASM_JIT_ATOMIC_I8 */
 							dreg_is_base = TRUE; break;
 						default: break;
 						}
@@ -2091,6 +2095,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
 					case OP_ATOMIC_ADD_I4: case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4:
 					case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4:   /* R360 */
+					case OP_ATOMIC_LOAD_I8: case OP_ATOMIC_LOAD_U8: case OP_ATOMIC_ADD_I8: case OP_ATOMIC_EXCHANGE_I8: case OP_ATOMIC_CAS_I8:   /* J1c */
 						base = insr->sreg1; knd = "load"; break;
 					case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
 					case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
@@ -2098,6 +2103,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:   /* R323b */
 					case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
 					case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:   /* R360 */
+					case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:   /* J1c, MONO_WASM_JIT_ATOMIC_I8 */
 						base = insr->dreg; knd = "store"; break;
 					case OP_CALL_MEMBASE: case OP_VCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_VOIDCALL_MEMBASE:
 						base = insr->sreg1; knd = "callrecv"; break;
@@ -4088,8 +4094,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			 * where x86 would not; that is not a new failure mode, because the interpreter's and the AOT'd
 			 * Interlocked/Volatile are the same wasm atomics (C11 atomics under emscripten) on the same address.
 			 * The memarg alignment must be EXACTLY the natural one for an atomic, or the module fails validation.
-			 * 64-bit variants are not here: SIZEOF_REGISTER == 4 keeps intrinsics.c from producing them for this
-			 * backend. A reference-sized CAS/exchange/load result is a reference (alloc_ireg_ref); wasm_st
+			 * The 64-bit variants are produced only under MONO_WASM_JIT_ATOMIC_I8 (J1c, below). A reference-sized CAS/exchange/load result is a reference (alloc_ireg_ref); wasm_st
 			 * routes it like any ref def, and its write barrier is separate IR. */
 			case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2:
 				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
@@ -4100,6 +4105,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
 				STOREM_PFX (WASM_OP_ATOMIC_PREFIX, 0x17 /* i32.atomic.store */, 2);
 				wj_count (WJC_ATOMIC_LOWERED);
+				break;
+			/* J1c (MONO_WASM_JIT_ATOMIC_I8, intrinsics.c produces these only under that knob): the 64-bit forms. wasm32 has
+			 * native i64 atomics and this backend keeps longs whole (COMPILE_METHODIR), so a long vreg is one i64 local.
+			 * Alignment is the same argument as R360's: the icall these replace does the same native atomic on the same
+			 * address (C11 atomics, ATOMIC_LLONG_LOCK_FREE), so a misaligned long traps there too. */
+			case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:
+				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
+				STOREM_PFX (WASM_OP_ATOMIC_PREFIX, 0x18 /* i64.atomic.store */, 3);
+				wj_count (WJC_ATOMIC_I8_LOWERED);
 				break;
 			case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8: {
 				/* no float atomics in wasm: store the bits */
@@ -4116,7 +4130,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				break;
 			}
 			case OP_ATOMIC_LOAD_I1: case OP_ATOMIC_LOAD_U1: case OP_ATOMIC_LOAD_I2: case OP_ATOMIC_LOAD_U2:
-			case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8: {
+			case OP_ATOMIC_LOAD_I4: case OP_ATOMIC_LOAD_U4: case OP_ATOMIC_LOAD_R4: case OP_ATOMIC_LOAD_R8:
+			case OP_ATOMIC_LOAD_I8: case OP_ATOMIC_LOAD_U8: {
 				/* Never an LCSE hit or entry: a volatile read must re-read, and wj_ins_clobbers_mem clears the table
 				 * here (an acquire must not be satisfied from a load cached before it). */
 				int sub, al, post = -1;
@@ -4127,6 +4142,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				case OP_ATOMIC_LOAD_U2: sub = 0x13; al = 1; break;
 				case OP_ATOMIC_LOAD_R4: sub = 0x10; al = 2; post = WASM_OP_F32_REINTERPRET_I32; break;
 				case OP_ATOMIC_LOAD_R8: sub = 0x11; al = 3; post = WASM_OP_F64_REINTERPRET_I64; break;   /* i64.atomic.load */
+				case OP_ATOMIC_LOAD_I8: case OP_ATOMIC_LOAD_U8: sub = 0x11; al = 3; break;   /* J1c */
 				default:                sub = 0x10; al = 2; break;   /* i32.atomic.load */
 				}
 				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
@@ -4136,11 +4152,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
 				if (post >= 0) wasm_op (&body, post);
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; }
-				wj_count (WJC_ATOMIC_LOWERED);
+				wj_count ((ins->opcode == OP_ATOMIC_LOAD_I8 || ins->opcode == OP_ATOMIC_LOAD_U8) ? WJC_ATOMIC_I8_LOWERED : WJC_ATOMIC_LOWERED);
 				break;
 			}
-			case OP_ATOMIC_ADD_I4:
-			case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4: {
+			case OP_ATOMIC_ADD_I4: case OP_ATOMIC_ADD_I8:
+			case OP_ATOMIC_EXCHANGE_U1: case OP_ATOMIC_EXCHANGE_U2: case OP_ATOMIC_EXCHANGE_I4: case OP_ATOMIC_EXCHANGE_I8: {
 				/* rmw returns the OLD value; mono's OP_ATOMIC_ADD returns the NEW one (mini-x86.c: lock xadd, then
 				 * add), so ADD re-adds sreg2. The sub-word exchanges zero-extend, which is what intrinsics.c's
 				 * trailing ICONV_TO_{I,U}{1,2} expects. */
@@ -4149,6 +4165,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				case OP_ATOMIC_ADD_I4:      sub = 0x1e; al = 2; break;   /* i32.atomic.rmw.add */
 				case OP_ATOMIC_EXCHANGE_U1: sub = 0x43; al = 0; break;   /* i32.atomic.rmw8.xchg_u */
 				case OP_ATOMIC_EXCHANGE_U2: sub = 0x44; al = 1; break;   /* i32.atomic.rmw16.xchg_u */
+				case OP_ATOMIC_ADD_I8:      sub = 0x1f; al = 3; break;   /* i64.atomic.rmw.add (J1c) */
+				case OP_ATOMIC_EXCHANGE_I8: sub = 0x42; al = 3; break;   /* i64.atomic.rmw.xchg (J1c) */
 				default:                    sub = 0x41; al = 2; break;   /* i32.atomic.rmw.xchg */
 				}
 				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
@@ -4157,20 +4175,20 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "rmw val"; goto done; }
 				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
 				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
-				if (ins->opcode == OP_ATOMIC_ADD_I4) {
+				if (ins->opcode == OP_ATOMIC_ADD_I4 || ins->opcode == OP_ATOMIC_ADD_I8) {
 					if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "rmw val"; goto done; }
-					wasm_op (&body, WASM_OP_I32_ADD);
+					wasm_op (&body, ins->opcode == OP_ATOMIC_ADD_I8 ? WASM_OP_I64_ADD : WASM_OP_I32_ADD);
 				}
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "rmw dreg"; goto done; }
-				wj_count (WJC_ATOMIC_LOWERED);
+				wj_count (al == 3 ? WJC_ATOMIC_I8_LOWERED : WJC_ATOMIC_LOWERED);
 				break;
 			}
-			case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4: {
+			case OP_ATOMIC_CAS_U1: case OP_ATOMIC_CAS_U2: case OP_ATOMIC_CAS_I4: case OP_ATOMIC_CAS_I8: {
 				/* dreg = cmpxchg (*(sreg1 + off), expected = sreg3, replacement = sreg2) -> the old value. The
 				 * sub-word forms wrap the expected value to their width before comparing and zero-extend the
 				 * result, matching intrinsics.c's zero-extended comparand. */
-				int sub = ins->opcode == OP_ATOMIC_CAS_U1 ? 0x4a : ins->opcode == OP_ATOMIC_CAS_U2 ? 0x4b : 0x48;
-				int al = ins->opcode == OP_ATOMIC_CAS_U1 ? 0 : ins->opcode == OP_ATOMIC_CAS_U2 ? 1 : 2;
+				int sub = ins->opcode == OP_ATOMIC_CAS_U1 ? 0x4a : ins->opcode == OP_ATOMIC_CAS_U2 ? 0x4b : ins->opcode == OP_ATOMIC_CAS_I8 ? 0x49 /* i64.atomic.rmw.cmpxchg (J1c) */ : 0x48;
+				int al = ins->opcode == OP_ATOMIC_CAS_U1 ? 0 : ins->opcode == OP_ATOMIC_CAS_U2 ? 1 : ins->opcode == OP_ATOMIC_CAS_I8 ? 3 : 2;
 				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
 				if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "cas addr guard"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "cas base"; goto done; }
@@ -4179,7 +4197,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
 				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "cas dreg"; goto done; }
-				wj_count (WJC_ATOMIC_LOWERED);
+				wj_count (al == 3 ? WJC_ATOMIC_I8_LOWERED : WJC_ATOMIC_LOWERED);
 				break;
 			}
 #undef STOREM
@@ -5329,7 +5347,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								MonoMethodSignature *pred_sig = mono_method_signature_internal (pred_target);
 								WasmCallInfo pred_ci;
 								mono_wasm_get_call_info (pred_sig, &pred_ci);
-								if (!pred_ci.valid || pred_ci.vret_byaddr ||
+								if (m_class_is_valuetype (pred_target->klass)) {
+									/* R376: the profile records a boxed receiver's VALUETYPE override (MINT_CALLVIRT_FAST
+									 * records, then unboxes), and an arm would call it with the boxed `this`, so its
+									 * fields read against the object header: LinkedList<T>.Enumerator.MoveNext threw
+									 * "collection was modified" once System.Collections was no longer AOT'd. Its
+									 * functype matches the site's, so the ABI test below cannot catch it. */
+									wj_count (WJC_DEVIRT_VALUETYPE); ic_tag = 5;
+									pred_vt = NULL;
+									pred_target = NULL;
+									pred_fslot = 0;
+								} else if (!pred_ci.valid || pred_ci.vret_byaddr ||
 								    !functype_eq (&pred_ci.ftype, &ftd)) {
 									wj_count (WJC_DEVIRT_SIG); ic_tag = 5;
 									pred_vt = NULL;
@@ -7437,7 +7465,7 @@ done:
 	else if (fail_op == OP_LDADDR) cfg->wasm_jit_result.bail = -5;         /* ldaddr (needs addressable locals) */
 	else if (fail_op == OP_LCOMPARE) cfg->wasm_jit_result.bail = -6;       /* lcompare */
 	else if (fail_op >= 0) cfg->wasm_jit_result.bail = fail_op;            /* some other unsupported opcode (>0) */
-	else if (strstr (fail, "EH clauses")) cfg->wasm_jit_result.bail = -2;
+	else if (strstr (fail, "EH clause kind")) cfg->wasm_jit_result.bail = -2;   /* the clause-kind gate: a filter (the only unsupported kind) */
 	else if (strstr (fail, "arg type") || strstr (fail, "ret type")) cfg->wasm_jit_result.bail = -3;   /* arg/ret sig type */
 	/* Split what used to be the -4 "other" catch-all so the vcall-perm breakdown is actionable (the bench
 	 * showed -4 was 99% of the perm vcall residual). Order: most specific class first. */
@@ -7470,7 +7498,9 @@ done:
 			 * once per DISTINCT method at wasm_jit_compile_publish (mono_wasm_jit_bail_hist_note_blocked),
 			 * so the histogram reflects terminal outcomes. */
 			else if (strstr (fail, "callee not jitted")) cat = -1;
-			else if (strstr (fail, "EH clauses")) cat = WJB_EH_CLAUSE;
+			/* every EH gate: the filter clause kind, the nested finally, the il_state cap. This matched "EH clauses", a
+			 * string no gate produces, so all three read as synchronized/other. */
+			else if (strstr (fail, "EH") || strstr (fail, "finally")) cat = WJB_EH_CLAUSE;
 			else if (strstr (fail, "arg type") || strstr (fail, "ret type")) cat = WJB_ARGRET_TYPE;
 			else cat = WJB_SYNC_OTHER;
 			if (cat >= 0)

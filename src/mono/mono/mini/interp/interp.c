@@ -93,6 +93,7 @@ extern int mono_wasm_jit_t2;   /* MONO_WASM_JIT_T2, R316 */
 #include <mono/mini/mini-arm.h>
 #endif
 #include <mono/metadata/icall-decl.h>
+#include <mono/metadata/icall-internals.h>
 
 #include "interp-pgo.h"
 
@@ -884,6 +885,7 @@ static volatile gint32 wj_retry_state [WJ_RETRY_SLOTS];
 static InterpMethod *wj_iroute_im [WJ_IROUTE_SLOTS];
 static gint64 wj_iroute_w [WJ_IROUTE_SLOTS];
 static char *wj_iroute_name [WJ_IROUTE_SLOTS];
+static const char *wj_iroute_kind [WJ_IROUTE_SLOTS];
 static volatile gint32 wj_iroute_state [WJ_IROUTE_SLOTS];
 
 static void
@@ -1010,6 +1012,48 @@ wj_aroute_note (InterpMethod *im)
 	}
 }
 
+/* What KIND of callee an interp-routed residual lands on, for the no-AOT census (R376 plan, J0): each kind needs a
+ * different lever -- an icall or pinvoke needs a native-call lowering, a wrapper needs the lazy pool to admit its
+ * subtype, a managed method needs its emitter gate lifted. Static strings only (the dump groups by pointer).
+ * Recording-thread only, like the name next to it. */
+static const char *
+wj_callee_kind (MonoMethod *m)
+{
+	if (m->wrapper_type != MONO_WRAPPER_NONE) {
+		WrapperInfo *info = mono_marshal_get_wrapper_info (m);
+		switch (info ? info->subtype : WRAPPER_SUBTYPE_NONE) {
+		case WRAPPER_SUBTYPE_NATIVE_FUNC_INDIRECT: return "m2n-calli";
+		case WRAPPER_SUBTYPE_PINVOKE: return "m2n-pinvoke";
+		case WRAPPER_SUBTYPE_ICALL_WRAPPER: return "m2n-jit-icall";
+		case WRAPPER_SUBTYPE_NATIVE_FUNC: case WRAPPER_SUBTYPE_NATIVE_FUNC_AOT: return "m2n-native-func";
+		case WRAPPER_SUBTYPE_CASTCLASS_WITH_CACHE: return "w-castclass-cache";
+		case WRAPPER_SUBTYPE_ISINST_WITH_CACHE: return "w-isinst-cache";
+		case WRAPPER_SUBTYPE_VIRTUAL_STELEMREF: return "w-virtual-stelemref";
+		case WRAPPER_SUBTYPE_ELEMENT_ADDR: return "w-element-addr";
+		case WRAPPER_SUBTYPE_STRING_CTOR: return "w-string-ctor";
+		case WRAPPER_SUBTYPE_PTR_TO_STRUCTURE: case WRAPPER_SUBTYPE_STRUCTURE_TO_PTR: return "w-struct-marshal";
+		case WRAPPER_SUBTYPE_FAST_MONITOR_ENTER: case WRAPPER_SUBTYPE_FAST_MONITOR_ENTER_V4:
+		case WRAPPER_SUBTYPE_FAST_MONITOR_EXIT: return "w-fast-monitor";
+		case WRAPPER_SUBTYPE_GSHAREDVT_IN: case WRAPPER_SUBTYPE_GSHAREDVT_OUT: return "w-gsharedvt";
+		case WRAPPER_SUBTYPE_ARRAY_ACCESSOR: return "w-array-accessor";
+		case WRAPPER_SUBTYPE_GENERIC_ARRAY_HELPER: return "w-generic-array-helper";
+		case WRAPPER_SUBTYPE_DELEGATE_INVOKE_VIRTUAL: case WRAPPER_SUBTYPE_DELEGATE_INVOKE_BOUND: return "w-delegate-invoke";
+		case WRAPPER_SUBTYPE_SYNCHRONIZED_INNER: return "w-synchronized-inner";
+		default: return mono_wrapper_type_to_str (m->wrapper_type);
+		}
+	}
+	if (m->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) {
+		mono_bool uses_handles = FALSE;
+		mono_lookup_internal_call_full (m, FALSE, &uses_handles, NULL);
+		return uses_handles ? "icall-handles" : "icall";
+	}
+	if (m->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL)
+		return "pinvoke";
+	if (!strncmp (m_class_get_name_space (m->klass), "System.Reflection", 17))
+		return "reflection";
+	return "managed";
+}
+
 static void
 wj_iroute_note (InterpMethod *im)
 {
@@ -1022,6 +1066,7 @@ wj_iroute_note (InterpMethod *im)
 			char *name = mono_method_get_full_name (im->method);
 			wj_iroute_w [idx] = 1;
 			wj_iroute_name [idx] = name;
+			wj_iroute_kind [idx] = wj_callee_kind (im->method);
 			wj_iroute_im [idx] = im;
 			mono_atomic_xchg_i32 (&wj_iroute_state [idx], 2);
 			return;
@@ -3058,12 +3103,31 @@ mono_wasm_jit_dump_blockers (int topn)
 				 * with slot>0 and fslot==0 can only be entered through the e-slot, so its boundary cost is
 				 * irreducible. A row with BOTH >0 is a site where self-healing simply was not emitted, and
 				 * extending it there removes the crossing entirely. */
-				printf ("  %10lld  %-18s (slot=%d fslot=%d bail=%d%s%s) %s\n", (long long) bestw,
-					wj_bail_word (bail, im->wasm_jit_slot), im->wasm_jit_slot, im->wasm_jit_fslot, bail,
+				const char *ew = wj_resid_emit_lookup (im->method);
+				printf ("  %10lld  %-18s %-20s emit=%-18s (slot=%d fslot=%d bail=%d%s%s) %s\n", (long long) bestw,
+					wj_bail_word (bail, im->wasm_jit_slot), wj_iroute_kind [best] ? wj_iroute_kind [best] : "?",
+					ew ? ew : "(not direct)", im->wasm_jit_slot, im->wasm_jit_fslot, bail,
 					gate ? " gate=" : "", gate ? gate : "", wj_iroute_name [best] ? wj_iroute_name [best] : "?");
 			}
 			lastw = bestw; lastk = best; shown++;
 		}
+	}
+	/* The same population summed by callee KIND over the whole table, not just the rows shown above: the kind decides
+	 * which lever applies. Kinds are static strings, so grouping is by pointer. */
+	{
+		const char *kinds [32]; gint64 kw [32]; int kn [32], nk = 0, k, j, drop = 0;
+		for (k = 0; k < WJ_IROUTE_SLOTS; ++k) {
+			const char *kd;
+			if (wj_iroute_state [k] != 2 || !wj_iroute_w [k]) continue;
+			kd = wj_iroute_kind [k] ? wj_iroute_kind [k] : "?";
+			for (j = 0; j < nk && kinds [j] != kd; ++j) ;
+			if (j == nk) { if (nk == 32) { drop++; continue; } kinds [nk] = kd; kw [nk] = 0; kn [nk] = 0; nk++; }
+			kw [j] += wj_iroute_w [k]; kn [j]++;
+		}
+		printf ("[wasm-jit iroute kinds]");
+		for (j = 0; j < nk; ++j)
+			printf (" %s=%lld/%d", kinds [j], (long long) kw [j], kn [j]);
+		printf (" (executed/methods; kinds_dropped=%d)\n", drop);
 	}
 	printf ("[wasm-jit aroute top] AOT-routed residual callees by executed count:\n");
 	{
@@ -10768,6 +10832,18 @@ interp_create_method_pointer (MonoMethod *method, gboolean compile, MonoError *e
 		ERROR_DECL (aot_err);
 		gpointer aot_body = mono_aot_get_method (method, aot_err);
 		mono_error_cleanup (aot_err);
+		/* ...and only if the TARGET has one too. The AOT compiler emits a native-to-managed wrapper for every
+		 * [UnmanagedCallersOnly] method of an image whatever its profile says, so a profile-only image can hold the
+		 * wrapper without its target, and the wrapper's call into the uncompiled target traps ("table index is out of
+		 * bounds": ICU's EnumCalendarInfo callback into CoreLib with an empty CoreLib profile, R376 W0). Without the
+		 * target the fast path would save nothing anyway; the interpreter entry runs the wrapper. */
+		if (aot_body && orig_method) {
+			ERROR_DECL (tgt_err);
+			gpointer tgt_body = mono_aot_get_method (orig_method, tgt_err);
+			mono_error_cleanup (tgt_err);
+			if (!tgt_body)
+				aot_body = NULL;
+		}
 		if (aot_body) {
 			ftndesc->addr = aot_body;
 			ftndesc->arg = (gpointer)(intptr_t)-1; /* WASM_N2M_AOT_DIRECT_ARG */
