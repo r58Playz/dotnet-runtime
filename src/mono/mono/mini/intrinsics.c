@@ -21,6 +21,17 @@
 #include <mono/metadata/monitor.h>
 #include <mono/utils/mono-memory-model.h>
 
+#if SIZEOF_REGISTER == 4 && defined(TARGET_WASM)
+/* MONO_WASM_JIT_ATOMIC_I8 (mini-wasm.c): a wasm-JIT compile keeps longs whole (COMPILE_METHODIR skips the long
+ * decomposition) and wasm32 has native i64 atomics, so the 64-bit Interlocked/Volatile below may become
+ * OP_ATOMIC_*_I8 there. Its results are long vregs (alloc_lreg), not the pointer-sized regs the 64-bit-target
+ * paths use. */
+extern int mono_wasm_jit_atomic_i8;
+#define WJ_ATOMIC_I8(cfg) (COMPILE_WASM (cfg) && mono_wasm_jit_atomic_i8)
+#else
+#define WJ_ATOMIC_I8(cfg) FALSE
+#endif
+
 static GENERATE_GET_CLASS_WITH_CACHE (runtime_helpers, "System.Runtime.CompilerServices", "RuntimeHelpers")
 static GENERATE_TRY_GET_CLASS_WITH_CACHE (memory_marshal, "System.Runtime.InteropServices", "MemoryMarshal")
 static GENERATE_TRY_GET_CLASS_WITH_CACHE (math, "System", "Math")
@@ -1442,6 +1453,14 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			}
 		}
 #endif
+		if (WJ_ATOMIC_I8 (cfg) && strcmp (cmethod->name, "Read") == 0 && fsig->param_count == 1 && (fsig->params [0]->type == MONO_TYPE_I8)) {
+			MONO_INST_NEW (cfg, ins, OP_ATOMIC_LOAD_I8);
+			ins->dreg = alloc_lreg (cfg);
+			ins->sreg1 = args [0]->dreg;
+			ins->type = STACK_I8;
+			ins->backend.memory_barrier_kind = MONO_MEMORY_BARRIER_SEQ;
+			MONO_ADD_INS (cfg->cbb, ins);
+		}
 
 		if (strcmp (cmethod->name, "Increment") == 0 && fsig->param_count == 1) {
 			MonoInst *ins_iconst;
@@ -1454,18 +1473,28 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 #if SIZEOF_REGISTER == 8
 			else if (fsig->params [0]->type == MONO_TYPE_I8)
 				opcode = OP_ATOMIC_ADD_I8;
+#else
+			else if (WJ_ATOMIC_I8 (cfg) && fsig->params [0]->type == MONO_TYPE_I8)
+				opcode = OP_ATOMIC_ADD_I8;
 #endif
 			if (opcode) {
+				gboolean wide32 = SIZEOF_REGISTER == 4 && opcode == OP_ATOMIC_ADD_I8;   /* long vregs on a 32-bit target */
 				if (!mono_arch_opcode_supported (opcode))
 					return NULL;
-				MONO_INST_NEW (cfg, ins_iconst, OP_ICONST);
-				ins_iconst->inst_c0 = 1;
-				ins_iconst->dreg = mono_alloc_ireg (cfg);
+				if (wide32) {
+					MONO_INST_NEW (cfg, ins_iconst, OP_I8CONST);
+					ins_iconst->inst_l = 1;
+					ins_iconst->dreg = alloc_lreg (cfg);
+				} else {
+					MONO_INST_NEW (cfg, ins_iconst, OP_ICONST);
+					ins_iconst->inst_c0 = 1;
+					ins_iconst->dreg = mono_alloc_ireg (cfg);
+				}
 				MONO_ADD_INS (cfg->cbb, ins_iconst);
 
 				MONO_EMIT_NULL_CHECK (cfg, args [0]->dreg, FALSE);
 				MONO_INST_NEW (cfg, ins, opcode);
-				ins->dreg = mono_alloc_ireg (cfg);
+				ins->dreg = wide32 ? alloc_lreg (cfg) : mono_alloc_ireg (cfg);
 				ins->inst_basereg = args [0]->dreg;
 				ins->inst_offset = 0;
 				ins->sreg2 = ins_iconst->dreg;
@@ -1483,18 +1512,28 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 #if SIZEOF_REGISTER == 8
 			else if (fsig->params [0]->type == MONO_TYPE_I8)
 				opcode = OP_ATOMIC_ADD_I8;
+#else
+			else if (WJ_ATOMIC_I8 (cfg) && fsig->params [0]->type == MONO_TYPE_I8)
+				opcode = OP_ATOMIC_ADD_I8;
 #endif
 			if (opcode) {
+				gboolean wide32 = SIZEOF_REGISTER == 4 && opcode == OP_ATOMIC_ADD_I8;   /* long vregs on a 32-bit target */
 				if (!mono_arch_opcode_supported (opcode))
 					return NULL;
-				MONO_INST_NEW (cfg, ins_iconst, OP_ICONST);
-				ins_iconst->inst_c0 = -1;
-				ins_iconst->dreg = mono_alloc_ireg (cfg);
+				if (wide32) {
+					MONO_INST_NEW (cfg, ins_iconst, OP_I8CONST);
+					ins_iconst->inst_l = -1;
+					ins_iconst->dreg = alloc_lreg (cfg);
+				} else {
+					MONO_INST_NEW (cfg, ins_iconst, OP_ICONST);
+					ins_iconst->inst_c0 = -1;
+					ins_iconst->dreg = mono_alloc_ireg (cfg);
+				}
 				MONO_ADD_INS (cfg->cbb, ins_iconst);
 
 				MONO_EMIT_NULL_CHECK (cfg, args [0]->dreg, FALSE);
 				MONO_INST_NEW (cfg, ins, opcode);
-				ins->dreg = mono_alloc_ireg (cfg);
+				ins->dreg = wide32 ? alloc_lreg (cfg) : mono_alloc_ireg (cfg);
 				ins->inst_basereg = args [0]->dreg;
 				ins->inst_offset = 0;
 				ins->sreg2 = ins_iconst->dreg;
@@ -1527,13 +1566,15 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 				cfg->has_atomic_add_i4 = TRUE;
 			} else if (fsig->params [0]->type == MONO_TYPE_I8 && SIZEOF_REGISTER == 8) {
 				opcode = opcode_i8;
+			} else if (fsig->params [0]->type == MONO_TYPE_I8 && WJ_ATOMIC_I8 (cfg) && opcode_i8 == OP_ATOMIC_ADD_I8) {
+				opcode = opcode_i8;   /* the emitter lowers Add only, not And/Or */
 			}
 
 			// For now, only Add is supported in non-LLVM back-ends
 			if (opcode && (COMPILE_LLVM (cfg) || mono_arch_opcode_supported (opcode))) {
 				MONO_EMIT_NULL_CHECK (cfg, args [0]->dreg, FALSE);
 				MONO_INST_NEW (cfg, ins, opcode);
-				ins->dreg = mono_alloc_ireg (cfg);
+				ins->dreg = (SIZEOF_REGISTER == 4 && opcode == opcode_i8) ? alloc_lreg (cfg) : mono_alloc_ireg (cfg);
 				ins->inst_basereg = args [0]->dreg;
 				ins->inst_offset = 0;
 				ins->sreg2 = args [1]->dreg;
@@ -1591,6 +1632,8 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 				opcode = OP_ATOMIC_EXCHANGE_I4;
 				cfg->has_atomic_exchange_i4 = TRUE;
 			}
+			else if (WJ_ATOMIC_I8 (cfg) && param_type->type == MONO_TYPE_I8)
+				opcode = OP_ATOMIC_EXCHANGE_I8;
 #endif
 			else
 				return NULL;
@@ -1616,7 +1659,7 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 
 			MONO_EMIT_NULL_CHECK (cfg, args [0]->dreg, FALSE);
 			MONO_INST_NEW (cfg, ins, opcode);
-			ins->dreg = is_ref ? mono_alloc_ireg_ref (cfg) : mono_alloc_ireg (cfg);
+			ins->dreg = is_ref ? mono_alloc_ireg_ref (cfg) : (SIZEOF_REGISTER == 4 && opcode == OP_ATOMIC_EXCHANGE_I8) ? alloc_lreg (cfg) : mono_alloc_ireg (cfg);
 			ins->inst_basereg = args [0]->dreg;
 			ins->inst_offset = 0;
 			ins->sreg2 = is_float ? f2i->dreg : args [1]->dreg;
@@ -1736,9 +1779,9 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 			 * (COMPILE_METHODIR skips mono_decompose_long_opts), so a 64-bit CAS need not go through the
 			 * icall wrapper -- which the Minecraft server tick spends ~1.1% in (AtomicLong.compareAndSet,
 			 * Random.next). The icall already does the same native cmpxchg (C11 atomics, ATOMIC_LLONG_LOCK_FREE
-			 * asserted in atomic.h), so alignment requirements are unchanged. Not for the wasm JIT: its
-			 * emitter does not lower OP_ATOMIC_CAS_* and would bail the caller instead of calling the icall. */
-			else if (COMPILE_LLVM (cfg) && param1_type->type == MONO_TYPE_I8) {
+			 * asserted in atomic.h), so alignment requirements are unchanged. The wasm JIT takes it only under
+			 * MONO_WASM_JIT_ATOMIC_I8 (its emitter lowers it to i64.atomic.rmw.cmpxchg). */
+			else if ((COMPILE_LLVM (cfg) || WJ_ATOMIC_I8 (cfg)) && param1_type->type == MONO_TYPE_I8) {
 				opcode = OP_ATOMIC_CAS_I8;
 			}
 #endif
@@ -1895,6 +1938,10 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 				opcode = OP_ATOMIC_LOAD_I4;
 			else if (is_ref || t->type == MONO_TYPE_U)
 				opcode = OP_ATOMIC_LOAD_U4;
+			else if (WJ_ATOMIC_I8 (cfg) && t->type == MONO_TYPE_I8)
+				opcode = OP_ATOMIC_LOAD_I8;
+			else if (WJ_ATOMIC_I8 (cfg) && t->type == MONO_TYPE_U8)
+				opcode = OP_ATOMIC_LOAD_U8;
 #endif
 
 			if (opcode) {
@@ -1902,7 +1949,8 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 					return NULL;
 
 				MONO_INST_NEW (cfg, ins, opcode);
-				ins->dreg = is_ref ? mono_alloc_ireg_ref (cfg) : (is_float ? mono_alloc_freg (cfg) : mono_alloc_ireg (cfg));
+				ins->dreg = is_ref ? mono_alloc_ireg_ref (cfg) : (is_float ? mono_alloc_freg (cfg) :
+					(SIZEOF_REGISTER == 4 && (opcode == OP_ATOMIC_LOAD_I8 || opcode == OP_ATOMIC_LOAD_U8)) ? alloc_lreg (cfg) : mono_alloc_ireg (cfg));
 				ins->sreg1 = args [0]->dreg;
 				ins->backend.memory_barrier_kind = MONO_MEMORY_BARRIER_ACQ;
 				MONO_ADD_INS (cfg->cbb, ins);
@@ -1976,6 +2024,10 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 				opcode = OP_ATOMIC_STORE_I4;
 			else if (is_ref || t->type == MONO_TYPE_U)
 				opcode = OP_ATOMIC_STORE_U4;
+			else if (WJ_ATOMIC_I8 (cfg) && t->type == MONO_TYPE_I8)
+				opcode = OP_ATOMIC_STORE_I8;
+			else if (WJ_ATOMIC_I8 (cfg) && t->type == MONO_TYPE_U8)
+				opcode = OP_ATOMIC_STORE_U8;
 #endif
 
 			if (opcode) {

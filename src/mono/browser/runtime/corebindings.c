@@ -112,7 +112,7 @@ static MonoAssembly* _mono_wasm_assembly_load (char *assembly_name)
 	return res;
 }
 
-void mono_wasm_assembly_get_entry_point (char *assembly_name, int auto_insert_breakpoint, MonoMethod **method_out)
+static void mono_wasm_assembly_get_entry_point_unsafe (char *assembly_name, int auto_insert_breakpoint, MonoMethod **method_out)
 {
 	assert (assembly_name);
 	*method_out = NULL;
@@ -176,7 +176,18 @@ end:
 	*method_out = method;
 }
 
-void mono_wasm_bind_assembly_exports (char *assembly_name)
+/* Registered with mono_add_internal_call, i.e. FOREIGN: its wrapper calls it GC-SAFE, and the embedding APIs
+ * below (mono_get_method, mono_class_from_name, ...) take runtime locks that must be taken GC-unsafe --
+ * mono_loader_lock's contended path enters GC-safe itself and aborts "Cannot transition thread ... from
+ * STATE_BLOCKING with DO_BLOCKING" (R376: the no-AOT build, whose interpreted startup contends that lock). */
+void mono_wasm_assembly_get_entry_point (char *assembly_name, int auto_insert_breakpoint, MonoMethod **method_out)
+{
+	MONO_ENTER_GC_UNSAFE;
+	mono_wasm_assembly_get_entry_point_unsafe (assembly_name, auto_insert_breakpoint, method_out);
+	MONO_EXIT_GC_UNSAFE;
+}
+
+static void mono_wasm_bind_assembly_exports_unsafe (char *assembly_name)
 {
 	MonoError error;
 	MonoAssembly* assembly;
@@ -213,7 +224,18 @@ void mono_wasm_bind_assembly_exports (char *assembly_name)
 	}
 }
 
-void mono_wasm_get_assembly_export (char *assembly_name, char *namespace, char *classname, char *methodname, int signature_hash, MonoMethod **method_out)
+/* Registered with mono_add_internal_call, i.e. FOREIGN: its wrapper calls it GC-SAFE, and the embedding APIs
+ * below (mono_get_method, mono_class_from_name, ...) take runtime locks that must be taken GC-unsafe --
+ * mono_loader_lock's contended path enters GC-safe itself and aborts "Cannot transition thread ... from
+ * STATE_BLOCKING with DO_BLOCKING" (R376: the no-AOT build, whose interpreted startup contends that lock). */
+void mono_wasm_bind_assembly_exports (char *assembly_name)
+{
+	MONO_ENTER_GC_UNSAFE;
+	mono_wasm_bind_assembly_exports_unsafe (assembly_name);
+	MONO_EXIT_GC_UNSAFE;
+}
+
+static void mono_wasm_get_assembly_export_unsafe (char *assembly_name, char *namespace, char *classname, char *methodname, int signature_hash, MonoMethod **method_out)
 {
 	MonoError error;
 	MonoAssembly* assembly;
@@ -243,6 +265,17 @@ void mono_wasm_get_assembly_export (char *assembly_name, char *namespace, char *
 	free (namespace);
 	free (classname);
 	free (methodname);
+}
+
+/* Registered with mono_add_internal_call, i.e. FOREIGN: its wrapper calls it GC-SAFE, and the embedding APIs
+ * below (mono_get_method, mono_class_from_name, ...) take runtime locks that must be taken GC-unsafe --
+ * mono_loader_lock's contended path enters GC-safe itself and aborts "Cannot transition thread ... from
+ * STATE_BLOCKING with DO_BLOCKING" (R376: the no-AOT build, whose interpreted startup contends that lock). */
+void mono_wasm_get_assembly_export (char *assembly_name, char *namespace, char *classname, char *methodname, int signature_hash, MonoMethod **method_out)
+{
+	MONO_ENTER_GC_UNSAFE;
+	mono_wasm_get_assembly_export_unsafe (assembly_name, namespace, classname, methodname, signature_hash, method_out);
+	MONO_EXIT_GC_UNSAFE;
 }
 
 #ifndef DISABLE_THREADS

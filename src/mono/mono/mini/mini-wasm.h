@@ -1332,6 +1332,8 @@ enum {
 	WJC_COLD_CALLS_OTHER, WJC_COLD_CALLS_HANDLER, WJC_COLD_CALLS_THROW,
 	WJC_COLD_T2_BYTES_COLD,    /* ... handler + throw bytes of tier-2 compiles */
 	WJC_COLD_T2_BYTES_ALL,     /* ... all block bytes of tier-2 compiles */
+	WJC_ATOMIC_I8_LOWERED,     /* J1c: 64-bit atomic loads/stores, CAS, exchange and add emitted inline (MONO_WASM_JIT_ATOMIC_I8) */
+	WJC_DEVIRT_VALUETYPE,      /* R376: a devirt arm / guarded inline refused because its profile target is a VALUETYPE method */
 	WJC_MAX
 };
 

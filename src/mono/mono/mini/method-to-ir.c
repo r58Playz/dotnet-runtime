@@ -4220,11 +4220,20 @@ handle_delegate_ctor (MonoCompile *cfg, MonoClass *klass, MonoInst *target, Mono
 
 	info_ins = emit_get_rgctx_dele_tramp_info (cfg, target_method_context_used | invoke_context_used, klass, method, is_virtual, MONO_RGCTX_INFO_DELEGATE_TRAMP_INFO);
 
-	if (cfg->llvm_only) {
+	/* The wasm JIT compiles with cfg->llvm_only FALSE inside an llvm-only RUNTIME. There a MonoDelegateTrampInfo's
+	 * method_ptr and invoke_impl hold the MonoFtnDesc*s mini_llvmonly_init_delegate caches in them, not code
+	 * addresses, so the stores below would copy a descriptor's ADDRESS into del->method_ptr, and an AOT
+	 * delegate-invoke wrapper then call_indirects it ("table index is out of bounds", R376: JIT'd IKVM.CoreLib
+	 * handing a lambda to AOT'd ConditionalWeakTable.GetValue). So initialize the delegate the llvm-only way.
+	 * invoke_info is stored as well because the JIT's delegate dispatch reads its recipe from it; interp_init_delegate
+	 * publishes the same (class, method) info for a non-virtual delegate. */
+	if (cfg->llvm_only || (COMPILE_WASM (cfg) && mono_llvm_only)) {
 		MonoInst *args [] = {
 			obj,
 			info_ins
 		};
+		if (COMPILE_WASM (cfg) && !is_virtual)
+			MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STORE_MEMBASE_REG, obj->dreg, MONO_STRUCT_OFFSET (MonoDelegate, invoke_info), info_ins->dreg);
 		mono_emit_jit_icall (cfg, mini_llvmonly_init_delegate, args);
 		return obj;
 	}
@@ -9066,6 +9075,11 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				} else if (gi_target == cfg->method) {
 					/* Self-recursion: inline_method would recurse into the method being compiled. */
 					wj_gi_count (WJC_GI_REFUSED_SELF);
+				} else if (m_class_is_valuetype (gi_target->klass)) {
+					/* R376: a boxed receiver's valuetype override expects an UNBOXED `this`, and the inlined body
+					 * would take the site's object reference instead. Counted as OTHER so the GI parts still sum. */
+					wj_gi_count (WJC_GI_REFUSED_OTHER);
+					wj_gi_count (WJC_DEVIRT_VALUETYPE);
 				} else if (cfg->wasm_jit_tier < 2 && wj_gi_refused_before (gi_target)) {
 					/* (R316: a tier-2 compile has a bigger budget and lifted call gates, so a tier-1 refusal
 					 * says nothing about it; the memo is bypassed there and not written from there.) */
