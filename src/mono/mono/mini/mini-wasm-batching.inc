@@ -175,6 +175,7 @@ typedef struct {
 	 * the entry claiming a standalone module whose exports do not exist, which mono_wasm_jit_admit turns
 	 * into the "function signature mismatch" R165 spent a session on. */
 	WjBatchDesc *batch;
+	guint8 hooked;   /* H5: a member that leaves this bind by rollback goes back to its old group's copy of the body */
 } WjRegSaved;
 
 /*
@@ -223,6 +224,7 @@ wj_batch_rollback (const int *desc_ids, int n, WjRegSaved *saved, WjBatchDesc *b
 			mono_wasm_jit_count (WJC_COLOCATE_MERGE_ROLLBACK);
 		wj_pub_begin (re);   /* R320: restored as one unit; ended after the depset */
 		re->batch = saved [i].batch;
+		re->hooked = saved [i].hooked;   /* H5: the restored group still holds the pre-hook body */
 		/* ONCE ONLY. Without this the method rejoins the candidate pool and the next publish regroups it,
 		 * fails the same way and rolls back again -- churn that wedges boot. */
 		re->colocate_refused = 1;
@@ -326,10 +328,10 @@ mono_wasm_jit_dump_dep_graph (void)
  * order as e_slots/f_slots. Returns 0 (and frees nothing) if any id is bad — the caller then still owns
  * `bytes`. */
 int mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_slots, int n,
-                              void *bytes, int len);
+                              void *bytes, int len, gint32 *guard, guint32 payload);
 int
 mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_slots, int n,
-                          void *bytes, int len)
+                          void *bytes, int len, gint32 *guard, guint32 payload)
 {
 	WjBatchDesc *bd;
 	WjRegSaved *saved = NULL;
@@ -359,6 +361,8 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	memcpy (bd->desc, desc_ids, sizeof (int) * n);
 	bd->bytes = bytes;
 	bd->len = len;
+	bd->guard = guard;
+	bd->payload = payload;
 	bd->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 	for (i = 0; i < n; i++) {
 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
@@ -366,13 +370,14 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 		/* batch_finish has already overwritten these slots on the compiling worker. Any previously
 		 * installed guard-free AOT adapter must stop entering them until admission below succeeds. */
 		if (re->logical_imethod)
-				mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod);
+				mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod, re->logical_method);
 #endif
 		if (saved) {
 			saved [i].bytes = re->bytes; saved [i].len = re->len;
 			saved [i].depset = re->depset;
 			saved [i].generation = re->generation;
 			saved [i].batch = re->batch;   /* NULL for a fresh group; the absorbed group on a merge */
+			saved [i].hooked = re->hooked;
 		}
 		wj_pub_begin (re);   /* R320: batch/bytes/depset change as one unit for admission; ended after the depset */
 		re->batch = bd;
@@ -446,6 +451,10 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 		 * capture at all, and leaving the old import list on the entry would make admission demand
 		 * instantiation of callees this generation no longer binds. Republished BEFORE the barrier below
 		 * publishes the generation -- same visibility rule as mono_wasm_jit_register. */
+		/* H5: this group frames the member's STORED body; if that was compiled from the IL in force, the hook's stub has
+		 * nothing left to stand in for. Published with the generation below, like every other field. */
+		if (re->hooked && re->body_current)
+			re->hooked = 0;
 		mono_memory_barrier ();
 		re->generation = bd->generation;
 		/* batch_finish physically installed this generation on the compiling worker, but installation
@@ -462,6 +471,12 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	if (!mono_wasm_jit_admit (desc_ids [0])) {
 		if (saved) {
 			wj_batch_rollback (desc_ids, n, saved, bd);
+			/* plan2x S1: this generation may have been instantiated here and be reachable through the table until
+			 * re-admission restores the members; anything still running in it must not trust its local calls. */
+			if (bd->guard) {
+				mono_atomic_store_i32 (bd->guard, 1);
+				mono_wasm_jit_counters [WJC_S1_SUPERSEDED]++;
+			}
 			/* No registry entry can acquire this failed generation after rollback.  An
 			 * admission that acquired it before rollback is covered by the registry-reader
 			 * grace period, so the large module blob no longer has to leak forever. */
@@ -516,8 +531,16 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 				for (j = 0; j < i; ++j)
 					if (saved [j].batch == saved [i].batch)
 						break;
-				if (j == i)
+				if (j == i) {
+					/* plan2x S1: the superseded generation's word, set AFTER the new one is published, so a
+					 * stale instance that reads it goes through a table that can already hold the new code.
+					 * The word is never freed (its address is baked); only the descriptor is retired. */
+					if (saved [i].batch->guard) {
+						mono_atomic_store_i32 (saved [i].batch->guard, 1);
+						mono_wasm_jit_counters [WJC_S1_SUPERSEDED]++;
+					}
 					wj_retire_payload (saved [i].batch, WJ_RETIRED_BATCH);
+				}
 			}
 			if (!saved [i].bytes || saved [i].bytes == bytes)
 				continue;
@@ -560,6 +583,8 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 	WjAsmMember *members;
 	WjAsmPolicy pol;
 	WasmBuf out;
+	gint32 *guard = NULL;
+	guint32 payload = 0;
 	int *e_slots, *f_slots;
 	void *cached;
 	char eb [192];
@@ -591,7 +616,7 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		 * an absorbed group is present to be restored together.
 		 */
 		if (re->batch) {
-			extern int mono_wasm_jit_colocate_merge;
+			extern int mono_wasm_jit_colocate_merge, mono_wasm_jit_b4;
 			int k, m, complete = 1;
 			for (k = 0; k < re->batch->n && complete; ++k) {
 				for (m = 0; m < n; ++m)
@@ -629,8 +654,8 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 				if (G_UNLIKELY (mono_wasm_jit_stats))
 					mono_wasm_jit_count (WJC_COLOCATE_MERGE_SPLIT);
 				return 0;
-			} else if (!mono_wasm_jit_colocate_merge) {
-				/* Complete, but alongside other descriptors: absorbing this group into a bigger one. */
+			} else if (!mono_wasm_jit_colocate_merge && mono_wasm_jit_b4 < 2) {
+				/* Complete, but alongside other descriptors: absorbing this group into a bigger one (B4=2 merges). */
 				if (G_UNLIKELY (mono_wasm_jit_stats))
 					mono_wasm_jit_count (WJC_COLOCATE_MERGE_OFF);
 				return 0;
@@ -703,6 +728,11 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 	   * and left the calls indirect, i.e. co-location's cost without its benefit. The policy FIELD
 	   * stays -- the lone-method path passes FALSE deliberately, to keep self-recursion indirect. */
 	  wj_asm_policy_init (&pol, TRUE);
+	  { extern int mono_wasm_jit_s1, mono_wasm_jit_b4;   /* plan2x S1: one word per group generation, never freed */
+	    if (((mono_wasm_jit_s1 & 1) || mono_wasm_jit_b4 >= 2) && (guard = wj_word_alloc ()) != NULL) {
+		pol.guard_addr = (guint32) (gsize) guard;
+		pol.guard_count_addr = (guint32) (gsize) &mono_wasm_jit_counters [WJC_S1_GUARD_TAKEN];   /* low word */
+	    } }
 	  /* CROSS-GROUP EDGES ARE `call_indirect`, and there is no longer a choice about it: method
 	   * imports are gone entirely. An import bound at INSTANTIATION had to be ordered, and ordering
 	   * is what could not be done -- R161 showed every deferral was an import-edge cycle, and R162
@@ -712,11 +742,15 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		wasm_buf_free (&out);
 		goto done;
 	}
+	{ extern int mono_wasm_jit_capture;
+	  if (G_UNLIKELY (mono_wasm_jit_capture))
+		mono_wasm_jit_capture_module ("b", "wasmjit-batch", out.data, out.len); }
 	cached = g_malloc ((gsize) out.len);
 	memcpy (cached, out.data, out.len);
 
 	eb [0] = 0;
-	if (!mono_wasm_jit_instantiate_batch_local (e_slots, f_slots, n, cached, (int) out.len, eb, (int) sizeof (eb), &ms)) {
+	payload = wj_payload_new ();   /* W1 C0 */
+	if (!mono_wasm_jit_instantiate_batch_local (e_slots, f_slots, n, cached, (int) out.len, eb, (int) sizeof (eb), &ms, payload)) {
 		/* The old generation is still in this worker's slots -- instantiate_batch_local installs nothing
 		 * on failure -- so declining here really does leave the members exactly as they were. */
 		printf ("WASM_JIT_REBATCH_FAIL members=%d bytes=%u : %s\n", n, (unsigned) out.len, eb);
@@ -724,7 +758,7 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		wasm_buf_free (&out);
 		goto done;
 	}
-	ok = mono_wasm_jit_batch_bind (desc_ids, e_slots, f_slots, n, cached, (int) out.len);
+	ok = mono_wasm_jit_batch_bind (desc_ids, e_slots, f_slots, n, cached, (int) out.len, guard, payload);
 	if (!ok) {
 		/* NOT `g_free (cached)` -- the same use-after-free as the batch descriptor. batch_bind
 		 * published re->batch = bd with bd->bytes = cached BEFORE it attempted admission, and a
@@ -775,7 +809,7 @@ wj_reinstall_batch_local (int desc_id)
 {
 	extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n,
 	                                                  const void *bytes, int len, char *errbuf, int errcap,
-	                                                  double *out_ms);
+	                                                  double *out_ms, guint32 payload);
 	WjRegEntry *re;
 	WjBatchDesc *bd;
 	char eb [192];
@@ -787,7 +821,7 @@ wj_reinstall_batch_local (int desc_id)
 	if (bd && bd->bytes && bd->len > 0) {
 		eb [0] = 0;
 		if (!mono_wasm_jit_instantiate_batch_local (bd->e, bd->f, bd->n, bd->bytes, bd->len,
-		                                            eb, (int) sizeof (eb), &ms))
+		                                            eb, (int) sizeof (eb), &ms, bd->payload))
 			printf ("WASM_JIT_REFRAME_UNDO_FAIL desc=%d members=%d : %s\n", desc_id, bd->n, eb);
 	}
 	wj_reg_read_leave ();
@@ -906,8 +940,8 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	{
 		/* R338: under tier 2, no automatic co-location -- a re-framed group's old instance outlives any frame
 		 * that never returns, and its module-local calls keep reaching the old member copies (R336/R337). */
-		extern int mono_wasm_jit_t2, mono_wasm_jit_t2_colocate;
-		if (mono_wasm_jit_t2 && !mono_wasm_jit_t2_colocate) {
+		extern int mono_wasm_jit_t2, mono_wasm_jit_t2_colocate, mono_wasm_jit_s1;
+		if (mono_wasm_jit_t2 && !mono_wasm_jit_t2_colocate && !(mono_wasm_jit_s1 & 4)) {
 			mono_wasm_jit_counters [WJC_COLOCATE_T2_SKIP]++;   /* ungated */
 			return 0;
 		}
@@ -1115,6 +1149,348 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
 	g_free (descs);
 	wj_reg_read_leave ();
 	return n;
+}
+
+/* --- plan B4: the hot-set partition (R442 dry run, R443 apply) -------------------------------------------------
+ *
+ * Every live registry entry whose body carries recorded edges (tier 2 under MONO_WASM_JIT_B4) contributes its direct
+ * calls to registered callees, each weighted by the call site's tier-1 S2 count (or, for a site tier 1 never counted --
+ * one inside a tier-2 inlinee -- the root's own tier-1 entry count). Agglomerative merging in descending weight
+ * (union-find) under MONO_WASM_JIT_B4_MAX members and MONO_WASM_JIT_B4_BYTES bytes per group: R380's offline algorithm,
+ * which kept 82.6% of the exact executed JIT->JIT weight internal at 16 members. B4=1 prints the partition at every
+ * stats dump; B4=2 also frames it (mono_wasm_jit_b4_step), one group per re-emit drainer visit. */
+typedef struct { gint32 a, b; guint32 w; guint8 est; } WjB4Edge;
+typedef struct { gint32 *desc; gint32 n; } WjB4Group;
+
+static int
+wj_b4_cmp (gconstpointer x, gconstpointer y)
+{
+	guint32 a = ((const WjB4Edge *) x)->w, b = ((const WjB4Edge *) y)->w;
+	return a < b ? 1 : a > b ? -1 : 0;
+}
+
+static gint32
+wj_b4_find (gint32 *par, gint32 x)
+{
+	while (par [x] != x) {
+		par [x] = par [par [x]];
+		x = par [x];
+	}
+	return x;
+}
+
+extern volatile gint32 mono_wasm_jit_b4_bodies;   /* mini-wasm.c; bumped as each edge-carrying body is stored */
+extern volatile gint32 mono_wasm_jit_b4_samples;  /* mini-wasm.c; tier-2-body safepoint samples, the planner's clock */
+extern gint32 mono_wasm_jit_im_body_samples (gpointer im);   /* interp.c */
+static gint32 wj_b4_planned_at, wj_b4_samples_at;
+/* Each descriptor's tier-2-body sample count at the previous plan (R446): a plan ranks groups by what their members ran
+ * SINCE then, so the budget goes to what is hot now -- at plateau, the tick -- not to what was hot at boot. */
+#define WJ_B4_SNAP_MAX (1 << 17)
+static gint32 *volatile wj_b4_snap;   /* WJ_B4_SNAP_MAX entries, allocated once and never freed or resized: the dump
+                                       * thread's dry run reads it while the drainer writes it */
+static WjB4Group *wj_b4_pend;   /* the current plan's groups, framed one per visit; drainer-owned */
+static int wj_b4_npend, wj_b4_ipend;
+/* Read without synchronisation on every drainer early-out: is there planning or framing to do? */
+gint32 mono_wasm_jit_b4_due (void);
+static gboolean
+wj_b4_grown (void)
+{
+	extern int mono_wasm_jit_b4_groups;
+	gint32 grow = MAX (32, wj_b4_planned_at / 4);   /* re-plan once the edge-carrying tier grew by 32 or 25% */
+	extern int mono_wasm_jit_b4_plan_samples;
+	if (mono_wasm_jit_counters [WJC_B4_FRAMED] >= mono_wasm_jit_b4_groups)
+		return FALSE;
+	return mono_wasm_jit_b4_bodies - wj_b4_planned_at >= grow ||
+		(mono_wasm_jit_b4_plan_samples > 0 && mono_wasm_jit_b4_samples - wj_b4_samples_at >= mono_wasm_jit_b4_plan_samples);
+}
+
+gint32
+mono_wasm_jit_b4_due (void)
+{
+	return wj_b4_ipend < wj_b4_npend || wj_b4_grown ();
+}
+
+/* A member's own bytes. NOT re->len: batch_bind sets that to the whole GROUP module's length, so once a member is framed
+ * it would read as the group's size and the byte bound would refuse every later merge (R443). */
+static int
+wj_b4_size (WjRegEntry *re)
+{
+	return (re && re->body) ? (int) (re->body->f_body.len + re->body->e_body.len) : 0;
+}
+
+/* The partition over the live registry. Caller holds the registry read bracket. Returns the groups (>= 2 members,
+ * heaviest internal weight first) and fills the census. */
+/* A descriptor's tier-2-body samples since the previous plan; with `take`, also advance its snapshot. */
+static gint32
+wj_b4_hot (int desc, gboolean take)
+{
+	WjRegEntry *re = wj_reg_at (desc - 1);
+	gint32 now = (re && re->logical_imethod) ? mono_wasm_jit_im_body_samples (re->logical_imethod) : 0, d;
+	gint32 *snap = wj_b4_snap;
+	if (!snap) {
+		if (!take)
+			return now > 0 ? now : 0;   /* the dry run before any plan: everything since the start */
+		snap = g_new0 (gint32, WJ_B4_SNAP_MAX);   /* only the single drainer takes, so only it allocates */
+		mono_memory_barrier ();
+		wj_b4_snap = snap;
+	}
+	if (desc >= WJ_B4_SNAP_MAX)
+		return 0;
+	d = now - snap [desc];
+	if (take)
+		snap [desc] = now;
+	return d > 0 ? d : 0;
+}
+
+static WjB4Group *
+wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nest, guint64 *out_total, guint64 *out_inside,
+                 gboolean take, guint64 **out_hot)
+{
+	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_anchor;
+	GArray *edges = g_array_new (FALSE, FALSE, sizeof (WjB4Edge));
+	gint32 *par, *sz, *by, *slot, *mx;
+	guint64 total = 0, inside = 0, *gw;
+	int n, i, k, cap, ndesc = 0, nest = 0, ngroups = 0;
+	WjB4Group *groups;
+
+	cap = mono_wasm_jit_b4_max < 2 ? 2 : MIN (mono_wasm_jit_b4_max, WJ_BATCH_MAX);
+	n = wj_reg_n;
+	for (i = 0; i < n; ++i) {
+		WjRegEntry *re = wj_reg_at (i);
+		if (!re || !re->body || !re->body->nedges || re->e <= 0 || re->f <= 0 || wj_desc_for_fslot (re->f) != i + 1)
+			continue;
+		ndesc++;
+		for (k = 0; k < (int) re->body->nedges; ++k) {
+			WjEdge *ed = &re->body->edges [k];
+			int d = wj_desc_for_fslot (ed->fslot);
+			WjRegEntry *dre = (d > 0 && d <= n) ? wj_reg_at (d - 1) : NULL;
+			WjB4Edge e;
+			guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+			if (!dre || !dre->body || d == i + 1 || w == 0 || dre->f != ed->fslot)
+				continue;
+			e.a = i + 1; e.b = d; e.w = w; e.est = ed->est ? 1 : 0;
+			g_array_append_val (edges, e);
+			total += e.w;
+			nest += e.est;
+		}
+	}
+	qsort (edges->data, edges->len, sizeof (WjB4Edge), wj_b4_cmp);
+	par = g_new (gint32, n + 1); sz = g_new (gint32, n + 1); by = g_new (gint32, n + 1); gw = g_new0 (guint64, n + 1);
+	mx = g_new (gint32, n + 1);
+	for (i = 0; i <= n; ++i) {
+		WjRegEntry *re = i > 0 ? wj_reg_at (i - 1) : NULL;
+		par [i] = i; sz [i] = 1; by [i] = mx [i] = wj_b4_size (re);
+	}
+	for (k = 0; k < (int) edges->len; ++k) {
+		WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
+		gint32 ra = wj_b4_find (par, e->a), rb = wj_b4_find (par, e->b), m;
+		if (ra == rb || sz [ra] + sz [rb] > cap)
+			continue;
+		/* R448: the byte bound excludes the group's largest member, its ANCHOR, which is bounded on its own: a tick giant
+		 * (Entity.move and friends stay at tier 1) groups with its small hot callees */
+		m = MAX (mx [ra], mx [rb]);
+		if (m > mono_wasm_jit_b4_anchor || by [ra] + by [rb] - m > mono_wasm_jit_b4_bytes)
+			continue;
+		if (sz [ra] < sz [rb]) { gint32 t = ra; ra = rb; rb = t; }
+		par [rb] = ra; sz [ra] += sz [rb]; by [ra] += by [rb]; mx [ra] = m;
+	}
+	for (k = 0; k < (int) edges->len; ++k) {
+		WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
+		gint32 ra = wj_b4_find (par, e->a);
+		if (ra == wj_b4_find (par, e->b)) { inside += e->w; gw [ra] += e->w; }
+	}
+	/* Each group's HEAT: its members' tier-2-body samples since the previous plan (R446). Groups are ordered by heat (a
+	 * group nobody ran since then has none and is not listed), the internal weight only breaking ties. */
+	{
+		guint64 *heat = g_new0 (guint64, n + 1);
+		for (i = 1; i <= n; ++i) {
+			gint32 r = wj_b4_find (par, i);
+			if (sz [r] >= 2)
+				heat [r] += (guint64) wj_b4_hot (i, take);
+			else if (take)
+				(void) wj_b4_hot (i, TRUE);
+		}
+		slot = g_new (gint32, n + 1);
+		for (i = 0; i <= n; ++i) slot [i] = -1;
+		for (i = 1; i <= n; ++i)
+			if (par [i] == i && sz [i] >= 2 && gw [i] && heat [i])
+				ngroups++;
+		groups = g_new0 (WjB4Group, ngroups ? ngroups : 1);
+		*out_hot = g_new0 (guint64, ngroups ? ngroups : 1);
+		for (k = 0; k < ngroups; ++k) {
+			gint32 best = -1;
+			for (i = 1; i <= n; ++i)
+				if (par [i] == i && sz [i] >= 2 && gw [i] && heat [i] && slot [i] < 0 &&
+				    (best < 0 || heat [i] > heat [best] || (heat [i] == heat [best] && gw [i] > gw [best])))
+					best = i;
+			slot [best] = k;
+			groups [k].desc = g_new (gint32, sz [best]);
+			(*out_hot) [k] = heat [best];
+		}
+		g_free (heat);
+	}
+	for (i = 1; i <= n; ++i) {
+		gint32 r = wj_b4_find (par, i);
+		if (slot [r] >= 0)
+			groups [slot [r]].desc [groups [slot [r]].n++] = i;
+	}
+	*out_ngroups = ngroups; *out_ndesc = ndesc; *out_nedges = (int) edges->len; *out_nest = nest;
+	*out_total = total; *out_inside = inside;
+	g_free (par); g_free (sz); g_free (by); g_free (gw); g_free (slot); g_free (mx);
+	g_array_free (edges, TRUE);
+	return groups;
+}
+
+static void
+wj_b4_free (WjB4Group *g, int n)
+{
+	int i;
+	for (i = 0; i < n; ++i)
+		g_free (g [i].desc);
+	g_free (g);
+}
+
+void mono_wasm_jit_b4_plan (void);
+void
+mono_wasm_jit_b4_plan (void)
+{
+	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_groups, mono_wasm_jit_b4_merge;
+	extern int mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor;
+	WjB4Group *g;
+	int ng, nd, ne, nest, k, m, nmem = 0;
+	guint64 total, inside, *hot = NULL;
+	wj_reg_read_enter ();
+	g = wj_b4_partition (&ng, &nd, &ne, &nest, &total, &inside, FALSE, &hot);
+	for (k = 0; k < ng; ++k)
+		nmem += g [k].n;
+	printf ("[wasm-jit b4] plan (dry run): bodies with edges=%d edges=%d (entry-estimated %d) weight=%llu | groups=%d "
+		"members=%d internal=%.1f%% (cap %d members / %d body bytes) | framed=%lld/%d (group budget) refused=%lld published=%lld "
+		"plans=%lld merge=%d (heat-ranked, tier-1 edges %d, anchor %d)\n", nd, ne, nest,
+		(unsigned long long) total, ng, nmem, total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max,
+		mono_wasm_jit_b4_bytes, (long long) mono_wasm_jit_counters [WJC_B4_FRAMED], mono_wasm_jit_b4_groups,
+		(long long) mono_wasm_jit_counters [WJC_B4_REFUSED], (long long) mono_wasm_jit_counters [WJC_B4_PUBLISHED],
+		(long long) mono_wasm_jit_counters [WJC_B4_PLANS], mono_wasm_jit_b4_merge, mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor);
+	for (k = 0; k < ng && k < 6; ++k) {
+		printf ("[wasm-jit b4]   group %d: %d members, heat %llu:", k, g [k].n, (unsigned long long) hot [k]);
+		for (m = 0; m < g [k].n && m < 4; ++m) {
+			WjRegEntry *re = wj_reg_at (g [k].desc [m] - 1);
+			printf (" %s;", (re && re->body && re->body->name) ? re->body->name : "?");
+		}
+		printf ("\n");
+	}
+	wj_b4_free (g, ng);
+	g_free (hot);
+	wj_reg_read_leave ();
+}
+
+/* B4=2: one unit of the drainer's B4 work. Re-plans when enough new edge-carrying bodies arrived, then frames ONE
+ * pending group per call: its members plus every sibling of any group a member already belongs to (a merge absorbs
+ * whole groups -- rebatch refuses a split), through mono_wasm_jit_rebatch (S1's guard is forced on with B4=2). Returns
+ * a member's descriptor for the caller to publish through the next rendezvous (adopting any member installs the
+ * group), or 0. Called only by the single re-emit drainer. */
+int mono_wasm_jit_b4_step (void);
+int
+mono_wasm_jit_b4_step (void)
+{
+	extern int mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_max, mono_wasm_jit_b4_groups, mono_wasm_jit_b4_merge;
+	gint32 *descs;
+	/* a merge may absorb whole groups, so the framed set is bounded at twice the planner's: 2 x B4_MAX members (R195:
+	 * 32 clean, 64 + 128 KB crashed) and 2 x B4_BYTES */
+	int n = 0, i, k, bytes = 0, ok, cap = MIN (2 * mono_wasm_jit_b4_max, WJ_BATCH_MAX), same = 1;
+	WjBatchDesc *first = NULL;
+	WjB4Group *g;
+
+	if (mono_wasm_jit_counters [WJC_B4_FRAMED] >= mono_wasm_jit_b4_groups) {
+		wj_b4_ipend = wj_b4_npend;   /* the budget is spent: drop the rest of the plan */
+		return 0;
+	}
+	if (wj_b4_ipend >= wj_b4_npend) {
+		int nd, ne, nest;
+		guint64 total, inside;
+		if (!wj_b4_grown ())
+			return 0;
+		guint64 *hot = NULL;
+		extern int mono_wasm_jit_b4_per_plan;
+		wj_b4_planned_at = mono_wasm_jit_b4_bodies;
+		wj_b4_samples_at = mono_wasm_jit_b4_samples;
+		wj_b4_free (wj_b4_pend, wj_b4_npend);
+		wj_reg_read_enter ();
+		wj_b4_pend = wj_b4_partition (&wj_b4_npend, &nd, &ne, &nest, &total, &inside, TRUE, &hot);
+		wj_reg_read_leave ();
+		g_free (hot);
+		/* the hottest per_plan groups only: the budget is spread over the run, not spent by the first plans */
+		if (wj_b4_npend > mono_wasm_jit_b4_per_plan) {
+			int q;
+			for (q = mono_wasm_jit_b4_per_plan; q < wj_b4_npend; ++q)
+				g_free (wj_b4_pend [q].desc);
+			wj_b4_npend = mono_wasm_jit_b4_per_plan;
+		}
+		wj_b4_ipend = 0;
+		mono_wasm_jit_counters [WJC_B4_PLANS]++;
+		if (!wj_b4_npend)
+			return 0;
+	}
+	g = &wj_b4_pend [wj_b4_ipend++];
+	descs = g_new (gint32, cap);
+	wj_reg_read_enter ();
+	for (i = 0; i < g->n; ++i) {
+		WjRegEntry *re = wj_reg_at (g->desc [i] - 1);
+		if (!re || !re->body || re->e <= 0 || re->f <= 0 || wj_desc_for_fslot (re->f) != g->desc [i])
+			continue;   /* re-registered or retired since the plan: leave it out */
+		if (re->batch && !mono_wasm_jit_b4_merge)
+			continue;   /* fresh groups only (R445): a member already framed stays where it is */
+		if (re->batch) {
+			if (!first) first = re->batch; else if (re->batch != first) same = 0;
+			for (k = 0; k < re->batch->n; ++k) {
+				int sd = re->batch->desc [k], j;
+				WjRegEntry *sre = sd > 0 ? wj_reg_at (sd - 1) : NULL;
+				for (j = 0; j < n && descs [j] != sd; ++j)
+					;
+				if (j < n || !sre) continue;
+				if (n >= cap) goto refuse;
+				descs [n++] = sd; bytes += wj_b4_size (sre);
+			}
+		} else {
+			int j;
+			same = 0;
+			for (j = 0; j < n && descs [j] != g->desc [i]; ++j)
+				;
+			if (j < n) continue;
+			if (n >= cap) goto refuse;
+			descs [n++] = g->desc [i]; bytes += wj_b4_size (re);
+		}
+	}
+	/* Nothing to frame: fewer than two members left, or every member already sits in ONE group with nobody new. */
+	if (n < 2 || (same && first && n == first->n)) {
+		wj_reg_read_leave ();
+		g_free (descs);
+		return 0;
+	}
+	{
+		extern int mono_wasm_jit_b4_anchor;
+		int q, mxb = 0;
+		for (q = 0; q < n; ++q)
+			mxb = MAX (mxb, wj_b4_size (wj_reg_at (descs [q] - 1)));
+		if (mxb > mono_wasm_jit_b4_anchor || bytes - mxb > 2 * mono_wasm_jit_b4_bytes)
+			goto refuse;
+	}
+	ok = mono_wasm_jit_rebatch (descs, n, NULL, NULL);
+	wj_reg_read_leave ();
+	if (!ok) {
+		mono_wasm_jit_counters [WJC_B4_REFUSED]++;
+		g_free (descs);
+		return 0;
+	}
+	mono_wasm_jit_counters [WJC_B4_FRAMED]++;
+	mono_wasm_jit_add (WJC_B4_MEMBERS, n);
+	k = descs [0];
+	g_free (descs);
+	return k;
+refuse:
+	wj_reg_read_leave ();
+	mono_wasm_jit_counters [WJC_B4_REFUSED]++;
+	g_free (descs);
+	return 0;
 }
 
 /* The MonoMethod captured as member i, so the driver can register the right slot pair against it. */

@@ -256,7 +256,34 @@ typedef struct {
 	/* Branch hints (R339): (offset of an `if`/`br_if` opcode in this buffer, 0 = unlikely / 1 = likely), or NULL.
 	 * Carried like relocs; the serializer translates them, the module assembler emits them. */
 	struct _WasmHints *hints;
+	/* Origin map (MONO_WASM_JIT_ORIGIN, the gap ledger): which emitter construct, source method and IL offset
+	 * each byte of this body serves, or NULL. Carried like hints; the module assembler emits it as the custom
+	 * section "wj.origin". Diagnostic only -- a custom section changes no code. */
+	struct _WasmOrigins *origins;
 } WasmBuf;
+
+/* One origin TRANSITION: from `off` on, the bytes serve (tag, meth, il, ilop) until the next transition.
+ * `nrel` is how many relocations had been recorded when it was: a hole is zero bytes long, so a transition and
+ * a hole can share an offset, and only the recording order says which side of the hole's bytes it lands on. */
+typedef struct {
+	guint32 off;
+	guint32 nrel;
+	guint16 tag;    /* < WASM_ORIGIN_OP_BASE: an emitter construct; else WASM_ORIGIN_OP_BASE + mono opcode */
+	guint16 meth;   /* 0 = the function's own method, k = its k-th inlinee (WasmOrigins.mnames [k]) */
+	gint32  il;     /* IL offset within `meth`, -1 = unknown */
+	guint16 ilop;   /* IL opcode byte at `il` (0xFE00 | second byte for a prefixed one), 0xFFFF = unknown */
+} WasmOrigin;
+
+#define WASM_ORIGIN_OP_BASE 256
+
+typedef struct _WasmOrigins {
+	WasmOrigin *v;
+	guint32     n, cap;
+	WasmOrigin  cur;        /* the state the next transition is diffed against */
+	char      **mnames;     /* [nmeth]; [0] unused (the function's own name is in the name section) */
+	guint32     nmeth;
+	gboolean    borrowed;   /* a serialized copy: mnames belongs to the source buffer */
+} WasmOrigins;
 
 typedef struct _WasmHints {
 	guint32 *off;
@@ -336,13 +363,24 @@ typedef struct _WasmRelocs {
 } WasmRelocs;
 
 /* How one reloc was resolved. `idx` is the function index for IMPORT/LOCAL and unused for INDIRECT. */
-typedef enum { WASM_FORM_INDIRECT, WASM_FORM_IMPORT, WASM_FORM_LOCAL } WasmRelocForm;
-typedef struct { guint8 form; guint32 idx; } WasmRelocFix;
+/* WASM_FORM_LOCAL_GUARDED (plan2x S1): `call idx` unless the word at linear-memory address `guard` is non-zero, in
+ * which case the call goes through the table at the reloc's f-slot (and bumps the i32 at `guard_count` if non-zero).
+ * `guard`/`guard_count` are ignored by every other form. */
+typedef enum { WASM_FORM_INDIRECT, WASM_FORM_IMPORT, WASM_FORM_LOCAL, WASM_FORM_LOCAL_GUARDED } WasmRelocForm;
+typedef struct { guint8 form; guint32 idx; guint32 guard, guard_count; } WasmRelocFix;
 
 /* Attach a reloc list to a body buffer. Must be called before any wasm_reloc on it. */
 void wasm_buf_init_relocs (WasmBuf *b);
 /* R339: hint the `if`/`br_if` opcode about to be appended (1 = likely taken, 0 = unlikely). */
 void wasm_hint (WasmBuf *b, guint8 likely);
+/* Origin map (MONO_WASM_JIT_ORIGIN). All of these are no-ops on a buffer without wasm_origins_init. */
+void wasm_origins_init (WasmBuf *b);
+void wasm_origin_set (WasmBuf *b, guint16 tag, guint16 meth, gint32 il, guint16 ilop);
+/* Switch the construct tag, keeping method/IL; returns the previous tag for wasm_origin_pop. */
+guint16 wasm_origin_push (WasmBuf *b, guint16 tag);
+void wasm_origin_pop (WasmBuf *b, guint16 prev);
+/* Hand the inlinee name table to the buffer (takes ownership of the array and the strings). */
+void wasm_origins_set_methods (WasmBuf *b, char **mnames, guint32 nmeth);
 
 /*
  * Record a hole at the current end of `b`.

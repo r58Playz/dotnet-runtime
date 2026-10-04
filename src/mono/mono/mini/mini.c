@@ -1831,6 +1831,8 @@ mono_destroy_compile (MonoCompile *cfg)
 	g_list_free (cfg->ldstr_list);
 	g_hash_table_destroy (cfg->token_info_hash);
 	g_hash_table_destroy (cfg->abs_patches);
+	if (cfg->wasm_site_gi)
+		g_hash_table_destroy (cfg->wasm_site_gi);
 
 	mono_debug_free_method (cfg);
 
@@ -3264,6 +3266,9 @@ mini_get_rgctx_access_for_method (MonoMethod *method)
 /* R315 (plan Phase 3.3): set by mono_wasm_force_compile's downgrade retry so the compile_wasm block below uses the
  * ordinary inline policy. Thread-local: compiles are per thread and force_compile is non-reentrant. */
 static __thread gboolean wasm_jit_policy_t1_only;
+/* plan2x S0b: set by mono_wasm_force_compile's strict retry (MONO_WASM_JIT_T2_STRICT). */
+static __thread gboolean wasm_jit_policy_t2_strict G_GNUC_UNUSED;
+static __thread gboolean wasm_jit_policy_no_gi2 G_GNUC_UNUSED;   /* R411: retry a tier-2 body without bimorphic GI */
 
 static guint32
 wasm_jit_extra_opt (void)
@@ -3570,6 +3575,12 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 					cfg->wasm_inline_cost_cap = mono_wasm_jit_t2_cost;
 					cfg->wasm_inline_depth_cap = mono_wasm_jit_t2_depth;
 					cfg->wasm_gi_size = mono_wasm_jit_t2_gi_size;
+					if (wasm_jit_policy_no_gi2)
+						cfg->wasm_no_gi2 = TRUE;
+					if (wasm_jit_policy_t2_strict) {   /* plan2x S0b: tier 1's guarded-inline size; strict sites in check_inlining */
+						cfg->wasm_t2_strict = TRUE;
+						cfg->wasm_gi_size = 0;
+					}
 				}
 			}
 #endif
@@ -4582,6 +4593,39 @@ mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 		}
 	}
 	cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+#ifdef HOST_BROWSER
+	/* R411: a tier-2 body that took bimorphic-GI arms and came out over T2_MAX_BODY is retried ONCE at tier 2 without them
+	 * (qb g0: LivingEntity.tickMovement went 90,851 B -> over the cap -> tier 1). Deterministic, so it cannot loop. */
+	if (cfg && cfg->wasm_jit_tier >= 2 && cfg->wasm_gi2_n > 0 && cfg->wasm_jit_result.e_slot <= 0 &&
+	    !cfg->wasm_jit_result.retriable && cfg->wasm_jit_result.fail_reason &&
+	    strstr (cfg->wasm_jit_result.fail_reason, "T2_MAX_BODY")) {
+		extern void mono_wasm_jit_count (int idx);
+		mono_destroy_compile (cfg);
+		mono_wasm_jit_count (WJC_T2_GI2_RETRY);
+		wasm_jit_policy_no_gi2 = TRUE;
+		cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+		wasm_jit_policy_no_gi2 = FALSE;
+		if (cfg && cfg->wasm_jit_result.e_slot > 0)
+			mono_wasm_jit_count (WJC_T2_GI2_RETRY_OK);
+	}
+	/* plan2x S0b: a tier-2 body over T2_MAX_BODY is retried once at tier 2 with strict inlining; if that fails too,
+	 * the downgrade below takes it, exactly as before. Deterministic, so it cannot loop. */
+	{
+		extern int mono_wasm_jit_t2_strict;
+		if (mono_wasm_jit_t2_strict && cfg && cfg->wasm_jit_tier >= 2 && cfg->wasm_jit_result.e_slot <= 0 &&
+		    !cfg->wasm_jit_result.retriable && cfg->wasm_jit_result.fail_reason &&
+		    strstr (cfg->wasm_jit_result.fail_reason, "T2_MAX_BODY")) {
+			extern void mono_wasm_jit_note_t2_strict (gboolean ok);
+			mono_destroy_compile (cfg);
+			mono_wasm_jit_note_t2_strict (FALSE);
+			wasm_jit_policy_t2_strict = TRUE;
+			cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+			wasm_jit_policy_t2_strict = FALSE;
+			if (cfg && cfg->wasm_jit_result.e_slot > 0)
+				mono_wasm_jit_note_t2_strict (TRUE);
+		}
+	}
+#endif
 	/* R315 (plan Phase 3.3): a compile that inlined bodies keeping their calls and then bailed PERMANENTLY may have
 	 * failed only because of what it inlined (a new rgctx site, too many callee types or direct deps, an
 	 * unsupported opcode). Recompile ONCE at the ordinary policy -- a deterministic downgrade, never a retry of the

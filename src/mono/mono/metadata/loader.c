@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <mono/metadata/body-override.h>
 #include <mono/metadata/metadata.h>
 #include <mono/metadata/image.h>
 #include <mono/metadata/assembly.h>
@@ -2026,6 +2027,15 @@ mono_method_get_header_internal (MonoMethod *method, MonoError *error)
 		return NULL;
 	}
 
+	/* A RUN-TIME BODY REPLACEMENT (body-override.c) wins for a metadata method, inflated or not -- keyed by this exact
+	 * MonoMethod, so an override of one instantiation is not an override of its definition. Persistent: callers'
+	 * mono_metadata_free_mh is a no-op on it. One load when no override exists anywhere. */
+	if (G_UNLIKELY (mono_body_override_live)) {
+		MonoMethodHeader *oh = mono_body_override_header (method);
+		if (oh)
+			return oh;
+	}
+
 	if (method->is_inflated) {
 		MonoMethodInflated *imethod = (MonoMethodInflated *) method;
 		MonoMethodHeader *header, *iheader;
@@ -2093,6 +2103,9 @@ mono_method_metadata_has_header (MonoMethod *method)
 	if (mono_method_has_no_body (method)) {
 		return FALSE;
 	}
+
+	if (G_UNLIKELY (mono_body_override_live) && mono_body_override_header (method))
+		return TRUE;
 
 	if (method->is_inflated) {
 		MonoMethodInflated *imethod = (MonoMethodInflated *) method;

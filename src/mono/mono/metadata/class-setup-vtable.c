@@ -16,6 +16,8 @@
 #include <mono/metadata/marshal.h>
 #include <mono/utils/mono-logger-internals.h>
 #include <mono/utils/unlocked.h>
+#include <mono/utils/atomic.h>
+#include <pthread.h>
 #ifdef MONO_CLASS_DEF_PRIVATE
 /* Class initialization gets to see the fields of MonoClass */
 #define REALLY_INCLUDE_CLASS_DEF 1
@@ -988,6 +990,133 @@ done:
 	g_list_remove (in_setup, klass);
 
 	return;
+}
+
+/*
+ * plan2x S3: class-hierarchy analysis for the wasm JIT (MONO_WASM_JIT_S3, read once). A record per method, keyed by
+ * the MonoMethod pointer -- hashed, compared, never dereferenced -- holding one word in linear memory: 0 while no class
+ * built so far overrides the method in its vtable slot, 1 (never back) once one does. Emitted code reads the word
+ * directly, so records are never freed and the word's address is stable. Inserts under cha_mx (held for an insert
+ * only, never across anything that can take the loader lock); lookups take no lock and publish order is record
+ * first, bucket head second.
+ */
+typedef struct _MonoChaRec {
+	MonoMethod *m;
+	volatile gint32 word;
+	struct _MonoChaRec *volatile next;
+} MonoChaRec;
+
+#define CHA_BUCKETS 16384
+#define CHA_CHUNK 2048
+#define CHA_MAXREC (1 << 20)
+static MonoChaRec *volatile cha_tab [CHA_BUCKETS];
+static pthread_mutex_t cha_mx = PTHREAD_MUTEX_INITIALIZER;
+static int cha_on = -1;
+static gint32 cha_nrec, cha_nmarked;
+
+gboolean
+mono_class_cha_enabled (void)
+{
+	if (G_UNLIKELY (cha_on < 0)) {
+		/* Recording must be on whenever the wasm JIT's S3 knob is, or the JIT finds no word and CHA is inert:
+		 * the same variable, with the browser build's default matching mono_wasm_jit_s3's (mini-wasm.c). */
+		char *v = g_getenv ("MONO_WASM_JIT_S3");
+#ifdef HOST_BROWSER
+		cha_on = v ? ((*v && *v != '0') ? 1 : 0) : 1;
+#else
+		cha_on = (v && *v && *v != '0') ? 1 : 0;
+#endif
+		g_free (v);
+	}
+	return cha_on;
+}
+
+static inline guint32
+cha_hash (MonoMethod *m)
+{
+	guint32 h = (guint32) ((gsize) m >> 3) * 0x9E3779B1u;
+	return (h ^ (h >> 16)) & (CHA_BUCKETS - 1);
+}
+
+static MonoChaRec *
+cha_get (MonoMethod *m)
+{
+	static MonoChaRec *chunk;
+	static int used = CHA_CHUNK;
+	guint32 h = cha_hash (m);
+	MonoChaRec *r;
+	for (r = cha_tab [h]; r; r = r->next)
+		if (r->m == m)
+			return r;
+	pthread_mutex_lock (&cha_mx);
+	for (r = cha_tab [h]; r; r = r->next)
+		if (r->m == m)
+			break;
+	if (!r && cha_nrec < CHA_MAXREC) {
+		if (used == CHA_CHUNK) {
+			chunk = g_new0 (MonoChaRec, CHA_CHUNK);
+			used = 0;
+		}
+		r = &chunk [used++];
+		r->m = m;
+		r->next = cha_tab [h];
+		mono_memory_barrier ();
+		cha_tab [h] = r;
+		cha_nrec++;
+	}
+	pthread_mutex_unlock (&cha_mx);
+	return r;
+}
+
+/* The method's word (created at 0 if absent), or NULL when recording is off or the table is full. */
+gint32 *
+mono_class_cha_word (MonoMethod *m)
+{
+	MonoChaRec *r;
+	if (!m || !mono_class_cha_enabled ())
+		return NULL;
+	r = cha_get (m);
+	return r ? (gint32 *) &r->word : NULL;
+}
+
+void
+mono_class_cha_stats (gint32 *records, gint32 *marked)
+{
+	*records = cha_nrec;
+	*marked = cha_nmarked;
+}
+
+/* KLASS's vtable is about to be published as VTABLE: mark every parent method it replaces. A full table cannot mark,
+ * and an unmarked override would make a CHA guard call the wrong method. So a full table first sets EVERY word
+ * already handed out (every guard then takes its fallback, which is always correct) and only then turns recording
+ * off for good: no new word is handed out after that. The cap is far above any measured need; the event is loud. */
+static void
+cha_note_overrides (MonoClass *klass, MonoMethod **vtable)
+{
+	MonoClass *parent = klass->parent;
+	int i;
+	if (!parent || !parent->vtable || !mono_class_cha_enabled ())
+		return;
+	for (i = 0; i < parent->vtable_size; ++i) {
+		MonoMethod *pm = parent->vtable [i];
+		MonoChaRec *r;
+		if (!pm || vtable [i] == pm)
+			continue;
+		r = cha_get (pm);
+		if (!r) {
+			int b;
+			g_warning ("MONO_WASM_JIT_S3: CHA table full -- every guard invalidated, recording is off");
+			for (b = 0; b < CHA_BUCKETS; ++b)
+				for (r = cha_tab [b]; r; r = r->next)
+					mono_atomic_store_i32 (&r->word, 1);
+			cha_on = 0;
+			return;
+		}
+		if (!r->word) {
+			mono_atomic_store_i32 (&r->word, 1);
+			mono_atomic_inc_i32 (&cha_nmarked);
+		}
+	}
 }
 
 gboolean
@@ -2248,6 +2377,9 @@ mono_class_setup_vtable_general (MonoClass *klass, MonoMethod **overrides, int o
 			g_assert (cur_slot == klass->vtable_size);
 		klass->vtable_size = cur_slot;
 	}
+
+	/* plan2x S3: record the overrides BEFORE klass->vtable is published (an instance needs a published vtable) */
+	cha_note_overrides (klass, vtable);
 
 	/* Try to share the vtable with our parent. */
 	if (klass->parent && (klass->parent->vtable_size == klass->vtable_size) && (memcmp (klass->parent->vtable, vtable, sizeof (gpointer) * klass->vtable_size) == 0)) {

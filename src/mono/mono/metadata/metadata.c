@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <glib.h>
+#include <mono/metadata/body-override.h>
 #include <mono/metadata/metadata.h>
 #include "tabledefs.h"
 #include "mono-endian.h"
@@ -4341,15 +4342,29 @@ mono_method_get_header_summary (MonoMethod *method, MonoMethodHeaderSummary *sum
 	unsigned char flags, format;
 	guint16 fat_flags;
 
-	/*Only the GMD has a pointer to the metadata.*/
-	while (method->is_inflated)
-		method = ((MonoMethodInflated*)method)->declaring;
-
 	summary->code = NULL;
 	summary->code_size = 0;
 	summary->max_stack = 0;
 	summary->has_clauses = FALSE;
 	summary->has_locals = FALSE;
+
+	/* A run-time body replacement (body-override.c) of this exact method, before resolving an instantiation to its
+	 * definition: both inliners size and screen a callee from this summary. */
+	if (G_UNLIKELY (mono_body_override_live)) {
+		MonoMethodHeader *oh = mono_body_override_header (method);
+		if (oh) {
+			summary->code = oh->code;
+			summary->code_size = oh->code_size;
+			summary->max_stack = oh->max_stack;
+			summary->has_clauses = oh->num_clauses > 0;
+			summary->has_locals = oh->num_locals > 0;
+			return TRUE;
+		}
+	}
+
+	/*Only the GMD has a pointer to the metadata.*/
+	while (method->is_inflated)
+		method = ((MonoMethodInflated*)method)->declaring;
 
 	/*FIXME extract this into a MACRO and share it with mono_method_get_header*/
 	if ((method->flags & METHOD_ATTRIBUTE_ABSTRACT) || (method->iflags & METHOD_IMPL_ATTRIBUTE_RUNTIME) || (method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) || (method->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL))

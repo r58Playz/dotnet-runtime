@@ -312,6 +312,10 @@ typedef struct _MonoThreadInfo {
 	 * TODO support multiple values by multiple tools
 	 */
 	void *tools_data;
+
+	/* The wasm JIT's per-worker action-word slot + 1 this thread claimed (mini-wasm-publish.inc), 0 = none: how a hook's
+	 * acknowledgement wait (plan H6) finds a live thread's acknowledged epoch. Unused elsewhere. */
+	gint32 wasm_jit_worker_slot1;
 } MonoThreadInfo;
 
 typedef struct {

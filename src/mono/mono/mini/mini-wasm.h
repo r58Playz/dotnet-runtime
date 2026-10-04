@@ -1203,8 +1203,7 @@ enum {
 	/* R314 (L1) census, stats-gated: a cache handed back an InterpMethod that an IKVM body swap retired.
 	 * RETIRED_IC_HIT: the vcall resolve cache (resolve_fslot's IC words); RETIRED_FASTMISS: get_virtual_method_fast;
 	 * RETIRED_LATE_FSLOT: a heal site's baked late_im; RETIRED_DELEGATE: a delegate recipe. Each is counted
-	 * whether or not MONO_WASM_JIT_FORWARD_RETIRED is on, so the knob-off run sizes the population.
-	 * RETIRED_FORWARDED: forwards actually taken (knob on); RETIRED_FWD_LIVE: of those, the call returned a live
+	 * RETIRED_FORWARDED: forwards taken (all of them, since forwarding is unconditional); RETIRED_FWD_LIVE: of those, the call returned a live
 	 * f-slot. RESID_LIVE_CALLEE: a call_interp crossing whose canonical callee is JIT-live on this thread --
 	 * the residual pool neither retired-cache route explains. */
 	WJC_RETIRED_IC_HIT,
@@ -1339,6 +1338,95 @@ enum {
 	WJC_VCALL2_SCALAR,         /* J1e: an OP_VCALL2_MEMBASE site lowered with a single-field (scalar) value-type result */
 	WJC_ICALL_AOT_SITE,        /* J1a: a direct InternalCall site emitted as an inline-AOT call of its native wrapper (MONO_WASM_JIT_ICALL_AOT) */
 	WJC_LDADDR_ARG,            /* R377: an address-taken scalar argument homed in an addr-frame slot (MONO_WASM_JIT_LDADDR_ARG) */
+	WJC_F4_VT_NONREF,          /* plan2x F4: vtable vregs exempted from the ref frame (MONO_WASM_JIT_F4 & 1) */
+	WJC_F4_VT_REUSE,           /* ... IC / devirt / AOT-IC sites that reused the IR's vtable vreg (& 2) */
+	WJC_F4_IC_MEMO,            /* ... IC method-identity fallbacks emitted with the vtable memo (& 4) */
+	WJC_F4_ARM_MEMO,           /* ... devirt-arm MID guards emitted with the process-wide memo (& 8) */
+	WJC_F9_MCACHE_SITES,       /* plan2x F9: IC sites emitted with the megamorphic-cache probe */
+	WJC_F9_MCACHE_FILLS,       /* ... cache entries written by the PIC publish (stats-gated) */
+	WJC_S1_GUARDED,            /* plan2x S1: guarded module-local calls framed (ungated) */
+	WJC_S1_SUPERSEDED,         /* ... group generations whose guard word was set (ungated) */
+	WJC_S1_GUARD_TAKEN,        /* ... guarded calls that took the table route, counted by the emitted code */
+	WJC_S1_REEMIT_TRY,         /* ... co-location attempts after a re-emit publish (ungated) */
+	WJC_T2C_SITES,             /* plan2x S0: tier-1 entry counters emitted */
+	WJC_T2C_HITS,              /* ... counters that reached MONO_WASM_JIT_T2_COUNT (ungated) */
+	WJC_T2C_REQUESTED,         /* ... of those, tier-2 requests made (ungated) */
+	WJC_T2C_CAPPED,            /* ... refused by MONO_WASM_JIT_T2_MAX (ungated) */
+	WJC_S2_SITES,              /* plan2x S2: tier-1 call-site counters emitted */
+	WJC_S2_ENTRIES,            /* ... tier-1 entry counters emitted */
+	WJC_S2_FULL,               /* ... records refused: the table is full (must stay 0) */
+	WJC_S2_UNKNOWN,            /* ... tier-2 size gate: no trusted count for the site (static policy) */
+	WJC_S2_COLD,               /* ... the site never executed: refused */
+	WJC_S2_WARM,               /* ... counted, below the hot bar (static policy) */
+	WJC_S2_HOT,                /* ... at or above the hot bar */
+	WJC_S2_RAISED,             /* ... hot, and the limit raised for it */
+	WJC_S2_NOPROF,             /* ... hot and over the static limit, but the callee has no tier-1 profile and makes calls */
+	WJC_S2_BUDGET_OUT,         /* ... hot and over the static limit, but the root's budget is spent */
+	WJC_S2_INLINED,            /* ... a raised site that inline_method accepted (the action) */
+	WJC_S2_CTX_MATCH,          /* ... inline_method found the gate's verdict for its own site */
+	WJC_S2_CTX_MISS,           /* ... inline_method entered with no matching verdict (unknown context) */
+	WJC_S3_GI_PRED,            /* plan2x S3: a no-prediction GI site whose base is not overridden: CHA target */
+	WJC_S3_GI_OVERRIDDEN,      /* ... a no-prediction GI site whose base is a CHA candidate but overridden */
+	WJC_S3_GI_EMITTED,         /* ... a CHA-guarded inline emitted (the action) */
+	WJC_S3_ARM_PRED,           /* ... an emitter devirt site with no prediction, base not overridden: CHA target */
+	WJC_S3_ARM_OVERRIDDEN,     /* ... ... base a CHA candidate but overridden */
+	WJC_S3_ARM_EMITTED,        /* ... a CHA-guarded direct-call arm emitted (the action) */
+	WJC_S3_VERIFY_SITES,       /* ... CHA arms carrying the verify check (S3 & 4) */
+	WJC_S3_GI_STATIC,          /* ... an R329 static GI prediction whose identity guard the CHA word replaced */
+	WJC_S4_SEEN,               /* plan2x S4: loads examined by the applying pass */
+	WJC_S4_REWRITTEN,          /* ... of those, rewritten into a move (the action) */
+	WJC_T2_STRICT_TRY,         /* plan2x S0b: strict tier-2 retries after a T2_MAX_BODY failure (ungated) */
+	WJC_T2_STRICT_OK,          /* ... of those, a tier-2 body (ungated) */
+	WJC_S2_GI_HOT_SITES,       /* plan2x S2 & 4: tier-1 guarded-inline hot-arm counters emitted */
+	WJC_S2_GI_COLD,            /* ... tier-2 GI gate: the site never executed (hot arm + fallback): refused */
+	WJC_S2_GI_RAISED,          /* ... tier-2 GI gate: hot, and the GI size limit raised for it */
+	WJC_S2_GI_UNKNOWN,         /* ... tier-2 GI gate: no trusted count (the GI size limit stands) */
+	WJC_ADOPT_SKIP,            /* W1 C0: an install the old generation test would have skipped (R399's class: module not here); ungated */
+	WJC_ADOPT_REINST,          /* W1 C0: an instantiation the old test would have repeated (same module already here); ungated */
+	/* H3 (R401): a compile whose method's body was swapped after the compile took its epoch snapshot is stale -- it may
+	 * have read the displaced IL -- and is refused at each point it could reach callers. Healthy, non-zero after swaps
+	 * that race a compile; ungated. */
+	WJC_EPOCH_REFUSED_LOCAL,     /* before this worker installs it (instantiate_local) */
+	WJC_EPOCH_REFUSED_REGISTER,  /* at registration, under the loader lock: the registry keeps the previous bytes */
+	WJC_EPOCH_REFUSED_PUBLISH,   /* at publication onto the InterpMethod, under the jit_mm lock */
+	WJC_EPOCH_REFUSED_RV,        /* at republication: a newer swap's own re-emission will publish; its request is kept */
+	WJC_PRESERVE_NOGC_REFUSED,   /* a generation that lost no-GC, over callers compiled crediting it: kept the old one */
+	WJC_REEMIT_FOLLOWED,         /* the broker followed a superseded InterpMethod to the current one, request carried */
+	WJC_REEMIT_MANDATORY_BUSY,   /* a body swap's re-emission lost the compile lock and was re-queued with no give-up */
+	WJC_STALE_CERTIFIED,         /* W1 C0 tripwire, MUST READ 0: admitted while its slots held another module */
+	/* plan H4-H6 (R403): hooks with the JIT on. Healthy: routed, restub, bind_interp, guarded, waits, skipped, proxy.
+	 * MUST READ 0: route_fail, unguarded (in hookable mode), ack_timeout. */
+	WJC_HOOK_CREDIT_REFUSED,     /* a no-GC credit not given because the app is hookable */
+	WJC_HOOK_ROUTED,             /* hooks whose method had a live JIT generation, routed to its stub */
+	WJC_HOOK_ROUTE_FAIL,         /* MUST READ 0: a live generation that could not be routed (keeps its old body) */
+	WJC_HOOK_RESTUB,             /* per-worker stub installs at a hooked f-slot */
+	WJC_HOOK_BIND_INTERP,        /* calls through a hooked f-slot's stub, run in the interpreter */
+	WJC_HOOK_GROUP_GUARDED,      /* hooks whose method was co-located: the group's guard word set */
+	WJC_HOOK_GROUP_UNGUARDED,    /* MUST READ 0 when hookable: co-located without a guard -- local calls stay stale */
+	WJC_HOOK_WAITS,              /* Apply/Undo waits for every thread's acknowledgement */
+	WJC_HOOK_WAIT_SKIPPED,       /* hooks with no live JIT generation: interpreter state is shared, nothing to wait for */
+	WJC_HOOK_ACK_PROXY,          /* threads counted acknowledged because they were not running managed code */
+	WJC_HOOK_WAIT_US_MAX,        /* high-water of one wait, microseconds */
+	WJC_HOOK_ACK_TIMEOUT,        /* MUST READ 0: a wait that gave up (MONO_WASM_JIT_HOOK_ACK_TIMEOUT_MS) */
+	WJC_T2_COLD_PRED_GI,         /* R405: tier-2 GI sites predicted from a one-receiver COLD record (decision) */
+	WJC_T2_COLD_PRED_GI_INL,     /* R405: ... of which from the inlinee's record */
+	WJC_T2_COLD_PRED_ARM,        /* R405: tier-2 devirt arms predicted from a one-receiver COLD record (decision) */
+	WJC_PROF_ANC_FOUND,          /* R407: tier-2 GI sites with no record of their own whose enclosing inlinee had one */
+	WJC_PROF_ANC_GI,             /* R407: ... predicted from it (decision) */
+	WJC_PROF_ANC_ARM,            /* R407: tier-2 virtual calls re-keyed to an enclosing inlinee's record for the arm */
+	WJC_T2_LOOP_SITES,           /* R409: tier-1 loop polls emitted with the back-edge counter */
+	WJC_UNDEF_LOCAL,             /* R410: local variables read but never written in a body, typed from their variable */
+	WJC_T2_GI2_CANDIDATE,        /* R411: tier-2 GI sites whose record names a second target */
+	WJC_T2_GI2_EMITTED,          /* R411: ... inlined behind a second guard (the action) */
+	WJC_T2_GI2_LATE,             /* R411: ... refused by inline_method after the guard was emitted */
+	WJC_T2_GI2_POLY_ARM1,        /* R411: tier-2 POLYMORPHIC GI sites predicted their top arm (decision) */
+	WJC_T2_GI2_RETRY,            /* R411: tier-2 bodies over T2_MAX_BODY with bimorphic arms, recompiled without them */
+	WJC_T2_GI2_RETRY_OK,         /* ... and that fit */
+	WJC_B4_PLANS,                /* plan B4 (R443): hot-set partitions computed by the re-emit drainer */
+	WJC_B4_FRAMED,               /* ... groups framed (mono_wasm_jit_rebatch succeeded; the action) */
+	WJC_B4_REFUSED,              /* ... groups refused (rebatch failed, or over the member / byte bound) */
+	WJC_B4_MEMBERS,              /* ... members in the framed groups (merged siblings included) */
+	WJC_B4_PUBLISHED,            /* ... framed groups queued for the next rendezvous */
 	WJC_MAX
 };
 
@@ -1375,7 +1463,7 @@ void mono_wasm_jit_census_note_entry (int eslot);
 
 /* Byte offsets of interp.c's WjEhRec (R353), for the emitter, which cannot see MonoLMFExt from here. */
 typedef struct {
-	int size, previous_lmf, lmf_addr, lmf_method, kind, il_state, magic, prev, finally_sp, il, il_method, il_offset;
+	int size, previous_lmf, lmf_addr, lmf_method, kind, il_state, magic, prev, finally_sp, il, il_method, il_offset, body;
 	guint32 magic_key;
 	int kind_il_state;
 } WjEhRecLayout;

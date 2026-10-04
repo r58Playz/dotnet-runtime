@@ -15,6 +15,7 @@
 #include "ir-emit.h"
 #include "jit-icalls.h"
 
+#include <mono/metadata/body-override.h>
 #include <mono/metadata/abi-details.h>
 #include <mono/metadata/class-abi-details.h>
 #include <mono/metadata/gc-internals.h>
@@ -1062,6 +1063,9 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 	MonoClass *runtime_helpers_class = mono_class_get_runtime_helpers_class ();
 
 	*ins_type_initialized = FALSE;
+	/* A replaced body (body-override.c) runs the replacement, never the intrinsic the original would have been. */
+	if (G_UNLIKELY (mono_body_override_live) && mono_body_override_header (cmethod))
+		return NULL;
 
 	const char* cmethod_klass_name_space;
 	if (m_class_get_nested_in (cmethod->klass))

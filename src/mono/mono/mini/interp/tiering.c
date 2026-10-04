@@ -3,12 +3,24 @@
  * countable from the harness like every other tier decision. */
 #include "../mini-wasm.h"
 #include <mono/utils/mono-threads-api.h>
+#include <mono/metadata/body-override.h>
+
+/* body_invalidate's flags. 0 = behaviour-preserving (an IKVM generation 2); see body_invalidate. */
+#define MONO_BODY_HOOK 1
+static int body_invalidate (MonoMethod *target, MonoMethodHeader *new_header, gpointer detour_ftn, MonoMethod *detour_target, int flags);
 
 static mono_mutex_t tiering_mutex;
 // FIXME: The add/remove traffic on this table may require dn_simdhash to implement cascade flag cleanup
 //  and compaction
 static dn_simdhash_ptr_ptr_t *patch_sites_table;
 static gboolean enable_tiering;
+extern gint32 mono_interp_patch_late_forward;
+gint32 mono_interp_tierup_epoch_refused;   /* H1: tier-ups refused because a body swap replaced the IL (healthy, non-zero after swaps) */
+gint32 mono_interp_swap_origin_forwarded;  /* R402: swaps that also forwarded the retired tier-up copy's origin (healthy) */
+/* Behaviour-altering swaps (MONO_BODY_HOOK) may happen in this process: set by the wasm JIT when liba is linked
+ * (mono_wasm_jit_hookable), and by the first hook regardless. Makes the transform register a patch site for an
+ * OPTIMIZED target as well (transform.c get_data_item_index_imethod). */
+gboolean mono_interp_body_hooks_possible;
 
 void
 mono_interp_tiering_init (void)
@@ -41,9 +53,22 @@ get_tier_up_imethod (InterpMethod *imethod)
 	new_imethod->is_invoke = imethod->is_invoke;
 	new_imethod->optimized = TRUE;
 	new_imethod->prof_flags = imethod->prof_flags;
+	/* Tier-up compiles the SAME IL: the frame migrates between the two by basic-block index. */
+	new_imethod->bound_header = imethod->bound_header;
+	new_imethod->body_epoch = imethod->body_epoch;
 
 	jit_mm_lock (jit_mm);
 	InterpMethod *old_imethod = mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, method);
+	/* A BODY SWAP SINCE `imethod` WAS COMPILED. The registered compilation is of different IL (another epoch), and
+	 * migrating this frame onto it -- or onto a fresh optimized copy, which the transform would build from the
+	 * CURRENT header -- would map its basic-block index into the wrong code (an assert in lookup_patchpoint_data,
+	 * or a frame relocated onto a different stack layout). The opcodes test `retired` first; this closes the window
+	 * between that test and here. The frame stays interpreted, which is merely slower. */
+	if (!old_imethod || imethod->retired || old_imethod->body_epoch != imethod->body_epoch) {
+		jit_mm_unlock (jit_mm);
+		mono_atomic_inc_i32 (&mono_interp_tierup_epoch_refused);
+		return NULL;   /* the newly allocated InterpMethod leaks to the mempool, as below */
+	}
 	if (old_imethod->optimized) {
 		new_imethod = old_imethod; /* leak the newly allocated InterpMethod to the mempool */
 	} else {
@@ -83,6 +108,7 @@ get_tier_up_imethod (InterpMethod *imethod)
 		new_imethod->wasm_jit_t2_samples = old_imethod->wasm_jit_t2_samples;
 		new_imethod->wasm_jit_tier = old_imethod->wasm_jit_tier;
 		new_imethod->wasm_jit_t2_want = old_imethod->wasm_jit_t2_want;
+		new_imethod->tier_origin = imethod;   /* see InterpMethod.tier_origin */
 		mono_internal_hash_table_remove (&jit_mm->interp_code_hash, method);
 		mono_internal_hash_table_insert (&jit_mm->interp_code_hash, method, new_imethod);
 	}
@@ -100,14 +126,22 @@ patch_imethod_site (gpointer data, gpointer user_data)
 	*addr = (InterpMethod*)(tagged ? INTERP_IMETHOD_TAG_1 (user_data) : user_data);
 }
 
+/* Repoint every site registered under old_imethod at new_imethod, and RE-KEY the list under new_imethod rather than
+ * freeing it. Upstream freed it, because an optimized InterpMethod was final; a body swap replaces optimized ones
+ * too, and a site that is no longer tracked is a caller that keeps calling the displaced IL forever (the second
+ * swap of a method -- a MonoMod Undo after Apply, or a tier-up between two IKVM relinks). Under tiering_mutex. */
 static void
 patch_interp_data_items (InterpMethod *old_imethod, InterpMethod *new_imethod)
 {
 	GSList *sites = NULL;
 	if (dn_simdhash_ptr_ptr_try_get_value (patch_sites_table, old_imethod, (void **)&sites)) {
+		GSList *existing = NULL;
 		g_slist_foreach (sites, patch_imethod_site, new_imethod);
 		dn_simdhash_ptr_ptr_try_remove (patch_sites_table, old_imethod);
-		g_slist_free (sites);
+		if (dn_simdhash_ptr_ptr_try_get_value (patch_sites_table, new_imethod, (void **)&existing))
+			dn_simdhash_ptr_ptr_try_replace_value (patch_sites_table, new_imethod, g_slist_concat (sites, existing));
+		else
+			dn_simdhash_ptr_ptr_try_add (patch_sites_table, new_imethod, sites);
 	}
 }
 
@@ -118,6 +152,8 @@ tier_up_method (InterpMethod *imethod, ThreadContext *context)
 	ERROR_DECL(error);
 	// This enables future code to obtain a reference to the optimized imethod
 	InterpMethod *new_imethod = get_tier_up_imethod (imethod);
+	if (!new_imethod)
+		return NULL;   /* refused: a body swap since this compilation (see get_tier_up_imethod) */
 
 	// In theory we can race with other threads compiling the same imethod, but this is not a problem
 	if (!new_imethod->transformed)
@@ -128,8 +164,10 @@ tier_up_method (InterpMethod *imethod, ThreadContext *context)
 	mono_os_mutex_lock (&tiering_mutex);
 
 	if (!imethod->optimized_imethod) {
-		// patch all data items
-		patch_interp_data_items (imethod, new_imethod);
+		/* patch all data items -- to the CURRENT generation: a body swap may have retired new_imethod since
+		 * get_tier_up_imethod registered it (the swap's own patch then found no sites under it), and callers must
+		 * reach the new IL, not this compilation of the old one. The frames below still migrate to new_imethod. */
+		patch_interp_data_items (imethod, interp_imethod_current (new_imethod, TRUE));
 
 		// Other threads executing this imethod will be able to tier the frame up in patchpoints
 		imethod->optimized_imethod = new_imethod;
@@ -169,6 +207,7 @@ gint32 mono_interp_relink_untouched; /* never transformed, so the next call pick
 gint32 mono_interp_relink_rejected;  /* shape/signature mismatch -- an IKVM bug if it ever fires */
 gint32 mono_interp_relink_bail_cleared; /* gen-1 had permanently bailed; gen-2 gets a fresh verdict */
 gint32 mono_interp_relink_refreshed;    /* gen-1 was live; gen-2 starts untried with a fresh slot pair */
+gint32 mono_interp_patch_late_forward;  /* H1: a data item registered after its target was tiered up or swapped, re-pointed to the current one */
 
 static void
 patch_imethod_refs (InterpMethod *old_imethod, InterpMethod *new_imethod)
@@ -234,32 +273,56 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 		return -1;
 	}
 
+	return body_invalidate (target, new_header, NULL, NULL, 0);
+}
+
+/*
+ * THE ONE BODY-REPLACEMENT PRIMITIVE (H2): make `new_header` (NULL = the method's own) the body of `target`, and
+ * retire every compilation of the previous one so NEW calls reach the new body -- an IKVM generation-2 swap
+ * (behaviour-preserving) and a MonoMod-style detour or Undo (MONO_BODY_HOOK, behaviour-altering) alike. Returns 1
+ * replaced, 0 declined (PRESERVING only: see mono_wasm_jit_relink_jitted).
+ *
+ * HOOK differs in two ways: it is never declined, and it sets NoInlining first, under the loader lock, so no compile
+ * that starts after this inlines the method (MonoMod's own contract: compilations that already inlined it keep the old
+ * body, on every runtime). With the wasm JIT, HOOK still republishes the JIT body the PRESERVING way (compile, then
+ * republish) until the routing of plan H5 lands, so a JIT'd method sees the new body only from its republication on.
+ */
+static int
+body_invalidate (MonoMethod *target, MonoMethodHeader *new_header, gpointer detour_ftn, MonoMethod *detour_target, int flags)
+{
 	MonoJitMemoryManager *jit_mm = jit_mm_for_method (target);
-	InterpMethod *old_imethod, *new_imethod;
+	InterpMethod *old_imethod, *new_imethod, *origin = NULL;
+	MonoMethodHeader *prev_header, *installed = NULL;
 	/* Set when the method already owns a live descriptor and needs a mandatory same-slot update. */
 	gboolean replace_live_generation = FALSE;
 	extern int mono_wasm_jit_relink_jitted;
+
+	if (flags & MONO_BODY_HOOK) {
+		mono_interp_body_hooks_possible = TRUE;
+		mono_loader_lock ();
+		target->iflags |= METHOD_IMPL_ATTRIBUTE_NOINLINING;
+		mono_loader_unlock ();
+	}
+	/* The body in force now, as a persistent header the displaced compilation can bind to. Outside the jit_mm lock:
+	 * a metadata method's first replacement parses its own header, which can load types. */
+	prev_header = mono_body_current_header (target);
 
 	jit_mm_lock (jit_mm);
 	old_imethod = (InterpMethod *)mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, target);
 	if (!old_imethod) {
 		/* Not transformed yet. Swap and leave: the first transform reads the header we just installed. */
-		((MonoMethodWrapper *)target)->header = new_header;
+		mono_body_override_install (target, new_header, detour_ftn, detour_target, NULL);
 		jit_mm_unlock (jit_mm);
 		mono_atomic_inc_i32 (&mono_interp_relink_untouched);
 		return 1;
 	}
 
-	/* REFUSE anything the INTERPRETER has promoted, always. A tiered imethod is reachable through
-	 * optimized_imethod and through patchpoints inside running frames, and tier-up migrates a frame
-	 * between two compilations of the SAME IL -- these would be two compilations of DIFFERENT IL, which
-	 * asserts in lookup_patchpoint_data and relocates the frame onto a different stack layout. There is
-	 * no version of that which is merely slow, so this half is not knob-able. */
-	if (old_imethod->optimized || old_imethod->optimized_imethod) {
-		jit_mm_unlock (jit_mm);
-		relink_note_late (target, "interp tier-up");
-		return 0;
-	}
+	/* AN INTERPRETER-TIERED METHOD IS SWAPPED LIKE ANY OTHER (H1). This used to be refused outright -- tier-up
+	 * migrates a frame between two compilations by basic-block index, and after a swap the registered one is of
+	 * DIFFERENT IL -- and a refusal kept the old body for good (IKVM's "late"; a hook silently not applied). What
+	 * makes it safe now: every compilation is bound to its own IL (bound_header, set below on the displaced entry
+	 * BEFORE the header pointer moves, so a tier-up transform already in flight still compiles the old IL), tier-up
+	 * refuses across epochs (get_tier_up_imethod), and frames already running the displaced code finish on it. */
 
 	/* A live wasm method can be replaced because its logical identity, descriptor and table pair stay
 	 * stable: the new body is compiled as another generation and each worker installs it into its OWN
@@ -276,14 +339,21 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	 * dynamic-dispatch helpers), so a late adoption is a missed optimisation. For a detour it is a patch
 	 * not yet applied. Both are bounded; neither is silent -- see WJC_REEMIT_REQUIRED_GIVEUP. */
 	if ((old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0) &&
-	    !mono_wasm_jit_relink_jitted) {
+	    !mono_wasm_jit_relink_jitted && !(flags & MONO_BODY_HOOK)) {
 		jit_mm_unlock (jit_mm);
 		relink_note_late (target, "wasm-JITted");
 		return 0;
 	}
 	replace_live_generation = (old_imethod->wasm_jit_fslot > 0 || old_imethod->wasm_jit_slot > 0);
 
-	((MonoMethodWrapper *)target)->header = new_header;
+	/* Bind the displaced compilation to the IL it was compiled from, BEFORE the header pointer moves, so anything
+	 * that still has to transform it -- a tier-up already in flight, an exception in one of its frames -- compiles
+	 * its own body (mono_interp_transform_method re-reads bound_header after the header). Its unoptimized origin,
+	 * when this entry is a tier-up copy, is already transformed and needs nothing. */
+	if (!old_imethod->bound_header)
+		old_imethod->bound_header = prev_header;
+	mono_memory_barrier ();
+	mono_body_override_install (target, new_header, detour_ftn, detour_target, &installed);
 
 	new_imethod = (InterpMethod *)m_method_alloc0 (target, sizeof (InterpMethod));
 	new_imethod->method = old_imethod->method;
@@ -295,7 +365,17 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 	new_imethod->param_types = old_imethod->param_types;
 	new_imethod->is_invoke = old_imethod->is_invoke;
 	new_imethod->prof_flags = old_imethod->prof_flags;
-	new_imethod->optimized = old_imethod->optimized;
+	/* A new IL generation starts unoptimized: the displaced entry may be a tier-up copy of the OLD IL. */
+	new_imethod->optimized = 0;
+	new_imethod->bound_header = installed;
+	new_imethod->body_epoch = old_imethod->body_epoch + 1;
+	/* Function-pointer identity survives the swap: an `ldftn` taken before it and one taken after must compare equal,
+	 * and a MonoFtnDesc a caller already holds must now enter the new generation. jit_entry and the unbox entry are
+	 * the same pointers' interpreter-entry stubs, keyed by the method. */
+	new_imethod->ftndesc = old_imethod->ftndesc;
+	new_imethod->ftndesc_unbox = old_imethod->ftndesc_unbox;
+	new_imethod->jit_entry = old_imethod->jit_entry;
+	new_imethod->llvmonly_unbox_entry = old_imethod->llvmonly_unbox_entry;
 	/* transformed stays 0 -- that is the whole point: the next call compiles the NEW header. */
 	/* The replacement has happened, so the JIT is free to compile this method again -- from generation 2. */
 	new_imethod->relink_pending = 0;
@@ -336,7 +416,9 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 		/* A new code generation of the same MonoMethod, not a second method. Preserving the pair and the
 		 * descriptor is what lets callers that already baked this f-slot reach generation 2 at all, and it
 		 * consumes no table entries -- R252's fresh-pair shape leaked two per swap against ~68k spare. */
-		new_imethod->wasm_jit_slot = old_imethod->wasm_jit_slot;
+		/* A HOOK's new generation does not enter the old body's e-slot: its entry thunk calls the OLD f module-locally
+		 * (plan H5). The interpreter runs it until the new body publishes its own e-slot. */
+		new_imethod->wasm_jit_slot = (flags & MONO_BODY_HOOK) ? 0 : old_imethod->wasm_jit_slot;
 		new_imethod->wasm_jit_bail = 0;
 		new_imethod->wasm_jit_desc = old_imethod->wasm_jit_desc;
 		new_imethod->wasm_jit_fslot = old_imethod->wasm_jit_fslot;
@@ -391,29 +473,61 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
 
 	/* Link the displaced body to its replacement for caches the swap cannot re-point (interp_imethod_current;
 	 * patch_imethod_refs below only reaches REGISTERED data items). Barrier first: a reader that sees the link
-	 * must see a fully initialised new_imethod. Written unconditionally; readers follow it only under
-	 * MONO_WASM_JIT_FORWARD_RETIRED. */
+	 * must see a fully initialised new_imethod. */
 	mono_memory_barrier ();
 	old_imethod->replaced_by = new_imethod;
 	/* Retire the displaced body BEFORE publishing the new one. Frames already inside it keep running it
 	 * to completion, which is what makes the swap safe -- but they must not tier up out of it. */
 	old_imethod->retired = 1;
+	/* Its interp->JIT entry fast path skips the scaffolding that would notice the swap. */
+	old_imethod->wasm_jit_entry_fast_ok = 0;
+	/* THE RETIRED ENTRY MAY BE A TIER-UP COPY WHOSE ORIGIN IS NOT LINKED TO IT YET (tier_up_method still transforming).
+	 * The origin's callers -- data items, function pointers, delegates -- then reach neither copy nor replacement:
+	 * hookstress measured new calls running the displaced body after Apply/Undo had returned (R402). Forward and
+	 * retire it like the copy; its sites are patched below. Whichever of this and tier_up_method's own link runs
+	 * first, interp_imethod_current reaches new_imethod (both are under tiering_mutex for the patching). */
+	origin = old_imethod->tier_origin;
+	if (origin && !origin->replaced_by && origin != new_imethod) {
+		origin->replaced_by = new_imethod;
+		origin->retired = 1;
+		origin->wasm_jit_entry_fast_ok = 0;
+		mono_atomic_inc_i32 (&mono_interp_swap_origin_forwarded);
+	} else {
+		origin = NULL;
+	}
 
 	mono_internal_hash_table_remove (&jit_mm->interp_code_hash, target);
 	mono_internal_hash_table_insert (&jit_mm->interp_code_hash, target, new_imethod);
+	/* Descriptors callers already hold now name the new generation (the barrier above published it whole). Entry
+	 * points that read an InterpMethod out of one still forward (interp_imethod_live) -- this saves them the hop. */
+	if (new_imethod->ftndesc)
+		new_imethod->ftndesc->interp_method = new_imethod;
+	if (new_imethod->ftndesc_unbox)
+		new_imethod->ftndesc_unbox->interp_method = INTERP_IMETHOD_TAG_UNBOX (new_imethod);
 	jit_mm_unlock (jit_mm);
 
 	/* Outside the jit-mm lock, and load-bearing: a caller that was already transformed baked the OLD
 	 * InterpMethod* into its data_items, so without this it keeps calling generation 1 forever. */
 	patch_imethod_refs (old_imethod, new_imethod);
+	if (origin)
+		patch_imethod_refs (origin, new_imethod);
 
 	if (replace_live_generation && new_imethod->wasm_jit_desc > 0) {
 #ifdef HOST_BROWSER
 		extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
 		mono_wasm_jit_bind_logical (new_imethod->wasm_jit_desc, target);
-		mono_wasm_jit_request_reemit (new_imethod->wasm_jit_desc);
+		if (!(flags & MONO_BODY_HOOK))
+			mono_wasm_jit_request_reemit (new_imethod->wasm_jit_desc);
 #endif
 	}
+#ifdef HOST_BROWSER
+	/* A hook routes the live generation to its stub on every worker and waits for them (plan H5/H6); it queues the
+	 * new body itself, after the route. */
+	if (flags & MONO_BODY_HOOK) {
+		extern void mono_wasm_jit_hook_publish (int desc_id, MonoMethod *m, InterpMethod *im);
+		mono_wasm_jit_hook_publish (replace_live_generation ? new_imethod->wasm_jit_desc : 0, target, new_imethod);
+	}
+#endif
 
 	/* Announce the first one unconditionally. Two reasons: it is the liveness signal for a feature whose
 	 * failure mode is silence (a swap that never fires reads exactly like a swap that is not compiled in),
@@ -479,10 +593,123 @@ mono_interp_replace_method_body (MonoMethod *target, MonoMethod *source)
 	return res;
 }
 
+/* Under tiering_mutex. Optimized InterpMethods are keys too: upstream never registered them because nothing replaced
+ * one, and a body swap does (patch_interp_data_items). */
+/* ---- the WasmDetour convention's entry points (liba, for MonoMod) ------------------------------------------------
+ *
+ * MonoMod's WasmDetourFactory installs exactly one shape of IL into a hooked method -- its ILHooks are detours to a
+ * generated DynamicMethod too -- so that is the only shape accepted: `ldarg* ; ldc.i4 <ftn> ; [tail.] calli 0xF0F0F0F0
+ * ; ret`, the magic token meaning "this method's own signature" (transform.c, method-to-ir.c). It arrives with a tiny
+ * or fat header in front; the fat one MonoMod builds names local-signature token 32, which is not a token, and a stub
+ * has no locals, so the header is rebuilt here rather than parsed. */
+gint32 mono_body_hooks_applied, mono_body_hooks_refused;
+
+static gpointer
+body_detour_stub_ftn (const guint8 *code, guint32 len)
+{
+	guint32 i = 0, v;
+	while (i < len) {
+		guint8 op = code [i];
+		if (op >= 0x02 && op <= 0x05) { i += 1; continue; }                                   /* ldarg.0..3 */
+		if (op == 0x0E && i + 1 < len) { i += 2; continue; }                                  /* ldarg.s */
+		if (op == 0xFE && i + 3 < len && code [i + 1] == 0x09) { i += 4; continue; }          /* ldarg */
+		break;
+	}
+	if (i + 5 > len || code [i] != 0x20)                                                    /* ldc.i4 */
+		return NULL;
+	memcpy (&v, code + i + 1, 4);
+	i += 5;
+	if (i + 2 <= len && code [i] == 0xFE && code [i + 1] == 0x14)                          /* tail. */
+		i += 2;
+	if (i + 5 > len || code [i] != 0x29)                                                    /* calli */
+		return NULL;
+	{ guint32 tok; memcpy (&tok, code + i + 1, 4); if (tok != 0xF0F0F0F0u) return NULL; }
+	i += 5;
+	if (i + 1 != len || code [i] != 0x2A)                                                   /* ret */
+		return NULL;
+	return (gpointer) (gsize) v;
+}
+
+/* The method a function pointer names: a MonoFtnDesc in llvm-only mode, else a (tagged) InterpMethod. Read once, at
+ * install time, from a pointer MonoMod just took (GetFunctionPointer), so no compiler interprets the IL constant. */
+static MonoMethod *
+body_ftn_method (gpointer ftn)
+{
+	extern gboolean mono_llvm_only;
+	if (!ftn)
+		return NULL;
+	if (mono_llvm_only)
+		return ((MonoFtnDesc *) ftn)->method;
+	return INTERP_IMETHOD_UNTAG_UNBOX ((InterpMethod *) ftn)->method;
+}
+
+/* `blob` = header + IL as MonoMod builds it; `len` 0 = derive the length from the header (liba passes only a pointer).
+ * Returns 1 installed, -1 refused (not a detour stub, or a malformed header). */
+int
+mono_body_set_il (MonoMethod *target, const guint8 *blob, guint32 len, int flags)
+{
+	const guint8 *code;
+	guint32 code_size;
+	guint16 max_stack = 8;
+	gpointer ftn;
+	int res;
+
+	if (!target || !blob)
+		return -1;
+	if ((blob [0] & 3) == 2) {             /* tiny: size in the high six bits */
+		code_size = blob [0] >> 2;
+		code = blob + 1;
+	} else if ((blob [0] & 3) == 3) {      /* fat: flags (2), max stack (2), code size (4), locals token (4, ignored) */
+		memcpy (&max_stack, blob + 2, 2);
+		memcpy (&code_size, blob + 4, 4);
+		code = blob + 12;
+	} else {
+		mono_atomic_inc_i32 (&mono_body_hooks_refused);
+		return -1;
+	}
+	if ((len && (guint32) (code - blob) + code_size > len) || code_size > 4096 ||
+	    !(ftn = body_detour_stub_ftn (code, code_size))) {
+		/* liba's P/Invoke returns void to MonoMod, so a refusal would otherwise read as an applied hook. */
+		if (mono_atomic_inc_i32 (&mono_body_hooks_refused) <= 16) {
+			char *name = mono_method_get_full_name (target);
+			g_print ("[body-override] REFUSED a detour on %s: not a WasmDetour stub (code_size=%u)\n", name, code_size);
+			g_free (name);
+		}
+		return -1;
+	}
+
+	MonoMethodHeader *h = (MonoMethodHeader *) g_malloc0 (MONO_SIZEOF_METHOD_HEADER);
+	guint8 *c = (guint8 *) g_malloc (code_size);
+	memcpy (c, code, code_size);
+	h->code = c;
+	h->code_size = code_size;
+	h->max_stack = max_stack;
+	h->is_transient = FALSE;
+
+	MONO_ENTER_GC_UNSAFE;
+	res = body_invalidate (target, h, ftn, body_ftn_method (ftn), flags);
+	MONO_EXIT_GC_UNSAFE;
+	if (res == 1)
+		mono_atomic_inc_i32 (&mono_body_hooks_applied);
+	return res;
+}
+
+/* Undo: the method's own body again. */
+int
+mono_body_clear (MonoMethod *target, int flags)
+{
+	int res;
+	if (!target)
+		return -1;
+	MONO_ENTER_GC_UNSAFE;
+	res = body_invalidate (target, NULL, NULL, NULL, flags);
+	MONO_EXIT_GC_UNSAFE;
+	return res;
+}
+
 static void
 register_imethod_patch_site (InterpMethod *imethod, gpointer *ptr)
 {
-	g_assert (!imethod->optimized);
 	GSList *sites = NULL;
 	guint8 found = dn_simdhash_ptr_ptr_try_get_value (patch_sites_table, imethod, (void **)&sites);
 	sites = g_slist_prepend (sites, ptr);
@@ -499,12 +726,15 @@ register_imethod_data_item (gpointer data, gpointer user_data)
 	InterpMethod **data_items = (InterpMethod**)user_data;
 
 	if (data_items [index]) {
-		if (data_items [index]->optimized_imethod) {
-			// We are under tiering lock, check if the method has been tiered up already
-			data_items [index] = data_items [index]->optimized_imethod;
-			return;
+		/* We are under tiering lock: resolve to the CURRENT compilation -- tiered up, or swapped (H1) -- and
+		 * register the site under THAT key, so a later tier-up or swap still finds it. The transform that baked
+		 * this pointer may have started before either happened. */
+		InterpMethod *cur = interp_imethod_current (data_items [index], TRUE);
+		if (cur != data_items [index]) {
+			data_items [index] = cur;
+			mono_atomic_inc_i32 (&mono_interp_patch_late_forward);
 		}
-		register_imethod_patch_site (data_items [index], (gpointer*)&data_items [index]);
+		register_imethod_patch_site (cur, (gpointer*)&data_items [index]);
 	}
 }
 
@@ -576,22 +806,16 @@ mono_interp_register_imethod_data_items (gpointer *data_items, GSList *indexes)
 void
 mono_interp_register_imethod_patch_site (gpointer *imethod_ptr)
 {
+	mono_os_mutex_lock (&tiering_mutex);
+	/* Under the tiering lock: resolve to the CURRENT compilation (tiered up, or swapped) and track the site under
+	 * it, optimized or not -- a body swap re-points optimized compilations too (H1). The tag is preserved, as
+	 * patch_imethod_site does. */
 	gboolean tagged = INTERP_IMETHOD_IS_TAGGED_1 (*imethod_ptr);
 	InterpMethod *imethod = INTERP_IMETHOD_UNTAG_1 (*imethod_ptr);
-	if (imethod->optimized) {
-		return;
-	} else if (imethod->optimized_imethod) {
-		*imethod_ptr = tagged ? imethod->optimized_imethod : INTERP_IMETHOD_TAG_1 (imethod->optimized_imethod);
-		return;
-	}
-
-	mono_os_mutex_lock (&tiering_mutex);
-	// We are under tiering lock, check if the method has been tiered up already
-	if (imethod->optimized_imethod) {
-		*imethod_ptr = tagged ? imethod->optimized_imethod : INTERP_IMETHOD_TAG_1 (imethod->optimized_imethod);
-	} else {
-		register_imethod_patch_site (imethod, imethod_ptr);
-	}
+	InterpMethod *cur = interp_imethod_current (imethod, TRUE);
+	if (cur != imethod)
+		*imethod_ptr = tagged ? INTERP_IMETHOD_TAG_1 (cur) : cur;
+	register_imethod_patch_site (cur, imethod_ptr);
 	mono_os_mutex_unlock (&tiering_mutex);
 }
 
@@ -603,6 +827,8 @@ mono_interp_tier_up_frame_enter (InterpFrame *frame, ThreadContext *context)
 		optimized_method = frame->imethod->optimized_imethod;
 	else
 		optimized_method = tier_up_method (frame->imethod, context);
+	if (!optimized_method)
+		return NULL;   /* refused (body swap): the caller stays in the unoptimized code */
 	context->stack_pointer = (guchar*)frame->stack + optimized_method->alloca_size;
 	frame->imethod = optimized_method;
 	return optimized_method->code;
@@ -629,6 +855,8 @@ mono_interp_tier_up_frame_patchpoint (InterpFrame *frame, ThreadContext *context
 		optimized_method = unoptimized_method->optimized_imethod;
 	else
 		optimized_method = tier_up_method (unoptimized_method, context);
+	if (!optimized_method)
+		return NULL;   /* refused (body swap): the caller stays in the unoptimized code */
 	for (int i = 0; i < unoptimized_method->num_clauses; i++) {
 		MonoExceptionClause *clause = &unoptimized_method->clauses [i];
 		if (clause->flags != MONO_EXCEPTION_CLAUSE_FINALLY)

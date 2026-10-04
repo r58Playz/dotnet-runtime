@@ -458,7 +458,7 @@ arch_unwind_frame (MonoJitTlsData *jit_tls,
 
 				// FIXME: Do this somewhere else ?
 				ERROR_DECL (error);
-				frame->ji = mini_get_interp_callbacks ()->compile_interp_method (frame->method, error);
+				frame->ji = mini_get_interp_callbacks ()->compile_interp_method (frame->method, ext->il_state, error);
 				mono_error_assert_ok (error);
 				g_assert (frame->ji);
 
@@ -476,7 +476,7 @@ arch_unwind_frame (MonoJitTlsData *jit_tls,
 				 * mono_method_get_header_internal -- i.e. this line. It was the single largest identified boot
 				 * cost, and it is pure bookkeeping: only try_offset/try_len are ever read from the header. */
 				int il_offset = ((MonoMethodILState*)frame->il_state)->il_offset;
-				int clause_index = mini_get_interp_callbacks ()->find_il_clause_for_offset (frame->method, il_offset);
+				int clause_index = mini_get_interp_callbacks ()->find_il_clause_for_offset (frame->method, frame->il_state, il_offset);
 
 				if (clause_index == -2) {
 					MonoMethodHeader *header = mono_method_get_header_checked (frame->method, error);

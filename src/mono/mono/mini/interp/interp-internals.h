@@ -266,6 +266,21 @@ struct InterpMethod {
 	 * cache, heal-site late_im, delegate recipes) would otherwise read this object's wasm_jit_fslot -- 0 for
 	 * a never-compiled generation -- forever. Follow it with interp_imethod_current (). */
 	InterpMethod *replaced_by;
+	/* A tier-up copy's untiered origin (tiering.c get_tier_up_imethod). The copy is registered in interp_code_hash
+	 * BEFORE tier_up_method links the origin forward (optimized_imethod), so a body swap that retires the copy in that
+	 * window must forward and patch the origin as well: its callers and caches still name it, and nothing else moves
+	 * them off the displaced body until the tier-up finishes (hookstress, R402). */
+	InterpMethod *tier_origin;
+	/* THE IL THIS COMPILATION IS BOUND TO, set by a body swap (tiering.c) on both sides of it: the new generation
+	 * gets the header it was swapped to, the retired one the header it was swapped FROM (when it had none). The
+	 * transform reads it instead of the method's current header, so a retired generation that still has to be
+	 * transformed (an exception in an old frame, tiering.c's swap of a never-transformed body) compiles its OWN
+	 * IL, and a tier-up copies it. NULL = never swapped: the current header IS this compilation's. Persistent:
+	 * an SRE header belongs to its method, a body-override header to its record; never freed here. */
+	MonoMethodHeader *bound_header;
+	/* Which IL generation of the method this is: 0 until the first swap, +1 per swap, copied by tier-up. Tier-up
+	 * refuses to migrate a frame onto a compilation of a different epoch (get_tier_up_imethod). */
+	guint32 body_epoch;
 	/* Tier 2 (R316, MONO_WASM_JIT_T2). Full-width fields, not bitfields: the sample count is bumped racily from
 	 * every worker, and a bitfield write would clobber its neighbours. */
 	gint32 wasm_jit_t2_samples;   /* safepoint samples taken inside this method's tier-1 body */
@@ -332,18 +347,50 @@ struct InterpMethod {
  * follow_replaced, IKVM body swaps (replaced_by, a newer generation of the same MonoMethod -- same signature,
  * and it inherits the descriptor and slot pair). Both links are written once, after the target is fully
  * initialised (tier_up_method under tiering_mutex; replace_method_body_locked behind a barrier), and chains
- * can form (gen 1 -> gen 2 -> gen 2 tiered), hence the loop. follow_replaced is MONO_WASM_JIT_FORWARD_RETIRED. */
+ * can form (gen 1 -> gen 2 -> gen 2 tiered), hence the loop. */
 static inline InterpMethod *
 interp_imethod_current (InterpMethod *im, gboolean follow_replaced)
 {
+	InterpMethod *start = im;
+	int hops = 0;
 	for (;;) {
 		if (im->optimized_imethod)
 			im = im->optimized_imethod;
 		else if (follow_replaced && im->replaced_by)
 			im = im->replaced_by;
 		else
-			return im;
+			break;
+		hops++;
 	}
+	/* PATH COMPRESSION. Every body swap adds a link, and a cache that kept the FIRST compilation -- a delegate or function
+	 * pointer taken before any hook -- forwards through all of them on every call: hookstress slowed linearly with the
+	 * number of Apply/Undo cycles (R403). Re-point each retired link passed at the newest compilation; a later one is
+	 * as good a forward as the next, a concurrent swap only extends from it, and links never form a cycle. */
+	if (G_UNLIKELY (hops > 2 && follow_replaced)) {
+		InterpMethod *p = start, *n;
+		int left = hops;
+		while (p && p != im && left-- > 0) {
+			n = p->optimized_imethod ? p->optimized_imethod : p->replaced_by;
+			if (p->replaced_by && p->replaced_by != im)
+				p->replaced_by = im;
+			p = n;
+		}
+	}
+	return im;
+}
+
+/* An InterpMethod read out of a cache that a body swap cannot re-point (a function pointer's descriptor, an
+ * interp-entry argument): the current generation if the method's IL has been swapped since -- directly, or through a
+ * tier-up copy that was then retired -- else `im` itself. One or two loads when nothing was swapped, and it does not
+ * move an untiered compilation onto its tier-up copy, which interp_imethod_current would. */
+extern gboolean mono_interp_body_hooks_possible;   /* tiering.c */
+
+static inline InterpMethod *
+interp_imethod_live (InterpMethod *im)
+{
+	if (G_UNLIKELY (im->replaced_by || (im->optimized_imethod && im->optimized_imethod->replaced_by)))
+		return interp_imethod_current (im, TRUE);
+	return im;
 }
 
 /* Used for localloc memory allocation */

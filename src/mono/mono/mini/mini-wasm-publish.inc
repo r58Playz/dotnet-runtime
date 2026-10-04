@@ -35,14 +35,30 @@ typedef struct {
 	gint32 *desc;     /* owned, never freed */
 } WjRendezvous;
 
-#define WJ_RV_LOG_MAX 4096          /* rendezvous per process; see wj_rv_log_full */
-static WjRendezvous  wj_rv_log [WJ_RV_LOG_MAX];
+/* CHUNKED, AND BOUNDED ONLY IN PRINCIPLE (plan H3). One 4,096-entry array used to be the whole log, and its
+ * exhaustion was a latch refusing every later publication: past it a body swap never reached another worker's
+ * table. Chunks are allocated under the publication lock and published before the epoch that indexes them, so a
+ * reader below the epoch always finds its chunk; never freed, like the records. */
+#define WJ_RV_CHUNK_BITS 12
+#define WJ_RV_CHUNK      (1 << WJ_RV_CHUNK_BITS)
+#define WJ_RV_CHUNKS     4096
+#define WJ_RV_LOG_MAX    (WJ_RV_CHUNK * WJ_RV_CHUNKS)   /* 16 M rendezvous per process; see wj_rv_log_full */
+static WjRendezvous * volatile wj_rv_chunk [WJ_RV_CHUNKS];
 static volatile gint32 wj_global_epoch;      /* published LAST, after the log entry's contents */
 static gint32 wj_rv_log_full;                /* 1 once the log is exhausted: refuse further rendezvous */
+
+static inline WjRendezvous *
+wj_rv_at (gint32 i)
+{
+	return &wj_rv_chunk [i >> WJ_RV_CHUNK_BITS][i & (WJ_RV_CHUNK - 1)];
+}
 
 /* This thread's position in the log, and the re-entrancy guard. Both __thread: the drain runs on the
  * thread that owns the table it is fixing, and nothing else reads them. */
 static __thread gint32 wj_local_epoch;
+/* H6: the newest rendezvous epoch a hook published (set before its wait scans the threads). A drain that has adopted
+ * less than this keeps going before it returns; see the loop at the end of mono_wasm_jit_rendezvous_drain. */
+static volatile gint32 wj_hook_epoch;
 static __thread int    wj_draining;
 /* Has THIS thread ever drained? Turns the global drain count into a participation count, which is the
  * number the positive control actually needs -- "some thread drained 500 times" and "every thread drained"
@@ -145,10 +161,17 @@ static __thread gint32 wj_pub_reraise;
 static __thread int wj_sample_defer;   /* loop polls a pending sample request has survived; see the poll */
 static volatile double wj_edge_tick_ms;   /* emscripten_get_now () at the last sampling tick */
 #define WJ_WORKER_MAX 1024
-static volatile gint32 wj_worker_action [WJ_WORKER_MAX];
+/* ONE WORD PER CACHE LINE (plan2x F5). Other threads write these words -- the sampling timer raises a bit on every
+ * worker, each owner clears its own -- and packed 16 to a line, every such write invalidated the line under the
+ * server thread's poll: the g2 ledger read 0.12 M L1 misses per tick on safepoint polls, where HotSpot has none. */
+/* `acked` (plan H6): the newest rendezvous epoch this worker has fully adopted -- written by its own drain, read by a
+ * hook's acknowledgement wait. Same line as `w`: both are written by the owner, and only the wait reads `acked`. */
+typedef struct { volatile gint32 w; volatile gint32 acked; gint32 pad [14]; } WjActionWord;
+static WjActionWord wj_worker_action [WJ_WORKER_MAX];
 static volatile gint32 wj_worker_n;
 static volatile gint32 wj_worker_action_overflow;      /* the shared always-set fallback; see below */
 static __thread volatile gint32 *wj_my_action;
+static __thread volatile gint32 *wj_my_ack;   /* &wj_worker_action [mine].acked, NULL for the overflow word */
 
 /*
  * This worker's action word, claimed on first use. Called from the instantiate sites' EM_ASM to supply the
@@ -172,7 +195,13 @@ mono_wasm_jit_worker_action_addr (void)
 	}
 	if (idx + 1 > (gint32) mono_wasm_jit_counters [WJC_WORKER_SLOTS])
 		mono_wasm_jit_counters [WJC_WORKER_SLOTS] = idx + 1;
-	wj_my_action = &wj_worker_action [idx];
+	wj_my_action = &wj_worker_action [idx].w;
+	wj_my_ack = &wj_worker_action [idx].acked;
+	{   /* H6: let a hook's wait find this thread's acknowledgement */
+		MonoThreadInfo *info = mono_thread_info_current_unchecked ();
+		if (info)
+			info->wasm_jit_worker_slot1 = idx + 1;
+	}
 	/* Start set: this worker has not adopted anything yet, and deriving that here would race the
 	 * publisher. One extra helper call on its first safepoint settles it. */
 	mono_atomic_store_i32 (wj_my_action, WJ_ACT_GC | WJ_ACT_PUB);
@@ -200,7 +229,7 @@ wj_worker_action_raise_all (gint32 bit)
 	if (n > WJ_WORKER_MAX)
 		n = WJ_WORKER_MAX;
 	for (i = 0; i < n; ++i)
-		wj_action_or (&wj_worker_action [i], bit);
+		wj_action_or (&wj_worker_action [i].w, bit);
 	wj_action_or (&wj_worker_action_overflow, bit);
 }
 
@@ -225,7 +254,8 @@ mono_wasm_jit_poll_all_workers (void)
  * Exported because the BROKER has to know. A refusal that can never clear, fed by a retry path that
  * cannot drop, is this tree's most-repeated bug (CLAUDE.md's admission rule, arrived at from a third
  * direction): the re-emission broker used to re-queue every mandatory descriptor on a failed publication,
- * so past record 4096 it recompiled the whole mandatory population forever, publishing none of it.
+ * so past the (then 4,096-record) log's end it recompiled the whole mandatory population forever, publishing
+ * none of it.
  */
 int mono_wasm_jit_rendezvous_exhausted (void);
 int
@@ -253,7 +283,7 @@ mono_wasm_jit_rendezvous_drain (void)
 {
 	gint32 target, i, completed;
 	gboolean pin = FALSE;
-	int k;
+	int k, rounds = 0;
 
 	target = wj_global_epoch;
 	if (G_LIKELY (wj_local_epoch == target && wj_rv_retry_n == 0))
@@ -261,6 +291,7 @@ mono_wasm_jit_rendezvous_drain (void)
 	if (wj_draining)
 		return;
 	wj_draining = 1;
+again:
 	completed = wj_local_epoch;
 
 	/* Owed re-admissions first, swap-removing the ones that now succeed. ORDER DOES NOT MATTER HERE, and
@@ -293,7 +324,7 @@ mono_wasm_jit_rendezvous_drain (void)
 	 * CURRENT generation, so replaying in order costs at most one redundant instantiation and replaying
 	 * out of order could leave the earlier one installed. */
 	for (i = wj_local_epoch; i < target && i < WJ_RV_LOG_MAX; ++i) {
-		WjRendezvous *rv = &wj_rv_log [i];
+		WjRendezvous *rv = wj_rv_at (i);
 		gint32 k;
 		if (!rv->desc)
 			continue;
@@ -415,8 +446,22 @@ mono_wasm_jit_rendezvous_drain (void)
 	 * mono_wasm_jit_admit that is false for its permanent refusals. It is now bounded by
 	 * WJ_RV_RETRY_ATTEMPTS instead, i.e. by this code rather than by someone else's. See the note there. */
 	wj_local_epoch = pin ? completed : target;
+	/* H6: A HOOK PUBLISHED DURING THIS DRAIN IS ADOPTED BEFORE IT RETURNS. The admissions above instantiate inside
+	 * GC-safe regions; a hook's wait counts a blocked thread as acknowledged (it drains on its way back), but that way
+	 * back is the nested drain the wj_draining guard turns into a no-op -- so without this loop the thread returned to
+	 * managed code still on the record before the hook. Hooks only: looping for every publication kept drains that run
+	 * inside a compile (at the instantiate's GC-safe exit) holding the compile section, and the lost CASes cost
+	 * Minecraft 23 abandoned generation-2 swaps in one run (R403). wj_hook_epoch is set before the wait scans, so a
+	 * drain it proxied finds it here. Bounded; past the bound the thread is RUNNING and the wait does not proxy it. */
+	if (!pin && mono_atomic_load_i32 (&wj_hook_epoch) > target && ++rounds < 64) {
+		target = mono_atomic_load_i32 (&wj_global_epoch);
+		goto again;
+	}
 	if (wj_rv_retry_n > (int) mono_wasm_jit_counters [WJC_RV_RETRY_MAXN])
 		mono_wasm_jit_counters [WJC_RV_RETRY_MAXN] = wj_rv_retry_n;
+	/* H6: acknowledged only with nothing owed -- a hook's restub that has to be retried has not happened here. */
+	if (wj_my_ack && wj_rv_retry_n == 0)
+		mono_atomic_store_i32 (wj_my_ack, wj_local_epoch);
 	wj_draining = 0;
 
 	mono_wasm_jit_counters [WJC_RV_DRAIN]++;
@@ -450,12 +495,15 @@ mono_wasm_jit_safepoint_poll (void)
 	if (wj_my_action && wj_my_action != &wj_worker_action_overflow)
 		was = mono_atomic_xchg_i32 (wj_my_action, 0);
 
-	if (mono_polling_required)
+	/* The GC bit only (MONO_POLLING_GC): the word's other bit is the hook doorbell (H6), which is for code that does
+	 * not read this per-worker word; here the drain below answers it, and re-raising WJ_ACT_GC for it would send every
+	 * back-edge to this helper for as long as a hook waits. */
+	if (mono_polling_required & 1)
 		mono_threads_state_poll ();
 	mono_wasm_jit_rendezvous_drain ();
 
 	if (wj_my_action && wj_my_action != &wj_worker_action_overflow) {
-		if (mono_polling_required)
+		if (mono_polling_required & 1)
 			wj_action_or (wj_my_action, WJ_ACT_GC);
 		if (wj_local_epoch != wj_global_epoch || wj_rv_retry_n) {
 			wj_action_or (wj_my_action, WJ_ACT_PUB);
@@ -799,9 +847,17 @@ mono_wasm_jit_edge_dump (void)
  * ordering: contents, fence, then the epoch that makes them reachable -- the same discipline
  * mono_wasm_jit_register and mono_wasm_jit_batch_bind use, for the same reason.
  */
+gint32 mono_wasm_jit_rendezvous_epoch (const int *descs, int n);
 int mono_wasm_jit_rendezvous (const int *descs, int n);
 int
 mono_wasm_jit_rendezvous (const int *descs, int n)
+{
+	return mono_wasm_jit_rendezvous_epoch (descs, n) > 0;
+}
+
+/* The same, returning the epoch the publication established (0 = refused): what a hook's wait waits for. */
+gint32
+mono_wasm_jit_rendezvous_epoch (const int *descs, int n)
 {
 	gint32 epoch;
 	gint32 *copy;
@@ -906,9 +962,8 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 	mono_loader_lock ();
 	epoch = wj_global_epoch;
 	if (epoch >= WJ_RV_LOG_MAX) {
-		/* REFUSE rather than wrap, for the same reason. Bounded retention is the cheap side of that trade:
-		 * the log is a few thousand small arrays, never freed, because every worker reads them lock-free
-		 * and nothing recalls them. */
+		/* REFUSE rather than wrap, for the same reason: every worker reads records lock-free and nothing
+		 * recalls them. At WJ_RV_LOG_MAX this is not reached by any workload here; WJC_RV_LOG_FULL must read 0. */
 		wj_rv_log_full = 1;
 		mono_wasm_jit_counters [WJC_RV_LOG_FULL]++;
 		mono_loader_unlock ();
@@ -973,10 +1028,15 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 	if (n < (int) (nexp_cap))
 		copy = (gint32 *) g_realloc (copy, (gsize) n * sizeof (gint32));
 
-	wj_rv_log [epoch].n = n;
-	wj_rv_log [epoch].epoch = epoch + 1;
+	if (!wj_rv_chunk [epoch >> WJ_RV_CHUNK_BITS]) {
+		WjRendezvous *chunk = g_new0 (WjRendezvous, WJ_RV_CHUNK);
+		mono_memory_barrier ();
+		wj_rv_chunk [epoch >> WJ_RV_CHUNK_BITS] = chunk;
+	}
+	wj_rv_at (epoch)->n = n;
+	wj_rv_at (epoch)->epoch = epoch + 1;
 	mono_memory_barrier ();              /* contents before the pointer that makes them reachable */
-	wj_rv_log [epoch].desc = copy;
+	wj_rv_at (epoch)->desc = copy;
 	mono_memory_barrier ();              /* ... and the pointer before the epoch that indexes it */
 	wj_global_epoch = epoch + 1;
 	mono_loader_unlock ();
@@ -991,5 +1051,80 @@ mono_wasm_jit_rendezvous (const int *descs, int n)
 
 	mono_wasm_jit_counters [WJC_RV_COUNT]++;
 	mono_wasm_jit_add (WJC_RV_MEMBERS, n);
-	return 1;
+	return epoch + 1;
+}
+
+/*
+ * PLAN H6: wait until every thread has adopted rendezvous `epoch` (a hook's route), so that when Apply returns no new
+ * call anywhere runs the displaced body. A thread is acknowledged when its drain reached the epoch, or by PROXY when it
+ * is not running managed code: blocked (GC-safe) or suspended threads drain on every route back (the coop re-entry
+ * points). Running threads are reached by the rendezvous's WJ_ACT_PUB (JIT code) and by the MONO_POLLING_HOOK doorbell
+ * (interpreter and AOT safepoints), held up for as long as any hook waits. The wait itself is GC-safe.
+ * MONO_WASM_JIT_HOOK_ACK_TIMEOUT_MS (default 0 = forever) bounds it; stragglers are named after 1 s either way.
+ */
+static volatile gint32 wj_hook_waiters;
+void mono_wasm_jit_hook_wait (gint32 epoch);
+void
+mono_wasm_jit_hook_wait (gint32 epoch)
+{
+	extern void mono_threads_polling_update (size_t set, size_t clear);
+	static int timeout_ms = -1;
+	MonoThreadInfo *self = mono_thread_info_current_unchecked ();
+	gint64 t0 = mono_100ns_ticks (), el_ms, us;
+	gboolean warned = FALSE;
+	if (timeout_ms < 0) {
+		const char *t = g_getenv ("MONO_WASM_JIT_HOOK_ACK_TIMEOUT_MS");
+		timeout_ms = (t && *t) ? atoi (t) : 0;
+	}
+	mono_wasm_jit_counters [WJC_HOOK_WAITS]++;
+	{   /* BEFORE the scan: a drain this wait proxies must find it (see the loop in mono_wasm_jit_rendezvous_drain) */
+		gint32 old;
+		do
+			old = mono_atomic_load_i32 (&wj_hook_epoch);
+		while (old < epoch && mono_atomic_cas_i32 (&wj_hook_epoch, epoch, old) != old);
+	}
+	if (mono_atomic_inc_i32 (&wj_hook_waiters) == 1)
+		mono_threads_polling_update (2 /* MONO_POLLING_HOOK */, 0);
+	MONO_ENTER_GC_SAFE;
+	for (;;) {
+		int pending = 0, proxied = 0;
+		FOREACH_THREAD_SAFE_ALL (info) {
+			int s = info->wasm_jit_worker_slot1 - 1, st;
+			if (info == self || s < 0 || s >= WJ_WORKER_MAX)
+				continue;
+			if (mono_atomic_load_i32 (&wj_worker_action [s].acked) >= epoch)
+				continue;
+			st = mono_thread_info_current_state (info);
+			if (st != STATE_RUNNING && st != STATE_ASYNC_SUSPEND_REQUESTED) {
+				proxied++;
+				continue;
+			}
+			pending++;
+			if (warned == 1) {
+				printf ("[wasm-jit hook] waiting on thread %p (worker slot %d, state %d, acked %d < epoch %d)\n",
+					(gpointer) (gsize) mono_thread_info_get_tid (info), s, st,
+					mono_atomic_load_i32 (&wj_worker_action [s].acked), epoch);
+			}
+		} FOREACH_THREAD_SAFE_END
+		if (warned == 1)
+			warned = 2;   /* named once */
+		if (!pending) {
+			mono_wasm_jit_add (WJC_HOOK_ACK_PROXY, proxied);
+			break;
+		}
+		el_ms = (mono_100ns_ticks () - t0) / 10000;
+		if (!warned && el_ms > 1000)
+			warned = 1;   /* the next pass names the stragglers */
+		if (timeout_ms > 0 && el_ms > timeout_ms) {
+			mono_wasm_jit_counters [WJC_HOOK_ACK_TIMEOUT]++;
+			break;
+		}
+		g_usleep (50);
+	}
+	MONO_EXIT_GC_SAFE;
+	if (mono_atomic_dec_i32 (&wj_hook_waiters) == 0)
+		mono_threads_polling_update (0, 2 /* MONO_POLLING_HOOK */);
+	us = (mono_100ns_ticks () - t0) / 10;
+	if (us > mono_wasm_jit_counters [WJC_HOOK_WAIT_US_MAX])
+		mono_wasm_jit_counters [WJC_HOOK_WAIT_US_MAX] = us;
 }

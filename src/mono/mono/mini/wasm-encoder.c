@@ -24,6 +24,7 @@ wasm_buf_init (WasmBuf *b)
 	b->tee_idx = 0;
 	b->relocs = NULL;
 	b->hints = NULL;
+	b->origins = NULL;
 }
 
 void
@@ -69,6 +70,104 @@ wasm_buf_free (WasmBuf *b)
 		g_free (b->hints);
 		b->hints = NULL;
 	}
+	if (b->origins) {
+		WasmOrigins *o = b->origins;
+		if (!o->borrowed && o->mnames) {
+			guint32 k;
+			for (k = 0; k < o->nmeth; ++k)
+				g_free (o->mnames [k]);
+			g_free (o->mnames);
+		}
+		g_free (o->v);
+		g_free (o);
+		b->origins = NULL;
+	}
+}
+
+void
+wasm_origins_init (WasmBuf *b)
+{
+	b->origins = g_new0 (WasmOrigins, 1);
+	b->origins->cur.tag = 0;
+	b->origins->cur.il = -1;
+	b->origins->cur.ilop = 0xFFFF;
+}
+
+static void
+wasm_origin_append (WasmOrigins *o, guint32 off, guint32 nrel, const WasmOrigin *st)
+{
+	WasmOrigin *e;
+	/* Same position as the last transition (same offset, same side of every hole): the later state wins. */
+	if (o->n && o->v [o->n - 1].off == off && o->v [o->n - 1].nrel == nrel) {
+		e = &o->v [o->n - 1];
+	} else {
+		if (o->n == o->cap) {
+			o->cap = o->cap ? o->cap * 2 : 64;
+			o->v = (WasmOrigin *) g_realloc (o->v, sizeof (WasmOrigin) * (gsize) o->cap);
+		}
+		e = &o->v [o->n++];
+	}
+	*e = *st;
+	e->off = off;
+	e->nrel = nrel;
+	/* Drop a transition that restates its predecessor, so a run of identical states is one record. */
+	if (o->n >= 2) {
+		const WasmOrigin *p = &o->v [o->n - 2];
+		if (p->tag == e->tag && p->meth == e->meth && p->il == e->il && p->ilop == e->ilop)
+			o->n--;
+	}
+}
+
+void
+wasm_origin_set (WasmBuf *b, guint16 tag, guint16 meth, gint32 il, guint16 ilop)
+{
+	WasmOrigins *o = b->origins;
+	if (!o)
+		return;
+	o->cur.tag = tag;
+	o->cur.meth = meth;
+	o->cur.il = il;
+	o->cur.ilop = ilop;
+	/* The body is append-only, but drop anything past the end in case an emitter ever rolls back. */
+	while (o->n && o->v [o->n - 1].off > b->len)
+		o->n--;
+	wasm_origin_append (o, b->len, b->relocs ? b->relocs->n : 0, &o->cur);
+}
+
+guint16
+wasm_origin_push (WasmBuf *b, guint16 tag)
+{
+	WasmOrigins *o = b->origins;
+	guint16 prev;
+	if (!o)
+		return 0;
+	prev = o->cur.tag;
+	wasm_origin_set (b, tag, o->cur.meth, o->cur.il, o->cur.ilop);
+	return prev;
+}
+
+void
+wasm_origin_pop (WasmBuf *b, guint16 prev)
+{
+	WasmOrigins *o = b->origins;
+	if (!o)
+		return;
+	wasm_origin_set (b, prev, o->cur.meth, o->cur.il, o->cur.ilop);
+}
+
+void
+wasm_origins_set_methods (WasmBuf *b, char **mnames, guint32 nmeth)
+{
+	WasmOrigins *o = b->origins;
+	guint32 k;
+	if (!o) {
+		for (k = 0; k < nmeth; ++k)
+			g_free (mnames [k]);
+		g_free (mnames);
+		return;
+	}
+	o->mnames = mnames;
+	o->nmeth = nmeth;
 }
 
 void
@@ -134,7 +233,26 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 {
 	const WasmRelocs *rl = src->relocs;
 	const WasmHints *hs = src->hints;
+	const WasmOrigins *os = src->origins;
 	guint32 k, prev = 0, n = rl ? rl->n : 0, hi = 0, nh = hs ? hs->n : 0, base = out->len;
+	guint32 oi = 0, no = os ? os->n : 0;
+	if (os) {
+		out->origins = g_new0 (WasmOrigins, 1);
+		out->origins->mnames = os->mnames;
+		out->origins->nmeth = os->nmeth;
+		out->origins->borrowed = TRUE;
+	}
+	/* Origin map: a transition belongs BEFORE hole k iff it was recorded before hole k was (off < hole, or
+	 * the same offset with nrel <= k); it lands at the output offset of its source offset in that span. */
+#define WASM_FLUSH_ORIGINS(LIMIT, K) do { \
+		guint32 _span_out = out->len; \
+		while (oi < no && (os->v [oi].off < (LIMIT) || (os->v [oi].off == (LIMIT) && os->v [oi].nrel <= (K)))) { \
+			WasmOrigin _t = os->v [oi]; \
+			_t.off = _span_out - base + (os->v [oi].off - prev); \
+			wasm_origin_append (out->origins, _t.off, 0, &_t); \
+			oi++; \
+		} \
+	} while (0)
 	/* R339: a hint at source offset o lands at (out offset of the span holding o) + (o - span start). A hole at
 	 * exactly o is inserted BEFORE the byte at o, so such a hint belongs to the span that starts at the hole. */
 #define WASM_FLUSH_HINTS(LIMIT) do { \
@@ -153,6 +271,7 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 		guint32 ti = ti_base + r->tpool;
 		g_assert (r->off >= prev && r->off <= src->len);   /* relocs are sorted and in range */
 		WASM_FLUSH_HINTS (r->off);
+		WASM_FLUSH_ORIGINS (r->off, k);
 		wasm_bytes (out, src->data + prev, r->off - prev);
 		prev = r->off;
 		switch ((WasmRelocKind) r->kind) {
@@ -174,12 +293,39 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 			wasm_uleb (out, fix [k].idx);
 			break;
 		default:
-			emit_call_site (out, r, &fix [k], ti);
+			if (fix [k].form == WASM_FORM_LOCAL_GUARDED) {
+				/* plan2x S1. The arguments are already on the stack; the callee's functype (ti) is the `if`'s
+				 * block type, so both arms take them as block params and leave its results. The taken arm --
+				 * this group generation was superseded -- is the rare one, hinted so. */
+				wasm_i32_const (out, 0);
+				wasm_op (out, WASM_OP_I32_LOAD); wasm_memarg (out, 2, fix [k].guard);
+				if (!out->hints)
+					out->hints = g_new0 (WasmHints, 1);
+				wasm_hint_at (out->hints, out->len - base, 0);
+				wasm_op (out, WASM_OP_IF); wasm_sleb (out, (gint64) ti);
+					if (fix [k].guard_count) {
+						wasm_i32_const (out, 0);
+						wasm_i32_const (out, 0);
+						wasm_op (out, WASM_OP_I32_LOAD); wasm_memarg (out, 2, fix [k].guard_count);
+						wasm_i32_const (out, 1);
+						wasm_op (out, WASM_OP_I32_ADD);
+						wasm_op (out, WASM_OP_I32_STORE); wasm_memarg (out, 2, fix [k].guard_count);
+					}
+					wasm_i32_const (out, (gint32) r->table_index);
+					wasm_op (out, WASM_OP_CALL_INDIRECT); wasm_uleb (out, ti); wasm_uleb (out, 0);
+				wasm_op (out, WASM_OP_ELSE);
+					wasm_op (out, WASM_OP_CALL); wasm_uleb (out, fix [k].idx);
+				wasm_op (out, WASM_OP_END);
+			} else {
+				emit_call_site (out, r, &fix [k], ti);
+			}
 			break;
 		}
 	}
 	WASM_FLUSH_HINTS (src->len);
 #undef WASM_FLUSH_HINTS
+	WASM_FLUSH_ORIGINS (src->len, 0xffffffffu);
+#undef WASM_FLUSH_ORIGINS
 	wasm_bytes (out, src->data + prev, src->len - prev);
 	/* Serializing must never disturb the peephole state of a buffer that is still being appended to. */
 	out->tee_end = 0;
@@ -639,6 +785,58 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 		emit_code_entry (&sec, no_locals, 1, members [i].e_body);
 	emit_section (out, 10, &sec);
 	wasm_buf_free (&sec);
+
+	/* Origin map (MONO_WASM_JIT_ORIGIN): custom section "wj.origin", after the code section. Offsets are relative
+	 * to the start of each function's local declarations, like the branch hints above, and that length is
+	 * written too so a reader can rebase either way. Layout (LEB): version 1, nfuncs, then per function:
+	 * func_index, locals_len, nmeth, (nmeth - 1) inlinee names, n, n x (off, tag, meth, sleb il, ilop). */
+	{
+		guint32 nf = 0;
+		for (i = 0; i < nmembers; ++i)
+			if (members [i].f_body->origins && members [i].f_body->origins->n)
+				nf++;
+		if (nf) {
+			WasmBuf osec;
+			wasm_buf_init (&osec);
+			wasm_name (&osec, "wj.origin");
+			wasm_uleb (&osec, 1);
+			wasm_uleb (&osec, nf);
+			for (i = 0; i < nmembers; ++i) {
+				const WasmOrigins *o = members [i].f_body->origins;
+				WasmBuf ld;
+				guint32 g, ngroups = 0, k;
+				if (!o || !o->n)
+					continue;
+				wasm_buf_init (&ld);
+				for (g = 0; g < members [i].nlocal_groups; ++g)
+					if (members [i].locals [g].count > 0)
+						ngroups++;
+				wasm_uleb (&ld, ngroups);
+				for (g = 0; g < members [i].nlocal_groups; ++g) {
+					if (members [i].locals [g].count == 0)
+						continue;
+					wasm_uleb (&ld, members [i].locals [g].count);
+					wasm_u8 (&ld, (guint8) members [i].locals [g].type);
+				}
+				wasm_uleb (&osec, nfimports + i);   /* methods precede the thunks */
+				wasm_uleb (&osec, ld.len);
+				wasm_uleb (&osec, o->nmeth ? o->nmeth : 1);
+				for (k = 1; k < o->nmeth; ++k)
+					wasm_name (&osec, o->mnames [k] ? o->mnames [k] : "?");
+				wasm_uleb (&osec, o->n);
+				for (k = 0; k < o->n; ++k) {
+					wasm_uleb (&osec, ld.len + o->v [k].off);
+					wasm_uleb (&osec, o->v [k].tag);
+					wasm_uleb (&osec, o->v [k].meth);
+					wasm_sleb (&osec, o->v [k].il);
+					wasm_uleb (&osec, o->v [k].ilop);
+				}
+				wasm_buf_free (&ld);
+			}
+			emit_section (out, 0, &osec);
+			wasm_buf_free (&osec);
+		}
+	}
 }
 
 /*

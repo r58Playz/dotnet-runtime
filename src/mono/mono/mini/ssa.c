@@ -1223,8 +1223,16 @@ fold_ins (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins, MonoInst **carray
 			g_assert (carray [ins->dreg]->opcode == OP_ICONST);
 			ins->opcode = OP_ICONST;
 			ins->inst_c0 = carray [ins->dreg]->inst_c0;
+			/* COMPILE_WASM: a MANAGED OBJECT constant (STACK_OBJ pconst) carries its GC literal-table slot in inst_p1
+			 * (method-to-ir.c, the ldstr site); the folded copy must keep it, or the backend meets a movable pointer
+			 * with no slot and bails ("managed pconst not interned", 10 tier-2 roots per run under plan2x S0). */
+			if (COMPILE_WASM (cfg) && carray [ins->dreg]->type == STACK_OBJ && carray [ins->dreg]->inst_p0)
+				ins->inst_p1 = carray [ins->dreg]->inst_p1;
 			MONO_INST_NULLIFY_SREGS (ins);
-		} else if (num_sregs == 2 && carray [ins->sreg2]) {
+		} else if (num_sregs == 2 && carray [ins->sreg2] &&
+		           /* COMPILE_WASM: never turn a managed-object constant into an immediate -- the object can move, and
+		            * the baked address would go stale (local-propagation.c refuses the same fold for the same reason) */
+		           !(COMPILE_WASM (cfg) && carray [ins->sreg2]->type == STACK_OBJ && carray [ins->sreg2]->inst_p0)) {
 			/* Perform op->op_imm conversion */
 			opcode2 = mono_op_to_op_imm (ins->opcode);
 			if (opcode2 != -1) {

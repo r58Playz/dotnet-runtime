@@ -130,6 +130,7 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_LCONV_TO_R4:   /* i64 -> f32 */
 	case OP_MOVE_I4_TO_F:  /* i32 bits -> f32 (reinterpret) */
 	case OP_RADD: case OP_RSUB: case OP_RMUL: case OP_RDIV: case OP_RNEG:
+	case OP_RREM:   /* only under MONO_WASM_JIT_RREM; otherwise emulated by an fmodf call before the backend */
 	/* float32 math intrinsics */
 	case OP_ABSF: case OP_SQRTF: case OP_CEILF: case OP_FLOORF: case OP_TRUNCF:
 	case OP_RMIN: case OP_RMAX: case OP_RCOPYSIGN:
@@ -418,6 +419,7 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	/* float arithmetic (float div doesn't raise) */
 	case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV: case OP_FNEG:
 	case OP_RADD: case OP_RSUB: case OP_RMUL: case OP_RDIV: case OP_RNEG:
+	case OP_RREM:   /* inline, or fmodf off its range: a C call that cannot reach a GC or write the heap */
 	/* conversions */
 	case OP_ICONV_TO_I1: case OP_ICONV_TO_U1: case OP_ICONV_TO_I2: case OP_ICONV_TO_U2:
 	case OP_ICONV_TO_R4: case OP_ICONV_TO_R8:
@@ -752,6 +754,1012 @@ typedef struct {
 	 * because a member cannot know its own module's final import count while it is still being written. */
 } WjCtx;
 
+/*
+ * GAP-LEDGER ORIGIN TAGS (MONO_WASM_JIT_ORIGIN; see WasmOrigins in wasm-encoder.h).
+ *
+ * Every byte of a body is attributed to one tag: an emitter construct below WASM_ORIGIN_OP_BASE, or
+ * WASM_ORIGIN_OP_BASE + the mono opcode of the instruction being lowered. The emit loop sets the opcode tag
+ * at each instruction; a construct pushes its tag and pops back to it. A construct nobody tagged therefore
+ * lands under the instruction that triggered it -- still attributable, just coarser. Names are printed once
+ * at init (WASM_JIT_ORIGIN_TAG lines), so the reader never hard-codes the numbering.
+ */
+#define WJO_TAG_LIST(X) \
+	X(UNKNOWN) X(PROLOGUE) X(FRAME) X(IC_PROLOGUE) X(EH_PUSH) X(DISPATCH) X(BB_ILOFS) X(SLOTZERO) \
+	X(ENSURE_FRAME) X(PIN) X(ADDR_ST) X(ADDR_LD) X(REF_LD) X(EXIT) X(EH_POP) X(THROW_SITES) X(LANDING) \
+	X(EPILOGUE) X(RETURN) X(BB_FALL) X(VCALL_PIC) X(AOT_IC) X(HELPER_CALL) X(DYN_CALL) X(METHOD_CALL)
+enum {
+#define WJO_X(n) WJO_##n,
+	WJO_TAG_LIST (WJO_X)
+#undef WJO_X
+	WJO_NTAGS
+};
+
+/* An accepted inlinee's IL range, recorded by inline_method (method-to-ir.c) under MONO_WASM_JIT_ORIGIN so the
+ * emitter can tell which method an instruction's cil_code points into. Mempool-allocated, newest first. */
+typedef struct _WjOriginInl {
+	struct _WjOriginInl *next;
+	const guint8        *code;
+	guint32              size;
+	char                *name;   /* mempool */
+	guint16              idx;    /* meth index in this function's table, assigned by the emitter */
+} WjOriginInl;
+
+void
+mono_wasm_jit_origin_note_inline (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodHeader *cheader)
+{
+	WjOriginInl *e, *it;
+	char *nm;
+	if (!cheader || !cheader->code)
+		return;
+	for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next)
+		if (it->code == cheader->code)
+			return;   /* inlined twice: one range, one entry */
+	e = (WjOriginInl *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjOriginInl));
+	e->code = cheader->code;
+	e->size = cheader->code_size;
+	/* The signature was parsed to inline it, so naming it resolves nothing new; diagnostic knob only. Under S2
+	 * alone the range is all that is needed, and the name stays NULL (every reader takes NULL as "?"). */
+	{ extern int mono_wasm_jit_origin;
+	  if (mono_wasm_jit_origin) {
+		nm = mono_method_get_full_name (cmethod);
+		e->name = mono_mempool_strdup (cfg->mempool, nm ? nm : "?");
+		g_free (nm);
+	  } }
+	e->next = (WjOriginInl *) cfg->wasm_origin_inl;
+	cfg->wasm_origin_inl = e;
+}
+
+/* MONO_WASM_JIT_CAPTURE: print one emitted module, base64, in self-describing lines (threads interleave):
+ *   WASM_JIT_CAPTURE_BEGIN <id> <kind> <len> <name>   then   WASM_JIT_CAPTURE <id> <seq> <b64>   then   ..._END <id>
+ * so the ledger can recompile exactly the bytes this run executed. Tab-separated; the name is last (it has spaces). */
+void
+mono_wasm_jit_capture_module (const char *kind, const char *name, const guint8 *data, guint32 len)
+{
+	static const char tab [] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	static gint32 next_id;
+	enum { CHUNK = 49152 };   /* input bytes per line -> 64 KiB of base64 */
+	char *line = (char *) g_malloc (CHUNK / 3 * 4 + 8);
+	gint32 id = mono_atomic_inc_i32 (&next_id);
+	guint32 off, seq = 0;
+	printf ("WASM_JIT_CAPTURE_BEGIN\t%d\t%s\t%u\t%s\n", id, kind, len, name ? name : "?");
+	for (off = 0; off < len; off += CHUNK, ++seq) {
+		guint32 n = MIN ((guint32) CHUNK, len - off), i, o = 0;
+		for (i = 0; i + 2 < n; i += 3) {
+			guint32 v = (data [off + i] << 16) | (data [off + i + 1] << 8) | data [off + i + 2];
+			line [o++] = tab [(v >> 18) & 63]; line [o++] = tab [(v >> 12) & 63];
+			line [o++] = tab [(v >> 6) & 63];  line [o++] = tab [v & 63];
+		}
+		if (i < n) {
+			guint32 v = data [off + i] << 16;
+			if (i + 1 < n) v |= data [off + i + 1] << 8;
+			line [o++] = tab [(v >> 18) & 63]; line [o++] = tab [(v >> 12) & 63];
+			line [o++] = (i + 1 < n) ? tab [(v >> 6) & 63] : '=';
+			line [o++] = '=';
+		}
+		line [o] = 0;
+		printf ("WASM_JIT_CAPTURE\t%d\t%u\t%s\n", id, seq, line);
+	}
+	printf ("WASM_JIT_CAPTURE_END\t%d\n", id);
+	g_free (line);
+}
+
+/* Tag the body with `ins`: its opcode, and the method/IL offset/IL opcode its cil_code points into. An
+ * instruction with no cil_code keeps the previous method and IL offset (later passes create such). */
+static void
+wj_origin_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins)
+{
+	WasmOrigins *o = b->origins;
+	guint16 meth = o ? o->cur.meth : 0, ilop = o ? o->cur.ilop : 0xFFFF;
+	gint32 il = o ? o->cur.il : -1;
+	const guint8 *ip;
+	if (!o)
+		return;
+	ip = ins->cil_code;
+	if (ip) {
+		if (cfg->header && ip >= cfg->header->code && ip < cfg->header->code + cfg->header->code_size) {
+			meth = 0; il = (gint32) (ip - cfg->header->code);
+		} else {
+			WjOriginInl *it;
+			meth = 0xFFFF; il = -1;
+			for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next)
+				if (ip >= it->code && ip < it->code + it->size) { meth = it->idx; il = (gint32) (ip - it->code); break; }
+		}
+		if (il >= 0)
+			ilop = (*ip == 0xFE) ? (guint16) (0xFE00 | ip [1]) : *ip;
+		else
+			ilop = 0xFFFF;
+	}
+	wasm_origin_set (b, (guint16) (WASM_ORIGIN_OP_BASE + ins->opcode), meth, il, ilop);
+}
+
+/* Number the inlinees (1..n) and hand their names to the body. Called once, before the emit loop. */
+static void
+wj_origin_methods (WasmBuf *b, MonoCompile *cfg)
+{
+	WjOriginInl *it;
+	guint32 n = 1, k;
+	char **names;
+	if (!b->origins)
+		return;
+	for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next)
+		n++;
+	names = g_new0 (char *, n);
+	k = n;
+	for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next) {
+		--k;   /* the list is newest first; number in inlining order */
+		it->idx = (guint16) k;
+		names [k] = g_strdup (it->name ? it->name : "?");
+	}
+	wasm_origins_set_methods (b, names, n);
+}
+
+/* --- MONO_WASM_JIT_S4C: the redundant-load census (plan2x S4, wave 0) ----------------------------------
+ *
+ * A DRY RUN of an alias-aware load CSE + LICM over the IR the emitter is about to lower. Nothing is changed; each
+ * load gets a verdict and the per-(origin method, IL offset, opcode) totals are printed:
+ *   WASM_JIT_HGVN <tier> <method> <il> <op> <loads> <removable> <hoistable> <class mask>
+ * removable = the same (opcode, base, offset) is already available on every path into it within the extended basic
+ *   block (single-predecessor chains, as LCSE), under these kills:
+ *     a def of the base or of the cached value;
+ *     a store to an OBJECT base kills the same byte range on any object base and every derived-base entry;
+ *     a store through anything else (an interior pointer, a byref, a computed address) kills every non-invariant;
+ *     a call, an atomic, a barrier, an LDADDR or any other memory effect kills every non-invariant;
+ *   INVARIANT entries -- offset 0 of an object (its vtable), anything read off a vtable or the klass it names, an
+ *   array's or a string's length -- survive everything but a redefinition of their base.
+ * hoistable = in a natural loop (mono's own, MONO_COMP_LOOPS), the base is not defined in the loop, and the loop
+ *   holds nothing that could kill the entry under the same rules.
+ * class mask: 1 field (object base), 2 invariant, 4 static (constant base), 8 derived base.
+ * The census over-counts nothing it cannot prove from the IR, and is still only a bound: a removable load whose
+ * value V8 keeps in a register costs only its latency, and the join prices each row by the ledger's cycles. */
+static int
+wj_s4_size (int op)
+{
+	switch (op) {
+	case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE: return 1;
+	case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE: return 2;
+	case OP_LOADI8_MEMBASE: case OP_LOADR8_MEMBASE: return 8;
+	case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE: case OP_LOADR4_MEMBASE: return 4;
+	case OP_STOREI1_MEMBASE_REG: case OP_STOREI1_MEMBASE_IMM: return 1;
+	case OP_STOREI2_MEMBASE_REG: case OP_STOREI2_MEMBASE_IMM: return 2;
+	case OP_STOREI8_MEMBASE_REG: case OP_STORER8_MEMBASE_REG: return 8;
+	default: return 4;
+	}
+}
+static gboolean
+wj_s4_is_load (int op)
+{
+	switch (op) {
+	case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE: case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE:
+	case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE: case OP_LOADI8_MEMBASE: case OP_LOADR4_MEMBASE: case OP_LOADR8_MEMBASE:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+enum { WJ_S4_UNK = 0, WJ_S4_OBJ = 1, WJ_S4_VT = 2, WJ_S4_KLASS = 3, WJ_S4_CONST = 4 };
+typedef struct { gint32 op, base, off, val; guint8 inv, cls; } WjS4Ent;
+#define WJ_S4_ENTS 64
+typedef struct { WjS4Ent e [WJ_S4_ENTS]; int n; } WjS4Tab;
+typedef struct { const char *meth; gint32 il; gint32 op; gint32 n, rem, hoist; guint8 mask; } WjS4Row;
+typedef struct { gint32 base, off, sz; guint8 cls; } WjS4St;
+#define WJ_S4_LSTORES 64
+typedef struct { guint8 *def; gboolean clob; int nst, nblocks; WjS4St st [WJ_S4_LSTORES]; } WjS4Loop;
+
+static guint8
+wj_s4_entcls (const guint8 *cls, int base, gint32 off)
+{
+	return cls [base] == WJ_S4_OBJ ? 1 : (cls [base] == WJ_S4_VT || cls [base] == WJ_S4_KLASS) ? 2 : cls [base] == WJ_S4_CONST ? 4 : 8;
+}
+static gboolean
+wj_s4_invariant (const guint8 *cls, int base, gint32 off)
+{
+	if (cls [base] == WJ_S4_VT || cls [base] == WJ_S4_KLASS)
+		return TRUE;
+	/* Offset 0 only. A string's length and an array's max_length were listed here too, but an OBJ base is not known to
+	 * be a string or an array, and on wasm32 those offsets (8, 12) are any object's first instance fields -- which then
+	 * survived stores and calls -- unsound, so the census figures in R383 are upper bounds because of it. (R389 blamed
+	 * the applying pass's boot fault on this; R393 showed it was not the cause, and R433 found it: S4 ran after local
+	 * coalescing.) */
+	if (cls [base] == WJ_S4_OBJ && off == MONO_STRUCT_OFFSET (MonoObject, vtable))
+		return TRUE;
+	return FALSE;
+}
+static void
+wj_s4_kill_store (WjS4Tab *t, const guint8 *cls, int base, gint32 off, int sz)
+{
+	int i, j = 0;
+	gboolean objbase = cls [base] == WJ_S4_OBJ, constbase = cls [base] == WJ_S4_CONST;
+	for (i = 0; i < t->n; ++i) {
+		WjS4Ent *e = &t->e [i];
+		gboolean kill;
+		if (e->inv)
+			kill = FALSE;
+		else if (e->cls == 8)
+			kill = TRUE;                                   /* a derived-base entry can alias anything */
+		else if (!objbase && !constbase)
+			kill = TRUE;                                   /* a store through a derived pointer can hit any field */
+		else if (objbase)
+			kill = e->cls == 1 && e->off < off + sz && off < e->off + wj_s4_size (e->op);
+		else
+			kill = e->cls == 4 && e->base == base && e->off < off + sz && off < e->off + wj_s4_size (e->op);
+		if (!kill)
+			t->e [j++] = *e;
+	}
+	t->n = j;
+}
+static void
+wj_s4_kill_all (WjS4Tab *t)
+{
+	int i, j = 0;
+	for (i = 0; i < t->n; ++i)
+		if (t->e [i].inv)
+			t->e [j++] = t->e [i];
+	t->n = j;
+}
+static void
+wj_s4_kill_vreg (WjS4Tab *t, int v)
+{
+	int i, j = 0;
+	for (i = 0; i < t->n; ++i)
+		if (t->e [i].base != v && t->e [i].val != v)
+			t->e [j++] = t->e [i];
+	t->n = j;
+}
+static gboolean
+wj_s4_is_call (MonoInst *ins)
+{
+	return MONO_IS_CALL (ins);
+}
+
+static const char *wj_opname (int op);   /* defined below; the cross build sees no earlier prototype */
+
+/* The strict invariant set wj_s4_run uses when it APPLIES (see patch_s4a / MONO_WASM_JIT_S4): fields written once
+ * before their object or class is reachable. */
+static gboolean
+wj_s4_invariant_strict (const guint8 *cls, int base, gint32 off)
+{
+	extern int mono_wasm_jit_class_vtable_off (void);
+	if (cls [base] == WJ_S4_OBJ)   /* offset 0 only: see wj_s4_invariant */
+		return off == MONO_STRUCT_OFFSET (MonoObject, vtable);
+	if (cls [base] == WJ_S4_VT)
+		return off == MONO_STRUCT_OFFSET (MonoVTable, klass);
+	if (cls [base] == WJ_S4_KLASS)
+		return off == mono_wasm_jit_class_vtable_off ();
+	return FALSE;
+}
+
+/* APPLY = FALSE: the census (MONO_WASM_JIT_S4C), which prints. APPLY = TRUE: every load found available is rewritten
+ * into a typed move from the vreg holding it, under the strict invariant set; nothing is printed. */
+static int
+wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gboolean calls_kill)
+{
+	MonoBasicBlock *bb;
+	MonoInst *ins;
+	guint8 *cls, *bad;
+	int i, this_dreg, nbb = 0, nrows = 0, caprows = 256;
+	WjS4Tab *exits, *cur;
+	int *order;
+	WjS4Row *rows;
+	gint64 tl = 0, tr = 0, th = 0;
+	if (nvreg <= 0 || !cfg->header)
+		return 0;
+	cls = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+	bad = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+	this_dreg = (mono_method_signature_internal (cfg->method)->hasthis && cfg->args [0] && !m_class_is_valuetype (cfg->method->klass)) ? cfg->args [0]->dreg : -1;
+	/* base classes: OBJ is mono's structural mark (or a reference type's `this`); VT / KLASS / CONST need EVERY def to
+	 * be that shape, iterated to a fixed point because a VT is defined from an OBJ and a KLASS from a VT */
+	for (i = 0; i < nvreg; ++i)
+		if ((vreg_is_ref (cfg, i) && !vreg_is_mp (cfg, i)) || i == this_dreg)
+			cls [i] = WJ_S4_OBJ;
+	{
+		int pass, changed = 1;
+		guint8 *tent = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+		for (pass = 0; changed && pass < 4; ++pass) {
+			changed = 0;
+			memset (tent, 0, (gsize) nvreg); memset (bad, 0, (gsize) nvreg);
+			for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+				MONO_BB_FOR_EACH_INS (bb, ins) {
+					int d = ins->dreg, b = ins->sreg1, want;
+					if (d < 0 || d >= nvreg || cls [d] == WJ_S4_OBJ)
+						continue;
+					if (ins->opcode == OP_LOAD_MEMBASE && ins->inst_offset == 0 && b >= 0 && b < nvreg && cls [b] == WJ_S4_OBJ)
+						want = WJ_S4_VT;
+					else if (ins->opcode == OP_LOAD_MEMBASE && ins->inst_offset == MONO_STRUCT_OFFSET (MonoVTable, klass) && b >= 0 && b < nvreg && cls [b] == WJ_S4_VT)
+						want = WJ_S4_KLASS;
+					else if (ins->opcode == OP_ICONST || ins->opcode == OP_PCONST)
+						want = WJ_S4_CONST;
+					else
+						want = -1;
+					if (want < 0 || (tent [d] && tent [d] != want))
+						bad [d] = 1;
+					else
+						tent [d] = (guint8) want;
+				}
+			for (i = 0; i < nvreg; ++i)
+				if (cls [i] != WJ_S4_OBJ) {
+					guint8 nv = (!bad [i] && tent [i]) ? tent [i] : WJ_S4_UNK;
+					if (nv != cls [i]) { cls [i] = nv; changed = 1; }
+				}
+		}
+	}
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+		nbb = MAX (nbb, bb->block_num + 1);
+	exits = (WjS4Tab *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjS4Tab) * (gsize) (nbb ? nbb : 1));
+	order = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * (gsize) (nbb ? nbb : 1));
+	for (i = 0; i < nbb; ++i) order [i] = -1;
+	cur = (WjS4Tab *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjS4Tab));
+	rows = (WjS4Row *) g_malloc0 (sizeof (WjS4Row) * (gsize) caprows);
+	{
+		int ord = 0;
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+			order [bb->block_num] = ord++;
+	}
+	/* loops: a load is hoistable when nothing in its loop can kill it (same rules). One summary per natural loop
+	 * (mono's loop_blocks, on the header), and each block's INNERMOST loop = the containing one with fewest blocks.
+	 * Stale loop info (a listed block no longer in the CFG) drops the loop. */
+	WjS4Loop *loops = NULL;
+	int *inner = NULL, nloops = 0;
+	if (cfg->comp_done & MONO_COMP_LOOPS) {
+		MonoBasicBlock *h;
+		for (h = cfg->bb_entry; h; h = h->next_bb)
+			if (h->loop_blocks) nloops++;
+		if (nloops) {
+			int li_ = 0;
+			loops = (WjS4Loop *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjS4Loop) * (gsize) nloops);
+			inner = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * (gsize) (nbb ? nbb : 1));
+			for (i = 0; i < nbb; ++i) inner [i] = -1;
+			for (h = cfg->bb_entry; h; h = h->next_bb) {
+				WjS4Loop *L;
+				GList *l;
+				gboolean stale = FALSE;
+				if (!h->loop_blocks)
+					continue;
+				L = &loops [li_];
+				L->def = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+				for (l = h->loop_blocks; l; l = l->next) {
+					MonoBasicBlock *lb = (MonoBasicBlock *) l->data;
+					MonoInst *li;
+					if (!lb || lb->block_num >= nbb || order [lb->block_num] < 0) { stale = TRUE; break; }
+					L->nblocks++;
+					MONO_BB_FOR_EACH_INS (lb, li) {
+						if (MONO_IS_STORE_MEMBASE (li)) {
+							int sb = li->dreg;
+							if (L->nst == WJ_S4_LSTORES || sb < 0 || sb >= nvreg) L->clob = TRUE;
+							else { WjS4St *st = &L->st [L->nst++]; st->base = sb; st->off = (gint32) li->inst_offset; st->sz = wj_s4_size (li->opcode); st->cls = cls [sb]; }
+							continue;
+						}
+						if ((li->flags & MONO_INST_VOLATILE) || (wj_s4_is_call (li) ? calls_kill : wj_ins_clobbers_mem (li)))
+							L->clob = TRUE;
+						if (li->dreg >= 0 && li->dreg < nvreg)
+							L->def [li->dreg] = 1;
+					}
+				}
+				if (stale)
+					continue;   /* li_ not advanced: the slot is reused */
+				for (l = h->loop_blocks; l; l = l->next) {
+					MonoBasicBlock *lb = (MonoBasicBlock *) l->data;
+					int cur_ = inner [lb->block_num];
+					if (cur_ < 0 || loops [cur_].nblocks > L->nblocks)
+						inner [lb->block_num] = li_;
+				}
+				li_++;
+			}
+			nloops = li_;
+		}
+	}
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+		gboolean inherit = bb->in_count == 1 && bb->in_bb [0] && !(bb->flags & BB_EXCEPTION_HANDLER) &&
+			bb->in_bb [0]->block_num < nbb && order [bb->in_bb [0]->block_num] >= 0 &&
+			order [bb->in_bb [0]->block_num] < order [bb->block_num];
+		if (inherit)
+			*cur = exits [bb->in_bb [0]->block_num];
+		else
+			cur->n = 0;
+		MONO_BB_FOR_EACH_INS (bb, ins) {
+			int hit = 0, hoist = 0;
+			if (wj_s4_is_load (ins->opcode) && ins->sreg1 >= 0 && ins->sreg1 < nvreg && !(ins->flags & MONO_INST_VOLATILE)) {
+				int b = ins->sreg1, k;
+				guint8 ec = wj_s4_entcls (cls, b, (gint32) ins->inst_offset);
+				for (k = 0; k < cur->n; ++k)
+					if (cur->e [k].op == ins->opcode && cur->e [k].base == b && cur->e [k].off == (gint32) ins->inst_offset) { hit = 1; break; }
+				/* LICM: against the precomputed summary of bb's innermost natural loop */
+				if (!hit && inner && bb->block_num < nbb && inner [bb->block_num] >= 0) {
+					WjS4Loop *L = &loops [inner [bb->block_num]];
+					if (!L->def [b]) {
+						if (wj_s4_invariant (cls, b, (gint32) ins->inst_offset))
+							hoist = 1;
+						else if (!L->clob && ec != 8) {
+							int q, ok = 1;
+							for (q = 0; q < L->nst && ok; ++q) {
+								WjS4St *st = &L->st [q];
+								gint32 lo = (gint32) ins->inst_offset, hi = lo + wj_s4_size (ins->opcode);
+								if (st->cls != WJ_S4_OBJ && st->cls != WJ_S4_CONST) ok = 0;
+								else if (st->cls == WJ_S4_OBJ && ec == 1 && st->off < hi && lo < st->off + st->sz) ok = 0;
+								else if (st->cls == WJ_S4_CONST && ec == 4 && st->base == b && st->off < hi && lo < st->off + st->sz) ok = 0;
+							}
+							hoist = ok;
+						}
+					}
+				}
+				/* record the verdict at the load's origin (as wj_origin_ins names it) */
+				{
+					const char *meth = mname;
+					gint32 il = -1;
+					const guint8 *ip = ins->cil_code;
+					int r;
+					if (ip && ip >= cfg->header->code && ip < cfg->header->code + cfg->header->code_size)
+						il = (gint32) (ip - cfg->header->code);
+					else if (ip) {
+						WjOriginInl *it;
+						meth = "?inl";
+						for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next)
+							if (ip >= it->code && ip < it->code + it->size) { meth = it->name; il = (gint32) (ip - it->code); break; }
+					}
+					for (r = 0; r < nrows; ++r)
+						if (rows [r].il == il && rows [r].op == ins->opcode && rows [r].meth == meth) break;
+					if (r == nrows) {
+						if (nrows == caprows) { caprows *= 2; rows = (WjS4Row *) g_realloc (rows, sizeof (WjS4Row) * (gsize) caprows); }
+						memset (&rows [r], 0, sizeof (WjS4Row)); rows [r].meth = meth; rows [r].il = il; rows [r].op = ins->opcode; nrows++;
+					}
+					rows [r].n++; tl++;
+					if (hit) { rows [r].rem++; tr++; rows [r].mask |= ec; }
+					else if (hoist) { rows [r].hoist++; th++; rows [r].mask |= ec; }
+				}
+				if (apply) {
+					wj_count (WJC_S4_SEEN);
+					if (hit) {
+						/* the value is in cur->e [k].val on every path into here: the load becomes a move */
+						int mv = ins->opcode == OP_LOADR8_MEMBASE ? OP_FMOVE :
+						         ins->opcode == OP_LOADR4_MEMBASE ? (cfg->r4fp ? OP_RMOVE : OP_FMOVE) :
+						         ins->opcode == OP_LOADI8_MEMBASE ? OP_LMOVE : OP_MOVE;
+						ins->opcode = mv;
+						ins->sreg1 = cur->e [k].val;
+						ins->inst_offset = 0;
+						ins->flags &= ~MONO_INST_FAULT;   /* the first load of this base already null-checked it */
+						wj_count (WJC_S4_REWRITTEN);
+					}
+				}
+				/* the def kills, then the load becomes available */
+				wj_s4_kill_vreg (cur, ins->dreg);
+				if (!hit && ins->dreg >= 0 && ins->dreg != b) {
+					WjS4Ent *e;
+					if (cur->n == WJ_S4_ENTS) { memmove (&cur->e [0], &cur->e [1], sizeof (WjS4Ent) * (WJ_S4_ENTS - 1)); cur->n--; }
+					e = &cur->e [cur->n++];
+					e->op = ins->opcode; e->base = b; e->off = (gint32) ins->inst_offset; e->val = ins->dreg;
+					e->inv = apply ? wj_s4_invariant_strict (cls, b, (gint32) ins->inst_offset) : wj_s4_invariant (cls, b, (gint32) ins->inst_offset);
+					e->cls = ec;
+				}
+				continue;
+			}
+			if (MONO_IS_STORE_MEMBASE (ins)) {
+				int sb = ins->dreg;
+				if (sb >= 0 && sb < nvreg)
+					wj_s4_kill_store (cur, cls, sb, (gint32) ins->inst_offset, wj_s4_size (ins->opcode));
+				else
+					wj_s4_kill_all (cur);
+				continue;   /* a store's dreg is its base, not a def */
+			}
+			/* the oracle must bypass wj_ins_clobbers_mem for calls too: its GC-point fallback clears the table on every
+			 * call, which made the first S4C=2 build print byte-identical HGVN and HGVN_NC rows (R417) */
+			if ((ins->flags & MONO_INST_VOLATILE) || (wj_s4_is_call (ins) ? calls_kill : wj_ins_clobbers_mem (ins)))
+				wj_s4_kill_all (cur);
+			if (ins->dreg >= 0)
+				wj_s4_kill_vreg (cur, ins->dreg);
+		}
+		if (bb->block_num < nbb)
+			exits [bb->block_num] = *cur;
+	}
+	if (!apply) {
+		/* calls_kill = FALSE is the R417 ORACLE (MONO_WASM_JIT_S4C=2): a call kills nothing but what stores, atomics,
+		 * barriers and volatile accesses kill -- i.e. every callee summarised perfectly as writing no field the caller
+		 * cached. An UPPER BOUND for call-effect summaries (plan lever B10), never a transformation: tagged _NC2 (the
+		 * first build's _NC rows were the plain census, see the kill test above). */
+		const char *tag = calls_kill ? "WASM_JIT_HGVN" : "WASM_JIT_HGVN_NC2";
+		for (i = 0; i < nrows; ++i)
+			if (rows [i].rem + rows [i].hoist > 0)
+				printf ("%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%u\n", tag, cfg->wasm_jit_tier, rows [i].meth ? rows [i].meth : "?",
+					rows [i].il, wj_opname (rows [i].op), rows [i].n, rows [i].rem, rows [i].hoist, (unsigned) rows [i].mask);
+		printf ("%s_M\t%d\t%s\t%lld\t%lld\t%lld\n", tag, cfg->wasm_jit_tier, mname ? mname : "?", (long long) tl, (long long) tr, (long long) th);
+	}
+	g_free (rows);
+	return apply ? (int) tr : 0;   /* applying: the loads rewritten */
+}
+
+static void
+wj_s4_census (MonoCompile *cfg, const char *mname, int nvreg)
+{
+	extern int mono_wasm_jit_s4c;
+	wj_s4_run (cfg, mname, nvreg, FALSE, TRUE);
+	if (mono_wasm_jit_s4c >= 2)
+		wj_s4_run (cfg, mname, nvreg, FALSE, FALSE);   /* the call-summary oracle, printed as WASM_JIT_HGVN_NC */
+}
+
+/* --- MONO_WASM_JIT_SITE_COUNT: the call-site census --------------------------------------------------
+ *
+ * One record per emitted IR call instruction, never freed (its counter's address is baked into a module that may
+ * outlive any owner). The emitted increment is a plain load/add/store, so two threads racing on one counter lose
+ * counts; only the server and client threads are hot and they do not share call sites, which is good enough for a
+ * census. Names are interned, under a mutex taken only at emit time, so ~450 k records stay ~15 MB. The dump reads
+ * ints and our own strings only -- no MonoMethod dereference -- so it is safe from the main thread. */
+typedef struct {
+	gint32 count, last;   /* the emitted code bumps count; the dump prints count - last and advances last */
+	gint32 il;            /* IL offset in the root, or in the inlinee when inl != NULL; -1 = unknown */
+	guint8 tier, kind, ready;
+	char gi;              /* W3: the guarded-inline verdict at this IL site (method-to-ir wj_site_gi_note), 0 = none */
+	gint8 arm;            /* W3: the emitter's devirt arm outcome for a virtual site (ic_tag), -1 = not a virtual site */
+	gpointer caller_m, callee_m;   /* identities only, NEVER dereferenced after record time */
+	const char *caller, *inl, *callee;
+} WjSiteRec;
+/* The record of the call instruction being lowered, so the lowering can file its arm outcome. Per thread: compiles
+ * on different workers do not share it, and the emitter loop clears it for every instruction. */
+static __thread WjSiteRec *wj_site_cur;
+
+#define WJ_SITE_CHUNK 8192
+#define WJ_SITE_MAXCHUNKS 4096
+static WjSiteRec *wj_site_chunks [WJ_SITE_MAXCHUNKS];
+static gint32 wj_site_n, wj_site_dumps;
+static mono_mutex_t wj_site_mx;
+static GHashTable *wj_site_names;
+
+void mono_wasm_jit_site_init (void);
+void
+mono_wasm_jit_site_init (void)
+{
+	mono_os_mutex_init (&wj_site_mx);
+	wj_site_names = g_hash_table_new (g_str_hash, g_str_equal);
+}
+
+/* Under wj_site_mx. */
+static const char *
+wj_site_intern (const char *s)
+{
+	char *v;
+	if (!s)
+		s = "?";
+	v = (char *) g_hash_table_lookup (wj_site_names, s);
+	if (!v) {
+		v = g_strdup (s);
+		g_hash_table_insert (wj_site_names, v, v);
+	}
+	return v;
+}
+
+static gboolean
+wj_site_is_call (int op)
+{
+	switch (op) {
+	case OP_CALL: case OP_VOIDCALL: case OP_FCALL: case OP_LCALL: case OP_RCALL: case OP_VCALL2:
+	case OP_CALL_REG: case OP_VOIDCALL_REG: case OP_FCALL_REG: case OP_LCALL_REG: case OP_RCALL_REG: case OP_VCALL2_REG:
+	case OP_CALL_MEMBASE: case OP_VOIDCALL_MEMBASE: case OP_FCALL_MEMBASE: case OP_LCALL_MEMBASE: case OP_RCALL_MEMBASE:
+	case OP_VCALL2_MEMBASE:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+/* Allocate this call instruction's record and emit its stack-neutral increment. Called before the call is
+ * lowered; an instruction that then fails the compile just leaves an unreachable record behind. */
+static void
+wj_site_count_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins, const char *mname)
+{
+	MonoCallInst *call = (MonoCallInst *) ins;
+	WjSiteRec *r;
+	const guint8 *ip = ins->cil_code;
+	char *cn = NULL;
+	gint32 i, ck;
+	guint32 addr;
+
+	i = mono_atomic_inc_i32 (&wj_site_n) - 1;
+	ck = i / WJ_SITE_CHUNK;
+	if (ck >= WJ_SITE_MAXCHUNKS)
+		return;   /* census full: the site is simply not counted */
+	if (!wj_site_chunks [ck]) {
+		WjSiteRec *c = g_new0 (WjSiteRec, WJ_SITE_CHUNK);
+		if (mono_atomic_cas_ptr ((gpointer *) &wj_site_chunks [ck], c, NULL) != NULL)
+			g_free (c);
+	}
+	r = &wj_site_chunks [ck][i % WJ_SITE_CHUNK];
+	r->tier = (guint8) cfg->wasm_jit_tier;
+	r->arm = -1;
+	r->gi = (cfg->wasm_site_gi && ip) ? (char) GPOINTER_TO_INT (g_hash_table_lookup (cfg->wasm_site_gi, ip)) : 0;
+	r->kind = (ins->opcode == OP_CALL_MEMBASE || ins->opcode == OP_VOIDCALL_MEMBASE || ins->opcode == OP_FCALL_MEMBASE ||
+	           ins->opcode == OP_LCALL_MEMBASE || ins->opcode == OP_RCALL_MEMBASE || ins->opcode == OP_VCALL2_MEMBASE) ? 'v'
+	        : (ins->opcode == OP_CALL_REG || ins->opcode == OP_VOIDCALL_REG || ins->opcode == OP_FCALL_REG ||
+	           ins->opcode == OP_LCALL_REG || ins->opcode == OP_RCALL_REG || ins->opcode == OP_VCALL2_REG) ? 'r' : 'd';
+	/* W3: 'i' = a virtual call to an INTERFACE method (IMT dispatch), split out of 'v' -- a flags read on the loaded
+	 * class, like the name reads below. */
+	if (r->kind == 'v' && call->method && call->method->klass && MONO_CLASS_IS_INTERFACE_INTERNAL (call->method->klass))
+		r->kind = 'i';
+	r->il = -1;
+	/* NOT mono_method_get_full_name. A callee's full name walks its signature, and resolving names in a compile-time
+	 * table on a worker is R199's `memory access out of bounds` (~33% of runs; R205 has the history). Namespace,
+	 * class and method name are direct field reads on loaded metadata. The full name a reader needs comes from the
+	 * callee's OWN records, joined on callee_m == caller_m: a JITted method's name is computed at its own emit. */
+	r->caller_m = cfg->method;
+	r->callee_m = call->method;
+	if (call->method && call->method->klass)
+		cn = g_strdup_printf ("%s%s%s:%s", m_class_get_name_space (call->method->klass),
+			*m_class_get_name_space (call->method->klass) ? "." : "", m_class_get_name (call->method->klass),
+			call->method->name);
+	mono_os_mutex_lock (&wj_site_mx);
+	if (ip && cfg->header && ip >= cfg->header->code && ip < cfg->header->code + cfg->header->code_size) {
+		r->il = (gint32) (ip - cfg->header->code);
+	} else if (ip) {
+		WjOriginInl *it;
+		for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next)
+			if (ip >= it->code && ip < it->code + it->size) {
+				r->il = (gint32) (ip - it->code); r->inl = wj_site_intern (it->name); break;
+			}
+	}
+	r->caller = wj_site_intern (mname);
+	if (!cn && call->jit_icall_id) {   /* R406: a JIT icall names itself (a static table read) */
+		MonoJitICallInfo *ji = mono_find_jit_icall_info (call->jit_icall_id);
+		if (ji && ji->name)
+			cn = g_strdup_printf ("icall:%s", ji->name);
+	}
+	r->callee = wj_site_intern (cn ? cn : (call->fptr ? (call->fptr_is_patch ? "?patch" : "?fptr") : "?"));
+	mono_os_mutex_unlock (&wj_site_mx);
+	g_free (cn);
+	mono_memory_barrier ();
+	r->ready = 1;
+	wj_site_cur = r;
+
+	addr = (guint32) (gsize) &r->count;
+	wasm_i32_const (b, 0);
+	wasm_i32_const (b, 0);
+	wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, addr);
+	wasm_i32_const (b, 1);
+	wasm_op (b, WASM_OP_I32_ADD);
+	wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, addr);
+}
+
+/* Print every site whose count moved since the previous dump. With --dumps the harness dumps at both edges of the
+ * in-game window, so the second dump's lines are the window's call graph. Also the deploy marker. */
+void mono_wasm_jit_dump_sites (void);
+void
+mono_wasm_jit_dump_sites (void)
+{
+	extern int mono_wasm_jit_site_count;
+	gint32 n = wj_site_n, i, lines = 0, seq;
+	gint64 total = 0;
+	if (!mono_wasm_jit_site_count)
+		return;
+	seq = ++wj_site_dumps;
+	if (n > WJ_SITE_MAXCHUNKS * WJ_SITE_CHUNK)
+		n = WJ_SITE_MAXCHUNKS * WJ_SITE_CHUNK;
+	mono_memory_barrier ();
+	for (i = 0; i < n; ++i) {
+		WjSiteRec *c = wj_site_chunks [i / WJ_SITE_CHUNK], *r;
+		gint32 now, d;
+		if (!c)
+			continue;
+		r = &c [i % WJ_SITE_CHUNK];
+		if (!r->ready)
+			continue;
+		now = r->count; d = now - r->last; r->last = now;
+		if (d <= 0)
+			continue;
+		total += d; lines++;
+		printf ("WASM_JIT_SITE\t%d\t%d\t%u\t%c\t%d\t%p\t%p\t%s\t%s\t%s\t%c\t%d\n", seq, d, r->tier, r->kind, r->il,
+			r->caller_m, r->callee_m, r->caller, r->inl ? r->inl : "-", r->callee, r->gi ? r->gi : '-', r->arm);
+	}
+	printf ("[wasm-jit sites] dump=%d records=%d moved=%d calls=%lld fields=gi+arm\n", seq, n, lines, (long long) total);
+	fflush (stdout);
+}
+
+/* --- MONO_WASM_JIT_S2: tier-1 counts for tier 2's inliner (plan2x S2) ----------------------------------------
+ *
+ * A record is keyed (root method, IL buffer the site's IL is in, IL offset); il -1 is the root's entry count and il
+ * -2 (code NULL) marks "this method has a tier-1 body". All three keys are IDENTITIES -- hashed and compared, never
+ * dereferenced -- so a lookup is safe on a worker in the middle of a compile (the retained-MonoMethod rule). An IKVM
+ * body swap installs a new IL buffer, so the old generation's counts stop matching rather than mis-attributing.
+ * Records are never freed: a counter's address is baked into modules that may outlive anything. Inserts take
+ * wj_s2_mx and publish the record before the bucket head; lookups take no lock. Counts are plain load/add/store
+ * from emitted code, so racing threads lose counts; a ratio tolerates that. Read them unsigned. */
+typedef struct _WjS2Rec {
+	gint32 count;
+	gint32 il;
+	gconstpointer root, code;
+	struct _WjS2Rec *volatile next;
+} WjS2Rec;
+
+#define WJ_S2_BUCKETS 65536
+#define WJ_S2_CHUNK 4096
+#define WJ_S2_MAXREC (1 << 20)
+static WjS2Rec *volatile wj_s2_tab [WJ_S2_BUCKETS];
+static mono_mutex_t wj_s2_mx;
+static gint32 wj_s2_nrec;
+
+void mono_wasm_jit_s2_init (void);
+void
+mono_wasm_jit_s2_init (void)
+{
+	mono_os_mutex_init (&wj_s2_mx);
+}
+
+static inline guint32
+wj_s2_hash (gconstpointer root, gconstpointer code, gint32 il)
+{
+	guint32 h = (guint32) (gsize) root * 0x9E3779B1u;
+	h ^= ((guint32) (gsize) code + 0x7F4A7C15u) * 0x85EBCA77u;
+	h ^= (guint32) il * 0xC2B2AE3Du;
+	h ^= h >> 15;
+	return h & (WJ_S2_BUCKETS - 1);
+}
+
+static WjS2Rec *
+wj_s2_find (gconstpointer root, gconstpointer code, gint32 il)
+{
+	WjS2Rec *r;
+	for (r = wj_s2_tab [wj_s2_hash (root, code, il)]; r; r = r->next)
+		if (r->root == root && r->code == code && r->il == il)
+			return r;
+	return NULL;
+}
+
+/* The record, created if absent; NULL once the table is full (counted, must stay 0). */
+static WjS2Rec *
+wj_s2_get (gconstpointer root, gconstpointer code, gint32 il)
+{
+	static WjS2Rec *chunk;
+	static int used = WJ_S2_CHUNK;
+	WjS2Rec *r = wj_s2_find (root, code, il);
+	guint32 h;
+	if (r)
+		return r;
+	mono_os_mutex_lock (&wj_s2_mx);
+	r = wj_s2_find (root, code, il);
+	if (!r && wj_s2_nrec < WJ_S2_MAXREC) {
+		if (used == WJ_S2_CHUNK) {
+			chunk = g_new0 (WjS2Rec, WJ_S2_CHUNK);
+			used = 0;
+		}
+		r = &chunk [used++];
+		r->root = root; r->code = code; r->il = il;
+		h = wj_s2_hash (root, code, il);
+		r->next = wj_s2_tab [h];
+		mono_memory_barrier ();
+		wj_s2_tab [h] = r;
+		wj_s2_nrec++;
+	}
+	mono_os_mutex_unlock (&wj_s2_mx);
+	if (!r)
+		wj_count (WJC_S2_FULL);
+	return r;
+}
+
+/* The IL buffer and offset of an instruction's cil_code: the root's own IL or an accepted inlinee's (the
+ * wasm_origin_inl list, which S2 bit 1 populates without names). */
+static gboolean
+wj_s2_site_of (MonoCompile *cfg, const guint8 *ip, gconstpointer *code, gint32 *il)
+{
+	WjOriginInl *it;
+	if (!ip)
+		return FALSE;
+	if (cfg->header && ip >= cfg->header->code && ip < cfg->header->code + cfg->header->code_size) {
+		*code = cfg->header->code; *il = (gint32) (ip - cfg->header->code);
+		return TRUE;
+	}
+	for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next)
+		if (ip >= it->code && ip < it->code + it->size) {
+			*code = it->code; *il = (gint32) (ip - it->code);
+			return TRUE;
+		}
+	return FALSE;
+}
+
+/* A tier-1 call instruction's counter: emits a stack-neutral increment of the site's record. */
+static void
+wj_s2_count_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins)
+{
+	gconstpointer code;
+	gint32 il;
+	WjS2Rec *r;
+	guint32 addr;
+	if (!((MonoCallInst *) ins)->method || !wj_s2_site_of (cfg, ins->cil_code, &code, &il))
+		return;
+	r = wj_s2_get (cfg->method, code, il);
+	if (!r)
+		return;
+	addr = (guint32) (gsize) &r->count;
+	wasm_i32_const (b, 0);
+	wasm_i32_const (b, 0);
+	wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, addr);
+	wasm_i32_const (b, 1);
+	wasm_op (b, WASM_OP_I32_ADD);
+	wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, addr);
+	wj_count (WJC_S2_SITES);
+}
+
+/* The entry counter of a tier-1 body (NULL if the table is full), and the "has a tier-1 body" mark. */
+static gint32 *
+wj_s2_entry_word (MonoCompile *cfg)
+{
+	WjS2Rec *r;
+	if (!cfg->header || !cfg->header->code)
+		return NULL;
+	r = wj_s2_get (cfg->method, cfg->header->code, -1);
+	if (r)
+		wj_count (WJC_S2_ENTRIES);
+	return r ? &r->count : NULL;
+}
+
+void mono_wasm_jit_s2_note_body (MonoCompile *cfg);
+void
+mono_wasm_jit_s2_note_body (MonoCompile *cfg)
+{
+	(void) wj_s2_get (cfg->method, NULL, -2);
+}
+
+gboolean mono_wasm_jit_s2_has_body (MonoMethod *m);
+gboolean
+mono_wasm_jit_s2_has_body (MonoMethod *m)
+{
+	return wj_s2_find (m, NULL, -2) != NULL;
+}
+
+/* The frequency, in calls per ROOT entry, of the call site cfg is IR-building (cfg->ip in the IL that starts at
+ * cfg->cil_start, inside cfg->current_method), or -1 when the counts do not say. Two routes:
+ *   1. the root's own tier-1 body counted this site (it is in the root's IL, or in an inlinee the tier-1 body also
+ *      inlined): count / root entries -- context-sensitive;
+ *   2. otherwise, inside an inlinee that has its own tier-1 body: the inline context's frequency times the site's
+ *      share of the inlinee's own entries -- context-insensitive, as C2's.
+ * A site tier 1 inlined has no call instruction and so no record: that reads "unknown", never "cold". */
+/* plan2x S3: M's CHA word if M is a candidate (a class-virtual, non-abstract, non-generic method of a non-generic,
+ * non-valuetype class whose vtable is built) and no loaded class overrides it now; else NULL. *candidate says
+ * whether M was a candidate at all, so the overridden share can be counted. Field reads on a method the IR builder
+ * is using right now -- not a retained pointer. */
+gint32 *mono_wasm_jit_cha_final_word (MonoMethod *m, gboolean *candidate);
+gint32 *
+mono_wasm_jit_cha_final_word (MonoMethod *m, gboolean *candidate)
+{
+	gint32 *w;
+	*candidate = FALSE;
+	/* No wrappers: the array store check (virt_stelemref_*) is a per-array-class wrapper in a vtable slot whose
+	 * "override" comes from array COVARIANCE (Foo[]'s parent is System.Array, not object[]), so no parent/child slot
+	 * comparison ever sees it -- it was every one of the ~30 M verify mismatches in b5/b6 (R388). */
+	if (!m || m->wrapper_type != MONO_WRAPPER_NONE || !(m->flags & METHOD_ATTRIBUTE_VIRTUAL) || (m->flags & METHOD_ATTRIBUTE_ABSTRACT) ||
+	    m->is_inflated || m->is_generic || m->slot < 0 || !m->klass)
+		return NULL;
+	if (mono_class_is_interface (m->klass) || mono_class_is_ginst (m->klass) || mono_class_is_gtd (m->klass) ||
+	    m_class_is_valuetype (m->klass) || !m_class_get_vtable (m->klass))
+		return NULL;
+	*candidate = TRUE;
+	w = mono_class_cha_word (m);
+	return (w && *w == 0) ? w : NULL;
+}
+
+/* plan2x S3 verify mismatches, by (base method, receiver class). Insert-only, lock-free (CAS on the base word, then the
+ * class); a full table counts into the last row. Identities are retained for the dump, which reads names off them --
+ * the receiver's class is live (an instance just used it) and the base is the method a JIT body names. */
+typedef struct { MonoMethod *volatile base; MonoClass *volatile klass; volatile gint32 n; } WjChaWrong;
+#define WJ_CHA_WRONG_N 64
+static WjChaWrong wj_cha_wrong_tab [WJ_CHA_WRONG_N];
+void mono_wasm_jit_cha_wrong_note (MonoMethod *base, MonoVTable *vt);
+void
+mono_wasm_jit_cha_wrong_note (MonoMethod *base, MonoVTable *vt)
+{
+	MonoClass *k = vt ? vt->klass : NULL;
+	int i;
+	for (i = 0; i < WJ_CHA_WRONG_N - 1; ++i) {
+		WjChaWrong *e = &wj_cha_wrong_tab [i];
+		if (e->base == base && e->klass == k) { mono_atomic_inc_i32 (&e->n); return; }
+		if (!e->base && mono_atomic_cas_ptr ((gpointer *) &e->base, base, NULL) == NULL) {
+			e->klass = k;
+			mono_memory_barrier ();
+			mono_atomic_inc_i32 (&e->n);
+			return;
+		}
+	}
+	mono_atomic_inc_i32 (&wj_cha_wrong_tab [WJ_CHA_WRONG_N - 1].n);
+}
+void mono_wasm_jit_cha_wrong_dump (void);
+void
+mono_wasm_jit_cha_wrong_dump (void)
+{
+	int i;
+	for (i = 0; i < WJ_CHA_WRONG_N; ++i) {
+		WjChaWrong *e = &wj_cha_wrong_tab [i];
+		MonoMethod *b = e->base, *s = NULL;
+		MonoClass *k = e->klass;
+		if (!e->n || !b)
+			continue;
+		if (k && m_class_get_vtable (k) && b->slot >= 0 && b->slot < m_class_get_vtable_size (k))
+			s = m_class_get_vtable (k) [b->slot];
+		printf ("[wasm-jit s3 wrong] %d  base %s%s%s:%s slot %d | receiver %s%s%s sub=%d | slot holds %s%s%s:%s\n", e->n,
+			m_class_get_name_space (b->klass), *m_class_get_name_space (b->klass) ? "." : "", m_class_get_name (b->klass), b->name,
+			b->slot, k ? m_class_get_name_space (k) : "?", k && *m_class_get_name_space (k) ? "." : "", k ? m_class_get_name (k) : "?",
+			k ? (int) mono_class_has_parent (k, b->klass) : -1,
+			s ? m_class_get_name_space (s->klass) : "-", s && *m_class_get_name_space (s->klass) ? "." : "", s ? m_class_get_name (s->klass) : "-",
+			s ? s->name : "-");
+	}
+}
+
+/* plan2x S0b's two counters, for mini.c (which does not see the WJC enum). FALSE = a strict retry began, TRUE = it
+ * produced a tier-2 body. Ungated. */
+void mono_wasm_jit_note_t2_strict (gboolean ok);
+void
+mono_wasm_jit_note_t2_strict (gboolean ok)
+{
+	mono_wasm_jit_counters [ok ? WJC_T2_STRICT_OK : WJC_T2_STRICT_TRY]++;
+}
+
+/* plan2x S2 & 4: the hot arm of a tier-1 guarded inline is counted under il | WJ_S2_GI_HOT (IL offsets are far below). */
+#define WJ_S2_GI_HOT 0x40000000
+gint32 *mono_wasm_jit_s2_gi_hot_word (MonoCompile *cfg);
+gint32 *
+mono_wasm_jit_s2_gi_hot_word (MonoCompile *cfg)
+{
+	WjS2Rec *r;
+	if (!cfg->cil_start || !cfg->ip || cfg->ip < (const guint8 *) cfg->cil_start)
+		return NULL;
+	r = wj_s2_get (cfg->method, cfg->cil_start, (gint32) (cfg->ip - (const guint8 *) cfg->cil_start) | WJ_S2_GI_HOT);
+	if (r)
+		wj_count (WJC_S2_GI_HOT_SITES);
+	return r ? &r->count : NULL;
+}
+
+/* The count of a GI site's executions under one root: fallback record + hot-arm record; -1 if neither exists. */
+static gint64
+wj_s2_gi_count (gconstpointer root, gconstpointer code, gint32 il)
+{
+	WjS2Rec *s = wj_s2_find (root, code, il), *h = wj_s2_find (root, code, il | WJ_S2_GI_HOT);
+	if (!s && !h)
+		return -1;
+	return (gint64) (s ? (guint32) s->count : 0) + (gint64) (h ? (guint32) h->count : 0);
+}
+
+/* As mono_wasm_jit_s2_site_freq, for a guarded-inline site: hot arm + fallback. */
+double mono_wasm_jit_s2_gi_site_freq (MonoCompile *cfg);
+double
+mono_wasm_jit_s2_gi_site_freq (MonoCompile *cfg)
+{
+	extern int mono_wasm_jit_s2_min;
+	gconstpointer code = cfg->cil_start;
+	const guint8 *ip = cfg->ip;
+	WjS2Rec *e;
+	gint64 n;
+	gint32 il;
+	if (!code || !ip || ip < (const guint8 *) code || !cfg->header)
+		return -1;
+	il = (gint32) (ip - (const guint8 *) code);
+	e = wj_s2_find (cfg->method, cfg->header->code, -1);
+	if (e && (guint32) e->count >= (guint32) mono_wasm_jit_s2_min && (n = wj_s2_gi_count (cfg->method, code, il)) >= 0)
+		return (double) n / (double) (guint32) e->count;
+	if (cfg->inline_depth > 0 && cfg->wasm_s2_ctx >= 0 && cfg->current_method) {
+		e = wj_s2_find (cfg->current_method, code, -1);
+		if (e && (guint32) e->count >= (guint32) mono_wasm_jit_s2_min && (n = wj_s2_gi_count (cfg->current_method, code, il)) >= 0)
+			return cfg->wasm_s2_ctx * (double) n / (double) (guint32) e->count;
+	}
+	return -1;
+}
+
+double mono_wasm_jit_s2_site_freq (MonoCompile *cfg);
+double
+mono_wasm_jit_s2_site_freq (MonoCompile *cfg)
+{
+	extern int mono_wasm_jit_s2_min;
+	gconstpointer code = cfg->cil_start;
+	const guint8 *ip = cfg->ip;
+	WjS2Rec *e, *s;
+	gint32 il;
+	if (!code || !ip || ip < (const guint8 *) code || !cfg->header)
+		return -1;
+	il = (gint32) (ip - (const guint8 *) code);
+	e = wj_s2_find (cfg->method, cfg->header->code, -1);
+	if (e && (guint32) e->count >= (guint32) mono_wasm_jit_s2_min && (s = wj_s2_find (cfg->method, code, il)))
+		return (double) (guint32) s->count / (double) (guint32) e->count;
+	if (cfg->inline_depth > 0 && cfg->wasm_s2_ctx >= 0 && cfg->current_method) {
+		e = wj_s2_find (cfg->current_method, code, -1);
+		if (e && (guint32) e->count >= (guint32) mono_wasm_jit_s2_min && (s = wj_s2_find (cfg->current_method, code, il)))
+			return cfg->wasm_s2_ctx * (double) (guint32) s->count / (double) (guint32) e->count;
+	}
+	return -1;
+}
+
+
+
 /* --- the four call forms the emitter can leave behind --------------------------------------------
  *
  * None of these writes a call. Each records a zero-length HOLE (see wasm-encoder.h) saying what is being
@@ -768,8 +1776,22 @@ typedef struct {
 static void
 wj_emit_helper_call (WasmBuf *b, gpointer addr, guint32 type_idx)
 {
+	guint16 _o = wasm_origin_push (b, WJO_HELPER_CALL);
 	wasm_reloc (b, WASM_RELOC_HELPER, type_idx, (guint32) (intptr_t) addr, NULL);
+	wasm_origin_pop (b, _o);
 }
+
+/* plan B4 (MONO_WASM_JIT_B4, R442): a tier-2 body's direct-call edges, each weighted by its call site's tier-1 S2
+ * count, for the hot-set partitioner (mono_wasm_jit_b4_plan). Recorded while the body is lowered and attached to its
+ * WjBody. wj_edge_on is set per compile by the emitter; the buffer is reused across this thread's compiles. */
+/* R448: an edge holds a POINTER to its S2 counter, read when the planner runs: a tier-1 body's own call sites keep
+ * counting, so its edges weigh what runs NOW; a tier-2 body's point at the tier-1-era record of the same site. est = the
+ * site had no record and the counter is the root's entry count. */
+typedef struct { gpointer callee; gint32 fslot; gint32 *wptr; guint32 est; } WjEdge;
+static __thread GArray *wj_edge_buf;
+static __thread gboolean wj_edge_on;
+static __thread gint32 *wj_edge_wptr;   /* the S2 counter of the call instruction being lowered (NULL: none) */
+static __thread guint32 wj_edge_est;
 
 /* Another wasm-JITted method, named by identity as well as by f-slot: the identity is what lets the
  * assembler notice the callee is co-located (making this a one-instruction `call <funcidx>` that V8 can
@@ -777,7 +1799,13 @@ wj_emit_helper_call (WasmBuf *b, gpointer addr, guint32 type_idx)
 static void
 wj_emit_method_call (WasmBuf *b, MonoMethod *callee, int fslot, guint32 type_idx)
 {
+	guint16 _o = wasm_origin_push (b, WJO_METHOD_CALL);
 	wasm_reloc (b, WASM_RELOC_CALL, type_idx, (guint32) fslot, callee);
+	wasm_origin_pop (b, _o);
+	if (G_UNLIKELY (wj_edge_on) && fslot > 0 && wj_edge_wptr) {
+		WjEdge e = { callee, fslot, wj_edge_wptr, wj_edge_est };
+		g_array_append_val (wj_edge_buf, e);
+	}
 }
 
 /* A call whose target index is computed at run time -- a virtual dispatch, an IC hit, a calli. This one
@@ -785,7 +1813,9 @@ wj_emit_method_call (WasmBuf *b, MonoMethod *callee, int fslot, guint32 type_idx
 static void
 wj_emit_dynamic_call (WasmBuf *b, guint32 type_idx)
 {
+	guint16 _o = wasm_origin_push (b, WJO_DYN_CALL);
 	wasm_reloc (b, WASM_RELOC_INDIRECT, type_idx, 0, NULL);
+	wasm_origin_pop (b, _o);
 }
 
 /* A fixed table index that the helper-import conversion never covered.
@@ -804,7 +1834,9 @@ wj_emit_dynamic_call (WasmBuf *b, guint32 type_idx)
 static void
 wj_emit_helper_call_ci (WasmBuf *b, gpointer addr, guint32 type_idx)
 {
+	guint16 _o = wasm_origin_push (b, WJO_HELPER_CALL);
 	wasm_reloc (b, WASM_RELOC_HELPER_CI, type_idx, (guint32) (intptr_t) addr, NULL);
+	wasm_origin_pop (b, _o);
 }
 
 /* An AOT method body. Identical mechanically to a helper -- a fixed function-table index with a known
@@ -969,9 +2001,14 @@ wasm_ld (WasmBuf *b, WjCtx *c, int vreg)
 {
 	if (vreg < 0 || vreg >= c->nvreg)
 		return FALSE;
-	if (c->addrslot && c->addrslot [vreg] >= 0)   /* address-taken local: read from the addr frame */
-		return wasm_addr_ld (b, c, vreg);
+	if (c->addrslot && c->addrslot [vreg] >= 0) {   /* address-taken local: read from the addr frame */
+		guint16 _o = wasm_origin_push (b, WJO_ADDR_LD);
+		gboolean _r = wasm_addr_ld (b, c, vreg);
+		wasm_origin_pop (b, _o);
+		return _r;
+	}
 	if (c->refslot && c->refslot [vreg] >= 0) {
+		guint16 _o;
 		if (c->ref_wt && c->ref_wt [vreg]) {
 			/* write-through ref: the wasm local is the value home; the slot copy (stored at every
 			 * def) pins the referent so this cached value can't be moved out from under us. */
@@ -979,6 +2016,7 @@ wasm_ld (WasmBuf *b, WjCtx *c, int vreg)
 			return TRUE;
 		}
 		/* reference vreg: load from the GC-scanned ref shadow stack */
+		_o = wasm_origin_push (b, WJO_REF_LD);
 #ifdef HOST_BROWSER
 		/* STOREGUARD, LOAD SIDE. kinds 0/1 were store-only, so a frame LOAD through a bad refbase was
 		 * the one piece of emitter memory traffic no guard covered -- and after R269 excluded a wild
@@ -1000,12 +2038,60 @@ wasm_ld (WasmBuf *b, WjCtx *c, int vreg)
 #endif
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
 		wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, (guint32) (c->refslot [vreg] * 4));
+		wasm_origin_pop (b, _o);
 		return TRUE;
 	}
 	if (c->li [vreg] < 0)
 		return FALSE;
 	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->li [vreg]);
 	return TRUE;
+}
+
+/* R405 follow-up: a move whose vreg has no home (no wasm local, ref slot or addr slot) bails the compile -- seen once
+ * per run on selectTicks' tier-2 body with MONO_WASM_JIT_T2_COLD_PRED on. Name the instruction, both vregs' homes, the
+ * variable behind each and its definitions, so the bail can be attributed to the IR that produced it. Rare (bail path
+ * only); reads the compile's own IR, no metadata. */
+static void
+wj_move_fail_diag (MonoCompile *cfg, WjCtx *c, MonoInst *bad, const char *mname)
+{
+	MonoBasicBlock *bb;
+	MonoInst *ins;
+	int regs [2], k;
+	const char *inl = "-";
+	gint32 il = -1;
+	if (bad->cil_code && cfg->header && bad->cil_code >= cfg->header->code && bad->cil_code < cfg->header->code + cfg->header->code_size) {
+		il = (gint32) (bad->cil_code - cfg->header->code);
+	} else if (bad->cil_code) {
+		WjOriginInl *it;
+		for (it = (WjOriginInl *) cfg->wasm_origin_inl; it; it = it->next)
+			if (bad->cil_code >= it->code && bad->cil_code < it->code + it->size) {
+				il = (gint32) (bad->cil_code - it->code); inl = it->name; break;
+			}
+	}
+	printf ("[wasm-jit move-fail] %s op=%d type=%d il=0x%x inl=%s nvreg=%d tier=%d\n", mname, bad->opcode, bad->type, il,
+		inl ? inl : "?", c->nvreg, cfg->wasm_jit_tier);
+	regs [0] = bad->sreg1; regs [1] = bad->dreg;
+	for (k = 0; k < 2; ++k) {
+		int v = regs [k], ndef = 0, nuse = 0;
+		MonoInst *var = v >= 0 ? get_vreg_to_inst (cfg, v) : NULL;
+		gboolean in = v >= 0 && v < c->nvreg;
+		printf ("    %s r%d: li=%d ref=%d addr=%d var=%s vop=%d vtype=%d vflags=0x%x klass=%s\n", k ? "dreg" : "sreg1", v,
+			in ? c->li [v] : -9, in && c->refslot ? c->refslot [v] : -9, in && c->addrslot ? c->addrslot [v] : -9,
+			var ? "yes" : "no", var ? var->opcode : -1, var ? var->type : -1, var ? var->flags : 0,
+			var && var->klass ? m_class_get_name (var->klass) : "-");
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+			MONO_BB_FOR_EACH_INS (bb, ins) {
+				if (ins->dreg == v) {
+					if (ndef++ < 4)
+						printf ("      def bb%d op=%d type=%d sreg1=%d sreg2=%d\n", bb->block_num, ins->opcode, ins->type, ins->sreg1, ins->sreg2);
+				} else if (ins->sreg1 == v || ins->sreg2 == v || ins->sreg3 == v) {
+					if (nuse++ < 4)
+						printf ("      use bb%d op=%d type=%d dreg=%d\n", bb->block_num, ins->opcode, ins->type, ins->dreg);
+				}
+			}
+		printf ("      defs=%d uses=%d\n", ndef, nuse);
+	}
+	fflush (stdout);
 }
 
 static gboolean
@@ -1032,9 +2118,14 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 {
 	if (vreg < 0 || vreg >= c->nvreg)
 		return FALSE;
-	if (c->addrslot && c->addrslot [vreg] >= 0)   /* address-taken local: write to the addr frame */
-		return wasm_addr_st (b, c, vreg);
+	if (c->addrslot && c->addrslot [vreg] >= 0) {   /* address-taken local: write to the addr frame */
+		guint16 _o = wasm_origin_push (b, WJO_ADDR_ST);
+		gboolean _r = wasm_addr_st (b, c, vreg);
+		wasm_origin_pop (b, _o);
+		return _r;
+	}
 	if (c->refslot && c->refslot [vreg] >= 0) {
+		guint16 _o = wasm_origin_push (b, WJO_PIN);
 		/* reference vreg: store the value (already on the wasm stack) to the ref shadow stack.
 		 * i32.store wants [addr, val] but val is on top, so stash it via a local then push addr+val.
 		 * Write-through mode stashes into the vreg's OWN local (which becomes the value home);
@@ -1045,8 +2136,10 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		/* lazy_frame 2 (MONO_WASM_JIT_LAZY_COLD): the frame is only ever live inside a raise or poll taken
 		 * arm, never at a def, and the gate required every slotted ref to be write-through -- the local
 		 * just set IS the value home, and ENSURE_REF_FRAME copies it into the slot when a GC can happen. */
-		if (c->lazy_frame == 2)
+		if (c->lazy_frame == 2) {
+			wasm_origin_pop (b, _o);
 			return TRUE;
+		}
 		if (c->lazy_frame) {
 			/* Before materialization the wasm local is the sole value home and there is no valid
 			 * refbase to mirror into. Once active, retain ordinary write-through semantics. */
@@ -1069,6 +2162,7 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, (guint32) (c->refslot [vreg] * 4));
 		if (c->lazy_frame)
 			wasm_op (b, WASM_OP_END);
+		wasm_origin_pop (b, _o);
 		return TRUE;
 	}
 	if (c->li [vreg] < 0)
@@ -1114,6 +2208,25 @@ wj_opname (int op)
 #undef MINI_OP
 #undef MINI_OP3
 	default: return "?";
+	}
+}
+
+/* MONO_WASM_JIT_ORIGIN: the tag-name table, once per process, for the ledger reader. */
+void
+mono_wasm_jit_origin_print_tags (void)
+{
+	static const char *const names [] = {
+#define WJO_X(n) #n,
+		WJO_TAG_LIST (WJO_X)
+#undef WJO_X
+	};
+	int t;
+	for (t = 0; t < WJO_NTAGS; ++t)
+		printf ("WASM_JIT_ORIGIN_TAG %d %s\n", t, names [t]);
+	for (t = 0; t < OP_LAST; ++t) {
+		const char *nm = wj_opname (t);
+		if (nm && strcmp (nm, "?"))
+			printf ("WASM_JIT_ORIGIN_TAG %d op:%s\n", WASM_ORIGIN_OP_BASE + t, nm);
 	}
 }
 
@@ -1204,6 +2317,12 @@ wj_fslot_is_nogc (int fslot)
 	WjRegEntry *re;
 	if (fslot <= 0)
 		return FALSE;
+	/* H4: a hook can replace any JIT callee with a body that collects, under frames already running. */
+	{ extern int mono_wasm_jit_hookable;
+	  if (mono_wasm_jit_hookable) {
+		mono_wasm_jit_counters [WJC_HOOK_CREDIT_REFUSED]++;
+		return FALSE;
+	  } }
 	/* Phase 5, invariant 3: a pool slot may still be a stub on the worker that runs this call, and a stub's bind
 	 * can collect. "Registered before their callers", the premise above, does not hold for it -- unless the callee
 	 * IS registered there, no-GC, and admission installs it for real before any caller goes live
@@ -1220,7 +2339,10 @@ wj_fslot_is_nogc (int fslot)
 	if (desc_id <= 0 || desc_id > wj_reg_n)
 		return FALSE;
 	re = wj_reg_at (desc_id - 1);
-	return re && re->f == fslot && re->no_gc;
+	if (!(re && re->f == fslot && re->no_gc))
+		return FALSE;
+	re->nogc_credited = 1;   /* a caller is about to rely on it (see WjRegEntry.nogc_credited) */
+	return TRUE;
 }
 
 /* The descriptor whose f-slot (kind 0) or e-slot (kind 1) is `idx`, or 0 if `idx` is not a JIT slot at all
@@ -2074,6 +3196,80 @@ wj_emit_class_slot_method (WasmBuf *body, int vt_local, int class_vtable_off, in
 	wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) (slot * 4));
 }
 
+/* plan2x F4 (MONO_WASM_JIT_F4 & 2): the vreg mono's IR already loaded `this->vtable` into for this call, or -1. A
+ * CALL_MEMBASE dispatches through [sreg1 + offset] with sreg1 = vtable_reg = load [this_reg + 0] (calls.c), so when
+ * that load is the reaching def in this block and reads the call's own receiver (or the vreg it was copied from), the
+ * IC can take the vreg instead of loading [this] a second time -- a load V8 would execute (R378). Scans back
+ * within the block only; anything else, including a receiver redefined in between, keeps the reload. */
+static G_GNUC_UNUSED int
+wj_ir_vtable_vreg (MonoInst *call_ins, int this_vr)
+{
+	MonoInst *p;
+	int v = call_ins->sreg1, alias = -1;
+	gboolean alias_redef = FALSE;
+	if (v < 0 || this_vr < 0)
+		return -1;
+	/* this_vr is the call's CARRIER, a copy of the receiver made when the call's arguments were set up
+	 * (mono_arch_emit_call), which on the callvirt path is BEFORE the IR's vtable load off the original receiver.
+	 * b2 g1 (2026-10-01) read vt_reuse=0 for 96 k unpinned vtable vregs because only the opposite order matched. */
+	for (p = call_ins->prev; p; p = p->prev) {
+		if (p->dreg == v) {
+			int b;
+			if (p->opcode != OP_LOAD_MEMBASE || p->inst_offset != MONO_STRUCT_OFFSET (MonoObject, vtable))
+				return -1;
+			b = p->sreg1;
+			if (alias >= 0)   /* the copy came after the load: the load's base must be the copy's source, unchanged */
+				return (b == alias && !alias_redef) ? v : -1;
+			if (b == this_vr)
+				return v;
+			/* the copy came before the load: it must copy b, and b must not change in between */
+			for (p = p->prev; p; p = p->prev) {
+				if (p->dreg == this_vr)
+					return (p->opcode == OP_MOVE && p->sreg1 == b) ? v : -1;
+				if (p->dreg == b)
+					return -1;
+			}
+			return -1;
+		}
+		if (p->dreg == this_vr) {
+			if (p->opcode != OP_MOVE || alias >= 0)
+				return -1;
+			alias = p->sreg1;   /* the receiver is a copy: the vtable may have been loaded off the original */
+		} else if (alias >= 0 && p->dreg == alias) {
+			alias_redef = TRUE;   /* the original changed between the load and the copy */
+		}
+	}
+	return -1;
+}
+
+/* plan2x F9: the megamorphic cache's index. MUST match interp.c's wj_mcache_put. The base half is a constant per
+ * site, so the emitted probe is two shifts, two xors and an and. */
+#define WJ_MCACHE_N 512
+static G_GNUC_UNUSED guint32
+wj_mcache_bhash (gconstpointer base)
+{
+	guint32 b = (guint32) (gsize) base;
+	return (b >> 3) ^ (b >> 13);
+}
+
+/* plan2x F4 (& 8): process-wide words, never freed -- their addresses are baked into modules. */
+#define WJ_WORD_CHUNK 8192
+static gint32 *wj_word_chunks [1024];
+static gint32 wj_word_n;
+static G_GNUC_UNUSED gint32 *
+wj_word_alloc (void)
+{
+	gint32 i = mono_atomic_inc_i32 (&wj_word_n) - 1, ck = i / WJ_WORD_CHUNK;
+	if (ck >= 1024)
+		return NULL;
+	if (!wj_word_chunks [ck]) {
+		gint32 *c = g_new0 (gint32, WJ_WORD_CHUNK);
+		if (mono_atomic_cas_ptr ((gpointer *) &wj_word_chunks [ck], c, NULL) != NULL)
+			g_free (c);
+	}
+	return &wj_word_chunks [ck][i % WJ_WORD_CHUNK];
+}
+
 /* Max distinct call_indirect callee functypes per JITted method (T0/T1 are the 2 base types; these are
  * the extras). Raised 32->128: big hot methods (class_1309:method_6091 LivingEntity, class_922:method_4054
  * entity render) have >32 distinct call signatures and were bailing "too many callee types". wasm allows
@@ -2138,6 +3334,8 @@ typedef struct _WjBody {
 	guint8         uses_calls;
 	guint8         uses_eh_tag;
 	int            eh_tpool;
+	WjEdge        *edges;         /* plan B4: owned, nedges entries; NULL unless recorded (tier 2, MONO_WASM_JIT_B4) */
+	guint32        nedges;
 } WjBody;
 
 static int
@@ -2155,6 +3353,7 @@ wj_body_free (WjBody *b)
 	wasm_buf_free (&b->e_body);
 	g_free (b->extra_types);
 	g_free (b->name);
+	g_free (b->edges);
 	g_free (b);
 }
 
@@ -2184,6 +3383,12 @@ wj_body_take (MonoMethod *method, const char *name, WasmBuf *f, WasmBuf *e,
 	b->uses_calls = uses_calls ? 1 : 0;
 	b->uses_eh_tag = uses_eh_tag ? 1 : 0;
 	b->eh_tpool = eh_tpool;
+	if (wj_edge_on && wj_edge_buf && wj_edge_buf->len) {
+		extern volatile gint32 mono_wasm_jit_b4_bodies;
+		b->nedges = wj_edge_buf->len;
+		b->edges = (WjEdge *) g_memdup (wj_edge_buf->data, (guint) (sizeof (WjEdge) * wj_edge_buf->len));
+		mono_atomic_inc_i32 (&mono_wasm_jit_b4_bodies);
+	}
 	return b;
 }
 
@@ -2217,6 +3422,8 @@ typedef struct {
 	guint8 local_calls;      /* resolve a co-located callee to `call <funcidx>` */
 	guint8 names;            /* MONO_WASM_JIT_NAMES: append the name section */
 	int    max_fimports;         /* WJ_HELPER_IMPORT_CAP */
+	guint32 guard_addr;          /* plan2x S1: non-zero = guard every member-to-member call on this word */
+	guint32 guard_count_addr;    /* ... and count the taken arm here */
 } WjAsmPolicy;
 
 /* Per-member census of what the forms came out as; feeds the WJC_ counters and the tier dumps. */
@@ -2542,6 +3749,7 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 
 		fix [k].form = WASM_FORM_INDIRECT;
 		fix [k].idx = 0;
+		fix [k].guard = fix [k].guard_count = 0;
 		switch ((WasmRelocKind) r->kind) {
 		case WASM_RELOC_TYPE_U:
 		case WASM_RELOC_TYPE_S:
@@ -2631,6 +3839,14 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			if (member >= 0) {
 				fix [k].form = WASM_FORM_LOCAL;
 				fix [k].idx = (guint32) member;
+				if (pol->guard_addr) {
+					/* plan2x S1: still a module-local call, unless this group generation is superseded. The
+					 * f-slot fallback needs no dependency entry: the member IS installed wherever this module is. */
+					fix [k].form = WASM_FORM_LOCAL_GUARDED;
+					fix [k].guard = pol->guard_addr;
+					fix [k].guard_count = pol->guard_count_addr;
+					mono_wasm_jit_counters [WJC_S1_GUARDED]++;
+				}
 				st->nlocal++;
 				continue;   /* module-local: no dependency, nothing to admit */
 			}
@@ -2754,7 +3970,7 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 		const WasmRelocs *rl = src->relocs;
 		guint32 k;
 		for (k = 0; rl && k < rl->n; ++k)
-			if (fixes [i][k].form == WASM_FORM_LOCAL)
+			if (fixes [i][k].form == WASM_FORM_LOCAL || fixes [i][k].form == WASM_FORM_LOCAL_GUARDED)
 				fixes [i][k].idx += (guint32) nhimp;
 		wasm_buf_init (&bodies [i]);
 		wasm_body_serialize (src, fixes [i], ti_base [i / 2], &bodies [i]);

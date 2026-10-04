@@ -246,14 +246,14 @@ stub_get_interp_method (MonoMethod *method)
 }
 
 static MonoJitInfo*
-stub_compile_interp_method (MonoMethod *method, MonoError *error)
+stub_compile_interp_method (MonoMethod *method, gpointer il_state, MonoError *error)
 {
 	g_assert_not_reached ();
 	return NULL;
 }
 
 static int
-stub_find_il_clause_for_offset (MonoMethod *method, int il_offset)
+stub_find_il_clause_for_offset (MonoMethod *method, gpointer il_state, int il_offset)
 {
 	/* -2 means "no cached ranges, parse the header", which is the correct answer for a build with no
 	 * interpreter and is reachable rather than impossible -- so it returns instead of asserting. */
