@@ -9,6 +9,7 @@
 
 #include "config.h"
 #include <string.h>
+#include <mono/metadata/body-override.h>
 #include <mono/metadata/appdomain.h>
 #include <mono/metadata/class-internals.h>
 #include <mono/metadata/debug-helpers.h>
@@ -1188,7 +1189,11 @@ get_data_item_index_imethod (TransformData *td, InterpMethod *imethod)
 	gboolean new_slot;
 	guint32 index = get_data_item_wide_index (td, imethod, &new_slot);
 	g_assertf (index <= G_MAXUINT16, "Interpreter data item index 0x%x for method '%s' overflows", index, td->method->name);
-	if (new_slot && imethod && !imethod->optimized)
+	/* Upstream registers a patch site only for an untiered target, because an optimized InterpMethod was final. A hook
+	 * replaces it (tiering.c body_invalidate), and EVERY wrapper -- MonoMod's trampolines and DynamicMethods -- is
+	 * optimized from creation, so an interpreted caller kept calling the displaced one (hookstress, R403). Registered
+	 * whenever hooks are possible; a behaviour-preserving swap only loses speed through such an item. */
+	if (new_slot && imethod && (!imethod->optimized || mono_interp_body_hooks_possible))
 		td->imethod_items = g_slist_prepend (td->imethod_items, (gpointer)(gsize)index);
 	return GUINT32_TO_UINT16 (index);
 }
@@ -1217,6 +1222,11 @@ gboolean
 mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig)
 {
 	GSList *l;
+
+	/* A method whose body was replaced at run time (body-override.c) must be entered through the interpreter, where
+	 * the replacement is: calling its AOT code directly would run the original. */
+	if (G_UNLIKELY (mono_body_override_live) && mono_body_override_header (method))
+		return FALSE;
 
 	if (!mono_jit_call_can_be_supported_by_interp (method, sig, mono_llvm_only))
 		return FALSE;
@@ -1885,6 +1895,9 @@ get_type_comparison_op (TransformData *td, gboolean equality)
 static gboolean
 interp_handle_intrinsics (TransformData *td, MonoMethod *target_method, MonoClass *constrained_class, MonoMethodSignature *csignature, gboolean readonly, int *op)
 {
+	/* A replaced body (body-override.c) runs the replacement, never the intrinsic the original would have been. */
+	if (G_UNLIKELY (mono_body_override_live) && mono_body_override_header (target_method))
+		return FALSE;
 	const char *tm = target_method->name;
 	gboolean in_corlib = m_class_get_image (target_method->klass) == mono_defaults.corlib;
 	const char *klass_name_space;
@@ -10282,8 +10295,20 @@ mono_wasm_jit_pin_slots_for_reemit (MonoMethod *method)
 	/* PEEK: same reasoning as every other predicate on this path -- it runs on a worker and
 	 * mono_interp_get_imethod would CREATE. A method with no InterpMethod has nothing to re-emit. */
 	InterpMethod *im = mono_interp_peek_imethod (method);
-	if (!im || im->wasm_jit_slot <= 0 || im->wasm_jit_fslot <= 0)
+	int he = 0, hf = 0;
+	extern int mono_wasm_jit_desc_hooked_slots (int desc_id, int *e, int *f);
+	if (!im || im->wasm_jit_fslot <= 0)
 		return 0;
+	/* H5: a hooked generation has no e-slot of its own (wasm_jit_slot 0, its entry thunk calls the old body) but
+	 * still owns its descriptor's pair; the new body goes back into it. Refusing here dropped every hook's
+	 * re-emission, so a hooked method stayed on its stub for good (hookstress: 3,850 refused of 3,863). */
+	if (im->wasm_jit_slot <= 0) {
+		if (!mono_wasm_jit_desc_hooked_slots (im->wasm_jit_desc, &he, &hf) || hf != im->wasm_jit_fslot)
+			return 0;
+		im->wasm_jit_self_resv_eslot = he;
+		im->wasm_jit_self_resv_fslot = hf;
+		return 1;
+	}
 	im->wasm_jit_self_resv_eslot = im->wasm_jit_slot;
 	im->wasm_jit_self_resv_fslot = im->wasm_jit_fslot;
 	return 1;
@@ -10472,9 +10497,20 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 		g_assert (method);
 	}
 
+	/* A COMPILATION BOUND TO ITS IL (tiering.c's body swap) transforms THAT IL, never the method's current header: a
+	 * retired generation still being transformed -- a tier-up already in flight, an exception in one of its frames --
+	 * must compile the body its frames run. Re-read after the fetch: the swap binds the displaced entry BEFORE it moves
+	 * the header pointer, so NULL first and non-NULL after means the fetch may have seen the new IL. */
+	if (!header && method == imethod->method && imethod->bound_header)
+		header = imethod->bound_header;
 	if (!header) {
 		header = mono_method_get_header_checked (method, error);
 		return_if_nok (error);
+		mono_memory_barrier ();
+		if (method == imethod->method && imethod->bound_header && header != imethod->bound_header) {
+			mono_metadata_free_mh (header);
+			header = imethod->bound_header;
+		}
 	}
 
 	/* Make modifications to a copy of imethod, copy them back inside the lock */
@@ -10492,27 +10528,59 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
 	/* Copy changes back */
 	imethod = real_imethod;
 
-	MonoJitMemoryManager *jit_mm = get_default_jit_mm ();
-	jit_mm_lock (jit_mm);
+	/* COPY BACK ONLY WHAT THE TRANSFORM PRODUCED, under the METHOD's jit_mm lock (the one tiering.c's body swap holds;
+	 * the default jit_mm is a different lock for a dynamic method, so the two used not to exclude each other).
+	 * Upstream memcpy'd the whole snapshot back, which wrote the values every OTHER writer had stored while the
+	 * transform ran back to their stale snapshot: a body swap's retired/replaced_by, a tier-up's optimized_imethod,
+	 * the wasm JIT's slot/desc/fslot, the lazily built arg_offsets / ftndesc / jit_entry. */
+	gboolean published = FALSE;
+	MonoJitMemoryManager *own_mm = jit_mm_for_method (imethod->method);
+	jit_mm_lock (own_mm);
 	if (!imethod->transformed) {
-		// Ignore the first two fields which are unchanged. next_jit_code_hash shouldn't
-		// be modified because it is racy with internal hash table insert.
-		const int start_offset = 2 * sizeof (gpointer);
-		memcpy ((char*)imethod + start_offset, (char*)&tmp_imethod + start_offset, sizeof (InterpMethod) - start_offset);
+		imethod->code = tmp_imethod.code;
+		imethod->clauses = tmp_imethod.clauses;
+		imethod->il_try_ranges = tmp_imethod.il_try_ranges;
+		imethod->data_items = tmp_imethod.data_items;
+		imethod->local_offsets = tmp_imethod.local_offsets;
+		imethod->clause_data_offsets = tmp_imethod.clause_data_offsets;
+		imethod->jinfo = tmp_imethod.jinfo;
+		imethod->locals_size = tmp_imethod.locals_size;
+		imethod->alloca_size = tmp_imethod.alloca_size;
+		imethod->n_data_items = tmp_imethod.n_data_items;
+		imethod->num_clauses = tmp_imethod.num_clauses;
+		imethod->ref_slot_offset = tmp_imethod.ref_slot_offset;
+		imethod->swift_error_offset = tmp_imethod.swift_error_offset;
+		imethod->ref_slots = tmp_imethod.ref_slots;
+		imethod->patchpoint_data = tmp_imethod.patchpoint_data;
+		imethod->init_locals = tmp_imethod.init_locals;
+		imethod->relink_hook = tmp_imethod.relink_hook;
+		imethod->needs_thread_attach = tmp_imethod.needs_thread_attach;
+		imethod->is_verbose = tmp_imethod.is_verbose;
+		imethod->optimized = tmp_imethod.optimized;
+#if HOST_BROWSER
+		imethod->contains_traces = tmp_imethod.contains_traces;   /* the jiterpreter's pass inside the transform */
+		imethod->address_taken_bits = tmp_imethod.address_taken_bits;
+#endif
 		mono_memory_barrier ();
 		imethod->transformed = TRUE;
 		mono_interp_stats.methods_transformed++;
 		mono_atomic_fetch_add_i32 (&mono_jit_stats.methods_with_interp, 1);
 
 		mono_interp_register_imethod_data_items (imethod->data_items, imethod_data_items);
+		published = TRUE;
+	}
+	jit_mm_unlock (own_mm);
 
+	if (published) {
 		// FIXME Publishing of seq points seems to be racy with tiereing. We can have both tiered and untiered method
 		// running at the same time. We could therefore get the optimized imethod seq points for the unoptimized method.
+		MonoJitMemoryManager *jit_mm = get_default_jit_mm ();
+		jit_mm_lock (jit_mm);
 		gpointer seq_points = dn_simdhash_ght_get_value_or_default (jit_mm->seq_points, imethod->method);
 		if (!seq_points || seq_points != imethod->jinfo->seq_points)
 			dn_simdhash_ght_replace (jit_mm->seq_points, imethod->method, imethod->jinfo->seq_points);
+		jit_mm_unlock (jit_mm);
 	}
-	jit_mm_unlock (jit_mm);
 
 	g_slist_free (imethod_data_items);
 

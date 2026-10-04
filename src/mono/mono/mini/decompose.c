@@ -1971,6 +1971,14 @@ mono_local_emulate_ops (MonoCompile *cfg)
 			 */
 			if (MONO_HAS_CUSTOM_EMULATION (ins))
 				continue;
+#if HOST_BROWSER
+			/* The wasm JIT lowers float32 % itself (MONO_WASM_JIT_RREM, mini-wasm-emitter.inc). */
+			{
+				extern int mono_wasm_jit_rrem_inline;
+				if (ins->opcode == OP_RREM && COMPILE_WASM (cfg) && mono_wasm_jit_rrem_inline)
+					continue;
+			}
+#endif
 
 			/*
 			 * Emulation can't handle _IMM ops. If this is an imm opcode we need

@@ -163,9 +163,13 @@ mono_threads_state_poll_with_info (MonoThreadInfo *info)
 	/* Fast fail if no_safepoints is set */
 	g_assert (!info->thread_state.no_safepoints);
 
-	/* Fast check for pending suspend requests */
-	if (info->thread_state.state != STATE_ASYNC_SUSPEND_REQUESTED)
+	/* Fast check for pending suspend requests. Not a suspend: the poll was taken because mono_polling_required is
+	 * non-zero, which is also the wasm JIT's hook DOORBELL (MONO_POLLING_HOOK) -- adopt pending code publications
+	 * before returning, so an interpreter or AOT loop acknowledges a hook as promptly as a JIT loop does (H6). */
+	if (info->thread_state.state != STATE_ASYNC_SUSPEND_REQUESTED) {
+		MONO_WASM_JIT_RENDEZVOUS_DRAIN ();
 		return;
+	}
 
 	++coop_save_count;
 	mono_threads_get_runtime_callbacks ()->thread_state_init (&info->thread_saved_state [SELF_SUSPEND_STATE_INDEX]);
@@ -782,11 +786,22 @@ mono_threads_coop_init (void)
 #endif
 }
 
+/* Set `set` and clear `clear` in mono_polling_required, atomically against the other bits' writers. */
+void
+mono_threads_polling_update (size_t set, size_t clear)
+{
+	size_t old;
+	do
+		old = mono_polling_required;
+	while (mono_atomic_cas_ptr ((volatile gpointer *) &mono_polling_required, (gpointer) ((old | set) & ~clear), (gpointer) old) != (gpointer) old);
+}
+
 void
 mono_threads_coop_begin_global_suspend (void)
 {
 	if (mono_threads_are_safepoints_enabled ()) {
-		mono_polling_required = 1;
+		/* An OR, not a store: the higher bits are the wasm JIT's hook doorbell (mono-threads-coop.h). */
+		mono_threads_polling_update (MONO_POLLING_GC, 0);
 		/* AFTER the flag, never before: a worker that takes its safepoint helper because of this bit must
 		 * find mono_polling_required already set when it re-derives the word. */
 		MONO_WASM_JIT_POLL_ALL_WORKERS ();
@@ -797,7 +812,7 @@ void
 mono_threads_coop_end_global_suspend (void)
 {
 	if (mono_threads_are_safepoints_enabled ())
-		mono_polling_required = 0;
+		mono_threads_polling_update (0, MONO_POLLING_GC);
 }
 
 void

@@ -106,6 +106,11 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   `BlockStateFlattening:.cctor` is the known member and emits 1.9 MB. Note this is the ONE place where
   local COUNT is not purely a wire-size question -- see the local-ops fact above for everything else.
 * **V8's implicit null checks are WasmGC-only** (`null_checks_for_struct_op`, `wasm-lowering-reducer.h:405-425`).
+* **V8 eliminates no linear-memory load, and has no wasm LICM.** Every wasm memory load is built
+  `.NotLoadEliminable()` (`wasm/turboshaft-graph-interface.cc:8268-8284`); the wasm optimize phase is
+  LateEscapeAnalysis, MachineOptimization, MemoryOptimization, BranchElimination, LateLoadElimination,
+  ValueNumbering (`compiler/turboshaft/wasm-optimize-phase.cc:25-28`). So every load mono emits executes, and load
+  CSE / LICM can only happen in mono's middle end (R378). Checked on 15.5.35.
 * **Classifier warning:** a case-insensitive match for "compile" hits the `-turbofan` SUFFIX on every symbol
   and reports ~88% of the window. Strip `-\d+-(turbofan|liftoff)$` before matching.
 
@@ -832,9 +837,24 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
   cooldown is mostly wasted** now that the thermal premise is retracted (~16 min per four-arm matrix);
   R194's order effect stands as an OBSERVATION but its thermal explanation does not, so keep running
   both orders and stop discounting single-order results as thermally confounded.
-* **Use plateau windows** (`--warm-ms 180000 --bench-ms 120000 --no-walk`). `--warm-ms` DEFAULTS TO 0, so a
-  bare in-game window measures the RAMP: work per frame falls ~40% inside the first quarter of a 120 s
-  "plateau" and is flat to ~7% after. Any historical A/B taken without `--warm-ms` was reading ramp position.
+* **Use protocol Q60 for Minecraft censuses** (`--warm-ms 160000 --bench-ms 60000 --no-walk --no-save-quit`;
+  `hwrun.sh`'s defaults since R418). `--warm-ms` DEFAULTS TO 0, so a bare in-game window measures the RAMP.
+  Measured on the server tick (R418, `stabslice.py` over R417's eight censuses; times from world join):
+  - 0-20 s ~100-114 M instr/tick (catch-up), 60 s ~67, settled ~61-64 from ~100 s, then a ~-3% drift.
+  - **An A/B needs the window to start ~200 s after join.** A 160-220 s window lost the GC probe's +4.6%; 100-160 s
+    showed nothing.
+  - **A 60 s window at 200-260 s measures what the old 120 s one did** (same effect, separated in instructions AND
+    cycles; base spread 4.0% / 7.5% vs 3.3% / 7.0%). 30 s windows hold for instructions but cycles spread 10.6%.
+  - **The 6,000-tick autosave lands ~300 s after join** (+17 M instr/tick for 10 s). It sat INSIDE the old
+    `--warm-ms 180000 --bench-ms 120000` window (~220-340 s) and added ~2% to every reading.
+  - The harness spends ~38 s settling before the hold starts, so `--warm-ms 160000` puts the window at ~198-258 s.
+  - Re-run `stabslice.py <rundirs> --trace` before trusting Q60 on a new world or mod set.
+  - An arm is ~7 min (was ~9.5): boot+menu+world ~135 s is fixed.
+  - **Between-run world variance is ~+-3.5% per run** (each run holds its own level for the whole window; R418
+    addendum: a b g g b validation could not separate the nursery effect). n=2 per arm resolves only >~6-7%; use
+    n=3 per arm (A B B A B A, ~44 min) for 3-6% effects, and the mechanism alone below that.
+  - hwrun queues each arm's census to run during the NEXT arm's boot. **Call `hwrun.sh <batchdir> --drain` after
+    a batch's last arm**, before reading any `<tag>.census.txt`.
 * **The ramp is not JIT warmup — it is work we are too slow to clear.** Q1 vs Q4 per frame: mono JIT compile
   ~0 -> ~0, V8 compile 2.0 -> 0.4. Both compilers are DONE before the window opens. What drains is
   MethodHandle/invokedynamic linking (103.5 -> 47.2 M/frame), chunk/world meshing (67.2 -> 27.7) and IC miss
@@ -1028,6 +1048,7 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 | `symclass.py`, `lib/symclass.mjs`, `jitsym.py` | Symbol classes from a `perf report` dump; the classifier library; resolving samples against a jitdump without `perf inject` |
 | `jitdumpsize.py`, `pairsize.py` | Emitted x86 size per JIT'd function; paired RyuJIT-vs-ours x86 size for the SAME method |
 | `gcshare.py`, `windecay.py` | STW GC share of the window; whether fps plateaus or keeps sliding |
+| `stabslice.py` | **Where the server tick stabilises and whether a shorter window measures the same thing** (R418): instructions per tick in slices from world join (`--trace`), and per-window means against the full window (`--wins`). The evidence behind protocol Q60; re-run it on a new world/mod set |
 | `offcpu.sh`, `offcpu.mjs`, `threadwait.mjs` | Off-CPU attribution during the in-game window; per-thread run / runqueue-wait / sleep accounting and what each thread waited on |
 | `stallcatch.sh` | Capture perf until a STALLED world.generate lands |
 | `replaylogs.mjs` | Re-derive phases from ARCHIVED logs using the driver's own markers — no re-run needed |

@@ -15,6 +15,10 @@
 #include "mini-llvm.h"
 #include "jit-icalls.h"
 #include "aot-compiler.h"
+#ifdef HOST_BROWSER
+#include "mini-wasm.h"
+extern void mono_wasm_jit_count (int idx);
+#endif
 #include <mono/metadata/abi-details.h>
 #include <mono/metadata/class-abi-details.h>
 #include "mono/metadata/icall-signatures.h"
@@ -532,6 +536,24 @@ mini_emit_method_call_full (MonoCompile *cfg, MonoMethod *method, MonoMethodSign
 
 	call = mini_emit_call_args (cfg, sig, args, FALSE, virtual_, tailcall, rgctx_arg ? TRUE : FALSE, need_unbox_trampoline, method);
 	call->method = method;
+#ifdef HOST_BROWSER
+	/* R407: the emitter's devirt arm reads call->wasm_prof_im's record (wj_call_prof_im); when neither it nor the root's
+	 * has a site for this callee, point it at the enclosing inlinee that does (mono_wasm_jit_prof_ancestor). */
+	{
+		extern int mono_wasm_jit_prof_ancestors;
+		extern gboolean mono_wasm_jit_prof_has_site (gpointer caller, MonoMethod *base);
+		extern gpointer mono_wasm_jit_prof_ancestor (MonoCompile *cfg, MonoMethod *base);
+		if ((mono_wasm_jit_prof_ancestors & 2) && virtual_ && COMPILE_WASM (cfg) && cfg->wasm_jit_tier >= 2 &&
+		    cfg->wasm_inl_sp >= 2 && !mono_wasm_jit_prof_has_site (cfg->wasm_jit_caller_imethod, method) &&
+		    !(call->wasm_prof_im && mono_wasm_jit_prof_has_site (call->wasm_prof_im, method))) {
+			gpointer anc = mono_wasm_jit_prof_ancestor (cfg, method);
+			if (anc) {
+				call->wasm_prof_im = anc;
+				mono_wasm_jit_count (WJC_PROF_ANC_ARM);
+			}
+		}
+	}
+#endif
 	call->inst.flags |= MONO_INST_HAS_METHOD;
 	call->inst.inst_left = this_ins;
 

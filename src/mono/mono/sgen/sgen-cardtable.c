@@ -67,11 +67,23 @@ sgen_card_table_wbarrier_set_field (GCObject *obj, gpointer field_ptr, GCObject*
 	sgen_dummy_use (value);
 }
 
+/* MONO_GC_ARRAYREF_BULK ("0" disables): with a non-concurrent major collector, an array-of-references copy into a
+ * non-nursery destination is one word-atomic memmove plus a mark of every card the destination range covers, instead of
+ * a load, a nursery test and a store per element. A card marked with no nursery pointer in it only costs the next minor
+ * collection a scan of that card. Measured on jbox2d's TimSort copies, R437. */
+static gboolean arrayref_bulk = TRUE;
+
 static void
 sgen_card_table_wbarrier_arrayref_copy (gpointer dest_ptr, gconstpointer src_ptr, int count)
 {
 	gpointer *dest = (gpointer *)dest_ptr;
 	const gpointer *src = (const gpointer *)src_ptr;
+
+	if (arrayref_bulk && !need_mod_union && count > 0) {
+		mono_gc_memmove_aligned (dest_ptr, src_ptr, (size_t) count * sizeof (gpointer));
+		sgen_card_table_mark_range ((mword) dest_ptr, (mword) count * sizeof (gpointer));
+		return;
+	}
 
 	/*overlapping that required backward copying*/
 	if (src < dest && (src + count) > dest) {
@@ -668,6 +680,12 @@ sgen_card_table_init (SgenRememberedSet *remset, gboolean consistency_checks)
 		remset->wbarrier_range_copy = sgen_card_table_wbarrier_range_copy;
 
 	need_mod_union = sgen_get_major_collector ()->is_concurrent;
+	{
+		char *ab = g_getenv ("MONO_GC_ARRAYREF_BULK");
+		if (ab && ab [0] == '0')
+			arrayref_bulk = FALSE;
+		g_free (ab);
+	}
 }
 
 #endif /*HAVE_SGEN_GC*/

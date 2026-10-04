@@ -51,6 +51,7 @@
 #include <mono/utils/mono-error-internals.h>
 #include <mono/utils/checked-build.h>
 #include <mono/utils/mono-counters.h>
+#include <mono/metadata/body-override.h>
 #include "icall-decl.h"
 
 static void get_default_param_value_blobs (MonoMethod *method, char **blobs, guint32 *types);
@@ -1309,8 +1310,13 @@ method_body_object_construct (MonoClass *unused_class, MonoMethod *method, gpoin
 	    (method->iflags & METHOD_IMPL_ATTRIBUTE_RUNTIME))
 		return MONO_HANDLE_CAST (MonoReflectionMethodBody, NULL_HANDLE);
 
-	header = mono_method_get_header_checked (method, error);
-	goto_if_nok (error, fail);
+	/* A replaced body is not reflection's: after a detour CoreCLR's MethodBody still shows the original IL (its
+	 * detours patch native code), and MonoMod clones a hooked method through it. Persistent; free_mh is a no-op. */
+	header = mono_body_override_original (method);
+	if (!header) {
+		header = mono_method_get_header_checked (method, error);
+		goto_if_nok (error, fail);
+	}
 
 	if (!image_is_dynamic (image)) {
 		/* Obtain local vars signature token */

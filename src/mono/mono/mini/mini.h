@@ -1397,6 +1397,7 @@ typedef struct {
 	const char  *t2_down_reason;     /* R316h: the fail string of the tier-2 compile a downgrade replaced (static literal) */
 	int          t2_down_bail;
 	int          t2_refresh;         /* R337: mono_wasm_jit_refresh_batch's verdict on a re-emit: 0 standalone, >0 group re-framed, <0 failed; -9 = not a re-emit */
+	guint32      body_epoch;         /* H3: the method's body epoch when the compile began (wasm_jit_compile_publish) */
 	guint32      direct_dep_sig [MONO_WASM_JIT_MAX_DIRECT_DEPS];
 	MonoMethod  *direct_dep_method [MONO_WASM_JIT_MAX_DIRECT_DEPS]; /* callee behind each dep f-slot (diagnostics: names the method when an ABI/registration mismatch is caught at admit) */
 	/* MONO_WASM_JIT_HEAL_WAIT's heal_callees[] carried out of here: the callees this body emitted a
@@ -1442,6 +1443,24 @@ typedef struct {
 	guint8           wasm_jit_tier;          /* R316: 2 = tier-2 compile (policy below; no T2 sampling emitted) */
 	int              wasm_gi_size;           /* R316: guarded-inline size cap when > 0 (else the global knob) */
 	gpointer         wasm_cur_inline_im;     /* R316b: the inlinee being IR'd, for MonoCallInst.wasm_prof_im */
+	/* R407: the methods inline_method is inside, outermost first (the root is not on it); entries past 16 are dropped. */
+	MonoMethod      *wasm_inl_stack [16];
+	int              wasm_inl_sp;
+	gint32          *wasm_t2_loop_word;      /* R409: this tier-1 body's loop back-edge counter (MONO_WASM_JIT_T2_LOOP_COUNT) */
+	gint32           wasm_gi2_n;             /* R411: bimorphic-GI arms this compile took (a poly site's arm 1, or an arm 2) */
+	guint8           wasm_no_gi2;            /* R411: the retry without them (a body over T2_MAX_BODY) */
+	gpointer         wasm_origin_inl;        /* MONO_WASM_JIT_ORIGIN: accepted inlinees' IL ranges (WjOriginInl list) */
+	/* plan2x S2 (MONO_WASM_JIT_S2 & 2): the inlining size gate's verdict for one site, consumed by inline_method when
+	 * its (ip, callee) match, and the inline chain's frequency (calls per root entry; < 0 = unknown). */
+	const guint8    *wasm_s2_gate_ip;
+	MonoMethod      *wasm_s2_gate_callee;
+	double           wasm_s2_gate_f;
+	gboolean         wasm_s2_gate_hot;
+	double           wasm_s2_ctx;
+	gint32           wasm_s2_spent;          /* IL bytes admitted above the static limit at hot sites, this compile */
+	gboolean         wasm_t2_strict;         /* plan2x S0b: the strict tier-2 retry after a T2_MAX_BODY failure */
+	gboolean         wasm_gi_cha_site;       /* plan2x S3: the GI size gate is judging a CHA-guarded inline (S2 & 4 skips it) */
+	GHashTable      *wasm_site_gi;           /* W3 census (SITE_COUNT only): IL pointer -> guarded-inline verdict char */
 	const char      *wasm_inline_fail_msg;   /* R316f: the last INLINE_FAILURE message (a static literal) */
 	guint8           wasm_t2r_noted;         /* R316f: the size gate already recorded this refusal */
 	const char      *wasm_t2r_why;           /* R316g: which check_inlining gate refused (a static literal) */

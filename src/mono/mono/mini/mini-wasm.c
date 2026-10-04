@@ -1,5 +1,6 @@
 #include "mini.h"
 #include "mini-runtime.h"
+#include <math.h>
 #include <mono/metadata/mono-debug.h>
 #include <mono/metadata/assembly.h>
 #include <mono/metadata/metadata.h>
@@ -14,6 +15,7 @@
 #include <mono/metadata/mono-hash-internals.h>
 #include <mono/utils/mono-time.h>
 #include <mono/utils/mono-memory-model.h>   /* MONO_MEMORY_BARRIER_* for OP_MEMORY_BARRIER lowering */
+#include <mono/metadata/body-override.h>    /* H3: the body epoch a compile is checked against */
 
 #ifdef HOST_BROWSER
 #ifndef DISABLE_THREADS
@@ -36,7 +38,7 @@ gpointer mono_interp_get_imethod (MonoMethod *method); /* interp/interp.c; kept 
 gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
 	MonoMethod **out_target, guint32 *out_samples, int *out_why); /* interp.c; lock-free pre-JIT receiver profile */
 void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
-void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod); /* jiterpreter-interp-entry.ts */
+void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod, void *method); /* jiterpreter-interp-entry.ts; method: H3 */
 gint32 *mono_wasm_jit_worker_action_addr (void);
 void mono_wasm_jit_safepoint_poll (void);
 #define WJ_KEEPALIVE EMSCRIPTEN_KEEPALIVE
@@ -430,13 +432,15 @@ int mono_wasm_jit_reemit_inflight = 0;
  * hot rather than merely warm; the site then never triggers again (WjVcallSite.reemit_noted). */
 int mono_wasm_jit_reemit_misses = 64;
 /* MONO_WASM_JIT_REEMIT_BATCH: descriptors published per record, and MONO_WASM_JIT_REEMIT_INTERVAL_MS
- * the floor between optional profile-driven batches. Batching prevents a burst of matured sites from
- * producing one log record and one instantiation pass per method during class loading. Mandatory semantic
- * replacements bypass the optional rate limit but still use the same queue and publication chokepoint.
+ * the floor between batches of OPTIONAL re-emissions (tier 2, profile). Batching prevents a burst of matured
+ * sites from producing one log record and one instantiation pass per method during class loading. A batch
+ * holding a MANDATORY replacement (a body swap) waits MONO_WASM_JIT_MANDATORY_INTERVAL_MS instead: same queue,
+ * same publication chokepoint, its own floor (plan H3; before it, mandatory entries sat out the optional one).
  * Clamped to [1, 64] -- 64 is
  * WJ_REEMIT_BATCH_MAX in interp.c and overrunning it would be a stack write past the array. */
 int mono_wasm_jit_reemit_batch = 64;       /* 64 / 250 ms: the tier-2 broker's rate, shipped with tier 2 (R348) */
 int mono_wasm_jit_reemit_interval = 250;
+int mono_wasm_jit_mandatory_interval = 0;
 /* MONO_WASM_JIT_REEMIT_MAX: re-emissions per process, a ceiling the rate limit cannot be talked out of. */
 int mono_wasm_jit_reemit_max = 200;
 int mono_wasm_jit_rendezvous_test = 0;
@@ -560,12 +564,6 @@ int mono_wasm_jit_prof_inlinee = 1;
 /* MONO_WASM_JIT_PROF_BLOCKS: how many WJ_PROF_MAX_SITES-site profile blocks one caller may chain; 1 is the
  * old fixed cap. See R311. */
 int mono_wasm_jit_prof_blocks = 4;
-/* MONO_WASM_JIT_FORWARD_RETIRED: caches holding an InterpMethod that an IKVM body swap retired follow its
- * replaced_by link to the current generation (interp_imethod_current). Off, a vcall resolve-cache entry cached
- * on a never-compiled generation 1 reads f-slot 0 forever and crosses into the interpreter on every call (R314:
- * 6.37 M such crossings per run -> 22; -3.6% server instructions/tick, ON/OFF/OFF/ON), and a delegate recipe on
- * a retired imethod runs generation-1 IL. The [wasm-jit retired] counters are the mechanism check. */
-int mono_wasm_jit_forward_retired = 1;
 /* MONO_WASM_JIT_LEAN_TRY_INVOKE: the interpreter's call hook (WASM_JIT_TRY_INVOKE) calls wasm_jit_maybe_compile only
  * when the callee is still compile-eligible or JIT work is pending, instead of on every interpreted call. */
 int mono_wasm_jit_lean_try_invoke = 1;
@@ -587,7 +585,16 @@ int mono_wasm_jit_inline_calls_depth = 6;    /* MONO_WASM_JIT_INLINE_CALLS_DEPTH
 int mono_wasm_jit_t2 = 1;
 int mono_wasm_jit_t2_sample_ms = 2;      /* MONO_WASM_JIT_T2_SAMPLE_MS: sampling timer period */
 int mono_wasm_jit_t2_threshold = 48;     /* MONO_WASM_JIT_T2_THRESHOLD: samples before a method is queued */
-int mono_wasm_jit_t2_max = 2000;         /* MONO_WASM_JIT_T2_MAX: tier-2 requests per process */
+int mono_wasm_jit_t2_max = 5000;         /* MONO_WASM_JIT_T2_MAX: tier-2 requests per process (S0 makes ~1,950, R387) */
+/* MONO_WASM_JIT_T2_COUNT (plan2x S0): N > 0 = a tier-1 body with an entry safepoint counts its entries in a
+ * process-wide word and requests tier 2 every 2^ceil(log2 N) entries (the request is idempotent; periodic so that one
+ * released on a BUSY give-up fires again), beside the time sampler. 0 = off. The sampler
+ * credits a sample to the next poll that runs, so a loop-free method whose time is spent in poll-free callees is
+ * credited to its CALLERS and never promoted (b1 census: 90% of tier-1 call volume). Cost: a load, add, store, load,
+ * compare and predicted branch per entry, in tier-1 code only (tier 2 replaces it). b4 census (2026-10-01, Minecraft
+ * server tick, P-cores, b c d d c b): -5.0% cycles, -10% calls; tier-1 code 62% -> 9.4% of IR calls (R385, R387).
+ * 10000 flooded tier 2 with boot-time methods and capped the hot set out (R385). */
+int mono_wasm_jit_t2_count = 200000;
 /* MONO_WASM_JIT_T2_LIMIT / _COST: tier 2's inline IL-size limit and cost cap. 60 / 400 against the old 35 / 200 on
  * the Minecraft server tick (R359/R360, p82 b t t b, one binary, equal ticks): cycles -2.1% (ranges clear), instructions
  * -4.6%, calls -12%; peak VmData +113 MiB, inside the control's own spread. Needs R360's atomics lowering, without which
@@ -607,8 +614,11 @@ int mono_wasm_jit_fast_tls = 1;
 int mono_wasm_jit_inline_cold_throw = 1;
 /* MONO_WASM_JIT_INLINE_BFI (R319): inline a method of a BeforeFieldInit class whose cctor has not run, without running it.
  * BeforeFieldInit only requires the cctor before a static FIELD access, and such an access inside the inlinee is still
- * guarded (method-to-ir's ldsfld path: a runtime init check, or INLINE_FAILURE "class init"). */
-int mono_wasm_jit_inline_bfi = 0;
+ * guarded (method-to-ir's ldsfld path: a runtime init check, or INLINE_FAILURE "class init"). Shipped with the wave-1
+ * set: b2 census (2026-10-01, Minecraft server tick, P-cores, b t t b, 0 skipped ticks): F4=15 + F9=1 + INLINE_BFI=1 +
+ * IKVM_LAZY_SIGDEPS + IKVM_LAZY_ARITY together, cycles 94.00 -> 89.04 M/tick (-5.3%, spreads 1.4% / 2.0%, R382).
+ * Measured as one set; no per-lever split. */
+int mono_wasm_jit_inline_bfi = 1;
 /* MONO_WASM_JIT_PROF_SHARE (R316j): tier-up and IKVM's body swap SHARE the call profile with the new generation, allocating
  * it at that moment if the method has recorded nothing yet (interp/tiering.c). */
 int mono_wasm_jit_prof_share = 0;
@@ -620,6 +630,23 @@ int mono_wasm_jit_reemit_validate = 1;
 /* MONO_WASM_JIT_T2_STATIC_PRED (R329): a tier-2 GI site with no profile record predicts the callvirt's own method behind
  * the method-identity guard; 2 (R333) also on a COLD verdict (a hot monomorphic IC site records one observation). */
 int mono_wasm_jit_t2_static_pred = 2;
+/* MONO_WASM_JIT_T2_COLD_PRED (R405): a tier-2 site whose record saw exactly ONE receiver predicts that receiver's
+ * resolved target however few observations it has (a hot monomorphic IC site records one) -- 1 = the GI gate, 2 = the
+ * emitter's devirt arm, 3 = both. Ahead of R329/R333's static prediction, which names the BASE. Minecraft server tick,
+ * plan2x/pz b t t b on the R410 binary: instructions -3.6% (disjoint), cycles -1.8% (overlapping). */
+int mono_wasm_jit_t2_cold_pred = 3;
+/* MONO_WASM_JIT_PROF_ANCESTORS (R407): when the root's and the inlinee's records have no site for a tier-2 virtual call,
+ * use the nearest enclosing inlinee's (method-to-ir mono_wasm_jit_prof_ancestor) -- 1 = the GI gate, 2 = the emitter's
+ * devirt arm (needs MONO_WASM_JIT_PROF_ORIGIN), 3 = both. */
+int mono_wasm_jit_prof_ancestors = 0;
+/* MONO_WASM_JIT_T2_LOOP_COUNT (R409): tier-1 loop back-edges per tier-2 request (rounded up to a power of two); 0 = off.
+ * Reaches what the entry count and the sampler miss: a once-per-step method whose time goes to its loops' callees
+ * (jbox2d's updatePairs / collide / World.step). jbox2d -3.3% disjoint (R436); Minecraft tick instructions -3.9%,
+ * cycles -0.8% inside the spread (R438, n=3). */
+int mono_wasm_jit_t2_loop_count = 65536;
+/* MONO_WASM_JIT_T2_GI_BIMORPHIC (R411): a tier-2 site's SECOND guarded inline, when its second target holds at least this
+ * % of the site's observations; 0 = off. */
+int mono_wasm_jit_t2_gi_bimorphic = 0;
 /* MONO_WASM_JIT_T2_REARM (R332): how many times a tier-2 request released on BUSY give-up is re-armed (0 = retire it). */
 int mono_wasm_jit_t2_rearm = 3;
 /* MONO_WASM_JIT_T2_SAMPLE_LOOP: 0 = every poll credits its own method; 1 (R335) = loop polls only, an entry poll
@@ -786,6 +813,48 @@ mono_wasm_jit_auto_init (void)
 	{ const char *bm = g_getenv ("MONO_WASM_JIT_BADMETH"); mono_wasm_jit_badmeth = (bm && *bm) ? atoi (bm) : 1; }
 	{ extern const char *mono_wasm_jit_watch; const char *w = g_getenv ("MONO_WASM_JIT_WATCH"); mono_wasm_jit_watch = (w && *w) ? g_strdup (w) : NULL; }
 	{ extern int mono_wasm_jit_names; const char *nm = g_getenv ("MONO_WASM_JIT_NAMES"); mono_wasm_jit_names = (nm && *nm) ? ((*nm != '0') ? 1 : 0) : mono_wasm_jit_names; }
+	{ extern int mono_wasm_jit_origin, mono_wasm_jit_capture;
+	  const char *og = g_getenv ("MONO_WASM_JIT_ORIGIN"), *cp = g_getenv ("MONO_WASM_JIT_CAPTURE");
+	  if (og && *og) mono_wasm_jit_origin = *og != '0';
+	  if (cp && *cp) mono_wasm_jit_capture = *cp != '0';
+	  { extern int mono_wasm_jit_site_count; const char *sc = g_getenv ("MONO_WASM_JIT_SITE_COUNT");
+	    if (sc && *sc) mono_wasm_jit_site_count = *sc != '0';
+	    if (mono_wasm_jit_site_count) { extern void mono_wasm_jit_site_init (void); mono_wasm_jit_site_init (); } }
+	{ extern int mono_wasm_jit_f4; const char *f4 = g_getenv ("MONO_WASM_JIT_F4"); if (f4 && *f4) mono_wasm_jit_f4 = atoi (f4); }
+	{ extern int mono_wasm_jit_f9; const char *f9 = g_getenv ("MONO_WASM_JIT_F9"); if (f9 && *f9) mono_wasm_jit_f9 = atoi (f9); }
+	{ extern int mono_wasm_jit_s1; const char *s1 = g_getenv ("MONO_WASM_JIT_S1"); if (s1 && *s1) mono_wasm_jit_s1 = atoi (s1); }
+#ifdef HOST_BROWSER
+	{ extern void magicdetour2 (void *, void *) __attribute__ ((weak));
+	  extern int mono_wasm_jit_s1, mono_wasm_jit_hookable;
+	  const char *hk = g_getenv ("MONO_WASM_JIT_HOOKABLE");
+	  mono_wasm_jit_hookable = (hk && *hk) ? (strcmp (hk, "none") != 0 && strcmp (hk, "0") != 0) : (magicdetour2 != NULL);
+	  if (mono_wasm_jit_hookable) {
+		extern gboolean mono_interp_body_hooks_possible;
+		mono_wasm_jit_s1 |= 1;
+		mono_interp_body_hooks_possible = TRUE;
+	  } }
+#endif
+	{ extern int mono_wasm_jit_s4c; const char *s4 = g_getenv ("MONO_WASM_JIT_S4C"); if (s4 && *s4) mono_wasm_jit_s4c = atoi (s4); }
+	{ extern int mono_wasm_jit_cfgc; const char *cc = g_getenv ("MONO_WASM_JIT_CFGC"); if (cc && *cc) mono_wasm_jit_cfgc = atoi (cc); }
+	{ extern int mono_wasm_jit_cfg_nest; const char *cn = g_getenv ("MONO_WASM_JIT_CFG_NEST"); if (cn && *cn) mono_wasm_jit_cfg_nest = atoi (cn); }
+	{ extern int mono_wasm_jit_stelem_obj; const char *so = g_getenv ("MONO_WASM_JIT_STELEM_OBJ"); if (so && *so) mono_wasm_jit_stelem_obj = atoi (so); }
+	{ extern int mono_wasm_jit_s4_sel_lo, mono_wasm_jit_s4_sel_hi; const char *ss = g_getenv ("MONO_WASM_JIT_S4_SEL");
+	  if (ss && *ss) { int lo = -1, hi = -1; if (sscanf (ss, "%d-%d", &lo, &hi) == 2 && lo >= 0 && hi >= lo) { mono_wasm_jit_s4_sel_lo = lo; mono_wasm_jit_s4_sel_hi = hi; } } }
+	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes; const char *b4 = g_getenv ("MONO_WASM_JIT_B4");
+	  if (b4 && *b4) mono_wasm_jit_b4 = atoi (b4);
+	  b4 = g_getenv ("MONO_WASM_JIT_B4_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v >= 2 && v <= 512) mono_wasm_jit_b4_max = v; }
+	  b4 = g_getenv ("MONO_WASM_JIT_B4_BYTES"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_bytes = v; }
+	  { extern int mono_wasm_jit_b4_groups, mono_wasm_jit_b4_merge;
+	    b4 = g_getenv ("MONO_WASM_JIT_B4_GROUPS"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_groups = v; }
+	    b4 = g_getenv ("MONO_WASM_JIT_B4_MERGE"); if (b4 && *b4) mono_wasm_jit_b4_merge = atoi (b4) != 0;
+	    { extern int mono_wasm_jit_b4_per_plan, mono_wasm_jit_b4_plan_samples;
+	      b4 = g_getenv ("MONO_WASM_JIT_B4_PER_PLAN"); if (b4 && *b4) { int v = atoi (b4); if (v >= 1) mono_wasm_jit_b4_per_plan = v; }
+	      b4 = g_getenv ("MONO_WASM_JIT_B4_PLAN_SAMPLES"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_plan_samples = v; }
+	      { extern int mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor;
+	        b4 = g_getenv ("MONO_WASM_JIT_B4_T1"); if (b4 && *b4) mono_wasm_jit_b4_t1 = atoi (b4) != 0;
+	        b4 = g_getenv ("MONO_WASM_JIT_B4_ANCHOR"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_anchor = v; } } } } }
+	{ extern int mono_wasm_jit_rrem_inline; const char *rr = g_getenv ("MONO_WASM_JIT_RREM"); if (rr && *rr) mono_wasm_jit_rrem_inline = atoi (rr); }
+	  if (mono_wasm_jit_origin) { extern void mono_wasm_jit_origin_print_tags (void); mono_wasm_jit_origin_print_tags (); } }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
 	{ extern int mono_wasm_jit_frame_zero; const char *fz = g_getenv ("MONO_WASM_JIT_FRAME_ZERO"); if (fz && *fz) mono_wasm_jit_frame_zero = *fz != '0'; }
 	{ extern int mono_wasm_jit_inline_alloc; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_ALLOC"); if (ia && *ia) mono_wasm_jit_inline_alloc = *ia != '0'; }
@@ -807,7 +876,6 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_pred_mid; const char *v = g_getenv ("MONO_WASM_JIT_PRED_MID"); if (v && *v) mono_wasm_jit_pred_mid = *v != '0'; }
 	{ extern int mono_wasm_jit_prof_inlinee; const char *v = g_getenv ("MONO_WASM_JIT_PROF_INLINEE"); if (v && *v) mono_wasm_jit_prof_inlinee = *v != '0'; }
 	{ extern int mono_wasm_jit_prof_blocks; const char *v = g_getenv ("MONO_WASM_JIT_PROF_BLOCKS"); if (v && *v) { int n = atoi (v); mono_wasm_jit_prof_blocks = (n >= 1 && n <= 16) ? n : 1; } }
-	{ extern int mono_wasm_jit_forward_retired; const char *v = g_getenv ("MONO_WASM_JIT_FORWARD_RETIRED"); if (v && *v) mono_wasm_jit_forward_retired = *v != '0'; }
 	{ extern int mono_wasm_jit_lean_try_invoke; const char *v = g_getenv ("MONO_WASM_JIT_LEAN_TRY_INVOKE"); if (v && *v) mono_wasm_jit_lean_try_invoke = *v != '0'; }
 	{ extern int mono_wasm_jit_ic_remat; const char *v = g_getenv ("MONO_WASM_JIT_IC_REMAT"); if (v && *v) mono_wasm_jit_ic_remat = *v != '0'; }
 	{ extern int mono_wasm_jit_inline_calls; const char *v = g_getenv ("MONO_WASM_JIT_INLINE_CALLS"); if (v && *v) mono_wasm_jit_inline_calls = *v != '0'; }
@@ -819,6 +887,19 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_sample_ms, "MONO_WASM_JIT_T2_SAMPLE_MS", 1, 1000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_threshold, "MONO_WASM_JIT_T2_THRESHOLD", 1, 1000000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max, "MONO_WASM_JIT_T2_MAX", 0, 100000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_count, "MONO_WASM_JIT_T2_COUNT", 0, 100000000)
+	WJ_T2_KNOB (mono_wasm_jit_s2, "MONO_WASM_JIT_S2", 0, 7)
+	WJ_T2_KNOB (mono_wasm_jit_s2_min, "MONO_WASM_JIT_S2_MIN", 1, 100000000)
+	WJ_T2_KNOB (mono_wasm_jit_s2_hot_pct, "MONO_WASM_JIT_S2_HOT_PCT", 1, 100000)
+	WJ_T2_KNOB (mono_wasm_jit_s2_hot_limit, "MONO_WASM_JIT_S2_HOT_LIMIT", 1, 2000)
+	WJ_T2_KNOB (mono_wasm_jit_s2_hot_cost, "MONO_WASM_JIT_S2_HOT_COST", 1, 100000)
+	WJ_T2_KNOB (mono_wasm_jit_s2_budget, "MONO_WASM_JIT_S2_BUDGET", 0, 1000000)
+	WJ_T2_KNOB (mono_wasm_jit_s2_cold, "MONO_WASM_JIT_S2_COLD", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_s3, "MONO_WASM_JIT_S3", 0, 15)
+	WJ_T2_KNOB (mono_wasm_jit_s4, "MONO_WASM_JIT_S4", 0, 3)
+	WJ_T2_KNOB (mono_wasm_jit_t2_strict, "MONO_WASM_JIT_T2_STRICT", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_t2_strict_limit, "MONO_WASM_JIT_T2_STRICT_LIMIT", 1, 1000)
+	{ extern void mono_wasm_jit_s2_init (void); mono_wasm_jit_s2_init (); }
 	WJ_T2_KNOB (mono_wasm_jit_t2_limit, "MONO_WASM_JIT_T2_LIMIT", 1, 1000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_cost, "MONO_WASM_JIT_T2_COST", 1, 100000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_depth, "MONO_WASM_JIT_T2_DEPTH", 1, 32)
@@ -831,6 +912,10 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_ldaddr_ref, "MONO_WASM_JIT_LDADDR_REF", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_reemit_validate, "MONO_WASM_JIT_REEMIT_VALIDATE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_static_pred, "MONO_WASM_JIT_T2_STATIC_PRED", 0, 2)
+	WJ_T2_KNOB (mono_wasm_jit_t2_cold_pred, "MONO_WASM_JIT_T2_COLD_PRED", 0, 3)
+	WJ_T2_KNOB (mono_wasm_jit_prof_ancestors, "MONO_WASM_JIT_PROF_ANCESTORS", 0, 3)
+	WJ_T2_KNOB (mono_wasm_jit_t2_loop_count, "MONO_WASM_JIT_T2_LOOP_COUNT", 0, 1000000000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_gi_bimorphic, "MONO_WASM_JIT_T2_GI_BIMORPHIC", 0, 100)
 	WJ_T2_KNOB (mono_wasm_jit_t2_rearm, "MONO_WASM_JIT_T2_REARM", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_t2_colocate, "MONO_WASM_JIT_T2_COLOCATE", 0, 1)
@@ -877,11 +962,11 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_reemit_misses; const char *rm = g_getenv ("MONO_WASM_JIT_REEMIT_MISSES"); if (rm && *rm) { int v = atoi (rm); if (v > 0) mono_wasm_jit_reemit_misses = v; } }
 	{ extern int mono_wasm_jit_reemit_batch; const char *rb = g_getenv ("MONO_WASM_JIT_REEMIT_BATCH"); if (rb && *rb) { int v = atoi (rb); if (v >= 1 && v <= 64) mono_wasm_jit_reemit_batch = v; } }
 	{ extern int mono_wasm_jit_reemit_interval; const char *ri = g_getenv ("MONO_WASM_JIT_REEMIT_INTERVAL_MS"); if (ri && *ri) { int v = atoi (ri); if (v >= 0) mono_wasm_jit_reemit_interval = v; } }
+	{ const char *mi = g_getenv ("MONO_WASM_JIT_MANDATORY_INTERVAL_MS"); if (mi && *mi) { int v = atoi (mi); if (v >= 0) mono_wasm_jit_mandatory_interval = v; } }
 	{ extern int mono_wasm_jit_reemit_max; const char *rx = g_getenv ("MONO_WASM_JIT_REEMIT_MAX"); if (rx && *rx) { int v = atoi (rx); if (v >= 0) mono_wasm_jit_reemit_max = v; } }
 	{ extern int mono_wasm_jit_dump_dep_graph_knob; const char *dg = g_getenv ("MONO_WASM_JIT_DUMP_DEP_GRAPH"); mono_wasm_jit_dump_dep_graph_knob = (dg && *dg) ? (*dg != '0') : 0; }
 	{ extern int mono_wasm_jit_verify_deps; const char *vd = g_getenv ("MONO_WASM_JIT_VERIFY_DEPS"); mono_wasm_jit_verify_deps = (vd && *vd) ? (*vd != '0') : 0; }
-	{ extern int mono_wasm_jit_single_writer; const char *sw = g_getenv ("MONO_WASM_JIT_SINGLE_WRITER"); mono_wasm_jit_single_writer = (sw && *sw) ? (*sw != '0') : 0; }
-	{ extern int mono_wasm_jit_sweep; const char *sp = g_getenv ("MONO_WASM_JIT_SWEEP"); mono_wasm_jit_sweep = (sp && *sp) ? atoi (sp) : 0; }
+	{ extern int mono_wasm_jit_single_writer; const char *sw = g_getenv ("MONO_WASM_JIT_SINGLE_WRITER"); mono_wasm_jit_single_writer = (sw && *sw) ? (*sw != '0') : 0; }	{ extern int mono_wasm_jit_sweep; const char *sp = g_getenv ("MONO_WASM_JIT_SWEEP"); mono_wasm_jit_sweep = (sp && *sp) ? atoi (sp) : 0; }
 	{ extern int mono_wasm_jit_raise_nogc; const char *rn = g_getenv ("MONO_WASM_JIT_RAISE_NOGC"); int v = (rn && *rn) ? atoi (rn) : 0; mono_wasm_jit_raise_nogc = (v >= 0 && v <= 2) ? v : 0; } /* 0=off, 1=liveness-only exemption (shipped, UNVERIFIED), 2=POSITIVE CONTROL ONLY (level 1 minus the gen_skipped_raises guard = the codegen measured 4/4 dead). See wj_ins_is_gcpoint -- its verdicts must be read in order. */
 	{ extern const char *mono_wasm_jit_dump_ir; mono_wasm_jit_dump_ir = g_getenv ("MONO_WASM_JIT_DUMP_IR"); } /* substring filter; methods whose full name contains it get their clauses+bb regions+opcodes dumped (ground truth for the nested-EH lowering). */
 	/* Island heuristic levers (Part 5), all default off. */
@@ -959,6 +1044,142 @@ mono_wasm_jit_add (int idx, gint64 v)
 int mono_wasm_jit_verbose = 0;
 const char *mono_wasm_jit_watch = NULL;
 int mono_wasm_jit_names = 1;
+/* MONO_WASM_JIT_ORIGIN: the gap ledger's origin map -- each module carries a "wj.origin" custom section saying which
+ * emitter construct / source method / IL offset every body byte serves (WasmOrigins, wasm-encoder.h). Adds bytes
+ * and memory, changes no code. MONO_WASM_JIT_CAPTURE: print every emitted module once, base64, from the thread that
+ * compiled it (WASM_JIT_CAPTURE lines), so the ledger can recompile the exact bytes the measured run executed. */
+int mono_wasm_jit_origin = 0;
+int mono_wasm_jit_capture = 0;
+/* MONO_WASM_JIT_SITE_COUNT: the call-site census (plan2x wave 0). Every IR call instruction, at every tier, bumps its
+ * own counter at a process-wide address (one add per call; the bytes stay identical on every worker), and
+ * mono_wasm_jit_dump_stats prints each site's DELTA since the previous dump -- so with --dumps, which dumps at both
+ * edges of the in-game window, the second dump is the window's exact call graph. Names the callee at emit time, so it
+ * is a diagnostic: never on in a timing arm. */
+int mono_wasm_jit_site_count = 0;
+/* MONO_WASM_JIT_S2 (plan2x S2), a bit mask:
+ *   1  tier-1 bodies count their entries and every managed call site, into process-wide records keyed by identities
+ *      (mini-wasm-ir.inc, WjS2Rec). One load/add/store per site and per entry, in tier-1 code only;
+ *   2  tier 2's ordinary inliner reads them: a site that never executed while its root ran is not inlined, and a hot
+ *      one gets MONO_WASM_JIT_S2_HOT_LIMIT IL bytes instead of the static limit. Needs bit 1.
+ *   4  the same for GUARDED-INLINE sites: tier 1 also counts a guarded inline's hot arm (its fallback call is counted
+ *      by bit 1), and tier 2's GI size gate reads hot arm + fallback. Needs bits 1 and 2. */
+int mono_wasm_jit_s2 = 3;   /* b4 census (2026-10-01, server tick, P-cores): -2.2% cycles, -7% calls on top of S0 (R387) */
+int mono_wasm_jit_s2_min = 64;          /* MONO_WASM_JIT_S2_MIN: root entries before its counts are trusted */
+int mono_wasm_jit_s2_hot_pct = 25;      /* MONO_WASM_JIT_S2_HOT_PCT: hot at >= this many calls per 100 root entries */
+int mono_wasm_jit_s2_hot_limit = 200;   /* MONO_WASM_JIT_S2_HOT_LIMIT: IL-byte limit at a hot site */
+int mono_wasm_jit_s2_hot_cost = 800;    /* MONO_WASM_JIT_S2_HOT_COST: inline_method's cost cap at a hot site */
+int mono_wasm_jit_s2_budget = 3000;     /* MONO_WASM_JIT_S2_BUDGET: IL bytes per root admitted above the static limit */
+int mono_wasm_jit_s2_cold = 1;          /* MONO_WASM_JIT_S2_COLD: 1 = never inline a site that never executed */
+/* MONO_WASM_JIT_S3 (plan2x S3, class-hierarchy analysis), a bit mask -- see mono_class_cha_word (class-setup-vtable.c)
+ * for the record, which is kept whenever this is non-zero:
+ *   1  guarded inlining: a virtual site with no profile prediction whose base no loaded class overrides inlines the
+ *      base behind a one-load guard on its word;
+ *   2  the emitter's devirt arm: such a site calls the base's f-slot behind the same guard instead of the IC;
+ *   4  verify: a CHA arm also checks the receiver's vtable slot, and counts a mismatch (must read 0);
+ *   8  bits 1 and 2 at tier 2 only -- CHA's extra code at both tiers cost +319 MiB peak VmData (R397).
+ * 11 = arms + GI at tier 2: b10 census (2026-10-02, server tick, P-cores, on the S0 + S2 base) -4.9% cycles, peak
+ * VmData +32 MiB (R398); both tiers (3) -5.7% at +326 MiB. */
+int mono_wasm_jit_s3 = 11;
+/* MONO_WASM_JIT_T2_STRICT (plan2x S0b): 1 = a tier-2 compile that fails on T2_MAX_BODY is retried ONCE at tier 2 with
+ * strict inlining (mono_wasm_force_compile) before the tier-1-policy downgrade; 0 = straight to the downgrade. */
+int mono_wasm_jit_t2_strict = 0;
+int mono_wasm_jit_t2_strict_limit = 20;   /* MONO_WASM_JIT_T2_STRICT_LIMIT: IL bytes at an unknown or warm site, strict */
+/* MONO_WASM_JIT_S4 (plan2x S4), a bit mask: 1 = rewrite the loads the S4 census proves redundant within an extended
+ * basic block into moves, in tier-2 compiles; 2 = in tier-1 compiles too. See wj_s4_run (mini-wasm-ir.inc). It must run
+ * before local coalescing (R433: after it, a rewritten load could read another vreg's local). jbox2d -1.3 to -1.7%,
+ * overlapping (R433); on Minecraft ~6,450 loads rewritten in ~960 tier-2 compiles per run, three clean runs (R433, R439). */
+int mono_wasm_jit_s4 = 1;
+/* MONO_WASM_JIT_S4_SEL="lo-hi" (diagnostic, R432): S4 applies only to methods whose full-name hash (g_str_hash % 4096)
+ * lies in [lo, hi], and every compile it rewrote prints WASM_JIT_S4_APPLIED <tier> <loads> <hash> <method>. For
+ * bisecting a miscompile by method; -1 = every method, no print. */
+int mono_wasm_jit_s4_sel_lo = -1, mono_wasm_jit_s4_sel_hi = -1;
+/* MONO_WASM_JIT_B4 (plan B4, R442-R445): 1 = tier-2 bodies record their direct-call edges weighted by tier-1 S2 site
+ * counts, and every stats dump prints the hot-set partition mono_wasm_jit_b4_plan would form (a dry run); 2 = also frame
+ * it (mono_wasm_jit_b4_step, B4_GROUPS budget). Minecraft tick -2.4% cycles / -1.4% instructions, jbox2d -1.5%, peak
+ * VmData unchanged (R445, n=3); unbudgeted it cost +460 MiB (R444). */
+int mono_wasm_jit_b4 = 2;
+/* MONO_WASM_JIT_B4_MAX / _BYTES: plan B4's group bound, members (self included) and summed body bytes. */
+int mono_wasm_jit_b4_max = 16;
+int mono_wasm_jit_b4_bytes = 65536;
+/* MONO_WASM_JIT_B4_GROUPS: groups framed per process, then B4 stops (R445: unbudgeted framing cost +460 MiB peak
+ * VmData, R444). MONO_WASM_JIT_B4_MERGE: 1 = a planned group absorbs the whole groups its members already sit in. */
+int mono_wasm_jit_b4_groups = 256;
+int mono_wasm_jit_b4_merge = 0;
+/* MONO_WASM_JIT_B4_PER_PLAN: groups framed per plan, hottest first (R446); MONO_WASM_JIT_B4_PLAN_SAMPLES: tier-2-body
+ * safepoint samples between plans, beside the growth trigger -- so plans keep coming once the tier stops growing. */
+int mono_wasm_jit_b4_per_plan = 16;
+int mono_wasm_jit_b4_plan_samples = 5000;
+/* MONO_WASM_JIT_B4_T1: tier-1 bodies record edges too (R447: 52% of the tick's entries into ungrouped callees come
+ * from tier-1 callers -- its giants never reach tier 2). On, with 256 KB anchors, it cost +759 MiB peak VmData and put
+ * both runs over 8 GiB (R448); off until the memory is found (R449). MONO_WASM_JIT_B4_ANCHOR: the bound on a group's
+ * largest member, which B4_BYTES excludes, so a giant can anchor a group of its callees. */
+int mono_wasm_jit_b4_t1 = 0;
+int mono_wasm_jit_b4_anchor = 262144;
+/* Safepoint samples taken inside tier-2 bodies, process-wide (interp.c mono_wasm_jit_t2_sample): the planner's clock. */
+volatile gint32 mono_wasm_jit_b4_samples;
+/* Edge-carrying bodies stored so far (wj_body_take); the B4 drainer re-plans once this has grown by 32. */
+volatile gint32 mono_wasm_jit_b4_bodies;
+/* plan2x S3 verify mode's mismatch count, bumped by emitted code (its address is baked). */
+gint32 mono_wasm_jit_cha_wrong;
+/* MONO_WASM_JIT_F4 (plan2x F4, dispatch guards), a bit mask:
+ *   1  a vreg every def of which is `load [object + 0]` -- a vtable, malloc'd and never moved -- is not a ref, so
+ *      it is never pinned (the fixpoint and the deref-base rule both pinned it);
+ *   2  the IC and the devirt arm reuse the vtable vreg mono's IR already loaded instead of loading [this] again
+ *      (V8 eliminates no wasm memory load, R378);
+ *   4  the IC's method-identity fallback (R311) remembers the last vtable it matched, in the PIC entry, so an
+ *      alternating second class pays one load instead of vtable->klass->vtable[slot];
+ *   8  the same memo for a devirt arm's MID guard, in a process-wide word per arm (its target is baked).
+ * See the g2 ledger: 3.41 M cycles/tick in 4+-load dispatch chains, PIN 1.12. Shipped with the wave-1 set: the
+ * b2 census (2026-10-01, Minecraft server tick, P-cores, b t t b, 0 skipped ticks): F4=15 + F9=1 + INLINE_BFI=1 +
+ * IKVM_LAZY_SIGDEPS + IKVM_LAZY_ARITY together, cycles 94.00 -> 89.04 M/tick (-5.3%, spreads 1.4% / 2.0%, R382).
+ * Measured as one set; no per-lever split. The mapping diff puts PIN at -0.36 M; bit 2 was dead in that build (R382) and is
+ * validated by b3's gates, not timed. */
+int mono_wasm_jit_f4 = 15;
+/* MONO_WASM_JIT_F9 (plan2x F9): bit 1 = the megamorphic cache. A one-way PIC misses on every receiver change at a
+ * site with many classes (g2: one GoalSelector wrapper, class_4135:method_6264, alone took 0.35 M cycles/tick of
+ * resolve + admit_live + publish); the C resolver's own memo still costs the helper call. A per-thread table of
+ * (vtable, base) -> admitted f-slot, 512 x 16 B in front of the thread's PIC array, filled by the PIC publish, lets
+ * the emitted IC take a repeat receiver without leaving wasm. Shipped with the wave-1 set: the
+ * b2 census (2026-10-01, Minecraft server tick, P-cores, b t t b, 0 skipped ticks): F4=15 + F9=1 + INLINE_BFI=1 +
+ * IKVM_LAZY_SIGDEPS + IKVM_LAZY_ARITY together, cycles 94.00 -> 89.04 M/tick (-5.3%, spreads 1.4% / 2.0%, R382).
+ * Measured as one set; no per-lever split. The mapping diff puts the IC-miss path (resolve + admit_live + publish) at -0.87 M. */
+int mono_wasm_jit_f9 = 1;
+/* MONO_WASM_JIT_S1 (plan2x S1), a bit mask:
+ *   1  a group framed by rebatch calls its members through `if (*guard) call_indirect <f-slot> else call <funcidx>`,
+ *      with one word per group generation set when the generation is superseded. A re-framed group's OLD instance
+ *      keeps running in frames that never return (R337), and its module-local calls used to reach the old copies
+ *      forever; with the word set they go through this worker's table, which holds whatever it has adopted.
+ *   2  co-locate after a RE-EMIT publish too (interp.c's compile_publish): a tier-2 body groups with its callees.
+ *   4  co-locate while tier 2 is on, the R338 skip lifted (MONO_WASM_JIT_T2_COLOCATE is the old spelling of this bit).
+ * 4 without 1 is R337's configuration and is kept only as the negative control. */
+int mono_wasm_jit_s1 = 0;
+/* MONO_WASM_JIT_HOOKABLE (plan H4): may a method's body be replaced by a behaviour-ALTERING swap (a MonoMod hook)?
+ * Then no caller may be credited no-GC for a JIT callee (a hook can allocate under frames that skipped their pins),
+ * and co-located groups are guarded (S1 bit 1) so a hook can send their module-local calls back through the table.
+ * 1 when the app links liba (MonoMod's WasmDetour shims: the weak magicdetour2 resolves), else 0; "all"/"none". */
+int mono_wasm_jit_hookable = 0;
+/* MONO_WASM_JIT_S4C (plan2x S4, wave 0): the redundant-load census, a dry run that changes no code. For every compile
+ * it prints which loads an alias-aware load CSE / LICM could remove (WASM_JIT_HGVN lines, keyed like the gap ledger's
+ * origin rows so plan2x/s4join.py can price them in cycles). V8 removes none (R378). Diagnostic only.
+ * 2 = also the call-summary ORACLE (WASM_JIT_HGVN_NC2 lines): the same census with calls killing nothing, the upper
+ * bound for call-effect summaries -- +0.35% removable loads, see R417. Diagnostic only. */
+int mono_wasm_jit_s4c = 0;
+/* MONO_WASM_JIT_CFGC (plan A5 census, R420): for each compile that takes the br_table dispatcher, print
+ * WASM_JIT_CFGC <tier> <class E/S/I> <loops> <depth> <bbs> <method> -- whether its CFG is stackifiable in mono's own
+ * block order (wj_cfg_stackify_class). Diagnostic only. */
+int mono_wasm_jit_cfgc = 0;
+/* MONO_WASM_JIT_CFG_NEST (plan A5): a method the br_table dispatcher would take is emitted with real nested wasm
+ * loops/blocks -- 1: when its CFG is stackifiable in mono's block order (wj_nest_plan proves the schedule first;
+ * R422); 2: also after wj_cfg_sort re-orders javac's rotated loops header-first (R424-R426: Minecraft tick -12.5%
+ * instructions / -6.4% cycles, jbox2d -11.6%). Anything else keeps the dispatcher; EH methods always do. */
+int mono_wasm_jit_cfg_nest = 2;
+/* MONO_WASM_JIT_STELEM_OBJ (plan B8a, R423): the inline stelem.ref fast path also stores without a check when the
+ * runtime array's element class is object (method-to-ir.c mini_emit_array_store). Removes the virt_stelemref_object
+ * wrapper call from the tick (R423: below what a tick census resolves; the mechanism is the evidence). */
+int mono_wasm_jit_stelem_obj = 1;
+/* MONO_WASM_JIT_RREM (plan A4, R432): float32 % is lowered inline (an exact double-precision sequence, fmodf only off
+ * its range; the OP_RREM case in mini-wasm-emitter.inc) instead of mono_local_emulate_ops' fmodf call. */
+int mono_wasm_jit_rrem_inline = 1;
 /* MONO_WASM_JIT_NAMES KEEPS ITS KNOB and gets default 1. It appends a wasm name section per JITted
  * module, which is what makes every profile symbolised and every trap self-symbolicating -- without it
  * perf reads the whole tier as a bare `wasmjit`. It stays switchable because the symbolisation loop is
@@ -1528,6 +1749,7 @@ static gboolean wj_lazy_dep_needs_real (int slot);
 #ifdef HOST_BROWSER
 static gboolean wj_lazy_dep_ok (int slot);
 static void wj_lazy_ensure_bank_of_slot (int slot);
+static void wj_hook_restub_slots (const int *f_slots, int n);   /* H5: after a group install */
 static gboolean wj_lazy_pool_ft (int slot, WasmFuncType *out);
 static const char *wj_lazy_refusal (MonoMethod *m, MonoMethodSignature *csig, gboolean rgctx, const WasmFuncType *ct, int *counter);
 static int wj_lazy_reserve (MonoMethod *m, MonoMethodSignature *csig, gboolean rgctx, const WasmFuncType *ct);
@@ -1548,6 +1770,45 @@ static __thread guint8 *wj_slot_live = NULL;
 static __thread int wj_slot_live_cap = 0;   /* capacity, in slots */
 static __thread guint8 *wj_slot_installed = NULL;
 static __thread int wj_slot_installed_cap = 0;
+/* W1 C0: per slot, the PAYLOAD (wj_payload_new) of the module THIS pthread installed there; 0 = none. Written only
+ * where the table is written (instantiate_local/_batch_local, the lazy alias); a new pthread starts with none, like
+ * the bitmaps. Install tests compare it with the payload the registry publishes now (see WjRegEntry.payload). */
+static __thread guint32 *wj_slot_payload = NULL;
+static __thread int wj_slot_payload_cap = 0;
+static volatile gint32 wj_payload_seq;
+
+/* A fresh payload id for module bytes about to be published. Never 0, never reused. */
+static guint32
+wj_payload_new (void)
+{
+	guint32 p;
+	do
+		p = (guint32) mono_atomic_inc_i32 (&wj_payload_seq);
+	while (p == 0);
+	return p;
+}
+
+static void
+wj_slot_payload_set (int slot, guint32 payload)
+{
+	if (slot <= 0)
+		return;
+	if (G_UNLIKELY (slot >= wj_slot_payload_cap)) {
+		int ncap = wj_slot_payload_cap ? wj_slot_payload_cap : 1024;
+		while (slot >= ncap)
+			ncap *= 2;
+		wj_slot_payload = (guint32 *) g_realloc (wj_slot_payload, (gsize) ncap * sizeof (guint32));
+		memset (wj_slot_payload + wj_slot_payload_cap, 0, (gsize) (ncap - wj_slot_payload_cap) * sizeof (guint32));
+		wj_slot_payload_cap = ncap;
+	}
+	wj_slot_payload [slot] = payload;
+}
+
+static inline guint32
+wj_slot_payload_at (int slot)
+{
+	return (slot > 0 && slot < wj_slot_payload_cap) ? wj_slot_payload [slot] : 0;
+}
 
 static int wj_slot_is_installed (int slot);   /* defined below; used by the guard in wj_mark_slot_live */
 
@@ -1596,6 +1857,7 @@ wj_clear_slot_installed (int slot)
 	if (slot <= 0 || slot >= wj_slot_installed_cap)
 		return;
 	wj_slot_installed [slot >> 3] &= (guint8) ~(1u << (slot & 7));
+	wj_slot_payload_set (slot, 0);
 	if (slot < wj_slot_live_cap)
 		wj_slot_live [slot >> 3] &= (guint8) ~(1u << (slot & 7));
 }
@@ -1696,7 +1958,7 @@ mono_wasm_jit_worker_reuse (int tramps, int adapters, int slots)
  * invoke of the method — interp.c MINT_CALL) before call_indirect-ing the slot. Returns 1 on success,
  * 0 on failure (caller then disables the JIT for the method → interpreter fallback). */
 int
-mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms)
+mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
 {
 	int _ok;
 	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);
@@ -1790,9 +2052,11 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			 * `function signature mismatch` failure this file has paid for repeatedly. */
 			/* R322: slots <= 0 = VALIDATE ONLY -- the module compiled and every import bound, nothing published. */
 			if ($0 > 0 && $1 > 0) {
+				var oldf = wasmTable.get ($1);
 				wasmTable.set ($0, inst.exports.e); /* entry thunk: interp entry */
 				wasmTable.set ($1, inst.exports.f); /* scalar method: call_indirect target */
 				if (Module.__wjSlotFn) { Module.__wjSlotFn.set ($0, inst.exports.e); Module.__wjSlotFn.set ($1, inst.exports.f); }
+				if (Module.__wjAliasRepoint) Module.__wjAliasRepoint ($1, oldf, inst.exports.f);
 			}
 			return 1;
 		} catch (e) {
@@ -1822,6 +2086,8 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 		 * e/f live after recursively admitting the complete closure. */
 		wj_mark_slot_installed (e_slot);
 		wj_mark_slot_installed (f_slot);
+		wj_slot_payload_set (e_slot, payload);
+		wj_slot_payload_set (f_slot, payload);
 		WJ_CENSUS_NOTE_INSTANTIATE (*out_ms);
 	}
 	return _ok;
@@ -1836,9 +2102,9 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
  *
  * e_slots/f_slots are parallel arrays of length n. Returns 1 on success; on failure nothing is installed
  * and errbuf carries the WebAssembly error. */
-int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
+int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
 int
-mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms)
+mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
 {
 	int _ok, i;
 	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);
@@ -1973,10 +2239,13 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 				k = k + 1;
 			}
 			k = 0;
+			var oldf = null;
 			while (k < $2) {
+				oldf = wasmTable.get (fslot[k]);
 				wasmTable.set (eslot[k], efn[k]);
 				wasmTable.set (fslot[k], ffn[k]);
 				if (Module.__wjSlotFn) { Module.__wjSlotFn.set (eslot[k], efn[k]); Module.__wjSlotFn.set (fslot[k], ffn[k]); }
+				if (Module.__wjAliasRepoint) Module.__wjAliasRepoint (fslot[k], oldf, ffn[k]);
 				k = k + 1;
 			}
 			return 1;
@@ -1996,7 +2265,12 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 		for (i = 0; i < n; i++) {
 			wj_mark_slot_installed (e_slots [i]);
 			wj_mark_slot_installed (f_slots [i]);
+			wj_slot_payload_set (e_slots [i], payload);
+			wj_slot_payload_set (f_slots [i], payload);
 		}
+		/* H5: a hooked member's slots now hold the group's copy of its OLD body. Restub them, after the records above
+		 * so the restub's own (stub at f, e not installed) are the ones that stand. */
+		wj_hook_restub_slots (f_slots, n);
 		/* One MODULE, n methods — count it as one instantiation, because the WebAssembly.Instance and
 		 * its export JSFunctions (the JSDispatchTable entries the renderer dies allocating) are what a
 		 * batch amortizes. Counting n here would hide exactly the win batching is supposed to deliver. */
@@ -2036,6 +2310,8 @@ typedef struct {
 	void *bytes;     /* the one module; owned here, shared by all members */
 	int len;
 	guint32 generation;
+	gint32 *guard;   /* plan2x S1: set to 1 when this generation is superseded or rolled back; NULL = unguarded */
+	guint32 payload; /* W1 C0: the id of `bytes`, immutable; what a member's install test compares against */
 } WjBatchDesc;
 
 /* An immutable dependency set: the f-slots a body reaches by call_indirect, with the functype hash
@@ -2335,6 +2611,11 @@ typedef struct {
 	gpointer logical_imethod;
 	guint32 f_sig_id;
 	guint8 no_gc;               /* transitive effect: body reaches no returning GC/safepoint */
+	/* Some caller was compiled crediting no_gc (wj_fslot_is_nogc said yes), so it holds references unpinned across
+	 * the call. A later generation that is not no-GC must then never be published here: those frames cannot be
+	 * fixed afterwards (H3; a hook never gets the credit at all, H4). Set-only, conservatively (a caller whose
+	 * compile then failed still sets it). */
+	guint8 nogc_credited;
 	guint8 batch_incompatible;  /* force-compile cannot reproduce this descriptor's captured body */
 	/* This method was in a group that had to be ROLLED BACK, so never co-locate it again.
 	 *
@@ -2404,7 +2685,23 @@ typedef struct {
 	 * then dispatch into a slot whose current owner they never installed -- the jiterpreter prefill --
 	 * and the emitted call_indirect traps. That is R267 addendum 10's root cause. */
 	guint8 orphaned;
+	/* W1 C0: the id of `bytes` while the entry is standalone (a batched entry's is batch->payload). Changes only
+	 * with `bytes`, inside the same pub_seq window, so a snapshot reads a matching pair. */
+	guint32 payload;
+	/* PLAN H5. A behaviour-altering swap (a hook) of this method is in force and its new body is not compiled yet: on
+	 * every worker the f-slot holds the hook bank's stub, whose bind runs the method in the interpreter, and the e-slot
+	 * is not live. Admission installs the stub instead of `bytes` (wj_hook_admit); registering the new body clears it
+	 * (a batched member's, when the re-frame that contains it binds). Set under the loader lock, before the generation
+	 * that makes workers look. */
+	guint8 hooked;
+	guint8 body_current;     /* the stored body was compiled from the IL in force: a re-frame may clear `hooked` */
+	gint32 hook_bank;        /* lazy bank index + 1, framed over `f` alone; made at the first hook, reused by every one */
+	guint32 hook_payload;    /* W1 C0 id of the stub at `f` for the hook in force */
 } WjRegEntry;
+
+#ifdef HOST_BROWSER
+static gboolean wj_hook_restub_local (WjRegEntry *re);   /* mini-wasm-lazy.inc */
+#endif
 
 /* R320: writers of an entry's {batch, bytes, len, depset} bracket the stores with these (see WjRegEntry.pub_seq). */
 static inline void
@@ -2424,7 +2721,7 @@ wj_pub_end (WjRegEntry *re)
 /* R320: one consistent reading of {batch, bytes, len, depset}, or FALSE if a writer was mid-replacement -- a
  * TRANSIENT condition (it clears when the writer's wj_pub_end lands), so the caller refuses with state 0, never 3. */
 static gboolean
-wj_pub_snapshot (WjRegEntry *re, WjBatchDesc **batch, void **bytes, int *len, WjDepSet **ds)
+wj_pub_snapshot2 (WjRegEntry *re, WjBatchDesc **batch, void **bytes, int *len, WjDepSet **ds, guint32 *payload)
 {
 	gint32 s1 = mono_atomic_load_i32 (&re->pub_seq);
 	if (s1 & 1)
@@ -2434,8 +2731,16 @@ wj_pub_snapshot (WjRegEntry *re, WjBatchDesc **batch, void **bytes, int *len, Wj
 	*bytes = re->bytes;
 	*len = re->len;
 	*ds = re->depset;
+	*payload = *batch ? (*batch)->payload : re->payload;   /* W1 C0: the module these bytes are */
 	mono_memory_barrier ();
 	return mono_atomic_load_i32 (&re->pub_seq) == s1;
+}
+
+static gboolean
+wj_pub_snapshot (WjRegEntry *re, WjBatchDesc **batch, void **bytes, int *len, WjDepSet **ds)
+{
+	guint32 payload;
+	return wj_pub_snapshot2 (re, batch, bytes, len, ds, &payload);
 }
 #define WJ_REG_CHUNK   8192
 #define WJ_REG_NCHUNKS 1024      /* up to 8M JITted methods; the 4KB top-level pointer array never moves */
@@ -2472,11 +2777,57 @@ mono_wasm_jit_desc_body_len (int desc)
 	return len;
 }
 
+/* THE COMPILE'S BODY EPOCH (H3). Taken by wasm_jit_compile_publish BEFORE the compile reads the method's IL; a body
+ * swap bumps the epoch in the same jit_mm critical section that installs the new header, so a compile that finds the
+ * epoch moved may have read the displaced IL. It is then refused wherever it could reach a caller -- this worker's
+ * table, the registry, the InterpMethod, the republication -- and retried; the swap queued its own re-emission. One
+ * compile at a time process-wide (wj_compiling), so a thread-local pair is enough; a compile that did not set it
+ * (the name-targeted bring-up) is not checked. */
+static __thread MonoMethod *wj_snap_method;
+static __thread guint32 wj_snap_epoch;
+
+void mono_wasm_jit_snap_begin (MonoMethod *method);
+void
+mono_wasm_jit_snap_begin (MonoMethod *method)
+{
+	wj_snap_epoch = mono_body_override_info (method, NULL, NULL);
+	wj_snap_method = method;
+}
+
+void mono_wasm_jit_snap_end (void);
+void
+mono_wasm_jit_snap_end (void)
+{
+	wj_snap_method = NULL;
+}
+
+/* The epoch the current compile started at (0 when none is in flight). */
+guint32 mono_wasm_jit_snap_epoch (void);
+guint32
+mono_wasm_jit_snap_epoch (void)
+{
+	return wj_snap_epoch;
+}
+
+/* TRUE when `method` is the method this thread is compiling and its body has been swapped since the compile began. */
+static gboolean
+wj_snap_stale (MonoMethod *method)
+{
+	return method && method == wj_snap_method && mono_body_override_info (method, NULL, NULL) != wj_snap_epoch;
+}
+
+/* Returns the descriptor id; 0 = refused for good (a slot collision, or a no-GC generation over credited callers);
+ * -2 = refused for now (a stale compile, H3): the caller marks the compile retriable. */
 int
-mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, gboolean no_gc, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps)
+mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes, int len, guint32 f_sig_id, gboolean no_gc, const int *deps, const guint32 *dep_sig, MonoMethod *const *dep_methods, int ndeps, guint32 payload)
 {
 	int desc_id = 0;
 	mono_loader_lock ();
+	if (G_UNLIKELY (wj_snap_stale (method))) {
+		mono_wasm_jit_counters [WJC_EPOCH_REFUSED_REGISTER]++;
+		mono_loader_unlock ();
+		return -2;
+	}
 	{
 		int n = wj_reg_n;
 		int ci = n / WJ_REG_CHUNK;
@@ -2511,6 +2862,17 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			/* A new generation registering onto the f-slot this logical method already owns. */
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_FSLOT_REREGISTER);
 
+			/* KEEP THE OLD GENERATION when it was no-GC, a caller was compiled crediting that, and this one is not:
+			 * publishing it would let a GC move objects those callers' frames hold unpinned (H3). Only a
+			 * behaviour-preserving swap can reach here with credited callers -- a hookable method is never credited
+			 * (H4) -- so the old body is still a correct one. Permanent for this body, so the caller drops the
+			 * request rather than retrying. Both arms below: the batched one would otherwise publish it at re-frame. */
+			if (same_method && old_re && old_re->no_gc && old_re->nogc_credited && !no_gc) {
+				mono_wasm_jit_counters [WJC_PRESERVE_NOGC_REFUSED]++;
+				mono_loader_unlock ();
+				return 0;
+			}
+
 			/* REUSE THE DESCRIPTOR. DO NOT MINT A NEW ONE.
 			 *
 			 * The comment above says replacing what the slot holds is benign, and it is -- but allocating
@@ -2538,11 +2900,16 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				WjDepSet *new_depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
 				wj_pub_begin (old_re);   /* R320: bytes and depset change as ONE unit for admission */
 				old_re->bytes = bytes;
+				old_re->payload = payload;
 				old_re->len = len;
 				old_re->body_len = len;
 				old_re->f_sig_id = f_sig_id;
 				old_re->no_gc = no_gc ? 1 : 0;
 				old_re->depset = new_depset;
+				/* H5: the body compiled from the IL in force (H3 refused a stale one above) -- the hook's stub retires
+				 * with the generation bump below, and every worker installs these bytes over it. */
+				old_re->body_current = 1;
+				old_re->hooked = 0;
 				wj_pub_end (old_re);
 				mono_memory_barrier ();
 				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
@@ -2583,6 +2950,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				old_re->body_len = len;
 				old_re->f_sig_id = f_sig_id;
 				old_re->no_gc = 0;
+				old_re->body_current = 1;   /* H5: mono_wasm_jit_batch_bind clears `hooked` once a group holds this body */
 				mono_memory_barrier ();
 				mono_wasm_jit_counters [WJC_FSLOT_REUSED]++;
 				mono_loader_unlock ();
@@ -2615,6 +2983,8 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			chunk [n % WJ_REG_CHUNK].e = e_slot;
 			chunk [n % WJ_REG_CHUNK].f = f_slot;
 			chunk [n % WJ_REG_CHUNK].bytes = bytes;
+			chunk [n % WJ_REG_CHUNK].payload = payload;
+			chunk [n % WJ_REG_CHUNK].body_current = 1;
 			chunk [n % WJ_REG_CHUNK].len = len;
 			chunk [n % WJ_REG_CHUNK].body_len = len;
 			chunk [n % WJ_REG_CHUNK].body_method = method;
@@ -3334,7 +3704,7 @@ wj_admit_dependencies (WjRegEntry *re, WjDepSet *ds, int desc_id, gboolean watch
  * live method can call_indirect is installed by the time it goes live.
  */
 static gboolean
-wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, void *snap_bytes, int snap_len)
+wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, void *snap_bytes, int snap_len, guint32 snap_payload)
 {
 	char eb [192];
 	double ms = 0;
@@ -3345,6 +3715,16 @@ wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, voi
 	if (G_UNLIKELY (re->orphaned)) {
 		mono_wasm_jit_counters [WJC_ADMIT_ORPHANED]++;
 		return FALSE;
+	}
+	/* H5: a hooked descriptor's `bytes` are the body the hook displaced (or an earlier hook's): the cycle break and the
+	 * closure walk would install them over the stub. */
+	if (G_UNLIKELY (re->hooked)) {
+		if (!wj_hook_restub_local (re)) {
+			mono_wasm_jit_counters [WJC_HOOK_ROUTE_FAIL]++;
+			return FALSE;
+		}
+		wj_desc_generation [desc_id] = re->generation;
+		return TRUE;
 	}
 	/* ONE READ OF THE GENERATION, used for both the decision and the record.
 	 *
@@ -3358,9 +3738,11 @@ wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, voi
 	 * Publishing the SNAPSHOT is both correct and self-healing: if the generation moved meanwhile, this
 	 * worker's cache is merely stale and the next dispatch re-admits against the new depset. */
 	gen = re->generation;
-	if (wj_slot_is_installed (re->e) && wj_slot_is_installed (re->f) &&
-	    wj_desc_generation [desc_id] == gen)
+	/* W1 C0: the module in this pthread's slots, not the generation it last admitted, decides the install. */
+	if (snap_payload && wj_slot_payload_at (re->e) == snap_payload && wj_slot_payload_at (re->f) == snap_payload) {
+		wj_desc_generation [desc_id] = gen;
 		return TRUE;
+	}
 	eb [0] = 0;
 	{
 	/* ONE SNAPSHOT. mono_wasm_jit_rebatch publishes a FRESH WjBatchDesc, so re-reading `re->batch`
@@ -3369,20 +3751,25 @@ wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, voi
 	/* R320: the caller's snapshot -- the same reading of the entry whose depset its walk installed. */
 	WjBatchDesc *ibatch = snap_batch;
 	if (ibatch) {
-		extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
+		extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
 		if (!mono_wasm_jit_instantiate_batch_local (ibatch->e, ibatch->f, ibatch->n,
-		                                            ibatch->bytes, ibatch->len, eb, (int) sizeof (eb), &ms)) {
+		                                            ibatch->bytes, ibatch->len, eb, (int) sizeof (eb), &ms, snap_payload)) {
 			static int _n = 0;
 			if (_n++ < 20)
 				printf ("WASM_JIT_CYCLE_INSTALL_FAIL desc=%d (batch n=%d) : %s\n", desc_id, ibatch->n, eb);
 			return FALSE;
 		}
-	} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, snap_bytes, snap_len, eb, (int) sizeof (eb), &ms)) {
+	} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, snap_bytes, snap_len, eb, (int) sizeof (eb), &ms, snap_payload)) {
 		static int _n = 0;
 		if (_n++ < 20)
 			printf ("WASM_JIT_CYCLE_INSTALL_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
 		return FALSE;
 	}
+	}
+	/* H5: a hook routed this descriptor during the GC-safe instantiate above (see wj_admit_impl). */
+	if (G_UNLIKELY (re->hooked) && !wj_hook_restub_local (re)) {
+		mono_wasm_jit_counters [WJC_HOOK_ROUTE_FAIL]++;
+		return FALSE;
 	}
 	/* The snapshot, not a fresh read -- see the note at the top of this function. */
 	wj_desc_generation [desc_id] = gen;
@@ -3513,7 +3900,8 @@ wj_install_closure (int desc_id)
 	void *snap_bytes = NULL;
 	int snap_len = 0;
 	WjDepSet *snap_ds = NULL;
-	if (!wj_pub_snapshot (re, &snap_b, &snap_bytes, &snap_len, &snap_ds)) {
+	guint32 snap_payload = 0;
+	if (!wj_pub_snapshot2 (re, &snap_b, &snap_bytes, &snap_len, &snap_ds, &snap_payload)) {
 		mono_wasm_jit_counters [WJC_ADMIT_PAYLOAD_TORN]++;
 		return FALSE;
 	}
@@ -3555,7 +3943,7 @@ wj_install_closure (int desc_id)
 			}
 		}
 	}
-	if (!wj_admit_install_only (desc_id, re, snap_b, snap_bytes, snap_len))
+	if (!wj_admit_install_only (desc_id, re, snap_b, snap_bytes, snap_len, snap_payload))
 		ok = FALSE;
 	return ok;
 }
@@ -3569,7 +3957,7 @@ static void
 wj_walk_note_gc_pending (void)
 {
 	extern volatile size_t mono_polling_required;
-	if (mono_polling_required)
+	if (mono_polling_required & 1)   /* MONO_POLLING_GC; the other bit is the hook doorbell (H6) */
 		mono_wasm_jit_counters [WJC_ADMIT_WALK_GC_PENDING]++;
 }
 
@@ -3853,7 +4241,7 @@ wj_make_callable (int desc_id)
 #ifdef HOST_BROWSER
 	/* Restore the guarded trampoline before the table underneath it changes; repatched per member below. */
 	if (desc_id < wj_desc_state_cap && wj_desc_generation [desc_id] != re->generation && re->logical_imethod)
-		mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod);
+		mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod, re->logical_method);
 #endif
 
 	/* wj_clo_n is reset by wj_install_closure_group / _root, next to the stamp and budget they also
@@ -3988,6 +4376,47 @@ wj_make_callable (int desc_id)
 	return (desc_id < wj_desc_state_cap && wj_desc_state [desc_id] == 2) ? 1 : 0;
 }
 
+/* H5: admission of a hooked descriptor -- the stub, never `bytes`. See WjRegEntry.hooked. */
+static int
+wj_hook_admit (int desc_id, WjRegEntry *re)
+{
+	guint32 gen = re->generation;
+	wj_desc_state_ensure (desc_id + 1);
+	if (!wj_hook_restub_local (re)) {
+		mono_wasm_jit_counters [WJC_HOOK_ROUTE_FAIL]++;
+		return 0;
+	}
+	wj_desc_state [desc_id] = 2;
+	wj_desc_generation [desc_id] = gen;
+	return 1;
+}
+
+/* H5: a hooked descriptor's own e/f pair (the re-emission broker pins the new body into it). 0 = not hooked. */
+int mono_wasm_jit_desc_hooked_slots (int desc_id, int *e, int *f);
+int
+mono_wasm_jit_desc_hooked_slots (int desc_id, int *e, int *f)
+{
+	WjRegEntry *re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
+	if (!re || !re->hooked || re->e <= 0 || re->f <= 0)
+		return 0;
+	*e = re->e;
+	*f = re->f;
+	return 1;
+}
+
+/* H5: a group install wrote these f-slots; any whose descriptor is hooked must hold its stub instead. */
+static void
+wj_hook_restub_slots (const int *f_slots, int n)
+{
+	int i;
+	for (i = 0; i < n; ++i) {
+		int d = wj_desc_for_fslot (f_slots [i]);
+		WjRegEntry *re = d > 0 ? wj_reg_at (d - 1) : NULL;
+		if (re && re->f == f_slots [i] && G_UNLIKELY (re->hooked) && !wj_hook_restub_local (re))
+			mono_wasm_jit_counters [WJC_HOOK_ROUTE_FAIL]++;
+	}
+}
+
 static int
 wj_admit_impl (int desc_id)
 {
@@ -4054,6 +4483,11 @@ wj_admit_impl (int desc_id)
 		mono_wasm_jit_counters [WJC_ADMIT_ORPHANED]++;
 		return 0;
 	}
+	/* H5: a hook is in force and its body is not compiled yet. The f-slot gets the stub (callers that call it run the
+	 * hook in the interpreter); the e-slot stays not live, so admit_live answers 0 and dynamic dispatch takes the
+	 * interpreter route too. No dependency walk: the stub calls nothing it has not resolved itself. */
+	if (G_UNLIKELY (re->hooked))
+		return wj_hook_admit (desc_id, re);
 	gen_snapshot = re->generation;
 	watch = mono_wasm_jit_watch && re->logical_method && re->logical_method->name &&
 		strstr (re->logical_method->name, mono_wasm_jit_watch);
@@ -4074,7 +4508,7 @@ wj_admit_impl (int desc_id)
 		 * replacing this worker's table slots with a newer batch generation, then repatch it below
 		 * only after the new dependency union has been admitted. */
 		if (re->logical_imethod)
-				mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod);
+				mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod, re->logical_method);
 #endif
 		/* A NEW generation earns a fresh attempt -- unless this worker has already burned
 		 * WJ_PERMFAIL_MAX of them on bytes that would not instantiate. See wj_desc_permfail.
@@ -4147,11 +4581,14 @@ wj_admit_impl (int desc_id)
 	void *snap_bytes = NULL;
 	int snap_len = 0;
 	WjDepSet *snap_ds = NULL;
-	if (!wj_pub_snapshot (re, &batch, &snap_bytes, &snap_len, &snap_ds)) {
+	guint32 snap_payload = 0;
+	if (!wj_pub_snapshot2 (re, &batch, &snap_bytes, &snap_len, &snap_ds, &snap_payload)) {
 		mono_wasm_jit_counters [WJC_ADMIT_PAYLOAD_TORN]++;   /* ungated: a race catch; non-zero is healthy */
 		batch = NULL;   /* no sibling was premarked yet: the fail path must not reset any */
 		goto fail;
 	}
+	/* W1 C0 diagnostics only: what the generation-keyed install test would have decided (see the install test). */
+	guint32 gen_before_premark = wj_desc_generation [desc_id];
 	if (batch) {
 		/* Instantiating any member installs every export, but that does NOT make every sibling
 		 * dispatchable: each sibling can have different unchecked external call_indirect targets.
@@ -4206,16 +4643,33 @@ wj_admit_impl (int desc_id)
 	/* The compiling worker already installed this descriptor; other workers instantiate it once here.
 	 * A batch member brings up the ENTIRE module (its exports are e<i>/f<i>, so there is no way to
 	 * instantiate one member alone) — which also installs its siblings, so they skip this. */
-	if (!wj_slot_is_installed (re->e) || !wj_slot_is_installed (re->f) ||
-	    wj_desc_generation [desc_id] != re->generation) {
+	/* THE MODULE IN THIS PTHREAD'S SLOTS DECIDES (W1 C0), not the generation it last admitted. The generation test
+	 * this replaces could not see a batch at all -- the premark above had already written batch->generation where
+	 * it looked, so only the compiling worker ever ran a re-framed group (R399) -- and it re-instantiated unchanged
+	 * bytes whenever a rendezvous re-minted their generation. A payload is the identity of the bytes themselves.
+	 * The two counters say where the old test would have been wrong: ADOPT_SKIP = it would have certified a module
+	 * not installed here (R399's class), ADOPT_REINST = it would have re-instantiated one that is. */
+	gboolean need_inst = !snap_payload || wj_slot_payload_at (re->e) != snap_payload ||
+	    wj_slot_payload_at (re->f) != snap_payload;
+	{
+		gboolean old_test = !wj_slot_is_installed (re->e) || !wj_slot_is_installed (re->f) ||
+		    wj_desc_generation [desc_id] != re->generation || (batch && gen_before_premark != batch->generation);
+		gboolean old_r399 = !wj_slot_is_installed (re->e) || !wj_slot_is_installed (re->f) ||
+		    wj_desc_generation [desc_id] != re->generation;
+		if (need_inst && !old_r399)
+			mono_wasm_jit_counters [WJC_ADOPT_SKIP]++;
+		if (!need_inst && old_test)
+			mono_wasm_jit_counters [WJC_ADOPT_REINST]++;
+	}
+	if (need_inst) {
 		instantiated_here = TRUE;
 		eb [0] = 0;
 		/* `batch`, NOT `re->batch`: the snapshot taken before the premark loop. Re-reading the pointer
 		 * here is what let a concurrent re-frame pair one module's bytes with another's slot list. */
 		if (batch) {
-			extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms);
+			extern int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
 			if (!mono_wasm_jit_instantiate_batch_local (batch->e, batch->f, batch->n,
-			                                            batch->bytes, batch->len, eb, (int) sizeof (eb), &ms)) {
+			                                            batch->bytes, batch->len, eb, (int) sizeof (eb), &ms, snap_payload)) {
 				printf ("WASM_JIT_ADMIT_FAIL desc=%d (batch n=%d) e=%d f=%d : %s\n", desc_id, batch->n, re->e, re->f, eb);
 				fail_perm = TRUE;   /* a LinkError/CompileError on these bytes will not fix itself */
 				goto fail;
@@ -4233,7 +4687,7 @@ wj_admit_impl (int desc_id)
 			 * marked PERMANENTLY bad on bytes that were merely read at the wrong moment. */
 			if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_BATCH_RACED);
 			goto fail;
-		} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, snap_bytes, snap_len, eb, (int) sizeof (eb), &ms)) {
+		} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, snap_bytes, snap_len, eb, (int) sizeof (eb), &ms, snap_payload)) {
 			printf ("WASM_JIT_ADMIT_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
 			fail_perm = TRUE;   /* as above: bad bytes, not a transient ordering miss */
 			/* A LinkError here should be impossible: admission refuses to instantiate until every
@@ -4261,6 +4715,21 @@ wj_admit_impl (int desc_id)
 		wj_census_instantiated++;
 		wj_census_inst_us += (gint64) (ms * 1000.0);
 		mono_atomic_inc_i32 (&wj_census_inst_admit);
+	}
+	/* H5: with nothing instantiated here the group install's own restub did not run; a hooked member keeps its stub. */
+	if (batch && !instantiated_here)
+		wj_hook_restub_slots (batch->f, batch->n);
+	/* H5: A HOOK THAT LANDED DURING THE INSTANTIATE. It ran GC-safe, where a hook's wait counts this thread as
+	 * acknowledged, and the drain on the way back skipped this descriptor (its install was not recorded yet) -- so what
+	 * was just installed is the body the hook displaced. Hand back the stub instead. */
+	if (!batch && instantiated_here && G_UNLIKELY (re->hooked)) {
+		gboolean ok = wj_hook_restub_local (re);
+		if (!ok)
+			mono_wasm_jit_counters [WJC_HOOK_ROUTE_FAIL]++;
+		wj_desc_state [desc_id] = ok ? 2 : 0;
+		if (ok)
+			wj_desc_generation [desc_id] = gen_snapshot;
+		return ok ? 1 : 0;
 	}
 	/* Publish dispatchability only after every unchecked direct dependency is admitted. */
 	/* MONO_WASM_JIT_VERIFY_DEPS=1: test the invariant directly, at the only moment it matters -- just
@@ -4350,6 +4819,9 @@ wj_admit_impl (int desc_id)
 		goto fail;
 	}
 	wj_desc_state [desc_id] = 2;
+	/* W1 C0 TRIPWIRE, must read 0: this descriptor is being certified while its slots hold another module. */
+	if (G_UNLIKELY (wj_slot_payload_at (re->e) != snap_payload || wj_slot_payload_at (re->f) != snap_payload))
+		mono_wasm_jit_counters [WJC_STALE_CERTIFIED]++;
 	/* Publish the generation this admission WALKED, and publish it unconditionally.
 	 *
 	 * The first version of this skipped the write whenever the recorded value differed from

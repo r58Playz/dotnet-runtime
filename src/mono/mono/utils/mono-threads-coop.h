@@ -21,6 +21,12 @@
 
 /* JIT specific interface */
 MONO_API_DATA volatile size_t mono_polling_required;
+/* mono_polling_required's bits. Every safepoint tests the word for non-zero and takes the poll; only the GC bit means a
+ * suspend. MONO_POLLING_HOOK is the wasm JIT's hook doorbell (mini-wasm-publish.inc, plan H6): a poll taken for it only
+ * adopts pending code publications. Whoever re-derives "is a GC suspend pending" must test MONO_POLLING_GC alone. */
+#define MONO_POLLING_GC   ((size_t) 1)
+#define MONO_POLLING_HOOK ((size_t) 2)
+void mono_threads_polling_update (size_t set, size_t clear);
 
 /* Internal API */
 

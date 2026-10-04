@@ -67,6 +67,14 @@ mono_class_setup_interface_offsets (MonoClass *klass);
 MONO_COMPONENT_API void
 mono_class_setup_vtable (MonoClass *klass);
 
+/* plan2x S3 (MONO_WASM_JIT_S3): class-hierarchy analysis records, class-setup-vtable.c. */
+gboolean
+mono_class_cha_enabled (void);
+gint32 *
+mono_class_cha_word (MonoMethod *m);
+void
+mono_class_cha_stats (gint32 *records, gint32 *marked);
+
 void
 mono_class_setup_parent    (MonoClass *klass, MonoClass *parent);
 

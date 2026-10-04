@@ -16,6 +16,7 @@
 #include <glib.h>
 #include <mono/utils/mono-compiler.h>
 #include "mini.h"
+#include <mono/metadata/body-override.h>
 
 #ifndef DISABLE_JIT
 
@@ -95,6 +96,7 @@ extern int mono_wasm_jit_stats;
 extern void mono_wasm_jit_count (int idx);
 extern gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
 	MonoMethod **out_target, guint32 *out_samples, int *out_why);
+gpointer mono_wasm_jit_prof_ancestor (MonoCompile *cfg, MonoMethod *base);   /* R407, defined below */
 /* Stats-gated, so a timing run pays two loads and a predictable branch per virtual site and nothing
  * else. Every bump sits where the ACTION happens, never where it is decided -- R215 spent a round on
  * DelegateDevirtArm reading 750 with FastDelegateDevirt at 0 because the two lived in different
@@ -153,6 +155,12 @@ wj_gi_prof_census (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, in
 /* R316k: the inlinee-record verdict of the last wj_gi_predict: -1 = the site is the root's own, 0 = inlinee site but the
  * inlinee has no InterpMethod, else 10 + the inlinee record's WJ_PRED_* (11 no record, 12 cold, 13/14 poly, 15 torn). */
 static __thread int wj_gi_last_inl;
+/* R407: 0, or 20 + the WJ_PRED_* verdict of the enclosing inlinee's record the last wj_gi_predict fell back to. */
+static __thread int wj_gi_last_anc;
+/* R411: the call profile the last wj_gi_predict's prediction came from (NULL: static / CHA, no profile behind it). */
+static __thread gpointer wj_gi_pred_im;
+/* W3 census: costs of the last inline_method (< 0 = the inlinee's IR aborted, else it exceeded the cost cap). */
+static __thread int wj_inline_last_costs;
 /* R329: TRUE iff the last wj_gi_predict answered from the static fallback (so the emission can count the ACTION). */
 static __thread gboolean wj_gi_static;
 
@@ -168,24 +176,96 @@ wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mi
 	int why2 = 0;
 
 	wj_gi_last_inl = (method && method != cfg->method) ? 0 : -1;
+	wj_gi_last_anc = 0;
+	wj_gi_pred_im = NULL;
 	wj_gi_static = FALSE;
-	if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples, why))
+	if (mono_wasm_jit_prof_predict (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples, why)) {
+		wj_gi_pred_im = cfg->wasm_jit_caller_imethod;
 		return TRUE;
+	}
 	if (mid && (*why == 3 || *why == 4) &&
 	    mono_wasm_jit_prof_predict_method (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples)) {
 		wj_gi_count (WJC_MID_PRED_GI);
+		wj_gi_pred_im = cfg->wasm_jit_caller_imethod;
 		return TRUE;
 	}
+	gpointer inl_im = NULL;
 	if (mono_wasm_jit_prof_inlinee && method && method != cfg->method) {
-		gpointer im = mono_interp_peek_imethod (method);
+		gpointer im = inl_im = mono_interp_peek_imethod (method);
 		if (im && (mono_wasm_jit_prof_predict (im, cmethod, vt, target, samples, &why2) ||
 		           (mid && (why2 == 3 || why2 == 4) &&
 		            mono_wasm_jit_prof_predict_method (im, cmethod, vt, target, samples)))) {
 			wj_gi_count (WJC_MID_PRED_INL);
+			wj_gi_pred_im = im;
 			return TRUE;
 		}
 		if (im)
 			wj_gi_last_inl = 10 + why2;
+	}
+	/* R405: a COLD verdict whose record saw ONE receiver predicts it (interp.c mono_wasm_jit_prof_predict_cold) -- the
+	 * root's record, then the inlinee's. Before the static prediction below, which names the BASE: the recorded target is
+	 * what the site actually dispatched to. Tier 2 only. */
+	{
+		extern int mono_wasm_jit_t2_cold_pred;
+		extern gboolean mono_wasm_jit_prof_predict_cold (gpointer caller, MonoMethod *base,
+			MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
+		if ((mono_wasm_jit_t2_cold_pred & 1) && cfg->wasm_jit_tier >= 2) {
+			if (*why == 2 && mono_wasm_jit_prof_predict_cold (cfg->wasm_jit_caller_imethod, cmethod, vt, target, samples)) {
+				wj_gi_count (WJC_T2_COLD_PRED_GI);
+				wj_gi_pred_im = cfg->wasm_jit_caller_imethod;
+				return TRUE;
+			}
+			if (wj_gi_last_inl == 12 && inl_im && mono_wasm_jit_prof_predict_cold (inl_im, cmethod, vt, target, samples)) {
+				wj_gi_count (WJC_T2_COLD_PRED_GI);
+				wj_gi_count (WJC_T2_COLD_PRED_GI_INL);
+				wj_gi_pred_im = inl_im;
+				return TRUE;
+			}
+		}
+	}
+	/* R411: a POLYMORPHIC verdict (the root's record, or the inlinee's) predicts its top arm when bimorphic GI is on; the
+	 * fallback then gets the second arm (the GI emission). Ranked by method under a method-identity guard, else by
+	 * receiver vtable. Tier 2 only, and only above the knob's share. */
+	{
+		extern int mono_wasm_jit_t2_gi_bimorphic;
+		extern gboolean mono_wasm_jit_prof_predict_second (gpointer caller, MonoMethod *base, MonoMethod *skip_target,
+			MonoVTable *skip_vt, gboolean by_target, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
+		guint32 pct = 0;
+		if (mono_wasm_jit_t2_gi_bimorphic > 0 && cfg->wasm_jit_tier >= 2 && !cfg->wasm_no_gi2) {
+			gpointer rec = (*why == 3 || *why == 4) ? cfg->wasm_jit_caller_imethod
+				: (wj_gi_last_inl == 13 || wj_gi_last_inl == 14) ? inl_im : NULL;
+			if (rec && mono_wasm_jit_prof_predict_second (rec, cmethod, NULL, NULL, mid, vt, target, &pct) &&
+			    pct >= (guint32) mono_wasm_jit_t2_gi_bimorphic) {
+				wj_gi_count (WJC_T2_GI2_POLY_ARM1);
+				cfg->wasm_gi2_n++;
+				wj_gi_pred_im = rec;
+				*samples = pct;
+				return TRUE;
+			}
+		}
+	}
+	/* R407: nothing in the root's record or the inlinee's -- an enclosing inlinee's (mono_wasm_jit_prof_ancestor). */
+	{
+		extern int mono_wasm_jit_prof_ancestors, mono_wasm_jit_t2_cold_pred;
+		extern gboolean mono_wasm_jit_prof_predict_cold (gpointer caller, MonoMethod *base,
+			MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
+		if ((mono_wasm_jit_prof_ancestors & 1) && cfg->wasm_jit_tier >= 2 && *why == 1 &&
+		    (wj_gi_last_inl < 0 || wj_gi_last_inl == 0 || wj_gi_last_inl == 11)) {
+			gpointer anc = mono_wasm_jit_prof_ancestor (cfg, cmethod);
+			int why3 = 0;
+			if (anc) {
+				wj_gi_count (WJC_PROF_ANC_FOUND);
+				if (mono_wasm_jit_prof_predict (anc, cmethod, vt, target, samples, &why3) ||
+				    (mid && (why3 == 3 || why3 == 4) && mono_wasm_jit_prof_predict_method (anc, cmethod, vt, target, samples)) ||
+				    ((mono_wasm_jit_t2_cold_pred & 1) && why3 == 2 &&
+				     mono_wasm_jit_prof_predict_cold (anc, cmethod, vt, target, samples))) {
+					wj_gi_count (WJC_PROF_ANC_GI);
+					wj_gi_pred_im = anc;
+					return TRUE;
+				}
+				wj_gi_last_anc = 20 + why3;   /* census: the ancestor's verdict */
+			}
+		}
 	}
 	/* R329: nothing observed at all (the caller's record, and an inlinee's, say NO RECORD) -- predict the method the
 	 * callvirt names. Only behind a method-identity guard (mid): any receiver that inherits it takes the inlined body,
@@ -435,6 +515,30 @@ wj_inline_origin_imethod (MonoCompile *cfg, MonoMethod *cmethod)
 	return NULL;
 }
 
+/* R407 (MONO_WASM_JIT_PROF_ANCESTORS): the nearest ENCLOSING inlinee -- not the root, not the method whose IL holds the
+ * site -- whose call profile has a site for `base`. A JITted IC records under the root of the compile that emitted it,
+ * so a site that a tier-1 root R1 had inlined from M is recorded under R1; once a tier-2 root R2 inlines R1, the site's
+ * record is neither R2's nor M's. Tier 2 only. Peeks (never creates) an InterpMethod per level; the methods are live,
+ * being compiled. NULL when none has one. */
+gpointer mono_wasm_jit_prof_ancestor (MonoCompile *cfg, MonoMethod *base);
+gpointer
+mono_wasm_jit_prof_ancestor (MonoCompile *cfg, MonoMethod *base)
+{
+#ifdef HOST_BROWSER
+	extern gpointer mono_interp_peek_imethod (MonoMethod *method);
+	extern gboolean mono_wasm_jit_prof_has_site (gpointer caller, MonoMethod *base);
+	int i = MIN (cfg->wasm_inl_sp, (int) G_N_ELEMENTS (cfg->wasm_inl_stack)) - 2;
+	if (!COMPILE_WASM (cfg) || cfg->wasm_jit_tier < 2 || !base)
+		return NULL;
+	for (; i >= 0; --i) {
+		gpointer im = mono_interp_peek_imethod (cfg->wasm_inl_stack [i]);
+		if (im && mono_wasm_jit_prof_has_site (im, base))
+			return im;
+	}
+#endif
+	return NULL;
+}
+
 /* R316f: per-callee inline refusals in TIER-2 compiles, by gate -- SIZE (IL, with the cold-throw-discounted size),
  * COST (inline_method's cost cap, with the largest cost seen), ABORT (an INLINE_FAILURE inside the inlinee, with its
  * message), OTHER (any other check_inlining gate: clauses, NOINLINING, class init, depth, ...). A SITE count over tier-2
@@ -451,6 +555,10 @@ typedef struct {
 	gint32 code_size, hot_size, max_cost;
 } WjT2Refusal;
 static WjT2Refusal wj_t2r [WJ_T2R_SLOTS];
+/* W3 census (R406): the last tier-2 refusal's site char, read by the ordinary inliner's call site: Z size, L cost cap,
+ * A inlinee aborted, E clauses, D depth, n NoInlining, s S2 (site never ran at tier 1), r does not return, c class init
+ * / cctor, O any other gate. 0 = nothing filed since the call site cleared it. */
+static __thread char wj_t2r_last_char;
 
 static void
 wj_t2_refuse (MonoCompile *cfg, MonoMethod *m, int reason, int a, int b, const char *msg)
@@ -459,6 +567,10 @@ wj_t2_refuse (MonoCompile *cfg, MonoMethod *m, int reason, int a, int b, const c
 	int i;
 	if (!COMPILE_WASM (cfg) || cfg->wasm_jit_tier < 2 || !m)
 		return;
+	wj_t2r_last_char = reason == WJ_T2R_SIZE ? 'Z' : reason == WJ_T2R_COST ? 'L' : reason == WJ_T2R_ABORT ? 'A'
+		: !msg ? 'O' : !strcmp (msg, "clauses") ? 'E' : !strcmp (msg, "depth") ? 'D' : !strcmp (msg, "NoInlining") ? 'n'
+		: !strncmp (msg, "s2:", 3) ? 's' : !strcmp (msg, "does not return") ? 'r'
+		: (strstr (msg, "cctor") || strstr (msg, "class") || strstr (msg, "vtable")) ? 'c' : 'O';
 	h = ((gsize) m >> 4) & (WJ_T2R_SLOTS - 1);
 	for (i = 0; i < 8; ++i) {
 		WjT2Refusal *r = &wj_t2r [(h + i) & (WJ_T2R_SLOTS - 1)];
@@ -854,6 +966,50 @@ field_access_failure (MonoCompile *cfg, MonoMethod *method, MonoClassField *fiel
 	mono_error_set_generic_error (cfg->error, "System", "FieldAccessException", "Field `%s' is inaccessible from method `%s'\n", field_fname, method_fname);
 	g_free (method_fname);
 	g_free (field_fname);
+}
+
+/* A WasmDetour stub calls its target with the hooked method's own argument list: an instance method's `this`
+ * becomes the static target's first parameter (a reference, or a byref for a value type's method), and every other
+ * parameter and the return must match exactly. Only then may the JIT call the target directly (CEE_CALLI). */
+/* W3 census (MONO_WASM_JIT_SITE_COUNT): the guarded-inline verdict at a virtual call site, read back by the emitter's
+ * site record of the call that survives (mini-wasm-ir.inc). N/C/P no prediction (no record, cold, polymorphic), S
+ * self, V valuetype, B refused before, G signature, X census only, E clauses, Z size, O other check_inlining, L
+ * refused late, I inlined (what survives is the fallback call). */
+static void
+wj_site_gi_note (MonoCompile *cfg, const guint8 *ip, char code)
+{
+#ifdef HOST_BROWSER
+	extern int mono_wasm_jit_site_count;
+	if (G_LIKELY (!mono_wasm_jit_site_count))
+		return;
+	if (!cfg->wasm_site_gi)
+		cfg->wasm_site_gi = g_hash_table_new (NULL, NULL);
+	g_hash_table_insert (cfg->wasm_site_gi, (gpointer) ip, GINT_TO_POINTER ((int) code));
+#endif
+}
+
+static gboolean
+wasm_detour_target_compatible (MonoMethod *src, MonoMethodSignature *fsig, MonoMethod *dst)
+{
+	MonoMethodSignature *dsig = mono_method_signature_internal (dst);
+	int shift = 0, i;
+	if (!dsig || dsig->generic_param_count)
+		return FALSE;
+	if (fsig->hasthis && !dsig->hasthis) {
+		MonoType *t0;
+		if (dsig->param_count != fsig->param_count + 1)
+			return FALSE;
+		t0 = dsig->params [0];
+		if (m_class_is_valuetype (src->klass) ? !m_type_is_byref (t0) : (m_type_is_byref (t0) || !MONO_TYPE_IS_REFERENCE (t0)))
+			return FALSE;
+		shift = 1;
+	} else if (fsig->hasthis != dsig->hasthis || dsig->param_count != fsig->param_count) {
+		return FALSE;
+	}
+	for (i = 0; i < fsig->param_count; ++i)
+		if (!mono_metadata_type_equal (fsig->params [i], dsig->params [i + shift]))
+			return FALSE;
+	return mono_metadata_type_equal (fsig->ret, dsig->ret);
 }
 
 static MONO_NEVER_INLINE void
@@ -4845,6 +5001,85 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 	if (limit_override > 0)
 		limit = limit_override;
 
+#ifdef HOST_BROWSER
+	/* plan2x S2 (MONO_WASM_JIT_S2 & 2): tier 2's ORDINARY inliner (limit_override <= 0; a guarded-inline site's
+	 * tier-1 counter sees only its fallback) reads the site's tier-1 frequency. Never executed -> refused; hot ->
+	 * a larger limit, if the callee has a tier-1 body of its own or makes no call (R372: an AOT-backed callee's
+	 * virtual sites become JIT IC traffic once inlined). The verdict is left for inline_method to consume. */
+	cfg->wasm_s2_gate_ip = NULL;
+	{
+		extern int mono_wasm_jit_s2, mono_wasm_jit_s2_cold, mono_wasm_jit_s2_hot_pct, mono_wasm_jit_s2_hot_limit, mono_wasm_jit_s2_budget;
+		extern double mono_wasm_jit_s2_site_freq (MonoCompile *cfg);
+		extern gboolean mono_wasm_jit_s2_has_body (MonoMethod *m);
+		if (COMPILE_WASM (cfg) && cfg->wasm_t2_strict && limit_override <= 0 && !(mono_wasm_jit_s2 & 2)) {
+			/* plan2x S0b without S2: every site is unknown -- the strict limit everywhere */
+			extern int mono_wasm_jit_t2_strict_limit;
+			if (limit > mono_wasm_jit_t2_strict_limit)
+				limit = mono_wasm_jit_t2_strict_limit;
+		}
+		/* !wasm_gi_cha_site: b8 (R396) measured S2 v2 + S3 WORSE than S3 alone -- this gate also judged CHA-guarded
+		 * inlines, whose target CHA proved; leave them to the static GI size. */
+		if (COMPILE_WASM (cfg) && (mono_wasm_jit_s2 & 6) == 6 && cfg->wasm_jit_tier >= 2 && limit_override > 0 && !cfg->wasm_gi_cha_site) {
+			/* plan2x S2 & 4: the guarded-inline gate, on hot arm + fallback */
+			extern double mono_wasm_jit_s2_gi_site_freq (MonoCompile *cfg);
+			double gf = mono_wasm_jit_s2_gi_site_freq (cfg);
+			cfg->wasm_s2_gate_ip = cfg->ip;
+			cfg->wasm_s2_gate_callee = method;
+			cfg->wasm_s2_gate_f = gf;
+			cfg->wasm_s2_gate_hot = FALSE;
+			if (gf < 0) {
+				wj_gi_count (WJC_S2_GI_UNKNOWN);
+			} else if (gf == 0 && mono_wasm_jit_s2_cold) {
+				wj_gi_count (WJC_S2_GI_COLD);
+				cfg->wasm_s2_gate_ip = NULL;
+				WJ_T2R_WHY ("s2: the guarded site never executed at tier 1");
+			} else if (gf * 100.0 >= (double) mono_wasm_jit_s2_hot_pct && header.code_size >= GINT_TO_UINT32 (limit) &&
+			           limit < mono_wasm_jit_s2_hot_limit && header.code_size < GINT_TO_UINT32 (mono_wasm_jit_s2_hot_limit) &&
+			           cfg->wasm_s2_spent + (int) header.code_size <= mono_wasm_jit_s2_budget &&
+			           (mono_wasm_jit_s2_has_body (method) || (header.code && wj_il_is_call_free (header.code, header.code_size)))) {
+				wj_gi_count (WJC_S2_GI_RAISED);
+				limit = mono_wasm_jit_s2_hot_limit;
+				cfg->wasm_s2_gate_hot = TRUE;
+			}
+		}
+		if (COMPILE_WASM (cfg) && (mono_wasm_jit_s2 & 2) && cfg->wasm_jit_tier >= 2 && limit_override <= 0) {
+			double f = mono_wasm_jit_s2_site_freq (cfg);
+			extern int mono_wasm_jit_t2_strict_limit;
+			/* plan2x S0b: an unknown or warm site gets the strict limit in the strict retry (hot keeps the tier-2 one) */
+			if (cfg->wasm_t2_strict && (f < 0 || f * 100.0 < (double) mono_wasm_jit_s2_hot_pct) && limit > mono_wasm_jit_t2_strict_limit)
+				limit = mono_wasm_jit_t2_strict_limit;
+			cfg->wasm_s2_gate_ip = cfg->ip;
+			cfg->wasm_s2_gate_callee = method;
+			cfg->wasm_s2_gate_f = f;
+			cfg->wasm_s2_gate_hot = FALSE;
+			if (f < 0) {
+				wj_gi_count (WJC_S2_UNKNOWN);
+			} else if (f == 0 && mono_wasm_jit_s2_cold) {
+				wj_gi_count (WJC_S2_COLD);
+				cfg->wasm_s2_gate_ip = NULL;
+				WJ_T2R_WHY ("s2: the site never executed at tier 1");
+			} else if (f * 100.0 < (double) mono_wasm_jit_s2_hot_pct) {
+				wj_gi_count (WJC_S2_WARM);
+			} else {
+				wj_gi_count (WJC_S2_HOT);
+				if (header.code_size >= GINT_TO_UINT32 (limit) && limit < mono_wasm_jit_s2_hot_limit &&
+				    header.code_size < GINT_TO_UINT32 (mono_wasm_jit_s2_hot_limit)) {
+					if (cfg->wasm_s2_spent + (int) header.code_size > mono_wasm_jit_s2_budget)
+						wj_gi_count (WJC_S2_BUDGET_OUT);
+					else if (!mono_wasm_jit_s2_has_body (method) &&
+					         !(header.code && wj_il_is_call_free (header.code, header.code_size)))
+						wj_gi_count (WJC_S2_NOPROF);
+					else {
+						wj_gi_count (WJC_S2_RAISED);
+						limit = mono_wasm_jit_s2_hot_limit;
+						cfg->wasm_s2_gate_hot = TRUE;
+					}
+				}
+			}
+		}
+	}
+#endif
+
 	guint32 eff_size = header.code_size;
 #ifdef HOST_BROWSER
 	/* R318: cold throw segments do not count -- only where their calls may stay (the per-compile policy); at tier 1
@@ -5324,6 +5559,20 @@ mini_emit_array_store (MonoCompile *cfg, MonoClass *klass, MonoInst **sp, gboole
 			MONO_EMIT_NEW_LOAD_MEMBASE_FAULT (cfg, avt_reg, sp [0]->dreg, MONO_STRUCT_OFFSET (MonoObject, vtable));
 			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, ak_reg, avt_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
 			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, aec_reg, ak_reg, GINTPTR_TO_TMREG (m_class_offsetof_element_class ()));
+#ifdef HOST_BROWSER
+			/* Plan B8a (MONO_WASM_JIT_STELEM_OBJ, R423): a RUNTIME object[] takes any reference, so its stores need
+			 * no check at all -- test the array's element class before touching the value. Without this every
+			 * store into an object[] (ArrayList.elementData, TimSort's tmp) misses the exact-class test below,
+			 * loads the value's vtable first and then makes the virtual wrapper call. Sound under covariance: the
+			 * element class compared is the ACTUAL array's, as for the exact test. */
+			{
+				extern int mono_wasm_jit_stelem_obj;
+				if (mono_wasm_jit_stelem_obj) {
+					MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, aec_reg, (target_mgreg_t) (gsize) mono_defaults.object_class);
+					MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, fast_store_bb);
+				}
+			}
+#endif
 
 			/* vklass = value->vtable->klass  (value is known non-null here) */
 			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, vvt_reg, sp [2]->dreg, MONO_STRUCT_OFFSET (MonoObject, vtable));
@@ -5658,6 +5907,9 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	MonoGenericContext *prev_generic_context;
 	gboolean ret_var_set, prev_ret_var_set, prev_disable_inline, virtual_ = FALSE;
 	gpointer prev_wasm_inline_im;
+	double prev_s2_ctx;
+	gboolean s2_hot;
+	int s2_cap;
 
 	g_assert (cfg->exception_type == MONO_EXCEPTION_NONE);
 
@@ -5746,11 +5998,32 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	cfg->ret_var_set = FALSE;
 	cfg->inline_depth ++;
 	cfg->wasm_cur_inline_im = wj_inline_origin_imethod (cfg, cmethod);
+	/* plan2x S2: take the size gate's verdict for THIS site (it ran on this ip and callee, or it is stale), and give
+	 * the inlinee its context frequency; nested gates overwrite the cfg fields, so both live in locals here. */
+	prev_s2_ctx = cfg->wasm_s2_ctx;
+	s2_hot = FALSE;
+	if (COMPILE_WASM (cfg) && cfg->wasm_s2_gate_ip && cfg->wasm_s2_gate_ip == ip && cfg->wasm_s2_gate_callee == cmethod) {
+		s2_hot = cfg->wasm_s2_gate_hot;
+		cfg->wasm_s2_ctx = cfg->wasm_s2_gate_f;
+		wj_p3_count (WJC_S2_CTX_MATCH);
+	} else {
+		cfg->wasm_s2_ctx = -1;
+		if (COMPILE_WASM (cfg) && cfg->wasm_jit_tier >= 2)
+			wj_p3_count (WJC_S2_CTX_MISS);
+	}
+	cfg->wasm_s2_gate_ip = NULL;
 
 	if (ip && *ip == CEE_CALLVIRT && !(cmethod->flags & METHOD_ATTRIBUTE_STATIC))
 		virtual_ = TRUE;
 
+	if (cfg->wasm_inl_sp < (int) G_N_ELEMENTS (cfg->wasm_inl_stack))
+		cfg->wasm_inl_stack [cfg->wasm_inl_sp] = cmethod;
+	cfg->wasm_inl_sp++;
 	costs = mono_method_to_ir (cfg, cmethod, sbblock, ebblock, rvar, sp, real_offset, virtual_);
+	cfg->wasm_inl_sp--;
+#ifdef HOST_BROWSER
+	wj_inline_last_costs = costs;   /* W3 census: the outermost inline_method's costs, read by the GI gate's late refusal */
+#endif
 
 	ret_var_set = cfg->ret_var_set;
 
@@ -5768,16 +6041,33 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	cfg->ret_var_set = prev_ret_var_set;
 	cfg->disable_inline = prev_disable_inline;
 	cfg->wasm_cur_inline_im = prev_wasm_inline_im;
+	cfg->wasm_s2_ctx = prev_s2_ctx;
 	cfg->inline_depth --;
 
-	if ((costs >= 0 && costs < (COMPILE_WASM (cfg) && cfg->wasm_inline_cost_cap > 0 ? cfg->wasm_inline_cost_cap : 60)) ||
+	{ extern int mono_wasm_jit_s2_hot_cost;   /* plan2x S2: a hot site's cost cap, when it is the larger */
+	  s2_cap = COMPILE_WASM (cfg) && cfg->wasm_inline_cost_cap > 0 ? cfg->wasm_inline_cost_cap : 60;
+	  if (s2_hot && mono_wasm_jit_s2_hot_cost > s2_cap)
+		s2_cap = mono_wasm_jit_s2_hot_cost; }
+	if ((costs >= 0 && costs < s2_cap) ||
 	    inline_always || (costs >= 0 && aggressive_inline_method (cfg, cmethod))) {
 		if (cfg->verbose_level > 2)
 			printf ("INLINE END %s -> %s\n", mono_method_full_name (cfg->method, TRUE), mono_method_full_name (cmethod, TRUE));
 		if (COMPILE_WASM (cfg)) {
 			wj_p3_count (WJC_INLINE_ACCEPTED);   /* the ACTION: counted at the accepted return (R315) */
+			if (s2_hot) {   /* plan2x S2: a raised site, accepted -- paid out of the root's S2 budget */
+				wj_p3_count (WJC_S2_INLINED);
+				cfg->wasm_s2_spent += (gint32) cheader->code_size;
+			}
 			if (cfg->wasm_jit_tier >= 2)
 				cfg->wasm_jit_result.t2_inlined++;   /* R316d */
+#ifdef HOST_BROWSER
+			{ extern int mono_wasm_jit_origin, mono_wasm_jit_s2;
+			  extern void mono_wasm_jit_origin_note_inline (MonoCompile *, MonoMethod *, MonoMethodHeader *);
+			  /* plan2x S2 & 1 needs the inlinees' IL ranges too: a tier-1 site inside an inlinee is counted against
+			   * that inlinee's IL buffer (the names stay ORIGIN-only). */
+			  if (G_UNLIKELY (mono_wasm_jit_origin || (mono_wasm_jit_s2 & 1)))
+				mono_wasm_jit_origin_note_inline (cfg, cmethod, cheader); }
+#endif
 		}
 
 		mono_error_assert_ok (cfg->error);
@@ -8442,7 +8732,14 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			--sp;
 			addr = *sp;
 			g_assert (addr);
-			fsig = mini_get_signature (method, token, generic_context, cfg->error);
+			/* The WasmDetour convention (MonoMod's WasmDetourFactory): a detour stub is `ldarg* ; ldc.i4 <target ftnptr>
+			 * ; [tail.] calli 0xF0F0F0F0 ; ret`, and the magic token means "this method's own signature" -- the interpreter
+			 * reads it the same way (transform.c). Without this a detoured DynamicMethod asserted in
+			 * mono_method_get_wrapper_data. Already inflated for an inflated method, so no context is applied. */
+			if (token == 0xF0F0F0F0)
+				fsig = mono_method_signature_internal (method);
+			else
+				fsig = mini_get_signature (method, token, generic_context, cfg->error);
 			CHECK_CFG_ERROR;
 
 			if (cfg->gsharedvt_min && mini_is_gsharedvt_variable_signature (fsig))
@@ -8608,6 +8905,27 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			}
 
 			inline_costs += CALL_COST * MIN(10, num_calls++);
+
+			/* THE WasmDetour STUB'S CALLI, LOWERED (plan H7, the JIT half; R402). Its constant is a function pointer -- an
+			 * InterpMethod or MonoFtnDesc address -- and the generic path below turned it into a FIXED-INDEX call: constant
+			 * propagation folds the register call into an absolute one, and an absolute wasm call target is a table
+			 * index, so the stub compiled to `call_indirect 0x06xxxxxx` and trapped on every worker (hookstress, JIT on).
+			 * The override record names the method the stub calls (mono_body_set_il read it from the pointer at
+			 * install), so call THAT, directly. Anything else carrying the magic token is refused, and the interpreter,
+			 * which resolves the pointer at run time, runs it. */
+			if (COMPILE_WASM (cfg) && token == 0xF0F0F0F0) {
+				gpointer dftn = NULL;
+				MonoMethod *dtarget = NULL;
+				mono_body_override_info (method, &dftn, &dtarget);
+				if (dtarget && addr->opcode == OP_ICONST && (gpointer) (gssize) addr->inst_c0 == dftn &&
+				    wasm_detour_target_compatible (method, fsig, dtarget)) {
+					NULLIFY_INS (addr);
+					ins = mono_emit_method_call (cfg, dtarget, sp, NULL);
+					goto calli_end;
+				}
+				mono_cfg_set_exception_invalid_program (cfg, "a WasmDetour calli the wasm JIT cannot lower");
+				goto exception_exit;
+			}
 
 			/*
 			 * Making generic calls out of gsharedvt methods.
@@ -9071,8 +9389,38 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				int gi_mid_slot = mono_wasm_jit_pred_mid ? mono_wasm_jit_mid_slot (cmethod) : -1;
 
 				wj_gi_count (WJC_GI_SITE);
-				if (!wj_gi_predict (cfg, method, cmethod, gi_mid_slot,
-				                    &gi_vt, &gi_target, &gi_samples, &gi_why)) {
+				gboolean gi_pred = wj_gi_predict (cfg, method, cmethod, gi_mid_slot,
+				                                  &gi_vt, &gi_target, &gi_samples, &gi_why);
+				/* R411: copied now -- arm 1's inline_method runs nested predictions that overwrite the TLS */
+				gpointer gi_pred_im = wj_gi_pred_im;
+				gint32 *gi_cha = NULL;   /* plan2x S3: a CHA target's guard word */
+				{ extern int mono_wasm_jit_s3;
+				  extern gint32 *mono_wasm_jit_cha_final_word (MonoMethod *m, gboolean *candidate);
+				  gboolean gi_cand = FALSE;
+				  gboolean s3_tier_ok = !(mono_wasm_jit_s3 & 8) || cfg->wasm_jit_tier >= 2;   /* S3 & 8: tier 2 only */
+				  if (!gi_pred && (mono_wasm_jit_s3 & 1) && s3_tier_ok) {
+					gi_cha = mono_wasm_jit_cha_final_word (cmethod, &gi_cand);
+					if (gi_cha) {
+						gi_pred = TRUE; gi_target = cmethod; gi_vt = NULL; gi_mid_slot = -1;
+						wj_gi_count (WJC_S3_GI_PRED);
+					} else if (gi_cand) {
+						wj_gi_count (WJC_S3_GI_OVERRIDDEN);
+					}
+				  } else if (gi_pred && wj_gi_static && gi_target == cmethod && (mono_wasm_jit_s3 & 1) && s3_tier_ok) {
+					/* R329's static prediction names the base behind the method-identity guard (vtable -> klass ->
+					 * vtable [slot], three dependent loads); while nothing overrides the base, one load answers it. */
+					gi_cha = mono_wasm_jit_cha_final_word (cmethod, &gi_cand);
+					if (gi_cha) {
+						gi_vt = NULL; gi_mid_slot = -1;
+						wj_gi_count (WJC_S3_GI_STATIC);
+					}
+				  } }
+				if (!gi_pred) {
+					/* R406: an inlinee site with an InterpMethod files the INLINEE record's verdict ('1' no record, '2' cold,
+					 * '3' poly); N/C/P are the root's, for root sites and inlinees without one. */
+					wj_site_gi_note (cfg, ip, wj_gi_last_anc ? (wj_gi_last_anc == 22 ? '5' : '6')   /* R407 ancestor: cold / poly */
+						: wj_gi_last_inl >= 11 ? (wj_gi_last_inl == 11 ? '1' : wj_gi_last_inl == 12 ? '2' : '3')
+						: gi_why == 1 ? 'N' : gi_why == 2 ? 'C' : 'P');
 					wj_gi_count (WJC_GI_REFUSED_PROF);
 					if (cfg->wasm_jit_tier >= 2) {
 						wj_gi_count (WJC_T2_GI_NOPRED);   /* R316c: the same refusal, tier-2 compiles only */
@@ -9096,10 +9444,12 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						wj_gi_prof_census (cfg, method, cmethod, gi_why);
 				} else if (gi_target == cfg->method) {
 					/* Self-recursion: inline_method would recurse into the method being compiled. */
+					wj_site_gi_note (cfg, ip, 'S');
 					wj_gi_count (WJC_GI_REFUSED_SELF);
 				} else if (m_class_is_valuetype (gi_target->klass)) {
 					/* R376: a boxed receiver's valuetype override expects an UNBOXED `this`, and the inlined body
 					 * would take the site's object reference instead. Counted as OTHER so the GI parts still sum. */
+					wj_site_gi_note (cfg, ip, 'V');
 					wj_gi_count (WJC_GI_REFUSED_OTHER);
 					wj_gi_count (WJC_DEVIRT_VALUETYPE);
 				} else if (cfg->wasm_jit_tier < 2 && wj_gi_refused_before (gi_target)) {
@@ -9107,16 +9457,20 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					 * says nothing about it; the memo is bypassed there and not written from there.) */
 					/* inline_method has already refused this callee at another site. Skip before emitting
 					 * a guard we would then have to abandon; counted as OTHER so the parts still sum. */
+					wj_site_gi_note (cfg, ip, 'B');
 					wj_gi_count (WJC_GI_REFUSED_OTHER);
 				} else if (!mono_metadata_signature_equal (mono_method_signature_internal (gi_target), fsig)) {
 					/* The inlined body is substituted into THIS call's argument list, so the override's
 					 * signature has to be the site's -- full equality, not an arity check: a covariant
 					 * return or a differently-lowered parameter would silently mistype the merge var. */
+					wj_site_gi_note (cfg, ip, 'G');
 					wj_gi_count (WJC_GI_REFUSED_SIG);
 				} else if (!mono_wasm_jit_guarded_inline) {
 					/* Census only: the population is sized, and nothing below this point runs. */
+					wj_site_gi_note (cfg, ip, 'X');
 					wj_gi_count (WJC_GI_CANDIDATE);
-				} else if (!mono_method_check_inlining_limit (cfg, gi_target,
+				} else if ((cfg->wasm_gi_cha_site = (gi_cha != NULL)),
+				           !mono_method_check_inlining_limit (cfg, gi_target,
 				                                             cfg->wasm_gi_size > 0 ? cfg->wasm_gi_size : mono_wasm_jit_guarded_inline_size)) {
 					/* ATTRIBUTE THE REFUSAL, do not lump it. check_inlining says no for at least seven
 					 * distinct reasons (EH clauses, NOINLINING, SYNCHRONIZED, gsharedvt, depth, size,
@@ -9129,6 +9483,14 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					 * Java is EH-dense and mono refuses to inline ANY method carrying a try/catch. SIZE
 					 * is the one a knob can move. OTHER is everything else, and it existing at all is
 					 * what stops the first two from quietly absorbing a cause nobody named. */
+					{   /* W3 census: which check_inlining refusal (the header summary is the one it just read) */
+						extern int mono_wasm_jit_site_count;
+						if (G_UNLIKELY (mono_wasm_jit_site_count)) {
+							MonoMethodHeaderSummary gi_hs2;
+							wj_site_gi_note (cfg, ip, !mono_method_get_header_summary (gi_target, &gi_hs2) ? 'O'
+								: gi_hs2.has_clauses ? 'E' : (int) gi_hs2.code_size >= mono_wasm_jit_guarded_inline_size ? 'Z' : 'O');
+						}
+					}
 					if (G_UNLIKELY (mono_wasm_jit_stats)) {
 						MonoMethodHeaderSummary gi_hs;
 						if (!mono_method_get_header_summary (gi_target, &gi_hs))
@@ -9173,7 +9535,15 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					/* COMPARE_IMM against the baked vtable, the same form the non-AOT array-store check
 					 * uses -- one fewer register than materialising a PCONST, and this is a runtime JIT
 					 * so compile_aot is never set on this path. */
-					if (gi_mid_slot >= 0) {
+					if (gi_cha) {
+						/* plan2x S3: CHA GUARD -- one load of the base's word; the vtable load above stays as the
+						 * null check. */
+						int gi_areg = alloc_preg (cfg), gi_wreg = alloc_ireg (cfg);
+						MONO_EMIT_NEW_PCONST (cfg, gi_areg, gi_cha);
+						MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, gi_wreg, gi_areg, 0);
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, gi_wreg, 0);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, gi_fallback_bb);
+					} else if (gi_mid_slot >= 0) {
 						/* R311 METHOD-IDENTITY GUARD. The predicted receiver still pays one compare; any
 						 * other receiver whose class holds gi_target in the same vtable slot -- i.e.
 						 * inherits it -- takes the inlined body too, instead of the callvirt. Sound under
@@ -9200,6 +9570,18 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi_fallback_bb);
 					}
 
+					{ extern int mono_wasm_jit_s2;
+					  extern gint32 *mono_wasm_jit_s2_gi_hot_word (MonoCompile *cfg);
+					  /* plan2x S2 & 4: count this tier-1 guarded inline's hot arm (the fallback call is counted by the
+					   * emitter), so tier 2's GI gate sees the whole site */
+					  gint32 *gi_hw = ((mono_wasm_jit_s2 & 5) == 5 && cfg->wasm_jit_tier < 2) ? mono_wasm_jit_s2_gi_hot_word (cfg) : NULL;
+					  if (gi_hw) {
+						int gi_har = alloc_preg (cfg), gi_hvr = alloc_ireg (cfg);
+						MONO_EMIT_NEW_PCONST (cfg, gi_har, gi_hw);
+						MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, gi_hvr, gi_har, 0);
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_IADD_IMM, gi_hvr, gi_hvr, 1);
+						MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STOREI4_MEMBASE_REG, gi_har, 0, gi_hvr);
+					  } }
 					/* HOT ARM. inline_method consumes its `sp` and writes the result back through it,
 					 * so it gets a COPY -- the fallback below needs the original argument list intact. */
 					memcpy (gi_sp, sp, sizeof (MonoInst *) * (gsize) n);
@@ -9211,6 +9593,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						 * folds the empty block away. Counted, because "admitted" and "emitted" being
 						 * different populations is exactly the accounting failure R215 cost a round to. */
 						wj_gi_count (WJC_GI_REFUSED_LATE);
+						wj_site_gi_note (cfg, ip, wj_inline_last_costs < 0 ? 'A' : 'L');   /* A aborted, L over the cost cap */
 						if (cfg->wasm_jit_tier < 2)
 							wj_gi_note_refused (gi_target);
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_fallback_bb);
@@ -9227,7 +9610,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						}
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_end_bb);
 						gi_active = TRUE;
+						wj_site_gi_note (cfg, ip, 'I');
 						wj_gi_count (WJC_GI_EMITTED);
+						if (gi_cha)
+							wj_gi_count (WJC_S3_GI_EMITTED);
 						if (cfg->wasm_jit_tier >= 2) {
 							wj_gi_count (WJC_T2_GI_EMITTED);
 							cfg->wasm_jit_result.t2_gi++;
@@ -9239,11 +9625,76 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					}
 					/* Everything the ordinary call emission does below now lands in the fallback. */
 					MONO_START_BB (cfg, gi_fallback_bb);
+					/* R411 (MONO_WASM_JIT_T2_GI_BIMORPHIC = the bar, in % of the site's observations; 0 = off): a SECOND
+					 * guarded inline at the head of the fallback, for the next most frequent TARGET in the same record
+					 * the first prediction came from. Same guard shapes as the first (receiver vtable, or method identity
+					 * at a class-virtual site), same merge var, same join; what both guards miss falls to the callvirt.
+					 * Tier 2 only; never behind a CHA or static prediction (no profile behind them) or a late refusal. */
+					{
+						extern int mono_wasm_jit_t2_gi_bimorphic;
+						extern gboolean mono_wasm_jit_prof_predict_second (gpointer caller, MonoMethod *base, MonoMethod *skip_target,
+							MonoVTable *skip_vt, gboolean by_target, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
+						MonoVTable *gi2_vt = NULL;
+						MonoMethod *gi2_target = NULL;
+						guint32 gi2_pct = 0;
+						if (mono_wasm_jit_t2_gi_bimorphic > 0 && cfg->wasm_jit_tier >= 2 && !cfg->wasm_no_gi2 && !gi_late_refused && !gi_cha &&
+						    gi_vt && gi_pred_im &&
+						    mono_wasm_jit_prof_predict_second (gi_pred_im, cmethod, gi_mid_slot >= 0 ? gi_target : NULL,
+						                                       gi_mid_slot >= 0 ? NULL : gi_vt, gi_mid_slot >= 0,
+						                                       &gi2_vt, &gi2_target, &gi2_pct)) {
+							wj_gi_count (WJC_T2_GI2_CANDIDATE);
+							if (gi2_pct >= (guint32) mono_wasm_jit_t2_gi_bimorphic && gi2_target != cfg->method &&
+							    !m_class_is_valuetype (gi2_target->klass) &&
+							    mono_metadata_signature_equal (mono_method_signature_internal (gi2_target), fsig) &&
+							    mono_method_check_inlining_limit (cfg, gi2_target,
+							        cfg->wasm_gi_size > 0 ? cfg->wasm_gi_size : mono_wasm_jit_guarded_inline_size)) {
+								MonoBasicBlock *gi2_fallback_bb, *gi2_hot_bb;
+								gboolean gi2_empty = FALSE;
+								int gi2_costs;
+								NEW_BBLOCK (cfg, gi2_fallback_bb);
+								NEW_BBLOCK (cfg, gi2_hot_bb);
+								MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi2_vt);
+								if (gi_mid_slot >= 0) {
+									extern int mono_wasm_jit_class_vtable_off (void);
+									int k2 = alloc_preg (cfg), mv2 = alloc_preg (cfg), m2 = alloc_preg (cfg);
+									MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, gi2_hot_bb);
+									MONO_EMIT_NEW_LOAD_MEMBASE (cfg, k2, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass));
+									MONO_EMIT_NEW_LOAD_MEMBASE (cfg, mv2, k2, mono_wasm_jit_class_vtable_off ());
+									MONO_EMIT_NEW_LOAD_MEMBASE (cfg, m2, mv2, gi_mid_slot * TARGET_SIZEOF_VOID_P);
+									MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, m2, (gssize) gi2_target);
+								}
+								MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi2_fallback_bb);
+								MONO_START_BB (cfg, gi2_hot_bb);
+								memcpy (gi_sp, sp, sizeof (MonoInst *) * (gsize) n);
+								gi2_costs = inline_method (cfg, gi2_target, fsig, gi_sp, ip, cfg->real_offset, FALSE, &gi2_empty);
+								if (!gi2_costs) {
+									/* refused after the guard: the hot arm becomes a branch to the fallback, as for arm 1 */
+									wj_gi_count (WJC_T2_GI2_LATE);
+									MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi2_fallback_bb);
+								} else {
+									cfg->real_offset += 5;
+									inline_costs += gi2_costs;
+									if (gi_ret_var) {
+										MonoInst *gi2_store;
+										EMIT_NEW_TEMPSTORE (cfg, gi2_store, gi_ret_var->inst_c0, *gi_sp);
+									}
+									MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_end_bb);
+									wj_gi_count (WJC_T2_GI2_EMITTED);
+									cfg->wasm_gi2_n++;
+									wj_site_gi_note (cfg, ip, 'J');
+								}
+								MONO_START_BB (cfg, gi2_fallback_bb);
+							}
+						}
+					}
 				}
 			}
 #endif /* HOST_BROWSER */
 
 			/* Inlining */
+#ifdef HOST_BROWSER
+			wj_t2r_last_char = 0;
+#endif
 			if ((cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual &&
 				(!virtual_ || !(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) || MONO_METHOD_IS_FINAL (cmethod)) &&
 			    wj_check_inlining_t2 (cfg, cmethod)) {
@@ -9287,6 +9738,11 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					goto call_end;
 				}
 			}
+#ifdef HOST_BROWSER
+			/* W3 census (R406): why the ordinary inliner left this call (tier 2; the GI gate notes virtual sites) */
+			if (wj_t2r_last_char && !gi_active)
+				wj_site_gi_note (cfg, ip, wj_t2r_last_char);
+#endif
 
 			pass_mrgctx = need_mrgctx_arg (cfg, cmethod);
 
@@ -10520,6 +10976,14 @@ calli_end:
 			if (method->wrapper_type == MONO_WRAPPER_DYNAMIC_METHOD) {
 				EMIT_NEW_PCONST (cfg, ins, mono_method_get_wrapper_data (method, n));
 				ins->type = STACK_OBJ;
+#ifdef HOST_BROWSER
+				/* wasm JIT: the same GC literal-table capture as the ordinary ldstr site below -- the wrapper-data
+				 * string is a movable object, and without a slot the emitter bails ("managed pconst not interned") */
+				if (cfg->compile_wasm && ins->inst_p0) {
+					extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
+					ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+				}
+#endif
 				*sp = ins;
 			}
 			else if (method->wrapper_type != MONO_WRAPPER_NONE) {

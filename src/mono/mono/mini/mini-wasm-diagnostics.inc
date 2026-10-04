@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 470);   /* + the R377 ldaddr-arg count, + the J1a icall site count, + the J1e value-type vcall pair, + the R376 aggressive-inline cap, + the R376 valuetype-target refusal, + the J1c 64-bit atomic count, + the R371 cold-block census (8), + the Phase 5 lazy-slot census (32), + the R360 atomic lowering count, + the R358 tier-2 unit census (14), + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
+g_static_assert (WJC_MAX == 554);   /* + the B4 quintet (R443), + the R411 bimorphic-GI quartet + retry pair, + the R410 undefined-local count, + the R409 loop-count site, + the R407 ancestor trio, + the R405 cold-prediction trio, + the H4-H6 hook census (12, R403), + the W1 C0 tripwire, + the H3 epoch/no-GC/broker census (7, R401), + the R399 adoption pair, + the plan2x S2 GI quartet, + the plan2x S0b pair, + the plan2x S4 pair, + the plan2x S3 census (8), + the plan2x S2 census (13), + the plan2x S0 count quartet, + the plan2x S1 quartet, + the plan2x F9 pair, + the plan2x F4 quartet, + the R377 ldaddr-arg count, + the J1a icall site count, + the J1e value-type vcall pair, + the R376 aggressive-inline cap, + the R376 valuetype-target refusal, + the J1c 64-bit atomic count, + the R371 cold-block census (8), + the Phase 5 lazy-slot census (32), + the R360 atomic lowering count, + the R358 tier-2 unit census (14), + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -266,7 +266,7 @@ mono_wasm_jit_dump_stats (void)
 	 * a static function's name can be inlined away and then never appears in the name section. This line
 	 * exists for that, and it is printed rather than merely declared so it cannot be dropped as unused.
 	 * Bump the tag whenever a runtime change needs to be provably deployed. */
-	printf ("[wasm-jit build] wjbuild-p3-reemit-cov\n");
+	printf ("[wasm-jit build] wjbuild-plan2x-w0\n");
 	printf ("[wasm-jit stats] registered=%lld bailed=%lld invalid=%lld invoked=%lld residual=%lld fastvcall=%lld (counting %s)\n",
 		WJC_(WJC_REGISTERED), WJC_(WJC_BAILED), WJC_(WJC_INVALID),
 		WJC_(WJC_INVOKE), WJC_(WJC_RESIDUAL), WJC_(WJC_FASTVCALL),
@@ -554,14 +554,19 @@ mono_wasm_jit_dump_stats (void)
 	{
 		extern int mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
 			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero, mono_wasm_jit_ic_mid, mono_wasm_jit_pred_mid,
-			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks;
+			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks, mono_wasm_jit_s4, mono_wasm_jit_t2_loop_count,
+			mono_wasm_jit_rrem_inline, mono_wasm_jit_b4, mono_wasm_jit_b4_groups;
 		printf ("[wasm-jit levers] guarded_inline=%d inline_leaf=%d lazy_cold=%d vcall_memo=%d frame_zero=%d "
-			"ic_mid=%d pred_mid=%d prof_inlinee=%d prof_blocks=%d "
-			"-- the R299/R311 call-pool levers IN EFFECT (runtime defaults unless overridden)\n",
+			"ic_mid=%d pred_mid=%d prof_inlinee=%d prof_blocks=%d s4=%d t2_loop=%d rrem=%d b4=%d/%d "
+			"-- the call-pool levers IN EFFECT (runtime defaults unless overridden)\n",
 			mono_wasm_jit_guarded_inline, mono_wasm_jit_inline_leaf, mono_wasm_jit_lazy_cold,
 			mono_wasm_jit_vcall_memo, mono_wasm_jit_frame_zero, mono_wasm_jit_ic_mid, mono_wasm_jit_pred_mid,
-			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks);
+			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks, mono_wasm_jit_s4, mono_wasm_jit_t2_loop_count,
+			mono_wasm_jit_rrem_inline, mono_wasm_jit_b4, mono_wasm_jit_b4_groups);
 	}
+	{ extern int mono_wasm_jit_b4; extern void mono_wasm_jit_b4_plan (void);   /* plan B4: the dry-run partition */
+	  if (mono_wasm_jit_b4)
+		mono_wasm_jit_b4_plan (); }
 	{
 		extern int mono_wasm_jit_inline_alloc;
 		extern gint32 mono_wasm_jit_inline_alloc_sites;
@@ -833,16 +838,15 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_MID_IC_SITES), WJC_(WJC_MID_IC_SKIP_IFACE), WJC_(WJC_MID_IC_SKIP_OTHER),
 		WJC_(WJC_MID_ARM), WJC_(WJC_MID_GI), WJC_(WJC_MID_PRED_GI), WJC_(WJC_MID_PRED_ARM),
 		WJC_(WJC_MID_PRED_INL), WJC_(WJC_PROF_BLOCK_GROW));
-	/* R314 (L1). Knob off: the four retired counters size the stale-cache population. Knob on: forwarded should
-	 * track their sum and fwd_live the part that became a direct f-slot call; resid_live_callee is what is left
-	 * of the boundary pool. */
+	/* R314 (L1): forwarded should track the four retired counters' sum (forwarding is unconditional since H1), and
+	 * fwd_live the part that became a direct f-slot call; resid_live_callee is what is left of the boundary pool. */
 	{
-		extern int mono_wasm_jit_forward_retired;
+		extern gint32 mono_interp_patch_late_forward, mono_interp_tierup_epoch_refused, mono_interp_swap_origin_forwarded;
 		printf ("[wasm-jit retired] ic_hit=%lld fastmiss=%lld late_fslot=%lld delegate=%lld | forwarded=%lld fwd_live=%lld"
-			" | resid_live_callee=%lld (forward_retired=%d)\n",
+			" | resid_live_callee=%lld | late_patch_fwd=%d tierup_epoch_refused=%d origin_fwd=%d\n",
 			WJC_(WJC_RETIRED_IC_HIT), WJC_(WJC_RETIRED_FASTMISS), WJC_(WJC_RETIRED_LATE_FSLOT),
 			WJC_(WJC_RETIRED_DELEGATE), WJC_(WJC_RETIRED_FORWARDED), WJC_(WJC_RETIRED_FWD_LIVE),
-			WJC_(WJC_RESID_LIVE_CALLEE), mono_wasm_jit_forward_retired);
+			WJC_(WJC_RESID_LIVE_CALLEE), mono_interp_patch_late_forward, mono_interp_tierup_epoch_refused, mono_interp_swap_origin_forwarded);
 	}
 	{
 		extern int mono_wasm_jit_inline_calls, mono_wasm_jit_inline_calls_limit, mono_wasm_jit_inline_calls_cost,
@@ -919,6 +923,20 @@ mono_wasm_jit_dump_stats (void)
 				extern int mono_wasm_jit_t2_static_pred;
 				printf ("[wasm-jit t2-static] predicted=%lld emitted=%lld (t2_static_pred=%d)\n", WJC_(WJC_T2_GI_STATIC_PRED),
 					WJC_(WJC_T2_GI_STATIC_EMITTED), mono_wasm_jit_t2_static_pred);
+				{ extern int mono_wasm_jit_t2_cold_pred;
+				  printf ("[wasm-jit t2-cold] gi=%lld gi_inl=%lld arm=%lld (t2_cold_pred=%d)\n", WJC_(WJC_T2_COLD_PRED_GI),
+					WJC_(WJC_T2_COLD_PRED_GI_INL), WJC_(WJC_T2_COLD_PRED_ARM), mono_wasm_jit_t2_cold_pred); }
+				{ extern int mono_wasm_jit_prof_ancestors;
+				  printf ("[wasm-jit prof-anc] found=%lld gi=%lld arm=%lld (prof_ancestors=%d)\n", WJC_(WJC_PROF_ANC_FOUND),
+					WJC_(WJC_PROF_ANC_GI), WJC_(WJC_PROF_ANC_ARM), mono_wasm_jit_prof_ancestors); }
+				{ extern int mono_wasm_jit_t2_loop_count;
+				  printf ("[wasm-jit undef-local] typed=%lld\n", WJC_(WJC_UNDEF_LOCAL));
+				  { extern int mono_wasm_jit_t2_gi_bimorphic;
+				    printf ("[wasm-jit t2-gi2] poly_arm1=%lld candidate=%lld emitted=%lld late=%lld retry=%lld retry_ok=%lld (t2_gi_bimorphic=%d)\n",
+					WJC_(WJC_T2_GI2_POLY_ARM1), WJC_(WJC_T2_GI2_CANDIDATE), WJC_(WJC_T2_GI2_EMITTED), WJC_(WJC_T2_GI2_LATE),
+					WJC_(WJC_T2_GI2_RETRY), WJC_(WJC_T2_GI2_RETRY_OK), mono_wasm_jit_t2_gi_bimorphic); }
+				  printf ("[wasm-jit t2-loop] sites=%lld t2c_hits=%lld t2c_requested=%lld (t2_loop_count=%d)\n", WJC_(WJC_T2_LOOP_SITES),
+					WJC_(WJC_T2C_HITS), WJC_(WJC_T2C_REQUESTED), mono_wasm_jit_t2_loop_count); }
 			}
 			{
 				extern int mono_wasm_jit_t2_rearm;
@@ -961,7 +979,48 @@ mono_wasm_jit_dump_stats (void)
 	{ extern void mono_wasm_jit_dump_guarded_inlines (int topn); mono_wasm_jit_dump_guarded_inlines (1024); }
 	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2 (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2 (4096); }   /* R331: every row -- a low-sample hot method sat below the old top 120 */
 	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2_refusals (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2_refusals (60); }
+	{ extern void mono_wasm_jit_dump_sites (void); mono_wasm_jit_dump_sites (); }   /* MONO_WASM_JIT_SITE_COUNT */
 #endif
+	{ extern int mono_wasm_jit_f4;
+	  printf ("[wasm-jit f4] vt_nonref=%lld vt_reuse=%lld ic_memo=%lld arm_memo=%lld (f4=%d)\n",
+		WJC_(WJC_F4_VT_NONREF), WJC_(WJC_F4_VT_REUSE), WJC_(WJC_F4_IC_MEMO), WJC_(WJC_F4_ARM_MEMO), mono_wasm_jit_f4); }
+	printf ("[wasm-jit s2 gi] hot_sites=%lld cold=%lld raised=%lld unknown=%lld\n", WJC_(WJC_S2_GI_HOT_SITES),
+		WJC_(WJC_S2_GI_COLD), WJC_(WJC_S2_GI_RAISED), WJC_(WJC_S2_GI_UNKNOWN));
+	{ extern int mono_wasm_jit_t2_strict;
+	  printf ("[wasm-jit t2 strict] try=%lld ok=%lld (t2_strict=%d)\n", WJC_(WJC_T2_STRICT_TRY), WJC_(WJC_T2_STRICT_OK), mono_wasm_jit_t2_strict); }
+	{ extern int mono_wasm_jit_s4;
+	  printf ("[wasm-jit s4] seen=%lld rewritten=%lld (s4=%d)\n", WJC_(WJC_S4_SEEN), WJC_(WJC_S4_REWRITTEN), mono_wasm_jit_s4); }
+	{ extern void mono_wasm_jit_cha_wrong_dump (void); mono_wasm_jit_cha_wrong_dump (); }
+	{ extern int mono_wasm_jit_s3; extern gint32 mono_wasm_jit_cha_wrong; gint32 cr = 0, cm = 0;
+	  mono_class_cha_stats (&cr, &cm);
+	  printf ("[wasm-jit s3] records=%d marked=%d | gi pred=%lld static=%lld overridden=%lld emitted=%lld | arm pred=%lld overridden=%lld emitted=%lld verify=%lld | wrong=%d (s3=%d t2only=%d)\n",
+		cr, cm, WJC_(WJC_S3_GI_PRED), WJC_(WJC_S3_GI_STATIC), WJC_(WJC_S3_GI_OVERRIDDEN), WJC_(WJC_S3_GI_EMITTED), WJC_(WJC_S3_ARM_PRED),
+		WJC_(WJC_S3_ARM_OVERRIDDEN), WJC_(WJC_S3_ARM_EMITTED), WJC_(WJC_S3_VERIFY_SITES), mono_wasm_jit_cha_wrong, mono_wasm_jit_s3, (mono_wasm_jit_s3 & 8) ? 1 : 0); }
+	{ extern int mono_wasm_jit_s2;
+	  printf ("[wasm-jit s2] sites=%lld entries=%lld full=%lld | unknown=%lld cold=%lld warm=%lld hot=%lld raised=%lld noprof=%lld budget_out=%lld inlined=%lld | ctx match=%lld miss=%lld (s2=%d)\n",
+		WJC_(WJC_S2_SITES), WJC_(WJC_S2_ENTRIES), WJC_(WJC_S2_FULL), WJC_(WJC_S2_UNKNOWN), WJC_(WJC_S2_COLD),
+		WJC_(WJC_S2_WARM), WJC_(WJC_S2_HOT), WJC_(WJC_S2_RAISED), WJC_(WJC_S2_NOPROF), WJC_(WJC_S2_BUDGET_OUT),
+		WJC_(WJC_S2_INLINED), WJC_(WJC_S2_CTX_MATCH), WJC_(WJC_S2_CTX_MISS), mono_wasm_jit_s2); }
+	{ extern int mono_wasm_jit_t2_count;
+	  printf ("[wasm-jit t2c] sites=%lld hits=%lld requested=%lld capped=%lld (t2_count=%d)\n",
+		WJC_(WJC_T2C_SITES), WJC_(WJC_T2C_HITS), WJC_(WJC_T2C_REQUESTED), WJC_(WJC_T2C_CAPPED), mono_wasm_jit_t2_count); }
+	{ extern int mono_wasm_jit_s1;
+	  printf ("[wasm-jit s1] guarded=%lld superseded=%lld guard_taken=%lld reemit_try=%lld (s1=%d)\n",
+		WJC_(WJC_S1_GUARDED), WJC_(WJC_S1_SUPERSEDED), WJC_(WJC_S1_GUARD_TAKEN), WJC_(WJC_S1_REEMIT_TRY), mono_wasm_jit_s1); }
+	{ extern int mono_wasm_jit_hookable;
+	  printf ("[wasm-jit hook] hookable=%d routed=%lld route_fail=%lld restub=%lld bind_interp=%lld guarded=%lld unguarded=%lld"
+		" | waits=%lld skipped=%lld proxy=%lld wait_us_max=%lld ack_timeout=%lld | credit_refused=%lld\n", mono_wasm_jit_hookable,
+		WJC_(WJC_HOOK_ROUTED), WJC_(WJC_HOOK_ROUTE_FAIL), WJC_(WJC_HOOK_RESTUB), WJC_(WJC_HOOK_BIND_INTERP),
+		WJC_(WJC_HOOK_GROUP_GUARDED), WJC_(WJC_HOOK_GROUP_UNGUARDED), WJC_(WJC_HOOK_WAITS), WJC_(WJC_HOOK_WAIT_SKIPPED),
+		WJC_(WJC_HOOK_ACK_PROXY), WJC_(WJC_HOOK_WAIT_US_MAX), WJC_(WJC_HOOK_ACK_TIMEOUT), WJC_(WJC_HOOK_CREDIT_REFUSED)); }
+	printf ("[wasm-jit adopt] old_test_would_skip=%lld old_test_would_reinst=%lld stale_certified=%lld\n",
+		WJC_(WJC_ADOPT_SKIP), WJC_(WJC_ADOPT_REINST), WJC_(WJC_STALE_CERTIFIED));
+	printf ("[wasm-jit epoch] refused local=%lld register=%lld publish=%lld rv=%lld nogc_kept=%lld followed=%lld mandatory_busy=%lld\n",
+		WJC_(WJC_EPOCH_REFUSED_LOCAL), WJC_(WJC_EPOCH_REFUSED_REGISTER), WJC_(WJC_EPOCH_REFUSED_PUBLISH), WJC_(WJC_EPOCH_REFUSED_RV),
+		WJC_(WJC_PRESERVE_NOGC_REFUSED), WJC_(WJC_REEMIT_FOLLOWED), WJC_(WJC_REEMIT_MANDATORY_BUSY));
+	{ extern int mono_wasm_jit_f9;
+	  printf ("[wasm-jit f9] mcache_sites=%lld mcache_fills=%lld (f9=%d)\n",
+		WJC_(WJC_F9_MCACHE_SITES), WJC_(WJC_F9_MCACHE_FILLS), mono_wasm_jit_f9); }
 	printf ("[wasm-jit lcse] loads_seen=%lld adds=%lld hits=%lld evict=%lld\n",
 		WJC_(WJC_LCSE_LOADS_SEEN), WJC_(WJC_LCSE_ADDS), WJC_(WJC_LCSE_HITS), WJC_(WJC_LCSE_EVICT));
 	fflush (stdout);

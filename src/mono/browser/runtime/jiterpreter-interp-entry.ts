@@ -221,7 +221,7 @@ export function mono_jiterp_free_method_data_interp_entry (imethod: number) {
 // An `unpatched` count far above `installed` means adapters are being removed faster than they are being
 // restored, which strands hot methods on the guarded interp-entry trampoline.
 const wjPatchStats: Record<string, number> = {
-    installed: 0, unpatched: 0,
+    installed: 0, unpatched: 0, unpatchedByMethod: 0,
     noInfo: 0, noDirectImpl: 0, alreadyInstalled: 0, noFnTable: 0, badResult: 0,
     flushGateOpen: 0, flushGateShut: 0,
     // Localise where the adapter is lost: did the flush run at all (flushCalls / flushNoPthread), did it
@@ -288,18 +288,55 @@ export function mono_jiterp_wasm_jit_patch_interp_entry (imethod: number) {
     wjPatchStats.installed++;
 }
 
-// Automatic rebatching reuses the target's f-slot. Admission calls this before replacing a worker's
-// slot so an already-installed guard-free adapter cannot enter the new generation prematurely.
-export function mono_jiterp_wasm_jit_unpatch_interp_entry (imethod: number) {
-    imethod = imethod >>> 0;
+// Every interp-entry key this worker holds for a MonoMethod. A body swap replaces the method's InterpMethod while an
+// adapter installed for the old one stays keyed by it, so an unpatch by the CURRENT InterpMethod missed it and the
+// adapter kept entering the f-slot unguarded across the republication (H3). Keys are added at the two infoTable
+// inserts and pruned lazily: a key whose entry is gone is dropped at the next unpatch of its method.
+const wjKeysByMethod = new Map<number, number[]>();
+function wjIndexKey (info: TrampolineInfo) {
+    const m = (<any>info.method) >>> 0, k = info.imethod >>> 0;
+    let keys = wjKeysByMethod.get(m);
+    if (!keys)
+        wjKeysByMethod.set(m, keys = []);
+    if (keys.indexOf(k) < 0)
+        keys.push(k);
+}
+
+// 0 = no entry under this key, 1 = an entry with nothing installed, 2 = an adapter removed.
+function wjUnpatchOne (imethod: number): number {
     const info = infoTable[imethod];
-    if (!info || !info.directInstalled || !fnTable || info.result <= 0)
-        return;
+    if (!info)
+        return 0;
+    if (!info.directInstalled || !fnTable || info.result <= 0)
+        return 1;
     const guarded = info.guardedImplementation || fnTable.get(info.defaultImplementation);
     if (guarded)
         fnTable.set(info.result, guarded);
     info.directInstalled = false;
     wjPatchStats.unpatched++;
+    return 2;
+}
+
+// Automatic rebatching reuses the target's f-slot. Admission calls this before replacing a worker's
+// slot so an already-installed guard-free adapter cannot enter the new generation prematurely. Every adapter of
+// the method, not only the current InterpMethod's (see wjKeysByMethod).
+export function mono_jiterp_wasm_jit_unpatch_interp_entry (imethod: number, method: number) {
+    imethod = imethod >>> 0;
+    wjUnpatchOne(imethod);
+    const keys = method ? wjKeysByMethod.get(method >>> 0) : undefined;
+    if (!keys)
+        return;
+    for (let i = 0; i < keys.length;) {
+        const r = keys[i] === imethod ? 1 : wjUnpatchOne(keys[i]);
+        if (r === 0) {
+            keys[i] = keys[keys.length - 1];
+            keys.pop();
+            continue;
+        }
+        if (r === 2)
+            wjPatchStats.unpatchedByMethod++; // an adapter the InterpMethod-keyed unpatch would have missed
+        i++;
+    }
 }
 
 // A JS worker outlives the pthreads it hosts: emscripten hands the same worker -- this realm, infoTable and the
@@ -395,6 +432,7 @@ function wj_adopt_entry (imethod: number): TrampolineInfo | undefined {
     );
     info.result = at(6);
     infoTable[imethod] = info;
+    wjIndexKey(info);
     wjPatchStats.adopted++;
     return info;
 }
@@ -488,6 +526,7 @@ export function mono_interp_jit_wasm_entry_trampoline (
     info.result = addWasmFunctionPointer(tableId, defaultImplementationFn);
 
     infoTable[imethod] = info;
+    wjIndexKey(info);
     return info.result;
 }
 

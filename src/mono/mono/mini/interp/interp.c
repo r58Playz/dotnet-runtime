@@ -64,9 +64,6 @@
 
 #include "interp.h"
 #include "interp-internals.h"
-/* MONO_WASM_JIT_FORWARD_RETIRED (mini-wasm.c, defined outside HOST_BROWSER): follow replaced_by, R314. Declared
- * at file scope unguarded because the interpreter's own delegate caches use it in every build. */
-extern int mono_wasm_jit_forward_retired;
 extern int mono_wasm_jit_lean_try_invoke;   /* MONO_WASM_JIT_LEAN_TRY_INVOKE, R314/L2 */
 extern int mono_wasm_jit_t2;   /* MONO_WASM_JIT_T2, R316 */
 #include "mintops.h"
@@ -88,6 +85,7 @@ extern int mono_wasm_jit_t2;   /* MONO_WASM_JIT_T2, R316 */
 
 #include <mono/metadata/components.h>
 #include <mono/metadata/loader-internals.h>
+#include <mono/metadata/body-override.h>
 
 #ifdef TARGET_ARM
 #include <mono/mini/mini-arm.h>
@@ -771,6 +769,7 @@ interp_pop_lmf (MonoLMFExt *ext)
  * Serialize with a NON-BLOCKING try-acquire: a thread that loses the race skips compiling and returns
  * "retriable" so the method is re-attempted later — never blocks, so coop-GC suspend can't deadlock. */
 static volatile gint32 wj_compiling = 0;
+static __thread gboolean wj_compiling_here;   /* THIS thread holds wj_compiling (a hook applied inside a compile, H5) */
 
 /*
  * Island/transition diagnostics (Part 3). Bounded, open-addressed lock-free tables. Slot ownership
@@ -1020,7 +1019,9 @@ static const char *
 wj_callee_kind (MonoMethod *m)
 {
 	if (m->wrapper_type != MONO_WRAPPER_NONE) {
-		WrapperInfo *info = mono_marshal_get_wrapper_info (m);
+		/* A DYNAMIC METHOD carries no WrapperInfo: its wrapper data is its own token table, and one that references no
+		 * tokens (MonoMod's chain trampolines) has no item 1 -- mono_method_get_wrapper_data asserts (hookstress). */
+		WrapperInfo *info = m->wrapper_type == MONO_WRAPPER_DYNAMIC_METHOD ? NULL : mono_marshal_get_wrapper_info (m);
 		switch (info ? info->subtype : WRAPPER_SUBTYPE_NONE) {
 		case WRAPPER_SUBTYPE_NATIVE_FUNC_INDIRECT: return "m2n-calli";
 		case WRAPPER_SUBTYPE_PINVOKE: return "m2n-pinvoke";
@@ -1541,6 +1542,11 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
 	s->target = target;
 	s->margin = target ? 1 : 0;
 	s->total = 1;
+	/* The identity set's first entry gets its target and count here too: the set path (wj_prof_note_identity) is
+	 * not taken for a first observation, and a record left at ONE observation -- a hot monomorphic IC site -- had
+	 * ids [0] with no target and a count of 0 until R405. */
+	s->id_targets [0] = target;
+	s->id_counts [0] = 1;
 	s->ids [0] = identity;
 	s->nids = 1;
 	s->ids_overflow = 0;
@@ -1956,6 +1962,88 @@ mono_wasm_jit_prof_predict_method (gpointer caller_ptr, MonoMethod *base, MonoVT
 	return TRUE;
 }
 
+/* W3 (R411): a guarded-inline arm at a POLYMORPHIC site. by_target (a method-identity guard, which takes every receiver
+ * inheriting the method): the method other than skip_target that the most observations resolved to, summed over its
+ * receivers, with its most frequent receiver as the guard's cheap first test. Otherwise (a receiver-vtable guard): the
+ * single most frequent receiver other than skip_vt. Both: its share of all observations in *out_pct; the caller applies
+ * the bar. Arm 1 asks with nothing skipped, arm 2 skipping arm 1. FALSE on an overflowed set (the shares are of what
+ * was tracked, not of what ran). Same double read as prof_predict. */
+gboolean
+mono_wasm_jit_prof_predict_second (gpointer caller_ptr, MonoMethod *base, MonoMethod *skip_target, MonoVTable *skip_vt,
+	gboolean by_target, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct)
+{
+	WjProfSite *s = wj_prof_site ((InterpMethod *) caller_ptr, base, WJ_SITE_VIRTUAL, FALSE);
+	guint32 k, j, n1, n2, total1, total2, best_sum = 0, best_vc = 0;
+	MonoMethod *best_t = NULL;
+	gpointer best_vt = NULL;
+	if (!s || !out_vt || !out_target || !out_pct)
+		return FALSE;
+	n1 = s->nids; total1 = s->total;
+	mono_memory_barrier ();
+	if (s->ids_overflow || n1 < 2 || !total1)
+		return FALSE;
+	for (k = 0; k < n1 && k < WJ_PROF_WAYS; ++k) {
+		MonoMethod *t = s->id_targets [k];
+		guint32 sum = 0, vc = 0;
+		gpointer vt = NULL;
+		if (!t || !s->ids [k] || (skip_target && t == skip_target) || (skip_vt && s->ids [k] == (gpointer) skip_vt))
+			continue;
+		if (by_target) {
+			for (j = 0; j < n1 && j < WJ_PROF_WAYS; ++j)
+				if (s->id_targets [j] == t) {
+					sum += s->id_counts [j];
+					if (s->id_counts [j] > vc) { vc = s->id_counts [j]; vt = s->ids [j]; }
+				}
+		} else {
+			sum = vc = s->id_counts [k];
+			vt = s->ids [k];
+		}
+		if (sum > best_sum && G_LIKELY (wj_method_usable_profile (t))) { best_sum = sum; best_t = t; best_vt = vt; best_vc = vc; }
+	}
+	mono_memory_barrier ();
+	n2 = s->nids; total2 = s->total;
+	if (n1 != n2 || total1 != total2 || s->ids_overflow || !best_t || !best_vt || !best_vc)
+		return FALSE;
+	*out_vt = (MonoVTable *) best_vt;
+	*out_target = best_t;
+	*out_pct = (guint32) MIN (100, (guint64) best_sum * 100 / total1);
+	return TRUE;
+}
+
+/* W3 (R405): the prediction a COLD verdict still holds. A JITted site records an observation only on an IC miss, so a
+ * hot monomorphic site records ONE (its first miss) and then only hits: total < 8 reads cold for the life of the
+ * process (R331). TRUE when the record saw exactly one receiver, with a resolved target, and no overflow; the caller
+ * decides where that is worth acting on (tier 2 only -- a tier-1 compile's cold sites are mostly sites that ran a
+ * few times in the interpreter). Same double read as prof_predict. */
+gboolean
+mono_wasm_jit_prof_predict_cold (gpointer caller_ptr, MonoMethod *base, MonoVTable **out_vt,
+	MonoMethod **out_target, guint32 *out_samples)
+{
+	WjProfSite *s = wj_prof_site ((InterpMethod *) caller_ptr, base, WJ_SITE_VIRTUAL, FALSE);
+	gpointer id;
+	MonoMethod *t;
+	guint32 n1, n2, total1, total2;
+	if (!s || !out_vt || !out_target)
+		return FALSE;
+	n1 = s->nids; total1 = s->total;
+	mono_memory_barrier ();
+	if (s->ids_overflow || n1 != 1 || total1 == 0)
+		return FALSE;
+	id = s->ids [0];
+	t = s->id_targets [0];
+	if (!id || !t || G_UNLIKELY (!wj_method_usable_profile (t)))
+		return FALSE;
+	mono_memory_barrier ();
+	n2 = s->nids; total2 = s->total;
+	if (n1 != n2 || total1 != total2 || s->ids_overflow || s->ids [0] != id || s->id_targets [0] != t)
+		return FALSE;
+	*out_vt = (MonoVTable *) id;
+	*out_target = t;
+	if (out_samples)
+		*out_samples = total1;
+	return TRUE;
+}
+
 /*
  * How many distinct identities this caller saw at `base`, for sizing that site's inline cache.
  *
@@ -2106,6 +2194,11 @@ typedef struct {
 	guint64 key_fslot;
 	MonoMethod *target;
 	guint32 hits;
+	/* plan2x F4 (MONO_WASM_JIT_F4 & 4): the last vtable OTHER than the key's whose class holds `target` in this
+	 * call's slot (R311's method-identity fallback), so it can skip vtable->klass->vtable[slot]. Cleared whenever
+	 * `target` changes. 16 -> 24 bytes per entry. */
+	MonoVTable *mid_vt;
+	guint32 pad;
 } WjLocalVcallPicEntry;
 
 typedef struct {
@@ -2179,6 +2272,37 @@ wj_vcall_site (gpointer ic)
 	return (WjVcallSite *) ((guint8 *) ic - sizeof (WjVcallSite));
 }
 
+/* plan2x F9 (MONO_WASM_JIT_F9 & 1): the megamorphic cache. Lives in a prefix in FRONT of this thread's PIC array, so
+ * the emitted probe addresses it from the PIC base it has already loaded -- no new import global. Per thread like the
+ * PIC, so every f-slot in it was admitted on this thread (it is written only by the publish, after admission). */
+#define WJ_MCACHE_N 512
+typedef struct { MonoVTable *vt; MonoMethod *base; gint32 fslot; guint32 pad; } WjMcacheEntry;
+int mono_wasm_jit_mcache_prefix (void);
+int
+mono_wasm_jit_mcache_prefix (void)
+{
+	extern int mono_wasm_jit_f9;
+	return (mono_wasm_jit_f9 & 1) ? (int) (WJ_MCACHE_N * sizeof (WjMcacheEntry)) : 0;
+}
+static void
+wj_mcache_put (MonoVTable *vt, MonoMethod *base, gint32 fslot)
+{
+	extern int mono_wasm_jit_f9;
+	guint32 v = (guint32) (gsize) vt, b = (guint32) (gsize) base, h;
+	WjMcacheEntry *e;
+	if (!(mono_wasm_jit_f9 & 1) || !wj_vcall_pic || !vt || !base || fslot <= 0 || base->is_inflated || base->is_generic)
+		return;
+	h = ((v >> 3) ^ (v >> 11) ^ ((b >> 3) ^ (b >> 13))) & (WJ_MCACHE_N - 1);   /* = the emitted probe's index */
+	e = (WjMcacheEntry *) ((guint8 *) wj_vcall_pic - mono_wasm_jit_mcache_prefix ()) + h;
+	e->vt = NULL;   /* invalidate first: a half-written entry must never match */
+	e->base = base;
+	e->fslot = fslot;
+	mono_memory_barrier ();
+	e->vt = vt;
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_count (WJC_F9_MCACHE_FILLS);
+}
+
 static WjLocalVcallPicEntry *
 wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 {
@@ -2196,7 +2320,15 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 			ncap *= 2;
 		oldbytes = (gsize) oldcap * mono_wasm_jit_vcall_ways * sizeof (WjLocalVcallPicEntry);
 		nbytes = (gsize) ncap * mono_wasm_jit_vcall_ways * sizeof (WjLocalVcallPicEntry);
-		wj_vcall_pic = (WjLocalVcallPicEntry *) g_realloc (wj_vcall_pic, nbytes);
+		{
+			/* plan2x F9: the allocation carries the megamorphic cache in front; wj_vcall_pic points past it. The
+			 * prefix size is fixed for the process (the knob is read once), and realloc keeps its contents. */
+			gsize pre = (gsize) mono_wasm_jit_mcache_prefix ();
+			guint8 *blk = (guint8 *) g_realloc (wj_vcall_pic ? (guint8 *) wj_vcall_pic - pre : NULL, pre + nbytes);
+			if (!wj_vcall_pic)
+				memset (blk, 0, pre);
+			wj_vcall_pic = (WjLocalVcallPicEntry *) (blk + pre);
+		}
 		memset ((guint8 *) wj_vcall_pic + oldbytes, 0, nbytes - oldbytes);
 		/* Publish the pointer before the capacity. Generated wasm reads cap first and only dereferences
 		 * the pointer when the site fits. Both are same-thread accesses; this ordering also makes the
@@ -2249,9 +2381,15 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 extern int mono_wasm_jit_reemit;          /* MONO_WASM_JIT_REEMIT, ships 0 -- see mini-wasm.c */
 extern int mono_wasm_jit_reemit_batch;    /* MONO_WASM_JIT_REEMIT_BATCH: descriptors per rendezvous */
 extern int mono_wasm_jit_reemit_interval; /* MONO_WASM_JIT_REEMIT_INTERVAL_MS: floor between rendezvous */
+extern int mono_wasm_jit_mandatory_interval; /* MONO_WASM_JIT_MANDATORY_INTERVAL_MS: the floor when a body swap waits */
 extern int mono_wasm_jit_reemit_max;      /* MONO_WASM_JIT_REEMIT_MAX: ceiling on re-emissions per run */
 extern int mono_wasm_jit_reemit_misses;   /* MONO_WASM_JIT_REEMIT_MISSES */
 extern gpointer mono_wasm_jit_desc_logical_imethod (int desc_id);
+#if HOST_BROWSER
+extern int mono_wasm_jit_b4;                 /* plan B4 (mini-wasm.c); the two below live in mini-wasm-batching.inc */
+extern gint32 mono_wasm_jit_b4_due (void);
+extern int mono_wasm_jit_b4_step (void);
+#endif
 
 /* Sized for the POPULATION, not for a trickle. With the per-method one-shot an enqueue happens at most
  * once per method ever, so the O(queue) dedup scan below is paid ~once per method rather than per miss,
@@ -2411,12 +2549,14 @@ static void wj_reemit_drain_one (void);
 
 /* R316 tier 2. One safepoint sample inside `p`'s tier-1 body (mini-wasm-publish.inc mono_wasm_jit_safepoint_poll_t2).
  * Plain field reads/writes only; the enqueue is the broker's own lock-light path. */
+/* Tier-2 requests made so far, by the sampler and by the plan2x S0 counter alike: MONO_WASM_JIT_T2_MAX bounds both. */
+static volatile gint32 t2_requested;
+
 void mono_wasm_jit_t2_sample (gpointer p);
 void
 mono_wasm_jit_t2_sample (gpointer p)
 {
 	extern int mono_wasm_jit_t2_threshold, mono_wasm_jit_t2_max;
-	static volatile gint32 t2_requested;
 	InterpMethod *im;
 	gboolean t2body = ((gsize) p & 1) != 0;   /* R336: a tier-2 body's poll */
 	p = (gpointer) ((gsize) p & ~(gsize) 3);   /* bit 1: R355's loop-poll tag, consumed by the poll helper */
@@ -2426,8 +2566,10 @@ mono_wasm_jit_t2_sample (gpointer p)
 	if (G_UNLIKELY (mono_wasm_jit_stats))
 		mono_wasm_jit_count (WJC_T2_SAMPLES);
 	if (t2body) {
+		extern volatile gint32 mono_wasm_jit_b4_samples;
 		if (im->wasm_jit_t2_body_samples < G_MAXINT32)
 			im->wasm_jit_t2_body_samples++;
+		mono_wasm_jit_b4_samples++;   /* plan B4: the planner's clock (plain, racy: a rate, not a count) */
 		return;
 	}
 	if (im->wasm_jit_tier >= 2 || im->wasm_jit_t2_want) {
@@ -2447,6 +2589,47 @@ mono_wasm_jit_t2_sample (gpointer p)
 	mono_atomic_inc_i32 (&t2_requested);
 	if (G_UNLIKELY (mono_wasm_jit_stats))
 		mono_wasm_jit_count (WJC_T2_REQUESTED);
+	(void) wj_reemit_enqueue (im->wasm_jit_desc, TRUE);
+}
+
+/* plan B4 (R446, R448): a registry entry's plateau hotness -- the safepoint samples taken inside its method's tier-2 body
+ * (R336's count) plus its tier-1 body's, on the method's current InterpMethod. A plain field read; a retired one still
+ * reads a number. */
+gint32 mono_wasm_jit_im_body_samples (gpointer p);
+gint32
+mono_wasm_jit_im_body_samples (gpointer p)
+{
+	InterpMethod *im = (InterpMethod *) p;
+	if (!im)
+		return 0;
+	im = interp_imethod_current (im, TRUE);
+	/* R448: tier-1 samples too (R316e keeps counting them past the tier-2 request) -- the tick's giants stay at tier 1 */
+	return im ? im->wasm_jit_t2_body_samples + im->wasm_jit_t2_samples : 0;
+}
+
+/* plan2x S0 (MONO_WASM_JIT_T2_COUNT): a tier-1 body's entry counter reached the threshold. The same request the
+ * sampler makes at its threshold, from the rare arm of the counter check; plain field reads, one enqueue. */
+void mono_wasm_jit_t2_count_hit (gpointer p);
+void
+mono_wasm_jit_t2_count_hit (gpointer p)
+{
+	extern int mono_wasm_jit_t2_max;
+	InterpMethod *im;
+	if (!p)
+		return;
+	im = interp_imethod_current ((InterpMethod *) p, TRUE);
+	mono_wasm_jit_counters [WJC_T2C_HITS]++;
+	if (im->wasm_jit_tier >= 2 || im->wasm_jit_t2_want)
+		return;
+	if (im->wasm_jit_desc <= 0 || im->wasm_jit_fslot <= 0 || im->retired)
+		return;
+	if (t2_requested >= mono_wasm_jit_t2_max) {
+		mono_wasm_jit_counters [WJC_T2C_CAPPED]++;
+		return;
+	}
+	im->wasm_jit_t2_want = 1;
+	mono_atomic_inc_i32 (&t2_requested);
+	mono_wasm_jit_counters [WJC_T2C_REQUESTED]++;
 	(void) wj_reemit_enqueue (im->wasm_jit_desc, TRUE);
 }
 
@@ -2586,6 +2769,56 @@ mono_wasm_jit_request_reemit (int desc_id)
 		(void) wj_reemit_enqueue (desc_id, TRUE);
 }
 
+/*
+ * PLAN H5/H6: a behaviour-altering swap (MONO_BODY_HOOK) of a method whose JIT generation `desc_id` is live. Route
+ * its f-slot to a stub that runs the hook in the interpreter, on every worker; queue the new body's compile; then wait
+ * until every thread has adopted the route. After this returns no new call runs the displaced body (MonoMod's
+ * contract; frames already in it finish there, and callers that INLINED it keep it, on every runtime). desc_id 0 =
+ * the method had no live JIT generation: interpreter state is shared memory, already switched, nothing to wait for.
+ * Called by tiering.c's body_invalidate outside every lock.
+ */
+void mono_wasm_jit_hook_publish (int desc_id, MonoMethod *m, InterpMethod *im);
+void
+mono_wasm_jit_hook_publish (int desc_id, MonoMethod *m, InterpMethod *im)
+{
+	extern int mono_wasm_jit_hook_route_locked (int desc_id, MonoMethod *m, gpointer imethod);
+	extern gint32 mono_wasm_jit_rendezvous_epoch (const int *descs, int n);
+	extern void mono_wasm_jit_hook_wait (gint32 epoch);
+	gboolean took = FALSE;
+	gint32 ep;
+	int r;
+	if (desc_id <= 0) {
+		mono_wasm_jit_counters [WJC_HOOK_WAIT_SKIPPED]++;
+		return;
+	}
+	/* The compile section serialises lazy-bank writers (mini-wasm-lazy.inc, invariant 4). Waited for GC-SAFE: its owner
+	 * may be waiting on a GC that needs this thread parked. Already held here = a hook applied inside a compile. */
+	if (!wj_compiling_here) {
+		while (mono_atomic_cas_i32 (&wj_compiling, 1, 0) != 0) {
+			MONO_ENTER_GC_SAFE;
+			g_usleep (100);
+			MONO_EXIT_GC_SAFE;
+		}
+		wj_compiling_here = took = TRUE;
+	}
+	r = mono_wasm_jit_hook_route_locked (desc_id, m, im);
+	if (took) {
+		wj_compiling_here = FALSE;
+		mono_atomic_store_i32 (&wj_compiling, 0);
+	}
+	/* AFTER the route: a registration that landed before it would have its `hooked` set again by the route and never
+	 * cleared. */
+	mono_wasm_jit_request_reemit (desc_id);
+	if (r <= 0) {
+		if (r == 0)
+			mono_wasm_jit_counters [WJC_HOOK_WAIT_SKIPPED]++;
+		return;
+	}
+	ep = mono_wasm_jit_rendezvous_epoch (&desc_id, 1);
+	if (ep > 0)
+		mono_wasm_jit_hook_wait (ep);
+}
+
 static void
 wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fslot)
 {
@@ -2679,9 +2912,12 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 	 * at one-target sites. */
 	for (k = 0; k < mono_wasm_jit_vcall_ways; ++k) {
 		if ((guint32) p [k].key_fslot == (guint32) (gsize) vt) {
+			if (p [k].target != target)
+				p [k].mid_vt = NULL;   /* plan2x F4: the memo vouches for `target`, not for the slot */
 			p [k].target = target;
 			p [k].key_fslot = pair;
 			if (p [k].hits != 0xffffffffu) p [k].hits++;
+			wj_mcache_put (vt, wj_vcall_site (ic)->base, fslot);   /* plan2x F9 */
 			return;
 		}
 		if (!p [k].key_fslot) { victim = k; least = 0; break; }
@@ -2689,8 +2925,10 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 	}
 	p [victim].target = target;
 	p [victim].hits = 1;
+	p [victim].mid_vt = NULL;   /* plan2x F4: a new method, so no vtable is known to resolve to it yet */
 	mono_memory_barrier ();
 	p [victim].key_fslot = pair; /* publish the guard+payload last */
+	wj_mcache_put (vt, wj_vcall_site (ic)->base, fslot);   /* plan2x F9 */
 }
 
 /* Imported as immutable globals by each dynamic method instance.  They are the addresses of the TLS
@@ -2723,6 +2961,13 @@ int
 mono_wasm_jit_vcall_pic_stride (void)
 {
 	return (int) sizeof (WjLocalVcallPicEntry);
+}
+
+int mono_wasm_jit_vcall_pic_midvt_off (void);
+int
+mono_wasm_jit_vcall_pic_midvt_off (void)
+{
+	return (int) G_STRUCT_OFFSET (WjLocalVcallPicEntry, mid_vt);
 }
 
 static WjDelegateIC *
@@ -3194,7 +3439,11 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 	extern gboolean mono_wasm_jit_method_denied (MonoMethod *m);
 	extern int mono_wasm_jit_colocate_deps_now (int desc_id);
+	extern void mono_wasm_jit_snap_begin (MonoMethod *method);
+	extern void mono_wasm_jit_snap_end (void);
+	extern guint32 mono_wasm_jit_snap_epoch (void);
 	MonoWasmJitResult r;
+	guint32 snap_epoch = 0;
 	memset (&r, 0, sizeof (r));
 	if (out)
 		memset (out, 0, sizeof (*out));
@@ -3204,6 +3453,7 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 	 * compile on this thread) holds it. Non-blocking, so it can't deadlock the GC. */
 	if (mono_atomic_cas_i32 (&wj_compiling, 1, 0) != 0)
 		return WASM_JIT_COMPILE_BUSY;
+	wj_compiling_here = TRUE;
 	/* Re-check the "already JITted" gate NOW that we hold the lock. All callers test im->wasm_jit_fslot>0
 	 * before getting here, but that check is stale by the time we win the CAS: a second worker can pass its
 	 * (fslot==0) guard while THIS method is being compiled by another thread, then reach its own CAS only
@@ -3224,6 +3474,7 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 	 * does NOT leak a pair, because mono_wasm_jit_pin_slots_for_reemit pointed the self-reservation at the
 	 * pair this method already owns. */
 	if (im->wasm_jit_fslot > 0 && !reemit) {
+		wj_compiling_here = FALSE;
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		if (out) {
 			out->desc_id = im->wasm_jit_desc;
@@ -3245,6 +3496,9 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		static int trace = -1;
 		if (G_UNLIKELY (trace < 0))
 			trace = g_getenv ("MONO_WASM_JIT_COMPILE_TRACE") != NULL;
+		/* H3: the body epoch, before the compile reads any IL (see mono_wasm_jit_snap_begin). */
+		mono_wasm_jit_snap_begin (im->method);
+		snap_epoch = mono_wasm_jit_snap_epoch ();
 		if (trace) {
 			char *tn = mono_method_get_full_name (im->method);
 			printf ("WASM_JIT_COMPILING %s\n", tn);
@@ -3256,7 +3510,9 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		} else {
 			mono_wasm_force_compile (im->method, &r);
 		}
+		mono_wasm_jit_snap_end ();
 	}
+	r.body_epoch = snap_epoch;
 	r.t2_refresh = -9;
 	if (reemit && r.e_slot > 0 && r.desc_id > 0) {
 		extern int mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len);
@@ -3300,6 +3556,13 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		 * the descriptor is either published to the replacement or copied by tier-up before replacement. */
 		jit_mm_lock (jit_mm);
 		im = wj_publish_imethod_locked (jit_mm, logical_method);
+		/* H3: a body swap after registration accepted it. The swap's epoch bump and its InterpMethod replacement are
+		 * one jit_mm critical section, so this read under the same lock is exact: refuse, and the BUSY below retries
+		 * (the swap queued the method's own re-emission too). */
+		if (im && mono_body_override_info (logical_method, NULL, NULL) != snap_epoch) {
+			mono_wasm_jit_counters [WJC_EPOCH_REFUSED_PUBLISH]++;
+			im = NULL;
+		}
 		/* Skip only the STORES here; the block's normal cleanup (waiter drain, compile-lock release,
 		 * the re-emit drain) still runs, and the RETURN at the bottom reports the decline -- see the
 		 * note there for why it must not be JITTED. */
@@ -3342,10 +3605,15 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		 * the standalone module it already has. That ordering is the whole difference from every batching
 		 * arm measured here, all of which DEFERRED publication until the group was built and paid +36% on
 		 * boot for it. */
-		if (!reemit && im)
+		{ extern int mono_wasm_jit_s1;   /* plan2x S1 & 2: a re-emit (a tier-2 body, a generation 2) groups too */
+		  if (im && (!reemit || (mono_wasm_jit_s1 & 2))) {
+			if (reemit)
+				mono_wasm_jit_counters [WJC_S1_REEMIT_TRY]++;
 			mono_wasm_jit_colocate_deps_now (r.desc_id);
+		  } }
 		/* The compiler owner services one queued follow-up after releasing ownership. The drain's own
 		 * re-entrancy guard makes this a no-op when compile_publish was itself called by the broker. */
+		wj_compiling_here = FALSE;
 		mono_atomic_store_i32 (&wj_compiling, 0);
 		wj_reemit_drain_one ();
 		/* A DECLINED PUBLICATION MUST NOT REPORT JITTED, OR THE METHOD IS LOST.
@@ -3364,6 +3632,7 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		 * clears shows up as a rising WJC_PUBLISH_NO_IMETHOD instead of a silent spin. */
 		return im ? WASM_JIT_COMPILE_JITTED : WASM_JIT_COMPILE_BUSY;
 	}
+	wj_compiling_here = FALSE;
 	mono_atomic_store_i32 (&wj_compiling, 0);
 	if (r.retriable) {
 		/* The bail histogram counts callee-not-jitted once per DISTINCT method (the emitter skips the
@@ -3386,7 +3655,9 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
  * at the flush below for why per-method publication wedged boot. */
 #define WJ_REEMIT_BATCH_MAX 64
 static int wj_reemit_batch [WJ_REEMIT_BATCH_MAX];
+static guint32 wj_reemit_batch_epoch [WJ_REEMIT_BATCH_MAX];   /* H3: the body epoch each entry was compiled at */
 static int wj_reemit_batch_n;
+static int wj_reemit_batch_mandatory;   /* the batch holds a body swap: flush on the mandatory floor */
 static volatile gint32 wj_reemit_draining;   /* one drainer process-wide; see the CAS in drain_one */
 static int wj_reemit_flush (void);   /* 1 = published (or nothing to publish), 0 = rate-limited */
 
@@ -3440,7 +3711,11 @@ wj_reemit_drain_one (void)
 	 * 89.9 s against a 31 s norm, and one `memory access out of bounds`. Leaving the entry queued IS the
 	 * wait; the flush below cannot make the batch fuller, so this arm never needs re-testing after it.
 	 */
-	if (wj_reemit_batch_n == 0 && wj_reemit_head == wj_reemit_tail && !wj_reemit_overflow_head) {
+	if (wj_reemit_batch_n == 0 && wj_reemit_head == wj_reemit_tail && !wj_reemit_overflow_head
+#if HOST_BROWSER
+	    && (mono_wasm_jit_b4 < 2 || !mono_wasm_jit_b4_due ())   /* plan B4: planning or framing pending */
+#endif
+	    ) {
 		/* STATS-GATED (R314/L2). Ungated, this was a non-atomic 64-bit increment of one process-global word by
 		 * every thread on every interp call and IC miss -- a cache line bounced between cores to count
 		 * "nothing to do". It read 7.7% of the server thread with the tier off (R313 addendum). */
@@ -3478,6 +3753,28 @@ wj_reemit_drain_one (void)
 	    wj_reemit_batch_n >= WJ_REEMIT_BATCH_MAX)
 		goto out;
 
+#if HOST_BROWSER
+	/* plan B4 (R443): frame up to FOUR hot-set groups per visit, on this single drainer, each published with the next
+	 * rendezvous -- re-admitting any member installs the group on that worker. The publication batch bounds it too:
+	 * once full, framing waits for the rate-limited flush. Four, not one: the drainer is visited only from compile and
+	 * interp-entry safepoints, which stop arriving once a small workload's tier settles. */
+	{
+		int b4i;
+		for (b4i = 0; b4i < 4 && mono_wasm_jit_b4 >= 2 && mono_wasm_jit_b4_due () &&
+		     wj_reemit_batch_n < mono_wasm_jit_reemit_batch && wj_reemit_batch_n < WJ_REEMIT_BATCH_MAX; ++b4i) {
+			int b4d = mono_wasm_jit_b4_step ();
+			if (b4d > 0) {
+				InterpMethod *b4im = (InterpMethod *) mono_wasm_jit_desc_logical_imethod (b4d);
+				wj_reemit_batch_epoch [wj_reemit_batch_n] = b4im ? mono_body_override_info (b4im->method, NULL, NULL) : 0;
+				wj_reemit_batch [wj_reemit_batch_n++] = b4d;
+				mono_wasm_jit_counters [WJC_B4_PUBLISHED]++;
+			}
+		}
+		if (wj_reemit_batch_n >= mono_wasm_jit_reemit_batch || wj_reemit_batch_n >= WJ_REEMIT_BATCH_MAX)
+			goto out;
+	}
+#endif
+
 
 	/* The drainer and producers share one topology lock. This pop never waits: a missed visit is harmless,
 	 * and the current compiler owner calls the broker again when it releases compilation ownership. */
@@ -3509,6 +3806,18 @@ wj_reemit_drain_one (void)
 	 * the registry may still name an older one. Follow first; for anything else this is the same object. */
 	if (im && mono_wasm_jit_t2 && interp_imethod_current (im, TRUE)->wasm_jit_t2_want)
 		im = interp_imethod_current (im, TRUE);
+	/* H3: a body swap's request too. Interpreter tier-up does not copy `wasm_jit_reemit_required` and the registry can
+	 * name the untiered compilation, which the refusal below then dropped -- and with it the swap's republication, so
+	 * every worker kept the previous body in its table. Follow, carrying the request. */
+	if (im && im->wasm_jit_reemit_required) {
+		InterpMethod *cur = interp_imethod_current (im, TRUE);
+		if (cur != im) {
+			cur->wasm_jit_reemit_required = 1;
+			im->wasm_jit_reemit_required = 0;
+			im = cur;
+			mono_wasm_jit_counters [WJC_REEMIT_FOLLOWED]++;
+		}
+	}
 	if (!im || !im->method || im->wasm_jit_fslot <= 0) {
 		mono_wasm_jit_counters [WJC_REEMIT_GONE]++;
 		/* No flag to clear and no owner to clear it on: there is no InterpMethod, or it holds no f-slot,
@@ -3551,7 +3860,8 @@ wj_reemit_drain_one (void)
 	 * merely slow. */
 	/* R316: a tier-2 request is the SAME IL, so an interpreter-tiered (optimized) canonical imethod is fine -- the
 	 * refusal exists for a body swap to DIFFERENT IL. Non-canonical ones are still refused. */
-	if ((im->optimized && !im->wasm_jit_t2_want) || im->optimized_imethod || im->retired) {
+	/* H3: a body swap's re-emission is the same IL as the canonical (interpreter-optimized) compilation, as tier 2 is. */
+	if ((im->optimized && !im->wasm_jit_t2_want && !im->wasm_jit_reemit_required) || im->optimized_imethod || im->retired) {
 		mono_wasm_jit_counters [WJC_REEMIT_REFUSED]++;
 		if (im->wasm_jit_t2_want) {
 			im->wasm_jit_t2_want = 0;
@@ -3614,7 +3924,20 @@ wj_reemit_drain_one (void)
 		 * is not optional -- but the exemption removed the only bound on a path whose re-enqueue cannot
 		 * drop, and `wasm_jit_reemit_busy` is a guint8, so an exempt method also wraps it. A budget that
 		 * one caller ignores is not a budget. */
-		if (im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX) {
+		if (im->wasm_jit_reemit_required && (res.e_slot <= 0 || im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX)) {
+			/* H3: A BODY SWAP IS NOT GIVEN UP ON A LOST CAS. Losing it means another compile was running, which always
+			 * ends, and each retry is one pop and one failed CAS; giving up at 8 left the previous body in every
+			 * worker's table for the rest of the run. A count of lost CASes bounds nothing in time -- a 255 cap still
+			 * gave up 23 swaps in one boot (R403) -- so a lost CAS (nothing compiled: res is empty) is never charged.
+			 * Only a BUSY that compiled and was then declined (a publication with no InterpMethod) spends the budget,
+			 * because each of those retries is a whole compile. The optional population keeps its own budget below,
+			 * whose absence is what R179 measured (82,270 BUSY against 1,175 compiles). */
+			if (res.e_slot > 0)
+				im->wasm_jit_reemit_busy++;
+			(void) wj_reemit_enqueue (desc_id, TRUE);
+			mono_wasm_jit_counters [WJC_REEMIT_MANDATORY_BUSY]++;
+			mono_wasm_jit_counters [WJC_REEMIT_BUSY]++;
+		} else if (im->wasm_jit_reemit_busy < WJ_REEMIT_BUSY_MAX) {
 			im->wasm_jit_reemit_busy++;
 			/* R316c: a tier-2 request re-queues like a mandatory one. As an optional entry it could be dropped
 			 * (queue lock not taken, ring full) with wasm_jit_t2_want still set -- and the sampler never
@@ -3682,8 +4005,12 @@ wj_reemit_drain_one (void)
 
 	/* Bounded at the WRITE as well as at the loop top: the check above decides when to stop draining,
 	 * this one is the invariant the array itself depends on. */
-	if (wj_reemit_batch_n < WJ_REEMIT_BATCH_MAX)
+	if (wj_reemit_batch_n < WJ_REEMIT_BATCH_MAX) {
+		wj_reemit_batch_epoch [wj_reemit_batch_n] = res.body_epoch;
 		wj_reemit_batch [wj_reemit_batch_n++] = res.desc_id;
+		if (im->wasm_jit_reemit_required)
+			wj_reemit_batch_mandatory = 1;
+	}
 	/* No flush here: the next visit publishes it, under this same lock, subject to the same rate limit.
 	 * Flushing on the append is what made the batch-full path bypass the limit in the first place. */
 out:
@@ -3712,21 +4039,53 @@ wj_reemit_flush (void)
 	 * loading, because triggers arrive far faster than 16 per interval. So batching changed the SHAPE of
 	 * the pauses and not their RATE, and the runtime wedged at boot a second time in exactly the same
 	 * way: 90 s with no output before the main screen. Keep the rate bound even with asynchronous adoption:
-	 * compiling and reinstantiating a burst still consumes real worker time. */
+	 * compiling and reinstantiating a burst still consumes real worker time.
+	 *
+	 * A batch holding a body swap is held to MONO_WASM_JIT_MANDATORY_INTERVAL_MS instead (plan H3). That floor is
+	 * still a floor, and the batch-full arm still cannot bypass it; whether its default brings the boot wedge
+	 * back is what H3's worldwait gate reads (boot and world.generate duration, R401). */
 	now = (gint64) mono_msec_ticks ();
-	if (last_ms && (now - last_ms) < (gint64) mono_wasm_jit_reemit_interval)
+	if (last_ms && (now - last_ms) < (gint64) (wj_reemit_batch_mandatory ? mono_wasm_jit_mandatory_interval : mono_wasm_jit_reemit_interval))
 		return 0;
 	last_ms = now;
 	wj_reemit_batch_n = 0;
+	wj_reemit_batch_mandatory = 0;
+	/* H3: ONLY WHAT IS STILL CURRENT. An entry compiled before a later swap of its method is not republished -- the
+	 * registry already holds its bytes, so a worker may still adopt them lazily, but prompting it to is pointless --
+	 * and its request is left set, because the swap's own re-emission is queued and must not find it cleared. That was
+	 * the bug: an Undo landing during an Apply's re-emission had its request cleared by the Apply's publication, and
+	 * the broker then dropped it (`!wasm_jit_reemit_required` with REEMIT off), leaving the hook body in every table. */
+	{
+		int i, k = 0;
+		for (i = 0; i < n; ++i) {
+			InterpMethod *im = (InterpMethod *) mono_wasm_jit_desc_logical_imethod (wj_reemit_batch [i]);
+			if (im && mono_body_override_info (im->method, NULL, NULL) != wj_reemit_batch_epoch [i]) {
+				mono_wasm_jit_counters [WJC_EPOCH_REFUSED_RV]++;
+				continue;
+			}
+			wj_reemit_batch_epoch [k] = wj_reemit_batch_epoch [i];
+			wj_reemit_batch [k++] = wj_reemit_batch [i];
+		}
+		n = k;
+		if (n == 0)
+			return 1;
+	}
 	if (mono_wasm_jit_rendezvous (wj_reemit_batch, n)) {
 		int i;
 		mono_wasm_jit_add (WJC_REEMIT_REPUBLISHED, n);
 		/* A semantic replacement remains mandatory until its generation is globally visible. Clearing
-		 * earlier lets a failed publication silently strand the old body in live table slots. */
+		 * earlier lets a failed publication silently strand the old body in live table slots. Cleared on the
+		 * CURRENT InterpMethod (the registry may name a superseded one), and only for the epoch just published
+		 * (H3): a swap after the filter above set a newer request that this publication does not satisfy. */
 		for (i = 0; i < n; ++i) {
 			InterpMethod *im = (InterpMethod *) mono_wasm_jit_desc_logical_imethod (wj_reemit_batch [i]);
-			if (im)
+			if (!im)
+				continue;
+			im = interp_imethod_current (im, TRUE);
+			if (mono_body_override_info (im->method, NULL, NULL) == wj_reemit_batch_epoch [i])
 				im->wasm_jit_reemit_required = 0;
+			else
+				mono_wasm_jit_counters [WJC_EPOCH_REFUSED_RV]++;
 		}
 	} else {
 		int i;
@@ -5419,7 +5778,8 @@ ftnptr_to_imethod (gpointer addr, gboolean *need_unbox)
 		*need_unbox = INTERP_IMETHOD_IS_TAGGED_UNBOX (addr);
 		imethod = INTERP_IMETHOD_UNTAG_UNBOX (addr);
 	}
-	return imethod;
+	/* A function pointer taken before a body swap still names the displaced generation (H1). */
+	return interp_imethod_live (imethod);
 }
 
 static gpointer
@@ -5862,6 +6222,9 @@ interp_entry (InterpEntryData *data)
 		data->this_arg = mono_object_unbox_internal ((MonoObject*)data->this_arg);
 		data->rmethod = (InterpMethod*)(gpointer)((gsize)data->rmethod & ~1);
 	}
+	/* The entry's InterpMethod comes from a cache a body swap cannot re-point (a function pointer, a trampoline's
+	 * baked argument): run the CURRENT generation (H1). One or two loads when nothing was swapped. */
+	data->rmethod = interp_imethod_live (data->rmethod);
 	rmethod = data->rmethod;
 #if HOST_BROWSER
 	/* R293b: a native->managed entry that reached the GENERIC C boundary although this thread has the method's
@@ -6675,7 +7038,7 @@ mono_wasm_jit_late_fslot (InterpMethod *imethod)
 	if (G_UNLIKELY (imethod->retired)) {
 		if (G_UNLIKELY (mono_wasm_jit_stats))
 			mono_wasm_jit_count (WJC_RETIRED_LATE_FSLOT);
-		if (mono_wasm_jit_forward_retired) {
+		{   /* forwarding a retired generation is unconditional (H1; R314 measured it) */
 			imethod = interp_imethod_current (imethod, TRUE);
 			forwarded = TRUE;
 			if (G_UNLIKELY (mono_wasm_jit_stats))
@@ -6690,7 +7053,7 @@ mono_wasm_jit_late_fslot (InterpMethod *imethod)
 	 * GC-invisible scratch, so island compilation and any resulting GC remain safe. */
 	if (wj_slot_hot_retry_eligible (imethod->wasm_jit_slot))
 		wasm_jit_maybe_compile (imethod);
-	imethod = interp_imethod_current (imethod, mono_wasm_jit_forward_retired);
+	imethod = interp_imethod_current (imethod, TRUE);
 	if (imethod->wasm_jit_fslot > 0) {
 		/* _live: admit() alone also succeeds on a cycle break, which instantiates nothing. Handing back an
 		 * f-slot this thread never installed hands back the jiterpreter placeholder. */
@@ -6828,10 +7191,12 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 	/* The direct residual's immediately preceding pretransform already paid this hash lookup.
 	 * Reuse it when the target identity still matches.  Synchronized-inner substitution changes
 	 * `method`, and vcall fallback has no pretransform handoff, so both retain the old safe path. */
-	/* With MONO_WASM_JIT_FORWARD_RETIRED off this is exactly the old expression (known_imethod as handed over). */
-	InterpMethod *imethod = known_imethod ? (mono_wasm_jit_forward_retired ? interp_imethod_current (known_imethod, TRUE) : known_imethod)
+	/* The pretransform handoff is a per-thread LAST value, not this call's: a path that does not pretransform (the vcall
+	 * fallback) finds whatever an earlier call left, possibly a compilation a body swap has since retired -- a hook
+	 * then ran after its Undo had returned (hookstress). Forward it like every other cached InterpMethod. */
+	InterpMethod *imethod = known_imethod ? interp_imethod_current (known_imethod, TRUE)
 		: method == wasm_jit_pretransformed_method
-		? wasm_jit_pretransformed_imethod
+		? interp_imethod_live (wasm_jit_pretransformed_imethod)
 		: mono_interp_get_imethod (method);
 #ifdef HOST_BROWSER
 	/* R314: a crossing whose callee is already JIT-live on this thread -- the boundary pool the retired-cache
@@ -7401,7 +7766,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		if (G_UNLIKELY (imethod->retired)) {
 			if (G_UNLIKELY (mono_wasm_jit_stats))
 				mono_wasm_jit_count (WJC_RETIRED_DELEGATE);
-			if (mono_wasm_jit_forward_retired) {
+			{   /* forwarding a retired generation is unconditional (H1; R314 measured it) */
 				imethod = interp_imethod_current (imethod, TRUE);
 				del_fwd = TRUE;
 				if (G_UNLIKELY (mono_wasm_jit_stats))
@@ -7822,7 +8187,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 		if (G_UNLIKELY (imethod->retired)) {
 			if (G_UNLIKELY (mono_wasm_jit_stats))
 				mono_wasm_jit_count (WJC_RETIRED_IC_HIT);
-			if (mono_wasm_jit_forward_retired) {
+			{   /* forwarding a retired generation is unconditional (H1; R314 measured it) */
 				imethod = interp_imethod_current (imethod, TRUE);
 				vfwd = TRUE;
 				if (G_UNLIKELY (mono_wasm_jit_stats))
@@ -7876,7 +8241,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			if (G_UNLIKELY (imethod->retired)) {
 				if (G_UNLIKELY (mono_wasm_jit_stats))
 					mono_wasm_jit_count (WJC_RETIRED_FASTMISS);
-				if (mono_wasm_jit_forward_retired) {
+				{   /* forwarding a retired generation is unconditional (H1; R314 measured it) */
 					imethod = interp_imethod_current (imethod, TRUE);
 					vfwd = TRUE;
 					if (G_UNLIKELY (mono_wasm_jit_stats))
@@ -8681,6 +9046,10 @@ typedef struct {
 	guint32 magic;                  /* WJ_EHREC_MAGIC ^ (guint32) &il */
 	MonoMethodILState *prev;        /* the cur_island_il_state this record shadows */
 	gint32 finally_sp;              /* wj_finally_exc_sp at entry */
+	/* The InterpMethod this body was compiled against (a compile-time constant). Exception handling for this frame
+	 * resolves its clauses through it, not through the method's CURRENT InterpMethod: after a body swap those are
+	 * compilations of different IL, and the frame is still running the old one (H1). 0 = use the current one. */
+	InterpMethod *body;
 	MonoMethodILState il;           /* method + il_offset only */
 } WjEhRec;
 
@@ -8718,6 +9087,20 @@ wj_ehrec_of_lmf (gpointer lmf)
 	return (WjEhRec *) ext;
 }
 
+/* The InterpMethod whose clauses describe the frame behind `il`: the one a JIT EH record was compiled against, or the
+ * method's current compilation for any other il_state (AOT, or a record from before H1). A body swap can have
+ * replaced the current one while the frame still runs the old body; its handler offsets are the old IL's. */
+static InterpMethod *
+interp_imethod_for_il_state (MonoMethod *method, MonoMethodILState *il)
+{
+	if (il && wj_ehrec_is_record_il (il)) {
+		InterpMethod *b = wj_ehrec_of_il (il)->body;
+		if (b && b->method == method)
+			return b;
+	}
+	return mono_interp_get_imethod (method);
+}
+
 static const WjEhRecLayout wj_ehrec_layout = {
 	sizeof (WjEhRec),
 	G_STRUCT_OFFSET (WjEhRec, ext.lmf.previous_lmf),
@@ -8731,6 +9114,7 @@ static const WjEhRecLayout wj_ehrec_layout = {
 	G_STRUCT_OFFSET (WjEhRec, il),
 	G_STRUCT_OFFSET (WjEhRec, il) + G_STRUCT_OFFSET (MonoMethodILState, method),
 	G_STRUCT_OFFSET (WjEhRec, il) + G_STRUCT_OFFSET (MonoMethodILState, il_offset),
+	G_STRUCT_OFFSET (WjEhRec, body),
 	WJ_EHREC_MAGIC,
 	MONO_LMFEXT_IL_STATE
 };
@@ -10528,10 +10912,19 @@ interp_get_interp_method (MonoMethod *method)
 	return mono_interp_get_imethod (method);
 }
 
-static MonoJitInfo*
-interp_compile_interp_method (MonoMethod *method, MonoError *error)
+#if !HOST_BROWSER
+/* No wasm-JIT EH records off the browser build: every il_state's frame runs the method's current compilation. */
+static InterpMethod *
+interp_imethod_for_il_state (MonoMethod *method, MonoMethodILState *il)
 {
-	InterpMethod *imethod = mono_interp_get_imethod (method);
+	return mono_interp_get_imethod (method);
+}
+#endif
+
+static MonoJitInfo*
+interp_compile_interp_method (MonoMethod *method, gpointer il_state, MonoError *error)
+{
+	InterpMethod *imethod = interp_imethod_for_il_state (method, (MonoMethodILState *) il_state);
 
 	if (!imethod->transformed) {
 		mono_interp_transform_method (imethod, get_context (), error);
@@ -10548,9 +10941,9 @@ interp_compile_interp_method (MonoMethod *method, MonoError *error)
  * which swallows exceptions rather than merely being slow. The caller must fall back.
  */
 static int
-interp_find_il_clause_for_offset (MonoMethod *method, int il_offset)
+interp_find_il_clause_for_offset (MonoMethod *method, gpointer il_state, int il_offset)
 {
-	InterpMethod *imethod = mono_interp_get_imethod (method);
+	InterpMethod *imethod = interp_imethod_for_il_state (method, (MonoMethodILState *) il_state);
 
 	/* Transforming here would be a surprising side effect of a lookup, so defer to the caller instead. */
 	if (!imethod->transformed)
@@ -11830,7 +12223,7 @@ main_loop:
 				}
 			}
 			{
-				InterpMethod *cur = interp_imethod_current (del_imethod, mono_wasm_jit_forward_retired);
+				InterpMethod *cur = interp_imethod_current (del_imethod, TRUE);
 				if (cur != del_imethod) {
 					del_imethod = cur;
 					// don't patch for virtual calls
@@ -15399,36 +15792,26 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 			MINT_IN_BREAK;
 		}
 
-		/* `retired` gates both: a body whose IL has been swapped out (see
-		 * mono_interp_replace_method_body) must not tier up, because tier-up maps a basic-block index
-		 * from this compilation into the registered one, and after a swap those are compilations of
-		 * DIFFERENT IL. The existing else-branch is already the correct behaviour -- just keep
-		 * interpreting -- so the gate costs one bit test on a path that already reads the same word.
-		 *
-		 * `relink_hook` gates both (R304, set by the transform for a body that calls IKVM's relink hook): p29 showed
-		 * `relink_pending` alone is too late -- IKVM sets it only when the batch STARTS, and queues only after the
-		 * method's lazily linked types load, so every one of the 32 lates had tiered before either.
-		 * `relink_pending` gates both too (R304): a method IKVM has queued for an in-place body swap must
-		 * not tier up before the swap, because replace_method_body refuses a tiered method UNCONDITIONALLY
-		 * ("late") and it then keeps generation 1 -- its lazy-link stubs -- for the rest of the run. Hot
-		 * per-tick methods with loops tier up within the batch's quiet window, so the hottest candidates
-		 * were exactly the ones lost: Lithium's LithiumServerTickScheduler.selectTicks stayed on __<>MHC /
-		 * DynamicBinder stubs worth ~11 M instr/tick. IKVM clears the flag for every queued method on every
-		 * outcome, so the method interprets unoptimized only until its batch runs. */
+		/* `retired` gates both: a body whose IL has been swapped out (tiering.c) must not tier up, because tier-up maps a
+		 * basic-block index from this compilation into the registered one, and after a swap those are compilations of
+		 * DIFFERENT IL. Interpreting on is the correct fallback, and get_tier_up_imethod's epoch check closes the window
+		 * between this test and the tier-up (it returns NULL). IKVM's generation-1 bodies tier up like anything else:
+		 * the swap accepts a tiered method since the interpreter's compilations are bound to their IL (H1, R400); the
+		 * relink_hook / relink_pending gates that used to keep them unoptimized until their batch ran are gone. */
 		MINT_IN_CASE(MINT_TIER_ENTER_METHOD) {
+			const guint16 *tip = NULL;
 			frame->imethod->entry_count++;
-			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired && !frame->imethod->relink_pending && !frame->imethod->relink_hook)
-				ip = mono_interp_tier_up_frame_enter (frame, context);
-			else
-				ip++;
+			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired)
+				tip = mono_interp_tier_up_frame_enter (frame, context);
+			ip = tip ? tip : ip + 1;   /* NULL: tier-up refused across a body swap (tiering.c get_tier_up_imethod) */
 			MINT_IN_BREAK;
 		}
 		MINT_IN_CASE(MINT_TIER_PATCHPOINT) {
+			const guint16 *tip = NULL;
 			frame->imethod->entry_count++;
-			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired && !frame->imethod->relink_pending && !frame->imethod->relink_hook)
-				ip = mono_interp_tier_up_frame_patchpoint (frame, context, ip [1]);
-			else
-				ip += 2;
+			if (frame->imethod->entry_count > INTERP_TIER_ENTRY_LIMIT && !clause_args && !frame->imethod->retired)
+				tip = mono_interp_tier_up_frame_patchpoint (frame, context, ip [1]);
+			ip = tip ? tip : ip + 2;
 			MINT_IN_BREAK;
 		}
 
@@ -15561,7 +15944,7 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
 				g_assert (del->method);
 				del->interp_method = mono_interp_get_imethod (del->method);
 			} else {
-				InterpMethod *cur = interp_imethod_current ((InterpMethod*)del->interp_method, mono_wasm_jit_forward_retired);
+				InterpMethod *cur = interp_imethod_current ((InterpMethod*)del->interp_method, TRUE);
 				if (cur != del->interp_method)
 					del->interp_method = cur;
 			}
@@ -16074,7 +16457,9 @@ interp_run_clause_with_il_state (gpointer il_state_ptr, int clause_index, MonoOb
 	sig = mono_method_signature_internal (il_state->method);
 	g_assert (sig);
 
-	imethod = mono_interp_get_imethod (il_state->method);
+	/* The compilation the frame runs, which a body swap may have displaced (H1): its clauses and locals, not the
+	 * current IL's. A displaced one is bound to its own header, so transforming it here compiles the old body. */
+	imethod = interp_imethod_for_il_state (il_state->method, il_state);
 	if (!imethod->transformed) {
 		// In case method is in process of being tiered up, make sure it is compiled
 		mono_interp_transform_method (imethod, context, error);
@@ -16119,7 +16504,7 @@ interp_run_clause_with_il_state (gpointer il_state_ptr, int clause_index, MonoOb
 	context->stack_pointer += imethod->alloca_size;
 	g_assert (context->stack_pointer < context->stack_end);
 
-	MonoMethodHeader *header = mono_method_get_header_internal (il_state->method, error);
+	MonoMethodHeader *header = imethod->bound_header ? imethod->bound_header : mono_method_get_header_internal (il_state->method, error);
 	mono_error_assert_ok (error);
 
 	/* Init locals */
@@ -16814,7 +17199,7 @@ mono_jiterp_ld_delegate_method_ptr (gpointer *destination, MonoDelegate **source
 		g_assert (del->method);
 		del->interp_method = mono_interp_get_imethod (del->method);
 	} else {
-		InterpMethod *cur = interp_imethod_current ((InterpMethod*)del->interp_method, mono_wasm_jit_forward_retired);
+		InterpMethod *cur = interp_imethod_current ((InterpMethod*)del->interp_method, TRUE);
 		if (cur != del->interp_method)
 			del->interp_method = cur;
 	}
@@ -16868,6 +17253,9 @@ mono_jiterp_interp_entry (void *res)
 
 	g_assert(header.rmethod);
 	g_assert(header.rmethod->method);
+	/* The trampoline baked its InterpMethod when it was generated: run the CURRENT generation after a body swap (H1).
+	 * The fast path below then sees the new one's wasm_jit_entry_fast_ok (the swap cleared the old one's). */
+	header.rmethod = interp_imethod_live (header.rmethod);
 
 	stackval *sp = (stackval*)header.context->stack_pointer;
 
