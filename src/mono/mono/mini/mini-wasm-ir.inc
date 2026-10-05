@@ -3425,6 +3425,7 @@ typedef struct {
 	int    max_fimports;         /* WJ_HELPER_IMPORT_CAP */
 	guint32 guard_addr;          /* plan2x S1: non-zero = guard every member-to-member call on this word */
 	guint32 guard_count_addr;    /* ... and count the taken arm here */
+	int    nexport;              /* B4 leaf copies (R452): members from this index on are private copies; 0 = all exported */
 } WjAsmPolicy;
 
 /* Per-member census of what the forms came out as; feeds the WJC_ counters and the tier dumps. */
@@ -3849,6 +3850,12 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 					mono_wasm_jit_counters [WJC_S1_GUARDED]++;
 				}
 				st->nlocal++;
+				/* ...EXCEPT a call into a private copy (B4 leaf copies, R452): this module does NOT install that f-slot,
+				 * and it is exactly what the guarded fallback calls once the guard is set -- so it is admitted like any
+				 * other dependency, or the fallback lands on the placeholder. */
+				if (pol->nexport > 0 && member >= pol->nexport)
+					wj_asm_deps_add (dp, (int) r->table_index, wj_functype_hash (&self_types [r->tpool]),
+					                 (MonoMethod *) r->sym);
 				continue;   /* module-local: no dependency, nothing to admit */
 			}
 			wj_asm_deps_add (dp, (int) r->table_index, wj_functype_hash (&self_types [r->tpool]),
