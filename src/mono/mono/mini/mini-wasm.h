@@ -1427,6 +1427,17 @@ enum {
 	WJC_B4_REFUSED,              /* ... groups refused (rebatch failed, or over the member / byte bound) */
 	WJC_B4_MEMBERS,              /* ... members in the framed groups (merged siblings included) */
 	WJC_B4_PUBLISHED,            /* ... framed groups queued for the next rendezvous */
+	WJC_FAST_VIC_W0,             /* typed-spindle C1 route mix (PROFILE_FAST only): EXECUTED inline-IC hits on way 0 */
+	WJC_FAST_VIC_MID,            /* ... on the R311 method-identity fallback (fast_vic - w0 - mid = F9 mcache + ways 1..N) */
+	WJC_FAST_VIC_SLIM,           /* ... on the slim alternate PIC way behind a devirt arm (not part of fast_vic) */
+	WJC_FAST_VMISS,              /* ... virtual sites that reached the per-site cold miss (after the inline AOT IC) */
+	WJC_FAST_VSITE,              /* ... every executed non-delegate virtual site (the denominator) */
+	WJC_VSLOW_STUBS,             /* typed-spindle C1: shared slow-path stubs created (one per functype x return normalisation) */
+	WJC_VSLOW_SITES,             /* ... virtual sites emitted in the compact form */
+	WJC_VSLOW_INST,              /* ... stub instantiations (per pthread) */
+	WJC_VSLOW_FAIL,              /* ... stub instantiations V8 refused (MUST be 0) */
+	WJC_VSLOW_REFUSED,           /* ... sites left in the full form because no stub could be made */
+	WJC_VSLOW_REPAIR,            /* R459: an instantiation's LinkError named a stub slot; the stub was re-installed, retried */
 	WJC_MAX
 };
 

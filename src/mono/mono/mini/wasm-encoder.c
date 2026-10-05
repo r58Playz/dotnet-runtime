@@ -666,6 +666,11 @@ emit_import_section (WasmBuf *out, gboolean import_table, gboolean import_eh_tag
  *            nexport > 1 -> "f<i>"/"e<i>" (the batch one). Members past nexport are shadows: callable
  *            in-module, exported nowhere.
  */
+/* R460: bytes of the "wj.origin" custom section the last wasm_module_assemble on this thread wrote (0 = none). The
+ * tier-2 body cap measures the module without it: under MONO_WASM_JIT_ORIGIN the map was ~half of a giant's module, so
+ * every ORIGIN run (gates, ledger mapping runs) refused tier-2 bodies a normal run admits. */
+__thread guint32 wasm_last_origin_section_len;
+
 void
 wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 nexport,
                       gboolean import_table, gboolean import_eh_tag, guint32 eh_type_idx,
@@ -680,6 +685,7 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 	g_assert (nmembers > 0);
 	g_assert (nexport > 0 && nexport <= nmembers);
 
+	wasm_last_origin_section_len = 0;
 	wasm_bytes (out, header, 8);
 
 	/* Type section (1) */
@@ -833,7 +839,9 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 				}
 				wasm_buf_free (&ld);
 			}
-			emit_section (out, 0, &osec);
+			{ guint32 before = out->len;
+			  emit_section (out, 0, &osec);
+			  wasm_last_origin_section_len = out->len - before; }
 			wasm_buf_free (&osec);
 		}
 	}
@@ -1097,3 +1105,5 @@ wasm_module_append_name_section_multi (WasmBuf *out, const char *module_name, co
 	emit_section (out, 0, &sec);
 	wasm_buf_free (&sec);
 }
+
+#include "wasm-encoder-vslow.inc"

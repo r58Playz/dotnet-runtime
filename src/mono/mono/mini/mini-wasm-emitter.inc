@@ -6809,6 +6809,7 @@ vcall_nullchk_done:
 									wj_count (WJC_DEVIRT_ARM2_NO_ALT);
 								}
 							}
+							if (!is_delegate_invoke) wj_emit_fast_count (&body, WJC_FAST_VSITE);   /* C1 route mix: denominator */
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
 							/* Strict monomorphic guard. A hit bypasses the worker PIC completely. The prediction
 							 * is deliberately speculative: interpreter warmup can see one receiver before the
@@ -6949,6 +6950,129 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred2_miss */
 							}
+#ifdef HOST_BROWSER
+							/* plan typed-spindle C1 (MONO_WASM_JIT_VSITE_COMPACT, mini-wasm-vslow.inc): keep the devirt arms
+							 * above and way 0 of the worker PIC inline; every way-0 miss goes to the shared slow-path stub
+							 * for this functype, which runs what the code below would have emitted here -- slim, method
+							 * identity, F9, ways 1..N, the inline AOT IC and the per-site cold miss (450-600 B a site, R455).
+							 * Not for delegate sites (their recipe IC and shape split stay inline), hidden-vret sites, or
+							 * objguard builds; a site whose stub cannot be made keeps the full form. */
+							{ extern int mono_wasm_jit_vsite_compact;
+							  if (mono_wasm_jit_vsite_compact && !is_delegate_invoke && !vc_vret && !lc.objguard && npp == n2 &&
+							      n2 >= 1 && n2 + 1 <= WASM_FUNCTYPE_MAX_PARAMS) {
+								int retnorm = 0, vs_slot, vs_ti = -1;
+								WasmFuncType vst;
+								if (rv == WASM_I32 && !m_type_is_byref (csig->ret)) {
+									switch (mini_get_underlying_type (csig->ret)->type) {
+									case MONO_TYPE_BOOLEAN: case MONO_TYPE_U1: retnorm = 1; break;
+									case MONO_TYPE_I1: retnorm = 2; break;
+									case MONO_TYPE_CHAR: case MONO_TYPE_U2: retnorm = 3; break;
+									case MONO_TYPE_I2: retnorm = 4; break;
+									default: break;
+									}
+								}
+								memset (&vst, 0, sizeof (vst));
+								for (vk = 0; vk < n2; ++vk) vst.params [vk] = pp [vk];
+								vst.params [n2] = WASM_I64;   /* the descriptor: an i64 can never match the placeholder's type */
+								vst.nparams = (guint32) (n2 + 1); vst.ret = rv;
+								for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &vst)) { vs_ti = ti_base + vk; break; }
+								if (vs_ti < 0 && nextra < WJ_EXTRA_TYPES_MAX) { extra_types [nextra] = vst; vs_ti = ti_base + nextra++; }
+								vs_slot = vs_ti >= 0 ? wj_vslow_slot (&ftd, retnorm) : 0;
+								if (vs_slot > 0) {
+									WjVslowDesc *vsd = wj_vslow_desc (vic, aic, call->method, (int) vpic_site, mono_wasm_jit_vcall_ways,
+										(vc_mid_slot >= 0 && mono_wasm_jit_ic_mid) ? vc_mid_slot : -1);
+									wj_count (WJC_VSLOW_SITES);
+									/* $cslow: a br out of it calls the stub. $chit: a br out of it holds an admitted f-slot in vc_fslot. */
+									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $cslow */
+									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $chit */
+									{ extern int mono_wasm_jit_f4;
+									  int _irvt = (mono_wasm_jit_f4 & 2) ? wj_ir_vtable_vreg (ins, this_vr) : -1;
+									  if (_irvt >= 0) {
+										if (!wasm_ld (&body, &lc, _irvt)) { fail = "vslow irvt ld"; goto done; }
+									  } else {
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "vslow this ld"; goto done; }
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									  } }
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
+									wasm_i32_const (&body, (gint32) vpic_site);
+									EMIT_IC_VPIC_CAPVAL ();
+									wasm_op (&body, WASM_OP_I32_GE_U);
+									WJ_HINT2 (0, WJC_BRANCH_HINT_IC);
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1);   /* no PIC yet -> $cslow */
+									EMIT_IC_VPIC_PTR ();
+									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);   /* the PIC array base */
+									/* way 0 */
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+									wasm_op (&body, WASM_OP_I64_LOAD); wasm_memarg (&body, 3, (guint32) (vpic_site * mono_wasm_jit_vcall_ways * vpic_stride));
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_ic_idx);
+									wasm_op (&body, WASM_OP_I32_WRAP_I64);
+									wasm_op (&body, WASM_OP_I32_EQ);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_ic_idx);
+										wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U); wasm_op (&body, WASM_OP_I32_WRAP_I64);
+										wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+										wj_emit_fast_count (&body, WJC_FAST_VIC_W0);
+										wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* -> $chit */
+									wasm_op (&body, WASM_OP_END);
+									/* plan2x F9 (vtable, base) -> f-slot, inline as in the full form: s1's route mix (typed-spindle,
+									 * 2026-10-04) put F9 + ways 1..N at 15.6% of executed virtual dispatch, too much to send to a call.
+									 * Ways 1..N, method identity, the AOT IC and the cold miss go to the stub. */
+									{ extern int mono_wasm_jit_f9, mono_wasm_jit_mcache_prefix (void);
+									  MonoMethod *_b = call->method;
+									  int _mcp = ((mono_wasm_jit_f9 & 1) && _b && !_b->is_inflated && !_b->is_generic &&
+									              !mono_class_is_ginst (_b->klass) && !mono_class_is_gtd (_b->klass)) ? mono_wasm_jit_mcache_prefix () : 0;
+									  if (_mcp > 0) {
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										wasm_i32_const (&body, 11); wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_op (&body, WASM_OP_I32_XOR);
+										wasm_i32_const (&body, (gint32) wj_mcache_bhash (_b)); wasm_op (&body, WASM_OP_I32_XOR);
+										wasm_i32_const (&body, WJ_MCACHE_N - 1); wasm_op (&body, WASM_OP_I32_AND);
+										wasm_i32_const (&body, 4); wasm_op (&body, WASM_OP_I32_SHL);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx);
+										wasm_op (&body, WASM_OP_I32_ADD);
+										wasm_i32_const (&body, _mcp); wasm_op (&body, WASM_OP_I32_SUB);
+										wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);   /* scratch: the entry address */
+										wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $mc_miss */
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+											wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);       /* .vt */
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+											wasm_op (&body, WASM_OP_I32_NE);
+											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+											wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 4);       /* .base */
+											wasm_i32_const (&body, (gint32) (intptr_t) _b);
+											wasm_op (&body, WASM_OP_I32_NE);
+											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+											wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 8);       /* .fslot */
+											wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1);                /* hit -> $chit */
+										wasm_op (&body, WASM_OP_END);   /* $mc_miss */
+									  } }
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* -> $cslow */
+									wasm_op (&body, WASM_OP_END);                        /* $chit */
+									wj_emit_fast_count (&body, WJC_FAST_VIC);
+									for (ai = 0; ai < n2; ++ai)
+										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vslow hit arg ld"; goto done; }
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+									wj_emit_dynamic_call (&body, (guint32) ftdi);
+									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vslow hit dreg"; goto done; }
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> end $after */
+									wasm_op (&body, WASM_OP_END);                            /* $cslow */
+									wj_emit_fast_count (&body, WJC_FAST_VMISS);
+									for (ai = 0; ai < n2; ++ai)
+										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vslow arg ld"; goto done; }
+									wasm_i64_const (&body, (gint64) (gsize) vsd);
+									wj_emit_helper_call (&body, (gpointer) (intptr_t) vs_slot, (guint32) vs_ti);
+									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vslow dreg"; goto done; }
+									goto vcall_compact_done;
+								}
+							  } }
+#endif
 							if (slim_pred) {
 								/* One compact worker-local alternate PIC entry. The first prediction miss reaches
 								 * vcall_resolve_fslot, which publishes its admitted {vtable,fslot} into way zero.
@@ -6979,6 +7103,7 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_I64_SHR_U);
 									wasm_op (&body, WASM_OP_I32_WRAP_I64);
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+									wj_emit_fast_count (&body, WJC_FAST_VIC_SLIM);   /* C1 route mix */
 									/* Preserve exact alternate-target frequency when profiling is enabled. */
 									{
 										extern int mono_wasm_jit_profile_fast;
@@ -7427,6 +7552,7 @@ vcall_nullchk_done:
 									}
 								}
 							/* HIT: the resolved f-slot is in $vc_fslot; jump to the shared call tail below. */
+							if (!is_delegate_invoke) wj_emit_fast_count (&body, WJC_FAST_VIC_W0);   /* C1 route mix */
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> exit $tail */
 							wasm_op (&body, WASM_OP_END);                            /* end $way_fail */
 							}   /* for each way */
@@ -7472,6 +7598,7 @@ vcall_nullchk_done:
 									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
 									wasm_op (&body, WASM_OP_I32_EQZ);
 									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* -> $mid_fail */
+									wj_emit_fast_count (&body, WJC_FAST_VIC_MID);   /* C1 route mix */
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);      /* hit -> exit $tail */
 								wasm_op (&body, WASM_OP_END);   /* $mid_fail */
 							} else if (!is_delegate_invoke && mono_wasm_jit_ic_mid) {
@@ -7678,6 +7805,7 @@ vcall_nullchk_done:
 								}
 							}
 vcall_cold_miss_emit:
+							if (!is_delegate_invoke) wj_emit_fast_count (&body, WJC_FAST_VMISS);   /* C1 route mix */
 							{
 							/* MONO_WASM_JIT_VCALL_SHARED_MISS ships **0**, and 0 is the MEASURED-GOOD arm, so this
 							 * is the one two-path knob whose LOSING arm was the runtime default.
@@ -8004,6 +8132,9 @@ vcall_cold_miss_emit:
 							}
 							wasm_op (&body, WASM_OP_END);   /* end the fslot if/else (slow path) */
 							}
+#ifdef HOST_BROWSER
+vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, inside $after */
+#endif
 							if (1)
 							wasm_op (&body, WASM_OP_END);   /* end $after (only emitted when the inline-IC fast path is on) */
 						if (is_vcall2)
@@ -8455,8 +8586,19 @@ vcall_cold_miss_emit:
 	 * was <= ~101 KB spiked. A permanent (non-retriable) fail: a re-emit leaves the method's tier-1 body live, and
 	 * mono_wasm_force_compile's downgrade retries once at the ordinary policy when lifted call inlining was used. */
 	{ extern int mono_wasm_jit_t2_max_body;
-	  if (!fail && cfg->wasm_jit_tier >= 2 && mono_wasm_jit_t2_max_body > 0 && out.len > (guint32) mono_wasm_jit_t2_max_body) {
+	  /* R460: the module V8 compiles -- not the ORIGIN diagnostic riding in it (0 bytes in a normal run) */
+	  guint32 cap_len = out.len - MIN (out.len, wasm_last_origin_section_len);
+	  if (!fail && cfg->wasm_jit_tier >= 2 && mono_wasm_jit_t2_max_body > 0 && cap_len > (guint32) mono_wasm_jit_t2_max_body) {
 		mono_wasm_jit_count (WJC_T2_BODY_CAPPED);
+		/* ~30 per run, so ungated: the size the downgrade discards, and under CAPTURE the bytes, kind "m2cap", so
+		 * sitebytes.py --kinds m2cap can say what a giant's tier-2 body carries */
+		printf ("[wasm-jit t2-cap] refused %u B (cap %d, module %u B) %s\n", cap_len, mono_wasm_jit_t2_max_body, out.len,
+			mname ? mname : "?");
+#ifdef HOST_BROWSER
+		{ extern int mono_wasm_jit_capture;
+		  if (G_UNLIKELY (mono_wasm_jit_capture))
+			mono_wasm_jit_capture_module ("m2cap", mname, out.data, out.len); }
+#endif
 		fail = "tier-2 body over MONO_WASM_JIT_T2_MAX_BODY";
 		wasm_buf_free (&out);   /* freed before `done:` on the normal path (below), so free it here */
 		goto done;
@@ -8592,6 +8734,7 @@ vcall_cold_miss_emit:
 					if (cfg->wasm_jit_result.desc_id == -2)
 						cfg->wasm_jit_result.retriable = 1;
 					cfg->wasm_jit_result.desc_id = 0;
+					{ extern void mono_wasm_jit_bytes_forget (const void *bytes); mono_wasm_jit_bytes_forget (cached); }   /* R462 */
 					g_free (cached);
 					cached = NULL;
 				} else {
@@ -8664,6 +8807,7 @@ vcall_cold_miss_emit:
 				{ gboolean _perm = ierr [0] && strstr (ierr, "CompileError") != NULL;
 				  cfg->wasm_jit_result.retriable = _perm ? 0 : 1;
 				  if (G_UNLIKELY (mono_wasm_jit_stats) && _perm) mono_wasm_jit_count (WJC_INVALID_PERM); }
+				{ extern void mono_wasm_jit_bytes_forget (const void *bytes); mono_wasm_jit_bytes_forget (cached); }   /* R462 */
 				g_free (cached);
 				if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_INVALID);
 				if (mono_wasm_jit_verbose >= 1) { printf ("WASM_JIT_INVALID %s e_slot=%d len=%u : %s\n", mname, e_slot, (unsigned) out.len, ierr); }

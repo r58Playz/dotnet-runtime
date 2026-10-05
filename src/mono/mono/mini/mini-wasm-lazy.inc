@@ -116,6 +116,9 @@ wj_lazy_ensure_bank (int bank)
 	 * write its old stub back (invariant 1), so it goes in first, here, like any slot's bank. */
 	if (b->prev_bank > 0 && !wj_lazy_ensure_bank (b->prev_bank - 1))
 		return FALSE;
+	{ extern int mono_wasm_jit_bytes_check;
+	  if (G_UNLIKELY (mono_wasm_jit_bytes_check))
+		wj_bytes_check (b->bytes, b->len, "l"); }   /* R462 */
 	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
 	ok = EM_ASM_INT ({
 		var p = $0 < 0 ? $0 + 4294967296 : $0;

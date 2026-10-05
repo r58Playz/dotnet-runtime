@@ -110,6 +110,86 @@ int mono_wasm_jit_badmeth = 1;   /* MONO_WASM_JIT_BADMETH: the dead-retained-Mon
 /* Forward: defined far below, but the registry's two diagnostic name walks need it long before that. */
 int mono_wasm_jit_method_usable (MonoMethod *m, int site);
 int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
+
+/* MONO_WASM_JIT_EAGER_LIST (plan typed-spindle J1): methods the CONSUMER took off LLVM AOT and wants compiled at tier 1
+ * from their first call instead of interpreted for MONO_WASM_JIT_THRESHOLD calls first. Entries are separated by
+ * whitespace or commas and use aotprofile/Program.cs's exclusion syntax without the '!': "T" = type T and every type
+ * nested in it (T's full name up to the first '/' equals T), "T::m" = every overload of m declared by exactly T. T is
+ * a Cecil full name ("java.util.Comparators", "java.lang.Comparable/__Helper"). ikvmcraft generates the value from
+ * the same AOT_JAVA_EXCLUDE list that drops those methods from the AOT profile, so "not AOT" and "compiled at first
+ * call" cannot disagree. Unset = empty = no effect; matching costs one load per InterpMethod creation then. */
+/* MONO_WASM_JIT_VSITE_COMPACT (plan typed-spindle C1, mini-wasm-vslow.inc): a non-delegate virtual call site keeps its
+ * devirt arms and way 0 of the worker PIC inline and hands every way-0 miss to a shared slow-path stub, instead of
+ * emitting method identity, F9, ways 1..N, the inline AOT IC and the per-site cold miss itself (450-600 B a site, R455). */
+int mono_wasm_jit_vsite_compact = 0;
+int mono_wasm_jit_eager_n;
+static char **wj_eager_type, **wj_eager_meth;
+gint32 mono_wasm_jit_eager_marked;
+
+static void
+wj_eager_parse (const char *v)
+{
+	gchar **parts = g_strsplit_set (v, " ,\t\n", -1);
+	int n = 0, i;
+	for (i = 0; parts [i]; ++i)
+		if (*parts [i])
+			n++;
+	wj_eager_type = g_new0 (char *, n + 1);
+	wj_eager_meth = g_new0 (char *, n + 1);
+	for (i = 0; parts [i]; ++i) {
+		const char *e = parts [i];
+		const char *sep;
+		if (!*e)
+			continue;
+		if (*e == '!')   /* tolerate the profile's own spelling */
+			e++;
+		sep = strstr (e, "::");
+		wj_eager_type [mono_wasm_jit_eager_n] = sep ? g_strndup (e, sep - e) : g_strdup (e);
+		wj_eager_meth [mono_wasm_jit_eager_n] = sep ? g_strdup (sep + 2) : NULL;
+		mono_wasm_jit_eager_n++;
+	}
+	g_strfreev (parts);
+}
+
+/* TRUE when METHOD is on the eager list. Field reads only (klass names and nesting): it runs at InterpMethod
+ * creation, which must not load or resolve anything. */
+gboolean
+mono_wasm_jit_eager_match (MonoMethod *method)
+{
+	MonoClass *chain [8];
+	char full [512];
+	int depth = 0, i, j, n, top_len;
+	MonoClass *k;
+	const char *ns;
+	for (k = method->klass; k && depth < 8; k = m_class_get_nested_in (k))
+		chain [depth++] = k;
+	if (!depth || k)
+		return FALSE;
+	ns = m_class_get_name_space (chain [depth - 1]);
+	n = g_snprintf (full, sizeof (full), "%s%s%s", ns ? ns : "", (ns && *ns) ? "." : "", m_class_get_name (chain [depth - 1]));
+	if (n <= 0 || n >= (int) sizeof (full))
+		return FALSE;
+	top_len = n;
+	for (i = depth - 2; i >= 0; --i) {
+		int w = g_snprintf (full + n, sizeof (full) - n, "/%s", m_class_get_name (chain [i]));
+		if (w <= 0 || n + w >= (int) sizeof (full))
+			return FALSE;
+		n += w;
+	}
+	for (j = 0; j < mono_wasm_jit_eager_n; ++j) {
+		const char *t = wj_eager_type [j];
+		if (wj_eager_meth [j]) {
+			if (!strcmp (full, t) && !strcmp (method->name, wj_eager_meth [j]))
+				goto hit;
+		} else if (!strcmp (full, t) || ((int) strlen (t) == top_len && !strncmp (full, t, top_len) && full [top_len] == '/')) {
+			goto hit;
+		}
+	}
+	return FALSE;
+hit:
+	mono_atomic_inc_i32 (&mono_wasm_jit_eager_marked);
+	return TRUE;
+}
 /* auto-JIT hotness threshold. 2000 was the pre-Minecraft value; 500 is what the product runs. R204 cut `no_fslot` 69%% by moving it, and that is worth NOTHING on the plateau -- it is a boot/worldgen effect, because 99.3%% of profile observations arrive AFTER a method is JITted. Right for boot, not a frame-rate lever. */
 /* MONO_WASM_JIT_OVER_AOT is deleted. It let the runtime wasm method-JIT compete with an
  * already-available AOT body (the interpreter kept code_type=COMPILED, so a failed emission,
@@ -797,9 +877,13 @@ mono_wasm_jit_auto_init (void)
 	 * them: a capture taken right afterwards ran at threshold 2000 with an 11,044-method tier instead of
 	 * threshold 500 with 29,224. Falling back to the variable's OWN value makes the initialiser the
 	 * single source of truth and makes that drift impossible. */
+	{ extern gint64 mono_wasm_jit_start_ms; mono_wasm_jit_start_ms = mono_msec_ticks (); }   /* B4_HOT's delay clock */
 	t = g_getenv ("MONO_WASM_JIT_THRESHOLD");
 	{ int tv = (t && *t) ? atoi (t) : mono_wasm_jit_thresh;
 	  if (tv > 0) mono_wasm_jit_thresh = tv; }
+	{ const char *vc = g_getenv ("MONO_WASM_JIT_VSITE_COMPACT"); if (vc && *vc) mono_wasm_jit_vsite_compact = atoi (vc); }
+	{ const char *el = g_getenv ("MONO_WASM_JIT_EAGER_LIST");
+	  if (el && *el && !mono_wasm_jit_eager_n) wj_eager_parse (el); }
 	{ extern int mono_wasm_jit_stats; const char *s = g_getenv ("MONO_WASM_JIT_STATS"); mono_wasm_jit_stats = (s && *s && *s != '0') ? 1 : 0; }
 	/* MONO_WASM_JIT_VERBOSE controls the per-method emit LOG spam, DECOUPLED from stats (counting is cheap,
 	 * logging floods): 0=silent (default), 1=+registered/invalid, 2=+bail, 3=+emit-enter AND per-call traces (vcall-aot
@@ -858,7 +942,12 @@ mono_wasm_jit_auto_init (void)
 	          { extern int mono_wasm_jit_b4_copy, mono_wasm_jit_b4_copy_bytes, mono_wasm_jit_b4_copy_max;
 	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_copy = v; }
 	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY_BYTES"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_copy_bytes = v; }
-	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_copy_max = v; } } } } } } }
+	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_copy_max = v; }
+	            { extern int mono_wasm_jit_b4_hot, mono_wasm_jit_b4_hot_delay;
+	              b4 = g_getenv ("MONO_WASM_JIT_B4_HOT"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_hot = v; }
+	              b4 = g_getenv ("MONO_WASM_JIT_B4_HOT_DELAY"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_hot_delay = v; } } } } } } } }
+	{ extern int mono_wasm_jit_bytes_check; const char *bc = g_getenv ("MONO_WASM_JIT_BYTES_CHECK");
+	  if (bc && *bc) mono_wasm_jit_bytes_check = atoi (bc) != 0; }
 	{ extern int mono_wasm_jit_rrem_inline; const char *rr = g_getenv ("MONO_WASM_JIT_RREM"); if (rr && *rr) mono_wasm_jit_rrem_inline = atoi (rr); }
 	  if (mono_wasm_jit_origin) { extern void mono_wasm_jit_origin_print_tags (void); mono_wasm_jit_origin_print_tags (); } }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
@@ -1131,6 +1220,15 @@ int mono_wasm_jit_b4_down = 0;
 int mono_wasm_jit_b4_copy = 0;
 int mono_wasm_jit_b4_copy_bytes = 16384;
 int mono_wasm_jit_b4_copy_max = 32;
+/* MONO_WASM_JIT_B4_HOT (plan typed-spindle P2, the hot-set ceiling experiment): N > 0 replaces the B4 edge partition
+ * with the N hottest live bodies, tier 1 and tier 2 alike (mono_wasm_jit_im_body_samples since the previous plan), edge-
+ * connected members kept together and packed into as few groups as B4_MAX / B4_BYTES allow -- ONCE, at the first plan at
+ * least MONO_WASM_JIT_B4_HOT_DELAY seconds after the JIT came up (no B4 groups form before it). Memory is not budgeted.
+ * Run it with B4_MERGE=1 (a member framed at compile time brings its siblings) and B4_PER_PLAN >= its group count. */
+int mono_wasm_jit_bytes_check = 0;   /* MONO_WASM_JIT_BYTES_CHECK, R462: see wj_bytes_check */
+int mono_wasm_jit_b4_hot = 0;
+int mono_wasm_jit_b4_hot_delay = 250;
+gint64 mono_wasm_jit_start_ms;
 /* Safepoint samples taken inside tier-2 bodies, process-wide (interp.c mono_wasm_jit_t2_sample): the planner's clock. */
 volatile gint32 mono_wasm_jit_b4_samples;
 /* Edge-carrying bodies stored so far (wj_body_take); the B4 drainer re-plans once this has grown by 32. */
@@ -1969,13 +2067,178 @@ mono_wasm_jit_worker_reuse (int tramps, int adapters, int slots)
 	return mono_wasm_jit_reuse_reset;
 }
 
+static void wj_vslow_ensure_all (void);   /* mini-wasm-vslow.inc (typed-spindle C1) */
+static void wj_vslow_explain (const char *err);   /* mini-wasm-vslow.inc, R459 diagnostic */
+static gboolean wj_vslow_repair (const char *err);   /* mini-wasm-vslow.inc, R459 */
+static int wj_instantiate_local_once (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
+static int wj_instantiate_batch_local_once (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
+
+/* MONO_WASM_JIT_BYTES_CHECK (R462 diagnostic): published module bytes -- registry modules, group modules, lazy banks, C1
+ * stubs -- are never freed and never rewritten in place, yet two runs on 2026-10-05 failed V8 validation on a worker
+ * other than the one that had validated the same buffer (a group module: "memory index exceeds"; a lazy bank: "invalid
+ * value type" in its type section), the module-bytes face of R454x's heap corruption. With the knob on, the FIRST
+ * instantiation of a buffer records a hash per 64-byte block, and every later one re-hashes and prints each block that
+ * changed, its current bytes and the 16 bytes before the buffer (the allocator's chunk header), as WASM_JIT_BYTES_CHANGED.
+ * Lock-free: a slot is claimed by CAS on its key and published by its ready word. Never freed (buffers never are).
+ * (The knob's int is defined beside B4_HOT's, outside HOST_BROWSER: auto_init parses it in both builds.) */
+#define WJ_BYTES_TAB (1 << 17)
+typedef struct { const guint8 *volatile key; gint32 len; volatile gint32 ready; guint32 *sums; char kind; } WjBytesEnt;
+static WjBytesEnt *wj_bytes_tab;
+static volatile gint32 wj_bytes_changed, wj_bytes_full, wj_bytes_forgot, wj_bytes_rekeyed;
+
+static guint32 wj_bytes_block_hash (const guint8 *p, int n);
+
+/* (Re)record e's hashes for the buffer now at its address. ready drops first, so a concurrent verifier skips it. */
+static void
+wj_bytes_record (WjBytesEnt *e, const guint8 *p, int len, const char *kind)
+{
+	guint32 nb = (guint32) (len + 63) / 64, i;
+	guint32 *sums = g_new (guint32, nb);   /* the old array is leaked: a concurrent verifier may still be reading it */
+	e->ready = 0;
+	mono_memory_barrier ();
+	for (i = 0; i < nb; ++i) {
+		int off = (int) i * 64;
+		sums [i] = wj_bytes_block_hash (p + off, MIN (64, len - off));
+	}
+	e->sums = sums;
+	e->len = len;
+	e->kind = kind [0];
+	mono_memory_barrier ();
+	e->ready = 1;
+}
+
+static guint32
+wj_bytes_block_hash (const guint8 *p, int n)
+{
+	guint32 h = 2166136261u;
+	int i;
+	for (i = 0; i < n; ++i)
+		h = (h ^ p [i]) * 16777619u;
+	return h;
+}
+
+static void
+wj_bytes_check (const void *bytes, int len, const char *kind)
+{
+	const guint8 *p = (const guint8 *) bytes;
+	guint32 h, k, nb, i;
+	WjBytesEnt *tab = wj_bytes_tab;
+	if (!p || len <= 0)
+		return;
+	if (!tab) {
+		WjBytesEnt *t = g_new0 (WjBytesEnt, WJ_BYTES_TAB);
+		if (mono_atomic_cas_ptr ((gpointer *) &wj_bytes_tab, t, NULL) != NULL)
+			g_free (t);
+		tab = wj_bytes_tab;
+	}
+	nb = (guint32) (len + 63) / 64;
+	h = (guint32) (((gsize) p >> 3) * 2654435761u);
+	for (k = 0; k < WJ_BYTES_TAB; ++k) {
+		WjBytesEnt *e = &tab [(h + k) & (WJ_BYTES_TAB - 1)];
+		const guint8 *key = e->key;
+		if (key == p) {
+			if (!e->ready)
+				return;   /* still being recorded */
+			if (e->len != len || e->kind != kind [0]) {
+				/* a different buffer at a recycled address (another length or another producer): the old one was
+				 * freed, so this is a new first instantiation, not a change (R464's bank report was this shape) */
+				mono_atomic_inc_i32 (&wj_bytes_rekeyed);
+				wj_bytes_record (e, p, len, kind);
+				return;
+			}
+			mono_memory_barrier ();
+			for (i = 0; i < nb; ++i) {
+				int off = (int) i * 64, n = MIN (64, len - off), j;
+				if (wj_bytes_block_hash (p + off, n) == e->sums [i])
+					continue;
+				if (mono_atomic_inc_i32 (&wj_bytes_changed) <= 40) {
+					GString *hx = g_string_new (NULL);
+					for (j = 0; j < n; ++j)
+						g_string_append_printf (hx, "%02x", p [off + j]);
+					g_string_append (hx, " | before buffer:");
+					for (j = -16; j < 0; ++j)
+						g_string_append_printf (hx, " %02x", p [j]);
+					printf ("WASM_JIT_BYTES_CHANGED kind=%s buf=%p len=%d block=%u off=%d : %s\n", kind, (void *) p, len, i,
+						off, hx->str);
+					g_string_free (hx, TRUE);
+				}
+			}
+			return;
+		}
+		if (key == NULL) {
+			if (mono_atomic_cas_ptr ((gpointer *) &e->key, (gpointer) p, NULL) != NULL) {
+				--k;   /* lost the slot: look at it again */
+				continue;
+			}
+			wj_bytes_record (e, p, len, kind);
+			return;
+		}
+	}
+	mono_atomic_inc_i32 (&wj_bytes_full);
+}
+
+void
+mono_wasm_jit_bytes_print (void)
+{
+	extern int mono_wasm_jit_bytes_check;
+	printf ("[wasm-jit bytes] check=%d changed=%d forgot=%d rekeyed=%d full=%d -- R462: changed MUST be 0 (a published module, "
+		"bank or stub buffer rewritten after its first instantiation); forgot = never-published buffers freed; rekeyed = "
+		"recycled addresses re-recorded\n",
+		mono_wasm_jit_bytes_check, (int) wj_bytes_changed, (int) wj_bytes_forgot, (int) wj_bytes_rekeyed, (int) wj_bytes_full);
+}
+
+/* R462: a buffer that was instantiated and is about to be freed -- a refused registration, a failed group -- was never
+ * published, so the detector must stop comparing its address (a later buffer there is another module, not a change). */
+void
+mono_wasm_jit_bytes_forget (const void *bytes)
+{
+	WjBytesEnt *tab = wj_bytes_tab;
+	guint32 h, k;
+	if (!tab || !bytes)
+		return;
+	h = (guint32) (((gsize) bytes >> 3) * 2654435761u);
+	for (k = 0; k < WJ_BYTES_TAB; ++k) {
+		WjBytesEnt *e = &tab [(h + k) & (WJ_BYTES_TAB - 1)];
+		if (e->key == bytes) {
+			e->len = -1;
+			mono_memory_barrier ();   /* the next buffer at this address is re-recorded (the rekey path), never compared */
+			mono_atomic_inc_i32 (&wj_bytes_forgot);
+			return;
+		}
+		if (e->key == NULL)
+			return;
+	}
+}
+
+/* R459: one retry after re-installing a stub a LinkError named (wj_vslow_repair); a failed instantiation installed nothing. */
+int
+mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
+{
+	int ok = wj_instantiate_local_once (e_slot, f_slot, bytes, len, errbuf, errcap, out_ms, payload);
+	if (!ok && errbuf && wj_vslow_repair (errbuf))
+		ok = wj_instantiate_local_once (e_slot, f_slot, bytes, len, errbuf, errcap, out_ms, payload);
+	return ok;
+}
+
+int
+mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
+{
+	int ok = wj_instantiate_batch_local_once (e_slots, f_slots, n, bytes, len, errbuf, errcap, out_ms, payload);
+	if (!ok && errbuf && wj_vslow_repair (errbuf))
+		ok = wj_instantiate_batch_local_once (e_slots, f_slots, n, bytes, len, errbuf, errcap, out_ms, payload);
+	return ok;
+}
+
 /* Instantiate a cached JITted module into the CURRENT thread's wasm function table. The table is
  * per-thread for dynamically-added entries, so each thread must do this once (lazily, on its first
  * invoke of the method — interp.c MINT_CALL) before call_indirect-ing the slot. Returns 1 on success,
  * 0 on failure (caller then disables the JIT for the method → interpreter fallback). */
-int
-mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
+static int
+wj_instantiate_local_once (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
 {
+	if (G_UNLIKELY (mono_wasm_jit_bytes_check))
+		wj_bytes_check (bytes, len, "m");
+	wj_vslow_ensure_all ();   /* typed-spindle C1 invariant 1: every slow-path stub before any module that may name one */
 	int _ok;
 	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);
 	extern gint32 *mono_wasm_jit_vcall_pic_cap_addr (void);
@@ -2086,6 +2349,19 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 			 * classifier mistake this tree keeps paying for. Cheap: only on the failure path. */
 			var _ex = "";
 			try { _ex = " exports=[" + Object.keys (inst && inst.exports || {}).join (",") + "]"; } catch (e2) {}
+			/* R459 diagnostic: a LinkError on a helper import -- what THIS worker's table holds at that index */
+			try {
+				var _hm = /"h" "([0-9]+)"/.exec ("" + e);
+				if (_hm) {
+					var _hi = Number (_hm[1]);
+					var _hf = wasmTable.get (_hi);
+					var _vs = Module.__wjVslowFn;
+					_ex += " [h " + _hi + ": table " + (_hf ? ("fn name=" + _hf.name + " len=" + _hf.length) : "null") +
+						" vslow_here=" + !!(_vs && _vs.has (_hi)) + " same_fn=" + !!(_vs && _vs.get (_hi) === _hf) +
+						" slotfn=" + !!(Module.__wjSlotFn && Module.__wjSlotFn.has (_hi)) +
+						" aliased=" + !!(Module.__wjAliasOf && Module.__wjAliasOf.has (_hi)) + "]";
+				}
+			} catch (e3) {}
 			if (eb) stringToUTF8 ("" + e + _ex, eb, $5); /* surface the WebAssembly error to the caller */
 			return 0;
 		}
@@ -2119,9 +2395,12 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
  * e_slots/f_slots are parallel arrays of length n. Returns 1 on success; on failure nothing is installed
  * and errbuf carries the WebAssembly error. */
 int mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
-int
-mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
+static int
+wj_instantiate_batch_local_once (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
 {
+	if (G_UNLIKELY (mono_wasm_jit_bytes_check))
+		wj_bytes_check (bytes, len, "b");
+	wj_vslow_ensure_all ();   /* typed-spindle C1 invariant 1 */
 	int _ok, i;
 	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);
 	extern gint32 *mono_wasm_jit_vcall_pic_cap_addr (void);
@@ -2267,7 +2546,21 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
 			return 1;
 		} catch (e) {
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
-			if (eb) stringToUTF8 ("" + e, eb, $6);
+			var _ex = "";
+			/* R459 diagnostic: as instantiate_local's */
+			try {
+				var _hm = /"h" "([0-9]+)"/.exec ("" + e);
+				if (_hm) {
+					var _hi = Number (_hm[1]);
+					var _hf = wasmTable.get (_hi);
+					var _vs = Module.__wjVslowFn;
+					_ex = " [h " + _hi + ": table " + (_hf ? ("fn name=" + _hf.name + " len=" + _hf.length) : "null") +
+						" vslow_here=" + !!(_vs && _vs.has (_hi)) + " same_fn=" + !!(_vs && _vs.get (_hi) === _hf) +
+						" slotfn=" + !!(Module.__wjSlotFn && Module.__wjSlotFn.has (_hi)) +
+						" aliased=" + !!(Module.__wjAliasOf && Module.__wjAliasOf.has (_hi)) + "]";
+				}
+			} catch (e3) {}
+			if (eb) stringToUTF8 ("" + e + _ex, eb, $6);
 			return 0;
 		}
 	}, (int) (intptr_t) e_slots, (int) (intptr_t) f_slots, n, (int) (intptr_t) bytes, len, (int) (intptr_t) errbuf, errcap, (int) (intptr_t) out_ms,
@@ -4690,6 +4983,7 @@ wj_admit_impl (int desc_id)
 			if (!mono_wasm_jit_instantiate_batch_local (batch->e, batch->f, batch->n,
 			                                            batch->bytes, batch->len, eb, (int) sizeof (eb), &ms, snap_payload)) {
 				printf ("WASM_JIT_ADMIT_FAIL desc=%d (batch n=%d) e=%d f=%d : %s\n", desc_id, batch->n, re->e, re->f, eb);
+				wj_vslow_explain (eb);
 				fail_perm = TRUE;   /* a LinkError/CompileError on these bytes will not fix itself */
 				goto fail;
 			}
@@ -4708,6 +5002,7 @@ wj_admit_impl (int desc_id)
 			goto fail;
 		} else if (!mono_wasm_jit_instantiate_local (re->e, re->f, snap_bytes, snap_len, eb, (int) sizeof (eb), &ms, snap_payload)) {
 			printf ("WASM_JIT_ADMIT_FAIL desc=%d e=%d f=%d : %s\n", desc_id, re->e, re->f, eb);
+			wj_vslow_explain (eb);
 			fail_perm = TRUE;   /* as above: bad bytes, not a transient ordering miss */
 			/* A LinkError here should be impossible: admission refuses to instantiate until every
 			 * IMPORTED slot is admitted on THIS worker. Dump what it actually saw -- "the slot is not in
@@ -5928,6 +6223,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 
 #include "mini-wasm-ir.inc"
 #include "mini-wasm-batching.inc"
+#include "mini-wasm-vslow.inc"
 #include "mini-wasm-emitter.inc"
 #include "mini-wasm-lazy.inc"
 
