@@ -519,6 +519,9 @@ mono_wasm_jit_hook_route_locked (int desc_id, MonoMethod *m, gpointer imethod)
 	re->body_current = 0;
 	mono_memory_barrier ();
 	re->hooked = 1;
+	/* B4 leaf copies (R452): every group carrying a private copy of this body calls it module-locally too */
+	{ extern void mono_wasm_jit_b4_copy_invalidate (int fslot);
+	  mono_wasm_jit_b4_copy_invalidate (re->f); }
 	/* A co-located method is also called module-locally by its group; the group's guard word sends those calls through
 	 * the table, i.e. to the stub (plan H4: hookable apps build guarded groups, S1 bit 1). */
 	if (re->batch) {

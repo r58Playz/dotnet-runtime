@@ -577,8 +577,53 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
  * already have, which are valid and installed -- a failed re-frame costs time, never correctness.
  */
 int mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len);
-int
-mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len)
+/* B4 leaf copies (R452): the module's export count, or -1 if its sections do not parse. The floor the deleted
+ * wj_verify_module_exports was (R167: a module without the exports the instantiate path asks for retried instantiation
+ * 959,405 times): a module carrying private copies is published only if it exports exactly e/f per member. */
+static int
+wj_module_export_count (const guint8 *p, guint32 len)
+{
+	guint32 off = 8;
+	if (!p || len < 8)
+		return -1;
+	while (off < len) {
+		guint8 id = p [off++], b;
+		guint32 size = 0, sh = 0;
+		do {
+			if (off >= len || sh > 28) return -1;
+			b = p [off++]; size |= (guint32) (b & 0x7f) << sh; sh += 7;
+		} while (b & 0x80);
+		if (size > len - off)
+			return -1;
+		if (id == 7) {
+			guint32 o = off, v = 0;
+			sh = 0;
+			do {
+				if (o >= off + size || sh > 28) return -1;
+				b = p [o++]; v |= (guint32) (b & 0x7f) << sh; sh += 7;
+			} while (b & 0x80);
+			return (int) v;
+		}
+		off += size;
+	}
+	return 0;
+}
+
+static volatile gint64 wj_b4_copy_framed, wj_b4_copy_bytes, wj_b4_copy_inval, wj_b4_copy_stale, wj_b4_copy_refull,
+	wj_b4_copy_exportfail, wj_b4_copy_dropped;
+typedef struct { gint32 fslot; gint32 *guard; } WjB4CopyRef;
+#define WJ_B4_COPYREF_MAX (1 << 16)
+static WjB4CopyRef *volatile wj_b4_copyref;
+static volatile gint32 wj_b4_ncopyref;
+
+/* mono_wasm_jit_rebatch, plus `ncopy` PRIVATE COPIES (B4 leaf copies, R452): registered methods framed after the n
+ * members, unexported, reached only by the members' guarded module-local calls. `guard_in`, when given, is the
+ * generation word to guard on (the caller registered it against the copies' slots BEFORE framing); `copy_bodies`
+ * receives the body each copy was framed from (NULL for a candidate dropped here). Copies are re-validated under the
+ * registry bracket -- the caller chose them outside it -- and an invalid one is dropped, not fatal. */
+static int
+wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gint32 *guard_in, WjBody **copy_bodies,
+                 void **out_bytes, int *out_len)
 {
 	WjAsmMember *members;
 	WjAsmPolicy pol;
@@ -589,10 +634,10 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 	void *cached;
 	char eb [192];
 	double ms = 0;
-	int i, ok = 0;
+	int i, ok = 0, nc = 0;
 
 	wj_stack_probe ();
-	if (n <= 1 || n > WJ_BATCH_MAX)
+	if (n <= 1 || n > WJ_BATCH_MAX || ncopy < 0 || n + ncopy > WJ_BATCH_MAX)
 		return 0;
 	for (i = 0; i < n; ++i) {
 		WjRegEntry *re = desc_ids [i] > 0 ? wj_reg_at (desc_ids [i] - 1) : NULL;
@@ -690,12 +735,12 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 	 * the two code buffers -- and held across wj_assemble and a JS WebAssembly.Module compile. A
 	 * re-emission of any of those members retires that body. Held until `done:`. */
 	wj_reg_read_enter ();
-	members = g_new0 (WjAsmMember, n);
+	members = g_new0 (WjAsmMember, n + ncopy);
 	e_slots = g_new0 (int, n);
 	f_slots = g_new0 (int, n);
 	/* The per-member import lists the assembler fills. Normally owned by the batch_begin/batch_end pair;
 	 * there is no capture phase here, so this path owns them and frees them at `done`. */
-	for (i = 0; i < n; ++i) {
+	for (i = 0; i < n + ncopy; ++i) {
 		wj_asm_deps_free (&wj_batch_deps [i]);
 	}
 	for (i = 0; i < n; ++i) {
@@ -719,6 +764,20 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 		members [i].uses_eh_tag = b->uses_eh_tag;
 		members [i].eh_tpool = b->eh_tpool;
 	}
+	for (i = 0; i < ncopy; ++i) {
+		WjRegEntry *cre = copy_ids [i] > 0 && copy_ids [i] <= wj_reg_n ? wj_reg_at (copy_ids [i] - 1) : NULL;
+		if (copy_bodies)
+			copy_bodies [i] = NULL;
+		if (!cre || !cre->body || cre->f <= 0 || cre->orphaned || cre->hooked || !cre->body_current ||
+		    wj_desc_for_fslot (cre->f) != copy_ids [i] || wj_asm_member_of (members, n + nc, cre->body->method) >= 0) {
+			wj_b4_copy_dropped++;
+			continue;
+		}
+		wj_member_from_body (&members [n + nc], cre->body, cre->f);
+		if (copy_bodies)
+			copy_bodies [i] = cre->body;
+		nc++;
+	}
 
 	{
 	  /* local_calls is the POINT of co-locating -- and also the only thing MONO_WASM_JIT_COLOCATE_LOCAL_CALLS=0
@@ -729,18 +788,39 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 	   * stays -- the lone-method path passes FALSE deliberately, to keep self-recursion indirect. */
 	  wj_asm_policy_init (&pol, TRUE);
 	  { extern int mono_wasm_jit_s1, mono_wasm_jit_b4;   /* plan2x S1: one word per group generation, never freed */
-	    if (((mono_wasm_jit_s1 & 1) || mono_wasm_jit_b4 >= 2) && (guard = wj_word_alloc ()) != NULL) {
+	    if (guard_in || (((mono_wasm_jit_s1 & 1) || mono_wasm_jit_b4 >= 2) && (guard = wj_word_alloc ()) != NULL)) {
+		if (guard_in)
+			guard = guard_in;
 		pol.guard_addr = (guint32) (gsize) guard;
 		pol.guard_count_addr = (guint32) (gsize) &mono_wasm_jit_counters [WJC_S1_GUARD_TAKEN];   /* low word */
 	    } }
+	  /* Copies need the guard: it is what a behaviour-altering swap of a copy's source flips (WjB4CopyRef). */
+	  if (nc > 0 && !pol.guard_addr)
+		nc = 0;
+	  if (nc > 0)
+		pol.nexport = n;
 	  /* CROSS-GROUP EDGES ARE `call_indirect`, and there is no longer a choice about it: method
 	   * imports are gone entirely. An import bound at INSTANTIATION had to be ordered, and ordering
 	   * is what could not be done -- R161 showed every deferral was an import-edge cycle, and R162
 	   * measured what that cost. call_indirect reads the table when it runs, so any order works. */ }
 	wasm_buf_init (&out);
-	if (!wj_assemble (members, n, n, &pol, &out, NULL, wj_batch_deps) || out.len == 0) {
+	if (!wj_assemble (members, n + nc, n, &pol, &out, NULL, wj_batch_deps) || out.len == 0) {
 		wasm_buf_free (&out);
 		goto done;
+	}
+	if (nc > 0) {
+		/* A copy's own direct calls are this module's dependencies too: admission walks the union of the MEMBERS'
+		 * depsets, so they are folded into member 0's. */
+		int c, d;
+		for (c = n; c < n + nc; ++c)
+			for (d = 0; d < wj_batch_deps [c].n; ++d)
+				wj_asm_deps_add (&wj_batch_deps [0], wj_batch_deps [c].slot [d], wj_batch_deps [c].sig [d],
+				                 wj_batch_deps [c].method [d]);
+		if (wj_module_export_count (out.data, out.len) != 2 * n) {
+			wj_b4_copy_exportfail++;
+			wasm_buf_free (&out);
+			goto done;
+		}
 	}
 	{ extern int mono_wasm_jit_capture;
 	  if (G_UNLIKELY (mono_wasm_jit_capture))
@@ -783,12 +863,23 @@ mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_le
 done:
 	/* batch_bind has COPIED whatever it needed into each entry's re->imports, so these are ours to drop
 	 * on every path -- including the ones that never reached it. */
-	for (i = 0; i < n; ++i) {
+	for (i = 0; i < n + ncopy; ++i) {
 		wj_asm_deps_free (&wj_batch_deps [i]);
+	}
+	if (ok && nc > 0) {
+		wj_b4_copy_framed += nc;
+		for (i = 0; i < nc; ++i)
+			wj_b4_copy_bytes += members [n + i].f_body ? members [n + i].f_body->len : 0;
 	}
 	g_free (members); g_free (e_slots); g_free (f_slots);
 	wj_reg_read_leave ();
 	return ok;
+}
+
+int
+mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len)
+{
+	return wj_rebatch_core (desc_ids, n, NULL, 0, NULL, NULL, out_bytes, out_len);
 }
 
 /*
@@ -1453,6 +1544,13 @@ mono_wasm_jit_b4_plan (void)
 			mono_wasm_jit_b4_down, dup.down_bodies, dup.down_grouped, 100.0 * (double) dup.down_w / t,
 			100.0 * (double) dup.down_in / dw, 100.0 * (double) dup.down_framed / dw,
 			100.0 * (double) (dup.down_w - dup.down_in - dup.down_framed) / dw); }
+		{ extern int mono_wasm_jit_b4_copy, mono_wasm_jit_b4_copy_bytes, mono_wasm_jit_b4_copy_max;
+		  printf ("[wasm-jit b4] leaf copies (B4_COPY=%d B, %d B / %d per group): framed=%lld bytes=%lld refs=%d "
+			"invalidated=%lld stale=%lld dropped=%lld refull=%lld exportfail=%lld\n", mono_wasm_jit_b4_copy,
+			mono_wasm_jit_b4_copy_bytes, mono_wasm_jit_b4_copy_max, (long long) wj_b4_copy_framed,
+			(long long) wj_b4_copy_bytes, (int) wj_b4_ncopyref, (long long) wj_b4_copy_inval,
+			(long long) wj_b4_copy_stale, (long long) wj_b4_copy_dropped, (long long) wj_b4_copy_refull,
+			(long long) wj_b4_copy_exportfail); }
 	}
 	for (k = 0; k < ng && k < 6; ++k) {
 		printf ("[wasm-jit b4]   group %d: %d members, heat %llu:", k, g [k].n, (unsigned long long) hot [k]);
@@ -1465,6 +1563,64 @@ mono_wasm_jit_b4_plan (void)
 	wj_b4_free (g, ng);
 	g_free (hot);
 	wj_reg_read_leave ();
+}
+
+/* B4 leaf copies (R452). Every (copied f-slot, group guard) pair, append-only, never freed. A copy is a private snapshot
+ * of its source's body, reached by the members' GUARDED module-local calls; a behaviour-ALTERING change at the source's
+ * slot -- a hook (wj_lazy_hook), a new owner (mono_wasm_jit_register's orphan path) -- must send those calls back
+ * through the table, so it sets every guard holding a copy of that slot. A re-emission or an IKVM relink does not: an
+ * old body stays a correct implementation of its slot (mono_wasm_jit_register, "callers need no invalidation"). */
+/* (WjB4CopyRef and its table are declared with the copy counters, before rebatch.) */
+
+static gboolean
+wj_b4_copy_note (int fslot, gint32 *guard)   /* the single re-emit drainer only */
+{
+	gint32 k = wj_b4_ncopyref;
+	if (!wj_b4_copyref) {
+		WjB4CopyRef *a = g_new0 (WjB4CopyRef, WJ_B4_COPYREF_MAX);
+		mono_memory_barrier ();
+		wj_b4_copyref = a;
+	}
+	if (k >= WJ_B4_COPYREF_MAX) {
+		wj_b4_copy_refull++;
+		return FALSE;
+	}
+	wj_b4_copyref [k].fslot = fslot;
+	wj_b4_copyref [k].guard = guard;
+	mono_memory_barrier ();
+	wj_b4_ncopyref = k + 1;
+	return TRUE;
+}
+
+/* One group's copy candidates, ranked by summed live edge weight; drainer-owned scratch. */
+typedef struct { gint32 desc, len; guint64 w; } WjB4Cand;
+#define WJ_B4_CAND_MAX 1024
+#define WJ_B4_COPY_CAP 128
+static WjB4Cand wj_b4_cand [WJ_B4_CAND_MAX];
+static int wj_b4_ncand;
+
+static int
+wj_b4_cand_cmp (gconstpointer x, gconstpointer y)
+{
+	guint64 a = ((const WjB4Cand *) x)->w, b = ((const WjB4Cand *) y)->w;
+	return a < b ? 1 : a > b ? -1 : 0;
+}
+
+void mono_wasm_jit_b4_copy_invalidate (int fslot);
+void
+mono_wasm_jit_b4_copy_invalidate (int fslot)
+{
+	gint32 k, nref = wj_b4_ncopyref;
+	WjB4CopyRef *a;
+	mono_memory_barrier ();
+	a = wj_b4_copyref;
+	if (!a || fslot <= 0)
+		return;
+	for (k = 0; k < nref; ++k)
+		if (a [k].fslot == fslot && a [k].guard && !*a [k].guard) {
+			mono_atomic_store_i32 (a [k].guard, 1);
+			wj_b4_copy_inval++;
+		}
 }
 
 /* B4=2: one unit of the drainer's B4 work. Re-plans when enough new edge-carrying bodies arrived, then frames ONE
@@ -1480,7 +1636,10 @@ mono_wasm_jit_b4_step (void)
 	gint32 *descs;
 	/* a merge may absorb whole groups, so the framed set is bounded at twice the planner's: 2 x B4_MAX members (R195:
 	 * 32 clean, 64 + 128 KB crashed) and 2 x B4_BYTES */
-	int n = 0, i, k, bytes = 0, ok, cap = MIN (2 * mono_wasm_jit_b4_max, WJ_BATCH_MAX), same = 1;
+	int n = 0, i, k, bytes = 0, ok, cap = MIN (2 * mono_wasm_jit_b4_max, WJ_BATCH_MAX), same = 1, ncopy = 0;
+	int copies [WJ_B4_COPY_CAP];
+	WjBody *copy_bodies [WJ_B4_COPY_CAP];
+	gint32 *guard = NULL;
 	WjBatchDesc *first = NULL;
 	WjB4Group *g;
 
@@ -1558,7 +1717,77 @@ mono_wasm_jit_b4_step (void)
 		if (mxb > mono_wasm_jit_b4_anchor || bytes - mxb > 2 * mono_wasm_jit_b4_bytes)
 			goto refuse;
 	}
-	ok = mono_wasm_jit_rebatch (descs, n, NULL, NULL);
+	/* B4 leaf copies (R452): the members' small callees OUTSIDE this group -- framed in another one, or free -- copied
+	 * in privately, heaviest live edge first. A partition can place a shared callee in one group only (R195); R451's
+	 * dup census put 17.6% of the edge weight on such callees of <= 500 B, which V8 inlines once co-resident. */
+	{
+		extern int mono_wasm_jit_b4_copy, mono_wasm_jit_b4_copy_bytes, mono_wasm_jit_b4_copy_max;
+		if (mono_wasm_jit_b4_copy > 0) {
+			int ci, cj, maxc = MIN (MIN (mono_wasm_jit_b4_copy_max, WJ_BATCH_MAX - n), WJ_B4_COPY_CAP), cb = 0;
+			for (i = 0; i < n; ++i) {
+				WjRegEntry *re = wj_reg_at (descs [i] - 1);
+				if (!re || !re->body)
+					continue;
+				for (k = 0; k < (int) re->body->nedges; ++k) {
+					WjEdge *ed = &re->body->edges [k];
+					int cd = wj_desc_for_fslot (ed->fslot), j;
+					guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+					WjRegEntry *cre;
+					if (cd <= 0 || w == 0)
+						continue;
+					for (j = 0; j < n && descs [j] != cd; ++j)
+						;
+					if (j < n)
+						continue;   /* a member: already module-local */
+					cre = wj_reg_at (cd - 1);
+					if (!cre || !cre->body || cre->f != ed->fslot || cre->orphaned || cre->hooked || !cre->body_current ||
+					    (int) cre->body->f_body.len > mono_wasm_jit_b4_copy)
+						continue;
+					for (j = 0; j < wj_b4_ncand && wj_b4_cand [j].desc != cd; ++j)
+						;
+					if (j < wj_b4_ncand) {
+						wj_b4_cand [j].w += w;
+					} else if (wj_b4_ncand < WJ_B4_CAND_MAX) {
+						wj_b4_cand [wj_b4_ncand].desc = cd;
+						wj_b4_cand [wj_b4_ncand].w = w;
+						wj_b4_cand [wj_b4_ncand].len = (int) cre->body->f_body.len;
+						wj_b4_ncand++;
+					}
+				}
+			}
+			qsort (wj_b4_cand, wj_b4_ncand, sizeof (WjB4Cand), wj_b4_cand_cmp);
+			for (ci = 0; ci < wj_b4_ncand && ncopy < maxc; ++ci) {
+				if (cb + wj_b4_cand [ci].len > mono_wasm_jit_b4_copy_bytes)
+					continue;
+				cb += wj_b4_cand [ci].len;
+				copies [ncopy++] = wj_b4_cand [ci].desc;
+			}
+			wj_b4_ncand = 0;
+			if (ncopy > 0) {
+				/* The guard is registered against every copy's slot BEFORE framing, so a hook landing while the
+				 * module is built still sets it; the post-check below covers one landing before this point. */
+				guard = wj_word_alloc ();
+				for (cj = 0; guard && cj < ncopy; ++cj)
+					if (!wj_b4_copy_note (wj_reg_at (copies [cj] - 1)->f, guard))
+						break;
+				ncopy = guard ? cj : 0;
+			}
+		}
+	}
+	ok = ncopy > 0 ? wj_rebatch_core (descs, n, copies, ncopy, guard, copy_bodies, NULL, NULL)
+	               : mono_wasm_jit_rebatch (descs, n, NULL, NULL);
+	if (ok && ncopy > 0) {
+		/* Re-check each copy's source now that the module is published: a hook or a new owner that landed between
+		 * the choice and the note above found no ref, so it is caught here. */
+		for (i = 0; i < ncopy; ++i) {
+			WjRegEntry *cre = copy_bodies [i] ? wj_reg_at (copies [i] - 1) : NULL;
+			if (cre && (cre->hooked || cre->orphaned || !cre->body_current || wj_desc_for_fslot (cre->f) != copies [i])) {
+				mono_atomic_store_i32 (guard, 1);
+				wj_b4_copy_stale++;
+				break;
+			}
+		}
+	}
 	wj_reg_read_leave ();
 	if (!ok) {
 		mono_wasm_jit_counters [WJC_B4_REFUSED]++;

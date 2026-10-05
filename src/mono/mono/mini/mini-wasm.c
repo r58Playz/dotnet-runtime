@@ -854,7 +854,11 @@ mono_wasm_jit_auto_init (void)
 	        b4 = g_getenv ("MONO_WASM_JIT_B4_T1"); if (b4 && *b4) mono_wasm_jit_b4_t1 = atoi (b4) != 0;
 	        b4 = g_getenv ("MONO_WASM_JIT_B4_ANCHOR"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_anchor = v; }
 	        { extern int mono_wasm_jit_b4_down;
-	          b4 = g_getenv ("MONO_WASM_JIT_B4_DOWN"); if (b4 && *b4) mono_wasm_jit_b4_down = atoi (b4) != 0; } } } } }
+	          b4 = g_getenv ("MONO_WASM_JIT_B4_DOWN"); if (b4 && *b4) mono_wasm_jit_b4_down = atoi (b4) != 0;
+	          { extern int mono_wasm_jit_b4_copy, mono_wasm_jit_b4_copy_bytes, mono_wasm_jit_b4_copy_max;
+	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_copy = v; }
+	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY_BYTES"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_copy_bytes = v; }
+	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_copy_max = v; } } } } } } }
 	{ extern int mono_wasm_jit_rrem_inline; const char *rr = g_getenv ("MONO_WASM_JIT_RREM"); if (rr && *rr) mono_wasm_jit_rrem_inline = atoi (rr); }
 	  if (mono_wasm_jit_origin) { extern void mono_wasm_jit_origin_print_tags (void); mono_wasm_jit_origin_print_tags (); } }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
@@ -1121,6 +1125,12 @@ int mono_wasm_jit_b4_anchor = 262144;
  * (mono_wasm_force_compile) -- records edges, though it is a tier-1 compile. ~30 bodies per run, the tick's giants
  * among them: ~13% of the server thread's JIT entries are theirs (R450). */
 int mono_wasm_jit_b4_down = 0;
+/* MONO_WASM_JIT_B4_COPY: B4 leaf copies -- a framed group also carries PRIVATE copies of its members' callees whose f-body
+ * is at most this many bytes and that sit outside the group (R452; mini-wasm-batching.inc WjB4CopyRef). 0 = none.
+ * MONO_WASM_JIT_B4_COPY_BYTES / _MAX: the copies' byte and count budget per group. */
+int mono_wasm_jit_b4_copy = 0;
+int mono_wasm_jit_b4_copy_bytes = 16384;
+int mono_wasm_jit_b4_copy_max = 32;
 /* Safepoint samples taken inside tier-2 bodies, process-wide (interp.c mono_wasm_jit_t2_sample): the planner's clock. */
 volatile gint32 mono_wasm_jit_b4_samples;
 /* Edge-carrying bodies stored so far (wj_body_take); the B4 drainer re-plans once this has grown by 32. */
@@ -2977,6 +2987,9 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				mono_memory_barrier ();
 				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 				mono_wasm_jit_counters [WJC_FSLOT_ORPHANED]++;
+				{ /* B4 leaf copies (R452): a private copy of the old owner must stop standing in for this slot */
+				  extern void mono_wasm_jit_b4_copy_invalidate (int fslot);
+				  mono_wasm_jit_b4_copy_invalidate (old_re->f); }
 			}
 		}
 		if (ci < WJ_REG_NCHUNKS) {
