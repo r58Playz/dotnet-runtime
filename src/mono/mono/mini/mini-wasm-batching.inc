@@ -1551,6 +1551,8 @@ mono_wasm_jit_b4_plan (void)
 			(long long) wj_b4_copy_bytes, (int) wj_b4_ncopyref, (long long) wj_b4_copy_inval,
 			(long long) wj_b4_copy_stale, (long long) wj_b4_copy_dropped, (long long) wj_b4_copy_refull,
 			(long long) wj_b4_copy_exportfail); }
+		printf ("[wasm-jit b4] asm: co-member calls kept indirect on a functype mismatch=%lld | local through another slot=%lld\n",
+			(long long) wj_asm_member_type_mismatch, (long long) wj_asm_member_other_slot);
 	}
 	for (k = 0; k < ng && k < 6; ++k) {
 		printf ("[wasm-jit b4]   group %d: %d members, heat %llu:", k, g [k].n, (unsigned long long) hot [k]);
