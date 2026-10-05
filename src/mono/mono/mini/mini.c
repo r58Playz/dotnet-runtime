@@ -3548,6 +3548,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 			 * everything beyond that is opted into through MONO_WASM_JIT_OPT.
 			 */
 			cfg->opt = WASM_JIT_OPT_BASE | wasm_jit_extra_opt ();
+			cfg->wasm_jit_t1_down = wasm_jit_policy_t1_only;
 			/* R315 (plan Phase 3): the per-compile inline policy. MONO_WASM_JIT_INLINE_CALLS is a diagnostic knob
 			 * for the whole tier; mono_wasm_force_compile's downgrade retry forces the ordinary policy. */
 			{

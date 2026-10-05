@@ -1025,8 +1025,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	MonoMethodSignature *fail_sig = NULL;
 	int fail_sig_arg = -2;
 	char *mname = mono_method_get_full_name (cfg->method);
-	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_t1;   /* plan B4: record this body's weighted direct-call edges */
-	  wj_edge_on = mono_wasm_jit_b4 && (cfg->wasm_jit_tier >= 2 || mono_wasm_jit_b4_t1);
+	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_t1, mono_wasm_jit_b4_down;   /* plan B4: record this body's weighted direct-call edges */
+	  wj_edge_on = mono_wasm_jit_b4 && (cfg->wasm_jit_tier >= 2 || mono_wasm_jit_b4_t1 || (mono_wasm_jit_b4_down && cfg->wasm_jit_t1_down));
 	  if (wj_edge_on) {
 		if (!wj_edge_buf)
 			wj_edge_buf = g_array_new (FALSE, FALSE, sizeof (WjEdge));
@@ -8444,6 +8444,8 @@ vcall_cold_miss_emit:
 			wj_stored_body = wj_body_take (cfg->method, mname, &body, &ethunk, param_types, (guint32) nwparams,
 			                               ret_vt, groups, extra_types, (guint32) nextra,
 			                               uses_calls, uses_eh_tag, eh_type_idx);
+			if (wj_stored_body)
+				wj_stored_body->t1down = cfg->wasm_jit_t1_down;
 		}
 		wasm_buf_free (&ethunk);
 	}

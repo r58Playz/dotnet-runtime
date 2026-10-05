@@ -852,7 +852,9 @@ mono_wasm_jit_auto_init (void)
 	      b4 = g_getenv ("MONO_WASM_JIT_B4_PLAN_SAMPLES"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_plan_samples = v; }
 	      { extern int mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor;
 	        b4 = g_getenv ("MONO_WASM_JIT_B4_T1"); if (b4 && *b4) mono_wasm_jit_b4_t1 = atoi (b4) != 0;
-	        b4 = g_getenv ("MONO_WASM_JIT_B4_ANCHOR"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_anchor = v; } } } } }
+	        b4 = g_getenv ("MONO_WASM_JIT_B4_ANCHOR"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_anchor = v; }
+	        { extern int mono_wasm_jit_b4_down;
+	          b4 = g_getenv ("MONO_WASM_JIT_B4_DOWN"); if (b4 && *b4) mono_wasm_jit_b4_down = atoi (b4) != 0; } } } } }
 	{ extern int mono_wasm_jit_rrem_inline; const char *rr = g_getenv ("MONO_WASM_JIT_RREM"); if (rr && *rr) mono_wasm_jit_rrem_inline = atoi (rr); }
 	  if (mono_wasm_jit_origin) { extern void mono_wasm_jit_origin_print_tags (void); mono_wasm_jit_origin_print_tags (); } }
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
@@ -1111,10 +1113,14 @@ int mono_wasm_jit_b4_per_plan = 16;
 int mono_wasm_jit_b4_plan_samples = 5000;
 /* MONO_WASM_JIT_B4_T1: tier-1 bodies record edges too (R447: 52% of the tick's entries into ungrouped callees come
  * from tier-1 callers -- its giants never reach tier 2). On, with 256 KB anchors, it cost +759 MiB peak VmData and put
- * both runs over 8 GiB (R448); off until the memory is found (R449). MONO_WASM_JIT_B4_ANCHOR: the bound on a group's
- * largest member, which B4_BYTES excludes, so a giant can anchor a group of its callees. */
+ * both runs over 8 GiB (R448; R449's split of that cost was confounded by a missing CPU pin). MONO_WASM_JIT_B4_ANCHOR:
+ * the bound on a group's largest member, which B4_BYTES excludes, so a giant can anchor a group of its callees. */
 int mono_wasm_jit_b4_t1 = 0;
 int mono_wasm_jit_b4_anchor = 262144;
+/* MONO_WASM_JIT_B4_DOWN: the downgrade recompile -- a tier-2 body over T2_MAX_BODY, recompiled at the ordinary policy
+ * (mono_wasm_force_compile) -- records edges, though it is a tier-1 compile. ~30 bodies per run, the tick's giants
+ * among them: ~13% of the server thread's JIT entries are theirs (R450). */
+int mono_wasm_jit_b4_down = 0;
 /* Safepoint samples taken inside tier-2 bodies, process-wide (interp.c mono_wasm_jit_t2_sample): the planner's clock. */
 volatile gint32 mono_wasm_jit_b4_samples;
 /* Edge-carrying bodies stored so far (wj_body_take); the B4 drainer re-plans once this has grown by 32. */
