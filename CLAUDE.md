@@ -873,6 +873,9 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
   performance result. A whole session was once run against a dead JIT tier.
 * **Measure the mechanism before the outcome.** A tier dump or a `hotinsn.py` run takes minutes and says
   whether a change did what it was supposed to; an fps A/B takes hours and says only whether the number moved.
+* **Measure on mains power.** On battery the platform drops to a power-saving profile: R454's base mapping run fell in a
+  dock unplug and came back with a slow boot, a worker stall and an in-game window whose frame counter never moved
+  (`ingameVoid`). `lib/preflight.mjs` now refuses on battery and warns off the `performance` power profile.
 * **Pin every arm of a comparison the same way (`MC_TASKSET`), and never compare across batches that differ in it.**
   Chromium counts CPUs through `sched_getaffinity` (`base/system/sys_info_posix.cc:157-159`) and sizes its thread pool
   at max(3, CPUs - 1) (`base/task/thread_pool/thread_pool_instance.cc:94`), so the pin changes the renderer's thread
@@ -979,6 +982,15 @@ thread running with `wchan=0`) versus `verdict=wedge` (no app progress, all thre
 captures 12 s of perf automatically. That capture is only readable because `worldwait` now passes
 `--perf-basic-prof` by default — R275's own capture had no symbol map and its five addresses stayed
 nameless, which is the whole reason the round ended undiagnosed.
+
+**ROOT CAUSE FOUND (R454x): it is `mallinfo()` looping forever on a corrupt heap chunk.** ikvmcraft's frontend polls
+`_ikvm_native_used_mb()` every 5 s on the MAIN thread (`frontend/src/dotnet/index.ts`, a UI memory stat), which calls
+`mallinfo()` (`loader/Emscripten.c:69`). A spin capture (`j2d/r454b/spin-b-1`, symbolised with `ledger/perfread.py` +
+`jitindex`) has 59,422 of 59,436 main-thread cycle samples in `dlmallinfo` for a full minute, ~38 billion loads with
+ONE L1 miss, touching exactly two data addresses: dlmalloc's walk advances by each chunk's size field, so a header
+whose size reads 0 is walked forever -- holding dlmalloc's global lock, which is why every allocating worker then sits in
+`__futex_wait` and the app goes quiet. So the hang is a DETECTOR: the real bug is whatever zeroes a malloc chunk header.
+Stopping the poll removes the hang; finding the corruption is separate. The paragraph below predates this.
 
 **Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
 The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
