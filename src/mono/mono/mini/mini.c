@@ -2277,15 +2277,38 @@ mono_codegen (MonoCompile *cfg)
 #endif
 }
 
+/*
+ * Mark every block reachable from ROOT, iteratively: the recursive form went one native frame deeper per block on a
+ * path and overflowed a web worker's stack on a large CFG ("Maximum call stack size exceeded" in compute_reachable at
+ * boot -- 2026-09-30, and R452's tier dump, where it wedged the run) -- the failure df_visit had (R377). Only the
+ * visited set is the result, so a worklist in any order computes the same thing. A block is marked when pushed, so
+ * each is pushed at most once; the stack is sized by the caller from the bb chain and grows if a block lies outside it.
+ */
 static void
-compute_reachable (MonoBasicBlock *bb)
+compute_reachable (MonoCompile *cfg, MonoBasicBlock *root, MonoBasicBlock ***stackp, int *capp)
 {
-	int i;
+	MonoBasicBlock **stack = *stackp;
+	int sp = 0, i;
 
-	if (!(bb->flags & BB_VISITED)) {
-		bb->flags |= BB_VISITED;
-		for (i = 0; i < bb->out_count; ++i)
-			compute_reachable (bb->out_bb [i]);
+	if (root->flags & BB_VISITED)
+		return;
+	root->flags |= BB_VISITED;
+	stack [sp++] = root;
+	while (sp > 0) {
+		MonoBasicBlock *bb = stack [--sp];
+		for (i = 0; i < bb->out_count; ++i) {
+			MonoBasicBlock *child = bb->out_bb [i];
+			if (child->flags & BB_VISITED)
+				continue;
+			child->flags |= BB_VISITED;
+			if (sp == *capp) {
+				MonoBasicBlock **ns = (MonoBasicBlock **)mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock *) * (*capp) * 2);
+				memcpy (ns, stack, sizeof (MonoBasicBlock *) * (*capp));
+				stack = *stackp = ns;
+				*capp *= 2;
+			}
+			stack [sp++] = child;
+		}
 	}
 }
 
@@ -2313,12 +2336,20 @@ static void mono_bb_ordering (MonoCompile *cfg)
 
 		/* remove unreachable code, because the code in them may be
 		 * inconsistent  (access to dead variables for example) */
-		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+		MonoBasicBlock **rstack;
+		int rcap = 2;
+
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 			bb->flags &= ~BB_VISITED;
-		compute_reachable (cfg->bb_entry);
+			rcap++;
+		}
+		rstack = (MonoBasicBlock **)mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock *) * rcap);
+		if (cfg->verbose_level > 1)
+			g_print ("compute_reachable: %d blocks, worklist\n", rcap - 2);
+		compute_reachable (cfg, cfg->bb_entry, &rstack, &rcap);
 		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
 			if (bb->flags & BB_EXCEPTION_HANDLER)
-				compute_reachable (bb);
+				compute_reachable (cfg, bb, &rstack, &rcap);
 		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 			if (!(bb->flags & BB_VISITED)) {
 				if (cfg->verbose_level > 1)
