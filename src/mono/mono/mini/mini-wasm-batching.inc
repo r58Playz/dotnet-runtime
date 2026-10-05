@@ -1165,7 +1165,12 @@ typedef struct { gint32 *desc; gint32 n; } WjB4Group;
  * callee's own f-body size -- <= 500 B (V8's wasm_inlining_max_size, flags/flag-definitions.h:2221, so a copy in the
  * caller's module is inlinable), <= 2 KB, larger -- and what one copy per (group, callee) pair would cost. Weight from
  * callers in no group is counted apart: a copy has no module to go into there. Dry run only. */
-typedef struct { guint64 w [3], wsolo; gint32 pairs [3]; gint64 bytes [3]; } WjB4Dup;
+typedef struct {
+	guint64 w [3], wsolo; gint32 pairs [3]; gint64 bytes [3];
+	/* R451: edges out of downgrade-recompile bodies (MONO_WASM_JIT_B4_DOWN): kept inside the caller's planned group,
+	 * into a callee already framed in another group (fresh-only framing cannot take it), or into a free one */
+	gint32 down_bodies, down_grouped; guint64 down_w, down_in, down_framed;
+} WjB4Dup;
 
 static int
 wj_b4_u64cmp (gconstpointer x, gconstpointer y)
@@ -1325,6 +1330,15 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 			WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
 			gint32 ra = wj_b4_find (par, e->a), fb;
 			guint64 key;
+			WjRegEntry *are = wj_reg_at (e->a - 1);
+			if (are && are->body && are->body->t1down) {
+				WjRegEntry *bre = wj_reg_at (e->b - 1);
+				dup->down_w += e->w;
+				if (ra == wj_b4_find (par, e->b) && sz [ra] >= 2)
+					dup->down_in += e->w;
+				else if (bre && bre->batch)
+					dup->down_framed += e->w;
+			}
 			if (ra == wj_b4_find (par, e->b))
 				continue;
 			if (sz [ra] < 2) { dup->wsolo += e->w; continue; }
@@ -1344,6 +1358,14 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 			dup->pairs [bk]++; dup->bytes [bk] += fb;
 		}
 		g_array_free (pairs, TRUE);
+		for (i = 1; i <= n; ++i) {
+			WjRegEntry *re = wj_reg_at (i - 1);
+			if (re && re->body && re->body->t1down && re->body->nedges) {
+				dup->down_bodies++;
+				if (sz [wj_b4_find (par, i)] >= 2)
+					dup->down_grouped++;
+			}
+		}
 	}
 	/* Each group's HEAT: its members' tier-2-body samples since the previous plan (R446). Groups are ordered by heat (a
 	 * group nobody ran since then has none and is not listed), the internal weight only breaking ties. */
@@ -1424,6 +1446,13 @@ mono_wasm_jit_b4_plan (void)
 			100.0 * (double) dup.w [0] / t, dup.pairs [0], (long long) dup.bytes [0], 100.0 * (double) dup.w [1] / t, dup.pairs [1],
 			(long long) dup.bytes [1], 100.0 * (double) dup.w [2] / t, dup.pairs [2], (long long) dup.bytes [2],
 			100.0 * (double) dup.wsolo / t);
+		{ extern int mono_wasm_jit_b4_down;
+		  double dw = dup.down_w ? (double) dup.down_w : 1.0;
+		  printf ("[wasm-jit b4] giants (downgrade bodies with edges, B4_DOWN=%d): bodies=%d in a planned group %d | weight %.1f%% "
+			"of all -> inside its group %.1f%% | callee framed in another group %.1f%% | callee free %.1f%%\n",
+			mono_wasm_jit_b4_down, dup.down_bodies, dup.down_grouped, 100.0 * (double) dup.down_w / t,
+			100.0 * (double) dup.down_in / dw, 100.0 * (double) dup.down_framed / dw,
+			100.0 * (double) (dup.down_w - dup.down_in - dup.down_framed) / dw); }
 	}
 	for (k = 0; k < ng && k < 6; ++k) {
 		printf ("[wasm-jit b4]   group %d: %d members, heat %llu:", k, g [k].n, (unsigned long long) hot [k]);

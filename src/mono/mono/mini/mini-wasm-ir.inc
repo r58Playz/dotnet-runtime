@@ -3336,6 +3336,7 @@ typedef struct _WjBody {
 	int            eh_tpool;
 	WjEdge        *edges;         /* plan B4: owned, nedges entries; NULL unless recorded (tier 2, MONO_WASM_JIT_B4) */
 	guint32        nedges;
+	guint8         t1down;        /* R451: a downgrade recompile's body (MonoCompile.wasm_jit_t1_down), for B4's census */
 } WjBody;
 
 static int
