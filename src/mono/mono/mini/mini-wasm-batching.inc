@@ -852,6 +852,7 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 		/* The old generation is still in this worker's slots -- instantiate_batch_local installs nothing
 		 * on failure -- so declining here really does leave the members exactly as they were. */
 		printf ("WASM_JIT_REBATCH_FAIL members=%d bytes=%u : %s\n", n, (unsigned) out.len, eb);
+		{ extern void mono_wasm_jit_bytes_forget (const void *bytes); mono_wasm_jit_bytes_forget (cached); }   /* R462 */
 		g_free (cached);
 		wasm_buf_free (&out);
 		goto done;
@@ -1375,12 +1376,18 @@ wj_b4_hot (int desc, gboolean take)
 	return d > 0 ? d : 0;
 }
 
+static WjB4Group *wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nest, guint64 *out_total,
+                                       guint64 *out_inside, gboolean take, guint64 **out_hot, WjB4Dup *dup);
+
 static WjB4Group *
 wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nest, guint64 *out_total, guint64 *out_inside,
                  gboolean take, guint64 **out_hot, WjB4Dup *dup)
 {
-	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_anchor;
-	GArray *edges = g_array_new (FALSE, FALSE, sizeof (WjB4Edge));
+	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_anchor, mono_wasm_jit_b4_hot;
+	GArray *edges;
+	if (mono_wasm_jit_b4_hot > 0)
+		return wj_b4_hot_partition (out_ngroups, out_ndesc, out_nedges, out_nest, out_total, out_inside, take, out_hot, dup);
+	edges = g_array_new (FALSE, FALSE, sizeof (WjB4Edge));
 	gint32 *par, *sz, *by, *slot, *mx;
 	guint64 total = 0, inside = 0, *gw;
 	int n, i, k, cap, ndesc = 0, nest = 0, ngroups = 0;
@@ -1624,6 +1631,179 @@ wj_b4_cand_cmp (gconstpointer x, gconstpointer y)
 {
 	guint64 a = ((const WjB4Cand *) x)->w, b = ((const WjB4Cand *) y)->w;
 	return a < b ? 1 : a > b ? -1 : 0;
+}
+
+/* MONO_WASM_JIT_B4_HOT (plan typed-spindle P2): the hot-set partition. Every live body's heat (its samples since the
+ * previous TAKEN plan -- every snapshot advances, so the delayed plan ranks by recent heat); the B4_HOT hottest under the
+ * anchor bound; their mutual edges joined by weight under B4_MAX / B4_BYTES (the anchor rule, as the edge partition);
+ * then the clusters, hottest first, first-fit packed into groups under the same bounds. One-shot: once a TAKEN plan past
+ * the delay formed groups, later plans form none. A member already framed (compile-time co-location) is kept: B4_MERGE=1
+ * makes the framer absorb its siblings. Caller holds the registry read bracket. */
+static gboolean wj_b4_hot_done;
+
+static WjB4Group *
+wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nest, guint64 *out_total, guint64 *out_inside,
+                     gboolean take, guint64 **out_hot, WjB4Dup *dup)
+{
+	extern int mono_wasm_jit_b4_hot, mono_wasm_jit_b4_hot_delay, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes,
+	           mono_wasm_jit_b4_anchor;
+	extern gint64 mono_wasm_jit_start_ms;
+	int n = wj_reg_n, i, k, nc = 0, nh, cap, ngroups = 0, nedges = 0, gi;
+	guint64 total = 0, inside = 0, allheat = 0, setheat = 0;
+	gint32 *heat = g_new0 (gint32, n + 1), *par = NULL, *sz = NULL, *by = NULL, *mx = NULL, *ingrp = NULL;
+	WjB4Cand *c = g_new (WjB4Cand, n + 1), *cl = NULL;
+	gint32 *gsz = NULL, *gby = NULL, *gmx = NULL;
+	guint64 *gheat = NULL;
+	WjB4Group *groups = NULL;
+	gboolean due = !wj_b4_hot_done &&
+		mono_msec_ticks () - mono_wasm_jit_start_ms >= (gint64) mono_wasm_jit_b4_hot_delay * 1000;
+
+	if (dup)
+		memset (dup, 0, sizeof (*dup));
+	cap = mono_wasm_jit_b4_max < 2 ? 2 : MIN (mono_wasm_jit_b4_max, WJ_BATCH_MAX);
+	for (i = 1; i <= n; ++i) {
+		WjRegEntry *re = wj_reg_at (i - 1);
+		gint32 h = wj_b4_hot (i, take);
+		if (!re || !re->body || re->e <= 0 || re->f <= 0 || wj_desc_for_fslot (re->f) != i || h <= 0)
+			continue;
+		allheat += (guint64) h;
+		if (wj_b4_size (re) > mono_wasm_jit_b4_anchor)
+			continue;
+		heat [i] = h;
+		c [nc].desc = i; c [nc].len = wj_b4_size (re); c [nc].w = (guint64) h; nc++;
+	}
+	if (!due || nc < 2)
+		goto empty;
+	qsort (c, nc, sizeof (WjB4Cand), wj_b4_cand_cmp);
+	nh = MIN (nc, mono_wasm_jit_b4_hot);
+	/* the set: heat [] keeps only its members (non-members zeroed), so an edge joins two members iff both are non-zero */
+	{
+		gint32 *keep = g_new0 (gint32, n + 1);
+		for (k = 0; k < nh; ++k) { keep [c [k].desc] = heat [c [k].desc]; setheat += c [k].w; }
+		g_free (heat);
+		heat = keep;
+	}
+	par = g_new (gint32, n + 1); sz = g_new (gint32, n + 1); by = g_new (gint32, n + 1); mx = g_new (gint32, n + 1);
+	for (i = 0; i <= n; ++i) {
+		WjRegEntry *re = i > 0 ? wj_reg_at (i - 1) : NULL;
+		par [i] = i; sz [i] = 1; by [i] = mx [i] = wj_b4_size (re);
+	}
+	{
+		GArray *edges = g_array_new (FALSE, FALSE, sizeof (WjB4Edge));
+		for (k = 0; k < nh; ++k) {
+			WjRegEntry *re = wj_reg_at (c [k].desc - 1);
+			int e2;
+			for (e2 = 0; re && re->body && e2 < (int) re->body->nedges; ++e2) {
+				WjEdge *ed = &re->body->edges [e2];
+				int d = wj_desc_for_fslot (ed->fslot);
+				guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+				WjB4Edge e;
+				if (d <= 0 || d > n || d == c [k].desc || !heat [d] || w == 0)
+					continue;
+				e.a = c [k].desc; e.b = d; e.w = w; e.est = ed->est ? 1 : 0;
+				g_array_append_val (edges, e);
+				total += w;
+			}
+		}
+		qsort (edges->data, edges->len, sizeof (WjB4Edge), wj_b4_cmp);
+		for (k = 0; k < (int) edges->len; ++k) {
+			WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
+			gint32 ra = wj_b4_find (par, e->a), rb = wj_b4_find (par, e->b), m;
+			if (ra == rb || sz [ra] + sz [rb] > cap)
+				continue;
+			m = MAX (mx [ra], mx [rb]);
+			if (by [ra] + by [rb] - m > mono_wasm_jit_b4_bytes)
+				continue;
+			if (sz [ra] < sz [rb]) { gint32 t = ra; ra = rb; rb = t; }
+			par [rb] = ra; sz [ra] += sz [rb]; by [ra] += by [rb]; mx [ra] = m;
+		}
+		nedges = (int) edges->len;
+		g_array_free (edges, TRUE);
+	}
+	/* the clusters (union-find roots inside the set), hottest first, each first-fit into a group */
+	cl = g_new0 (WjB4Cand, nh);
+	{
+		int ncl = 0;
+		gint32 *slot = g_new (gint32, n + 1);
+		for (i = 0; i <= n; ++i) slot [i] = -1;
+		for (k = 0; k < nh; ++k) {
+			gint32 r = wj_b4_find (par, c [k].desc);
+			if (slot [r] < 0) { slot [r] = ncl; cl [ncl].desc = r; cl [ncl].len = 0; cl [ncl].w = 0; ncl++; }
+			cl [slot [r]].w += c [k].w;
+		}
+		qsort (cl, ncl, sizeof (WjB4Cand), wj_b4_cand_cmp);
+		ingrp = g_new (gint32, n + 1);   /* cluster root -> group index */
+		for (i = 0; i <= n; ++i) ingrp [i] = -1;
+		gsz = g_new0 (gint32, ncl); gby = g_new0 (gint32, ncl); gmx = g_new0 (gint32, ncl); gheat = g_new0 (guint64, ncl);
+		for (k = 0; k < ncl; ++k) {
+			gint32 r = cl [k].desc;
+			for (gi = 0; gi < ngroups; ++gi) {
+				int m = MAX (gmx [gi], mx [r]);
+				if (gsz [gi] + sz [r] <= cap && gby [gi] + by [r] - m <= mono_wasm_jit_b4_bytes)
+					break;
+			}
+			if (gi == ngroups)
+				ngroups++;
+			ingrp [r] = gi;
+			gsz [gi] += sz [r]; gby [gi] += by [r]; gmx [gi] = MAX (gmx [gi], mx [r]); gheat [gi] += cl [k].w;
+		}
+		g_free (slot);
+	}
+	/* groups of one member are dropped (a module of one is what every body already is) */
+	{
+		gint32 *remap = g_new (gint32, ngroups ? ngroups : 1);
+		int out = 0;
+		for (gi = 0; gi < ngroups; ++gi)
+			remap [gi] = gsz [gi] >= 2 ? out++ : -1;
+		groups = g_new0 (WjB4Group, out ? out : 1);
+		*out_hot = g_new0 (guint64, out ? out : 1);
+		for (gi = 0; gi < ngroups; ++gi)
+			if (remap [gi] >= 0) {
+				groups [remap [gi]].desc = g_new (gint32, gsz [gi]);
+				(*out_hot) [remap [gi]] = gheat [gi];
+			}
+		for (k = 0; k < nh; ++k) {
+			gint32 g2 = remap [ingrp [wj_b4_find (par, c [k].desc)]];
+			if (g2 >= 0)
+				groups [g2].desc [groups [g2].n++] = c [k].desc;
+		}
+		/* internal weight: edges whose both ends landed in one emitted group */
+		for (k = 0; k < nh; ++k) {
+			WjRegEntry *re = wj_reg_at (c [k].desc - 1);
+			gint32 ga = remap [ingrp [wj_b4_find (par, c [k].desc)]];
+			int e2;
+			for (e2 = 0; ga >= 0 && re && re->body && e2 < (int) re->body->nedges; ++e2) {
+				WjEdge *ed = &re->body->edges [e2];
+				int d = wj_desc_for_fslot (ed->fslot);
+				guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+				if (d > 0 && d <= n && d != c [k].desc && heat [d] && w &&
+				    remap [ingrp [wj_b4_find (par, d)]] == ga)
+					inside += w;
+			}
+		}
+		g_free (remap);
+		ngroups = out;
+	}
+	if (take && ngroups > 0) {
+		int nm = 0;
+		wj_b4_hot_done = TRUE;
+		for (gi = 0; gi < ngroups; ++gi)
+			nm += groups [gi].n;
+		printf ("[wasm-jit b4] hot plan (B4_HOT=%d, at %llds): bodies with heat=%d, set=%d carrying %.1f%% of the heat, "
+			"groups=%d members=%d, edges in the set=%d, internal %.1f%% of their weight (cap %d members / %d body bytes)\n",
+			mono_wasm_jit_b4_hot, (long long) ((mono_msec_ticks () - mono_wasm_jit_start_ms) / 1000), nc, nh,
+			allheat ? 100.0 * (double) setheat / (double) allheat : 0.0, ngroups, nm, nedges,
+			total ? 100.0 * (double) inside / (double) total : 0.0, cap, mono_wasm_jit_b4_bytes);
+	}
+	*out_ngroups = ngroups; *out_ndesc = nh; *out_nedges = nedges; *out_nest = 0; *out_total = total; *out_inside = inside;
+	g_free (heat); g_free (c); g_free (cl); g_free (par); g_free (sz); g_free (by); g_free (mx); g_free (ingrp);
+	g_free (gsz); g_free (gby); g_free (gmx); g_free (gheat);
+	return groups;
+empty:
+	*out_ngroups = 0; *out_ndesc = nc; *out_nedges = 0; *out_nest = 0; *out_total = 0; *out_inside = 0;
+	*out_hot = g_new0 (guint64, 1);
+	g_free (heat); g_free (c);
+	return g_new0 (WjB4Group, 1);
 }
 
 void mono_wasm_jit_b4_copy_invalidate (int fslot);

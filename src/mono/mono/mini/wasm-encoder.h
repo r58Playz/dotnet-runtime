@@ -507,6 +507,11 @@ typedef struct {
 /* A lazy stub bank (MONO_WASM_JIT_LAZY_T1): k stubs of functype ft at table slots f_slots[], see wasm-encoder.c.
  * helper_idx = table indices of bind, scratch, interp, continue_unwind. */
 void wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, const guint32 *helper_idx, WasmBuf *out);
+/* plan typed-spindle C1: the shared slow path of a compact virtual call site (wasm-encoder-vslow.inc) */
+void wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint32 *helper_idx, WasmBuf *out);
+
+/* R460: the "wj.origin" section bytes the last wasm_module_assemble on this thread wrote (0 = none) */
+extern __thread guint32 wasm_last_origin_section_len;
 
 void wasm_module_assemble (
 	const WasmAsmMember *members, guint32 nmembers, guint32 nexport,

@@ -651,6 +651,13 @@ mono_interp_get_imethod (MonoMethod *method)
 		/* A live method at this address: clear any freed-method mark a recycled address still carries. */
 		extern void mono_wasm_jit_note_method_live (MonoMethod *method);
 		mono_wasm_jit_note_method_live (method);
+		/* plan typed-spindle J1: a method on the consumer's eager list (MONO_WASM_JIT_EAGER_LIST -- the methods it
+		 * took off AOT) starts one hit short of the threshold, so wasm_jit_maybe_compile's `== thresh` gate fires on
+		 * its FIRST call: tier 1 at once, no interpreted phase. Everything after that is the ordinary path. */
+		extern int mono_wasm_jit_eager_n, mono_wasm_jit_thresh;
+		extern gboolean mono_wasm_jit_eager_match (MonoMethod *method);
+		if (G_UNLIKELY (mono_wasm_jit_eager_n) && mono_wasm_jit_thresh > 1 && mono_wasm_jit_eager_match (method))
+			imethod->wasm_jit_hits = mono_wasm_jit_thresh - 1;
 	}
 #endif
 	imethod->param_count = sig->param_count;
@@ -3532,6 +3539,9 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 			 * So without this free the buffer is unreachable, and the retry below produces another one:
 			 * one leaked module per attempt, at compile-safepoint rate. V8 leaks harder than we do here,
 			 * since each attempt also mints a NativeModule + Instance kept alive by the table entry. */
+#if HOST_BROWSER
+			{ extern void mono_wasm_jit_bytes_forget (const void *bytes); mono_wasm_jit_bytes_forget (r.bytes); }   /* R462 */
+#endif
 			g_free (r.bytes);
 			r.bytes = NULL;
 			r.bytes_len = 0;
@@ -3540,6 +3550,9 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 			r.retriable = 1;
 			mono_wasm_jit_counters [WJC_REEMIT_REFRAME_FAIL]++;
 		} else if (br > 0) {
+#if HOST_BROWSER
+			{ extern void mono_wasm_jit_bytes_forget (const void *bytes); mono_wasm_jit_bytes_forget (r.bytes); }   /* R462 */
+#endif
 			g_free (r.bytes); /* WebAssembly.Module consumed the temporary standalone bytes synchronously. */
 			r.bytes = batch_bytes;
 			r.bytes_len = batch_len;
@@ -8068,6 +8081,51 @@ wj_vcall_memo_at (gpointer ic, MonoVTable *vt)
 		wj_vcall_memo = (WjVcallMemo *) g_malloc0 (sizeof (WjVcallMemo) << WJ_VCALL_MEMO_BITS);
 	return &wj_vcall_memo [h >> (32 - WJ_VCALL_MEMO_BITS)];
 }
+
+#if HOST_BROWSER
+/* plan typed-spindle C1: a COMPACT virtual call site's way-0 miss, entered from its shared slow-path stub
+ * (mini-wasm-vslow.inc, wasm-encoder-vslow.inc). The site no longer emits method identity or ways 1..N, so they are
+ * answered here, from the same worker PIC entries the inline code read, before the full resolve. Same layout contract
+ * as mini-wasm-vslow.inc's WjVslowDesc. Returns an f-slot admitted on THIS worker (what the PIC holds is admitted by
+ * construction, wj_vcall_pic_publish), or what mono_wasm_jit_vcall_resolve_fslot returns: 0 with the target at
+ * scratch+200 for the AOT / interpreter routes. */
+typedef struct {
+	gpointer vic;
+	gpointer aic;
+	MonoMethod *base;
+	gint32 site;
+	gint32 ways;
+	gint32 mid_slot;
+	gint32 pad [2];
+} WjVslowDescI;
+
+int mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic);
+
+int
+mono_wasm_jit_vslow_resolve (MonoObject *this_obj, gpointer desc, guint8 *scratch)
+{
+	WjVslowDescI *d = (WjVslowDescI *) desc;
+	if (G_LIKELY (this_obj) && d->site >= 0 && d->site < wj_vcall_pic_cap && d->ways > 0) {
+		extern int mono_wasm_jit_ic_mid;
+		MonoVTable *vt = this_obj->vtable;
+		WjLocalVcallPicEntry *e = wj_vcall_pic + (gsize) d->site * (gsize) d->ways;
+		guint32 f0;
+		int k;
+		for (k = 0; k < d->ways; ++k) {
+			guint64 c = e [k].key_fslot;
+			if ((guint32) c == (guint32) (gsize) vt && (guint32) (c >> 32))
+				return (int) (guint32) (c >> 32);
+		}
+		/* R311 method identity: another class holding way 0's method in this slot is the same method, and way 0's
+		 * f-slot is already admitted here. A zero f-slot (an empty entry) falls through to the resolver. */
+		f0 = (guint32) (e [0].key_fslot >> 32);
+		if (d->mid_slot >= 0 && mono_wasm_jit_ic_mid && f0 && e [0].target &&
+		    m_class_get_vtable (vt->klass) [d->mid_slot] == e [0].target)
+			return (int) f0;
+	}
+	return mono_wasm_jit_vcall_resolve_fslot (this_obj, d->base, scratch, d->vic);
+}
+#endif
 
 int
 mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic)
