@@ -610,7 +610,7 @@ wj_module_export_count (const guint8 *p, guint32 len)
 }
 
 static volatile gint64 wj_b4_copy_framed, wj_b4_copy_bytes, wj_b4_copy_inval, wj_b4_copy_stale, wj_b4_copy_refull,
-	wj_b4_copy_exportfail, wj_b4_copy_dropped;
+	wj_b4_copy_exportfail, wj_b4_copy_dropped, wj_b4_copy_depchecked, wj_b4_copy_undeclared;
 typedef struct { gint32 fslot; gint32 *guard; } WjB4CopyRef;
 #define WJ_B4_COPYREF_MAX (1 << 16)
 static WjB4CopyRef *volatile wj_b4_copyref;
@@ -820,6 +820,24 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 			wj_b4_copy_exportfail++;
 			wasm_buf_free (&out);
 			goto done;
+		}
+		/* R453: the publish-time form of the depcheck gate. Each copy's slot is what a set guard falls back to, so it
+		 * must be in the depsets batch_bind is about to publish (members 0..n-1 -- admission walks only their union),
+		 * or the fallback lands on whatever this worker's table holds there. True by construction (the resolver
+		 * records it at every call into a copy); refused, not trusted, if it ever is not. */
+		for (c = n; c < n + nc; ++c) {
+			int m, found = 0;
+			for (m = 0; m < n && !found; ++m)
+				for (d = 0; d < wj_batch_deps [m].n && !found; ++d)
+					found = wj_batch_deps [m].slot [d] == members [c].f_slot;
+			wj_b4_copy_depchecked++;
+			if (!found) {
+				if (wj_b4_copy_undeclared++ < 10)
+					printf ("WASM_JIT_B4_COPY_UNDECLARED copy=%s slot=%d (no member's depset names it; group refused)\n",
+						members [c].name ? members [c].name : "?", members [c].f_slot);
+				wasm_buf_free (&out);
+				goto done;
+			}
 		}
 	}
 	{ extern int mono_wasm_jit_capture;
@@ -1546,11 +1564,11 @@ mono_wasm_jit_b4_plan (void)
 			100.0 * (double) (dup.down_w - dup.down_in - dup.down_framed) / dw); }
 		{ extern int mono_wasm_jit_b4_copy, mono_wasm_jit_b4_copy_bytes, mono_wasm_jit_b4_copy_max;
 		  printf ("[wasm-jit b4] leaf copies (B4_COPY=%d B, %d B / %d per group): framed=%lld bytes=%lld refs=%d "
-			"invalidated=%lld stale=%lld dropped=%lld refull=%lld exportfail=%lld\n", mono_wasm_jit_b4_copy,
+			"invalidated=%lld stale=%lld dropped=%lld refull=%lld exportfail=%lld depchecked=%lld undeclared=%lld\n", mono_wasm_jit_b4_copy,
 			mono_wasm_jit_b4_copy_bytes, mono_wasm_jit_b4_copy_max, (long long) wj_b4_copy_framed,
 			(long long) wj_b4_copy_bytes, (int) wj_b4_ncopyref, (long long) wj_b4_copy_inval,
 			(long long) wj_b4_copy_stale, (long long) wj_b4_copy_dropped, (long long) wj_b4_copy_refull,
-			(long long) wj_b4_copy_exportfail); }
+			(long long) wj_b4_copy_exportfail, (long long) wj_b4_copy_depchecked, (long long) wj_b4_copy_undeclared); }
 		printf ("[wasm-jit b4] asm: co-member calls kept indirect on a functype mismatch=%lld | local through another slot=%lld\n",
 			(long long) wj_asm_member_type_mismatch, (long long) wj_asm_member_other_slot);
 	}
