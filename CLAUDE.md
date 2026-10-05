@@ -873,6 +873,11 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
   performance result. A whole session was once run against a dead JIT tier.
 * **Measure the mechanism before the outcome.** A tier dump or a `hotinsn.py` run takes minutes and says
   whether a change did what it was supposed to; an fps A/B takes hours and says only whether the number moved.
+* **Pin every arm of a comparison the same way (`MC_TASKSET`), and never compare across batches that differ in it.**
+  Chromium counts CPUs through `sched_getaffinity` (`base/system/sys_info_posix.cc:157-159`) and sizes its thread pool
+  at max(3, CPUs - 1) (`base/task/thread_pool/thread_pool_instance.cc:94`), so the pin changes the renderer's thread
+  count (55-57 pinned to 8 CPUs, 63-64 unpinned), its stack reservations and its concurrent compile zones -- i.e. peak
+  VmData. R449 compared unpinned arms against a pinned base and first blamed desktop load. Run the base in the SAME batch.
 * **Prefer a within-binary knob A/B to a cross-binary comparison.** A cross-binary reading at this spread
   cannot support a 4% claim however tidy the mechanism sounds.
 * **Count ABSOLUTE quantities, not shares of a moving denominator.** Every mechanism in the direct-call path
@@ -1111,8 +1116,9 @@ jitdumps ~4 GB; keep the newest of each kind and delete the rest. Do not commit 
 run.** Nothing used to remove them: 100 stale maps = 4.9 GiB left 2.7 G free, and runs then died at PAGE
 LOAD — before any app code — so it read as a browser bug or a flaky deploy, and two arms were nearly
 blamed on the change under test (R280f). Now handled at three levels, and all three are needed:
-`runSession` drops its own renderer's map at teardown (before `game.kill()`, so the pid still resolves)
-unless a spin capture needs it; `scratchpad/wj/reap.sh` sweeps dead-pid maps, orphaned profiles and v8
+`runSession` drops the maps of every process under its profile at teardown (before `game.kill()`, so the pids still
+resolve; the renderer alone used to be dropped, and its small siblings' maps leaked 340 files in a day) unless a spin
+capture needs them; `scratchpad/wj/reap.sh` sweeps dead-pid maps, orphaned profiles and v8
 isolate logs, and **REFUSES TO RUN if `scratchpad/mcsr/seed` is missing**; and `preflight` gates on
 ABSOLUTE free bytes in `/tmp`, not a percentage — R280f happened at 64% full, under the old 70% threshold.
 
@@ -1121,6 +1127,13 @@ from two directions (jitdumps at ~4 GB, symbol maps at ~240 MB), and turning on 
 default took `/tmp` from 62 MB to 741 MB in three runs before the teardown fix. Anything written per run
 into a RAM-backed filesystem needs an owner at teardown, not a periodic sweep — a sweep only helps if
 someone remembers, and the failure it prevents does not look like a disk problem.
+
+**`--perf-basic-prof` and `--perf-prof` imply `--log`** (`v8/src/flags/flag-definitions.h:4516-4517`), and V8's
+default per-isolate log file then drops an `isolate-<addr>-<pid>-v8.log` per isolate (~64 per run) into the
+browser's CWD -- 8,103 had piled up in `scratchpad/wj`, more in the repo root. Every launcher now passes
+`--no-logfile-per-isolate --logfile=+` (`lib/mcdrive.mjs` `launchGame`, `j2d/run.mjs`, `perfrun.mjs`): `+` is an
+already-unlinked `tmpfile()`, and the perf map / jitdump are separate listeners, unaffected. **A new launcher that
+passes either perf flag must pass the pair too.**
 
 **Browser profiles:** ~1 GB per run, reflink-copied from the seed. `reapProfile` drops them on a clean
 run and **KEEPS them on a failure**, where they hold the OPFS save and the crash-time state and are the
