@@ -586,6 +586,16 @@ being in a browser costs a good wasm compiler ~1.02x. Both of those explanations
 
 ## Where the time actually goes (in-game plateau, ~25 fps / 40 ms)
 
+**The server tick's cycle gap IS its instruction gap (R458, stall census on both JVMs, four GP events per group, no
+multiplexing).** 68.7 M cycles / 52.7 M instructions per tick against JDK 8's 13.0 / 10.4: 5.30x and 5.04x, IPC 0.767 vs
+0.806. **Per instruction our BACK END stalls like HotSpot's** (execution stalls 0.855 vs 0.882, L3-pending 0.508 vs
+0.653 -- HotSpot's tick is memory-bound too); **our FRONT END is 1.6-2.5x worse per instruction** (icache data/tag stalls,
+iTLB walks, and BACLEARS 21x per tick -- BTB misses; machine clears and SMC are ~0). The front-end tax follows CODE
+VOLUME, not placement: C1's byte cut took 6-10% off it (R459), packing the whole hot set into 28 modules took nothing
+(R463). And the same body loads cost 2.5x HotSpot's cycles each (R461: 30.5 k L3 misses per tick in field loads alone,
+more than HotSpot's whole tick), with allocation only <= 1.8x HotSpot's bytes (R465). So ~3x needs ~40% fewer executed
+instructions, or the front-end tax and the load latency attacked directly -- not cheaper instructions.
+
 * **57.03%** of the window is code this emitter generates; 30.83% "AOT image"; ~1.8% V8; 12.14% outside
   JIT-emitted code (chromium, GL emulation, kernel). Measured, `perf-imp`, 126,498 ingame samples.
 * **The "AOT image" bucket is NOT one thing and is not immovable.** Split over its 1,710 symbols: AOT-compiled
@@ -723,6 +733,7 @@ with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A
 | module batching **as it was originally built** | measured negative four times (-26.6%, -35.7%, -13.0%, regression) for two mechanical reasons, and BOTH are now gone: producing a batched body cost a full `mini_method_compile` per member (bodies are now relocatable and re-framing is a memcpy), and the planner planned a plateau ONCE, on a quiescence this workload never reaches. Do not re-run the OLD arms or re-tune `batch_max`/`batch_bytes` (measured non-binding). **Co-location is UNCONDITIONAL** — R245 verified there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no variable behind it, so the `=1`/`=0` arms this file used to describe are not performable. Same for `MONO_WASM_JIT_SCC_COLOCATE`, which several comments still offer as an in-binary A/B. `COLOCATE_MERGE` and `COLOCATE_MAX` are real |
 | **raising co-location's STATIC capture** | **R258's CLOSURE IS RETRACTED (R269) -- the measurement stands, the conclusion does not.** R258 read the tick at **-1.2% against a control arm whose own spread was 5.0%**, i.e. it could not have resolved its own lever: sized independently, converting the ~27.4% of dispatch that is a devirt arm still going indirect is worth **~2.5-3.7 M/tick = 1.5-2.2% of the thread**, under half that spread. CLAUDE.md's own rule -- under ~12%, measure the MECHANISM, not the outcome -- was not applied to R258 itself. **And co-location is NOT independent of re-emission**: `WASM_RELOC_CALL` is only emitted when the callee already has an f-slot, so only re-emission creates the holes co-location fills (REEMIT=0 -> 1 measured **+1,077 devirt arms, +1,258 absolute module-local calls**). Never A/B the two separately again. The original R258 text follows, still true as measurement: **CLOSED ON OUTCOME (R258)** `MONO_WASM_JIT_COLOCATE_MERGE=1` moved captured call edges **32.4% -> 44.2%** and `callform local` **+126%** -- and the server tick did not move: OFF mean 167.0 (spread 8.4 = 5.0%), ON mean 165.1, a difference of **-1.2%, one quarter of the control arm's own spread**. The reason is that execution-weighted co-residency only went **4.47% -> 6.53%**, and 2.1 points against a ~5% IC-miss share of dispatch is ~0.1% of dispatch. Ships 0. **Static capture is not the binding constraint; execution weight is.** If this is revisited the target is a profile-weighted global partitioner -- `partreach.py` puts the cap-16 ceiling at 96.4% and a global agglomerative partition at 51.5% of the residual, and an offline seed-and-grow reaches 79% of call edges internal at 16 members, 85.5% execution-weighted |
 | **co-location as a route to "most dispatch is a direct call"** | CLOSED ON STRUCTURE (R195). The reachable set is only the devirt predicted arms — both `WASM_RELOC_CALL` sites are gated on the callee already having an f-slot, so a callee un-JITted at emit time has NO hole and only RE-EMISSION can convert it. Arm-local plateaus ~30% because **co-location is a PARTITION and the arm graph is not partitionable**: if two callers hold arms on the same target, only one can have it co-resident. Proof it is the partition and not tuning: surviving refusals are **100% caps, 0 rules**, and doubling `COLOCATE_MAX` bought **+1.5 points**. `max=64`+`bytes=131072` also CRASHES (undiagnosed); `max=32` is clean. The mechanism that bypasses a partition is DUPLICATION — shadow copies |
+| **hot-set consolidation (`MONO_WASM_JIT_B4_HOT`, plan P2's ceiling)** | **CLOSED (R463).** The 600 hottest live bodies (98.2% of the plateau's heat, tier 1 and tier 2) framed into 28 modules ~130 s after join, 0 refused: cycles -0.2%, instructions +1.1%, icache/iTLB/BACLEARS per instruction flat (pooled, 13 arms). Neither the partition (R195/R258) nor the PLACEMENT binds: the front-end tax is code volume. The knob stays as the instrument |
 | **SCC co-location as a source of reach** | 7 modules / 24 members per boot against a ~24,000-method tier. Cycles are rare on this workload. It was kept as a correctness mechanism until R366 deleted it with the islands: a lazy pool slot lets cycle members bake each other's f-slot before either exists, so nothing needs ordering. Never a performance lever |
 | shadow copies — cap sweeps (`WJ_SHADOW_MAX`, `MONO_WASM_JIT_SHADOW_BYTES`) | **CLOSED after ranking, R201/R202.** SELECTION ORDER was the real variable: ranking candidates by **sites/bytes descending** gives 63.7% arm-local with 2.8% FEWER bodies than encounter order at identical caps. After that, raising the caps drove `ShadowCap` to 0 and conversion did **not** move — with ranked selection the candidate SUPPLY is exhausted. **A cap closed as "non-binding" is closed only for the population it was measured on** — an earlier sweep saw 169 shadows where the current stack has 23,202, and its closure had to be retracted. Ships `MONO_WASM_JIT_SHADOW=0`; plateau is ~63% arm-local ≈ ~54% of executed dispatch direct, at **+50% bodies**, and the timing cost of that is still unpriced |
 | `shadowNojit` as evidence about the AOT wall | the counter is a TAUTOLOGY: shadow collection walks `WASM_RELOC_CALL`, which only ever names an already-JITted callee, so `nojit` cannot fire. AOT callees emit `WASM_RELOC_AOT` and are never candidates |
@@ -906,6 +917,11 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
   action live in different functions or `if` arms, count both and assert they are equal.
 * **A diagnostic behind a default-off knob is not evidence of absence**, and "every error counter is zero" is
   a statement about the counters you have, not about the run.
+* **A diagnostic that rides in the module can change what the module IS (R460).** `MONO_WASM_JIT_ORIGIN`'s `wj.origin`
+  section was ~half of a giant's module and the tier-2 cap (T2_MAX_BODY) measured the whole module, so every ORIGIN run
+  -- capture gates AND ledger mapping runs -- refused tier-2 bodies a normal run admits (LivingEntity.travel, 76 KB of
+  function, read "down"). Fixed: the cap subtracts `wasm_last_origin_section_len`. Mapping runs before the fix have a
+  more tier-1-heavy population than the runs they explain.
 * **Verify a tool's classifier before trusting its output.** Five classifier bugs of the same shape have
   shipped here: a `scriptId === 0` clause that reported our tier as 2.80% of the window when it is ~60%; a
   category ordering that classified `call *0x18(%rbx)` as a memory access and reported dispatch as 0.0%; a
@@ -991,6 +1007,16 @@ ONE L1 miss, touching exactly two data addresses: dlmalloc's walk advances by ea
 whose size reads 0 is walked forever -- holding dlmalloc's global lock, which is why every allocating worker then sits in
 `__futex_wait` and the app goes quiet. So the hang is a DETECTOR: the real bug is whatever zeroes a malloc chunk header.
 Stopping the poll removes the hang; finding the corruption is separate. The paragraph below predates this.
+
+**With the poll gone the corruption surfaces as MODULE BYTES that change after validation (R462, R464).** A group module
+("memory index exceeds number of declared memories") and a lazy bank ("invalid value type 0xb9") failed V8 validation
+on bytes another worker had validated -- new fault texts, ~2 of 45 runs on 2026-10-05. `MONO_WASM_JIT_BYTES_CHECK=1`
+(block hashes at first instantiation, re-checked at every later one, `WASM_JIT_BYTES_CHANGED` + the 16 bytes before the
+buffer; `[wasm-jit bytes] changed` MUST be 0) is the instrument. Its first two versions reported RECYCLED addresses --
+never-published buffers (refused registrations, invalid modules, failed groups, batched re-emits' standalone bytes) are
+freed after their validating instantiation, and the next buffer at that address read as "changed"; R464's "live lazy
+bank handed out twice" was exactly that shape and is NOT established. The third version forgets those six frees and
+re-records an address whose length or producer kind changed; only a report on a matching kind and length is evidence.
 
 **Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
 The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
