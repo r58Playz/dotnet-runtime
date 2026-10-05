@@ -3735,6 +3735,27 @@ wj_reloc_fixed_importable (WasmRelocKind k)
 	return k == WASM_RELOC_HELPER || k == WASM_RELOC_AOT;
 }
 
+/* R451: a co-member is matched to a call site by MonoMethod (wj_asm_member_of), but the site baked an f-slot and a
+ * functype of its own. One run of B4_DOWN framed a group in which a member's call to a co-member passed two more
+ * arguments than that member's function takes -- `call <funcidx>` then left them on the stack and V8 rejected the
+ * module (CompileError, contained: WASM_JIT_REBATCH_FAIL, never published). A call becomes module-local only when the
+ * member's function type IS the site's functype; otherwise it stays `call_indirect` through the slot the site baked,
+ * exactly as the standalone body ran. Counted: a type mismatch (now kept indirect), and a match through a different
+ * slot than the member's own (types equal, so still local -- the diagnostic for how a site reaches a co-member). */
+static volatile gint64 wj_asm_member_type_mismatch, wj_asm_member_other_slot;
+
+static gboolean
+wj_asm_member_type_eq (const WjAsmMember *m, const WasmFuncType *t)
+{
+	guint32 i;
+	if (m->nparams != t->nparams || m->ret_type != t->ret)
+		return FALSE;
+	for (i = 0; i < t->nparams; ++i)
+		if (m->param_types [i] != t->params [i])
+			return FALSE;
+	return TRUE;
+}
+
 static void
 wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int self_index,
                      const WjAsmMember *mem, int n, const WasmFuncType *self_types,
@@ -3834,6 +3855,16 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 			 * strict import list was the only source of the deferral path, and the deferral path was the
 			 * only way a method could be permanently denied the JIT tier (R160-R162). */
 			member = pol->local_calls ? wj_asm_member_of (mem, n, (MonoMethod *) r->sym) : -1;
+			if (member >= 0 && !wj_asm_member_type_eq (&mem [member], &self_types [r->tpool])) {
+				if (wj_asm_member_type_mismatch++ < 10)
+					printf ("WASM_JIT_MEMBER_TYPE_MISMATCH caller=%s callee=%s site_slot=%d member_slot=%d site_params=%u member_params=%u\n",
+						(self_index >= 0 && mem [self_index].name) ? mem [self_index].name : "?",
+						mem [member].name ? mem [member].name : "?", (int) r->table_index, mem [member].f_slot,
+						self_types [r->tpool].nparams, mem [member].nparams);
+				member = -1;   /* the site's own slot and functype, i.e. call_indirect */
+			} else if (member >= 0 && mem [member].f_slot != (int) r->table_index) {
+				wj_asm_member_other_slot++;
+			}
 			/* Self-recursion keeps the form it has always had unless co-location explicitly asked for
 			 * module-local calls. */
 			if (member == self_index && !pol->local_calls)
