@@ -1161,6 +1161,25 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
  * stats dump; B4=2 also frames it (mono_wasm_jit_b4_step), one group per re-emit drainer visit. */
 typedef struct { gint32 a, b; guint32 w; guint8 est; } WjB4Edge;
 typedef struct { gint32 *desc; gint32 n; } WjB4Group;
+/* The duplication census (plan B4 step 5): edge weight from a grouped caller into a callee OUTSIDE its group, by the
+ * callee's own f-body size -- <= 500 B (V8's wasm_inlining_max_size, flags/flag-definitions.h:2221, so a copy in the
+ * caller's module is inlinable), <= 2 KB, larger -- and what one copy per (group, callee) pair would cost. Weight from
+ * callers in no group is counted apart: a copy has no module to go into there. Dry run only. */
+typedef struct { guint64 w [3], wsolo; gint32 pairs [3]; gint64 bytes [3]; } WjB4Dup;
+
+static int
+wj_b4_u64cmp (gconstpointer x, gconstpointer y)
+{
+	guint64 a = *(const guint64 *) x, b = *(const guint64 *) y;
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static int
+wj_b4_fbytes (gint32 desc)
+{
+	WjRegEntry *re = wj_reg_at (desc - 1);
+	return (re && re->body) ? (int) re->body->f_body.len : 0;
+}
 
 static int
 wj_b4_cmp (gconstpointer x, gconstpointer y)
@@ -1244,7 +1263,7 @@ wj_b4_hot (int desc, gboolean take)
 
 static WjB4Group *
 wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nest, guint64 *out_total, guint64 *out_inside,
-                 gboolean take, guint64 **out_hot)
+                 gboolean take, guint64 **out_hot, WjB4Dup *dup)
 {
 	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_anchor;
 	GArray *edges = g_array_new (FALSE, FALSE, sizeof (WjB4Edge));
@@ -1298,6 +1317,33 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 		WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
 		gint32 ra = wj_b4_find (par, e->a);
 		if (ra == wj_b4_find (par, e->b)) { inside += e->w; gw [ra] += e->w; }
+	}
+	if (dup) {
+		GArray *pairs = g_array_new (FALSE, FALSE, sizeof (guint64));
+		memset (dup, 0, sizeof (*dup));
+		for (k = 0; k < (int) edges->len; ++k) {
+			WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
+			gint32 ra = wj_b4_find (par, e->a), fb;
+			guint64 key;
+			if (ra == wj_b4_find (par, e->b))
+				continue;
+			if (sz [ra] < 2) { dup->wsolo += e->w; continue; }
+			fb = wj_b4_fbytes (e->b);
+			dup->w [fb <= 500 ? 0 : fb <= 2048 ? 1 : 2] += e->w;
+			key = ((guint64) (guint32) ra << 32) | (guint32) e->b;
+			g_array_append_val (pairs, key);
+		}
+		qsort (pairs->data, pairs->len, sizeof (guint64), wj_b4_u64cmp);
+		for (k = 0; k < (int) pairs->len; ++k) {
+			guint64 key = g_array_index (pairs, guint64, k);
+			int fb, bk;
+			if (k > 0 && g_array_index (pairs, guint64, k - 1) == key)
+				continue;
+			fb = wj_b4_fbytes ((gint32) (guint32) key);
+			bk = fb <= 500 ? 0 : fb <= 2048 ? 1 : 2;
+			dup->pairs [bk]++; dup->bytes [bk] += fb;
+		}
+		g_array_free (pairs, TRUE);
 	}
 	/* Each group's HEAT: its members' tier-2-body samples since the previous plan (R446). Groups are ordered by heat (a
 	 * group nobody ran since then has none and is not listed), the internal weight only breaking ties. */
@@ -1359,8 +1405,9 @@ mono_wasm_jit_b4_plan (void)
 	WjB4Group *g;
 	int ng, nd, ne, nest, k, m, nmem = 0;
 	guint64 total, inside, *hot = NULL;
+	WjB4Dup dup;
 	wj_reg_read_enter ();
-	g = wj_b4_partition (&ng, &nd, &ne, &nest, &total, &inside, FALSE, &hot);
+	g = wj_b4_partition (&ng, &nd, &ne, &nest, &total, &inside, FALSE, &hot, &dup);
 	for (k = 0; k < ng; ++k)
 		nmem += g [k].n;
 	printf ("[wasm-jit b4] plan (dry run): bodies with edges=%d edges=%d (entry-estimated %d) weight=%llu | groups=%d "
@@ -1370,6 +1417,14 @@ mono_wasm_jit_b4_plan (void)
 		mono_wasm_jit_b4_bytes, (long long) mono_wasm_jit_counters [WJC_B4_FRAMED], mono_wasm_jit_b4_groups,
 		(long long) mono_wasm_jit_counters [WJC_B4_REFUSED], (long long) mono_wasm_jit_counters [WJC_B4_PUBLISHED],
 		(long long) mono_wasm_jit_counters [WJC_B4_PLANS], mono_wasm_jit_b4_merge, mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor);
+	{
+		double t = total ? (double) total : 1.0;
+		printf ("[wasm-jit b4] dup census: weight from a grouped caller into a callee outside its group: <=500 B %.1f%% "
+			"(%d copies, %lld B) | <=2 KB %.1f%% (%d, %lld B) | larger %.1f%% (%d, %lld B) | from ungrouped callers %.1f%%\n",
+			100.0 * (double) dup.w [0] / t, dup.pairs [0], (long long) dup.bytes [0], 100.0 * (double) dup.w [1] / t, dup.pairs [1],
+			(long long) dup.bytes [1], 100.0 * (double) dup.w [2] / t, dup.pairs [2], (long long) dup.bytes [2],
+			100.0 * (double) dup.wsolo / t);
+	}
 	for (k = 0; k < ng && k < 6; ++k) {
 		printf ("[wasm-jit b4]   group %d: %d members, heat %llu:", k, g [k].n, (unsigned long long) hot [k]);
 		for (m = 0; m < g [k].n && m < 4; ++m) {
@@ -1415,7 +1470,7 @@ mono_wasm_jit_b4_step (void)
 		wj_b4_samples_at = mono_wasm_jit_b4_samples;
 		wj_b4_free (wj_b4_pend, wj_b4_npend);
 		wj_reg_read_enter ();
-		wj_b4_pend = wj_b4_partition (&wj_b4_npend, &nd, &ne, &nest, &total, &inside, TRUE, &hot);
+		wj_b4_pend = wj_b4_partition (&wj_b4_npend, &nd, &ne, &nest, &total, &inside, TRUE, &hot, NULL);
 		wj_reg_read_leave ();
 		g_free (hot);
 		/* the hottest per_plan groups only: the budget is spread over the run, not spent by the first plans */
