@@ -8679,7 +8679,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		} else if (e_slot > 0 && f_slot > 0) {
 			void *cached = g_malloc ((gsize) out.len);
 			guint32 payload = wj_payload_new ();   /* W1 C0: this module, here and in the registry */
-			char ierr [192]; ierr [0] = 0;
+			char ierr [512]; ierr [0] = 0;   /* R470: room for the R459 [h ...] probe after V8's message */
 			memcpy (cached, out.data, out.len);
 			/* Validate by instantiating once on THIS thread (also populates this thread's table).
 			 * If the module is invalid (a codegen bug for some opcode shape), bail to the interpreter

@@ -359,6 +359,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	memcpy (bd->e, e_slots, sizeof (int) * n);
 	memcpy (bd->f, f_slots, sizeof (int) * n);
 	memcpy (bd->desc, desc_ids, sizeof (int) * n);
+	wj_bytes_live_add (bytes);   /* R470: before any member's re->bytes can name it */
 	bd->bytes = bytes;
 	bd->len = len;
 	bd->guard = guard;
@@ -480,7 +481,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			/* No registry entry can acquire this failed generation after rollback.  An
 			 * admission that acquired it before rollback is covered by the registry-reader
 			 * grace period, so the large module blob no longer has to leak forever. */
-			wj_retire_payload (bytes, WJ_RETIRED_BYTES);
+			wj_retire_bytes (bytes, "rebatch-rollback");
 			g_free (saved);
 			/* DO NOT FREE bd OR ITS ARRAYS -- USE AFTER FREE (2026-09-09). `re->batch = bd` was published
 			 * to every worker above, so a worker already inside mono_wasm_jit_admit is holding
@@ -548,7 +549,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 				if (saved [j].bytes == saved [i].bytes)
 					break;
 			if (j == i)
-				wj_retire_payload (saved [i].bytes, WJ_RETIRED_BYTES);
+				wj_retire_bytes (saved [i].bytes, "rebatch-commit");
 		}
 	}
 	g_free (saved);
@@ -632,7 +633,7 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 	guint32 payload = 0;
 	int *e_slots, *f_slots;
 	void *cached;
-	char eb [192];
+	char eb [512];
 	double ms = 0;
 	int i, ok = 0, nc = 0;
 
@@ -922,7 +923,7 @@ wj_reinstall_batch_local (int desc_id)
 	                                                  double *out_ms, guint32 payload);
 	WjRegEntry *re;
 	WjBatchDesc *bd;
-	char eb [192];
+	char eb [512];
 	double ms = 0;
 
 	wj_reg_read_enter ();

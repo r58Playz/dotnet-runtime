@@ -122,73 +122,121 @@ int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 
  * devirt arms and way 0 of the worker PIC inline and hands every way-0 miss to a shared slow-path stub, instead of
  * emitting method identity, F9, ways 1..N, the inline AOT IC and the per-site cold miss itself (450-600 B a site, R455). */
 int mono_wasm_jit_vsite_compact = 0;
-int mono_wasm_jit_eager_n;
-static char **wj_eager_type, **wj_eager_meth;
-gint32 mono_wasm_jit_eager_marked;
+/* MONO_WASM_JIT_AOT_DENY (plan typed-spindle J3's within-binary arm): methods the runtime treats as having NO AOT body
+ * although the image carries one -- mono_interp_jit_call_supported (transform.c) answers FALSE for them, and it is the
+ * one predicate the interpreter's code_type, the emitter's inline-AOT and AOT-IC paths and the lazy pool all ask, so a
+ * denied method is interpreted, then compiled by this tier, and JIT callers can inline it. AOT callers keep calling its
+ * AOT body directly (same semantics, two bodies). Same syntax as MONO_WASM_JIT_EAGER_LIST, plus "prefix*" = every type
+ * whose full name starts with prefix ("java.util.*"). A denied method is also eager (tier 1 at its first call) unless
+ * MONO_WASM_JIT_AOT_DENY_EAGER=0, which leaves it to the ordinary threshold (R468: eager marking of 739 curated methods
+ * cost ~20 s of boot). An AOT-profile change cannot be A/B'd in one binary; this can. Unset = empty = no effect. */
+int mono_wasm_jit_eager_n, mono_wasm_jit_aot_deny_n;
+int mono_wasm_jit_aot_deny_eager = 1;
+gint32 mono_wasm_jit_eager_marked, mono_wasm_jit_aot_denied_n;
+typedef struct { char **type, **meth; guint8 *prefix; } WjNameList;
+static WjNameList wj_eager_list, wj_deny_list;
 
-static void
-wj_eager_parse (const char *v)
+static int
+wj_namelist_parse (WjNameList *l, const char *v)
 {
 	gchar **parts = g_strsplit_set (v, " ,\t\n", -1);
-	int n = 0, i;
+	int n = 0, i, k = 0;
 	for (i = 0; parts [i]; ++i)
 		if (*parts [i])
 			n++;
-	wj_eager_type = g_new0 (char *, n + 1);
-	wj_eager_meth = g_new0 (char *, n + 1);
+	l->type = g_new0 (char *, n + 1);
+	l->meth = g_new0 (char *, n + 1);
+	l->prefix = g_new0 (guint8, n + 1);
 	for (i = 0; parts [i]; ++i) {
 		const char *e = parts [i];
 		const char *sep;
+		size_t len;
 		if (!*e)
 			continue;
 		if (*e == '!')   /* tolerate the profile's own spelling */
 			e++;
 		sep = strstr (e, "::");
-		wj_eager_type [mono_wasm_jit_eager_n] = sep ? g_strndup (e, sep - e) : g_strdup (e);
-		wj_eager_meth [mono_wasm_jit_eager_n] = sep ? g_strdup (sep + 2) : NULL;
-		mono_wasm_jit_eager_n++;
+		len = strlen (e);
+		if (!sep && len > 1 && e [len - 1] == '*') {
+			l->type [k] = g_strndup (e, len - 1);
+			l->prefix [k] = 1;
+		} else {
+			l->type [k] = sep ? g_strndup (e, sep - e) : g_strdup (e);
+			l->meth [k] = sep ? g_strdup (sep + 2) : NULL;
+		}
+		k++;
 	}
 	g_strfreev (parts);
+	return k;
 }
 
-/* TRUE when METHOD is on the eager list. Field reads only (klass names and nesting): it runs at InterpMethod
- * creation, which must not load or resolve anything. */
-gboolean
-mono_wasm_jit_eager_match (MonoMethod *method)
+/* METHOD's Cecil full name ("ns.Outer/Inner") into full; returns its length (0 = too deep / too long), and the top-level
+ * type's length in *top_len. Field reads only (klass names and nesting): it runs at InterpMethod creation and inside
+ * mono_interp_jit_call_supported, which must not load or resolve anything. */
+static int
+wj_full_type_name (MonoMethod *method, char *full, int cap, int *top_len)
 {
 	MonoClass *chain [8];
-	char full [512];
-	int depth = 0, i, j, n, top_len;
+	int depth = 0, i, n;
 	MonoClass *k;
 	const char *ns;
 	for (k = method->klass; k && depth < 8; k = m_class_get_nested_in (k))
 		chain [depth++] = k;
 	if (!depth || k)
-		return FALSE;
+		return 0;
 	ns = m_class_get_name_space (chain [depth - 1]);
-	n = g_snprintf (full, sizeof (full), "%s%s%s", ns ? ns : "", (ns && *ns) ? "." : "", m_class_get_name (chain [depth - 1]));
-	if (n <= 0 || n >= (int) sizeof (full))
-		return FALSE;
-	top_len = n;
+	n = g_snprintf (full, cap, "%s%s%s", ns ? ns : "", (ns && *ns) ? "." : "", m_class_get_name (chain [depth - 1]));
+	if (n <= 0 || n >= cap)
+		return 0;
+	*top_len = n;
 	for (i = depth - 2; i >= 0; --i) {
-		int w = g_snprintf (full + n, sizeof (full) - n, "/%s", m_class_get_name (chain [i]));
-		if (w <= 0 || n + w >= (int) sizeof (full))
-			return FALSE;
+		int w = g_snprintf (full + n, cap - n, "/%s", m_class_get_name (chain [i]));
+		if (w <= 0 || n + w >= cap)
+			return 0;
 		n += w;
 	}
-	for (j = 0; j < mono_wasm_jit_eager_n; ++j) {
-		const char *t = wj_eager_type [j];
-		if (wj_eager_meth [j]) {
-			if (!strcmp (full, t) && !strcmp (method->name, wj_eager_meth [j]))
-				goto hit;
+	return n;
+}
+
+static gboolean
+wj_namelist_match (const WjNameList *l, int nl, MonoMethod *method)
+{
+	char full [512];
+	int top_len = 0, j;
+	if (!wj_full_type_name (method, full, (int) sizeof (full), &top_len))
+		return FALSE;
+	for (j = 0; j < nl; ++j) {
+		const char *t = l->type [j];
+		if (l->prefix [j]) {
+			if (!strncmp (full, t, strlen (t)))
+				return TRUE;
+		} else if (l->meth [j]) {
+			if (!strcmp (full, t) && !strcmp (method->name, l->meth [j]))
+				return TRUE;
 		} else if (!strcmp (full, t) || ((int) strlen (t) == top_len && !strncmp (full, t, top_len) && full [top_len] == '/')) {
-			goto hit;
+			return TRUE;
 		}
 	}
 	return FALSE;
-hit:
-	mono_atomic_inc_i32 (&mono_wasm_jit_eager_marked);
-	return TRUE;
+}
+
+/* TRUE when METHOD is denied its AOT body (MONO_WASM_JIT_AOT_DENY). */
+gboolean
+mono_wasm_jit_aot_denied (MonoMethod *method)
+{
+	return mono_wasm_jit_aot_deny_n && wj_namelist_match (&wj_deny_list, mono_wasm_jit_aot_deny_n, method);
+}
+
+/* TRUE when METHOD is on the eager list -- or denied its AOT body, which implies it. */
+gboolean
+mono_wasm_jit_eager_match (MonoMethod *method)
+{
+	if ((mono_wasm_jit_eager_n && wj_namelist_match (&wj_eager_list, mono_wasm_jit_eager_n, method)) ||
+	    (mono_wasm_jit_aot_deny_eager && mono_wasm_jit_aot_denied (method))) {
+		mono_atomic_inc_i32 (&mono_wasm_jit_eager_marked);
+		return TRUE;
+	}
+	return FALSE;
 }
 /* auto-JIT hotness threshold. 2000 was the pre-Minecraft value; 500 is what the product runs. R204 cut `no_fslot` 69%% by moving it, and that is worth NOTHING on the plateau -- it is a boot/worldgen effect, because 99.3%% of profile observations arrive AFTER a method is JITted. Right for boot, not a frame-rate lever. */
 /* MONO_WASM_JIT_OVER_AOT is deleted. It let the runtime wasm method-JIT compete with an
@@ -830,6 +878,15 @@ int mono_wasm_jit_deadset = 1;
 /* MONO_WASM_JIT_RETIRE_FREE: 0 = never free a retired registry payload (leak it). A DIAGNOSTIC, the
  * use-after-free discriminator for the reclamation scheme above wj_reclaim_retired. */
 int mono_wasm_jit_retire_free = 1;
+/* MONO_WASM_JIT_RETIRE_GUARD (R470): module bytes are retired only while the registry publishes them (wj_bytes_live_*);
+ * a retire of a buffer that is not published -- already retired, so a SECOND g_free of memory the allocator may have
+ * handed to someone else -- is refused and counted as WJC_RETIRE_DUP, i.e. leaked. 0 = the unguarded A/B. */
+int mono_wasm_jit_retire_guard = 1;
+/* MONO_WASM_JIT_B4_SECTION (R470): the re-emit drainer frames B4 groups only while holding the compile section
+ * (interp.c wj_compiling), the one writer lock every other registry writer holds; a busy section skips the visit.
+ * 0 = the drainer frames unserialized, as R443-R469 shipped. It restores R320's single-writer assumption; it is NOT
+ * the module-corruption fix -- 0 and 1 both corrupted, with no double retire caught either way (R470). */
+int mono_wasm_jit_b4_section = 1;
 /* MONO_WASM_JIT_AOT_ENTRY: 0 = the jiterpreter's interp-entry trampolines never forward AOT callers
  * straight into a JIT f-slot, so every AOT->JIT entry takes the C interp_entry boundary. A DIAGNOSTIC
  * (it was once this switch's A/B baseline, then made unconditional); see mono_jiterp_wasm_jit_entry_ok. */
@@ -883,7 +940,11 @@ mono_wasm_jit_auto_init (void)
 	  if (tv > 0) mono_wasm_jit_thresh = tv; }
 	{ const char *vc = g_getenv ("MONO_WASM_JIT_VSITE_COMPACT"); if (vc && *vc) mono_wasm_jit_vsite_compact = atoi (vc); }
 	{ const char *el = g_getenv ("MONO_WASM_JIT_EAGER_LIST");
-	  if (el && *el && !mono_wasm_jit_eager_n) wj_eager_parse (el); }
+	  if (el && *el && !mono_wasm_jit_eager_n) mono_wasm_jit_eager_n = wj_namelist_parse (&wj_eager_list, el);
+	  el = g_getenv ("MONO_WASM_JIT_AOT_DENY");
+	  if (el && *el && !mono_wasm_jit_aot_deny_n) mono_wasm_jit_aot_deny_n = wj_namelist_parse (&wj_deny_list, el);
+	  el = g_getenv ("MONO_WASM_JIT_AOT_DENY_EAGER");
+	  if (el && *el) mono_wasm_jit_aot_deny_eager = atoi (el) != 0; }
 	{ extern int mono_wasm_jit_stats; const char *s = g_getenv ("MONO_WASM_JIT_STATS"); mono_wasm_jit_stats = (s && *s && *s != '0') ? 1 : 0; }
 	/* MONO_WASM_JIT_VERBOSE controls the per-method emit LOG spam, DECOUPLED from stats (counting is cheap,
 	 * logging floods): 0=silent (default), 1=+registered/invalid, 2=+bail, 3=+emit-enter AND per-call traces (vcall-aot
@@ -1037,6 +1098,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_inline_leaf; const char *il = g_getenv ("MONO_WASM_JIT_INLINE_LEAF"); if (il && *il) { int v = atoi (il); mono_wasm_jit_inline_leaf = (v >= 0 && v <= 256) ? v : 0; } }
 	{ extern int mono_wasm_jit_deadset; const char *ds = g_getenv ("MONO_WASM_JIT_DEADSET"); if (ds && *ds) mono_wasm_jit_deadset = *ds != '0'; }
 	{ extern int mono_wasm_jit_retire_free; const char *rf = g_getenv ("MONO_WASM_JIT_RETIRE_FREE"); if (rf && *rf) mono_wasm_jit_retire_free = *rf != '0'; }
+	{ extern int mono_wasm_jit_retire_guard; const char *rg = g_getenv ("MONO_WASM_JIT_RETIRE_GUARD"); if (rg && *rg) mono_wasm_jit_retire_guard = *rg != '0'; }
+	{ extern int mono_wasm_jit_b4_section; const char *bs = g_getenv ("MONO_WASM_JIT_B4_SECTION"); if (bs && *bs) mono_wasm_jit_b4_section = *bs != '0'; }
 	{ extern int mono_wasm_jit_aot_entry; const char *ae = g_getenv ("MONO_WASM_JIT_AOT_ENTRY"); if (ae && *ae) mono_wasm_jit_aot_entry = *ae != '0'; }
 	{ extern int mono_wasm_jit_reuse_reset; const char *rr = g_getenv ("MONO_WASM_JIT_REUSE_RESET"); if (rr && *rr) mono_wasm_jit_reuse_reset = *rr != '0'; }
 	{ extern int mono_wasm_jit_vcall_ways; const char *w = g_getenv ("MONO_WASM_JIT_VCALL_WAYS"); int n = (w && *w) ? atoi (w) : 1; mono_wasm_jit_vcall_ways = n < 1 ? 1 : (n > 8 ? 8 : n); } /* N-way inline vcall IC; clamp [1,8]; 1 = legacy monomorphic */
@@ -1880,6 +1943,18 @@ static int wj_lazy_arm_fslot (MonoMethod *target, MonoMethod *self, const WasmFu
  * on the compiling thread. call_indirect-ing such a slot is a signature-mismatch wasm TRAP that kills the
  * worker. The interp invoke paths consult mono_wasm_jit_slot_live() and fall back to the interpreter when
  * the slot isn't live on this thread, instead of trapping. */
+void mono_wasm_jit_free_note (const void *p, guint32 usable, const char *tag);   /* R471, below */
+guint32 mono_wasm_jit_usable_size (const void *p);
+/* g_realloc that records the old block in the R471 free ring when it moved (MONO_WASM_JIT_BYTES_CHECK only). */
+static gpointer
+wj_realloc_noted (gpointer old, gsize n, const char *tag)
+{
+	guint32 os = mono_wasm_jit_usable_size (old);
+	gpointer p = g_realloc (old, n);
+	if (os && p != old)
+		mono_wasm_jit_free_note (old, os, tag);
+	return p;
+}
 static __thread guint8 *wj_slot_live = NULL;
 static __thread int wj_slot_live_cap = 0;   /* capacity, in slots */
 static __thread guint8 *wj_slot_installed = NULL;
@@ -1911,7 +1986,7 @@ wj_slot_payload_set (int slot, guint32 payload)
 		int ncap = wj_slot_payload_cap ? wj_slot_payload_cap : 1024;
 		while (slot >= ncap)
 			ncap *= 2;
-		wj_slot_payload = (guint32 *) g_realloc (wj_slot_payload, (gsize) ncap * sizeof (guint32));
+		wj_slot_payload = (guint32 *) wj_realloc_noted (wj_slot_payload, (gsize) ncap * sizeof (guint32), "slot_payload");
 		memset (wj_slot_payload + wj_slot_payload_cap, 0, (gsize) (ncap - wj_slot_payload_cap) * sizeof (guint32));
 		wj_slot_payload_cap = ncap;
 	}
@@ -1953,7 +2028,7 @@ wj_mark_slot_live (int slot)
 		while (slot >= ncap)
 			ncap *= 2;
 		nbytes = (ncap + 7) / 8;
-		wj_slot_live = (guint8 *) g_realloc (wj_slot_live, nbytes);
+		wj_slot_live = (guint8 *) wj_realloc_noted (wj_slot_live, nbytes, "slot_live");
 		memset (wj_slot_live + oldbytes, 0, nbytes - oldbytes);
 		wj_slot_live_cap = ncap;
 	}
@@ -1987,7 +2062,7 @@ wj_mark_slot_installed (int slot)
 		int nbytes;
 		while (slot >= ncap) ncap *= 2;
 		nbytes = (ncap + 7) / 8;
-		wj_slot_installed = (guint8 *)g_realloc (wj_slot_installed, nbytes);
+		wj_slot_installed = (guint8 *) wj_realloc_noted (wj_slot_installed, nbytes, "slot_installed");
 		memset (wj_slot_installed + oldbytes, 0, nbytes - oldbytes);
 		wj_slot_installed_cap = ncap;
 	}
@@ -2073,8 +2148,124 @@ static gboolean wj_vslow_repair (const char *err);   /* mini-wasm-vslow.inc, R45
 static int wj_instantiate_local_once (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
 static int wj_instantiate_batch_local_once (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
 
+/* R471 (MONO_WASM_JIT_BYTES_CHECK only): who owned the memory a changed block now occupies. R470's s17 c0-1 changed a live
+ * lazy bank by zeroing two aligned words 592 bytes apart and nothing else -- a stale writer into memory that used to be
+ * someone else's, not a chunk shared by two live owners. Recorded here: every JIT-using pthread's stack and TLS ranges
+ * (at its first instantiation; marked dead by a key destructor at its exit -- emscripten frees a pthread's struct, TLS
+ * and stack when it exits, and later allocations land there), and a ring of the JIT's own frees (the reclaim, the
+ * per-thread array reallocs). WASM_JIT_BYTES_CHANGED is followed by WASM_JIT_BYTES_OWNER for every one that overlaps. */
+#include <emscripten/stack.h>
+#include <malloc.h>
+#define WJ_THR_MAX 1024
+typedef struct { guint32 stk_lo, stk_hi, tls_lo, tls_hi, tid, dead_seq; volatile gint32 dead; } WjThrRec;
+static WjThrRec wj_thr_tab [WJ_THR_MAX];
+static volatile gint32 wj_thr_n;
+static pthread_key_t wj_thr_key;
+static pthread_once_t wj_thr_once = PTHREAD_ONCE_INIT;
+static __thread int wj_thr_idx;   /* 1-based; -1 = the table was full */
+#define WJ_FREE_RING 8192
+typedef struct { guint32 lo, hi, seq; const char *tag; } WjFreeRec;
+static WjFreeRec wj_free_ring [WJ_FREE_RING];
+static volatile gint32 wj_free_seq;
+
+static void
+wj_thr_dtor (void *v)
+{
+	int i = (int) (intptr_t) v - 1;
+	if (i < 0 || i >= WJ_THR_MAX)
+		return;
+	wj_thr_tab [i].dead_seq = (guint32) wj_free_seq;
+	mono_memory_barrier ();
+	wj_thr_tab [i].dead = 1;
+}
+
+static void
+wj_thr_key_init (void)
+{
+	pthread_key_create (&wj_thr_key, wj_thr_dtor);
+}
+
+static void
+wj_thr_note (void)
+{
+	int i;
+	if (G_LIKELY (wj_thr_idx))
+		return;
+	pthread_once (&wj_thr_once, wj_thr_key_init);
+	i = mono_atomic_inc_i32 (&wj_thr_n) - 1;
+	if (i >= WJ_THR_MAX) {
+		wj_thr_idx = -1;
+		return;
+	}
+	wj_thr_tab [i].stk_lo = (guint32) emscripten_stack_get_end ();
+	wj_thr_tab [i].stk_hi = (guint32) emscripten_stack_get_base ();
+	wj_thr_tab [i].tls_lo = (guint32) (gsize) __builtin_wasm_tls_base ();
+	wj_thr_tab [i].tls_hi = wj_thr_tab [i].tls_lo + (guint32) __builtin_wasm_tls_size ();
+	wj_thr_tab [i].tid = (guint32) (gsize) pthread_self ();
+	wj_thr_idx = i + 1;
+	pthread_setspecific (wj_thr_key, (void *) (intptr_t) (i + 1));
+}
+
+/* P (USABLE bytes) is about to be freed, or was the old block of a realloc that moved. */
+void mono_wasm_jit_free_note (const void *p, guint32 usable, const char *tag);
+void
+mono_wasm_jit_free_note (const void *p, guint32 usable, const char *tag)
+{
+	extern int mono_wasm_jit_bytes_check;
+	guint32 s;
+	WjFreeRec *r;
+	if (!mono_wasm_jit_bytes_check || !p)
+		return;
+	if (!usable)
+		usable = (guint32) malloc_usable_size ((void *) p);
+	s = (guint32) mono_atomic_inc_i32 (&wj_free_seq);
+	r = &wj_free_ring [s % WJ_FREE_RING];
+	r->lo = (guint32) (gsize) p;
+	r->hi = r->lo + usable;
+	r->seq = s;
+	r->tag = tag;
+}
+
+guint32 mono_wasm_jit_usable_size (const void *p);
+guint32
+mono_wasm_jit_usable_size (const void *p)
+{
+	extern int mono_wasm_jit_bytes_check;
+	return (mono_wasm_jit_bytes_check && p) ? (guint32) malloc_usable_size ((void *) p) : 0;
+}
+
+/* Every recorded previous owner of [lo, hi): pthread stacks/TLS (live or dead) and freed JIT blocks, newest first. */
+static void
+wj_owner_report (guint32 lo, guint32 hi)
+{
+	int n = MIN ((int) wj_thr_n, WJ_THR_MAX), i, shown = 0;
+	guint32 s = (guint32) wj_free_seq, k;
+	for (i = 0; i < n; ++i) {
+		WjThrRec *t = &wj_thr_tab [i];
+		if (lo < t->stk_hi && hi > t->stk_lo)
+			printf ("WASM_JIT_BYTES_OWNER stack of pthread#%d (tid %u, %s at free-seq %u, now %u): [%u, %u) offset %u below its base\n",
+				i, t->tid, t->dead ? "DEAD" : "live", t->dead_seq, s, t->stk_lo, t->stk_hi, t->stk_hi - lo);
+		else if (hi <= t->stk_lo && t->stk_lo - hi < (1u << 20))   /* an overflow writes below the end: no guard page */
+			printf ("WASM_JIT_BYTES_OWNER %u bytes BELOW the stack end of pthread#%d (tid %u, %s): [%u, %u)\n",
+				t->stk_lo - hi, i, t->tid, t->dead ? "DEAD" : "live", t->stk_lo, t->stk_hi);
+		if (lo < t->tls_hi && hi > t->tls_lo)
+			printf ("WASM_JIT_BYTES_OWNER TLS of pthread#%d (tid %u, %s at free-seq %u, now %u): [%u, %u) offset %u\n",
+				i, t->tid, t->dead ? "DEAD" : "live", t->dead_seq, s, t->tls_lo, t->tls_hi, lo - t->tls_lo);
+	}
+	for (k = 0; k < WJ_FREE_RING && k < s && shown < 8; ++k) {
+		WjFreeRec *r = &wj_free_ring [(s - k) % WJ_FREE_RING];
+		if (r->tag && lo < r->hi && hi > r->lo) {
+			printf ("WASM_JIT_BYTES_OWNER freed %s [%u, %u) at free-seq %u (now %u), block at offset %u\n",
+				r->tag, r->lo, r->hi, r->seq, s, lo - r->lo);
+			shown++;
+		}
+	}
+}
+
 /* MONO_WASM_JIT_BYTES_CHECK (R462 diagnostic): published module bytes -- registry modules, group modules, lazy banks, C1
- * stubs -- are never freed and never rewritten in place, yet two runs on 2026-10-05 failed V8 validation on a worker
+ * stubs -- are never rewritten in place; banks and stubs are never freed, and a registry module only once it is retired
+ * and every reader has left (wj_reclaim_retired, which forgets it here first, R470). Yet two runs on 2026-10-05 failed V8
+ * validation on a worker
  * other than the one that had validated the same buffer (a group module: "memory index exceeds"; a lazy bank: "invalid
  * value type" in its type section), the module-bytes face of R454x's heap corruption. With the knob on, the FIRST
  * instantiation of a buffer records a hash per 64-byte block, and every later one re-hashes and prints each block that
@@ -2125,6 +2316,7 @@ wj_bytes_check (const void *bytes, int len, const char *kind)
 	WjBytesEnt *tab = wj_bytes_tab;
 	if (!p || len <= 0)
 		return;
+	wj_thr_note ();   /* R471 */
 	if (!tab) {
 		WjBytesEnt *t = g_new0 (WjBytesEnt, WJ_BYTES_TAB);
 		if (mono_atomic_cas_ptr ((gpointer *) &wj_bytes_tab, t, NULL) != NULL)
@@ -2161,6 +2353,7 @@ wj_bytes_check (const void *bytes, int len, const char *kind)
 					printf ("WASM_JIT_BYTES_CHANGED kind=%s buf=%p len=%d block=%u off=%d : %s\n", kind, (void *) p, len, i,
 						off, hx->str);
 					g_string_free (hx, TRUE);
+					wj_owner_report ((guint32) (gsize) (p + off), (guint32) (gsize) (p + off + n));   /* R471 */
 				}
 			}
 			return;
@@ -2838,10 +3031,13 @@ wj_reclaim_retired (void)
 	wj_retired_leave ();
 	while (p) {
 		next = p->next;
+		mono_wasm_jit_free_note (p->ptr, 0, p->kind == WJ_RETIRED_BYTES ? "retired-bytes" : p->kind == WJ_RETIRED_DEPSET ? "retired-depset"
+			: p->kind == WJ_RETIRED_BODY ? "retired-body" : "retired-batch");   /* R471 */
 		switch (p->kind) {
 		case WJ_RETIRED_DEPSET: wj_depset_free ((WjDepSet *) p->ptr); break;
 		case WJ_RETIRED_BODY:   wj_body_free ((struct _WjBody *) p->ptr); break;
 		case WJ_RETIRED_BATCH:  wj_batchdesc_free ((WjBatchDesc *) p->ptr); break;
+		case WJ_RETIRED_BYTES:  mono_wasm_jit_bytes_forget (p->ptr); g_free (p->ptr); break;   /* R470: its address recycles */
 		default:                g_free (p->ptr); break;
 		}
 		g_free (p);
@@ -2873,6 +3069,109 @@ wj_retire_payload (gpointer ptr, WjRetiredKind kind)
 	/* A retire site is never itself inside the bracket when it can help it, so this usually reclaims on
 	 * the spot; when it cannot, the next reader-exit or the next retire will. */
 	wj_reclaim_retired ();
+}
+
+/* R470: the module-bytes buffers the registry publishes (re->bytes, a group's bd->bytes), so a retire can be checked
+ * against publication -- see MONO_WASM_JIT_RETIRE_GUARD. Two writers that each snapshot an entry's bytes and each
+ * retire what they displaced (the B4 drainer's batch_bind outside the compile section, a compile's re-registration or
+ * rebatch inside it) can retire ONE buffer twice, and the reclaim would free it twice (never caught: R470 read dup=0
+ * in every run). Open addressing over pointer keys,
+ * tombstones reused by inserts, under wj_retired_lock (a leaf: nothing is taken or allocated inside it). A buffer is
+ * added BEFORE the store that makes it reachable, so no writer can retire it first. The ring names a duplicate's first
+ * retire. */
+#define WJ_LIVE_TAB (1 << 18)
+#define WJ_LIVE_DEAD ((gpointer) (gsize) 1)
+#define WJ_RETIRE_RING 1024
+static gpointer *volatile wj_live_tab;
+static struct { gpointer ptr; const char *site; } wj_retire_ring [WJ_RETIRE_RING];
+static guint32 wj_retire_ring_n;   /* under wj_retired_lock */
+
+static gpointer *
+wj_live_tab_get (void)
+{
+	gpointer *t = wj_live_tab;
+	if (G_LIKELY (t))
+		return t;
+	t = g_new0 (gpointer, WJ_LIVE_TAB);
+	if (mono_atomic_cas_ptr ((gpointer *) &wj_live_tab, t, NULL) != NULL)
+		g_free (t);
+	return wj_live_tab;
+}
+
+/* P is about to be published. Idempotent: a group's bytes are published once per member. */
+static void
+wj_bytes_live_add (gpointer p)
+{
+	gpointer *tab, *dead = NULL;
+	guint32 h, k;
+	if (!mono_wasm_jit_retire_guard || !p)
+		return;
+	tab = wj_live_tab_get ();
+	h = (guint32) (((gsize) p >> 3) * 2654435761u);
+	wj_retired_enter ();
+	for (k = 0; k < WJ_LIVE_TAB; ++k) {
+		gpointer *s = &tab [(h + k) & (WJ_LIVE_TAB - 1)];
+		if (*s == p)
+			goto out;
+		if (*s == WJ_LIVE_DEAD) {
+			if (!dead)
+				dead = s;
+			continue;
+		}
+		if (!*s) {
+			*(dead ? dead : s) = p;
+			goto out;
+		}
+	}
+	if (dead)
+		*dead = p;
+	else
+		mono_wasm_jit_counters [WJC_RETIRE_GUARD_FULL]++;
+out:
+	wj_retired_leave ();
+}
+
+/* Retire module bytes the registry no longer publishes. Refused -- leaked and counted -- unless they are published now
+ * (MONO_WASM_JIT_RETIRE_GUARD); SITE names the caller for WASM_JIT_RETIRE_DUP. */
+static void
+wj_retire_bytes (gpointer p, const char *site)
+{
+	if (!p)
+		return;
+	if (mono_wasm_jit_retire_guard) {
+		gpointer *tab = wj_live_tab_get ();
+		const char *first = NULL;
+		gboolean live = FALSE;
+		guint32 h = (guint32) (((gsize) p >> 3) * 2654435761u), k, i;
+		wj_retired_enter ();
+		for (k = 0; k < WJ_LIVE_TAB; ++k) {
+			gpointer *s = &tab [(h + k) & (WJ_LIVE_TAB - 1)];
+			if (*s == p) {
+				*s = WJ_LIVE_DEAD;
+				live = TRUE;
+				break;
+			}
+			if (!*s)
+				break;
+		}
+		if (live) {
+			wj_retire_ring [wj_retire_ring_n % WJ_RETIRE_RING].ptr = p;
+			wj_retire_ring [wj_retire_ring_n % WJ_RETIRE_RING].site = site;
+			wj_retire_ring_n++;
+		} else {
+			for (i = 0; i < MIN (wj_retire_ring_n, WJ_RETIRE_RING); ++i)
+				if (wj_retire_ring [i].ptr == p)
+					first = wj_retire_ring [i].site;
+		}
+		wj_retired_leave ();
+		if (!live) {
+			if (++mono_wasm_jit_counters [WJC_RETIRE_DUP] <= 20)
+				printf ("WASM_JIT_RETIRE_DUP ptr=%p site=%s first=%s -- refused (not published: retired already, or never)\n",
+					p, site, first ? first : "(not among the last 1024 retires)");
+			return;
+		}
+	}
+	wj_retire_payload (p, WJ_RETIRED_BYTES);
 }
 
 /*
@@ -3207,6 +3506,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 				void *old_bytes = old_re->bytes;
 				WjDepSet *old_depset = old_re->depset;
 				WjDepSet *new_depset = wj_depset_new (deps, dep_sig, dep_methods, ndeps);
+				wj_bytes_live_add (bytes);   /* R470: published before it is reachable */
 				wj_pub_begin (old_re);   /* R320: bytes and depset change as ONE unit for admission */
 				old_re->bytes = bytes;
 				old_re->payload = payload;
@@ -3229,7 +3529,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 					mono_wasm_jit_repoint_imethod_bytes (old_re->logical_imethod, bytes, len);
 				}
 				if (old_bytes != bytes)
-					wj_retire_payload (old_bytes, WJ_RETIRED_BYTES);
+					wj_retire_bytes (old_bytes, "reregister");
 				if (old_depset != old_re->depset)
 					wj_retire_payload (old_depset, WJ_RETIRED_DEPSET);
 				return old_desc;
@@ -3294,6 +3594,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			}
 			chunk [n % WJ_REG_CHUNK].e = e_slot;
 			chunk [n % WJ_REG_CHUNK].f = f_slot;
+			wj_bytes_live_add (bytes);   /* R470 */
 			chunk [n % WJ_REG_CHUNK].bytes = bytes;
 			chunk [n % WJ_REG_CHUNK].payload = payload;
 			chunk [n % WJ_REG_CHUNK].body_current = 1;
@@ -3574,9 +3875,9 @@ wj_desc_state_ensure (int id)
 	{
 		int old = wj_desc_state_cap, cap = old ? old : 1024;
 		while (id >= cap) cap *= 2;
-		wj_desc_state = (guint8 *) g_realloc (wj_desc_state, cap);
-		wj_desc_generation = (guint32 *) g_realloc (wj_desc_generation, sizeof (guint32) * cap);
-		wj_desc_permfail = (guint8 *) g_realloc (wj_desc_permfail, cap);
+		wj_desc_state = (guint8 *) wj_realloc_noted (wj_desc_state, cap, "desc_state");
+		wj_desc_generation = (guint32 *) wj_realloc_noted (wj_desc_generation, sizeof (guint32) * cap, "desc_generation");
+		wj_desc_permfail = (guint8 *) wj_realloc_noted (wj_desc_permfail, cap, "desc_permfail");
 		memset (wj_desc_state + old, 0, cap - old);
 		memset (wj_desc_generation + old, 0, sizeof (guint32) * (cap - old));
 		memset (wj_desc_permfail + old, 0, cap - old);
@@ -4018,7 +4319,7 @@ wj_admit_dependencies (WjRegEntry *re, WjDepSet *ds, int desc_id, gboolean watch
 static gboolean
 wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, void *snap_bytes, int snap_len, guint32 snap_payload)
 {
-	char eb [192];
+	char eb [512];
 	double ms = 0;
 	guint32 gen;
 
@@ -4742,7 +5043,7 @@ wj_admit_impl (int desc_id)
 	 * single largest cost of co-location. */
 	gboolean fail_perm = FALSE;
 	guint32 gen_snapshot = 0;   /* re->generation as of BEFORE the dependency walk; see the publish below */
-	char eb [192]; double ms = 0;
+	char eb [512]; double ms = 0;
 	if (desc_id <= 0 || desc_id > wj_reg_n) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_BAD_ID);
 		return 0;

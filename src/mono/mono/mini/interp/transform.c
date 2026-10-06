@@ -1228,6 +1228,18 @@ mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig)
 	if (G_UNLIKELY (mono_body_override_live) && mono_body_override_header (method))
 		return FALSE;
 
+#if HOST_BROWSER
+	/* plan typed-spindle J3: a method denied its AOT body (MONO_WASM_JIT_AOT_DENY, mini-wasm.c) answers FALSE here, the
+	 * one predicate the interpreter, the wasm JIT's emitter and its lazy pool all ask -- so it is interpreted, then
+	 * compiled by the JIT tier, consistently everywhere. */
+	{ extern int mono_wasm_jit_aot_deny_n; extern gboolean mono_wasm_jit_aot_denied (MonoMethod *method);
+	  if (G_UNLIKELY (mono_wasm_jit_aot_deny_n) && mono_wasm_jit_aot_denied (method)) {
+		extern gint32 mono_wasm_jit_aot_denied_n;
+		mono_atomic_inc_i32 (&mono_wasm_jit_aot_denied_n);
+		return FALSE;
+	  } }
+#endif
+
 	if (!mono_jit_call_can_be_supported_by_interp (method, sig, mono_llvm_only))
 		return FALSE;
 

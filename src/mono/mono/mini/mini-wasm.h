@@ -1438,6 +1438,9 @@ enum {
 	WJC_VSLOW_FAIL,              /* ... stub instantiations V8 refused (MUST be 0) */
 	WJC_VSLOW_REFUSED,           /* ... sites left in the full form because no stub could be made */
 	WJC_VSLOW_REPAIR,            /* R459: an instantiation's LinkError named a stub slot; the stub was re-installed, retried */
+	WJC_RETIRE_DUP,              /* R470: module bytes retired while not published -- a second retire, refused (MUST be 0) */
+	WJC_RETIRE_GUARD_FULL,       /* R470: the published-bytes set had no free slot; that buffer is unguarded (MUST be 0) */
+	WJC_B4_SECTION_BUSY,         /* R470: drainer visits whose B4 framing was skipped because a compile held the section */
 	WJC_MAX
 };
 

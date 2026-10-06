@@ -654,9 +654,10 @@ mono_interp_get_imethod (MonoMethod *method)
 		/* plan typed-spindle J1: a method on the consumer's eager list (MONO_WASM_JIT_EAGER_LIST -- the methods it
 		 * took off AOT) starts one hit short of the threshold, so wasm_jit_maybe_compile's `== thresh` gate fires on
 		 * its FIRST call: tier 1 at once, no interpreted phase. Everything after that is the ordinary path. */
-		extern int mono_wasm_jit_eager_n, mono_wasm_jit_thresh;
+		extern int mono_wasm_jit_eager_n, mono_wasm_jit_aot_deny_n, mono_wasm_jit_thresh;
 		extern gboolean mono_wasm_jit_eager_match (MonoMethod *method);
-		if (G_UNLIKELY (mono_wasm_jit_eager_n) && mono_wasm_jit_thresh > 1 && mono_wasm_jit_eager_match (method))
+		if (G_UNLIKELY (mono_wasm_jit_eager_n | mono_wasm_jit_aot_deny_n) && mono_wasm_jit_thresh > 1 &&
+		    mono_wasm_jit_eager_match (method))
 			imethod->wasm_jit_hits = mono_wasm_jit_thresh - 1;
 	}
 #endif
@@ -2331,7 +2332,13 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 			/* plan2x F9: the allocation carries the megamorphic cache in front; wj_vcall_pic points past it. The
 			 * prefix size is fixed for the process (the knob is read once), and realloc keeps its contents. */
 			gsize pre = (gsize) mono_wasm_jit_mcache_prefix ();
-			guint8 *blk = (guint8 *) g_realloc (wj_vcall_pic ? (guint8 *) wj_vcall_pic - pre : NULL, pre + nbytes);
+			guint8 *oblk = wj_vcall_pic ? (guint8 *) wj_vcall_pic - pre : NULL;
+			extern guint32 mono_wasm_jit_usable_size (const void *p);
+			extern void mono_wasm_jit_free_note (const void *p, guint32 usable, const char *tag);
+			guint32 osz = mono_wasm_jit_usable_size (oblk);   /* R471 */
+			guint8 *blk = (guint8 *) g_realloc (oblk, pre + nbytes);
+			if (osz && blk != oblk)
+				mono_wasm_jit_free_note (oblk, osz, "vcall_pic");
 			if (!wj_vcall_pic)
 				memset (blk, 0, pre);
 			wj_vcall_pic = (WjLocalVcallPicEntry *) (blk + pre);
@@ -3772,8 +3779,20 @@ wj_reemit_drain_one (void)
 	 * once full, framing waits for the rate-limited flush. Four, not one: the drainer is visited only from compile and
 	 * interp-entry safepoints, which stop arriving once a small workload's tier settles. */
 	{
+		extern int mono_wasm_jit_b4_section;
 		int b4i;
-		for (b4i = 0; b4i < 4 && mono_wasm_jit_b4 >= 2 && mono_wasm_jit_b4_due () &&
+		/* R470: framing rewrites registry entries ({batch, bytes, depset}) and retires what it displaced, and so does
+		 * every compile -- inside the compile section, which this drainer does not otherwise hold. Unserialized, the
+		 * two can snapshot one entry's bytes and both retire them (R320's seqlock assumes one writer; R470 never caught
+		 * the double retire). Take the section or skip this visit. */
+		gboolean b4_ok = !mono_wasm_jit_b4_section || wj_compiling_here, b4_took = FALSE;
+		if (!b4_ok && mono_wasm_jit_b4 >= 2 && mono_wasm_jit_b4_due ()) {
+			if (mono_atomic_cas_i32 (&wj_compiling, 1, 0) == 0)
+				b4_ok = b4_took = wj_compiling_here = TRUE;
+			else
+				mono_wasm_jit_counters [WJC_B4_SECTION_BUSY]++;
+		}
+		for (b4i = 0; b4i < 4 && b4_ok && mono_wasm_jit_b4 >= 2 && mono_wasm_jit_b4_due () &&
 		     wj_reemit_batch_n < mono_wasm_jit_reemit_batch && wj_reemit_batch_n < WJ_REEMIT_BATCH_MAX; ++b4i) {
 			int b4d = mono_wasm_jit_b4_step ();
 			if (b4d > 0) {
@@ -3782,6 +3801,10 @@ wj_reemit_drain_one (void)
 				wj_reemit_batch [wj_reemit_batch_n++] = b4d;
 				mono_wasm_jit_counters [WJC_B4_PUBLISHED]++;
 			}
+		}
+		if (b4_took) {
+			wj_compiling_here = FALSE;
+			mono_atomic_store_i32 (&wj_compiling, 0);
 		}
 		if (wj_reemit_batch_n >= mono_wasm_jit_reemit_batch || wj_reemit_batch_n >= WJ_REEMIT_BATCH_MAX)
 			goto out;
