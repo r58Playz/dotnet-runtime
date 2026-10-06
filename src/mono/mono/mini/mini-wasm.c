@@ -120,8 +120,11 @@ int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 
  * call" cannot disagree. Unset = empty = no effect; matching costs one load per InterpMethod creation then. */
 /* MONO_WASM_JIT_VSITE_COMPACT (plan typed-spindle C1, mini-wasm-vslow.inc): a non-delegate virtual call site keeps its
  * devirt arms and way 0 of the worker PIC inline and hands every way-0 miss to a shared slow-path stub, instead of
- * emitting method identity, F9, ways 1..N, the inline AOT IC and the per-site cold miss itself (450-600 B a site, R455). */
-int mono_wasm_jit_vsite_compact = 0;
+ * emitting method identity, F9, ways 1..N, the inline AOT IC and the per-site cold miss itself (450-600 B a site, R455).
+ * 1 (with T2_STRICT=1, T2_MAX_BODY=106496 and IKVM_LAZY_TYPEDEPS=1): Minecraft server tick, Q60, d k k d k d, n=3 a
+ * side, -3.7% cycles, -4.2% instructions, peak VmData -402 MiB, every row non-overlapping (R466); 213 B a site. Its rare
+ * stub LinkError (R459) is repaired and counted (`[wasm-jit vslow] repair=`). 0 = every route inline, as before. */
+int mono_wasm_jit_vsite_compact = 1;
 /* MONO_WASM_JIT_AOT_DENY (plan typed-spindle J3's within-binary arm): methods the runtime treats as having NO AOT body
  * although the image carries one -- mono_interp_jit_call_supported (transform.c) answers FALSE for them, and it is the
  * one predicate the interpreter's code_type, the emitter's inline-AOT and AOT-IC paths and the lazy pool all ask, so a
@@ -775,6 +778,11 @@ int mono_wasm_jit_t2_loop_count = 65536;
 /* MONO_WASM_JIT_T2_GI_BIMORPHIC (R411): a tier-2 site's SECOND guarded inline, when its second target holds at least this
  * % of the site's observations; 0 = off. */
 int mono_wasm_jit_t2_gi_bimorphic = 0;
+/* MONO_WASM_JIT_GI_LATE_RETRY (plan swirling-moore S2): a guarded inline refused AFTER its guard was emitted because the
+ * inlinee plus ITS inlines went over the cost cap is retried once with nesting off -- the outer body inlines, its inner
+ * calls stay calls -- instead of leaving the guard in front of the full fallback call. 1 = tier-2 compiles, 2 = every
+ * tier, 0 = off. R467 found ~23 k such calls per server tick at the block-access methods (getBlockState and friends). */
+int mono_wasm_jit_gi_late_retry = 0;
 /* MONO_WASM_JIT_T2_REARM (R332): how many times a tier-2 request released on BUSY give-up is re-armed (0 = retire it). */
 int mono_wasm_jit_t2_rearm = 3;
 /* MONO_WASM_JIT_T2_SAMPLE_LOOP: 0 = every poll credits its own method; 1 (R335) = loop polls only, an entry poll
@@ -832,8 +840,10 @@ int mono_wasm_jit_trace_compile = 0;
  * through that pass in the same trace had 5,834. 0 = no bound. */
 int mono_wasm_jit_aggr_inline_blocks = 3000;
 /* MONO_WASM_JIT_T2_MAX_BODY (R349): largest tier-2 module, in bytes, the emitter will hand to V8; a bigger one fails
- * permanently and the method keeps its tier-1 body (or takes the tier-1-policy downgrade). 0 = no cap. */
-int mono_wasm_jit_t2_max_body = 98304;
+ * permanently and the method keeps its tier-1 body (or takes the tier-1-policy downgrade). 0 = no cap. 104 KB takes
+ * ServerWorld.tick's strict body (100.6 KB) once VSITE_COMPACT shrinks virtual sites: all five server giants then reach
+ * tier 2 at no measured memory cost (R464). 160 KB costs +551 MiB of TurboFan zones (R450, R460). */
+int mono_wasm_jit_t2_max_body = 106496;
 /* MONO_WASM_JIT_EH_REC (R353): an EH method keeps its IL_STATE LMFExt in a record inside its OWN C-stack frame and
  * links/unlinks it inline, instead of calling mono_wasm_jit_enter_island / leave_island (interp.c, WjEhRec). p75, b t t b
  * on the Minecraft server tick: the island helpers 2.98 -> 0.08 M instr/tick, all instructions -3.6%, calls -9.6%;
@@ -1072,6 +1082,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_prof_ancestors, "MONO_WASM_JIT_PROF_ANCESTORS", 0, 3)
 	WJ_T2_KNOB (mono_wasm_jit_t2_loop_count, "MONO_WASM_JIT_T2_LOOP_COUNT", 0, 1000000000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_gi_bimorphic, "MONO_WASM_JIT_T2_GI_BIMORPHIC", 0, 100)
+	WJ_T2_KNOB (mono_wasm_jit_gi_late_retry, "MONO_WASM_JIT_GI_LATE_RETRY", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_t2_rearm, "MONO_WASM_JIT_T2_REARM", 0, 8)
 	WJ_T2_KNOB (mono_wasm_jit_t2_sample_loop, "MONO_WASM_JIT_T2_SAMPLE_LOOP", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_t2_colocate, "MONO_WASM_JIT_T2_COLOCATE", 0, 1)
@@ -1239,8 +1250,9 @@ int mono_wasm_jit_s2_cold = 1;          /* MONO_WASM_JIT_S2_COLD: 1 = never inli
  * VmData +32 MiB (R398); both tiers (3) -5.7% at +326 MiB. */
 int mono_wasm_jit_s3 = 11;
 /* MONO_WASM_JIT_T2_STRICT (plan2x S0b): 1 = a tier-2 compile that fails on T2_MAX_BODY is retried ONCE at tier 2 with
- * strict inlining (mono_wasm_force_compile) before the tier-1-policy downgrade; 0 = straight to the downgrade. */
-int mono_wasm_jit_t2_strict = 0;
+ * strict inlining (mono_wasm_force_compile) before the tier-1-policy downgrade; 0 = straight to the downgrade. Neutral
+ * before VSITE_COMPACT, because the giants still missed the cap (R390); with it, part of R466's bundle (see there). */
+int mono_wasm_jit_t2_strict = 1;
 int mono_wasm_jit_t2_strict_limit = 20;   /* MONO_WASM_JIT_T2_STRICT_LIMIT: IL bytes at an unknown or warm site, strict */
 /* MONO_WASM_JIT_S4 (plan2x S4), a bit mask: 1 = rewrite the loads the S4 census proves redundant within an extended
  * basic block into moves, in tier-2 compiles; 2 = in tier-1 compiles too. See wj_s4_run (mini-wasm-ir.inc). It must run
@@ -2204,6 +2216,46 @@ wj_thr_note (void)
 	wj_thr_tab [i].tid = (guint32) (gsize) pthread_self ();
 	wj_thr_idx = i + 1;
 	pthread_setspecific (wj_thr_key, (void *) (intptr_t) (i + 1));
+	mono_wasm_jit_counters [WJC_THR_NOTED]++;
+	/* R475: a pthread whose stack or TLS overlaps one that never ran its exit destructor. emscripten allocates a
+	 * pthread's struct, TLS and stack as ONE block and frees it at exit, so a later pthread landing on a DEAD one's
+	 * range is ordinary; landing on a LIVE one's means two running threads share TLS and stack -- which R459's stub
+	 * LinkError (done == n while this worker never instantiated stub n-1) and R470's call-frame-shaped corruption
+	 * both look like. Records are claimed before they are filled, so a half-written one reads as [0,0) and matches
+	 * nothing. */
+	{
+		WjThrRec *me = &wj_thr_tab [i];
+		int j, n = MIN ((int) wj_thr_n, WJ_THR_MAX);
+		for (j = 0; j < n; ++j) {
+			WjThrRec *o = &wj_thr_tab [j];
+			gboolean tls, stk;
+			if (j == i || o->dead)
+				continue;
+			tls = o->tls_lo < me->tls_hi && me->tls_lo < o->tls_hi;
+			stk = (o->stk_lo < me->stk_hi && me->stk_lo < o->stk_hi) || (o->tls_lo < me->stk_hi && me->stk_lo < o->tls_hi) ||
+			      (o->stk_lo < me->tls_hi && me->tls_lo < o->stk_hi);
+			if (!tls && !stk)
+				continue;
+			if ((mono_wasm_jit_counters [WJC_THR_OVERLAP]++) < 20)
+				printf ("WASM_JIT_THREAD_OVERLAP new pthread#%d self=%u tls=[%u,%u) stk=[%u,%u) overlaps LIVE pthread#%d "
+					"self=%u tls=[%u,%u) stk=[%u,%u)%s%s\n", i, me->tid, me->tls_lo, me->tls_hi, me->stk_lo,
+					me->stk_hi, j, o->tid, o->tls_lo, o->tls_hi, o->stk_lo, o->stk_hi, tls ? " [tls]" : "", stk ? " [stack]" : "");
+		}
+	}
+}
+
+/* R475: this pthread's record index and whether a LIVE other record shares its TLS, for the stub explainer. */
+static int
+wj_thr_live_overlap (guint32 *tls_out)
+{
+	int j, n = MIN ((int) wj_thr_n, WJ_THR_MAX), i = wj_thr_idx - 1, hits = 0;
+	guint32 tls = (guint32) (gsize) __builtin_wasm_tls_base ();
+	if (tls_out)
+		*tls_out = tls;
+	for (j = 0; j < n; ++j)
+		if (j != i && !wj_thr_tab [j].dead && wj_thr_tab [j].tls_lo <= tls && tls < wj_thr_tab [j].tls_hi)
+			hits++;
+	return hits;
 }
 
 /* P (USABLE bytes) is about to be freed, or was the old block of a realloc that moved. */
@@ -2431,6 +2483,7 @@ wj_instantiate_local_once (int e_slot, int f_slot, const void *bytes, int len, c
 {
 	if (G_UNLIKELY (mono_wasm_jit_bytes_check))
 		wj_bytes_check (bytes, len, "m");
+	wj_thr_note ();   /* R475: once per pthread; records its stack/TLS and checks it against the live ones */
 	wj_vslow_ensure_all ();   /* typed-spindle C1 invariant 1: every slow-path stub before any module that may name one */
 	int _ok;
 	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);
@@ -2593,6 +2646,7 @@ wj_instantiate_batch_local_once (const int *e_slots, const int *f_slots, int n, 
 {
 	if (G_UNLIKELY (mono_wasm_jit_bytes_check))
 		wj_bytes_check (bytes, len, "b");
+	wj_thr_note ();   /* R475 */
 	wj_vslow_ensure_all ();   /* typed-spindle C1 invariant 1 */
 	int _ok, i;
 	extern gpointer *mono_wasm_jit_vcall_pic_ptr_addr (void);

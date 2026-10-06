@@ -1441,6 +1441,11 @@ enum {
 	WJC_RETIRE_DUP,              /* R470: module bytes retired while not published -- a second retire, refused (MUST be 0) */
 	WJC_RETIRE_GUARD_FULL,       /* R470: the published-bytes set had no free slot; that buffer is unguarded (MUST be 0) */
 	WJC_B4_SECTION_BUSY,         /* R470: drainer visits whose B4 framing was skipped because a compile held the section */
+	WJC_THR_NOTED,               /* R475: pthreads whose stack/TLS ranges were recorded at their first JIT instantiation */
+	WJC_THR_OVERLAP,             /* R475: ... whose TLS or stack overlaps a pthread recorded earlier and NOT marked exited (MUST be 0) */
+	WJC_GI_LATE_RETRY_OK,        /* S2: a late cost refusal of a guarded inline, retried with nesting off, inlined */
+	WJC_GI_LATE_RETRY_FAIL,      /* ... and refused again (the two sum to the retries; each is a late refusal too) */
+	WJC_B4_DEAD_SKIP,            /* R476: the B4 planner skipped a registry entry whose method is in the freed-method set */
 	WJC_MAX
 };
 

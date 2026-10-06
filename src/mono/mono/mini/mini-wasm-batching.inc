@@ -1359,8 +1359,20 @@ wj_b4_size (WjRegEntry *re)
 static gint32
 wj_b4_hot (int desc, gboolean take)
 {
+	extern int mono_wasm_jit_method_known_dead (MonoMethod *method, int site);
 	WjRegEntry *re = wj_reg_at (desc - 1);
-	gint32 now = (re && re->logical_imethod) ? mono_wasm_jit_im_body_samples (re->logical_imethod) : 0, d;
+	gint32 now = 0, d;
+	/* R476: a registry entry outlives its method -- IKVM's DynamicMethods are collected, and their InterpMethods freed
+	 * with them -- and this read DEREFERENCES logical_imethod (interp_imethod_current), which twice trapped the planner
+	 * at boot (memory access out of bounds in mono_wasm_jit_im_body_samples). The freed-method set is a pointer lookup
+	 * that never dereferences; a dead entry has no heat. */
+	if (re && re->logical_imethod) {
+		if (mono_wasm_jit_method_known_dead (re->logical_method, -1) ||
+		    mono_wasm_jit_method_known_dead (re->body_method, -1))
+			mono_wasm_jit_counters [WJC_B4_DEAD_SKIP]++;
+		else
+			now = mono_wasm_jit_im_body_samples (re->logical_imethod);
+	}
 	gint32 *snap = wj_b4_snap;
 	if (!snap) {
 		if (!take)
