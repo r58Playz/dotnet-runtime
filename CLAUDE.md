@@ -1031,10 +1031,10 @@ shared by two owners. **Refuted as the cause:** the B4 drainer framing outside t
 violation of R320's seqlock, now serialized by `MONO_WASM_JIT_B4_SECTION=1`, with a published-bytes retire guard
 counting `[wasm-jit retire] dup`): both arms corrupted with `dup=0`. **Not it either:** a recorded pthread stack or TLS,
 live or dead, or a freed JIT block (`MONO_WASM_JIT_BYTES_CHECK=1` prints `WASM_JIT_BYTES_OWNER` for each overlap; o1-3
-had none). **The rate moved with J3** (the hot java.util types and their AOT callers out of the AOT image): ~50% of runs
-on that image against ~6% before it and 0 of ~22 for the deny form, which ran the same java.util as JIT code called
-only from JIT code. j2d/s19 bisects it (AOT->JIT trampoline fast path, stream/function as JIT code, any JIT java.util).
-**Do not ship J3, or measure anything long on its image, until that resolves.**
+had none). **A cluster, not a rate:** 6 of 12 runs faulted between 20:07 and 21:59 on 2026-10-05 across three deploys, then 0
+of 61 since on two binaries -- including 12 of 12 clean on the exact binary that had faulted 3 of 6 (R471, j2d/s22). It
+first read as "J3 raised the rate"; that is retracted. Something about that window mattered and was not recorded (the
+driver keeps no fps or display state); the corruption itself (R454x/R462) predates J3 and is not found.
 
 **Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
 The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
