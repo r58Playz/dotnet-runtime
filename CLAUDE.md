@@ -740,6 +740,7 @@ with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A
 | "55% of real call sites target the main module" as a co-location ceiling | RETRACTED (R180) — that is a STATIC SITE COUNT. From 2,598,503 caller->callee edge instances, **93.66% of calls out of our tier land in our own tier** and only 6.24% in AOT code. The AOT wall is not what limits co-location reach |
 | **"process-wide modules cannot reach `__thread` state"** | RETRACTED — wrong, and it wrongly closed the monitor inline-CAS lever. See the imported-globals invariant above |
 | `IKVM_LAZY_CTORS` (relinking constructors) | **Ships 0, and do not re-run the A/B.** The mechanism is correct and clean -- +208 generation-2 bodies (4,293 -> 4,501), 0 failures, 0 faults over 4 healthy runs, `bad_offsets=0` -- but the server tick is a WASH (155.2 -> 155.5). The lazy-link bucket moved -14.4% in the predicted direction and at the predicted magnitude, and that is **not resolvable on this instrument**: the same-arm spread on that bucket is ~20% (R277's `a0`/`b0` were the same arm and read 27.37 vs 22.43). A ~1.8%-of-thread lever against a ~20% instrument spread is the closure, not the sample size. The durable result of that round is the RUNTIME fix it forced out (`clause_is_dead`) |
+| **the B4 drainer's double retire as the module-corruption cause** | **REFUTED (R470).** Real in the code -- `wj_reemit_drain_one` framed B4 groups outside the compile section every other registry writer holds, so two writers could snapshot one entry's bytes and both retire them -- and now closed (`MONO_WASM_JIT_B4_SECTION=1`, a retire guard counting `dup`). But with the fix on and off the corruption came back in both arms and the guard caught `dup=0` in all 8 runs. Its tick cost is unmeasured |
 | monitors / inflated locks as a mutex-traffic problem | every lock IS inflated (`monitor.c:1013`: an object whose identity hash has ever been taken can never use the thin lock again, and Java takes identity hashes constantly), but the recoverable part is NOT mutex traffic — `mono_monitor_try_enter_inflated` already has an uncontended CAS fast path. The ~3.2% is CALL OVERHEAD around one CAS. Synchronized wrappers ARE JITted, so an inline CAS has somewhere to attach. Unbuilt, ceiling ~1.5-2% |
 
 ## Building: the runtime and the app are two different builds
@@ -887,6 +888,10 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
 * **Measure on mains power.** On battery the platform drops to a power-saving profile: R454's base mapping run fell in a
   dock unplug and came back with a slow boot, a worker stall and an in-game window whose frame counter never moved
   (`ingameVoid`). `lib/preflight.mjs` now refuses on battery and warns off the `performance` power profile.
+* **The native reference reads the Prism instance's own `options.txt`, and a manual session rewrites it.** On 2026-10-05 a
+  manual stress run left `renderDistance:32` in it, and the next natrun arm ran at 32 chunks (discarded; the
+  integrated server's view distance follows it). `natrun.sh` snapshots nothing, but the instance's `minecraft/logs/`
+  date every session. `natrun.sh` now refuses (VOID) unless `renderDistance` is 12 (`NAT_RENDER_DISTANCE`).
 * **Pin every arm of a comparison the same way (`MC_TASKSET`), and never compare across batches that differ in it.**
   Chromium counts CPUs through `sched_getaffinity` (`base/system/sys_info_posix.cc:157-159`) and sizes its thread pool
   at max(3, CPUs - 1) (`base/task/thread_pool/thread_pool_instance.cc:94`), so the pin changes the renderer's thread
@@ -1017,6 +1022,19 @@ never-published buffers (refused registrations, invalid modules, failed groups, 
 freed after their validating instantiation, and the next buffer at that address read as "changed"; R464's "live lazy
 bank handed out twice" was exactly that shape and is NOT established. The third version forgets those six frees and
 re-records an address whose length or producer kind changed; only a report on a matching kind and length is evidence.
+
+**Where it stands (R470, R471).** The detector now also forgets buffers the RECLAIM frees (retired registry bytes are freed
+once readers leave -- `MONO_WASM_JIT_RETIRE_FREE=1` -- which the detector's original "never freed" premise missed), so a
+`changed` report is real. What the reports show: live module, bank and GC-heap memory overwritten by ALIGNED 32-bit zeros
+or runs of small integers, the allocator header intact -- managed stores through a stale or wrong base, not a chunk
+shared by two owners. **Refuted as the cause:** the B4 drainer framing outside the compile section (a real two-writer
+violation of R320's seqlock, now serialized by `MONO_WASM_JIT_B4_SECTION=1`, with a published-bytes retire guard
+counting `[wasm-jit retire] dup`): both arms corrupted with `dup=0`. **Not it either:** a recorded pthread stack or TLS,
+live or dead, or a freed JIT block (`MONO_WASM_JIT_BYTES_CHECK=1` prints `WASM_JIT_BYTES_OWNER` for each overlap; o1-3
+had none). **The rate moved with J3** (the hot java.util types and their AOT callers out of the AOT image): ~50% of runs
+on that image against ~6% before it and 0 of ~22 for the deny form, which ran the same java.util as JIT code called
+only from JIT code. j2d/s19 bisects it (AOT->JIT trampoline fast path, stream/function as JIT code, any JIT java.util).
+**Do not ship J3, or measure anything long on its image, until that resolves.**
 
 **Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
 The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
