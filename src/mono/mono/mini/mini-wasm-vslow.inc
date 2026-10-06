@@ -61,6 +61,7 @@ static gboolean
 wj_vslow_instantiate (WjVslowStub *s)
 {
 	int ok;
+	wj_thr_note ();   /* R475 */
 	{ extern int mono_wasm_jit_bytes_check;
 	  if (G_UNLIKELY (mono_wasm_jit_bytes_check))
 		wj_bytes_check (s->bytes, s->len, "v"); }   /* R462 */
@@ -202,8 +203,13 @@ wj_vslow_explain (const char *err)
 		if (wj_vslow_stubs [k] && wj_vslow_stubs [k]->slot == idx)
 			break;
 	jd = wj_fixed_index_jit_desc (idx, &kind);
-	printf ("WASM_JIT_VSLOW_EXPLAIN idx=%d stub=%d of %d done=%d desc_for_fslot=%d fixed_jit_desc=%d kind=%d\n",
-		idx, k < n ? k : -1, n, wj_vslow_done, wj_desc_for_fslot (idx), jd, kind);
+	{
+		guint32 tls = 0;
+		int live = wj_thr_live_overlap (&tls);
+		printf ("WASM_JIT_VSLOW_EXPLAIN idx=%d stub=%d of %d done=%d desc_for_fslot=%d fixed_jit_desc=%d kind=%d self=%u tls=%u "
+			"thr#%d live_tls_sharers=%d\n", idx, k < n ? k : -1, n, wj_vslow_done, wj_desc_for_fslot (idx), jd, kind,
+			(guint32) (gsize) pthread_self (), tls, wj_thr_idx - 1, live);
+	}
 }
 
 /* R459: an instantiation failed with a LinkError on a helper import that is a STUB's slot -- this pthread's table did not

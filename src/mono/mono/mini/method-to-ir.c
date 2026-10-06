@@ -9587,6 +9587,20 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					memcpy (gi_sp, sp, sizeof (MonoInst *) * (gsize) n);
 					gi_costs = inline_method (cfg, gi_target, fsig, gi_sp, ip, cfg->real_offset,
 					                          FALSE, &gi_empty);
+#ifdef HOST_BROWSER
+					{ extern int mono_wasm_jit_gi_late_retry;
+					  /* S2: refused on COST (not aborted): the inlinee's nested inlines took it over the cap. Retry once
+					   * with nesting off, from a fresh copy of the arguments; inline_method restores disable_inline to
+					   * what it found, so this restores ours. */
+					  if (!gi_costs && wj_inline_last_costs >= 0 && !cfg->disable_inline &&
+					      (mono_wasm_jit_gi_late_retry == 2 || (mono_wasm_jit_gi_late_retry == 1 && cfg->wasm_jit_tier >= 2))) {
+						memcpy (gi_sp, sp, sizeof (MonoInst *) * (gsize) n);
+						cfg->disable_inline = TRUE;
+						gi_costs = inline_method (cfg, gi_target, fsig, gi_sp, ip, cfg->real_offset, FALSE, &gi_empty);
+						cfg->disable_inline = FALSE;
+						wj_gi_count (gi_costs ? WJC_GI_LATE_RETRY_OK : WJC_GI_LATE_RETRY_FAIL);
+					  } }
+#endif
 					if (!gi_costs) {
 						/* Refused after the guard was emitted. There is no undo, so make the hot arm an
 						 * unconditional branch to the fallback: correct, and mono_optimize_branches
