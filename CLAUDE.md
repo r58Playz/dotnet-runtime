@@ -22,6 +22,7 @@ exists because a previous pass got it wrong at real cost.
 | the assembler (`wj_assemble`) | resolves a body's relocations and frames N members into one module |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
 | the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
+| **the GL stack: mesa-wink** | `~/Documents/android-wasm/mesa-wink`, branch `wink` (origin `mercuryworkshop/mesa-wink`): Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. `bash wink/build.sh --variant=mt --emsdk=$HOME/emsdk --test` builds it and runs its smoke suite in all three modes. Linked through ikvm-wasm-build's GLFW port (`tools/native-deps`: `build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`); gl4es, Krypton and MobileGL are gone. See **The GL stack** below |
 | IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm` — branch `wasm`, and it is CLEAN; the uncommitted IKVM-side work is in **ikvmcraft** (`loader/IkvmWasm.cs`, `loader/Transforms/Bench/`) |
 | measurement harness | `scratchpad/wj/` (see **The instruments**) |
 | **the running log — read before proposing anything** | `scratchpad/wj/MINECRAFT-FINDINGS.md` |
@@ -743,6 +744,33 @@ with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A
 | **the B4 drainer's double retire as the module-corruption cause** | **REFUTED (R470).** Real in the code -- `wj_reemit_drain_one` framed B4 groups outside the compile section every other registry writer holds, so two writers could snapshot one entry's bytes and both retire them -- and now closed (`MONO_WASM_JIT_B4_SECTION=1`, a retire guard counting `dup`). But with the fix on and off the corruption came back in both arms and the guard caught `dup=0` in all 8 runs. Its tick cost is unmeasured |
 | monitors / inflated locks as a mutex-traffic problem | every lock IS inflated (`monitor.c:1013`: an object whose identity hash has ever been taken can never use the thin lock again, and Java takes identity hashes constantly), but the recoverable part is NOT mutex traffic — `mono_monitor_try_enter_inflated` already has an uncontended CAS fast path. The ~3.2% is CALL OVERHEAD around one CAS. Synchronized wrappers ARE JITted, so an inline CAS has somewhere to attach. Unbuilt, ceiling ~1.5-2% |
 
+## The GL stack: mesa-wink, GL on the main thread (R477)
+
+**GL runs on the browser's main thread** (`?wj.WINK_GL_MAIN`, default 1; 0 = on the render worker with an
+OffscreenCanvas). The render thread only records GL calls -- Mesa's glthread -- and wink runs them, and WebGPU, on main.
+Uncapped, 2026-10-06 (j2d/w2k, n=2 per arm, a 20 s window 30 s after join): main 70.4 / 67.3 fps, worker 57.6 / 59.6;
+the render thread 32 M cycles a frame against 52. Three things make that true, and each is easy to undo:
+
+* **Any GL call that returns a value or reads client memory is a round trip through main's event loop**, unless
+  glthread handles it on the render thread: it COPIES client-array draws, buffer uploads over 8 KiB and client-memory
+  TexImage2D/TexSubImage2D (transient blocks freed on main; `MESA_GLTHREAD_REMOTE_COPY=0` waits instead), and ANSWERS
+  the VAO binding and the whole fog state itself. Every 240 swaps the log reads `wink: the GL thread waited for the main
+  thread N times a frame (by GL call and pname) ...; read live M` -- in game N should be ~0 and M MUST be 0. A new
+  per-frame query in a mod shows up there by name; answer it in glthread rather than accept the wait.
+* **The canvas must not be transferred** in that mode: `scratchpad/mcsr/deploy.sh`'s post-publish patch decides it (the
+  Makefile has a copy that deploy does NOT run) and must test `window.WINK_GL_MAIN`; deploy refuses without it.
+* **gex_wgpu keeps no CPU copy of a GPU buffer by default.** It adopts one only for indirect command buffers and buffers
+  of 16 KiB or less (`GEX_WGPU_ADOPT_SHADOW`): without it, every Sodium `glMultiDrawArraysIndirect` was a GPU readback.
+  Keep shadows that narrow -- they are wasm heap the managed side does not get.
+
+**The ~62 fps ceiling exists only in the headless harness** (OffscreenCanvas/BeginFrame pacing; Minecraft's limiter is 120
+and vsync is off). A headed browser follows the display. Compare GL configurations with `MC_UNCAPPED=1`.
+
+Traps: edits to the `emscripten-glfw` checkout need the patch regenerated (`git -C emscripten-glfw diff HEAD >
+emscripten-glfw.patch`) or `build-glfw.sh` refuses to build. wink's suite hangs with "no result" ~1 run in 4 in UPSTREAM
+cases (the plain page, `wvk_draw`); re-run once before believing it. `GEX_*`, `MESA_*` and `WINK_*` variables reach the
+driver through `?wj.<NAME>=` like the runtime's (the C environment is shared; a worker's `Module.winkEnv` is not).
+
 ## Building: the runtime and the app are two different builds
 
 The **runtime** (this repo) is built and packed with
@@ -1100,7 +1128,7 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 
 | tool | what it does |
 |---|---|
-| `perfraw.py` | **Primary.** Parses `perf.data` directly (0.6 s for 299 MB), resolves against the `--perf-basic-prof` map or the jitdump, and **reads the call chains**. `--phase ingame --by-thread --inclusive`, `--tid N`, `--marker SYM`, `--tsv`. Handles fixed-period captures (`perf record -c N`), whose sample_type omits PERIOD and shifts the callchain 8 bytes |
+| `perfraw.py` | **Primary.** Parses `perf.data` directly (0.6 s for 299 MB), resolves against the `--perf-basic-prof` map or the jitdump, and **reads the call chains**. `--phase ingame --by-thread --inclusive`, `--tid N`, `--marker SYM`, `--tsv`. Handles fixed-period captures (`perf record -c N`), whose sample_type omits PERIOD and shifts the callchain 8 bytes. **`PERFRAW_DSO_SYMS=1` names native samples** (`DSO:<path>!<function>`): chromium ships stripped and Arch's debuginfod serves its `.symtab` by build-id -- without it the chromium share (WebGPU, Blink, V8 runtime) is one opaque bucket |
 | `hotinsn.py` | Resolves each sample to the exact x86 instruction. `--bands` (prologue vs body), `--dispatch`, `--kind ours\|aot\|v8`, `--feeder` (splits the `add %r14,reg` decompression pool by what fed it — the `s.p` attribution). **Run `--selftest` before quoting a feeder number** |
 | `callform-x86.py` | Disassembles `call *` sites out of a jitdump and groups them by what the preamble CONTAINS. Use this whenever a claim depends on telling `call <import>` from `call_indirect` — only the latter has the table bounds check |
 | `codegencensus.py`, `spillsites.py` | What KIND of instruction the hot set spends bytes on; where inside a hot method TurboFan spills |
