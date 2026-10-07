@@ -781,7 +781,9 @@ int mono_wasm_jit_t2_gi_bimorphic = 0;
 /* MONO_WASM_JIT_GI_LATE_RETRY (plan swirling-moore S2): a guarded inline refused AFTER its guard was emitted because the
  * inlinee plus ITS inlines went over the cost cap is retried once with nesting off -- the outer body inlines, its inner
  * calls stay calls -- instead of leaving the guard in front of the full fallback call. 1 = tier-2 compiles, 2 = every
- * tier, 0 = off. R467 found ~23 k such calls per server tick at the block-access methods (getBlockState and friends). */
+ * tier, 0 = off. R467 found ~23 k such calls per server tick at the block-access methods (getBlockState and friends).
+ * Measured as nothing on the tick (R479, j2d/w5): the inner calls it leaves outnumber the one it removes -- near calls
+ * +7%, instructions +2.1%, cycles +0.2%. */
 int mono_wasm_jit_gi_late_retry = 0;
 /* MONO_WASM_JIT_T2_REARM (R332): how many times a tier-2 request released on BUSY give-up is re-armed (0 = retire it). */
 int mono_wasm_jit_t2_rearm = 3;
