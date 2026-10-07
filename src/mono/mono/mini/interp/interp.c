@@ -648,9 +648,11 @@ mono_interp_get_imethod (MonoMethod *method)
 	imethod->method = method;
 #if HOST_BROWSER
 	{
-		/* A live method at this address: clear any freed-method mark a recycled address still carries. */
+		/* A live method at this address: clear any freed-method mark a recycled address still carries -- and the
+		 * same for the InterpMethod's own address, which interp_free_method also records (R479). */
 		extern void mono_wasm_jit_note_method_live (MonoMethod *method);
 		mono_wasm_jit_note_method_live (method);
+		mono_wasm_jit_note_method_live ((MonoMethod *) imethod);
 		/* plan typed-spindle J1: a method on the consumer's eager list (MONO_WASM_JIT_EAGER_LIST -- the methods it
 		 * took off AOT) starts one hit short of the threshold, so wasm_jit_maybe_compile's `== thresh` gate fires on
 		 * its FIRST call: tier 1 at once, no interpreted phase. Everything after that is the ordinary path. */
@@ -11482,6 +11484,13 @@ interp_free_method (MonoMethod *method)
 	if (imethod) {
 #if HOST_BROWSER
 		mono_jiterp_free_method_data (method, imethod);
+		/* The InterpMethod too, by its own pointer (R479): a registry entry keeps (method, imethod), and a new method
+		 * at the freed method's address revives the METHOD key while the entry's imethod still points into this
+		 * method's destroyed mempool -- wj_b4_hot read through exactly that. */
+		{
+			extern void mono_wasm_jit_note_method_freed (MonoMethod *method);
+			mono_wasm_jit_note_method_freed ((MonoMethod *) imethod);
+		}
 #endif
 
 		mono_interp_clear_data_items_patch_sites (imethod->data_items, imethod->n_data_items);

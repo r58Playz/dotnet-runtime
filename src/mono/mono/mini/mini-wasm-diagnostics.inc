@@ -804,7 +804,7 @@ mono_wasm_jit_dump_stats (void)
 #ifdef HOST_BROWSER
 	{ extern void mono_wasm_jit_bytes_print (void); mono_wasm_jit_bytes_print (); }
 #endif
-	printf ("[wasm-jit b4] dead_skip=%lld -- R476: planner heat reads skipped for freed methods (non-zero is the guard working)\n",
+	printf ("[wasm-jit b4] dead_skip=%lld -- R476/R479: planner heat reads skipped for a freed method or InterpMethod (non-zero is the guard working)\n",
 		WJC_(WJC_B4_DEAD_SKIP));
 	printf ("[wasm-jit thr] noted=%lld overlap=%lld -- R475: pthreads whose stack/TLS block overlaps one that never "
 		"exited; overlap MUST be 0 (noted is the liveness check)\n", WJC_(WJC_THR_NOTED), WJC_(WJC_THR_OVERLAP));

@@ -1367,8 +1367,11 @@ wj_b4_hot (int desc, gboolean take)
 	 * at boot (memory access out of bounds in mono_wasm_jit_im_body_samples). The freed-method set is a pointer lookup
 	 * that never dereferences; a dead entry has no heat. */
 	if (re && re->logical_imethod) {
+		/* R479: and the InterpMethod by its own pointer -- a new method at a freed one's address revives the method
+		 * key while logical_imethod still names the freed InterpMethod (w10/diag-a trapped here past the R476 test). */
 		if (mono_wasm_jit_method_known_dead (re->logical_method, -1) ||
-		    mono_wasm_jit_method_known_dead (re->body_method, -1))
+		    mono_wasm_jit_method_known_dead (re->body_method, -1) ||
+		    mono_wasm_jit_method_known_dead ((MonoMethod *) re->logical_imethod, -1))
 			mono_wasm_jit_counters [WJC_B4_DEAD_SKIP]++;
 		else
 			now = mono_wasm_jit_im_body_samples (re->logical_imethod);
