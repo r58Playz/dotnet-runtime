@@ -291,4 +291,5 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 	emit_section (out, 10, &sec);
 	wasm_buf_free (&sec);
 	wasm_buf_free (&body);
+	emit_stub_names (out, "wjvslow", 5, 1, "wj_vslow_stub");
 }

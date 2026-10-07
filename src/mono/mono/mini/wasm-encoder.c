@@ -848,6 +848,40 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 }
 
 /*
+ * Name section for a stub module (a lazy bank, a vslow stub): its k defined functions, at function indices
+ * first..first+k-1 above the imports, all called `fname`. Without it perf reports them as wasm-function[N] -- the
+ * vslow stub was 1.5% of the render thread and 1.2% of the server tick in j2d/w5 under that name, and N is just its
+ * import count, so the symbol said nothing about what it was.
+ */
+static void
+emit_stub_names (WasmBuf *out, const char *module_name, guint32 first, guint32 k, const char *fname)
+{
+	WasmBuf sec, sub;
+	guint32 i;
+
+	wasm_buf_init (&sec);
+	wasm_name (&sec, "name");
+	wasm_buf_init (&sub);
+	wasm_name (&sub, module_name);
+	wasm_u8 (&sec, 0x00);
+	wasm_uleb (&sec, sub.len);
+	wasm_bytes (&sec, sub.data, sub.len);
+	wasm_buf_free (&sub);
+	wasm_buf_init (&sub);
+	wasm_uleb (&sub, k);
+	for (i = 0; i < k; ++i) {
+		wasm_uleb (&sub, first + i);
+		wasm_name (&sub, fname);
+	}
+	wasm_u8 (&sec, 0x01);
+	wasm_uleb (&sec, sub.len);
+	wasm_bytes (&sec, sub.data, sub.len);
+	wasm_buf_free (&sub);
+	emit_section (out, 0, &sec);
+	wasm_buf_free (&sec);
+}
+
+/*
  * A LAZY STUB BANK (MONO_WASM_JIT_LAZY_T1, mini-wasm-lazy.inc): k functions of the one functype `ft`, stub i
  * written into table slot f_slots [i] by an ACTIVE element segment -- so instantiating the bank on a worker is
  * exactly what makes those f-slots callable there, and nothing else ever has to install a stub.
@@ -998,6 +1032,7 @@ wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, co
 	}
 	emit_section (out, 10, &sec);
 	wasm_buf_free (&sec);
+	emit_stub_names (out, "wjlazybank", 4, k, "wj_lazy_stub");
 }
 
 void
