@@ -170,9 +170,30 @@ static gboolean missing_remsets;
 	} while (0)
 
 /*
+ * wasm fork (R479): sgen-scan-object.h's default case -- a descriptor type no object can have -- used to assert with no
+ * trace of the object, twice in ~25 Minecraft runs (j2d/w5/r2, w6/s3), the heap-corruption family R454x-R471 never found.
+ * Record its shape before the assert: aligned zeros, small integers or a stray pointer in the header each point somewhere
+ * different. Reads a few words either side of the object, which on wasm cannot fault.
+ */
+void
+sgen_report_bad_scan_desc (const char *start, mword desc)
+{
+	const mword *w = (const mword *)start;
+	char buf [640];
+	int i, n;
+
+	n = snprintf (buf, sizeof (buf), "SGEN_BAD_DESC obj=%p desc=0x%lx vtable_word=0x%lx in_nursery=%d words[-8..+15]:",
+		start, (unsigned long)desc, (unsigned long)w [0], sgen_ptr_in_nursery ((void*)start) ? 1 : 0);
+	for (i = -8; i < 16 && n > 0 && n < (int)sizeof (buf) - 12; ++i)
+		n += snprintf (buf + n, sizeof (buf) - n, "%s%lx", i == 0 ? " |" : " ", (unsigned long)w [i]);
+	g_warning ("%s", buf);
+}
+
+/*
  * Check that each object reference which points into the nursery can
  * be found in the remembered sets.
  */
+
 static void
 check_consistency_callback (GCObject *obj, size_t size, void *dummy)
 {

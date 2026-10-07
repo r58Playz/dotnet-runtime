@@ -1159,6 +1159,9 @@ void sgen_check_remset_consistency (void);
 void sgen_check_mod_union_consistency (void);
 void sgen_check_major_refs (void);
 void sgen_check_whole_heap (gboolean allow_missing_pinning);
+/* wasm fork (R479): the scanner met a descriptor type no object can have -- its header was overwritten. Logs the object,
+ * its first word and the words around it, then the caller asserts as before. */
+void sgen_report_bad_scan_desc (const char *start, mword desc);
 void sgen_check_whole_heap_stw (void)
 	MONO_PERMIT (need (sgen_gc_locked, sgen_stop_world));
 void sgen_check_objref (char *obj);
