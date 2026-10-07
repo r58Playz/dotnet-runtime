@@ -90,6 +90,7 @@ MONO_DISABLE_WARNING(4127) /* conditional expression is constant */
 		/*Nothing to do*/
 		break;
 	default:
+		sgen_report_bad_scan_desc ((const char*)start, desc);
 		g_assert_not_reached ();
 	}
 
