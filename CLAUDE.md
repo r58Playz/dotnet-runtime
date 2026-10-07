@@ -133,6 +133,13 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   (`[wasm-jit spin]`). **A shared spinlock is also the only thing that can put two DIFFERENT threads on
   the SAME ~22 bytes of generated code**, which is what R275 measured on the world-load hang — so this is
   the first thing to price against any "two threads at 92% CPU" reading.
+* **emscripten 3.1.56 can deadlock the MAIN thread on its own proxying lock (R479, fixed by backport).** `do_proxy` holds
+  the system queue's mutex across a malloc; a main-thread futex wait SPINS and yields into
+  `emscripten_proxy_execute_queue`, which re-locks that mutex. So a contended malloc at the moment main first proxies to a
+  thread (an async JSExport at boot) hangs the page with main at 100% and every worker asleep. Upstream fixed it in
+  21a3a81daf (#24565); FNA-WASM-Build's `emsdk.7.patch` backports it into the frozen emsdk, which needs `embuilder build
+  --force libc-mt libc-mt-debug` there. Proof a deploy carries it: the served wasm's `do_proxy` is 136 B, not 84. The
+  harness used to file this hang as a network `env` failure, from the last log line alone.
 * **Nothing that blocks properly is safe at those sites.** `mono_thread_info_sleep(ms>0)` does
   `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
   (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the
@@ -400,6 +407,12 @@ What exists now, and what each thing is worth:
   `wj_waiter_key` went with the islands, R367). `canon_subst` measures `wj_sync_inner_canon` at ~300/run; bind and
   the interpreter leg test `WjLazySlot.method` with `mono_wasm_jit_method_known_dead` first (`[wasm-jit lazy]
   dead=` must read 0). The root fix is to stop retaining, or to purge on `mono_mem_manager_free`; neither is done.
+* **A retained PAIR goes stale one half at a time (R479).** The freed-method set forgets an address when a new method
+  is created there -- correct for the method, but a registry entry's `logical_imethod` still names the OLD
+  InterpMethod (a DynamicMethod's lives in its `mp`, destroyed with it), so testing the method alone passed and the B4
+  planner read through freed memory four times. The set now also keys InterpMethod pointers (marked in
+  `interp_free_method`, revived at InterpMethod creation). **Test every retained pointer you are about to
+  dereference, not the one it was retained beside.**
 * **An instrumentation gap to fix before quoting those counters:** `WJC_BADMETH_SEEN` is an AGGREGATE
   over all sites, so `registry=0 profile=0` cannot distinguish "ran and caught nothing" from "never ran".
   Those two counters had no caller at all for months and read exactly the same then. A per-site
@@ -749,7 +762,9 @@ with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A
 **GL runs on the browser's main thread** (`?wj.WINK_GL_MAIN`, default 1; 0 = on the render worker with an
 OffscreenCanvas). The render thread only records GL calls -- Mesa's glthread -- and wink runs them, and WebGPU, on main.
 Uncapped, 2026-10-06 (j2d/w2k, n=2 per arm, a 20 s window 30 s after join): main 70.4 / 67.3 fps, worker 57.6 / 59.6;
-the render thread 32 M cycles a frame against 52. Three things make that true, and each is easy to undo:
+the render thread 32 M cycles a frame against 52. **2026-10-07, after R479's readback fix, Q60 window with Minecraft's
+limiter lifted: 169-185 fps, the client 18.7-20.6 M cycles a frame (j2d/w7, n=5), and the render thread ~93% of a core
+-- it, not GL, is the limiter now; 63% of it is JIT-tier Java.** Three things make that true, and each is easy to undo:
 
 * **Any GL call that returns a value or reads client memory is a round trip through main's event loop**, unless
   glthread handles it on the render thread: it COPIES client-array draws, buffer uploads over 8 KiB and client-memory
@@ -760,11 +775,20 @@ the render thread 32 M cycles a frame against 52. Three things make that true, a
 * **The canvas must not be transferred** in that mode: `scratchpad/mcsr/deploy.sh`'s post-publish patch decides it (the
   Makefile has a copy that deploy does NOT run) and must test `window.WINK_GL_MAIN`; deploy refuses without it.
 * **gex_wgpu keeps no CPU copy of a GPU buffer by default.** It adopts one only for indirect command buffers and buffers
-  of 16 KiB or less (`GEX_WGPU_ADOPT_SHADOW`): without it, every Sodium `glMultiDrawArraysIndirect` was a GPU readback.
-  Keep shadows that narrow -- they are wasm heap the managed side does not get.
+  of 64 KiB or less (`GEX_WGPU_ADOPT_SHADOW`): without it, every Sodium `glMultiDrawArraysIndirect` was a GPU readback.
+  **A readback on main stalls the render thread too**: main waits on the GPU while glthread's queue fills behind it. At
+  16 KiB, Sodium's ~16.5-17.5 KiB per-frame command buffer missed the rule -- one readback a frame cost 4.4 ms of every
+  ~12 ms frame as "blocked on a full queue" (R479; 83 -> 109 fps uncapped with only that fixed, 112 with the deeper
+  queue too -- single 20 s diags 30 s after join, so the 109/112 split is noise). The census line's `GPU readbacks a
+  frame on main` must read 0, and its `blocked ... on a full queue of N batches` should read ~0 (glthread's remote queue is
+  64 batches of 8 KiB; `WINK_GLTHREAD_BATCHES` puts the old 8 back). Keep shadows that narrow -- they are wasm heap the
+  managed side does not get.
 
-**The ~62 fps ceiling exists only in the headless harness** (OffscreenCanvas/BeginFrame pacing; Minecraft's limiter is 120
-and vsync is off). A headed browser follows the display. Compare GL configurations with `MC_UNCAPPED=1`.
+**The ~62 fps ceiling exists only in the headless harness** (OffscreenCanvas/BeginFrame pacing; vsync is off). A headed
+browser follows the display. Compare GL configurations with `MC_UNCAPPED=1`. **Past that, Minecraft's OWN limiter (the
+seed's `maxFps:120`) holds an uncapped run at ~112-120 fps**, with the render thread idle the rest of each frame:
+`?wj.IKVM_GAME_OPTIONS=maxFps:260` (ikvmcraft `IkvmWasm.cs`, rewrites options.txt lines at launch) lifts it. Below the
+limiter, read the render thread's cycles a frame, not fps.
 
 Traps: edits to the `emscripten-glfw` checkout need the patch regenerated (`git -C emscripten-glfw diff HEAD >
 emscripten-glfw.patch`) or `build-glfw.sh` refuses to build. wink's suite hangs with "no result" ~1 run in 4 in UPSTREAM
