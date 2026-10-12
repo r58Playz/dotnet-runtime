@@ -1030,6 +1030,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	  if (wj_edge_on) {
 		if (!wj_edge_buf)
 			wj_edge_buf = g_array_new (FALSE, FALSE, sizeof (WjEdge));
+			wj_thread_state_note ();   /* R484 */
 		g_array_set_size (wj_edge_buf, 0);
 	  } }
 #ifdef HOST_BROWSER

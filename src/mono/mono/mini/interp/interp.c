@@ -1318,8 +1318,17 @@ typedef struct _WjCallProfile {
 	guint32 n;
 	guint32 evicted;       /* HEAD block only: observations dropped because every block was full (R310) */
 	struct _WjCallProfile *next;   /* R311: the next block of this caller's chain, NULL at the end */
-	WjProfSite sites [WJ_PROF_MAX_SITES];
+	guint32 cap;           /* R484: this block's site slots, set before the block is published and never changed */
+	WjProfSite sites [MONO_ZERO_LEN_ARRAY];
 } WjCallProfile;
+
+/* R484: blocks are sized by wj_prof_next_cap, not fixed at WJ_PROF_MAX_SITES. Most callers record one or two sites,
+ * and a full 12-site block (~1.4 KB) for each of them was 47 MiB of mempool on the 1.16.1 plateau (R483). With
+ * MONO_WASM_JIT_PROF_SMALL the head block holds WJ_PROF_HEAD_SITES, the second completes the first
+ * WJ_PROF_MAX_SITES, and later blocks hold WJ_PROF_MAX_SITES -- so a chain still holds exactly
+ * mono_wasm_jit_prof_blocks x WJ_PROF_MAX_SITES sites, appended in the same order and evicted at the same point:
+ * the profile the emitter reads is unchanged. The cost is a second block walk for callers with 3-12 sites. */
+#define WJ_PROF_HEAD_SITES 2
 
 /* MONO_WASM_JIT_DEVIRT_PROFILE=1: collect the profile above. Default off until the consumer lands.
  * DEFINED IN mini-wasm.c, not here: mono_wasm_jit_auto_init reads it, and mini-wasm.c is linked into
@@ -1336,8 +1345,11 @@ static gint32 wj_prof_methods;    /* callers that allocated a profile */
 static gint32 wj_prof_evicted;    /* observations dropped because a caller hit WJ_PROF_MAX_SITES */
 static gint32 wj_prof_jit_samples;/* of which came from the JITTED code's IC miss rather than the interp */
 static gint32 wj_prof_ids_reused; /* site_id handed back to a re-emission instead of freshly allocated */
+static gint32 wj_prof_nblocks;    /* R484: profile blocks allocated (head and chained) */
+static gint64 wj_prof_bytes;      /* R484: bytes those blocks took from the methods' mempools */
 
-/* Field: 0 = samples, 1 = sites, 2 = methods, 3 = evicted, 4 = post-JIT samples, 5 = site ids reused. */
+/* Field: 0 = samples, 1 = sites, 2 = methods, 3 = evicted, 4 = post-JIT samples, 5 = site ids reused, 6 = blocks,
+ * 7 = block KiB. */
 EMSCRIPTEN_KEEPALIVE int
 mono_wasm_jit_prof_stat (int field)
 {
@@ -1348,6 +1360,8 @@ mono_wasm_jit_prof_stat (int field)
 	case 3: return wj_prof_evicted;
 	case 4: return wj_prof_jit_samples;
 	case 5: return wj_prof_ids_reused;
+	case 6: return wj_prof_nblocks;                        /* R484 */
+	case 7: return (int) (wj_prof_bytes >> 10);            /* R484: KiB */
 	default: return -1;
 	}
 }
@@ -1379,6 +1393,41 @@ wj_prof_note_identity (WjProfSite *s, gpointer identity, MonoMethod *target)
 	s->ids [s->nids++] = identity;
 }
 
+/* R484: the site capacity of the next block of a chain whose blocks already hold `used_cap` slots; 0 when the
+ * chain is at its full mono_wasm_jit_prof_blocks x WJ_PROF_MAX_SITES. */
+static guint32
+wj_prof_next_cap (guint32 used_cap)
+{
+	extern int mono_wasm_jit_prof_blocks, mono_wasm_jit_prof_small;
+	guint32 total = (guint32) mono_wasm_jit_prof_blocks * WJ_PROF_MAX_SITES, want;
+
+	if (used_cap >= total)
+		return 0;
+	if (!mono_wasm_jit_prof_small)
+		want = WJ_PROF_MAX_SITES;
+	else if (used_cap == 0)
+		want = WJ_PROF_HEAD_SITES;
+	else if (used_cap < WJ_PROF_MAX_SITES)
+		want = WJ_PROF_MAX_SITES - used_cap;   /* complete the first WJ_PROF_MAX_SITES */
+	else
+		want = WJ_PROF_MAX_SITES;
+	return MIN (want, total - used_cap);
+}
+
+static WjCallProfile *
+wj_prof_alloc_block (InterpMethod *caller, guint32 cap)
+{
+	gsize sz = G_STRUCT_OFFSET (WjCallProfile, sites) + (gsize) cap * sizeof (WjProfSite);
+	WjCallProfile *p = (WjCallProfile *) m_method_alloc0 (caller->method, (guint) sz);
+
+	if (p) {
+		p->cap = cap;   /* before the CAS that publishes the block */
+		mono_atomic_inc_i32 (&wj_prof_nblocks);
+		mono_atomic_add_i64 (&wj_prof_bytes, (gint64) sz);
+	}
+	return p;
+}
+
 /* This caller's profile block, allocating it on first use. NULL only if the allocation failed. */
 static WjCallProfile *
 wj_prof_block (InterpMethod *caller)
@@ -1386,7 +1435,7 @@ wj_prof_block (InterpMethod *caller)
 	WjCallProfile *p = (WjCallProfile *) caller->wasm_jit_profile;
 
 	if (!p) {
-		p = (WjCallProfile *) m_method_alloc0 (caller->method, sizeof (WjCallProfile));
+		p = wj_prof_alloc_block (caller, wj_prof_next_cap (0));
 		if (!p)
 			return NULL;
 		/* Benign race: a concurrent recorder may install its own and we leak this one into the
@@ -1431,8 +1480,7 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
 {
 	extern int mono_wasm_jit_prof_blocks;
 	WjCallProfile *head, *p, *last = NULL;
-	guint32 i, n;
-	int depth = 0;
+	guint32 i, n, used_cap = 0;
 
 	if (!caller || !base)
 		return NULL;
@@ -1447,32 +1495,35 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
 		 * needs; the writer keeps its barrier before publishing n. This was a full mono_memory_barrier per
 		 * block -- wasm atomic.fence, an mfence on x64 -- on every interpreted virtual call (R314/L3). */
 		n = (guint32) mono_atomic_load_i32 ((volatile gint32 *) &p->n);
-		if (n > WJ_PROF_MAX_SITES)
-			n = WJ_PROF_MAX_SITES;
+		if (n > p->cap)
+			n = p->cap;
 		for (i = 0; i < n; ++i)
 			if (p->sites [i].base == base && p->sites [i].kind == (guint8) kind)
 				return &p->sites [i];
 		last = p;
-		depth++;
+		used_cap += p->cap;
 	}
 	if (!create)
 		return NULL;
 	p = last;
-	if (p->n >= WJ_PROF_MAX_SITES) {
+	if (p->n >= p->cap) {
 		WjCallProfile *nb;
-		if (depth >= mono_wasm_jit_prof_blocks) {
+		guint32 cap = wj_prof_next_cap (used_cap);
+		if (!cap) {
 			wj_prof_evicted++;                /* every block full: ignore further callees rather than thrash */
 			wj_prof_note_capped (caller, head, base);
 			return NULL;
 		}
 		/* Same benign race as wj_prof_block: a losing block leaks into the method's mempool. */
-		nb = (WjCallProfile *) m_method_alloc0 (caller->method, sizeof (WjCallProfile));
+		nb = wj_prof_alloc_block (caller, cap);
+		if (!nb)
+			return NULL;
 		if (mono_atomic_cas_ptr ((gpointer *) &p->next, nb, NULL) != NULL)
 			nb = p->next;
 		else if (G_UNLIKELY (mono_wasm_jit_stats))
 			mono_wasm_jit_count (WJC_PROF_BLOCK_GROW);
 		p = nb;
-		if (p->n >= WJ_PROF_MAX_SITES)
+		if (p->n >= p->cap)
 			return NULL;                      /* a racing appender filled it first; a later observation walks on */
 	}
 	i = p->n;
@@ -1924,9 +1975,10 @@ mono_wasm_jit_prof_full (gpointer caller_ptr)
 	extern int mono_wasm_jit_prof_blocks;
 	InterpMethod *caller = (InterpMethod *) caller_ptr;
 	WjCallProfile *p = caller ? (WjCallProfile *) caller->wasm_jit_profile : NULL;
-	int depth = 0;
+	guint32 used_cap = 0;
 	for (; p; p = p->next) {
-		if (++depth >= mono_wasm_jit_prof_blocks && p->n >= WJ_PROF_MAX_SITES)
+		used_cap += p->cap;
+		if (used_cap >= (guint32) mono_wasm_jit_prof_blocks * WJ_PROF_MAX_SITES && p->n >= p->cap)
 			return TRUE;
 		if (!p->next)
 			return FALSE;
@@ -2344,6 +2396,9 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 			if (!wj_vcall_pic)
 				memset (blk, 0, pre);
 			wj_vcall_pic = (WjLocalVcallPicEntry *) (blk + pre);
+#if HOST_BROWSER
+			{ extern void mono_wasm_jit_thread_state_note (void); mono_wasm_jit_thread_state_note (); }   /* R484 */
+#endif
 		}
 		memset ((guint8 *) wj_vcall_pic + oldbytes, 0, nbytes - oldbytes);
 		/* Publish the pointer before the capacity. Generated wasm reads cap first and only dereferences
@@ -3089,6 +3144,9 @@ wj_delegate_pic_for_site (gpointer ic, gboolean grow)
 		nbytes = (gsize) ncap * mono_wasm_jit_vcall_ways * sizeof (WjLocalDelegatePicEntry);
 		wj_delegate_pic = (WjLocalDelegatePicEntry *) g_realloc (wj_delegate_pic, nbytes);
 		memset ((guint8 *) wj_delegate_pic + oldbytes, 0, nbytes - oldbytes);
+#if HOST_BROWSER
+		{ extern void mono_wasm_jit_thread_state_note (void); mono_wasm_jit_thread_state_note (); }   /* R484 */
+#endif
 		/* Pointer before capacity, same as the vcall PIC: generated code reads cap first and only
 		 * dereferences the pointer for a site the cap admits. */
 		mono_memory_barrier ();
@@ -6897,6 +6955,9 @@ mono_wasm_jit_vcall_miss_frame_acquire (void)
 			(gsize) ncap * sizeof (guint8 *));
 		memset (wj_vcall_miss_frames + oldcap, 0, (gsize) (ncap - oldcap) * sizeof (guint8 *));
 		wj_vcall_miss_frame_cap = ncap;
+#if HOST_BROWSER
+		{ extern void mono_wasm_jit_thread_state_note (void); mono_wasm_jit_thread_state_note (); }   /* R484 */
+#endif
 	}
 	if (G_UNLIKELY (!wj_vcall_miss_frames [depth])) {
 		guint8 *frame = (guint8 *) g_malloc0 (WJ_SCRATCH_SIZE);
@@ -8102,10 +8163,75 @@ static inline WjVcallMemo *
 wj_vcall_memo_at (gpointer ic, MonoVTable *vt)
 {
 	guint32 h = ((guint32) (gsize) ic * 0x9E3779B1u) ^ ((guint32) (gsize) vt * 0x85EBCA77u);
-	if (G_UNLIKELY (!wj_vcall_memo))
+	if (G_UNLIKELY (!wj_vcall_memo)) {
 		wj_vcall_memo = (WjVcallMemo *) g_malloc0 (sizeof (WjVcallMemo) << WJ_VCALL_MEMO_BITS);
+#if HOST_BROWSER
+		{ extern void mono_wasm_jit_thread_state_note (void); mono_wasm_jit_thread_state_note (); }   /* R484 */
+#endif
+	}
 	return &wj_vcall_memo [h >> (32 - WJ_VCALL_MEMO_BITS)];
 }
+
+#if HOST_BROWSER
+/* R484: free this pthread's interpreter-side JIT dispatch state -- both PICs, the vcall memo and the vcall-miss
+ * frames (deregistering their GC roots) -- and return the bytes released. Called from mini-wasm.c's pthread-exit
+ * destructor (MONO_WASM_JIT_THREAD_FREE), on the exiting thread; all of it is __thread and read only by its owner.
+ * Pointers and capacities are reset, so anything that still runs on this thread afterwards sees empty state and
+ * reallocates. */
+gint64
+mono_wasm_jit_interp_thread_free (void)
+{
+	extern guint32 mono_wasm_jit_usable_size (const void *p);
+	extern void mono_wasm_jit_free_note (const void *p, guint32 usable, const char *tag);
+	extern guint32 mono_wasm_jit_alloc_size (const void *p);   /* the ungated size, for the byte count */
+	gint64 bytes = 0;
+	guint32 us;
+
+	if (wj_vcall_pic) {
+		guint8 *blk = (guint8 *) wj_vcall_pic - mono_wasm_jit_mcache_prefix ();
+		wj_vcall_pic_cap = 0;
+		mono_memory_barrier ();
+		wj_vcall_pic = NULL;
+		us = mono_wasm_jit_usable_size (blk);
+		mono_wasm_jit_free_note (blk, us, "thread_exit_vpic");
+		bytes += mono_wasm_jit_alloc_size (blk);
+		g_free (blk);
+	}
+	if (wj_delegate_pic) {
+		gpointer blk = wj_delegate_pic;
+		wj_delegate_pic_cap = 0;
+		mono_memory_barrier ();
+		wj_delegate_pic = NULL;
+		us = mono_wasm_jit_usable_size (blk);
+		mono_wasm_jit_free_note (blk, us, "thread_exit_dpic");
+		bytes += mono_wasm_jit_alloc_size (blk);
+		g_free (blk);
+	}
+	if (wj_vcall_memo) {
+		gpointer blk = wj_vcall_memo;
+		wj_vcall_memo = NULL;
+		us = mono_wasm_jit_usable_size (blk);
+		mono_wasm_jit_free_note (blk, us, "thread_exit_memo");
+		bytes += mono_wasm_jit_alloc_size (blk);
+		g_free (blk);
+	}
+	if (wj_vcall_miss_frames && wj_vcall_miss_frame_depth == 0) {
+		for (gint32 i = 0; i < wj_vcall_miss_frame_cap; i++) {
+			guint8 *frame = wj_vcall_miss_frames [i];
+			if (!frame)
+				continue;
+			mono_gc_deregister_root ((char *) frame);
+			bytes += mono_wasm_jit_alloc_size (frame);
+			g_free (frame);
+		}
+		bytes += mono_wasm_jit_alloc_size (wj_vcall_miss_frames);
+		g_free (wj_vcall_miss_frames);
+		wj_vcall_miss_frames = NULL;
+		wj_vcall_miss_frame_cap = 0;
+	}
+	return bytes;
+}
+#endif
 
 #if HOST_BROWSER
 /* plan typed-spindle C1: a COMPACT virtual call site's way-0 miss, entered from its shared slow-path stub

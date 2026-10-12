@@ -504,6 +504,18 @@ mono_wasm_jit_dump_stats (void)
 		WJC_(WJC_ACT_PUB_RERAISE_MAX),
 		WJC_(WJC_RETIRE_SPINS), WJC_(WJC_RETIRE_SPIN_MAX), WJC_(WJC_RETIRE_TRYLOCK_MISS),
 		WJC_(WJC_REEMIT_Q_SPINS), WJC_(WJC_REEMIT_Q_SPIN_MAX));
+	/* R484: the JIT tier's own memory levers. thread_free threads/bytes = pthread exits whose per-thread JIT state was
+	 * released (0 with MONO_WASM_JIT_THREAD_FREE=1 and threads having exited means the destructor never ran); prof
+	 * blocks/KiB = call-profile storage (MONO_WASM_JIT_PROF_SMALL sizes it to need). */
+	{
+		extern gint32 mono_wasm_jit_thread_free_count;
+		extern gint64 mono_wasm_jit_thread_free_bytes;
+		int mono_wasm_jit_prof_stat (int field);
+		printf ("[wasm-jit memory] thread_free=%d threads=%d bytes=%lld | prof small=%d blocks=%d KiB=%d methods=%d sites=%d\n",
+			mono_wasm_jit_thread_free, mono_wasm_jit_thread_free_count, (long long) mono_wasm_jit_thread_free_bytes,
+			mono_wasm_jit_prof_small, mono_wasm_jit_prof_stat (6), mono_wasm_jit_prof_stat (7),
+			mono_wasm_jit_prof_stat (2), mono_wasm_jit_prof_stat (1));
+	}
 	/* The mandatory-replacement chain, end to end. Every step must be readable or "re-emission works" is
 	 * an assertion: requested (IKVM body swaps + profile triggers) -> compiled -> republished -> adopted,
 	 * with the three ways a mandatory one can be lost broken out. */
