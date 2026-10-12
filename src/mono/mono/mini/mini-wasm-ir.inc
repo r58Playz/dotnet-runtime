@@ -3588,6 +3588,7 @@ wj_asm_reaches (int from_desc, int target_fslot)
 		memset (wj_reach_stamp + wj_reach_cap, 0, sizeof (guint32) * (gsize) (ncap - wj_reach_cap));
 		wj_reach_stack = (int *) g_realloc (wj_reach_stack, sizeof (int) * (gsize) ncap);
 		wj_reach_cap = ncap;
+		wj_thread_state_note ();   /* R484 */
 	}
 	/* Stamped rather than cleared: clearing a 24k-entry array per call site would cost more than the walk. */
 	if (++wj_reach_gen == 0) {

@@ -26,6 +26,14 @@
 static int mono_wasm_debug_level = 0;
 #ifndef DISABLE_JIT
 
+/* R484 (MONO_WASM_JIT_THREAD_FREE): arm this pthread's exit-time free of its per-thread JIT state. Called at every
+ * allocation of that state; defined after the .inc files, where every array it frees is declared. */
+#ifdef HOST_BROWSER
+static void wj_thread_state_note (void);
+#else
+static inline void wj_thread_state_note (void) {}
+#endif
+
 #include "ir-emit.h"
 #include "cpu-wasm.h"
 #include "wasm-encoder.h"
@@ -695,6 +703,12 @@ int mono_wasm_jit_prof_inlinee = 1;
 /* MONO_WASM_JIT_PROF_BLOCKS: how many WJ_PROF_MAX_SITES-site profile blocks one caller may chain; 1 is the
  * old fixed cap. See R311. */
 int mono_wasm_jit_prof_blocks = 4;
+/* MONO_WASM_JIT_PROF_SMALL: size profile blocks to need (a 2-site head block, then up to the same chain capacity)
+ * instead of a fixed 12-site block per caller. The recorded profile is identical either way. See R484. */
+int mono_wasm_jit_prof_small = 1;
+/* MONO_WASM_JIT_THREAD_FREE: free a pthread's per-thread JIT state (slot bitmaps, descriptor arrays, PICs, memo)
+ * when it exits. Without it every exited pthread's arrays stay allocated with nothing pointing at them. See R484. */
+int mono_wasm_jit_thread_free = 1;
 /* MONO_WASM_JIT_LEAN_TRY_INVOKE: the interpreter's call hook (WASM_JIT_TRY_INVOKE) calls wasm_jit_maybe_compile only
  * when the callee is still compile-eligible or JIT work is pending, instead of on every interpreted call. */
 int mono_wasm_jit_lean_try_invoke = 1;
@@ -1044,6 +1058,8 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_pred_mid; const char *v = g_getenv ("MONO_WASM_JIT_PRED_MID"); if (v && *v) mono_wasm_jit_pred_mid = *v != '0'; }
 	{ extern int mono_wasm_jit_prof_inlinee; const char *v = g_getenv ("MONO_WASM_JIT_PROF_INLINEE"); if (v && *v) mono_wasm_jit_prof_inlinee = *v != '0'; }
 	{ extern int mono_wasm_jit_prof_blocks; const char *v = g_getenv ("MONO_WASM_JIT_PROF_BLOCKS"); if (v && *v) { int n = atoi (v); mono_wasm_jit_prof_blocks = (n >= 1 && n <= 16) ? n : 1; } }
+	{ const char *v = g_getenv ("MONO_WASM_JIT_PROF_SMALL"); if (v && *v) mono_wasm_jit_prof_small = atoi (v) ? 1 : 0; }
+	{ const char *v = g_getenv ("MONO_WASM_JIT_THREAD_FREE"); if (v && *v) mono_wasm_jit_thread_free = atoi (v) ? 1 : 0; }
 	{ extern int mono_wasm_jit_lean_try_invoke; const char *v = g_getenv ("MONO_WASM_JIT_LEAN_TRY_INVOKE"); if (v && *v) mono_wasm_jit_lean_try_invoke = *v != '0'; }
 	{ extern int mono_wasm_jit_ic_remat; const char *v = g_getenv ("MONO_WASM_JIT_IC_REMAT"); if (v && *v) mono_wasm_jit_ic_remat = *v != '0'; }
 	{ extern int mono_wasm_jit_inline_calls; const char *v = g_getenv ("MONO_WASM_JIT_INLINE_CALLS"); if (v && *v) mono_wasm_jit_inline_calls = *v != '0'; }
@@ -1967,6 +1983,7 @@ wj_realloc_noted (gpointer old, gsize n, const char *tag)
 	gpointer p = g_realloc (old, n);
 	if (os && p != old)
 		mono_wasm_jit_free_note (old, os, tag);
+	wj_thread_state_note ();   /* R484: every caller is a __thread array */
 	return p;
 }
 static __thread guint8 *wj_slot_live = NULL;
@@ -3771,6 +3788,7 @@ mono_wasm_jit_census_note_entry (int eslot)
 		wj_census_seen = (guint32 *) g_malloc0 ((WJ_CENSUS_SLOTS / 32) * sizeof (guint32));
 		if (!wj_census_seen)
 			return;
+		wj_thread_state_note ();
 	}
 	word = (guint32) eslot >> 5;
 	bit = 1u << ((guint32) eslot & 31);
@@ -4496,6 +4514,7 @@ wj_clo_ensure (int need)
 	if (wj_clo_cap < need)
 		wj_clo_cap = need;
 	wj_clo_list = (int *) g_realloc (wj_clo_list, sizeof (int) * (gsize) wj_clo_cap);
+	wj_thread_state_note ();
 }
 static __thread guint32 *wj_inst_stamp;
 static __thread int      wj_inst_cap;
@@ -4513,6 +4532,7 @@ wj_inst_stamp_ensure (int id)
 		wj_inst_stamp = (guint32 *) g_realloc (wj_inst_stamp, sizeof (guint32) * (gsize) ncap);
 		memset (wj_inst_stamp + wj_inst_cap, 0, sizeof (guint32) * (gsize) (ncap - wj_inst_cap));
 		wj_inst_cap = ncap;
+		wj_thread_state_note ();
 	}
 }
 
@@ -6583,6 +6603,90 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 #include "mini-wasm-vslow.inc"
 #include "mini-wasm-emitter.inc"
 #include "mini-wasm-lazy.inc"
+
+#ifdef HOST_BROWSER
+/*
+ * R484: free a pthread's per-thread JIT state when it exits (MONO_WASM_JIT_THREAD_FREE).
+ *
+ * All of it is __thread, read and written only by its owner, and nothing else holds the arrays: JIT instances and the
+ * jiterpreter's per-worker cell hold the ADDRESS of the __thread variable (inside the TLS block, freed by emscripten
+ * when the pthread exits; R293), never the array. Before this, every exited pthread's arrays stayed allocated with
+ * nothing pointing at them -- 122.7 of 194 MiB of this state at the 1.16.1 window belonged to no live thread (R481).
+ *
+ * Runs as a pthread-key destructor, on the exiting thread with its TLS still valid. Pointers and capacities are reset,
+ * so code a later destructor runs on this thread sees empty state and reallocates (and stays unfreed: the key's value
+ * is consumed).
+ */
+gint32 mono_wasm_jit_thread_free_count;   /* pthreads whose state was freed */
+gint64 mono_wasm_jit_thread_free_bytes;   /* bytes those frees released */
+static pthread_key_t wj_tfree_key;
+static pthread_once_t wj_tfree_once = PTHREAD_ONCE_INIT;
+static __thread gboolean wj_tfree_armed;
+gint64 mono_wasm_jit_interp_thread_free (void);   /* interp.c */
+
+/* The real allocation size for accounting. mono_wasm_jit_usable_size is 0 unless MONO_WASM_JIT_BYTES_CHECK is on:
+ * it feeds the R471 free ring, which is gated, and must not be reused as a byte count. */
+guint32
+mono_wasm_jit_alloc_size (const void *p)
+{
+	return p ? (guint32) malloc_usable_size ((void *) p) : 0;
+}
+
+static void
+wj_thread_state_free (void *unused)
+{
+	gint64 bytes = 0;
+#define WJ_TFREE(p) do { if (p) { bytes += mono_wasm_jit_alloc_size (p); \
+		mono_wasm_jit_free_note ((p), mono_wasm_jit_usable_size (p), "thread_exit"); g_free (p); (p) = NULL; } } while (0)
+	wj_slot_live_cap = 0; wj_slot_installed_cap = 0; wj_slot_payload_cap = 0; wj_desc_state_cap = 0;
+	wj_clo_cap = 0; wj_clo_n = 0; wj_inst_cap = 0; wj_reach_cap = 0;
+	mono_memory_barrier ();
+	WJ_TFREE (wj_slot_live);
+	WJ_TFREE (wj_slot_installed);
+	WJ_TFREE (wj_slot_payload);
+	WJ_TFREE (wj_desc_state);
+	WJ_TFREE (wj_desc_generation);
+	WJ_TFREE (wj_desc_permfail);
+	WJ_TFREE (wj_clo_list);
+	WJ_TFREE (wj_inst_stamp);
+	WJ_TFREE (wj_census_seen);
+	WJ_TFREE (wj_reach_stamp);
+	WJ_TFREE (wj_reach_stack);
+#undef WJ_TFREE
+	if (wj_edge_buf) {
+		g_array_free (wj_edge_buf, TRUE);
+		wj_edge_buf = NULL;
+	}
+	bytes += mono_wasm_jit_interp_thread_free ();
+	mono_atomic_inc_i32 (&mono_wasm_jit_thread_free_count);
+	mono_atomic_add_i64 (&mono_wasm_jit_thread_free_bytes, bytes);
+	if (G_UNLIKELY (mono_wasm_jit_verbose))
+		printf ("[wasm-jit thread-free] pthread exit released %lld B of per-thread JIT state\n", (long long) bytes);
+}
+
+static void
+wj_tfree_key_init (void)
+{
+	pthread_key_create (&wj_tfree_key, wj_thread_state_free);
+}
+
+static void
+wj_thread_state_note (void)
+{
+	if (G_LIKELY (wj_tfree_armed) || !mono_wasm_jit_thread_free)
+		return;
+	wj_tfree_armed = TRUE;
+	pthread_once (&wj_tfree_once, wj_tfree_key_init);
+	pthread_setspecific (wj_tfree_key, (void *) 1);
+}
+
+/* For interp.c's per-thread allocations (PICs, memo, miss frames). */
+void
+mono_wasm_jit_thread_state_note (void)
+{
+	wj_thread_state_note ();
+}
+#endif
 
 #endif // DISABLE_JIT
 
