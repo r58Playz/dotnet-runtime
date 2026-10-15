@@ -5670,8 +5670,17 @@ mono_metadata_type_hash (MonoType *t1)
 		 * This is specially problematic with generic instances since they are
 		 * inserted in a bunch of hash tables before been finished.
 		 */
-		if (image_is_dynamic (m_class_get_image (klass)))
-			return ((m_type_is_byref (t1) ? 1 : 0) << 6) | m_class_get_name_hash (klass);
+		if (image_is_dynamic (m_class_get_image (klass))) {
+			/* Not the type (CLASS/VALUETYPE can still change), but the TypeDef token: fixed when the TypeBuilder is set
+			 * up (sre.c), unique in its module, and the same for every type equal to this one. The short name alone
+			 * gave every nested helper IKVM names alike (IndyCallSite0, MethodHandleConstant3, CallerID, ... one per
+			 * class) the SAME hash, and the reflection type table then probed runs of them (wasm JIT findings R493).
+			 * An array type stays an array type, so SZARRAY is told apart from its element too. */
+			guint h = m_class_get_name_hash (klass) ^ (m_class_get_type_token (klass) * 2654435761u);
+			if (t1->type == MONO_TYPE_SZARRAY)
+				h ^= 0x5bd1e995u;
+			return h ^ (m_type_is_byref (t1) ? 0x40u : 0u);
+		}
 		return ((hash << 5) - hash) ^ m_class_get_name_hash (klass);
 	}
 	case MONO_TYPE_PTR:
