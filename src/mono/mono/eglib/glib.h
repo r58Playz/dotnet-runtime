@@ -316,9 +316,6 @@ typedef struct {
 
 void g_mem_set_vtable (GMemVTable* vtable);
 void g_mem_get_vtable (GMemVTable* vtable);
-/* MONO_FREE_QUARANTINE_MB, browser-only diagnostic (gmem.c); a no-op elsewhere. */
-void g_mem_quarantine_init (void);
-extern void (*g_mem_quarantine_hit_hook) (void *p, size_t size);
 
 /*
  * Misc.
