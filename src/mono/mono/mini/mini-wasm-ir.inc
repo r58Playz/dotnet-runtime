@@ -3612,6 +3612,12 @@ wj_asm_reaches (int from_desc, int target_fslot)
 			d = wj_desc_for_fslot (ds->slot [i]);
 			if (d <= 0 || d > wj_reg_n)
 				continue;
+			/* wj_reg_n is live and the stamp array was sized from its value at entry: a descriptor registered by
+			 * another thread during this walk can lie past the end. Unknown means reachable (R489). */
+			if (G_UNLIKELY (d > wj_reach_cap)) {
+				mono_wasm_jit_counters [WJC_REACH_OOB]++;
+				return TRUE;
+			}
 			if (wj_reach_stamp [d - 1] == wj_reach_gen)
 				continue;
 			wj_reach_stamp [d - 1] = wj_reach_gen;

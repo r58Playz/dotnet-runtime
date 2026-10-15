@@ -4397,6 +4397,15 @@ wj_admit_install_only (int desc_id, WjRegEntry *re, WjBatchDesc *snap_batch, voi
 	double ms = 0;
 	guint32 gen;
 
+	/* The closure walk reaches dependencies and batch members, not just the root its caller ensured, and a
+	 * republished descriptor keeps its old id while its callees register after it -- so desc_id can be past this
+	 * pthread's arrays, and every wj_desc_generation store below would land beyond them (R489). */
+	if (G_UNLIKELY (desc_id >= wj_desc_state_cap)) {
+		mono_wasm_jit_counters [WJC_DESC_GROW]++;
+		if (G_UNLIKELY (mono_wasm_jit_verbose))
+			printf ("[wasm-jit desc-grow] desc=%d cap=%d reg_n=%d gen=%u\n", desc_id, wj_desc_state_cap, (int) wj_reg_n, re->generation);
+		wj_desc_state_ensure (desc_id + 1);
+	}
 	/* Never re-instantiate a descriptor that has lost its slot: its module's exports would land on top of
 	 * whoever owns those slots now. */
 	if (G_UNLIKELY (re->orphaned)) {

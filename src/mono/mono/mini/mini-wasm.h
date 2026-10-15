@@ -1446,6 +1446,8 @@ enum {
 	WJC_GI_LATE_RETRY_OK,        /* S2: a late cost refusal of a guarded inline, retried with nesting off, inlined */
 	WJC_GI_LATE_RETRY_FAIL,      /* ... and refused again (the two sum to the retries; each is a late refusal too) */
 	WJC_B4_DEAD_SKIP,            /* R476: the B4 planner skipped a registry entry whose method is in the freed-method set */
+	WJC_DESC_GROW,               /* R489: closure installs whose descriptor was past this pthread's desc arrays (grown first; each was a store past their end) */
+	WJC_REACH_OOB,               /* R489: reach walks that met a descriptor past their stamp array (answered "reachable") */
 	WJC_MAX
 };
 
