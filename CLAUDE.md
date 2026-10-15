@@ -1063,7 +1063,7 @@ nameless, which is the whole reason the round ended undiagnosed.
 ONE L1 miss, touching exactly two data addresses: dlmalloc's walk advances by each chunk's size field, so a header
 whose size reads 0 is walked forever -- holding dlmalloc's global lock, which is why every allocating worker then sits in
 `__futex_wait` and the app goes quiet. So the hang is a DETECTOR: the real bug is whatever zeroes a malloc chunk header.
-Stopping the poll removes the hang; finding the corruption is separate. The paragraph below predates this.
+Stopping the poll removes the hang; the corruption was found separately (R489, below). The paragraph below predates this.
 
 **With the poll gone the corruption surfaces as MODULE BYTES that change after validation (R462, R464).** A group module
 ("memory index exceeds number of declared memories") and a lazy bank ("invalid value type 0xb9") failed V8 validation
@@ -1086,7 +1086,25 @@ live or dead, or a freed JIT block (`MONO_WASM_JIT_BYTES_CHECK=1` prints `WASM_J
 had none). **A cluster, not a rate:** 6 of 12 runs faulted between 20:07 and 21:59 on 2026-10-05 across three deploys, then 0
 of 61 since on two binaries -- including 12 of 12 clean on the exact binary that had faulted 3 of 6 (R471, j2d/s22). It
 first read as "J3 raised the rate"; that is retracted. Something about that window mattered and was not recorded (the
-driver keeps no fps or display state); the corruption itself (R454x/R462) predates J3 and is not found.
+driver keeps no fps or display state); the corruption itself (R454x/R462) predates J3. Found in R489:
+
+**THE WRITER (R489): `wj_admit_install_only` stored `wj_desc_generation [desc_id]` without growing the per-pthread desc
+arrays.** The install-closure walk reaches every dependency and batch member of the admission root, and only the root was
+ensured; a republished descriptor keeps its old id while its callees register after it, so the walk met ids past the
+pthread's capacity and wrote their batch GENERATIONS (small, growing integers; zeros for generation 0; runs of one value
+across a batch's consecutive ids) `(desc_id - cap) * 4` bytes past the array's end, into module bytes, chunk links,
+mempools and sgen headers -- the faces above. Same binary, h2's config: bound on 0 of 5 runs with stray writes, bound
+off 3 of 6 with up to 1,750 past-the-end stores a run, and the stray values ARE the generations the detector printed.
+Now unconditional, counted as `[wasm-jit bounds] desc_grow=` (small and non-zero is normal). **The rule it breaks: an
+array indexed by a GLOBAL id (descriptor, slot) is sized per pthread, so every WRITE ensures it -- not the walk's entry.**
+**The instrument that found it, for the next one -- REMOVED, restore with `git revert b5779c96628`** (it re-applies
+763ae3c1686): `MONO_FREE_QUARANTINE_MB=256` (eglib `gmem.c`, browser only, default off) poisons
+every `g_free`d block (and growing `g_realloc`'s old one), holds it until 256 MB of later frees push it out, and reports a
+block written meanwhile as `FREE_QUARANTINE_HIT` with the changed words, its first 8 words from BEFORE the free (they name
+the object), freer/evictor and ms timestamps, then `WASM_JIT_COUNTERS_AT_HIT` and the R471 owner report. Read the VALUES:
+they named this writer when four rounds of reading code had not. It costs memory (h4 run 1 peaked at 7.6 GB VmData; no
+baseline run without it was taken), and a stale READ of a block it holds sees poison (`0xA5C3E1F7`) -- h4 run 1's
+`class-accessors.c:93` assert during a RuntimeResolve is probably one (not verified).
 
 **Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
 The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
