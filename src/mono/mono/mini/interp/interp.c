@@ -4140,6 +4140,15 @@ wj_reemit_flush (void)
 	 * A batch holding a body swap is held to MONO_WASM_JIT_MANDATORY_INTERVAL_MS instead (plan H3). That floor is
 	 * still a floor, and the batch-full arm still cannot bypass it; whether its default brings the boot wedge
 	 * back is what H3's worldwait gate reads (boot and world.generate duration, R401). */
+	/* READ THE CLOCK ONE VISIT IN 64. mono_msec_ticks is performance.now() through JS, and while a partial batch waits out
+	 * its interval every visit -- every interpreted call and IC miss on every thread -- came here: 1.4 s of the boot's
+	 * critical path and 11.5% of worker CPU during world generation (R487, R492). The broker runs under
+	 * wj_reemit_draining, so the counter needs no atomics; a publication is late by at most 63 visits. */
+	{
+		static guint32 visits;
+		if (last_ms && (++visits & 63))
+			return 0;
+	}
 	now = (gint64) mono_msec_ticks ();
 	if (last_ms && (now - last_ms) < (gint64) (wj_reemit_batch_mandatory ? mono_wasm_jit_mandatory_interval : mono_wasm_jit_reemit_interval))
 		return 0;
@@ -12119,9 +12128,18 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
 			    /* wj_entry_edges was ALSO gated on BATCH_MODULE==1 for the auto planner, which is gone. \
 			     * Stats alone now, which is the only consumer left (mono_wasm_jit_dump_hot_edges). */ \
 			    wj_edge_bump (frame->imethod, cmethod); } } \
-			/* Lever A: this interp caller keeps entering jitted islands — queue it for upward JIT. */ \
+			/* Lever A: this interp caller keeps entering jitted islands — queue it for upward JIT. Only if it has \
+			 * been ENTERED at least twice: the compile pays from the next entry (the live frame keeps interpreting), \
+			 * so a method entered once -- a <clinit>, a one-shot init routine -- would never run it. Registry \
+			 * <clinit>s of 11-38k blocks were promoted this way at boot (R493). */ \
 			{ InterpMethod *wjc = frame->imethod; \
-			  if (G_UNLIKELY (mono_wasm_jit_entry_promote > 0) && wj_slot_hot_retry_eligible (wjc->wasm_jit_slot) && ++wjc->wasm_jit_invoke_out >= mono_wasm_jit_entry_promote) { wjc->wasm_jit_invoke_out = 0; wj_promote_push (wjc->method); } } \
+			  if (G_UNLIKELY (mono_wasm_jit_entry_promote > 0) && wj_slot_hot_retry_eligible (wjc->wasm_jit_slot) && ++wjc->wasm_jit_invoke_out >= mono_wasm_jit_entry_promote) { \
+				wjc->wasm_jit_invoke_out = 0; \
+				if (wjc->wasm_jit_hits >= 2) \
+					wj_promote_push (wjc->method); \
+				else \
+					mono_wasm_jit_counters [WJC_PROMOTE_ONCE_SKIP]++; \
+			  } } \
 			/* If a residual interp call inside the JITted method threw, interp_entry set the thread \
 			 * resume-state and the JITted method returned early (a dummy result). Propagate through \
 			 * the interp's EH — the LMF above lets mono_handle_exception skip the JITted native frame. */ \
