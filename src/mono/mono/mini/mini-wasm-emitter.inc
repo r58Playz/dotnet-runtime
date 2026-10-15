@@ -5638,7 +5638,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						for (ai = 0; ai < nm; ++ai)
 							if (!wasm_ld (&body, &lc, wj_arg_vreg (call, ai))) { fail = "icall arg ld"; goto done; }
 					}
+					/* A native calli whose pointer constant propagation folded into an absolute call lands here too
+					 * (MONO_WASM_JIT_NATIVE_CALLI): fptr is then the C function's table index, and it keeps its bracket. */
+					if (call->wasm_native_calli && !wj_emit_native_transition (&body, extra_types, &nextra, WJ_EXTRA_TYPES_MAX, ti_base, TRUE)) { fail = "too many callee types"; goto done; }
 					wj_emit_helper_call_ci (&body, (gpointer) (intptr_t) ifptr, (guint32) type_idx);
+					if (call->wasm_native_calli) {
+						if (!wj_emit_native_transition (&body, extra_types, &nextra, WJ_EXTRA_TYPES_MAX, ti_base, FALSE)) { fail = "too many callee types"; goto done; }
+						wj_native_ret_norm (&body, &ct, csig);
+						mono_atomic_inc_i32 (&mono_wasm_jit_native_calli_emitted);
+					}
 					if (ct.ret != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "icall dreg"; goto done; }
 					break;
 				}
@@ -8149,9 +8157,9 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				 * table index — so bail the method to the interpreter. The VIRTUAL subcase above is NOT
 				 * gated: it dispatches via the inline IC + interp-entry-thunk fallback, which always
 				 * resolves to a callable slot. */
-				{
-					if (cfg->wasm_jit_forced) { fail = "raw indirect call under auto-JIT"; goto done; }
-				}
+				/* EXCEPT a native function pointer (MONO_WASM_JIT_NATIVE_CALLI, method-to-ir marked it): a C function
+				 * of dotnet.native.wasm IS an index into the table every JIT module imports, so it is called as it is. */
+				if (cfg->wasm_jit_forced && !(call->wasm_native_calli && !is_membase)) { fail = "raw indirect call under auto-JIT"; goto done; }
 				if (is_vcall2) { fail = "vcall2 raw indirect"; goto done; }
 				/* rgctx (ftndesc.arg) is folded into csig as a trailing param + call->args, so it's
 				 * handled like any other arg — no separate rgctx_arg_reg (that field is LLVM-only). */
@@ -8180,9 +8188,15 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				if (!call->call_info) { fail = "no captured callreg args"; goto done; }
 				for (ai = 0; ai < nmeth; ++ai)
 					if (!wasm_ld (&body, &lc, wj_arg_vreg (call, ai))) { fail = "creg arg ld"; goto done; }
+				if (call->wasm_native_calli && !wj_emit_native_transition (&body, extra_types, &nextra, WJ_EXTRA_TYPES_MAX, ti_base, TRUE)) { fail = "too many callee types"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "creg target ld"; goto done; }
 					if (is_membase) { wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) ins->inst_offset); } /* target = *(base + offset) */
 				wj_emit_dynamic_call (&body, (guint32) type_idx);
+				if (call->wasm_native_calli) {
+					if (!wj_emit_native_transition (&body, extra_types, &nextra, WJ_EXTRA_TYPES_MAX, ti_base, FALSE)) { fail = "too many callee types"; goto done; }
+					wj_native_ret_norm (&body, &ct, csig);
+					mono_atomic_inc_i32 (&mono_wasm_jit_native_calli_emitted);
+				}
 				if (ct.ret != WASM_VOID && !wasm_st (&body, &lc, ins->dreg)) { fail = "creg dreg"; goto done; }
 				break;
 			}

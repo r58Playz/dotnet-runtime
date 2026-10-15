@@ -2183,6 +2183,59 @@ functype_eq (const WasmFuncType *a, const WasmFuncType *b)
 	return TRUE;
 }
 
+/* MONO_WASM_JIT_NATIVE_CALLI: one half of the GC-safe bracket around a native call this tier emits itself
+ * (mono_wasm_jit_native_enter / _exit, mini-wasm.c). Both are ()->void, so they leave the call's arguments and its
+ * result on the operand stack untouched. FALSE when the member's callee-type block is full. */
+static gboolean
+wj_emit_native_transition (WasmBuf *b, WasmFuncType *extra_types, int *nextra, int cap, int ti_base, gboolean enter)
+{
+	WasmFuncType vt;
+	int k, ti = -1;
+	memset (&vt, 0, sizeof (vt));
+	vt.ret = WASM_VOID;
+	for (k = 0; k < *nextra; ++k) if (functype_eq (&extra_types [k], &vt)) { ti = ti_base + k; break; }
+	if (ti < 0) {
+		if (*nextra >= cap)
+			return FALSE;
+		extra_types [*nextra] = vt;
+		ti = ti_base + (*nextra)++;
+	}
+#ifdef HOST_BROWSER
+	{
+		extern void mono_wasm_jit_native_enter (void), mono_wasm_jit_native_exit (void);
+		wj_emit_helper_call (b, enter ? (gpointer) mono_wasm_jit_native_enter : (gpointer) mono_wasm_jit_native_exit, (guint32) ti);
+	}
+#else
+	wj_emit_helper_call (b, (gpointer) (intptr_t) (enter ? 0x7ffc : 0x7ffb), (guint32) ti);   /* offline dump: placeholder slots */
+#endif
+	return TRUE;
+}
+
+/* The native result as the managed signature reads it: a C function returning a sub-word integer leaves an i32 whose
+ * upper bits the managed side must not trust, and a BOOLEAN is the 4-byte BOOL, any non-zero value true. */
+static void
+wj_native_ret_norm (WasmBuf *b, const WasmFuncType *ct, MonoMethodSignature *sig)
+{
+	MonoType *rt;
+	if (ct->ret != WASM_I32 || m_type_is_byref (sig->ret))
+		return;
+	rt = mini_get_underlying_type (sig->ret);
+	switch (rt->type) {
+	case MONO_TYPE_BOOLEAN:
+		wasm_i32_const (b, 0); wasm_op (b, WASM_OP_I32_NE); break;
+	case MONO_TYPE_U1:
+		wasm_i32_const (b, 0xff); wasm_op (b, WASM_OP_I32_AND); break;
+	case MONO_TYPE_I1:
+		wasm_op (b, WASM_OP_I32_EXTEND8_S); break;
+	case MONO_TYPE_U2: case MONO_TYPE_CHAR:
+		wasm_i32_const (b, 0xffff); wasm_op (b, WASM_OP_I32_AND); break;
+	case MONO_TYPE_I2:
+		wasm_op (b, WASM_OP_I32_EXTEND16_S); break;
+	default:
+		break;
+	}
+}
+
 static guint32
 wj_functype_hash (const WasmFuncType *t)
 {

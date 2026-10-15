@@ -841,6 +841,9 @@ struct MonoCallInst {
 	guint32 rgctx_reg : 1;
 	/* Whenever the call will need an unbox trampoline */
 	guint need_unbox_trampoline : 1;
+	/* wasm JIT (MONO_WASM_JIT_NATIVE_CALLI): a calli to a NATIVE function pointer that method-to-ir routed around the
+	 * managed-to-native wrapper; the emitter brackets the call_indirect with the GC-safe transition itself. */
+	guint wasm_native_calli : 1;
 };
 
 struct MonoCallArgParm {

@@ -144,6 +144,16 @@ int mono_wasm_jit_vsite_compact = 1;
 int mono_wasm_jit_eager_n, mono_wasm_jit_aot_deny_n;
 int mono_wasm_jit_aot_deny_eager = 1;
 gint32 mono_wasm_jit_eager_marked, mono_wasm_jit_aot_denied_n;
+/* MONO_WASM_JIT_NATIVE_CALLI: a `calli` to a NATIVE function pointer whose signature is primitive scalars only (no
+ * references, structs, byrefs, char, varargs) is lowered by this tier -- leave GC-unsafe, `call_indirect` into the
+ * shared function table, re-enter -- instead of calling mono's managed-to-native wrapper, which the emitter refuses
+ * (its marshalling-wrapper bail), so every such call ran in the interpreter. That is all the wasm AOT wrapper is
+ * either: llvm-only never pushes the wrapper's LMF (method-to-ir.c skips emit_push_lmf under llvm_only). The consumer
+ * is IKVM's JNI stubs, LWJGL's GL natives above all (R488). routed = sites method-to-ir lowered this way; emitted =
+ * sites the emitter wrote; a method that bails after routing makes the two differ. With it on, ikvmc_lwjgl3 is not
+ * AOT'd: R490 measured the render thread at +5% (not resolved from 0, n=3) where lwjgl off AOT without it cost +23.8%. */
+int mono_wasm_jit_native_calli = 1;
+gint32 mono_wasm_jit_native_calli_routed, mono_wasm_jit_native_calli_emitted;
 typedef struct { char **type, **meth; guint8 *prefix; } WjNameList;
 static WjNameList wj_eager_list, wj_deny_list;
 
@@ -971,6 +981,7 @@ mono_wasm_jit_auto_init (void)
 	  if (el && *el && !mono_wasm_jit_aot_deny_n) mono_wasm_jit_aot_deny_n = wj_namelist_parse (&wj_deny_list, el);
 	  el = g_getenv ("MONO_WASM_JIT_AOT_DENY_EAGER");
 	  if (el && *el) mono_wasm_jit_aot_deny_eager = atoi (el) != 0; }
+	{ const char *nc = g_getenv ("MONO_WASM_JIT_NATIVE_CALLI"); if (nc && *nc) mono_wasm_jit_native_calli = atoi (nc) != 0; }
 	{ extern int mono_wasm_jit_stats; const char *s = g_getenv ("MONO_WASM_JIT_STATS"); mono_wasm_jit_stats = (s && *s && *s != '0') ? 1 : 0; }
 	/* MONO_WASM_JIT_VERBOSE controls the per-method emit LOG spam, DECOUPLED from stats (counting is cheap,
 	 * logging floods): 0=silent (default), 1=+registered/invalid, 2=+bail, 3=+emit-enter AND per-call traces (vcall-aot
@@ -2178,6 +2189,27 @@ static void wj_vslow_explain (const char *err);   /* mini-wasm-vslow.inc, R459 d
 static gboolean wj_vslow_repair (const char *err);   /* mini-wasm-vslow.inc, R459 */
 static int wj_instantiate_local_once (int e_slot, int f_slot, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
 static int wj_instantiate_batch_local_once (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload);
+
+/* MONO_WASM_JIT_NATIVE_CALLI: the GC transition around a native call_indirect this tier emitted itself, as the AOT
+ * wrapper's enter/exit icalls do. The stack pointer recorded is THIS helper's frame, which lies below the calling JIT
+ * frame's shadow area on the one linear-memory stack, so a collection that scans the thread while it is in native code
+ * covers that frame and every caller -- what the wrapper's `&dummy` does from the wrapper's frame. The native code then
+ * reuses this frame's memory; scanning it is conservative, so stale words there can only over-retain. The exit derives
+ * the thread from TLS: the enter's cookie IS mono_thread_info_current_unchecked () (NULL only when blocking transitions
+ * are off, and the exit returns before reading it then), so no value has to be carried across the native call. */
+void
+mono_wasm_jit_native_enter (void)
+{
+	MONO_STACKDATA (stackdata);
+	mono_threads_enter_gc_safe_region_unbalanced_internal (&stackdata);
+}
+
+void
+mono_wasm_jit_native_exit (void)
+{
+	MONO_STACKDATA (stackdata);
+	mono_threads_exit_gc_safe_region_unbalanced_internal (mono_thread_info_current_unchecked (), &stackdata);
+}
 
 /* R471 (MONO_WASM_JIT_BYTES_CHECK only): who owned the memory a changed block now occupies. R470's s17 c0-1 changed a live
  * lazy bank by zeroing two aligned words 592 bytes apart and nothing else -- a stale writer into memory that used to be
