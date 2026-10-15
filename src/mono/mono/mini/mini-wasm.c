@@ -30,6 +30,7 @@ static int mono_wasm_debug_level = 0;
  * allocation of that state; defined after the .inc files, where every array it frees is declared. */
 #ifdef HOST_BROWSER
 static void wj_thread_state_note (void);
+static void wj_quarantine_owner (void *p, size_t size);   /* R489, MONO_FREE_QUARANTINE_MB's hit hook */
 #else
 static inline void wj_thread_state_note (void) {}
 #endif
@@ -971,6 +972,10 @@ mono_wasm_jit_auto_init (void)
 	 * threshold 500 with 29,224. Falling back to the variable's OWN value makes the initialiser the
 	 * single source of truth and makes that drift impossible. */
 	{ extern gint64 mono_wasm_jit_start_ms; mono_wasm_jit_start_ms = mono_msec_ticks (); }   /* B4_HOT's delay clock */
+	g_mem_quarantine_init ();   /* MONO_FREE_QUARANTINE_MB (eglib gmem.c), a diagnostic; reads its own variable */
+#ifdef HOST_BROWSER
+	g_mem_quarantine_hit_hook = wj_quarantine_owner;
+#endif
 	t = g_getenv ("MONO_WASM_JIT_THRESHOLD");
 	{ int tv = (t && *t) ? atoi (t) : mono_wasm_jit_thresh;
 	  if (tv > 0) mono_wasm_jit_thresh = tv; }
@@ -6726,6 +6731,19 @@ void
 mono_wasm_jit_thread_state_note (void)
 {
 	wj_thread_state_note ();
+}
+
+/* R489: MONO_FREE_QUARANTINE_MB's hit hook (eglib gmem.c). The stray values are small integers that grow over a run, so
+ * print every id counter's value now (the write happened between the hit's freed_ms and now_ms), then the block's
+ * recorded previous owners -- pthread stacks/TLS, live or dead, and the JIT's own frees (BYTES_CHECK only). */
+static void
+wj_quarantine_owner (void *p, size_t size)
+{
+	printf ("WASM_JIT_COUNTERS_AT_HIT reg_n=%d batch_gen=%d payload_seq=%d global_epoch=%d vslow_n=%d site_n=%d thr_n=%d desc_grow=%d reach_oob=%d | evictor pthread=%p reach_gen=%u inst_gen=%u local_epoch=%d desc_cap=%d\n",
+		(int) wj_reg_n, (int) wj_batch_generation, (int) wj_payload_seq, (int) wj_global_epoch, (int) wj_vslow_n,
+		(int) wj_site_n, (int) wj_thr_n, (int) mono_wasm_jit_counters [WJC_DESC_GROW], (int) mono_wasm_jit_counters [WJC_REACH_OOB], (void *) pthread_self (), wj_reach_gen,
+		wj_inst_gen, (int) wj_local_epoch, wj_desc_state_cap);
+	wj_owner_report ((guint32) (gsize) p, (guint32) (gsize) p + (guint32) size);
 }
 #endif
 
