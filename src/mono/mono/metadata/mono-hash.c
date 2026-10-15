@@ -109,10 +109,30 @@ static void mono_g_hash_table_value_store (MonoGHashTable *hash, int slot, MonoO
 		*value_addr = value;
 }
 
+/*
+ * A key's home slot. The hash is mixed (murmur3's finalizer) before the modulus: this table probes LINEARLY, and its
+ * callers' hashes are often weak -- mono_metadata_type_hash of a Reflection.Emit class is its short name's
+ * mono_metadata_str_hash, so similar names (IKVM's thousands of `class_NNNN`) land in runs of nearby slots, and a class
+ * and its array type share one hash. Simulated over a boot's class names (wasm JIT findings R493): 14.3 -> 2.1 probes
+ * per insert and 65 -> 5.6 per failed lookup at the 0.7 load factor, each probe a mono_metadata_type_equal. Internal to
+ * the table: no hash value anyone stores changes. Both slot computations (lookup, and remove's back-shift) use it.
+ */
+static inline guint
+mono_g_hash_table_home_slot (MonoGHashTable *hash, const MonoObject *key)
+{
+	guint32 h = (guint32) (*hash->hash_func) (key);
+	h ^= h >> 16;
+	h *= 0x85ebca6bu;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35u;
+	h ^= h >> 16;
+	return h % hash->table_size;
+}
+
 /* Returns position of key or of an empty slot for it */
 static guint mono_g_hash_table_find_slot (MonoGHashTable *hash, const MonoObject *key)
 {
-	guint start = ((*hash->hash_func) (key)) % hash->table_size;
+	guint start = mono_g_hash_table_home_slot (hash, key);
 	guint i = start;
 
 	if (hash->key_equal_func) {
@@ -359,7 +379,7 @@ mono_g_hash_table_remove (MonoGHashTable *hash, gconstpointer key)
 	last_clear_slot = slot;
 	slot = (slot + 1) % hash->table_size;
 	while (hash->keys [slot]) {
-		guint hashcode = ((*hash->hash_func)(hash->keys [slot])) % hash->table_size;
+		guint hashcode = mono_g_hash_table_home_slot (hash, hash->keys [slot]);
 		/*
 		 * We try to move the current element to last_clear_slot, but only if
 		 * it brings it closer to its normal position (hashcode)
