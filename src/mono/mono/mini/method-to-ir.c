@@ -441,6 +441,45 @@ wj_gi_note_refused (MonoMethod *m)
 	/* Probe full: drop it. The cost is that this callee keeps re-paying its own guard, which is exactly
 	 * the pre-memo behaviour, so a full table degrades to the old cost rather than to anything worse. */
 }
+
+/* MONO_WASM_JIT_NATIVE_CALLI (mini-wasm.c): may this calli to a native function pointer skip the managed-to-native
+ * wrapper? Only when the wrapper would MARSHAL nothing: every parameter and the return a primitive scalar the wasm C ABI
+ * passes as-is. Refused: references and byrefs (the wrapper pins/converts), value types (struct ABI), CHAR (the
+ * marshaller may convert it to an ANSI byte), varargs and Swift. BOOLEAN is the 4-byte BOOL either way on wasm (an i32),
+ * and its return is normalised to 0/1 by the emitter. */
+extern int mono_wasm_jit_native_calli;
+extern gint32 mono_wasm_jit_native_calli_routed;
+static gboolean
+wj_native_calli_type_ok (MonoType *t, gboolean ret)
+{
+	if (m_type_is_byref (t))
+		return FALSE;
+	t = mini_get_underlying_type (t);
+	switch (t->type) {
+	case MONO_TYPE_VOID:
+		return ret;
+	case MONO_TYPE_BOOLEAN: case MONO_TYPE_I1: case MONO_TYPE_U1: case MONO_TYPE_I2: case MONO_TYPE_U2:
+	case MONO_TYPE_I4: case MONO_TYPE_U4: case MONO_TYPE_I8: case MONO_TYPE_U8: case MONO_TYPE_R4: case MONO_TYPE_R8:
+	case MONO_TYPE_I: case MONO_TYPE_U: case MONO_TYPE_PTR: case MONO_TYPE_FNPTR:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+static gboolean
+wj_native_calli_sig_ok (MonoMethodSignature *sig)
+{
+	if (sig->hasthis || sig->explicit_this || sig->has_type_parameters || sig->call_convention == MONO_CALL_VARARG ||
+	    mono_method_signature_has_ext_callconv (sig, MONO_EXT_CALLCONV_SWIFTCALL))
+		return FALSE;
+	if (!wj_native_calli_type_ok (sig->ret, TRUE))
+		return FALSE;
+	for (int i = 0; i < sig->param_count; ++i)
+		if (!wj_native_calli_type_ok (sig->params [i], FALSE))
+			return FALSE;
+	return TRUE;
+}
 #endif
 
 /* The R315 counters, usable from code compiled into both the runtime and mono-aot-cross (wj_gi_count lives in the
@@ -8850,6 +8889,24 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				what its doing and added its own GC transitions */
 
 				gboolean skip_gc_trans = mono_method_signature_has_ext_callconv (fsig, MONO_EXT_CALLCONV_SUPPRESS_GC_TRANSITION);
+#ifdef HOST_BROWSER
+				/* MONO_WASM_JIT_NATIVE_CALLI: call the native pointer directly; the emitter brackets the call_indirect
+				 * with the GC-safe transition the wrapper would have made. Emitted HERE, ahead of the generic tail
+				 * below, because under the wasm JIT cfg->llvm_only is set and that tail would read the pointer as a
+				 * <addr, arg> ftndesc pair. Not inlined into callers: mono refuses to inline any indirect call. */
+				if (!skip_gc_trans && COMPILE_WASM (cfg) && mono_wasm_jit_native_calli && !save_last_error &&
+				    wj_native_calli_sig_ok (fsig)) {
+					INLINE_FAILURE ("native calli");
+					n = fsig->param_count;
+					CHECK_STACK (n);
+					sp -= n;
+					tailcall = FALSE;
+					ins = (MonoInst*)mini_emit_calli_full (cfg, fsig, sp, addr, NULL, NULL, FALSE);
+					((MonoCallInst *) ins)->wasm_native_calli = 1;
+					mono_atomic_inc_i32 (&mono_wasm_jit_native_calli_routed);
+					goto calli_end;
+				}
+#endif
 				if (!skip_gc_trans) {
 #if 0
 					fprintf (stderr, "generating wrapper for calli in method %s with wrapper type %s\n", method->name, mono_wrapper_type_to_str (method->wrapper_type));

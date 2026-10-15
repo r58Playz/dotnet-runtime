@@ -587,6 +587,11 @@ mono_wasm_jit_dump_stats (void)
 		"entries and the jit_call_supported answers it turned to FALSE (J3)\n",
 		mono_wasm_jit_eager_n, mono_atomic_load_i32 (&mono_wasm_jit_eager_marked), mono_wasm_jit_aot_deny_n,
 		mono_atomic_load_i32 (&mono_wasm_jit_aot_denied_n), mono_wasm_jit_aot_deny_eager); }
+	{ extern int mono_wasm_jit_native_calli; extern gint32 mono_wasm_jit_native_calli_routed, mono_wasm_jit_native_calli_emitted;
+	  printf ("[wasm-jit ncalli] knob=%d routed=%d emitted=%d -- native callis this tier lowered itself (MONO_WASM_JIT_NATIVE_CALLI) "
+		"instead of calling the interpreted managed-to-native wrapper; routed by method-to-ir, emitted by the emitter\n",
+		mono_wasm_jit_native_calli, mono_atomic_load_i32 (&mono_wasm_jit_native_calli_routed),
+		mono_atomic_load_i32 (&mono_wasm_jit_native_calli_emitted)); }
 	{ extern int mono_wasm_jit_b4; extern void mono_wasm_jit_b4_plan (void);   /* plan B4: the dry-run partition */
 	  if (mono_wasm_jit_b4)
 		mono_wasm_jit_b4_plan (); }
