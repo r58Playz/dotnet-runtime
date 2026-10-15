@@ -1448,6 +1448,7 @@ enum {
 	WJC_B4_DEAD_SKIP,            /* R476: the B4 planner skipped a registry entry whose method is in the freed-method set */
 	WJC_DESC_GROW,               /* R489: closure installs whose descriptor was past this pthread's desc arrays (grown first; each was a store past their end) */
 	WJC_REACH_OOB,               /* R489: reach walks that met a descriptor past their stamp array (answered "reachable") */
+	WJC_PROMOTE_ONCE_SKIP,       /* R493: Lever A promotions refused because the caller was entered only once (a <clinit>) */
 	WJC_MAX
 };
 
