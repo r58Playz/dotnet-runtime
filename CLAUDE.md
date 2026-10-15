@@ -1115,6 +1115,14 @@ validated**. The reading that settles it has to come from a HANGING run. If one 
 than defending them. Four explanations for the earlier failures were each proposed before the evidence
 was gathered and all four were wrong.
 
+**wasmfs's OPFS backend caches negative lookups (R491, FNA-WASM-Build `emsdk.9.patch`).** A name the browser reported
+missing is answered locally until the cache is invalidated; creates and moves through wasmfs drop the name. **JS that creates
+OPFS entries directly must call `opfsInvalidate()` (ikvmcraft `frontend/src/opfs.ts`, i.e.
+`Module._wasmfs_opfs_invalidate_negative_cache`) or the game will not see them.** OPFS_BLOCKED's `neg` row counts hits,
+inserts, invalidations and overflows. It took the reload from ~19 to ~10 s (JDK_Canonicalize probed `/minecraft/file:` ~85,000
+times a boot). The app links the in-place `statics/emsdk`, which is ahead of the FNA-WASM-Build release zip (patches 5-9):
+re-extracting `statics/emsdk.zip` reverts them.
+
 ### Debugging a wasm trap
 
 * **Raise the stack limit first.** V8 defaults to **10 frames** and every `WORKER_TRAP_STACK` this harness
