@@ -653,14 +653,6 @@ mono_interp_get_imethod (MonoMethod *method)
 		extern void mono_wasm_jit_note_method_live (MonoMethod *method);
 		mono_wasm_jit_note_method_live (method);
 		mono_wasm_jit_note_method_live ((MonoMethod *) imethod);
-		/* plan typed-spindle J1: a method on the consumer's eager list (MONO_WASM_JIT_EAGER_LIST -- the methods it
-		 * took off AOT) starts one hit short of the threshold, so wasm_jit_maybe_compile's `== thresh` gate fires on
-		 * its FIRST call: tier 1 at once, no interpreted phase. Everything after that is the ordinary path. */
-		extern int mono_wasm_jit_eager_n, mono_wasm_jit_aot_deny_n, mono_wasm_jit_thresh;
-		extern gboolean mono_wasm_jit_eager_match (MonoMethod *method);
-		if (G_UNLIKELY (mono_wasm_jit_eager_n | mono_wasm_jit_aot_deny_n) && mono_wasm_jit_thresh > 1 &&
-		    mono_wasm_jit_eager_match (method))
-			imethod->wasm_jit_hits = mono_wasm_jit_thresh - 1;
 	}
 #endif
 	imethod->param_count = sig->param_count;

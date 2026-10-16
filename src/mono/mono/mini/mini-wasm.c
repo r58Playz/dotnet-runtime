@@ -119,13 +119,6 @@ int mono_wasm_jit_badmeth = 1;   /* MONO_WASM_JIT_BADMETH: the dead-retained-Mon
 int mono_wasm_jit_method_usable (MonoMethod *m, int site);
 int mono_wasm_jit_thresh = 500;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
 
-/* MONO_WASM_JIT_EAGER_LIST (plan typed-spindle J1): methods the CONSUMER took off LLVM AOT and wants compiled at tier 1
- * from their first call instead of interpreted for MONO_WASM_JIT_THRESHOLD calls first. Entries are separated by
- * whitespace or commas and use aotprofile/Program.cs's exclusion syntax without the '!': "T" = type T and every type
- * nested in it (T's full name up to the first '/' equals T), "T::m" = every overload of m declared by exactly T. T is
- * a Cecil full name ("java.util.Comparators", "java.lang.Comparable/__Helper"). ikvmcraft generates the value from
- * the same AOT_JAVA_EXCLUDE list that drops those methods from the AOT profile, so "not AOT" and "compiled at first
- * call" cannot disagree. Unset = empty = no effect; matching costs one load per InterpMethod creation then. */
 /* MONO_WASM_JIT_VSITE_COMPACT (plan typed-spindle C1, mini-wasm-vslow.inc): a non-delegate virtual call site keeps its
  * devirt arms and way 0 of the worker PIC inline and hands every way-0 miss to a shared slow-path stub, instead of
  * emitting method identity, F9, ways 1..N, the inline AOT IC and the per-site cold miss itself (450-600 B a site, R455).
@@ -137,13 +130,13 @@ int mono_wasm_jit_vsite_compact = 1;
  * although the image carries one -- mono_interp_jit_call_supported (transform.c) answers FALSE for them, and it is the
  * one predicate the interpreter's code_type, the emitter's inline-AOT and AOT-IC paths and the lazy pool all ask, so a
  * denied method is interpreted, then compiled by this tier, and JIT callers can inline it. AOT callers keep calling its
- * AOT body directly (same semantics, two bodies). Same syntax as MONO_WASM_JIT_EAGER_LIST, plus "prefix*" = every type
- * whose full name starts with prefix ("java.util.*"). A denied method is also eager (tier 1 at its first call) unless
- * MONO_WASM_JIT_AOT_DENY_EAGER=0, which leaves it to the ordinary threshold (R468: eager marking of 739 curated methods
- * cost ~20 s of boot). An AOT-profile change cannot be A/B'd in one binary; this can. Unset = empty = no effect. */
-int mono_wasm_jit_eager_n, mono_wasm_jit_aot_deny_n;
-int mono_wasm_jit_aot_deny_eager = 1;
-gint32 mono_wasm_jit_eager_marked, mono_wasm_jit_aot_denied_n;
+ * AOT body directly (same semantics, two bodies). Entries are separated by whitespace or commas and use
+ * aotprofile/Program.cs's exclusion syntax without the '!': "T" = type T and every type nested in it (T's full name up to
+ * the first '/' equals T), "T::m" = every overload of m declared by exactly T, "prefix*" = every type whose full name
+ * starts with prefix ("java.util.*"). T is a Cecil full name ("java.lang.Comparable/__Helper"). A denied method runs at
+ * the ordinary threshold. An AOT-profile change cannot be A/B'd in one binary; this can. Unset = empty = no effect. */
+int mono_wasm_jit_aot_deny_n;
+gint32 mono_wasm_jit_aot_denied_n;
 /* MONO_WASM_JIT_NATIVE_CALLI: a `calli` to a NATIVE function pointer whose signature is primitive scalars only (no
  * references, structs, byrefs, char, varargs) is lowered by this tier -- leave GC-unsafe, `call_indirect` into the
  * shared function table, re-enter -- instead of calling mono's managed-to-native wrapper, which the emitter refuses
@@ -155,7 +148,7 @@ gint32 mono_wasm_jit_eager_marked, mono_wasm_jit_aot_denied_n;
 int mono_wasm_jit_native_calli = 1;
 gint32 mono_wasm_jit_native_calli_routed, mono_wasm_jit_native_calli_emitted;
 typedef struct { char **type, **meth; guint8 *prefix; } WjNameList;
-static WjNameList wj_eager_list, wj_deny_list;
+static WjNameList wj_deny_list;
 
 static int
 wj_namelist_parse (WjNameList *l, const char *v)
@@ -192,8 +185,8 @@ wj_namelist_parse (WjNameList *l, const char *v)
 }
 
 /* METHOD's Cecil full name ("ns.Outer/Inner") into full; returns its length (0 = too deep / too long), and the top-level
- * type's length in *top_len. Field reads only (klass names and nesting): it runs at InterpMethod creation and inside
- * mono_interp_jit_call_supported, which must not load or resolve anything. */
+ * type's length in *top_len. Field reads only (klass names and nesting): it runs inside mono_interp_jit_call_supported,
+ * which must not load or resolve anything. */
 static int
 wj_full_type_name (MonoMethod *method, char *full, int cap, int *top_len)
 {
@@ -248,17 +241,6 @@ mono_wasm_jit_aot_denied (MonoMethod *method)
 	return mono_wasm_jit_aot_deny_n && wj_namelist_match (&wj_deny_list, mono_wasm_jit_aot_deny_n, method);
 }
 
-/* TRUE when METHOD is on the eager list -- or denied its AOT body, which implies it. */
-gboolean
-mono_wasm_jit_eager_match (MonoMethod *method)
-{
-	if ((mono_wasm_jit_eager_n && wj_namelist_match (&wj_eager_list, mono_wasm_jit_eager_n, method)) ||
-	    (mono_wasm_jit_aot_deny_eager && mono_wasm_jit_aot_denied (method))) {
-		mono_atomic_inc_i32 (&mono_wasm_jit_eager_marked);
-		return TRUE;
-	}
-	return FALSE;
-}
 /* auto-JIT hotness threshold. 2000 was the pre-Minecraft value; 500 is what the product runs. R204 cut `no_fslot` 69%% by moving it, and that is worth NOTHING on the plateau -- it is a boot/worldgen effect, because 99.3%% of profile observations arrive AFTER a method is JITted. Right for boot, not a frame-rate lever. */
 /* MONO_WASM_JIT_OVER_AOT is deleted. It let the runtime wasm method-JIT compete with an
  * already-available AOT body (the interpreter kept code_type=COMPILED, so a failed emission,
@@ -975,12 +957,8 @@ mono_wasm_jit_auto_init (void)
 	{ int tv = (t && *t) ? atoi (t) : mono_wasm_jit_thresh;
 	  if (tv > 0) mono_wasm_jit_thresh = tv; }
 	{ const char *vc = g_getenv ("MONO_WASM_JIT_VSITE_COMPACT"); if (vc && *vc) mono_wasm_jit_vsite_compact = atoi (vc); }
-	{ const char *el = g_getenv ("MONO_WASM_JIT_EAGER_LIST");
-	  if (el && *el && !mono_wasm_jit_eager_n) mono_wasm_jit_eager_n = wj_namelist_parse (&wj_eager_list, el);
-	  el = g_getenv ("MONO_WASM_JIT_AOT_DENY");
-	  if (el && *el && !mono_wasm_jit_aot_deny_n) mono_wasm_jit_aot_deny_n = wj_namelist_parse (&wj_deny_list, el);
-	  el = g_getenv ("MONO_WASM_JIT_AOT_DENY_EAGER");
-	  if (el && *el) mono_wasm_jit_aot_deny_eager = atoi (el) != 0; }
+	{ const char *el = g_getenv ("MONO_WASM_JIT_AOT_DENY");
+	  if (el && *el && !mono_wasm_jit_aot_deny_n) mono_wasm_jit_aot_deny_n = wj_namelist_parse (&wj_deny_list, el); }
 	{ const char *nc = g_getenv ("MONO_WASM_JIT_NATIVE_CALLI"); if (nc && *nc) mono_wasm_jit_native_calli = atoi (nc) != 0; }
 	{ extern int mono_wasm_jit_stats; const char *s = g_getenv ("MONO_WASM_JIT_STATS"); mono_wasm_jit_stats = (s && *s && *s != '0') ? 1 : 0; }
 	/* MONO_WASM_JIT_VERBOSE controls the per-method emit LOG spam, DECOUPLED from stats (counting is cheap,
