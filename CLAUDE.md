@@ -148,6 +148,13 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   run**: `exit(1)` returns into `eg_unreachable`'s `for(;;)` and the 3 s force-exit timer cannot run on a spinning thread,
   so it reads `verdict=spin`, `faults=[]` (verdict class `interp-native-sig` now names it). Before taking an assembly off
   AOT, check its calli shapes are in the table.
+* **A partial AOT profile is worse than none unless it is closed over direct calls (R498).** In profile-only llvm-only
+  AOT, a call from an AOT'd method to a same-image method OUTSIDE the profile compiles to an indirect ftndesc call that
+  may enter the interpreter (`calls.c` `can_enter_interp`), and LLVM inlines small direct callees inside the image, so
+  they never show in V8's perf map. Cutting IKVM.Java's profile to "what ran" cost 1.2 s of boot and to the hot set
+  2.0 s; the same sets closed over direct callees (`call`/`newobj`/`ldftn`/non-virtual `callvirt`) cost nothing at 10.5%
+  of the profile. That closed list is what ships: ikvmcraft `aotprofile/ikvm_java.methods.txt`, regenerated with
+  `make aot-java-methods` (R499).
 * **Nothing that blocks properly is safe at those sites.** `mono_thread_info_sleep(ms>0)` does
   `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
   (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the
