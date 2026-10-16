@@ -581,13 +581,11 @@ mono_wasm_jit_dump_stats (void)
 			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks, mono_wasm_jit_s4, mono_wasm_jit_t2_loop_count,
 			mono_wasm_jit_rrem_inline, mono_wasm_jit_b4, mono_wasm_jit_b4_groups);
 	}
-	{ extern int mono_wasm_jit_eager_n, mono_wasm_jit_aot_deny_n, mono_wasm_jit_aot_deny_eager;
-	  extern gint32 mono_wasm_jit_eager_marked, mono_wasm_jit_aot_denied_n;
-	  printf ("[wasm-jit eager] list=%d marked=%d deny=%d denied=%d deny_eager=%d -- MONO_WASM_JIT_EAGER_LIST entries, and InterpMethods "
-		"started one hit short of the JIT threshold because they matched one (typed-spindle J1); MONO_WASM_JIT_AOT_DENY "
-		"entries and the jit_call_supported answers it turned to FALSE (J3)\n",
-		mono_wasm_jit_eager_n, mono_atomic_load_i32 (&mono_wasm_jit_eager_marked), mono_wasm_jit_aot_deny_n,
-		mono_atomic_load_i32 (&mono_wasm_jit_aot_denied_n), mono_wasm_jit_aot_deny_eager); }
+	{ extern int mono_wasm_jit_aot_deny_n;
+	  extern gint32 mono_wasm_jit_aot_denied_n;
+	  printf ("[wasm-jit aotdeny] deny=%d denied=%d -- MONO_WASM_JIT_AOT_DENY entries and the jit_call_supported answers "
+		"it turned to FALSE (J3)\n",
+		mono_wasm_jit_aot_deny_n, mono_atomic_load_i32 (&mono_wasm_jit_aot_denied_n)); }
 	{ extern int mono_wasm_jit_native_calli; extern gint32 mono_wasm_jit_native_calli_routed, mono_wasm_jit_native_calli_emitted;
 	  printf ("[wasm-jit ncalli] knob=%d routed=%d emitted=%d -- native callis this tier lowered itself (MONO_WASM_JIT_NATIVE_CALLI) "
 		"instead of calling the interpreted managed-to-native wrapper; routed by method-to-ir, emitted by the emitter\n",
