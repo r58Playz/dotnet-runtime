@@ -140,6 +140,14 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   21a3a81daf (#24565); FNA-WASM-Build's `emsdk.7.patch` backports it into the frozen emsdk, which needs `embuilder build
   --force libc-mt libc-mt-debug` there. Proof a deploy carries it: the served wasm's `do_proxy` is 136 B, not 84. The
   harness used to file this hang as a network `env` failure, from the last log line alone.
+* **An interpreted `calli` to a native function pointer needs a build-time trampoline for its signature (R497).** The
+  interpreter reaches natives through `mono_wasm_get_interp_to_native_trampoline(cookie)`, a table WasmAppBuilder
+  generates at APP build time, and it used to collect pinvoke and icall cookies only -- so IKVM.Java's 1,103 JNI stubs and
+  lwjgl's (all `calli`) were covered only while AOT'd or JIT'd. `CalliSignatureCollector` now adds every unmanaged
+  calli's cookie. A miss is `g_error("CANNOT HANDLE INTERP ICALL SIG ...")`, and **on a worker g_error does not end the
+  run**: `exit(1)` returns into `eg_unreachable`'s `for(;;)` and the 3 s force-exit timer cannot run on a spinning thread,
+  so it reads `verdict=spin`, `faults=[]` (verdict class `interp-native-sig` now names it). Before taking an assembly off
+  AOT, check its calli shapes are in the table.
 * **Nothing that blocks properly is safe at those sites.** `mono_thread_info_sleep(ms>0)` does
   `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
   (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the

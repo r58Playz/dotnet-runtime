@@ -84,9 +84,17 @@ public class ManagedToNativeGenerator : Task
                 icall.ScanAssembly(asm);
             }
 
+            // calli through unmanaged function pointers: the interpreter needs a trampoline for those too, and their
+            // signatures exist only in IL (see CalliSignatureCollector).
+            var calli = new CalliSignatureCollector(log);
+            foreach (string asmPath in managedAssemblies)
+                calli.ScanAssembly(asmPath);
+
             IEnumerable<string> cookies = Enumerable.Concat(
-                pinvoke.Generate(PInvokeModules, PInvokeOutputPath),
-                icall.Generate(IcallOutputPath));
+                Enumerable.Concat(
+                    pinvoke.Generate(PInvokeModules, PInvokeOutputPath),
+                    icall.Generate(IcallOutputPath)),
+                calli.Signatures);
 
             var m2n = new InterpToNativeGenerator(log);
             m2n.Generate(cookies, InterpToNativeOutputPath);
