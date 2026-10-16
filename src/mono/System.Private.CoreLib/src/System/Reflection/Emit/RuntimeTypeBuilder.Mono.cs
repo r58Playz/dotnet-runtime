@@ -95,6 +95,29 @@ namespace System.Reflection.Emit
         // locks — holding both directions creates a lock-ordering cycle.
         private readonly object resolveLock = new object();
         private Thread? resolveOwner;
+        // Guards the member-array appends (fields, methods, ctors, properties, events, nested types, interfaces).
+        // IKVM links a class's members one at a time under a per-MEMBER lock, from the thread finishing the class and
+        // from its relink worker at once, so two Define* calls on one TypeBuilder can race: both write the same slot
+        // (a member silently lost) and num_* passes the array's length (the next append throws IndexOutOfRange, which
+        // Java sees as ArrayIndexOutOfBoundsException in RuntimeJavaField.Link -- R496). A leaf lock: nothing is called
+        // under it that takes another, so it cannot order against IKVM's or resolveLock.
+        private readonly object memberLock = new object();
+        private static int memberLockContended;
+
+        // Counts appends that find another thread inside memberLock -- the race the lock closes -- and names the first
+        // few: a guard whose catches are never counted cannot be told apart from a race that never happens.
+        private void ProbeMemberLock()
+        {
+            if (Monitor.TryEnter(memberLock))
+            {
+                Monitor.Exit(memberLock);
+                return;
+            }
+
+            int n = Interlocked.Increment(ref memberLockContended);
+            if (n <= 8 || (n & (n - 1)) == 0)
+                Internal.Console.WriteLine("[sre] concurrent member append on TypeBuilder " + Name + " (#" + n + ")");
+        }
 
         protected override TypeAttributes GetAttributeFlagsImpl()
         {
@@ -285,22 +308,26 @@ namespace System.Reflection.Emit
         {
             check_not_created();
 
-            if (interfaces != null)
+            ProbeMemberLock();
+            lock (memberLock)
             {
-                // Check for duplicates
-                foreach (Type t in interfaces)
-                    if (t == interfaceType)
-                        return;
+                if (interfaces != null)
+                {
+                    // Check for duplicates
+                    foreach (Type t in interfaces)
+                        if (t == interfaceType)
+                            return;
 
-                Type[] ifnew = new Type[interfaces.Length + 1];
-                interfaces.CopyTo(ifnew, 0);
-                ifnew[interfaces.Length] = interfaceType;
-                interfaces = ifnew;
-            }
-            else
-            {
-                interfaces = new Type[1];
-                interfaces[0] = interfaceType;
+                    Type[] ifnew = new Type[interfaces.Length + 1];
+                    interfaces.CopyTo(ifnew, 0);
+                    ifnew[interfaces.Length] = interfaceType;
+                    interfaces = ifnew;
+                }
+                else
+                {
+                    interfaces = new Type[1];
+                    interfaces[0] = interfaceType;
+                }
             }
         }
 
@@ -409,17 +436,21 @@ namespace System.Reflection.Emit
             RuntimeTypeBuilder res = new RuntimeTypeBuilder(pmodule, name, attr, parent, interfaces, packSize, typeSize, this);
             res.fullname = res.GetFullName();
             pmodule.RegisterTypeName(res, res.fullname);
-            if (subtypes != null)
+            ProbeMemberLock();
+            lock (memberLock)
             {
-                RuntimeTypeBuilder[] new_types = new RuntimeTypeBuilder[subtypes.Length + 1];
-                Array.Copy(subtypes, new_types, subtypes.Length);
-                new_types[subtypes.Length] = res;
-                subtypes = new_types;
-            }
-            else
-            {
-                subtypes = new RuntimeTypeBuilder[1];
-                subtypes[0] = res;
+                if (subtypes != null)
+                {
+                    RuntimeTypeBuilder[] new_types = new RuntimeTypeBuilder[subtypes.Length + 1];
+                    Array.Copy(subtypes, new_types, subtypes.Length);
+                    new_types[subtypes.Length] = res;
+                    subtypes = new_types;
+                }
+                else
+                {
+                    subtypes = new RuntimeTypeBuilder[1];
+                    subtypes[0] = res;
+                }
             }
             return res;
         }
@@ -432,17 +463,21 @@ namespace System.Reflection.Emit
             RuntimeConstructorBuilder cb = new RuntimeConstructorBuilder(this, attributes,
                 callingConvention, parameterTypes, requiredCustomModifiers,
                 optionalCustomModifiers);
-            if (ctors != null)
+            ProbeMemberLock();
+            lock (memberLock)
             {
-                RuntimeConstructorBuilder[] new_ctors = new RuntimeConstructorBuilder[ctors.Length + 1];
-                Array.Copy(ctors, new_ctors, ctors.Length);
-                new_ctors[ctors.Length] = cb;
-                ctors = new_ctors;
-            }
-            else
-            {
-                ctors = new RuntimeConstructorBuilder[1];
-                ctors[0] = cb;
+                if (ctors != null)
+                {
+                    RuntimeConstructorBuilder[] new_ctors = new RuntimeConstructorBuilder[ctors.Length + 1];
+                    Array.Copy(ctors, new_ctors, ctors.Length);
+                    new_ctors[ctors.Length] = cb;
+                    ctors = new_ctors;
+                }
+                else
+                {
+                    ctors = new RuntimeConstructorBuilder[1];
+                    ctors[0] = cb;
+                }
             }
             return cb;
         }
@@ -490,21 +525,25 @@ namespace System.Reflection.Emit
 
         private void append_method(RuntimeMethodBuilder mb)
         {
-            if (methods != null)
+            ProbeMemberLock();
+            lock (memberLock)
             {
-                if (methods.Length == num_methods)
+                if (methods != null)
                 {
-                    RuntimeMethodBuilder[] new_methods = new RuntimeMethodBuilder[methods.Length * 2];
-                    Array.Copy(methods, new_methods, num_methods);
-                    methods = new_methods;
+                    if (methods.Length == num_methods)
+                    {
+                        RuntimeMethodBuilder[] new_methods = new RuntimeMethodBuilder[methods.Length * 2];
+                        Array.Copy(methods, new_methods, num_methods);
+                        methods = new_methods;
+                    }
                 }
+                else
+                {
+                    methods = new RuntimeMethodBuilder[1];
+                }
+                methods[num_methods] = mb;
+                num_methods++;
             }
-            else
-            {
-                methods = new RuntimeMethodBuilder[1];
-            }
-            methods[num_methods] = mb;
-            num_methods++;
         }
 
         protected override MethodBuilder DefineMethodCore(string name, MethodAttributes attributes, CallingConventions callingConvention, Type? returnType, Type[]? returnTypeRequiredCustomModifiers, Type[]? returnTypeOptionalCustomModifiers, Type[]? parameterTypes, Type[][]? parameterTypeRequiredCustomModifiers, Type[][]? parameterTypeOptionalCustomModifiers)
@@ -592,22 +631,26 @@ namespace System.Reflection.Emit
             check_not_created();
 
             RuntimeFieldBuilder res = new RuntimeFieldBuilder(this, fieldName, type, attributes, requiredCustomModifiers, optionalCustomModifiers);
-            if (fields != null)
+            ProbeMemberLock();
+            lock (memberLock)
             {
-                if (fields.Length == num_fields)
+                if (fields != null)
                 {
-                    RuntimeFieldBuilder[] new_fields = new RuntimeFieldBuilder[fields.Length * 2];
-                    Array.Copy(fields, new_fields, num_fields);
-                    fields = new_fields;
+                    if (fields.Length == num_fields)
+                    {
+                        RuntimeFieldBuilder[] new_fields = new RuntimeFieldBuilder[fields.Length * 2];
+                        Array.Copy(fields, new_fields, num_fields);
+                        fields = new_fields;
+                    }
+                    fields[num_fields] = res;
+                    num_fields++;
                 }
-                fields[num_fields] = res;
-                num_fields++;
-            }
-            else
-            {
-                fields = new RuntimeFieldBuilder[1];
-                fields[0] = res;
-                num_fields++;
+                else
+                {
+                    fields = new RuntimeFieldBuilder[1];
+                    fields[0] = res;
+                    num_fields++;
+                }
             }
 
             if (IsEnum)
@@ -629,14 +672,18 @@ namespace System.Reflection.Emit
 
             RuntimePropertyBuilder res = new RuntimePropertyBuilder(this, name, attributes, callingConvention, returnType, returnTypeRequiredCustomModifiers, returnTypeOptionalCustomModifiers, parameterTypes, parameterTypeRequiredCustomModifiers, parameterTypeOptionalCustomModifiers);
 
-            if (properties != null)
+            ProbeMemberLock();
+            lock (memberLock)
             {
-                Array.Resize(ref properties, properties.Length + 1);
-                properties[properties.Length - 1] = res;
-            }
-            else
-            {
-                properties = new RuntimePropertyBuilder[1] { res };
+                if (properties != null)
+                {
+                    Array.Resize(ref properties, properties.Length + 1);
+                    properties[properties.Length - 1] = res;
+                }
+                else
+                {
+                    properties = new RuntimePropertyBuilder[1] { res };
+                }
             }
             return res;
         }
@@ -1521,17 +1568,21 @@ namespace System.Reflection.Emit
             check_not_created();
 
             RuntimeEventBuilder res = new RuntimeEventBuilder(this, name, attributes, eventtype);
-            if (events != null)
+            ProbeMemberLock();
+            lock (memberLock)
             {
-                RuntimeEventBuilder[] new_events = new RuntimeEventBuilder[events.Length + 1];
-                Array.Copy(events, new_events, events.Length);
-                new_events[events.Length] = res;
-                events = new_events;
-            }
-            else
-            {
-                events = new RuntimeEventBuilder[1];
-                events[0] = res;
+                if (events != null)
+                {
+                    RuntimeEventBuilder[] new_events = new RuntimeEventBuilder[events.Length + 1];
+                    Array.Copy(events, new_events, events.Length);
+                    new_events[events.Length] = res;
+                    events = new_events;
+                }
+                else
+                {
+                    events = new RuntimeEventBuilder[1];
+                    events[0] = res;
+                }
             }
             return res;
         }
