@@ -5344,11 +5344,19 @@ retry:
 		}
 	}
 
+#ifndef TARGET_WASM
 	if (ilen > INTERP_ICALL_TRAMP_IARGS)
 		g_error ("build_args_from_sig: TODO, allocate gregs: %d\n", ilen);
 
 	if (flen > INTERP_ICALL_TRAMP_FARGS)
 		g_error ("build_args_from_sig: TODO, allocate fregs: %d\n", flen);
+#endif
+	/*
+	 * No cap on wasm: the interp->native trampoline is generated per signature (WasmAppBuilder's
+	 * InterpToNativeGenerator) and reads margs->iargs/fargs by index, and build_args_from_sig sizes those
+	 * arrays to ilen/flen. 176 of the app's 1,132 cookies need more than 16 int slots (a wasm32 `long` takes
+	 * two), the lwjgl/JNI calli signatures R497 added among them, and an interpreted call through one aborted here.
+	 */
 
 	info->ilen = ilen;
 	info->flen = flen;
