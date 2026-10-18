@@ -550,11 +550,9 @@ namespace System.Reflection.Emit
         {
             check_name(nameof(name), name);
             check_not_created();
-            if (IsInterface && (
-                !((attributes & MethodAttributes.Abstract) != 0) ||
-                !((attributes & MethodAttributes.Virtual) != 0)) &&
-                !(((attributes & MethodAttributes.Static) != 0)))
-                throw new ArgumentException(SR.InvalidOperation_BadInterfaceNotAbstractAndVirtual);
+            // An interface takes any method, as CoreCLR's DefineMethodCore lets it since default interface methods:
+            // virtual with a body, or instance and non-virtual (IKVM's invokespecial stubs for Kotlin's access$...$jd
+            // bridges). ensure_runtime_vtable (sre.c) gives interface slots to the virtual ones only.
 
             returnType ??= typeof(void);
             RuntimeMethodBuilder res = new RuntimeMethodBuilder(this, name, attributes,
