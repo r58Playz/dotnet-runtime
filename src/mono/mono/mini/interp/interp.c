@@ -7265,6 +7265,33 @@ mono_wasm_jit_call_interp (MonoMethod *method, guint8 *buf)
  * scratch+252). It is dropped the moment the SYNCHRONIZED_INNER substitution below changes `method`,
  * because then it describes a different method; that is the same hazard the pretransform memo's identity
  * check exists for. */
+#if HOST_BROWSER
+/* R500: the spilled arguments' snapshot, see wj_call_interp_inner. 24 slots is the whole argument area (the return
+ * slot is at +192); a call with more cannot have been spilled through scratch at all. */
+#define WJ_ARGS_SAVED_MAX 24
+static gint32 wj_args_clobbered;
+
+/* Put the arguments the caller spilled back into `buf` if the callee's warmup overwrote them, counting each time and
+ * naming the first callees it happened to. */
+static void
+wj_args_restore (guint8 *buf, const guint64 *saved, int nslots, gpointer saved_vret, MonoMethod *method)
+{
+	gboolean args = memcmp (buf, saved, (gsize) nslots * 8) != 0;
+	gboolean vret = *(gpointer *) (buf + WJ_SCRATCH_VRET_OFF) != saved_vret;
+	if (G_LIKELY (!args && !vret))
+		return;
+	if (mono_atomic_inc_i32 (&wj_args_clobbered) <= 16) {
+		char *fn = mono_method_get_full_name (method);
+		g_warning ("WASM_JIT_ARGS_CLOBBERED #%d: %s -- its warmup's nested crossings overwrote %s%s%s it was spilled into this "
+			"thread's scratch with; restored", wj_args_clobbered, fn, args ? "the arguments" : "", args && vret ? " and " : "",
+			vret ? "the vret pointer" : "");
+		g_free (fn);
+	}
+	memcpy (buf, saved, (gsize) nslots * 8);
+	*(gpointer *) (buf + WJ_SCRATCH_VRET_OFF) = saved_vret;
+}
+#endif
+
 static int
 wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imethod)
 {
@@ -7321,6 +7348,26 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 	int idx = 0, i;
 	guint8 shape;
 	guint32 ptrmask;
+#ifdef HOST_BROWSER
+	/* R500: THE SPILLED ARGUMENTS MUST SURVIVE THE CALLEE'S WARMUP. The caller spilled them into this pthread's scratch,
+	 * `buf`, and everything between here and their first read below -- wasm_jit_prepare_interp_callee (a first transform:
+	 * IKVM's dynamic methods resolve tokens through managed RuntimeModuleBuilder.RuntimeResolve), wj_argshape (class
+	 * loading over the parameters) and the code_type decision (class init, AOT lookup) -- can run managed code that makes
+	 * its own JIT->interpreter crossings on this thread, through the SAME scratch, overwriting buf [0, 8 * nslots) and the
+	 * vret pointer with theirs; and until they are read, the spilled references are invisible to the GC. Caught in the
+	 * 26.2 world-gen hunt (MONO_GC_STORE_WATCH): a vslow call into LightmapRenderStateExtractor.extract
+	 * (LightmapRenderState, float) received, as `state`, the ConcurrentDictionary<Type, RuntimeJavaType> Tables a nested
+	 * IKVM type lookup had spilled at buf + 8, and its first statement stored a boolean at offset 32 of it -- the first
+	 * byte of the object after that Tables, the low byte of its vtable: SGEN_BAD_DESC, and the dangling-class family
+	 * (loader.c:1827) wherever it hit something else. So the arguments are copied into this C frame first (scanned
+	 * conservatively, so they also pin what they reference across the warmup) and put back before anything reads them. */
+	guint64 wj_args_saved [WJ_ARGS_SAVED_MAX];
+	int wj_nslots = (sig->hasthis ? 1 : 0) + sig->param_count;
+	gpointer wj_vret_saved = *(gpointer *) (buf + WJ_SCRATCH_VRET_OFF);
+	if (G_UNLIKELY (wj_nslots > WJ_ARGS_SAVED_MAX))
+		wj_nslots = WJ_ARGS_SAVED_MAX;
+	memcpy (wj_args_saved, buf, (gsize) wj_nslots * 8);
+#endif
 
 #ifdef HOST_BROWSER
 	/* DIAG (type-confusion source): a JITted caller spilled its args into `buf` before this residual call.
@@ -7413,6 +7460,10 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 			ct = mono_interp_jit_call_supported (method, sig) ? IMETHOD_CODE_COMPILED : IMETHOD_CODE_INTERP;
 			imethod->code_type = ct;
 		}
+#ifdef HOST_BROWSER
+		/* R500: the warmup is over; nothing past here runs managed code before the arguments are read. */
+		wj_args_restore (buf, wj_args_saved, wj_nslots, wj_vret_saved, method);
+#endif
 		if (ct == IMETHOD_CODE_COMPILED) {
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
 				mono_wasm_jit_count (WJC_RESIDUAL);
