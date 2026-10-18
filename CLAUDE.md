@@ -1119,7 +1119,24 @@ block written meanwhile as `FREE_QUARANTINE_HIT` with the changed words, its fir
 the object), freer/evictor and ms timestamps, then `WASM_JIT_COUNTERS_AT_HIT` and the R471 owner report. Read the VALUES:
 they named this writer when four rounds of reading code had not. It costs memory (h4 run 1 peaked at 7.6 GB VmData; no
 baseline run without it was taken), and a stale READ of a block it holds sees poison (`0xA5C3E1F7`) -- h4 run 1's
-`class-accessors.c:93` assert during a RuntimeResolve is probably one (not verified).
+`class-accessors.c:93` assert during a RuntimeResolve is probably one (not verified). On 26.2 boot hangs ~40% of the time
+under it at mixin apply (R500; also without it, rarely -- a lock-order deadlock, probably) -- set `--title-timeout-s 300`
+on the driver.
+
+**THE SECOND WRITER (R500, 26.2 world gen): a residual's spilled arguments overwritten during the callee's warmup.** A
+JIT->interpreter call spills `this` and its arguments into the pthread's SCRATCH (`+8*j`) and `wj_call_interp_inner`
+read them only after `wasm_jit_prepare_interp_callee` / `wj_argshape` / the code-type decision -- which transform a cold
+callee (a vslow IC hit can hand back an InterpMethod whose current generation is untransformed) and so run IKVM managed
+code whose own residuals reuse the same scratch. The callee ran with another call's arguments:
+`LightmapRenderStateExtractor.extract`'s `state` was IKVM's `globalTypeToTypeWrapper` Tables, and its first store zeroed
+the low byte of the next object's vtable (`SGEN_BAD_DESC`, `loader.c:1827`). Fixed by snapshotting the argument slots and
+the vret pointer into the C frame first (which also pins them) and restoring them before the read;
+`WASM_JIT_ARGS_CLOBBERED #n: <callee>` counts it -- 1-2 a world creation is normal. **The rule: anything in the scratch
+is one call's until that call has copied it out; between the spill and the copy nothing may run managed code, or the
+copy must be taken first.** The instruments that found it -- `MONO_GC_HEADER_AUDIT=1` (kept: 32-byte headers checked at
+each collection's start and end, the low-byte face repaired and named with the slot before it) and `MONO_GC_STORE_WATCH=1`
+(removed; `git apply scratchpad/wj/r500-instruments.patch`: names the interpreter or JIT store into a watched object's
+trailing bytes, with the method and a JS stack) -- are written up in MINECRAFT-FINDINGS.md R500.
 
 **Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
 The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
