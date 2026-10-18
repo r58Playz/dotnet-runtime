@@ -12200,6 +12200,30 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
 	}
 #endif
 
+#if HOST_BROWSER
+/* R501 (the 26.2 OOM, stack census): every pthread gets an 8 MiB C stack, a live census reads <= 132 KiB used, and
+ * 2-3 interpreter stack overflows per world creation happen on threads that are gone by the time it looks. Before the
+ * default pthread stack can shrink, measure what C stack a recursion deep enough to fill the 1 MiB interpreter stack
+ * costs: printed at the throw, the first 16 times. */
+static MONO_NEVER_INLINE void
+interp_soe_report (InterpMethod *imethod, ThreadContext *context)
+{
+	static int nsoe;
+	gsize cur = (gsize) emscripten_stack_get_current ();
+	gsize end = (gsize) emscripten_stack_get_end ();
+	gsize base = (gsize) emscripten_stack_get_base ();
+	int n = mono_atomic_inc_i32 (&nsoe);
+	if (n <= 16) {
+		char *name = imethod ? mono_method_full_name (imethod->method, TRUE) : NULL;
+		printf ("INTERP_STACK_OVERFLOW #%d: C stack used %u of %u bytes (headroom %d), interp stack %u of %u, thread %p, calling %s\n",
+			n, (unsigned) (base - cur), (unsigned) (base - end), (int) (cur - end),
+			(unsigned) (context->stack_pointer - context->stack_start), (unsigned) (context->stack_real_end - context->stack_start),
+			(gpointer) (gsize) mono_native_thread_id_get (), name ? name : "?");
+		g_free (name);
+	}
+}
+#endif
+
 /*
  * If CLAUSE_ARGS is non-null, start executing from it.
  * The ERROR argument is used to avoid declaring an error object for every interp frame, its not used
@@ -12441,6 +12465,9 @@ main_loop:
 			context->stack_pointer = (guchar*)frame->stack + new_method->alloca_size;
 			if (G_UNLIKELY (context->stack_pointer >= context->stack_end)) {
 				context->stack_end = context->stack_real_end;
+#if HOST_BROWSER
+				interp_soe_report (new_method, context);
+#endif
 				THROW_EX (mono_domain_get ()->stack_overflow_ex, ip);
 			}
 
@@ -12775,6 +12802,9 @@ interp_call:
 
 			if (G_UNLIKELY (context->stack_pointer >= context->stack_end)) {
 				context->stack_end = context->stack_real_end;
+#if HOST_BROWSER
+				interp_soe_report (cmethod, context);
+#endif
 				THROW_EX (mono_domain_get ()->stack_overflow_ex, ip);
 			}
 

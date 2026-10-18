@@ -38,6 +38,11 @@
 #include "metadata/w32handle.h"
 #include "icall-signatures.h"
 #include "mono/utils/mono-tls-inline.h"
+#ifdef HOST_BROWSER
+#include <emscripten.h>
+#include <emscripten/stack.h>
+#include <emscripten/threading.h>
+#endif
 
 #if _MSC_VER
 #pragma warning(disable:4312) // FIXME pointer cast to different size
@@ -1996,6 +2001,23 @@ sgen_client_thread_attach (SgenThreadInfo* info)
 	mono_tls_set_sgen_thread_info (info);
 #ifdef HOST_BROWSER
 	mono_wasm_sgen_tls_info = info;
+	/* R501 stack census: emscripten does not clear a pthread's stack and a block reused from freed memory carries
+	 * stale bytes, so a census can only bound the deepest frame from above. MONO_WASM_STACK_ZERO=1 zeroes the unused
+	 * part of this thread's C stack once, here, so the lowest non-zero word is its exact lifetime high-water mark.
+	 * Diagnostic: touches every page of every thread's stack. */
+	{
+		static int zero_stacks = -1;
+		if (zero_stacks < 0)
+			zero_stacks = g_hasenv ("MONO_WASM_STACK_ZERO") ? 1 : 0;
+		if (zero_stacks && !emscripten_is_main_runtime_thread ()) {
+			gsize cur = (gsize) emscripten_stack_get_current ();
+			gsize end = (gsize) emscripten_stack_get_end ();
+			if (cur > end + 65536)
+				memset ((void *) end, 0, cur - 65536 - end);
+			printf ("MONO_WASM_STACK_ZERO: thread %p zeroed %u bytes below sp-64K (stack %u bytes)\n", (gpointer) (gsize) mono_native_thread_id_get (),
+				cur > end + 65536 ? (unsigned) (cur - 65536 - end) : 0, (unsigned) ((gsize) emscripten_stack_get_base () - end));
+		}
+	}
 #endif
 
 	info->client_info.skip = FALSE;
