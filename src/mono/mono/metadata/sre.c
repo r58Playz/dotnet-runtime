@@ -3573,10 +3573,15 @@ ensure_runtime_vtable (MonoClass *klass, MonoError *error)
 	if (mono_class_is_interface (klass) && !mono_class_is_ginst (klass)) {
 		int slot_num = 0;
 		int mcount = mono_class_get_method_count (klass);
+		/* Virtual methods only, as mono_class_setup_methods numbers them and mono_class_setup_count_virtual_methods
+		 * sizes an implementor's interface region: an interface may also have non-virtual instance methods. */
 		for (i = 0; i < mcount; ++i) {
 			MonoMethod *im = klass->methods [i];
-			if (!(im->flags & METHOD_ATTRIBUTE_STATIC))
+			if (im->flags & METHOD_ATTRIBUTE_VIRTUAL)
 				im->slot = slot_num++;
+			else if (!(im->flags & METHOD_ATTRIBUTE_STATIC))
+				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_TYPE, "sre: interface %s.%s's non-virtual instance method %s takes no slot",
+					m_class_get_name_space (klass), m_class_get_name (klass), im->name);
 		}
 
 		/* make mono_class_setup_interface_offsets do work */
