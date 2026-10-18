@@ -1983,7 +1983,11 @@ static __thread int wj_slot_installed_cap = 0;
  * where the table is written (instantiate_local/_batch_local, the lazy alias); a new pthread starts with none, like
  * the bitmaps. Install tests compare it with the payload the registry publishes now (see WjRegEntry.payload). */
 static __thread guint32 *wj_slot_payload = NULL;
-static __thread int wj_slot_payload_cap = 0;
+static __thread int wj_slot_payload_cap = 0;   /* entries; entry i is slot wj_slot_payload_lo + i */
+/* R502: the window's first slot. Indexed from 0 the array paid for every slot below the first JIT slot -- the main
+ * module's ~255 k static table entries -- in every pthread that installed anything: 45 MiB at 41 threads of the 26.2
+ * world creation, 1-2 MiB each. Only the two accessors below touch the array, so the window is free to move. */
+static __thread int wj_slot_payload_lo = 0;
 static volatile gint32 wj_payload_seq;
 
 /* A fresh payload id for module bytes about to be published. Never 0, never reused. */
@@ -1997,26 +2001,57 @@ wj_payload_new (void)
 	return p;
 }
 
+#define WJ_SLOT_PAYLOAD_GRAIN 1024
+
+/* R507 bisection: MONO_WASM_JIT_PAYLOAD_WINDOW=0 pins the window at slot 0, i.e. the pre-R502 [0, cap) layout. */
+static int
+wj_payload_window (void)
+{
+	static int on = -1;
+	if (G_UNLIKELY (on < 0)) {
+		char *v = g_getenv ("MONO_WASM_JIT_PAYLOAD_WINDOW");
+		on = (v && *v == '0') ? 0 : 1;
+		g_free (v);
+	}
+	return on;
+}
+
 static void
 wj_slot_payload_set (int slot, guint32 payload)
 {
+	int lo = wj_slot_payload_lo, cap = wj_slot_payload_cap;
 	if (slot <= 0)
 		return;
-	if (G_UNLIKELY (slot >= wj_slot_payload_cap)) {
-		int ncap = wj_slot_payload_cap ? wj_slot_payload_cap : 1024;
-		while (slot >= ncap)
-			ncap *= 2;
+	if (G_UNLIKELY (slot < lo || slot >= lo + cap)) {
+		int nlo, nhi, ncap, shift;
+		if (!payload)
+			return;   /* clearing a slot outside the window: it holds nothing */
+		nlo = cap ? MIN (lo, slot & ~(WJ_SLOT_PAYLOAD_GRAIN - 1)) : slot & ~(WJ_SLOT_PAYLOAD_GRAIN - 1);
+		if (!wj_payload_window ())
+			nlo = 0;
+		nhi = cap ? MAX (lo + cap, (slot | (WJ_SLOT_PAYLOAD_GRAIN - 1)) + 1) : (slot | (WJ_SLOT_PAYLOAD_GRAIN - 1)) + 1;
+		/* Slots are handed out upward, so leave the top 1.25x the span to amortize, in whole grains. */
+		ncap = nhi - nlo;
+		if (cap && slot >= lo + cap)
+			ncap = MAX (ncap, cap + cap / 4);
+		ncap = (ncap + WJ_SLOT_PAYLOAD_GRAIN - 1) & ~(WJ_SLOT_PAYLOAD_GRAIN - 1);
+		shift = cap ? lo - nlo : 0;
 		wj_slot_payload = (guint32 *) wj_realloc_noted (wj_slot_payload, (gsize) ncap * sizeof (guint32), "slot_payload");
-		memset (wj_slot_payload + wj_slot_payload_cap, 0, (gsize) (ncap - wj_slot_payload_cap) * sizeof (guint32));
+		if (shift)
+			memmove (wj_slot_payload + shift, wj_slot_payload, (gsize) cap * sizeof (guint32));
+		memset (wj_slot_payload, 0, (gsize) shift * sizeof (guint32));
+		memset (wj_slot_payload + shift + cap, 0, (gsize) (ncap - shift - cap) * sizeof (guint32));
+		wj_slot_payload_lo = lo = nlo;
 		wj_slot_payload_cap = ncap;
 	}
-	wj_slot_payload [slot] = payload;
+	wj_slot_payload [slot - lo] = payload;
 }
 
 static inline guint32
 wj_slot_payload_at (int slot)
 {
-	return (slot > 0 && slot < wj_slot_payload_cap) ? wj_slot_payload [slot] : 0;
+	int i = slot - wj_slot_payload_lo;
+	return (slot > 0 && i >= 0 && i < wj_slot_payload_cap) ? wj_slot_payload [i] : 0;
 }
 
 static int wj_slot_is_installed (int slot);   /* defined below; used by the guard in wj_mark_slot_live */
@@ -6657,7 +6692,7 @@ wj_thread_state_free (void *unused)
 	gint64 bytes = 0;
 #define WJ_TFREE(p) do { if (p) { bytes += mono_wasm_jit_alloc_size (p); \
 		mono_wasm_jit_free_note ((p), mono_wasm_jit_usable_size (p), "thread_exit"); g_free (p); (p) = NULL; } } while (0)
-	wj_slot_live_cap = 0; wj_slot_installed_cap = 0; wj_slot_payload_cap = 0; wj_desc_state_cap = 0;
+	wj_slot_live_cap = 0; wj_slot_installed_cap = 0; wj_slot_payload_cap = 0; wj_slot_payload_lo = 0; wj_desc_state_cap = 0;
 	wj_clo_cap = 0; wj_clo_n = 0; wj_inst_cap = 0; wj_reach_cap = 0;
 	mono_memory_barrier ();
 	WJ_TFREE (wj_slot_live);

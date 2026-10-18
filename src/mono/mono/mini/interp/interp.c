@@ -2320,6 +2320,34 @@ static volatile gint32 wj_vcall_site_count;
 static __thread WjLocalVcallPicEntry *wj_vcall_pic;
 static __thread gint32 wj_vcall_pic_cap; /* sites, not entries */
 
+/* R502: a per-thread PIC's new capacity, in sites. Site ids are global (up to WJ_VCALL_SITE_MAX) and the PIC is dense up
+ * to the highest one the thread has reached, so doubling to the next power of two held up to 2x that in every thread
+ * (26.2 world creation: 29 + 18 MiB of vcall + delegate PIC at 41 threads, many at the full 65,536 sites). Grow to the
+ * site needed with 1.25x headroom over the old capacity, in 256-site grains. The emitted code reads the pointer and the
+ * capacity at each IC site (MONO_WASM_JIT_IC_REMAT, default on), so more frequent moves are safe. */
+static gint32
+wj_pic_grow_cap (gint32 oldcap, guint32 need)
+{
+	/* R507 bisection: MONO_WASM_JIT_PIC_DOUBLING=1 restores the pre-R502 growth (256, then doubling). */
+	static int doubling = -1;
+	if (G_UNLIKELY (doubling < 0)) {
+		char *v = g_getenv ("MONO_WASM_JIT_PIC_DOUBLING");
+		doubling = (v && *v == '1') ? 1 : 0;
+		g_free (v);
+	}
+	if (doubling) {
+		gint32 c = oldcap ? oldcap : 256;
+		while (need > (guint32) c)
+			c *= 2;
+		return c;
+	}
+	guint32 ncap = MAX (need, (guint32) oldcap + (guint32) oldcap / 4);
+	ncap = (ncap + 255) & ~255u;
+	if (ncap > WJ_VCALL_SITE_MAX)
+		ncap = MAX (need, WJ_VCALL_SITE_MAX);
+	return (gint32) ncap;
+}
+
 static inline WjVcallSite *
 wj_vcall_site (gpointer ic)
 {
@@ -2369,9 +2397,7 @@ wj_vcall_pic_for_site (gpointer ic, gboolean grow)
 		if (!grow)
 			return NULL;
 		oldcap = wj_vcall_pic_cap;
-		ncap = oldcap ? oldcap : 256;
-		while (need > (guint32) ncap)
-			ncap *= 2;
+		ncap = wj_pic_grow_cap (oldcap, need);
 		oldbytes = (gsize) oldcap * mono_wasm_jit_vcall_ways * sizeof (WjLocalVcallPicEntry);
 		nbytes = (gsize) ncap * mono_wasm_jit_vcall_ways * sizeof (WjLocalVcallPicEntry);
 		{
@@ -3129,9 +3155,7 @@ wj_delegate_pic_for_site (gpointer ic, gboolean grow)
 		if (!grow)
 			return NULL;
 		oldcap = wj_delegate_pic_cap;
-		ncap = oldcap ? oldcap : 256;
-		while (need > (guint32) ncap)
-			ncap *= 2;
+		ncap = wj_pic_grow_cap (oldcap, need);
 		oldbytes = (gsize) oldcap * mono_wasm_jit_vcall_ways * sizeof (WjLocalDelegatePicEntry);
 		nbytes = (gsize) ncap * mono_wasm_jit_vcall_ways * sizeof (WjLocalDelegatePicEntry);
 		wj_delegate_pic = (WjLocalDelegatePicEntry *) g_realloc (wj_delegate_pic, nbytes);
