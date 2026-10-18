@@ -2884,6 +2884,249 @@ sgen_client_describe_invalid_pointer (GCObject *ptr)
 	sgen_bridge_describe_pointer (ptr);
 }
 
+#ifdef HOST_WASM
+/* Whether [p, p + n) lies in the linear memory: on wasm the only reads a stray word can make trap are past its end. */
+static gboolean
+bad_desc_readable (mword p, mword n)
+{
+	guint64 lim = (guint64) __builtin_wasm_memory_size (0) << 16;
+	return p >= 4096 && (guint64) p + n <= lim;
+}
+
+/* The C string at p as printable ASCII, at most cap - 1 chars; "?" when nothing is readable. */
+static const char*
+bad_desc_str (char *dst, int cap, const char *p)
+{
+	int i = 0;
+	while (i < cap - 1 && bad_desc_readable ((mword) (gsize) (p + i), 1)) {
+		char c = p [i];
+		if (!c)
+			break;
+		dst [i++] = (c >= 32 && c < 127) ? c : '?';
+	}
+	if (!i && !bad_desc_readable ((mword) (gsize) p, 1))
+		dst [i++] = '?';
+	dst [i] = 0;
+	return dst;
+}
+
+/* A validated class's full name with its generic arguments -- which ConcurrentDictionary<K,V> a Tables is, say. Only for a
+ * class whose runtime_vtable points back at the word: the name walk follows the class's metadata unbounded. */
+static void
+bad_desc_full_name (const char *what, mword word, MonoClass *k)
+{
+	char *full = mono_type_get_full_name (k);
+	g_warning ("SGEN_BAD_DESC %s 0x%lx is %s", what, (unsigned long) word, full ? full : "?");
+	g_free (full);
+}
+
+/* A class's name as namespace.Outer/Name, every read bounded; "?" for what is not readable. */
+static const char*
+bad_desc_class_name (char *dst, int cap, MonoClass *k)
+{
+	char ns [96], outer [96], name [96];
+	MonoClass *in;
+
+	if (!bad_desc_readable ((mword) (gsize) k, 512)) {
+		snprintf (dst, cap, "?");
+		return dst;
+	}
+	in = m_class_get_nested_in (k);
+	bad_desc_str (name, sizeof (name), m_class_get_name (k));
+	if (bad_desc_readable ((mword) (gsize) in, 512)) {
+		bad_desc_str (ns, sizeof (ns), m_class_get_name_space (in));
+		snprintf (dst, cap, "%s.%s/%s", ns, bad_desc_str (outer, sizeof (outer), m_class_get_name (in)), name);
+	} else {
+		snprintf (dst, cap, "%s.%s", bad_desc_str (ns, sizeof (ns), m_class_get_name_space (k)), name);
+	}
+	return dst;
+}
+#endif
+
+/*
+ * wasm fork (R500): what a suspect vtable word points at. Its words; then, read as a MonoVTable, its class, that class's
+ * runtime_vtable and gc_descr against the word's second word -- the class pointing back with a different descriptor
+ * says the vtable itself was overwritten, another runtime_vtable a stale or dropped vtable, no readable class not a
+ * vtable at all -- and, read as a MonoClass (a header that took the class instead of its vtable), its name.
+ */
+void
+sgen_client_report_vtable_word (const char *what, mword word)
+{
+#ifdef HOST_WASM
+	const mword *w;
+	char buf [512], cname [320], img [96];
+	MonoClass *klass;
+	MonoVTable *rvt;
+	MonoImage *image;
+	int i, n;
+
+	word = (mword) SGEN_POINTER_UNTAG_VTABLE (word);
+	w = (const mword *) word;
+	if (!bad_desc_readable (word, 12 * sizeof (mword))) {
+		g_warning ("SGEN_BAD_DESC %s 0x%lx: outside the linear memory", what, (unsigned long) word);
+		return;
+	}
+	/* words -2 and -1 too: a dlmalloc chunk's prev_foot and head (size | CINUSE 2 | PINUSE 1) when word starts a block */
+	n = snprintf (buf, sizeof (buf), "SGEN_BAD_DESC %s 0x%lx words[-2..11]:", what, (unsigned long) word);
+	for (i = -2; i < 12 && n > 0 && n < (int) sizeof (buf) - 12; ++i)
+		if (bad_desc_readable ((mword) (gsize) (w + i), sizeof (mword)))
+			n += snprintf (buf + n, sizeof (buf) - n, "%s%lx", i == 0 ? " |" : " ", (unsigned long) w [i]);
+	g_warning ("%s", buf);
+
+	klass = (MonoClass *) w [0];
+	if (!bad_desc_readable ((mword) (gsize) klass, 512)) {
+		g_warning ("SGEN_BAD_DESC %s 0x%lx: its word 0 is no readable class -- not a vtable", what, (unsigned long) word);
+	} else {
+		rvt = m_class_get_runtime_vtable (klass);
+		image = m_class_get_image (klass);
+		g_warning ("SGEN_BAD_DESC %s 0x%lx as a vtable: klass %p '%s' image '%s', its runtime_vtable %p (%s), its gc_descr 0x%lx (inited %d) vs the word's 0x%lx, typebuilder %d",
+			what, (unsigned long) word, klass, bad_desc_class_name (cname, sizeof (cname), klass),
+			bad_desc_readable ((mword) (gsize) image, 512) ? bad_desc_str (img, sizeof (img), mono_image_get_name (image)) : "?",
+			rvt, (mword) (gsize) rvt == word ? "THIS word" : "another",
+			(unsigned long) m_class_get_gc_descr (klass), m_class_is_gc_descr_inited (klass) ? 1 : 0, (unsigned long) w [1],
+			m_class_was_typebuilder (klass) ? 1 : 0);
+		if ((mword) (gsize) rvt == word)
+			bad_desc_full_name (what, word, klass);
+	}
+	if (bad_desc_readable (word, 512))
+		g_warning ("SGEN_BAD_DESC %s 0x%lx as a class: '%s'", what, (unsigned long) word,
+			bad_desc_class_name (cname, sizeof (cname), (MonoClass *) word));
+
+	/* The vtable it was if only its low byte changed: the three 26.2 world-gen captures end in 00, and in one the true
+	 * vtable was the same word with d0 there. A candidate counts when its class points back at it. */
+	if (!(bad_desc_readable ((mword) (gsize) klass, 512) && (mword) (gsize) m_class_get_runtime_vtable (klass) == word)) {
+		for (i = 0; i < 256; i += 8) {
+			mword cand = (word & ~(mword) 0xFF) | (mword) i;
+			MonoClass *ck;
+			if (cand == word || !bad_desc_readable (cand, sizeof (MonoVTable)))
+				continue;
+			ck = ((MonoVTable *) cand)->klass;
+			if (!bad_desc_readable ((mword) (gsize) ck, 512) || (mword) (gsize) m_class_get_runtime_vtable (ck) != cand)
+				continue;
+			image = m_class_get_image (ck);
+			g_warning ("SGEN_BAD_DESC %s 0x%lx: with low byte %02x it is the vtable of '%s' image '%s' (gc_descr 0x%lx)",
+				what, (unsigned long) word, i, bad_desc_class_name (cname, sizeof (cname), ck),
+				bad_desc_readable ((mword) (gsize) image, 512) ? bad_desc_str (img, sizeof (img), mono_image_get_name (image)) : "?",
+				(unsigned long) ((MonoVTable *) cand)->gc_descr);
+			bad_desc_full_name (what, cand, ck);
+		}
+	}
+#endif
+}
+
+/*
+ * wasm fork (R500): the thread stack or registered GC root a native address lies in, and the words around it -- for a
+ * word outside the GC heap that still holds a suspect object.
+ */
+void
+sgen_client_report_native_ref (const char *what, const void *addr)
+{
+#ifdef HOST_WASM
+	const char *a = (const char *) addr;
+	const mword *w = (const mword *) ((mword) (gsize) addr & ~(mword) (sizeof (mword) - 1));
+	char buf [400];
+	int t, i, n, found = 0;
+
+	FOREACH_THREAD_ALL (info) {
+		const char *sp = (const char *) info->client_info.stack_start, *hi = (const char *) info->client_info.info.stack_end;
+		const char *lo = (const char *) info->client_info.info.stack_start_limit;
+		if (hi && a < hi && a >= (lo ? lo : sp ? sp : hi)) {
+			g_warning ("SGEN_BAD_DESC %s %p: on the stack of thread %p (tid %p), %d bytes below its end, %s its scanned part [%p, %p)",
+				what, addr, info, (gpointer) (gsize) mono_thread_info_get_tid (info), (int) (hi - a),
+				sp && a >= sp ? "inside" : "OUTSIDE", sp, hi);
+			found = 1;
+		}
+	} FOREACH_THREAD_END
+	for (t = 0; t < ROOT_TYPE_NUM; ++t) {
+		void **start_root;
+		RootRecord *root;
+		SGEN_HASH_TABLE_FOREACH (&sgen_roots_hash [t], void **, start_root, RootRecord *, root) {
+			if (a >= (char *) start_root && a < root->end_root) {
+				g_warning ("SGEN_BAD_DESC %s %p: in registered root [%p, %p) type %d source %d '%s' at +%d",
+					what, addr, start_root, root->end_root, t, root->source, root->msg ? root->msg : "", (int) (a - (char *) start_root));
+				found = 1;
+			}
+		} SGEN_HASH_TABLE_FOREACH_END;
+	}
+	n = snprintf (buf, sizeof (buf), "SGEN_BAD_DESC %s %p: %s; words[-6..+5]:", what, addr, found ? "native" : "native, no thread stack or root");
+	for (i = -6; i < 6 && n > 0 && n < (int) sizeof (buf) - 12; ++i)
+		if (bad_desc_readable ((mword) (gsize) (w + i), sizeof (mword)))
+			n += snprintf (buf + n, sizeof (buf) - n, "%s%lx", i == 0 ? " |" : " ", (unsigned long) w [i]);
+	g_warning ("%s", buf);
+#endif
+}
+
+#ifdef HOST_WASM
+/* The audit's cache of words already found good: one direct-mapped slot per 8-byte-aligned vtable bucket. Touched only
+ * by the collector with the world stopped. A class whose vtable is dropped later stays "good" here, which errs quiet. */
+static mword audit_ok_cache [1024];
+static int audit_repaired, audit_odd;
+#endif
+
+gboolean
+sgen_client_vtable_word_ok (mword word)
+{
+#ifdef HOST_WASM
+	mword vt = (mword) SGEN_POINTER_UNTAG_VTABLE (word);
+	unsigned idx = (unsigned) (vt >> 3) & (G_N_ELEMENTS (audit_ok_cache) - 1);
+	MonoClass *k;
+
+	if (audit_ok_cache [idx] == vt)
+		return TRUE;
+	if (!bad_desc_readable (vt, sizeof (MonoVTable)))
+		return FALSE;
+	k = ((MonoVTable *) vt)->klass;
+	if (!bad_desc_readable ((mword) (gsize) k, 512) || (mword) (gsize) m_class_get_runtime_vtable (k) != vt)
+		return FALSE;
+	audit_ok_cache [idx] = vt;
+#endif
+	return TRUE;
+}
+
+/*
+ * One header the audit found bad (sgen_ms_audit_headers). The R500 face -- a vtable whose low byte was zeroed -- is
+ * named with the class it was and the slot before it, and repaired so the run goes on to the next one; anything else
+ * (a TypeBuilder object on a dropped provisional vtable, say) is only counted, its first five printed.
+ */
+int
+sgen_client_audit_bad_header (const char *phase, char *obj, char *prev)
+{
+#ifdef HOST_WASM
+	mword word = *(mword *) obj, fix = 0, pw;
+	int i;
+
+	for (i = 0; i < 256 && !fix; i += 8) {
+		mword cand = (word & ~(mword) 0xFF) | (mword) i;
+		if (cand != word && sgen_client_vtable_word_ok (cand))
+			fix = cand;
+	}
+	if (!fix) {
+		if (++audit_odd <= 5)
+			g_warning ("SGEN_HEADER_AUDIT %s: obj %p vtable word 0x%lx is no vtable, and no low byte makes it one (%d such)",
+				phase, obj, (unsigned long) word, audit_odd);
+		return 0;
+	}
+	if (++audit_repaired <= 64) {
+		char *fn = mono_type_get_full_name (((MonoVTable *) fix)->klass);
+		char *pn = NULL;
+		pw = prev ? (mword) SGEN_POINTER_UNTAG_VTABLE (*(mword *) prev) : 0;
+		if (prev && sgen_client_vtable_word_ok (pw))
+			pn = mono_type_get_full_name (((MonoVTable *) pw)->klass);
+		g_warning ("SGEN_HEADER_AUDIT %s #%d: obj %p header 0x%lx -> 0x%lx (%s, low byte %02x); previous slot %p: %s; words[0..7]: %lx %lx %lx %lx %lx %lx %lx %lx",
+			phase, audit_repaired, obj, (unsigned long) word, (unsigned long) fix, fn ? fn : "?", (unsigned) (fix & 0xFF),
+			prev, pn ? pn : (prev ? "no valid vtable" : "none (first slot)"),
+			((unsigned long *) obj) [0], ((unsigned long *) obj) [1], ((unsigned long *) obj) [2], ((unsigned long *) obj) [3],
+			((unsigned long *) obj) [4], ((unsigned long *) obj) [5], ((unsigned long *) obj) [6], ((unsigned long *) obj) [7]);
+		g_free (fn);
+		g_free (pn);
+	}
+	*(mword *) obj = fix;
+	return 1;
+#else
+	return 0;
+#endif
+}
+
 static gboolean gc_inited;
 
 /**
