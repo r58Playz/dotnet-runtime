@@ -175,6 +175,81 @@ static gboolean missing_remsets;
  * Record its shape before the assert: aligned zeros, small integers or a stray pointer in the header each point somewhere
  * different. Reads a few words either side of the object, which on wasm cannot fault.
  */
+#ifdef HOST_WASM
+/* Where a word that holds the suspect object (or its vtable word) lies: a LOS object, a major slot, or native memory. */
+static void
+report_bad_desc_holder (const char *what, const mword *at, gboolean describe_vtable)
+{
+	char *s = NULL;
+
+	if (sgen_ptr_in_nursery ((void*)at)) {
+		sgen_client_report_native_ref (what, at);   /* the nursery is not walkable mid-collection: its words only */
+	} else if (sgen_ptr_is_in_los ((char*)at, &s)) {
+		g_warning ("SGEN_BAD_DESC %s %p: LOS object %p +%d", what, at, s, (int)((char*)at - s));
+		if (describe_vtable)
+			sgen_client_report_vtable_word ("  its vtable word", *(mword*)s);
+	} else if ((s = sgen_ms_report_ptr (what, (char*)at, NULL))) {
+		if (describe_vtable)
+			sgen_client_report_vtable_word ("  its vtable word", *(mword*)s);
+	} else {
+		sgen_client_report_native_ref (what, at);
+	}
+}
+
+/*
+ * wasm fork (R500): the shape behind a bad descriptor, which R479's words alone could not name. The 26.2 world-gen
+ * capture (wgen262-batch1/r1) read as a block of 32-byte objects whose slot at obj held vtable word 0x17a88900 with a
+ * pointer where its descriptor belongs: a vtable overwritten, a header holding something that is no vtable, or a stale
+ * reference into memory reused since. These lines separate them -- where obj lies (an allocated slot, a FREE one, no
+ * block at all); what its vtable word points at, and the neighbouring slots' for contrast; and every word in the linear
+ * memory that holds obj (the referrer: the object, root or stack it lies in) or its vtable word. One pass over the whole
+ * linear memory, ~1 s at 4 GB: the world is stopped and the caller asserts next.
+ */
+static void
+report_bad_desc_shape (const char *start, mword vt_word)
+{
+	const mword *refs [24], *vts [8], *p, *end;
+	guint64 lim = (guint64)__builtin_wasm_memory_size (0) << 16;
+	mword target = (mword)start, vt = (mword)SGEN_POINTER_UNTAG_VTABLE (vt_word);
+	char *slot = NULL, *los = NULL;
+	int obj_size = 0, nref = 0, nvt = 0, i;
+
+	if (sgen_ptr_in_nursery ((void*)start))
+		g_warning ("SGEN_BAD_DESC obj %p: in the nursery", start);
+	else if (sgen_ptr_is_in_los ((char*)start, &los))
+		g_warning ("SGEN_BAD_DESC obj %p: LOS object %p +%d", start, los, (int)(start - los));
+	else if (!(slot = sgen_ms_report_ptr ("obj", (char*)start, &obj_size)))
+		g_warning ("SGEN_BAD_DESC obj %p: in no allocated major block and not in LOS -- memory the GC no longer owns", start);
+	sgen_client_report_vtable_word ("obj's vtable word", vt_word);
+	if (slot && obj_size > 0) {
+		sgen_client_report_vtable_word ("previous slot's word 0", *(mword*)(slot - obj_size));
+		sgen_client_report_vtable_word ("next slot's word 0", *(mword*)(slot + obj_size));
+	}
+
+	if (lim > 0xFFFFFFF0ull)
+		lim = 0xFFFFFFF0ull;   /* wasm32's 4 GB does not fit a pointer */
+	end = (const mword*)(gsize)(lim & ~(guint64)(sizeof (mword) - 1));
+	for (p = (const mword*)4096; p < end; ++p) {
+		mword v = *p;
+		if (G_UNLIKELY (v == target)) {
+			if (nref < (int)G_N_ELEMENTS (refs))
+				refs [nref] = p;
+			nref++;
+		} else if (G_UNLIKELY (v == vt)) {
+			if (nvt < (int)G_N_ELEMENTS (vts))
+				vts [nvt] = p;
+			nvt++;
+		}
+	}
+	g_warning ("SGEN_BAD_DESC %d words in the linear memory hold obj %p (the GC's own and this report's frames among them), %d hold its vtable word 0x%lx",
+		nref, start, nvt, (unsigned long)vt);
+	for (i = 0; i < MIN (nref, (int)G_N_ELEMENTS (refs)); ++i)
+		report_bad_desc_holder ("holder of obj", refs [i], TRUE);
+	for (i = 0; i < MIN (nvt, (int)G_N_ELEMENTS (vts)); ++i)
+		report_bad_desc_holder ("holder of its vtable word", vts [i], FALSE);
+}
+#endif
+
 void
 sgen_report_bad_scan_desc (const char *start, mword desc)
 {
@@ -187,6 +262,9 @@ sgen_report_bad_scan_desc (const char *start, mword desc)
 	for (i = -8; i < 16 && n > 0 && n < (int)sizeof (buf) - 12; ++i)
 		n += snprintf (buf + n, sizeof (buf) - n, "%s%lx", i == 0 ? " |" : " ", (unsigned long)w [i]);
 	g_warning ("%s", buf);
+#ifdef HOST_WASM
+	report_bad_desc_shape (start, w [0]);
+#endif
 }
 
 /*

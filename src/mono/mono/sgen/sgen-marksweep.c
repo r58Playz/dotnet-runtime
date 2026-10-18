@@ -967,6 +967,71 @@ major_is_valid_object (char *object)
 	return FALSE;
 }
 
+/*
+ * wasm fork (sgen_report_bad_scan_desc): the major-heap slot holding ptr, as one g_warning line -- the block, its
+ * object size and state, the slot, ptr's offset in it, whether the slot is allocated and marked. Returns the slot's
+ * start (and its size in *obj_size), or NULL when no allocated block contains ptr.
+ */
+char*
+sgen_ms_report_ptr (const char *what, char *ptr, int *obj_size)
+{
+	MSBlockInfo *block;
+
+	FOREACH_BLOCK_NO_LOCK (block) {
+		char *base = MS_BLOCK_FOR_BLOCK_INFO (block);
+		char *obj;
+		int idx, w, b;
+
+		if (ptr < base || ptr >= base + ms_block_size)
+			continue;
+		if (ptr < base + MS_BLOCK_SKIP) {
+			g_warning ("SGEN_BAD_DESC %s %p: in the header of major block %p (obj size %d)", what, ptr, base, block->obj_size);
+			return NULL;
+		}
+		idx = MS_BLOCK_OBJ_INDEX (ptr, block);
+		obj = (char*)MS_BLOCK_OBJ (block, idx);
+		MS_CALC_MARK_BIT (w, b, obj);
+		g_warning ("SGEN_BAD_DESC %s %p: major block %p obj size %d state %d nused %d pinned %d refs %d, slot %d at %p +%d %s marked %d",
+			what, ptr, base, block->obj_size, (int)block->state, (int)block->nused, block->pinned, block->has_references,
+			idx, obj, (int)(ptr - obj), MS_OBJ_ALLOCED (obj, block) ? "allocated" : "FREE", MS_MARK_BIT (block, w, b) ? 1 : 0);
+		if (obj_size)
+			*obj_size = block->obj_size;
+		return obj;
+	} END_FOREACH_BLOCK_NO_LOCK;
+
+	return NULL;
+}
+
+/*
+ * wasm fork (R500, MONO_GC_HEADER_AUDIT=1): hand every allocated slot of the 32-byte blocks whose vtable word fails the
+ * client's check to sgen_client_audit_bad_header, which names it and puts back the vtable a low-byte change hid. The
+ * 26.2 world-gen corruption is exactly that -- one zero byte over the first byte of the object right after a
+ * ConcurrentDictionary Tables, four captures of four, all in 32-byte blocks -- and the collection phase that first sees
+ * it says whether a mutator or the collector wrote it. Returns how many it repaired.
+ */
+int
+sgen_ms_audit_headers (const char *phase)
+{
+	MSBlockInfo *block;
+	int repaired = 0;
+
+	FOREACH_BLOCK_NO_LOCK (block) {
+		int count, i;
+
+		if (block->obj_size != 32)
+			continue;
+		count = MS_BLOCK_FREE / block->obj_size;
+		for (i = 0; i < count; ++i) {
+			char *obj = (char*)MS_BLOCK_OBJ (block, i);
+			if (!MS_OBJ_ALLOCED (obj, block) || G_LIKELY (sgen_client_vtable_word_ok (*(mword*)obj)))
+				continue;
+			repaired += sgen_client_audit_bad_header (phase, obj, i > 0 ? (char*)MS_BLOCK_OBJ (block, i - 1) : NULL);
+		}
+	} END_FOREACH_BLOCK_NO_LOCK;
+
+	return repaired;
+}
+
 
 static GCVTable
 major_describe_pointer (char *ptr)

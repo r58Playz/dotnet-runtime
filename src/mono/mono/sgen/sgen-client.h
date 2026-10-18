@@ -243,6 +243,18 @@ gpointer sgen_client_get_provenance (void);
 void sgen_client_describe_invalid_pointer (GCObject *ptr);
 
 /*
+ * wasm fork (R500, sgen_report_bad_scan_desc): what a suspect vtable word points at, and which thread stack or registered
+ * root holds a native address. Both report through g_warning and read only inside the linear memory; off wasm they
+ * report nothing.
+ */
+void sgen_client_report_vtable_word (const char *what, mword word);
+void sgen_client_report_native_ref (const char *what, const void *addr);
+/* MONO_GC_HEADER_AUDIT (R500): whether a header word is a vtable its class points back at; and, for one that is not,
+ * report it and restore the vtable a low-byte change hid (returns 1 when it did). */
+gboolean sgen_client_vtable_word_ok (mword word);
+int sgen_client_audit_bad_header (const char *phase, char *obj, char *prev);
+
+/*
  * Return the weak bitmap for a class
  */
 gsize *sgen_client_get_weak_bitmap (GCVTable vt, int *nbits);

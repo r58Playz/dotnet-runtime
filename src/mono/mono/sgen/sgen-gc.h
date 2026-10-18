@@ -1162,6 +1162,10 @@ void sgen_check_whole_heap (gboolean allow_missing_pinning);
 /* wasm fork (R479): the scanner met a descriptor type no object can have -- its header was overwritten. Logs the object,
  * its first word and the words around it, then the caller asserts as before. */
 void sgen_report_bad_scan_desc (const char *start, mword desc);
+/* wasm fork (R500): the major-heap slot holding ptr, reported; NULL when no allocated block holds it (sgen-marksweep.c). */
+char* sgen_ms_report_ptr (const char *what, char *ptr, int *obj_size);
+/* wasm fork (R500, MONO_GC_HEADER_AUDIT=1): check, name and repair the 32-byte blocks' headers (sgen-marksweep.c). */
+int sgen_ms_audit_headers (const char *phase);
 void sgen_check_whole_heap_stw (void)
 	MONO_PERMIT (need (sgen_gc_locked, sgen_stop_world));
 void sgen_check_objref (char *obj);

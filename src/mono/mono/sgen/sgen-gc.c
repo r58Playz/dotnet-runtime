@@ -2628,6 +2628,32 @@ sgen_ensure_free_space (size_t size, int generation)
 }
 
 /*
+ * wasm fork (R500): MONO_GC_HEADER_AUDIT=1 checks the 32-byte blocks' headers as each collection starts, with the world
+ * just stopped, and again just before it restarts (sgen_ms_audit_headers): a header first found bad at "pre" was
+ * written by a mutator since the last collection; one the marker trips on after a clean "pre" was written by this one.
+ */
+static void
+header_audit (const char *when, int generation)
+{
+	static int on = -1;
+	char phase [96];
+
+	if (G_LIKELY (on == 0))
+		return;
+	if (on < 0) {
+		char *v = g_getenv ("MONO_GC_HEADER_AUDIT");
+		on = v && v [0] == '1';
+		g_free (v);
+		if (!on)
+			return;
+		g_warning ("SGEN_HEADER_AUDIT on: 32-byte blocks checked before and after every collection");
+	}
+	snprintf (phase, sizeof (phase), "%s-%s minor#%d major#%d", when, generation == GENERATION_OLD ? "major" : "minor",
+		mono_atomic_load_i32 (&mono_gc_stats.minor_gc_count), mono_atomic_load_i32 (&mono_gc_stats.major_gc_count));
+	sgen_ms_audit_headers (phase);
+}
+
+/*
  * LOCKING: Assumes the GC lock is held.
  */
 static void
@@ -2651,6 +2677,7 @@ sgen_perform_collection_inner (size_t requested_size, int generation_to_collect,
 
 
 	TV_GETTIME (gc_total_start);
+	header_audit ("pre", generation_to_collect);
 
 	// FIXME: extract overflow reason
 	// FIXME: minor overflow for concurrent case
@@ -2719,6 +2746,8 @@ sgen_perform_collection_inner (size_t requested_size, int generation_to_collect,
 	timestamp_last_start = timestamp_last_end;
 
 	time_max = MAX (time_max, time_last);
+
+	header_audit ("post", oldest_generation_collected);
 
 	if (stw)
 		sgen_restart_world (oldest_generation_collected, forced_serial || !sgen_major_collector.is_concurrent);
