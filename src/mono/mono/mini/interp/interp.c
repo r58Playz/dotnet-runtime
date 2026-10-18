@@ -2228,6 +2228,12 @@ typedef struct {
 	 * signature, which is exactly what this cache exists to avoid. Trailing, like slow_reason, because
 	 * emitted code reads earlier fields by G_STRUCT_OFFSET and only growth at the end is safe. */
 	volatile gint32 abi_ok;
+	/* R507: wj_dyn_method_epoch when the recipe was computed. A DynamicMethod is collectible, and the next one is
+	 * often allocated at the freed one's address: a cache keyed by the MonoMethod * then hands the NEW delegate the
+	 * DEAD method's target and InterpMethod (26.2: a lambda-ctor invoker run on another lambda class's instance,
+	 * BootstrapMethodError <- LambdaConversionException <- ClassCastException). A dynamic source only hits at the
+	 * epoch it was cached in. Trailing, like the two above. */
+	volatile gint32 epoch;
 } WjDelegateIC;
 
 /*
@@ -3179,6 +3185,8 @@ wj_delegate_pic_for_site (gpointer ic, gboolean grow)
 
 /* Publish one recipe for THIS worker. Called only from the miss helper, so it runs at most once per
  * (site, way, thread) per distinct key -- a generated hit never reaches here. */
+static int wj_dyn_delegate_epoch_on (void);
+
 static void
 wj_delegate_pic_publish (gpointer ic, MonoMethod *source, MonoVTable *receiver_vt, gint32 fslot, gint32 shape)
 {
@@ -3189,6 +3197,10 @@ wj_delegate_pic_publish (gpointer ic, MonoMethod *source, MonoVTable *receiver_v
 
 	if (fslot <= 0 || !source)
 		return;   /* nothing cacheable: a hit must imply an admitted scalar target */
+	/* R507: a DynamicMethod's address is reused after it is collected, and the emitted hit compares only the pointer
+	 * (no epoch), so a dynamic source is never cached here; it takes the C prepare, whose cache checks the epoch. */
+	if (source->dynamic && wj_dyn_delegate_epoch_on ())
+		return;
 	p = wj_delegate_pic_for_site (ic, TRUE);
 	if (G_UNLIKELY (!p))
 		return;   /* publishing is a pure optimisation */
@@ -7786,6 +7798,23 @@ enum {
 	WJ_DELEGATE_OPEN_INSTANCE
 };
 
+/* R507: bumped by interp_free_method before a dynamic method's memory goes, so any cached recipe for a dynamic
+ * source from before the free stops matching. MONO_WASM_JIT_DYN_DELEGATE_EPOCH=0 turns the check (and the per-thread
+ * PIC's refusal of dynamic sources) off, for the A/B. */
+static volatile gint32 wj_dyn_method_epoch = 1;
+
+static int
+wj_dyn_delegate_epoch_on (void)
+{
+	static int on = -1;
+	if (G_UNLIKELY (on < 0)) {
+		char *v = g_getenv ("MONO_WASM_JIT_DYN_DELEGATE_EPOCH");
+		on = (v && *v == '0') ? 0 : 1;
+		g_free (v);
+	}
+	return on;
+}
+
 static gboolean
 wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
 	MonoMethod **target, InterpMethod **imethod, int *shape, int *slots, gboolean *scalar, int *slow_reason,
@@ -7795,11 +7824,12 @@ wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable 
 	MonoMethod *cached_source, *cached_target;
 	MonoVTable *cached_receiver;
 	InterpMethod *cached_imethod;
-	gint32 cached_shape, cached_slots, cached_scalar, cached_reason, cached_abi;
+	gint32 cached_shape, cached_slots, cached_scalar, cached_reason, cached_abi, cached_epoch;
 
 	if (!before || (before & 1))
 		return FALSE;
 	mono_memory_barrier ();
+	cached_epoch = cache->epoch;
 	cached_source = cache->source;
 	cached_receiver = cache->receiver_vt;
 	cached_target = cache->target;
@@ -7813,6 +7843,23 @@ wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable 
 	if (before != mono_atomic_load_i32 (&cache->seq) || cached_source != source ||
 	    cached_receiver != receiver_vt || !cached_target || !cached_imethod)
 		return FALSE;
+	/* `source` is the live delegate's method, so reading its flag is safe; the cached pointer may be a dead one's.
+	 * A recipe from before a dynamic-method free is re-resolved; when its InterpMethod is not the one the method has
+	 * now, it belonged to the method that died at this address, and dispatching it was the bug: say so. */
+	if (source->dynamic && cached_epoch != mono_atomic_load_i32 (&wj_dyn_method_epoch) && wj_dyn_delegate_epoch_on ()) {
+		InterpMethod *now = lookup_imethod (source);
+		if (now != cached_imethod) {
+			static gint32 nstale;
+			int n = mono_atomic_inc_i32 (&nstale);
+			if (n <= 16) {
+				char *name = mono_method_full_name (source, TRUE);
+				g_printf ("WASM_JIT_DELEGATE_STALE_RECIPE #%d averted: %s -- cached InterpMethod %p, the method's own %p\n",
+					n, name, cached_imethod, now);
+				g_free (name);
+			}
+		}
+		return FALSE;
+	}
 	*target = cached_target;
 	*imethod = cached_imethod;
 	*shape = cached_shape;
@@ -7826,7 +7873,7 @@ wj_delegate_cache_read_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable 
 static void
 wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
 	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason,
-	gboolean abi_ok)
+	gboolean abi_ok, gint32 epoch)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
 	if (before & 1)
@@ -7842,6 +7889,7 @@ wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable
 	cache->scalar = scalar ? 1 : 0;
 	cache->slow_reason = slow_reason;
 	cache->abi_ok = abi_ok ? 1 : 0;
+	cache->epoch = epoch;
 	mono_memory_barrier ();
 	mono_atomic_xchg_i32 (&cache->seq, before + 2);
 }
@@ -7863,7 +7911,7 @@ wj_delegate_cache_read (WjDelegateIC *cache, MonoMethod *source, MonoVTable *rec
 static void
 wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *receiver_vt,
 	MonoMethod *target, InterpMethod *imethod, int shape, int slots, gboolean scalar, int slow_reason,
-	gboolean abi_ok)
+	gboolean abi_ok, gint32 epoch)
 {
 	extern int mono_wasm_jit_vcall_ways;
 	int victim = -1;
@@ -7884,7 +7932,7 @@ wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *re
 		victim = (int) (hash % (guint) mono_wasm_jit_vcall_ways);
 	}
 	wj_delegate_cache_write_way (&cache [victim], source, receiver_vt,
-		target, imethod, shape, slots, scalar, slow_reason, abi_ok);
+		target, imethod, shape, slots, scalar, slow_reason, abi_ok, epoch);
 }
 
 /* Why a delegate recipe is not `scalar`, decided in prepare_delegate_call and carried in the recipe's
@@ -7926,6 +7974,9 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	 *              That is a strictly weaker condition, and it is the one the emitted path needs; the
 	 *              PIC never touches the interp layout. See mono_wasm_jit_delegate_abi_ok. */
 	gboolean abi_ok = FALSE;
+	/* R507: read before anything that could run managed code and free a dynamic method, so a recipe computed across
+	 * a free is cached as already stale */
+	gint32 epoch0 = mono_atomic_load_i32 (&wj_dyn_method_epoch);
 	ERROR_DECL (error);
 
 	/* A multicast delegate can still retain a non-NULL `method` (normally the last target), so that
@@ -7958,7 +8009,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		}
 		if (imethod != cached_imethod)
 			wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar,
-				slow_reason, abi_ok);
+				slow_reason, abi_ok, epoch0);
 		/* A recipe can be cached on the target's first invocation, before it crosses the auto-JIT threshold.
 		 * Keep accumulating the same hotness/retry state as the uncached path; otherwise that first recipe
 		 * permanently strands the target in the interpreter (profile13: registered -6%, interp-routed +40%).
@@ -8084,7 +8135,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		}
 	}
 	wj_delegate_cache_write (cache, source, receiver_vt, target, imethod, shape, slots, scalar, slow_reason,
-		abi_ok);
+		abi_ok, epoch0);
 	/* ABI_OK, not `scalar`. The PIC calls `f` through the site's lowered functype, where a by-value
 	 * vtype is an i32 pointer on both sides -- exactly what the JIT caller spilled. Gating this on the
 	 * interp's stackval layout sent 100% of by-value-vtype delegate dispatches (9.35M per window) to the
@@ -11753,6 +11804,8 @@ static void
 interp_free_method (MonoMethod *method)
 {
 #if HOST_BROWSER
+	/* R507: first, so every cached delegate recipe keyed by this method's address is stale before it can be reused */
+	mono_atomic_inc_i32 (&wj_dyn_method_epoch);
 	/* Before anything is released: the wasm JIT retains raw MonoMethod * and must learn this one is dead
 	 * (mono_wasm_jit_note_method_freed, R290). Guarded -- this file also links into mono-aot-cross. */
 	{
