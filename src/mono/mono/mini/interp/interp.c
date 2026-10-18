@@ -11321,6 +11321,61 @@ mono_jiterp_entry_adopt_info (InterpMethod *imethod, gint32 *out)
 }
 #endif
 
+#if HOST_BROWSER
+/* R504 (MONO_WASM_JITERP_ENTRY_SITES=N): every Nth interp-entry trampoline request -- each takes a jiterpreter table
+ * slot for good, and on 26.2 the static_ret_0/1 tables overflow 16,384 -- logs the method, its shape and the wasm stack
+ * that asked for a native-callable pointer to it (an llvmonly vtable/IMT slot, a delegate, an ldftn ...). Off unless
+ * set; read once. */
+static int
+wj_entry_sites_every (void)
+{
+	static int every = -1;
+	if (G_UNLIKELY (every < 0)) {
+		const char *v = g_getenv ("MONO_WASM_JITERP_ENTRY_SITES");
+		every = (v && *v) ? MAX (atoi (v), 1) : 0;
+	}
+	return every;
+}
+
+static void
+wj_entry_site_note (MonoMethod *method, MonoMethodSignature *sig, gboolean unbox, gboolean got_slot)
+{
+	static gint32 nreq;
+	int k = mono_atomic_inc_i32 (&nreq);
+	char *name;
+	if (k % wj_entry_sites_every ())
+		return;
+	name = mono_method_full_name (method, TRUE);
+	EM_ASM ({
+		var f = (new Error ()).stack.split ("\n").slice (2, 18).map (function (l) { return l.trim ().split (" ") [1]; }).join ("<");
+		console.log ("JITERP_ENTRY_SITE " + $0 + " " + ($1 ? "inst" : "static") + ($2 ? "_ret_" : "_") + $3 + ($4 ? " unbox" : "") + ($5 ? " slot" : "") + " | " + UTF8ToString ($6) + " | " + f);
+	}, k, sig->hasthis, sig->ret->type != MONO_TYPE_VOID, sig->param_count, unbox, got_slot, name);
+	g_free (name);
+}
+#endif
+
+#if HOST_BROWSER
+/* R504: a hot interp entry got its jiterpreter table slot (the worker that compiled its trampoline put it there; every
+ * other worker's table holds the shape's standard entry function at that index, as for any slot). Point the entry's
+ * inner ftndesc at the slot, so native callers -- including every delegate already built on it, which hold the ftndesc
+ * by pointer in extra_arg -- reach the trampoline. A concurrent caller reads either the standard function or the slot;
+ * both are correct. */
+EMSCRIPTEN_KEEPALIVE void
+mono_jiterp_interp_entry_set_slot (InterpMethod *imethod, int unbox, int slot)
+{
+	MonoFtnDesc *desc;
+	if (!imethod || slot <= 0)
+		return;
+	desc = (MonoFtnDesc *) (unbox ? imethod->jiterp_unbox_entry_ftndesc : imethod->jiterp_entry_ftndesc);
+	if (!desc)
+		return;
+	mono_memory_barrier ();
+	desc->addr = (gpointer) (gsize) slot;
+	if (!unbox)
+		imethod->jiterp_entry_index = slot;
+}
+#endif
+
 static MonoFtnDesc*
 interp_create_method_pointer_llvmonly (MonoMethod *method, gboolean unbox, MonoError *error)
 {
@@ -11376,6 +11431,10 @@ interp_create_method_pointer_llvmonly (MonoMethod *method, gboolean unbox, MonoE
 			entry_func = entry_funcs_static_ret [sig->param_count];
 	}
 	g_assert (entry_func);
+#if HOST_BROWSER
+	gpointer shape_entry_func = entry_func;
+	gboolean jiterp_lazy_entry = FALSE;
+#endif
 
 #if HOST_BROWSER
 	// FIXME: We don't support generating wasm trampolines for high arg counts yet
@@ -11390,7 +11449,13 @@ interp_create_method_pointer_llvmonly (MonoMethod *method, gboolean unbox, MonoE
 			unbox, sig->hasthis, sig->ret->type != MONO_TYPE_VOID,
 			entry_func
 		);
+		if (G_UNLIKELY (wj_entry_sites_every ()))
+			wj_entry_site_note (method, sig, unbox, wasm_entry_func != NULL);
 
+		/* R504: the jiterpreter now takes the method's table slot only once the entry is hot (or never), so it returns 0
+		 * here and the entry starts on the shape's standard entry function -- what a fresh slot holds in every worker's
+		 * table anyway. Remember to record the inner ftndesc below so mono_jiterp_interp_entry_set_slot can move it. */
+		jiterp_lazy_entry = TRUE;
 		// Compiling a trampoline can fail for various reasons, so in that case we will fall back to the pre-existing ones below
 		if (wasm_entry_func) {
 			entry_func = wasm_entry_func;
@@ -11477,6 +11542,16 @@ have_entry_wrapper:
 		entry_arg = (gpointer)(((gsize)entry_arg) | 1);
 
 	MonoFtnDesc *entry_ftndesc = mini_llvmonly_create_ftndesc (method, entry_func, entry_arg);
+#if HOST_BROWSER
+	/* Only an entry still on the shape's standard function can be moved to a slot: the slot's trampoline has that
+	 * calling convention, interp_entry_from_trampoline (the !entry_wrapper fallback above) does not. */
+	if (jiterp_lazy_entry && entry_func == shape_entry_func) {
+		if (unbox)
+			imethod->jiterp_unbox_entry_ftndesc = entry_ftndesc;
+		else
+			imethod->jiterp_entry_ftndesc = entry_ftndesc;
+	}
+#endif
 
 	addr = mini_llvmonly_create_ftndesc (method, entry_wrapper, entry_ftndesc);
 

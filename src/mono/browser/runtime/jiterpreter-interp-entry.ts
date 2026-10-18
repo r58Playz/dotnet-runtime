@@ -11,7 +11,7 @@ import {
 import { WasmOpcode } from "./jiterpreter-opcodes";
 import cwraps from "./cwraps";
 import {
-    WasmBuilder, addWasmFunctionPointer, getMemberOffset,
+    WasmBuilder, getMemberOffset,
     _now, getRawCwrap, importDef,
     getWasmFunctionTable, recordFailure, getOptions,
     JiterpreterOptions,
@@ -99,6 +99,8 @@ class TrampolineInfo {
     private traceName?: string;
 
     defaultImplementation: number;
+    // R504: the shape's table, and the slot in it -- 0 until the entry is hot (see mono_interp_jit_wasm_entry_trampoline)
+    tableId = 0;
     result: number;
     hitCount: number;
     guardedImplementation?: Function;
@@ -235,6 +237,8 @@ const wjPatchStats: Record<string, number> = {
     // Queued entries dropped because their method was freed on another worker (R291).
     deadDropped: 0,
     reuseReverted: 0, tlsCell: 0, adopted: 0,
+    // R504: hot entries given their table slot at flush time, and the ones whose table was already full.
+    lazySlots: 0, lazyNoSlot: 0,
     bailBudget: 0, bailLimit: 0, bailBytes: 0, genAttempts: 0, genThrew: 0,
 };
 (globalThis as any).__wj_patch_stats = () => wjPatchStats;
@@ -506,12 +510,12 @@ export function mono_interp_jit_wasm_entry_trampoline (
     if (!fnTable)
         fnTable = getWasmFunctionTable();
 
-    // We start by creating a function pointer for this interp_entry trampoline, but instead of
-    //  compiling it right away, we make it point to the default implementation for that signature
-    // This gives us time to wait before jitting it so we can jit multiple trampolines at once.
-    // Some entry wrappers are also only called a few dozen times, so it's valuable to wait
-    //  until a wrapper is called a lot before wasting time/memory jitting it.
-    const defaultImplementationFn = fnTable.get(defaultImplementation);
+    // R504: no table slot yet. A slot is taken for good, and it used to be taken here, for every entry ever asked for --
+    // 26.2 asked for ~82 k (91% delegates built on IKVM's DynamicMethods: lazy-link binders, MethodHandle invokers,
+    // indy bootstrap stubs), against tables sized for a few thousand, while only entries that get hot
+    // (interpEntryHitCount) are ever compiled into one. The caller falls back to the shape's standard entry function --
+    // exactly what a fresh slot holds in every worker's table -- and records the entry's inner ftndesc; the flush gives
+    // a hot entry its slot and moves that ftndesc there (mono_jiterp_interp_entry_set_slot).
     const tableId = (hasThisReference
         ? (
             hasReturnValue
@@ -523,11 +527,12 @@ export function mono_interp_jit_wasm_entry_trampoline (
                 ? JiterpreterTable.InterpEntryStaticRet0
                 : JiterpreterTable.InterpEntryStatic0
         )) + argumentCount;
-    info.result = addWasmFunctionPointer(tableId, defaultImplementationFn);
+    info.tableId = tableId;
+    info.result = 0;
 
     infoTable[imethod] = info;
     wjIndexKey(info);
-    return info.result;
+    return 0;
 }
 
 function ensure_jit_is_scheduled () {
@@ -577,6 +582,23 @@ function flush_wasm_entry_trampoline_jit_queue () {
         }
         jitQueue.push(info);
         wjPatchStats.queueDrained++;
+    }
+
+    // R504: the slots, now that these entries are hot. Every worker's table already holds the shape's standard entry
+    // function at each index of its table, so a slot is valid everywhere the moment it is allocated; it only becomes
+    // reachable once the ftndesc is moved to it, after the trampoline is installed below.
+    for (let i = jitQueue.length - 1; i >= 0; i--) {
+        const info = jitQueue[i];
+        if (info.result > 0)
+            continue;
+        const index = info.tableId > 0 ? cwraps.mono_jiterp_allocate_table_entry(info.tableId) : 0;
+        if (index > 0) {
+            info.result = index;
+            wjPatchStats.lazySlots++;
+        } else {
+            jitQueue.splice(i, 1);
+            wjPatchStats.lazyNoSlot++;
+        }
     }
 
     if (!jitQueue.length)
@@ -787,6 +809,8 @@ function flush_wasm_entry_trampoline_jit_queue () {
             const fn = traceInstance.exports[traceName];
             // Patch the function pointer for this function to use the trampoline now.
             fnTable.set(info.result, fn);
+            // R504: and route native callers to it (the entry started on the shape's standard function)
+            cwraps.mono_jiterp_interp_entry_set_slot(info.imethod, info.unbox ? 1 : 0, info.result);
             wjPatchStats.guardedInstalled++;
             if (info.wjNargs < 0)
                 wjPatchStats.noWjSig++;
