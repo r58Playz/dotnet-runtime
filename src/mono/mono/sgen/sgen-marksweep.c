@@ -52,9 +52,14 @@ static int ms_block_size;
 #ifndef TARGET_WASM
 #define MS_BLOCK_ALLOC_NUM	32
 #else
-// WASM doesn't support partial munmap, so we can't free individual blocks
-// we use posix_memalign and free the whole block at once
-#define MS_BLOCK_ALLOC_NUM	1
+/*
+ * WASM doesn't support partial munmap: mono_valloc is posix_memalign and mono_vfree is free(), which cannot release part
+ * of an allocation. This used to be 1, one allocation per block, and dlmalloc returned each block's misaligned lead-in
+ * (up to a block) to its bins, where almost nothing reused it: 327 MiB of free holes directly below major blocks at the
+ * 26.2 OOM (R501). Blocks now come in arenas of MS_BLOCK_ALLOC_NUM, one lead-in per arena, and an arena is only ever
+ * freed whole, once every block in it is empty (ms_free_empty_arenas).
+ */
+#define MS_BLOCK_ALLOC_NUM	32
 #endif
 
 #define MS_NUM_MARK_WORDS	((ms_block_size / SGEN_ALLOC_ALIGN + sizeof (guint32) * 8 - 1) / (sizeof (guint32) * 8))
@@ -230,6 +235,62 @@ static void *empty_blocks = NULL;
 static size_t num_empty_blocks = 0;
 static gboolean compact_blocks = FALSE;
 
+#ifdef TARGET_WASM
+/* Every block arena ms_get_empty_block allocated, sorted by base: what ms_free_empty_arenas may hand back to free(). */
+typedef struct {
+	char *base;
+	guint32 nblocks;
+} MSArena;
+static MSArena *ms_arenas;
+static size_t ms_arenas_n, ms_arenas_cap;
+static guint64 stat_major_arenas_alloced, stat_major_arenas_freed;
+/* R507 bisection: MONO_GC_WASM_ARENAS=0 restores one posix_memalign per block and the original major_free_swept_blocks
+ * path, exactly as before R502. Read once at init. */
+static gboolean ms_wasm_arenas = TRUE;
+/* A spin lock: inserts come from ms_get_empty_block, compaction from major_free_swept_blocks with the world stopped.
+ * Suspension is cooperative on wasm, so a stopped thread never holds it. */
+static gint32 ms_arenas_lock;
+
+static void
+ms_arenas_acquire (void)
+{
+	while (mono_atomic_cas_i32 (&ms_arenas_lock, 1, 0) != 0)
+		;
+}
+
+static void
+ms_arenas_release (void)
+{
+	mono_atomic_store_i32 (&ms_arenas_lock, 0);
+}
+
+static void
+ms_arena_register (char *base, int nblocks)
+{
+	size_t lo = 0, hi;
+	ms_arenas_acquire ();
+	if (ms_arenas_n == ms_arenas_cap) {
+		size_t ncap = ms_arenas_cap ? ms_arenas_cap * 2 : 256;
+		ms_arenas = (MSArena *) g_realloc (ms_arenas, ncap * sizeof (MSArena));
+		ms_arenas_cap = ncap;
+	}
+	hi = ms_arenas_n;
+	while (lo < hi) {
+		size_t mid = (lo + hi) / 2;
+		if (ms_arenas [mid].base < base)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	memmove (&ms_arenas [lo + 1], &ms_arenas [lo], (ms_arenas_n - lo) * sizeof (MSArena));
+	ms_arenas [lo].base = base;
+	ms_arenas [lo].nblocks = (guint32) nblocks;
+	ms_arenas_n++;
+	stat_major_arenas_alloced++;
+	ms_arenas_release ();
+}
+#endif
+
 /*
  * We can iterate the block list also while sweep is in progress but we
  * need to account for blocks that will be checked for sweeping and even
@@ -374,6 +435,10 @@ ms_get_empty_block (void)
 		 * 1.  If that doesn't work, either, we assert.
 		 */
 		int alloc_num = MS_BLOCK_ALLOC_NUM;
+#ifdef TARGET_WASM
+		if (!ms_wasm_arenas)
+			alloc_num = 1;
+#endif
 		for (;;) {
 			p = (char *)sgen_alloc_os_memory_aligned (ms_block_size * alloc_num, ms_block_size,
 				(SgenAllocFlags)(SGEN_ALLOC_HEAP | SGEN_ALLOC_ACTIVATE),
@@ -382,6 +447,10 @@ ms_get_empty_block (void)
 				break;
 			alloc_num >>= 1;
 		}
+#ifdef TARGET_WASM
+		if (ms_wasm_arenas)
+			ms_arena_register (p, alloc_num);
+#endif
 
 		for (i = 0; i < alloc_num; ++i) {
 			block = p;
@@ -2197,6 +2266,73 @@ compare_pointers (const void *va, const void *vb) {
 	return 0;
 }
 
+#ifdef TARGET_WASM
+/*
+ * The wasm half of major_free_swept_blocks: free every arena whose blocks are all on the empty list, while more than
+ * section_reserve blocks are empty -- the same policy as the contiguous-run frees below, at arena granularity, and
+ * never a part of an arena (free() of an interior pointer). Sweep completed, world stopped.
+ */
+static void
+ms_free_empty_arenas (size_t section_reserve)
+{
+	size_t i, n, k, a, w;
+	void *block, **arr, **rebuild_next;
+
+	if (num_empty_blocks <= section_reserve)
+		return;
+	n = num_empty_blocks;
+	arr = (void**)sgen_alloc_internal_dynamic (sizeof (void*) * n, INTERNAL_MEM_MS_BLOCK_INFO_SORT, FALSE);
+	if (!arr)
+		return;
+	i = 0;
+	for (block = empty_blocks; block; block = *(void**)block)
+		arr [i++] = block;
+	SGEN_ASSERT (0, i == n, "empty block count wrong");
+	sgen_qsort (arr, n, sizeof (void*), compare_pointers);
+
+	ms_arenas_acquire ();
+	k = 0;
+	w = 0;
+	for (a = 0; a < ms_arenas_n; a++) {
+		MSArena ar = ms_arenas [a];
+		size_t last;
+		while (k < n && (char*)arr [k] < ar.base)
+			k++;
+		last = k + ar.nblocks - 1;
+		/* The entries are sorted, distinct and block-aligned, so nblocks of them running from the arena's first block to
+		 * its last are exactly its blocks. */
+		if (num_empty_blocks > section_reserve && last < n && (char*)arr [k] == ar.base &&
+				(char*)arr [last] == ar.base + (size_t) (ar.nblocks - 1) * ms_block_size) {
+			sgen_free_os_memory (ar.base, (size_t) ar.nblocks * ms_block_size, SGEN_ALLOC_HEAP, MONO_MEM_ACCOUNT_SGEN_MARKSWEEP);
+			for (i = k; i <= last; ++i)
+				arr [i] = NULL;
+			k = last + 1;
+			num_empty_blocks -= ar.nblocks;
+			stat_major_arenas_freed++;
+			stat_major_blocks_freed += ar.nblocks;
+			if (ar.nblocks == MS_BLOCK_ALLOC_NUM)
+				stat_major_blocks_freed_ideal += ar.nblocks;
+			else
+				stat_major_blocks_freed_less_ideal += ar.nblocks;
+			continue;   /* dropped from the registry */
+		}
+		ms_arenas [w++] = ar;
+	}
+	ms_arenas_n = w;
+	ms_arenas_release ();
+
+	rebuild_next = (void**)&empty_blocks;
+	for (i = 0; i < n; ++i) {
+		if (!arr [i])
+			continue;
+		*rebuild_next = arr [i];
+		rebuild_next = (void**)arr [i];
+	}
+	*rebuild_next = NULL;
+	sgen_free_internal_dynamic (arr, sizeof (void*) * n, INTERNAL_MEM_MS_BLOCK_INFO_SORT);
+}
+#endif
+
 /*
  * This is called with sweep completed and the world stopped.
  */
@@ -2204,6 +2340,13 @@ static void
 major_free_swept_blocks (size_t section_reserve)
 {
 	SGEN_ASSERT (0, sweep_state == SWEEP_STATE_SWEPT, "Sweeping must have finished before freeing blocks");
+
+#ifdef TARGET_WASM
+	if (ms_wasm_arenas) {
+		ms_free_empty_arenas (section_reserve);
+		return;
+	}
+#endif
 
 #if defined(HOST_WIN32) || defined(HOST_ORBIS)
 		/*
@@ -2245,6 +2388,9 @@ major_free_swept_blocks (size_t section_reserve)
 		 */
 		arr_length = num_empty_blocks_orig;
 		num_blocks = MS_BLOCK_ALLOC_NUM;
+#ifdef TARGET_WASM
+		num_blocks = 1;   /* arenas off (R507): blocks were allocated one at a time, so none may be freed together */
+#endif
 		while (num_empty_blocks > section_reserve && num_blocks > 1) {
 			int first = -1;
 			int dest = 0;
@@ -2932,6 +3078,16 @@ sgen_marksweep_init_internal (SgenMajorCollector *collector, gboolean is_concurr
 
 	mono_counters_register ("# major blocks allocated", MONO_COUNTER_GC | MONO_COUNTER_ULONG, &stat_major_blocks_alloced);
 	mono_counters_register ("# major blocks freed", MONO_COUNTER_GC | MONO_COUNTER_ULONG, &stat_major_blocks_freed);
+#ifdef TARGET_WASM
+	{
+		const char *v = g_getenv ("MONO_GC_WASM_ARENAS");
+		if (v && *v == '0')
+			ms_wasm_arenas = FALSE;
+		g_free ((char *) v);
+	}
+	mono_counters_register ("# major block arenas allocated (wasm)", MONO_COUNTER_GC | MONO_COUNTER_ULONG, &stat_major_arenas_alloced);
+	mono_counters_register ("# major block arenas freed whole (wasm)", MONO_COUNTER_GC | MONO_COUNTER_ULONG, &stat_major_arenas_freed);
+#endif
 	mono_counters_register ("# major blocks lazy swept", MONO_COUNTER_GC | MONO_COUNTER_ULONG, &stat_major_blocks_lazy_swept);
 	mono_counters_register ("# major blocks freed ideally", MONO_COUNTER_GC | MONO_COUNTER_ULONG, &stat_major_blocks_freed_ideal);
 	mono_counters_register ("# major blocks freed less ideally", MONO_COUNTER_GC | MONO_COUNTER_ULONG, &stat_major_blocks_freed_less_ideal);

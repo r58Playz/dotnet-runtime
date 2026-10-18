@@ -411,6 +411,21 @@ sgen_los_free_object (LOSObject *obj)
 		sgen_memgov_release_space (size, SPACE_LOS);
 	} else if (!sgen_los_enable_sections_allocator) {
 		size += sizeof (LOSObject);
+#ifndef SGEN_HAVE_OVERLAPPING_CARDS
+		/* The allocation was rounded up to the card size (sgen_los_alloc_large_inner); release the same amount, or
+		 * every freed object leaves up to a card in the accounting, sgen_los_memory_usage_total and the governor
+		 * (R480: 11 MiB phantom by the 1.16.1 window). MONO_GC_LOS_FREE_CARDS=0: the pre-R502 size (R507 bisection). */
+		{
+			static int round_free = -1;
+			if (round_free < 0) {
+				const char *v = g_getenv ("MONO_GC_LOS_FREE_CARDS");
+				round_free = (v && *v == '0') ? 0 : 1;
+				g_free ((char *) v);
+			}
+			if (round_free)
+				size = SGEN_ALIGN_UP_TO (size, CARD_SIZE_IN_BYTES);
+		}
+#endif
 		sgen_free_os_memory (obj, size, SGEN_ALLOC_HEAP, MONO_MEM_ACCOUNT_SGEN_LOS);
 		sgen_los_memory_usage_total -= size;
 		sgen_memgov_release_space (size, SPACE_LOS);

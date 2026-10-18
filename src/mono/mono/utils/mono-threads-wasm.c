@@ -224,6 +224,22 @@ mono_thread_platform_create_thread (MonoThreadStart thread_fn, gpointer thread_d
 	if (res != 0)
 		g_error ("%s: pthread_attr_init failed, error: \"%s\" (%d)", __func__, g_strerror (res), res);
 
+	/* R507 bisection: MONO_WASM_PTHREAD_STACK_KB=N gives the threads mono creates an N KiB stack instead of the link's
+	 * DEFAULT_PTHREAD_STACK_SIZE (the app now links 1 MB; it was 8 MB before R502). Native-only threads keep the default. */
+	{
+		static int kb = -1;
+		if (G_UNLIKELY (kb < 0)) {
+			char *v = g_getenv ("MONO_WASM_PTHREAD_STACK_KB");
+			kb = v ? atoi (v) : 0;
+			g_free (v);
+		}
+		if (kb > 0) {
+			res = pthread_attr_setstacksize (&attr, (size_t) kb * 1024);
+			if (res != 0)
+				g_error ("%s: pthread_attr_setstacksize failed, error: \"%s\" (%d)", __func__, g_strerror (res), res);
+		}
+	}
+
 #if 0
 	if (stack_size)
 		set_stack_size = *stack_size;

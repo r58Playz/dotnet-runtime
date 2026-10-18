@@ -74,6 +74,18 @@ mono_account_mem (MonoMemAccountType type, ssize_t size)
 	mono_atomic_fetch_add_word (&total_allocation_count, size);
 }
 
+/* R502: what the GC holds through mono_valloc (sgen internal, nursery, LOS, major blocks, card tables), for a memory
+ * monitor. On wasm mono_valloc is posix_memalign, so a native-allocation total that should not count the GC heap
+ * subtracts this from the malloc heap's in-use bytes. Unlocked reads: a monitor's number. */
+size_t
+mono_mem_account_sgen_bytes (void)
+{
+	size_t n = 0;
+	for (int i = MONO_MEM_ACCOUNT_SGEN_INTERNAL; i <= MONO_MEM_ACCOUNT_SGEN_BINARY_PROTOCOL; i++)
+		n += allocation_count [i];
+	return n;
+}
+
 void
 mono_valloc_set_limit (size_t size)
 {

@@ -78,6 +78,7 @@ MONO_API int   mono_file_unmap_fileio (void *addr, void *handle);
 MONO_API int   mono_mprotect   (void *addr, size_t length, int flags);
 
 MONO_API const char* mono_mem_account_type_name (MonoMemAccountType type);
+size_t mono_mem_account_sgen_bytes (void);
 MONO_API void  mono_mem_account_register_counters (void);
 
 /*
