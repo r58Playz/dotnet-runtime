@@ -31,6 +31,9 @@ mono_class_get_ref_info (MonoClass *klass);
 MONO_COMPONENT_API gboolean
 mono_reflection_parse_type_checked (char *name, MonoTypeNameParse *info, MonoError *error);
 
+MonoStringHandle
+mono_reflection_member_name_handle (const char *name, MonoError *error);
+
 gboolean
 mono_reflection_is_usertype (MonoReflectionTypeHandle ref);
 

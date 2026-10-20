@@ -6432,7 +6432,7 @@ ves_icall_RuntimeMethodInfo_get_name (MonoReflectionMethodHandle m, MonoError *e
 {
 	MonoMethod *method = MONO_HANDLE_GETVAL (m, method);
 
-	MonoStringHandle s = mono_string_new_handle (method->name, error);
+	MonoStringHandle s = mono_reflection_member_name_handle (method->name, error);
 	return_val_if_nok (error, NULL_HANDLE_STRING);
 	MONO_HANDLE_SET (m, name, s);
 	return s;

@@ -798,6 +798,12 @@ limiter lifted: 169-185 fps, the client 18.7-20.6 M cycles a frame (j2d/w7, n=5)
   frame on main` must read 0, and its `blocked ... on a full queue of N batches` should read ~0 (glthread's remote queue is
   64 batches of 8 KiB; `WINK_GLTHREAD_BATCHES` puts the old 8 back). Keep shadows that narrow -- they are wasm heap the
   managed side does not get.
+* **gex_wgpu re-sends every write-mapped persistent buffer WHOLE at every submit** (`gex_wgpu_flush_persistent_maps`,
+  unless a shader writes it). 1.16.x never noticed (0.5 MiB a submit); 26.2's Sodium 0.9 maps a 32,000,000-byte staging
+  buffer that way, ~260 MiB a frame through queue.writeBuffer on main: **16 fps, 108 with `GEX_WGPU_PERSIST_EXPLICIT=1`**
+  (R509; an uncommitted mesa-wink patch, default off). Read `gex-wgpu: persistent mappings sent X MiB a submit`. And
+  26.2's `GlCommandEncoder.submit()` does `glFenceSync` + `glClientWaitSync` every frame -- two round trips through main
+  that serialize the render thread with it (census `2.0 times a frame`); unfixed.
 
 **The ~62 fps ceiling exists only in the headless harness** (OffscreenCanvas/BeginFrame pacing; vsync is off). A headed
 browser follows the display. Compare GL configurations with `MC_UNCAPPED=1`. **Past that, Minecraft's OWN limiter (the
@@ -880,6 +886,10 @@ throttling; treat 2-3-core measurement arms as running at ~3.7 GHz. preflight's 
 therefore uninformative on this box rather than merely unactionable. Ambient desktop load is the
 confound that IS real — preflight refusing an arm for that is worth obeying.
 
+* **`GC_MAJOR: (LOS overflow)` does not mean the LOS is full.** Every allocation over 8,000 B checks the major trigger
+  (major + LOS > survivors + max(33%, 128 MB)), and large objects arrive ~540/s at boot, so one of them is always first
+  to notice; all automatic majors read so in 1.16.5 and 26.2 alike (R510). JDK 25's 8,192-element buffers and its
+  ClassFile API's 16 KB `int[]`s are what fill the LOS; `memaudit/loscensus.js` diffs it by kind.
 * **`mode=stall` is NOT a fault.** `worldGenMode` classifies world-generation DURATION (the documented
   ~20%-incidence bimodality, ~19 s vs ~90 s); a `stall` run routinely completes with `faults=[]` and
   `verdict=ok`. Read `verdict`, which is the one field that says whether a run counts against the build,

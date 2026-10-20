@@ -78,7 +78,7 @@ namespace System.Reflection.Emit
         [DynamicDependency(nameof(paramModOpt))]  // Automatically keeps all previous fields too due to StructLayout
         internal RuntimeMethodBuilder(RuntimeTypeBuilder tb, string name, MethodAttributes attributes, CallingConventions callingConvention, Type? returnType, Type[]? returnModReq, Type[]? returnModOpt, Type[]? parameterTypes, Type[][]? paramModReq, Type[][]? paramModOpt)
         {
-            this.name = name;
+            this.name = SreNames.Intern(name);
             this.attrs = attributes;
             this.call_conv = callingConvention;
             this.rtype = returnType;

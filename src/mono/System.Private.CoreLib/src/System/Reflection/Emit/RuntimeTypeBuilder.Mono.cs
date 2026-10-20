@@ -46,6 +46,20 @@ using System.Threading;
 
 namespace System.Reflection.Emit
 {
+    /// <summary>
+    /// wasm fork (R513): the names Reflection.Emit's builders keep (type, field, method, parameter) are interned. IKVM
+    /// defines its Java classes through these builders and keeps them for the life of the dynamic assembly (its token
+    /// table holds every builder), and helper names such as "__&lt;&gt;invokeCache4" or "callerID" recur in every class:
+    /// ~18 MB of duplicate builder names on the 26.2 world-load heap. MONO_WASM_INTERN_NAMES=0 keeps the caller's string.
+    /// </summary>
+    internal static class SreNames
+    {
+        private static readonly bool s_intern = Environment.GetEnvironmentVariable("MONO_WASM_INTERN_NAMES") != "0";
+
+        [return: NotNullIfNotNull(nameof(name))]
+        internal static string? Intern(string? name) => s_intern && name != null ? string.Intern(name) : name;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal sealed partial class RuntimeTypeBuilder : TypeBuilder
     {
@@ -162,12 +176,12 @@ namespace System.Reflection.Emit
             sep_index = name.LastIndexOf('.');
             if (sep_index != -1)
             {
-                this.tname = name.Substring(sep_index + 1);
-                this.nspace = name.Substring(0, sep_index);
+                this.tname = SreNames.Intern(name.Substring(sep_index + 1));
+                this.nspace = SreNames.Intern(name.Substring(0, sep_index));
             }
             else
             {
-                this.tname = name;
+                this.tname = SreNames.Intern(name);
                 this.nspace = string.Empty;
             }
             if (interfaces != null)
