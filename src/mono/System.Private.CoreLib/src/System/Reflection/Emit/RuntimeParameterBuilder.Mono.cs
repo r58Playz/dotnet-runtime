@@ -57,7 +57,7 @@ namespace System.Reflection.Emit
         [DynamicDependency(nameof(def_value))]  // Automatically keeps all previous fields too due to StructLayout
         internal RuntimeParameterBuilder(MethodBase mb, int pos, ParameterAttributes attributes, string? strParamName)
         {
-            name = strParamName;
+            name = SreNames.Intern(strParamName);
             position = pos;
             attrs = attributes;
             methodb = mb;

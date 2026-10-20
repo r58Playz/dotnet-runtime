@@ -65,7 +65,7 @@ namespace System.Reflection.Emit
             ArgumentNullException.ThrowIfNull(type);
 
             attrs = attributes & ~FieldAttributes.ReservedMask;
-            name = fieldName;
+            name = SreNames.Intern(fieldName);
             this.type = type;
             this.modReq = modReq;
             this.modOpt = modOpt;

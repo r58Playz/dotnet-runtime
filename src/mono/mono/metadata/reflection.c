@@ -756,6 +756,28 @@ mono_field_get_object (MonoDomain *domain, MonoClass *klass, MonoClassField *fie
 	HANDLE_FUNCTION_RETURN_OBJ (result);
 }
 
+/*
+ * wasm fork (R513): the name string of a reflection field / method / parameter object, interned. Every such object used
+ * to get its own copy of a name the metadata already holds as UTF-8, and IKVM creates them by the hundred thousand for its
+ * runtime-defined types: ~16 MB of duplicate names on the 26.2 world-load heap (RuntimeFieldInfo.name,
+ * RuntimeMethodInfo.name, RuntimeParameterInfo.NameImpl). Most of these names are already in the intern table (IKVM
+ * interns member names), so the lookup usually hits. MONO_WASM_INTERN_NAMES=0 restores a fresh copy per object.
+ */
+static int intern_member_names = -1;
+
+MonoStringHandle
+mono_reflection_member_name_handle (const char *name, MonoError *error)
+{
+	MonoStringHandle s = mono_string_new_handle (name, error);
+	if (intern_member_names < 0) {
+		const char *v = g_getenv ("MONO_WASM_INTERN_NAMES");
+		intern_member_names = !(v && v [0] == '0');
+	}
+	if (!is_ok (error) || !intern_member_names || MONO_HANDLE_IS_NULL (s))
+		return s;
+	return mono_string_intern_checked (s, error);
+}
+
 static MonoReflectionFieldHandle
 field_object_construct (MonoClass *klass, MonoClassField *field, gpointer user_data, MonoError *error)
 {
@@ -766,7 +788,7 @@ field_object_construct (MonoClass *klass, MonoClassField *field, gpointer user_d
 	MONO_HANDLE_SETVAL (res, klass, MonoClass *, klass);
 	MONO_HANDLE_SETVAL (res, field, MonoClassField *, field);
 	MonoStringHandle name;
-	name = mono_string_new_handle (mono_field_get_name (field), error);
+	name = mono_reflection_member_name_handle (mono_field_get_name (field), error);
 	goto_if_nok (error, fail);
 	MONO_HANDLE_SET (res, name, name);
 
@@ -1018,7 +1040,7 @@ add_parameter_object_to_array (MonoMethod *method, MonoObjectHandle member, int 
 	goto_if_nok (error, leave);
 
 	MonoStringHandle name_str;
-	name_str = mono_string_new_handle (name, error);
+	name_str = mono_reflection_member_name_handle (name, error);
 	goto_if_nok (error, leave);
 
 	MonoObjectHandle def_value;
