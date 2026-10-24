@@ -7391,10 +7391,10 @@ ves_icall_System_Diagnostics_StackFrame_GetFrameInfo (gint32 skip, MonoBoolean n
 	if (!res)
 		return FALSE;
 
+	/* With no debug location, keep the callback's: mono_get_frame_info reports the frame's real IL offset when it has
+	 * one (-1 = unknown; the V8-assisted walk on wasm, R516) and the legacy 0 otherwise. */
 	if (location)
 		*iloffset = location->il_offset;
-	else
-		*iloffset = 0;
 
 	if (need_file_info) {
 		if (location) {

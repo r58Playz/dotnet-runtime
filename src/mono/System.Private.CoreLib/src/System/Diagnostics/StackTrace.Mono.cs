@@ -1,8 +1,6 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -36,28 +34,23 @@ namespace System.Diagnostics
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
         internal static extern void GetTrace(ObjectHandleOnStack ex, ObjectHandleOnStack res, int skipFrames, bool needFileInfo);
 
-        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2026:RequiresUnreferencedCode",
-            Justification = "StackFrame.GetMethod is getting compared to null but nothing else on it is touched.")]
+        // ONE walk: GetTrace with a null exception walks the current thread, drops the frames of this API itself by
+        // what they are (System.Diagnostics.StackFrame/StackTrace, and wrappers), then skips the caller's skipFrames.
+        // This used to construct `new StackFrame(skipFrames++)` until one came back empty -- a full walk per frame -- with
+        // "+2" for this method and the calling constructor, frames inlining can remove.
         [MethodImplAttribute(MethodImplOptions.NoInlining)]
         private void InitializeForCurrentThread(int skipFrames, bool needFileInfo)
         {
-            skipFrames += 2; // Current method + parent ctor
+            Exception? e = null;
+            MonoStackFrame[]? frames = null;
+            GetTrace(ObjectHandleOnStack.Create(ref e), ObjectHandleOnStack.Create(ref frames), skipFrames, needFileInfo);
 
-            StackFrame sf;
-            var frames = new List<StackFrame>();
-            while (skipFrames >= 0)
+            _numOfFrames = frames!.Length;
+            _stackFrames = new StackFrame[_numOfFrames];
+            for (int i = 0; i < _numOfFrames; ++i)
             {
-                sf = new StackFrame(skipFrames, needFileInfo);
-                if (sf.GetMethod() == null)
-                {
-                    break;
-                }
-                frames.Add(sf);
-                skipFrames++;
+                _stackFrames[i] = new StackFrame(frames[i], needFileInfo);
             }
-
-            _stackFrames = frames.ToArray();
-            _numOfFrames = _stackFrames.Length;
         }
 
         private void InitializeForException(Exception e, int skipFrames, bool needFileInfo)

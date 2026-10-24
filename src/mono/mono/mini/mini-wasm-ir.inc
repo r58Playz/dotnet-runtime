@@ -809,6 +809,114 @@ mono_wasm_jit_origin_note_inline (MonoCompile *cfg, MonoMethod *cmethod, MonoMet
 	cfg->wasm_origin_inl = e;
 }
 
+/* R516: an accepted inlinee, ALWAYS recorded (mempool, newest first), so the stack walk can report a frame for each
+ * method the emitted code is running inside of (exceptions-wasm-stackwalk.inc). `parent_code` is the IL buffer the
+ * call site is in (the root's header code, or another inlinee's), `call_il` the call's offset in it. Keyed by IL code
+ * pointer like WjOriginInl: a callee inlined twice keeps its FIRST call site, so the caller's line can be the other
+ * site's -- the frames themselves are right. */
+typedef struct _WjSwInlRec {
+	struct _WjSwInlRec *next;
+	MonoMethod          *method;
+	const guint8        *code;
+	guint32              size;
+	const guint8        *parent_code;
+	gint32               call_il;
+} WjSwInlRec;
+
+void
+mono_wasm_jit_sw_note_inline (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodHeader *cheader, const guint8 *parent_code,
+                              const guint8 *call_ip)
+{
+	WjSwInlRec *e, *it;
+	if (!cheader || !cheader->code)
+		return;
+	for (it = (WjSwInlRec *) cfg->wasm_sw_inl; it; it = it->next)
+		if (it->code == cheader->code)
+			return;
+	e = (WjSwInlRec *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjSwInlRec));
+	e->method = cmethod;
+	e->code = cheader->code;
+	e->size = cheader->code_size;
+	e->parent_code = parent_code;
+	e->call_il = (parent_code && call_ip && call_ip >= parent_code) ? (gint32) (call_ip - parent_code) : -1;
+	e->next = (WjSwInlRec *) cfg->wasm_sw_inl;
+	cfg->wasm_sw_inl = e;
+}
+
+/* The emitted form of the list above, kept with the body (WjBody.sw_inl) and handed to the stack walk's module
+ * record: entry k (1..n) is site tag inl == k; parent 0 = the method itself. */
+typedef MonoWasmSwInl WjSwInl;   /* mini-runtime.h: the stack walk reads it */
+
+/* Per compile: the inlinees sorted by IL start, for the per-instruction tag lookup (a tier-2 body can carry ~1,500). */
+typedef struct {
+	const guint8 *code;
+	guint32       size;
+	guint16       idx;
+} WjSwRange;
+
+static void
+wj_sw_sites_free (WasmSites **sites, int n)
+{
+	int i;
+	if (!sites)
+		return;
+	for (i = 0; i < n; ++i)
+		wasm_sites_free (sites [i]);
+	g_free (sites);
+}
+
+static int
+wj_sw_range_cmp (const void *a, const void *b)
+{
+	const guint8 *x = ((const WjSwRange *) a)->code, *y = ((const WjSwRange *) b)->code;
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static WjSwInl *
+wj_sw_inl_freeze (MonoCompile *cfg, WjSwRange **out_ranges, int *out_n)
+{
+	WjSwInlRec *it;
+	WjSwInl *t;
+	WjSwRange *r;
+	int n = 0, k, i;
+	for (it = (WjSwInlRec *) cfg->wasm_sw_inl; it; it = it->next)
+		n++;
+	*out_n = n;
+	*out_ranges = NULL;
+	if (!n)
+		return NULL;
+	t = g_new0 (WjSwInl, n + 1);   /* [0] = the method itself, unused */
+	r = g_new0 (WjSwRange, n);
+	k = n;
+	for (it = (WjSwInlRec *) cfg->wasm_sw_inl; it; it = it->next) {
+		--k;   /* newest first: number in inlining order, so a parent precedes its children */
+		r [k].code = it->code;
+		r [k].size = it->size;
+		r [k].idx = (guint16) (k + 1);
+		t [k + 1].method = it->method;
+		t [k + 1].call_il = it->call_il;
+	}
+	for (i = 0; i < n; ++i) {
+		/* the parent: the inlinee whose IL holds the call site, else the method itself */
+		WjSwInlRec *rec = NULL;
+		int j;
+		for (it = (WjSwInlRec *) cfg->wasm_sw_inl; it; it = it->next)
+			if (it->code == r [i].code) {
+				rec = it;
+				break;
+			}
+		t [i + 1].parent = 0;
+		for (j = 0; rec && j < n; ++j)
+			if (r [j].code == rec->parent_code && j != i) {
+				t [i + 1].parent = r [j].idx;
+				break;
+			}
+	}
+	qsort (r, (size_t) n, sizeof (WjSwRange), wj_sw_range_cmp);
+	*out_ranges = r;
+	return t;
+}
+
 /* MONO_WASM_JIT_CAPTURE: print one emitted module, base64, in self-describing lines (threads interleave):
  *   WASM_JIT_CAPTURE_BEGIN <id> <kind> <len> <name>   then   WASM_JIT_CAPTURE <id> <seq> <b64>   then   ..._END <id>
  * so the ledger can recompile exactly the bytes this run executed. Tab-separated; the name is last (it has spaces). */
@@ -870,6 +978,33 @@ wj_origin_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins)
 			ilop = 0xFFFF;
 	}
 	wasm_origin_set (b, (guint16) (WASM_ORIGIN_OP_BASE + ins->opcode), meth, il, ilop);
+}
+
+/* R516: tag the body with `ins`'s (inline index, IL offset) for the call sites it emits (wasm_site_set). An
+ * instruction with no cil_code keeps the previous tag. */
+static void
+wj_sw_tag_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins, const WjSwRange *r, int nr)
+{
+	const guint8 *ip = ins->cil_code;
+	int lo = 0, hi = nr - 1;
+	if (!ip)
+		return;
+	if (cfg->header && ip >= cfg->header->code && ip < cfg->header->code + cfg->header->code_size) {
+		wasm_site_set (b, 0, (gint32) (ip - cfg->header->code));
+		return;
+	}
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+		if (ip < r [mid].code)
+			hi = mid - 1;
+		else if (ip >= r [mid].code + r [mid].size)
+			lo = mid + 1;
+		else {
+			wasm_site_set (b, r [mid].idx, (gint32) (ip - r [mid].code));
+			return;
+		}
+	}
+	wasm_site_set (b, 0, -1);
 }
 
 /* Number the inlinees (1..n) and hand their names to the body. Called once, before the emit loop. */
@@ -3390,6 +3525,9 @@ typedef struct _WjBody {
 	WjEdge        *edges;         /* plan B4: owned, nedges entries; NULL unless recorded (tier 2, MONO_WASM_JIT_B4) */
 	guint32        nedges;
 	guint8         t1down;        /* R451: a downgrade recompile's body (MonoCompile.wasm_jit_t1_down), for B4's census */
+	gpointer       body_imethod;  /* R516: the InterpMethod this body was compiled against (MonoCompile.wasm_jit_caller_imethod), for the stack walk's module records */
+	WjSwInl       *sw_inl;        /* R516: its inlinees (owned; [1..sw_ninl]), for the stack walk's module records */
+	int            sw_ninl;
 } WjBody;
 
 static int
@@ -3408,6 +3546,7 @@ wj_body_free (WjBody *b)
 	g_free (b->extra_types);
 	g_free (b->name);
 	g_free (b->edges);
+	g_free (b->sw_inl);
 	g_free (b);
 }
 
@@ -3468,6 +3607,9 @@ typedef struct {
 	guint8                uses_calls;
 	guint8                uses_eh_tag;
 	int                   eh_tpool;       /* pool index of the tag's (i32)->void type, or -1 */
+	gpointer              body_imethod;   /* R516: WjBody.body_imethod, for the stack walk's module record */
+	const WjSwInl        *sw_inl;         /* R516: WjBody.sw_inl / sw_ninl */
+	int                   sw_ninl;
 } WjAsmMember;
 
 typedef struct {
@@ -3765,6 +3907,9 @@ wj_member_from_body (WjAsmMember *m, WjBody *b, int f_slot)
 	m->uses_calls    = b->uses_calls;
 	m->uses_eh_tag   = b->uses_eh_tag;
 	m->eh_tpool      = b->eh_tpool;
+	m->body_imethod  = b->body_imethod;
+	m->sw_inl        = b->sw_inl;
+	m->sw_ninl       = b->sw_ninl;
 }
 
 /* wj_shadow_candidate, WjShadowCand and wj_collect_shadows lived here -- the eligibility test, the
@@ -3997,7 +4142,7 @@ wj_asm_policy_init (WjAsmPolicy *pol, gboolean local_calls)
  */
 static gboolean
 wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol, WasmBuf *out,
-             WjAsmStats *out_st, WjAsmDeps *out_deps)
+             WjAsmStats *out_st, WjAsmDeps *out_deps, WasmSites **out_sites)
 {
 	static const WasmValtype entry_params [2] = { WASM_I32, WASM_I32 };
 	WasmFuncImport *himp;
@@ -4120,6 +4265,12 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 		g_free (names);
 	}
 
+	/* R516: each member's call sites (its f body's), for the stack walk's module record; the caller owns them */
+	if (out_sites)
+		for (i = 0; i < n; ++i) {
+			out_sites [i] = bodies [2 * i].sites;
+			bodies [2 * i].sites = NULL;
+		}
 	for (i = 0; i < 2 * n; ++i) {
 		wasm_buf_free (&bodies [i]);
 		g_free (fixes [i]);

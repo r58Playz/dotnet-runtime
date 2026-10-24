@@ -3170,7 +3170,18 @@ mono_jit_free_method (MonoMethod *method)
 	//seq_points are always on get_default_jit_mm
 	jit_mm = get_default_jit_mm ();
 	jit_mm_lock (jit_mm);
+#ifdef HOST_BROWSER
+	{
+		/* The table does not own its values on the browser (init_jit_mem_manager); a freed method's own info
+		 * goes with it here -- no frame can be running a method that is being freed. */
+		gpointer sp = dn_simdhash_ght_get_value_or_default (jit_mm->seq_points, method);
+		dn_simdhash_ght_try_remove (jit_mm->seq_points, method);
+		if (sp)
+			mono_seq_point_info_free (sp);
+	}
+#else
 	dn_simdhash_ght_try_remove (jit_mm->seq_points, method);
+#endif
 	jit_mm_unlock (jit_mm);
 
 	jit_mm = jit_mm_for_method (method);
@@ -4549,7 +4560,18 @@ init_jit_mem_manager (MonoMemoryManager *mem_manager)
 	info->jump_target_hash = g_hash_table_new (NULL, NULL);
 	info->jit_trampoline_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
 	info->delegate_info_hash = g_hash_table_new (delegate_class_method_pair_hash, delegate_class_method_pair_equal);
+#ifdef HOST_BROWSER
+	/* NOT the owner of its values here. The interpreter publishes each compilation's jinfo->seq_points into this table
+	 * (transform.c), and a later compilation of the same method -- a tier-up copy, an IKVM body swap -- REPLACES the
+	 * entry, which with a value destructor freed the info the older InterpMethod's jinfo still points at. The stack walk
+	 * reads a frame's IL offset through its own InterpMethod's jinfo (interp.c mono_interp_frame_il_offset, R516), i.e.
+	 * exactly the older compilation a long-running frame is still in: a use-after-free that aborted on
+	 * "value has more than 28 bits" in seq-points-data.c. The info now lives as long as the jinfo that points at it
+	 * (retired InterpMethods are never freed); a replaced entry is a few hundred bytes, once per recompilation. */
+	info->seq_points = dn_simdhash_ght_new_full (mono_aligned_addr_hash, NULL, NULL, NULL, 0, NULL);
+#else
 	info->seq_points = dn_simdhash_ght_new_full (mono_aligned_addr_hash, NULL, NULL, mono_seq_point_info_free, 0, NULL);
+#endif
 	info->runtime_invoke_hash = mono_conc_hashtable_new_full (mono_aligned_addr_hash, NULL, NULL, runtime_invoke_info_free);
 	info->ftndesc_hash = mono_conc_hashtable_new_full (mono_aligned_addr_hash, NULL, NULL, NULL);   /* values are mempool-allocated ftndescs; no value destructor */
 	info->arch_seq_points = g_hash_table_new (mono_aligned_addr_hash, NULL);

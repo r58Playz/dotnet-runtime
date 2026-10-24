@@ -114,6 +114,13 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   CSE / LICM can only happen in mono's middle end (R378). Checked on 15.5.35.
 * **Classifier warning:** a case-insensitive match for "compile" hits the `-turbofan` SUFFIX on every symbol
   and reports ~88% of the window. Strip `-\d+-(turbofan|liftoff)$` before matching.
+* **A call inside a `try` of its own frame has NO source position in TurboFan code** (R516, 15.5.35). The instruction
+  selector generates it at the block's `CheckException` terminator (`compiler/backend/instruction-selector.cc:2983-2987`),
+  and `IsSourcePositionUsed` (`:1373-1421`) lists `DidntThrowOp` but not `CheckExceptionOp`. `WasmFrame::position`
+  (`execution/frames.cc:3669`) then answers `GetSourcePositionBefore` (`wasm/wasm-code-manager.cc:626-634`): the last
+  positioned instruction before the return pc, in practice a memory access a few bytes earlier. Liftoff does position
+  them. An EH method's whole body is a `try`, so a CallSite position in one is not its call opcode -- which is why the
+  stack walk's call sites carry KEYS (`wasm-encoder.h`, WasmSites.kd).
 
 ## Verified mono-on-wasm facts
 
@@ -159,6 +166,27 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
   (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the
   drain can want.
+* **Managed stack walks ask V8 (R516, `exceptions-wasm-stackwalk.inc`, `MONO_WASM_STACKWALK_V8`).** mono's walker sees only
+  the LMF chain -- interpreter segments and the EH records of methods WITH clauses -- so every JIT and AOT frame without
+  clauses was invisible, and every consumer (CoreLib's StackFrame/StackTrace, IKVM's getCallerClass, StackWalker,
+  exception traces) counted frames that were not there; that was the "no caller frame" `setAccessible` failure and the
+  reason for ikvmcraft's two MixedAOT transforms, now deleted. A walk captures V8's CallSites once (EM_JS) and merges
+  them with the LMF chain: a JIT frame names its module record through a per-worker `WeakMap<Instance, payload>`, a
+  main-module frame maps to an AOT method by function index, each `mono_interp_exec_method` splices the next
+  interpreter segment. Before touching it:
+  - **It is opt-in by consumer** (StackFrame, current-thread StackTrace -- one `GetTrace(null)` --, exception pass 1, and
+    `walk_stack_full` only when `wasm_sw_consumer` is set). `Type.GetType` walks through `mono_method_get_last_managed`
+    ~1 M times a boot; as V8 walks that cost 47.6 s. Keep a consumer that only wants an assembly on the LMF walk.
+  - **A phantom INTERP_EXIT** (one pushed for a callee that is not interpreted) is marked through the ext's unused
+    `lmf.method` (`interp_lmf_mark_phantom`); a new such push must mark it or the merge mis-pairs a frame.
+  - **The seq-points hash no longer owns its values on the browser** (`init_jit_mem_manager`): a newer compilation of a
+    method (a tier-up copy, an IKVM body swap) used to free the older one's seq points while its jinfo still pointed at
+    them, and the walk reads exactly those for long-running frames (`seq-points-data.c:54` abort on 1.16.1).
+  - A frame running a body an IKVM relink superseded reports IL -1 (no line), by design.
+  Costs +3.6% to the first frame and +4.5% to the title of a 26.2 boot (~27.8 k walks, ~140 us each). In
+  `[wasm-jit stackwalk]` every `fallback` field and `verify fail` must read 0; `MONO_WASM_STACKWALK_VERIFY=1` checks each
+  walk against the legacy one, and ikvmcraft's `?wj.IKVM_STACKWALK_SELFTEST=1` checks caller, position, trace and line
+  cases (the walk off fails them).
 
 ## Architecture invariants — check a design against these before building it
 

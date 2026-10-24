@@ -490,6 +490,8 @@ mono_wasm_jit_dump_stats (void)
 		 * first -- non-zero and small is normal (1-4 a run); before R489 each one stored a generation past the
 		 * arrays' end. reach_oob = wj_asm_reaches walks that met a descriptor registered past their stamp array. */
 		WJC_(WJC_DESC_GROW), WJC_(WJC_REACH_OOB));
+	/* R516: the V8-assisted stack walk (exceptions-wasm-stackwalk.inc). Ungated, like the bounds above. */
+	mono_wasm_stackwalk_print_stats ();
 	/*
 	 * WJ_SPIN_CENSUS -- the line to read first on a run that hung with a core pinned and `registered`
 	 * flat. Every quantity here was UNOBSERVABLE before: mono_thread_info_yield() is a no-op on wasm, so
