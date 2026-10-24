@@ -166,6 +166,16 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
   (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the
   drain can want.
+* **IKVM's relink drain must never finish a type or call a Java class loader (R514).** It runs on a .NET ThreadPool
+  thread, and finishing or linking a class can enter Knot's `loadClass`, which takes that class's loading lock and then
+  Mixin's `synchronized` transformer. The thread applying mixins holds that monitor and can need the same class: R500's
+  boot hang (~1 boot in 12-16 on the user's build, 6 of 25 on R514's first builds; always right after `LazyDfuTransform`
+  is applied to `DataFixerBuilder$Result`), caught with `bootcheck --dump-on-stall`. `PrepareRelinkBatch` called
+  `DeclaringType.Finish()` and `ResolveMethod()`, which finishes every parameter and return type. Now
+  `ByteCodeHelper.InRelinkDrain` makes both refuse (throw before changing state; the relink is declined), counted as
+  `[IKVM lazybody] ... drainRefused finish= load=`: 12-14 loader calls refused per 26.2 boot, 0 hangs in 12 boots after.
+  **Before adding work to the drain, check it cannot reach a Java loader or another type's Finish** -- FinishRelinkBatch's
+  RelinkTarget (a default method's types) was such work, ran outside the guard, and hung 4 of 4 capped boots (R515).
 * **Managed stack walks ask V8 (R516, `exceptions-wasm-stackwalk.inc`, `MONO_WASM_STACKWALK_V8`).** mono's walker sees only
   the LMF chain -- interpreter segments and the EH records of methods WITH clauses -- so every JIT and AOT frame without
   clauses was invisible, and every consumer (CoreLib's StackFrame/StackTrace, IKVM's getCallerClass, StackWalker,
@@ -1227,17 +1237,25 @@ disposable. Start with these rather than `perf report`, which takes minutes per 
 
 ### Drivers — run a real workload
 
+**Every driver now drives the launcher and takes a seed (R514).** Since ikvmcraft 246560a the page shows a launcher and
+nothing boots until Play; `lib/mcdrive.mjs` `driveLauncher` types the seed's version pair and presses it. A seed
+(`lib/seeds.mjs`: `mcsr` (default, 1.16.1), `165`, `262u`, `262b`, `262p`) carries its profile, version, title/join
+lines, menu keys, save+quit Tab count and benign log lines; pick one with `--seed NAME` or `MC_SEED`. Phases `boot.toframe`
+(Play -> first frame, the first `Reloading ResourceManager`) and `boot.reload` are measured from the `play` mark.
+Use `262p` (peaceful copy of 262b) for in-game windows. Details: `MINECRAFT-HARNESS.md`, "Seeds, versions and the launcher".
+
 | tool | what it does |
 |---|---|
 | `worldwait.mjs` | **The current default for fault and counter batches.** `--runs N --stats --bench-ms N --knob K=V`; drives boot -> world -> in-game, prints per-run `faults=[...]`, the admit/tier line, partition and memory sampling |
 | `mcab.mjs` | Interleaved A/B over full Minecraft with the variance made explicit instead of assumed away. `--cooldown-ms` |
 | `mcbench.mjs` | Wall-clock A/B, one fresh isolated browser per run. `--stats --dumps` to reach `dumpWasmJit()` |
 | `mcperf.mjs` | Non-interactive perf capture of ONE run, sliced into the three phases. `--warm-ms` matters |
-| `bootcheck.mjs` | Boot-only PASS/FAIL for one configuration, ~2 min instead of ~9 |
+| `bootcheck.mjs` | Boot-only PASS/FAIL for one configuration, ~2 min instead of ~9. Marker times from Play; `--keep-going` for timing runs, `--stall-s` (default 120 s of app silence = STALL), `--dump-on-stall` (mono thread dump + /proc snapshot), `--jprop`, memory at the title |
+| `boot/abboot.sh` | Interleaved (ABBA) bootcheck arms -> `boots.tsv` (first frame, title, heap at title). The boot A/B tool |
 | `arm.sh` | One arm of a boot-crash A/B: N sequential bootchecks under one knob set, reported as crashes/valid |
 | `bench.mjs`, `benchseeded.mjs`, `benchstats.mjs` | The jbox2d fixed-work kernel — low variance, checksum-gated, the right tool for a within-binary A/B and for cross-VM reference rows. `benchstats` captures the JIT's own stats lines |
 | `perfrun.mjs` | Perf capture of one **jbox2d** bench run, producing the `.jitted` file the pattern/size readers take (the kernel-workload counterpart to `mcperf.mjs`) |
-| `seedbuild.mjs` | Rebuild `scratchpad/mcsr/seed` (see Housekeeping) |
+| `seedbuild.mjs` | Rebuild `scratchpad/mcsr/seed` (see Housekeeping), or make another seed: `--dest mcsr/seed-X --tar /X.tar` from an OPFS export copied into the dev server's `frontend/public` (delete it after), then register it in `lib/seeds.mjs` |
 | `serve-coep.mjs` | Minimal static server with COOP/COEP headers |
 | `nativemc/natrun.sh`, `natstat.py` | **The native reference.** Drives native OpenJDK Minecraft on the MATCHED Prism instance (same save, mods sha256-identical) and reports **M instructions/frame** per thread, the same metric as our side. `EXTRA_JAVA=` for ablation arms (`novirt`, `noinl`). Read its README before use: three defects in the old `jvminline.sh` and two Xwayland traps are documented there, and `results/HARNESS-DEFECTS-2026-09-11.md` for the five that were live in these tools until R244 |
 | `nativemc/join.py`, `split.py` | Per-method join of an async-profiler collapsed profile against our census, on IKVM-preserved Java names; and the bucket split by whether a method exists on native at all. `--thread "Server thread"` selects the clean instrument. **Both resolve the ONE tid perf counted out of the sibling `perf.txt`** — three threads are named `Render thread` and pooling them deflated every native figure 16.7% (R244) |
@@ -1356,4 +1374,5 @@ holding Minecraft 1.16.1 + Fabric, the mods, `options.txt` and the "New World" s
 reflink-copies it for every run; without it the app re-downloads Minecraft *inside the boot phase* and boot
 measures the network. It is easy to mistake for junk because it sits in the otherwise-dead `mcsr/` directory —
 it was in fact deleted once during a cleanup. Rebuild with `node scratchpad/wj/seedbuild.mjs` (~1 minute; the
-dev server must be up).
+dev server must be up). The same holds for every `mcsr/seed-*` profile `lib/seeds.mjs` names (seed-165, seed-262u,
+seed-262b, seed-262p): each is a user's OPFS export and is not regenerable without the tar.
