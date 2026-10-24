@@ -262,6 +262,43 @@ typedef struct {
 #endif
 } MonoLMFExt;
 
+/* R516: one inlinee of a wasm-JIT body (mini-wasm-ir.inc WjSwInl), as the stack walk's module record keeps it: entry k
+ * (1..n) is call-site tag inl == k, `parent` 0 the method itself, `call_il` the call's IL offset in the parent. */
+typedef struct {
+	MonoMethod *method;
+	guint16 parent;
+	gint32 call_il;
+} MonoWasmSwInl;
+
+struct _WasmSites;   /* wasm-encoder.h */
+
+#ifdef HOST_BROWSER
+/* The V8-assisted managed stack walk (exceptions-wasm-stackwalk.inc, R516). One frame: sfi as the legacy unwinder
+ * would fill it (JIT and AOT frames are FRAME_TYPE_MANAGED with a jinfo; il_offset is set, -1 = unknown). */
+#define MONO_WASM_SW_SRC_INTERP 1
+#define MONO_WASM_SW_SRC_JIT 2
+#define MONO_WASM_SW_SRC_AOT 3
+typedef struct {
+	StackFrameInfo sfi;
+	int src;
+} MonoWasmSwFrame;
+/* consumers, for the census; must match the file's WJSW_C_ order */
+#define MONO_WASM_SW_C_FRAMEINFO 1
+#define MONO_WASM_SW_C_TRACE 2
+#define MONO_WASM_SW_C_WALKFULL 3
+#define MONO_WASM_SW_C_EXC 4
+int mono_wasm_stackwalk_begin (int consumer, int want, MonoWasmSwFrame **out);
+void mono_wasm_stackwalk_end (void);
+int mono_wasm_stackwalk_verify_on (void);
+void mono_wasm_stackwalk_verify_result (int ok);
+void mono_wasm_stackwalk_module_note (guint32 payload, int n, MonoMethod *const *methods, gpointer const *body_imethods,
+                                      const struct _WasmSites *const *sites, const void *const *inl_tabs, const int *ninl,
+                                      const guint8 *bytes, int len);
+void mono_wasm_stackwalk_note_aot_methods (gpointer const *table_indices, int n);
+void mono_wasm_stackwalk_print_stats (void);
+gboolean mono_wasm_stackwalk_same_method (MonoMethod *a, MonoMethod *b);
+#endif
+
 typedef void (*MonoFtnPtrEHCallback) (MonoGCHandle gchandle);
 
 typedef struct MonoDebugOptions {

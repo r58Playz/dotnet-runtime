@@ -636,6 +636,7 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 	char eb [512];
 	double ms = 0;
 	int i, ok = 0, nc = 0;
+	WasmSites **sw_sites = NULL;   /* R516: each member's call sites, for the stack walk's module record */
 
 	wj_stack_probe ();
 	if (n <= 1 || n > WJ_BATCH_MAX || ncopy < 0 || n + ncopy > WJ_BATCH_MAX)
@@ -764,6 +765,7 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 		members [i].uses_calls = b->uses_calls;
 		members [i].uses_eh_tag = b->uses_eh_tag;
 		members [i].eh_tpool = b->eh_tpool;
+		members [i].body_imethod = b->body_imethod;
 	}
 	for (i = 0; i < ncopy; ++i) {
 		WjRegEntry *cre = copy_ids [i] > 0 && copy_ids [i] <= wj_reg_n ? wj_reg_at (copy_ids [i] - 1) : NULL;
@@ -805,7 +807,8 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 	   * is what could not be done -- R161 showed every deferral was an import-edge cycle, and R162
 	   * measured what that cost. call_indirect reads the table when it runs, so any order works. */ }
 	wasm_buf_init (&out);
-	if (!wj_assemble (members, n + nc, n, &pol, &out, NULL, wj_batch_deps) || out.len == 0) {
+	sw_sites = g_new0 (WasmSites *, n + nc);
+	if (!wj_assemble (members, n + nc, n, &pol, &out, NULL, wj_batch_deps, sw_sites) || out.len == 0) {
 		wasm_buf_free (&out);
 		goto done;
 	}
@@ -849,6 +852,25 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 
 	eb [0] = 0;
 	payload = wj_payload_new ();   /* W1 C0 */
+	{
+		/* R516: the stack walk's record of this module, in assembly order (its first n + nc defined functions). */
+		MonoMethod **swm = g_new (MonoMethod *, n + nc);
+		gpointer *swi = g_new (gpointer, n + nc);
+		const void **swl = g_new (const void *, n + nc);
+		int *swn = g_new (int, n + nc);
+		for (i = 0; i < n + nc; ++i) {
+			swm [i] = members [i].method;
+			swi [i] = members [i].body_imethod;
+			swl [i] = members [i].sw_inl;
+			swn [i] = members [i].sw_ninl;
+		}
+		mono_wasm_stackwalk_module_note (payload, n + nc, swm, swi, (const WasmSites *const *) sw_sites, swl, swn,
+		                                 (const guint8 *) cached, (int) out.len);
+		g_free (swm);
+		g_free (swi);
+		g_free (swl);
+		g_free (swn);
+	}
 	if (!mono_wasm_jit_instantiate_batch_local (e_slots, f_slots, n, cached, (int) out.len, eb, (int) sizeof (eb), &ms, payload)) {
 		/* The old generation is still in this worker's slots -- instantiate_batch_local installs nothing
 		 * on failure -- so declining here really does leave the members exactly as they were. */
@@ -891,6 +913,7 @@ done:
 		for (i = 0; i < nc; ++i)
 			wj_b4_copy_bytes += members [n + i].f_body ? members [n + i].f_body->len : 0;
 	}
+	wj_sw_sites_free (sw_sites, n + nc);
 	g_free (members); g_free (e_slots); g_free (f_slots);
 	wj_reg_read_leave ();
 	return ok;

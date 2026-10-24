@@ -6106,6 +6106,9 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 			   * that inlinee's IL buffer (the names stay ORIGIN-only). */
 			  if (G_UNLIKELY (mono_wasm_jit_origin || (mono_wasm_jit_s2 & 1)))
 				mono_wasm_jit_origin_note_inline (cfg, cmethod, cheader); }
+			{ extern void mono_wasm_jit_sw_note_inline (MonoCompile *, MonoMethod *, MonoMethodHeader *, const guint8 *, const guint8 *);
+			  /* R516: always -- the stack walk reports inlined frames from it (mini-wasm-ir.inc, WjSwInlRec) */
+			  mono_wasm_jit_sw_note_inline (cfg, cmethod, cheader, prev_cil_start, ip); }
 #endif
 		}
 

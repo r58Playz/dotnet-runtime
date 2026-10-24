@@ -1968,6 +1968,10 @@ register_methods_in_jinfo (MonoAotModule *amodule)
 		mono_bitset_set_fast (registered, GPOINTER_TO_INT (amodule->sorted_methods [i]));
 
 	mono_aot_unlock ();
+#ifdef HOST_BROWSER
+	/* R516: the V8-assisted stack walk maps a frame's function index back to these table indices. */
+	mono_wasm_stackwalk_note_aot_methods ((gpointer const *) amodule->sorted_methods, amodule->sorted_methods_len);
+#endif
 }
 #endif
 

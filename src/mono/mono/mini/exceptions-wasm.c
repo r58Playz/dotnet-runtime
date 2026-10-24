@@ -401,3 +401,7 @@ mono_arch_handle_exception (void *sigctx, gpointer obj)
 {
 	g_error ("mono_arch_handle_exception");
 }
+
+#ifdef HOST_BROWSER
+#include "exceptions-wasm-stackwalk.inc"
+#endif

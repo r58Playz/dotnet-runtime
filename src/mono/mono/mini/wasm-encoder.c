@@ -25,6 +25,12 @@ wasm_buf_init (WasmBuf *b)
 	b->relocs = NULL;
 	b->hints = NULL;
 	b->origins = NULL;
+	b->site_il = -1;
+	b->site_inl = 0;
+	b->sites = NULL;
+	b->op_start = 0;
+	b->key_src = -1;
+	b->key_pending = -1;
 }
 
 void
@@ -82,6 +88,68 @@ wasm_buf_free (WasmBuf *b)
 		g_free (o);
 		b->origins = NULL;
 	}
+	wasm_sites_free (b->sites);
+	b->sites = NULL;
+}
+
+void
+wasm_sites_free (WasmSites *st)
+{
+	if (!st)
+		return;
+	g_free (st->off);
+	g_free (st->il);
+	g_free (st->inl);
+	g_free (st->kd);
+	g_free (st);
+}
+
+void
+wasm_site_set (WasmBuf *b, guint16 inl, gint32 il)
+{
+	b->site_inl = inl;
+	b->site_il = il;
+}
+
+/* A call opcode about to be written at out->len (relative to the body start `base`), tagged as reloc `r` was;
+ * `key` is its key's offset in the same terms, or -1 (WasmSites.kd). */
+static void
+wasm_site_note (WasmBuf *out, guint32 base, const WasmReloc *r, gint64 key)
+{
+	WasmSites *st = out->sites;
+	guint32 off = out->len - base;
+	if (!st)
+		st = out->sites = g_new0 (WasmSites, 1);
+	if (st->n == st->cap) {
+		st->cap = st->cap ? st->cap * 2 : 16;
+		st->off = (guint32 *) g_realloc (st->off, sizeof (guint32) * (gsize) st->cap);
+		st->il = (gint32 *) g_realloc (st->il, sizeof (gint32) * (gsize) st->cap);
+		st->inl = (guint16 *) g_realloc (st->inl, sizeof (guint16) * (gsize) st->cap);
+		st->kd = (guint16 *) g_realloc (st->kd, sizeof (guint16) * (gsize) st->cap);
+	}
+	st->off [st->n] = off;
+	st->il [st->n] = r->site_il;
+	st->inl [st->n] = r->site_inl;
+	st->kd [st->n] = key >= 0 && key < off && off - key <= 0xffff ? (guint16) (off - key) : 0;
+	st->n++;
+}
+
+/* The site-key tracker (WasmSites.kd). A call's run ends at a control op or at the next call; a key not followed
+ * by a memory access before then is dropped, because a later call with no key of its own could report it. */
+static void
+wasm_site_key_open (WasmBuf *b)
+{
+	if (b->key_pending >= 0 && b->relocs && (guint32) b->key_pending < b->relocs->n)
+		b->relocs->r [b->key_pending].site_kd = 0;
+	b->key_pending = -1;
+}
+
+static void
+wasm_site_key_close (WasmBuf *b)
+{
+	if (b->key_pending >= 0 && b->relocs && (guint32) b->key_pending < b->relocs->n)
+		b->relocs->r [b->key_pending].site_kd |= WASM_SITE_KD_CLOSED;
+	b->key_pending = -1;
 }
 
 void
@@ -187,13 +255,25 @@ wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, 
 	e->tpool = (guint16) tpool;
 	e->table_index = table_index;
 	e->sym = sym;
+	e->site_il = b->site_il;
+	e->site_inl = b->site_inl;
+	e->site_kd = 0;
+	if (kind != WASM_RELOC_TYPE_U && kind != WASM_RELOC_TYPE_S) {
+		/* a call: it ends the previous call's run, and its key is the last memory access of its own */
+		wasm_site_key_open (b);
+		if (b->key_src >= 0 && (guint32) b->key_src < b->len && b->len - (guint32) b->key_src <= WASM_SITE_KD_MASK)
+			e->site_kd = (guint16) (b->len - (guint32) b->key_src);
+		b->key_pending = (gint32) (rl->n - 1);
+	}
+	b->key_src = -1;
 	/* See the header: a zero-length hole would otherwise leave the local.tee peephole armed ACROSS it. */
 	b->tee_end = 0;
 }
 
-/* One resolved call site. `ti` is the module type index; `fix` says which of the three forms to use. */
+/* One resolved call site. `ti` is the module type index; `fix` says which of the three forms to use; `key` is
+ * the site's key in output terms (WasmSites.kd), or -1. */
 static void
-emit_call_site (WasmBuf *out, const WasmReloc *r, const WasmRelocFix *fix, guint32 ti)
+emit_call_site (WasmBuf *out, guint32 base, const WasmReloc *r, const WasmRelocFix *fix, guint32 ti, gint64 key)
 {
 	switch (fix->form) {
 	case WASM_FORM_IMPORT:
@@ -201,11 +281,13 @@ emit_call_site (WasmBuf *out, const WasmReloc *r, const WasmRelocFix *fix, guint
 		/* Identical encoding; they differ only in which half of the function index space `idx` names,
 		 * and therefore in what V8 makes of them (three loads and an indirect call, versus one
 		 * `call rel32` that is also the only form V8 will inline through). */
+		wasm_site_note (out, base, r, key);
 		wasm_op (out, WASM_OP_CALL);
 		wasm_uleb (out, fix->idx);
 		break;
 	default:
 		wasm_i32_const (out, (gint32) r->table_index);
+		wasm_site_note (out, base, r, key);
 		wasm_op (out, WASM_OP_CALL_INDIRECT);
 		wasm_uleb (out, ti);
 		wasm_uleb (out, 0);   /* table 0 (the imported f.f) */
@@ -269,6 +351,10 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 	for (k = 0; k < n; ++k) {
 		const WasmReloc *r = &rl->r [k];
 		guint32 ti = ti_base + r->tpool;
+		/* the site's key in output terms: it lies in the span about to be copied (the tracker resets at every hole) */
+		guint32 kd = r->site_kd & WASM_SITE_KD_MASK;
+		gboolean closed = (r->site_kd & WASM_SITE_KD_CLOSED) != 0;
+		gint64 key = closed && kd && r->off - kd >= prev ? (gint64) (out->len - base) + (r->off - kd - prev) : -1;
 		g_assert (r->off >= prev && r->off <= src->len);   /* relocs are sorted and in range */
 		WASM_FLUSH_HINTS (r->off);
 		WASM_FLUSH_ORIGINS (r->off, k);
@@ -282,6 +368,7 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 			wasm_sleb (out, (gint64) ti);
 			break;
 		case WASM_RELOC_INDIRECT:
+			wasm_site_note (out, base, r, key);
 			wasm_op (out, WASM_OP_CALL_INDIRECT);
 			wasm_uleb (out, ti);
 			wasm_uleb (out, 0);
@@ -289,6 +376,7 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 		case WASM_RELOC_SELF:
 			/* The entry thunk calling its own method. Always module-local: they are framed together. */
 			g_assert (fix [k].form == WASM_FORM_LOCAL);
+			wasm_site_note (out, base, r, key);
 			wasm_op (out, WASM_OP_CALL);
 			wasm_uleb (out, fix [k].idx);
 			break;
@@ -297,7 +385,10 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 				/* plan2x S1. The arguments are already on the stack; the callee's functype (ti) is the `if`'s
 				 * block type, so both arms take them as block params and leave its results. The taken arm --
 				 * this group generation was superseded -- is the rare one, hinted so. */
+				/* The guard load is the key: the hot `else` call follows it directly in V8's code (the taken arm
+				 * is hinted cold), and both calls carry the one tag, so it is given to the first. */
 				wasm_i32_const (out, 0);
+				key = closed ? (gint64) (out->len - base) : -1;
 				wasm_op (out, WASM_OP_I32_LOAD); wasm_memarg (out, 2, fix [k].guard);
 				if (!out->hints)
 					out->hints = g_new0 (WasmHints, 1);
@@ -312,12 +403,14 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 						wasm_op (out, WASM_OP_I32_STORE); wasm_memarg (out, 2, fix [k].guard_count);
 					}
 					wasm_i32_const (out, (gint32) r->table_index);
+					wasm_site_note (out, base, r, key);
 					wasm_op (out, WASM_OP_CALL_INDIRECT); wasm_uleb (out, ti); wasm_uleb (out, 0);
 				wasm_op (out, WASM_OP_ELSE);
+					wasm_site_note (out, base, r, -1);
 					wasm_op (out, WASM_OP_CALL); wasm_uleb (out, fix [k].idx);
 				wasm_op (out, WASM_OP_END);
 			} else {
-				emit_call_site (out, r, &fix [k], ti);
+				emit_call_site (out, base, r, &fix [k], ti, key);
 			}
 			break;
 		}
@@ -417,6 +510,15 @@ wasm_f64 (WasmBuf *b, double v)
 void
 wasm_op (WasmBuf *b, WasmOpcode op)
 {
+	b->op_start = b->len;
+	/* Control flow (0x00-0x19 but nop, and try_table) ends a call-site key's run. `unreachable` is a trap V8 gives
+	 * a position, so it bounds the call before it the way a memory access does. */
+	if ((guint8) op == 0x00)
+		wasm_site_key_close (b);
+	if (((guint8) op <= 0x19 && (guint8) op != 0x01) || (guint8) op == 0x1f) {
+		wasm_site_key_open (b);
+		b->key_src = -1;
+	}
 	wasm_u8 (b, (guint8) op);
 }
 
@@ -491,6 +593,11 @@ wasm_f64_const (WasmBuf *b, double v)
 void
 wasm_memarg (WasmBuf *b, guint32 align_log2, guint32 offset)
 {
+	/* A memory access: V8 positions it (a trap-handler access, or its explicit bounds check). It bounds the
+	 * pending call's key and is the next call's key -- if its opcode went through wasm_op, which this checks. */
+	guint8 op = b->op_start < b->len ? b->data [b->op_start] : 0;
+	wasm_site_key_close (b);
+	b->key_src = (op >= 0x28 && op <= 0x3e) || op == WASM_OP_ATOMIC_PREFIX ? (gint32) b->op_start : -1;
 	wasm_uleb (b, align_log2);
 	wasm_uleb (b, offset);
 }

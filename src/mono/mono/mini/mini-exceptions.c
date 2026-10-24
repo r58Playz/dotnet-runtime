@@ -109,6 +109,16 @@ typedef struct
 	MonoJitInfo *ji;
 }  ExceptionTraceIp;
 
+/* A trace_ips entry the V8-assisted walk recorded (R516): `generic_info` is this tag, `ji` the frame's jinfo (an AOT
+ * method's, an interpreter compilation's, or a JIT member's synthetic one -- method only), and `ip` the frame's IL
+ * offset + 2 rather than a code address: these frames have no native offset anyone could map. Never 0 (IL -1 is 1):
+ * mini_llvmonly_load_exception cuts a trace at the first entry whose ip equals the return address, which is NULL on
+ * wasm. The tag is a static address, which no generic context (a vtable or an mrgctx) can equal. */
+static const char wasm_sw_trace_tag_obj = 0;
+#define WASM_SW_TRACE_TAG ((gpointer) &wasm_sw_trace_tag_obj)
+#define WASM_SW_TRACE_IP(il) ((gpointer) (gsize) ((il) + 2))
+#define WASM_SW_TRACE_IL(ip) ((int) (gsize) (ip) - 2)
+
 /* Number of words in trace_ips belonging to one entry */
 #define TRACE_IP_ENTRY_SIZE (sizeof (ExceptionTraceIp) / sizeof (gpointer))
 
@@ -1081,6 +1091,13 @@ mono_exception_walk_trace_internal (MonoException *ex, MonoExceptionFrameWalk fu
 			ji = mono_jit_info_table_find_internal (ip, TRUE, FALSE);
 		}
 
+		if (generic_info == WASM_SW_TRACE_TAG && ji) {
+			/* a frame the V8-assisted walk recorded: no native offset exists; `ip` holds the IL offset (WASM_SW_TRACE_IP) */
+			if (func (jinfo_get_method (ji), ji->code_start, 0, TRUE, user_data))
+				break;
+			continue;
+		}
+
 		if (ji == NULL) {
 			gboolean r;
 			MONO_ENTER_GC_SAFE;
@@ -1110,15 +1127,229 @@ mono_exception_walk_trace_internal (MonoException *ex, MonoExceptionFrameWalk fu
 	return captured_has_traces || otherwise_has_traces;
 }
 
+/* --- the current thread's trace in ONE walk ------------------------------------------------------------------------
+ *
+ * StackTrace.InitializeForCurrentThread used to build a trace by constructing `new StackFrame (skip++)` until one came
+ * back empty: a full walk per frame, quadratic in depth. It now calls GetTrace with a null exception, which lands here.
+ * Which frames to drop is decided by what they ARE -- the leading run of System.Diagnostics.StackFrame/StackTrace
+ * frames, wrappers never reported -- not by a constant: the +2 the old loop added counted frames the walker could not
+ * always see (AOT'd CoreLib was invisible on wasm until R516), and LLVM may inline among them. */
+
+typedef struct {
+	MonoMethod *method;
+	int il_offset;
+	int native_offset;
+} CurTraceFrame;
+
+/* A frame a trace reports: managed code, no wrapper other than a dynamic method. */
+static gboolean
+trace_frame_reportable (StackFrameInfo *f, MonoMethod **out)
+{
+	MonoMethod *m;
+	if (f->type != FRAME_TYPE_INTERP && f->type != FRAME_TYPE_MANAGED && f->type != FRAME_TYPE_IL_STATE)
+		return FALSE;
+	m = f->actual_method ? f->actual_method : f->method;
+	if (!m && f->ji)
+		m = jinfo_get_method (f->ji);
+	if (!m || (m->wrapper_type != MONO_WRAPPER_NONE && m->wrapper_type != MONO_WRAPPER_DYNAMIC_METHOD))
+		return FALSE;
+	*out = m;
+	return TRUE;
+}
+
+/* A frame the stack-trace API itself contributes. */
+static gboolean
+trace_frame_is_stack_api (MonoMethod *m)
+{
+	MonoClass *k = m ? m->klass : NULL;
+	const char *name;
+	if (!k || m_class_get_image (k) != mono_defaults.corlib || strcmp (m_class_get_name_space (k), "System.Diagnostics"))
+		return FALSE;
+	name = m_class_get_name (k);
+	return !strcmp (name, "StackFrame") || !strcmp (name, "StackTrace");
+}
+
+static gboolean
+cur_trace_collect (StackFrameInfo *frame, MonoContext *ctx, gpointer data)
+{
+	CurTraceFrame t;
+	if (!trace_frame_reportable (frame, &t.method))
+		return FALSE;
+	t.native_offset = frame->native_offset;
+	t.il_offset = frame->il_offset;
+	if (frame->type == FRAME_TYPE_IL_STATE && frame->il_state)
+		t.il_offset = ((MonoMethodILState *) frame->il_state)->il_offset;
+	g_array_append_val ((GArray *) data, t);
+	return FALSE;
+}
+
+#ifdef HOST_BROWSER
+static __thread int wasm_sw_consumer;   /* which API the next current-thread walk_stack_full serves, for the census */
+static __thread gboolean wasm_sw_force_legacy;   /* the verify pass's own legacy walk */
+static void wasm_sw_verify (GArray *merged, MonoContext *start_ctx, MonoJitTlsData *jit_tls, MonoLMF *lmf);
+#endif
+
+#ifdef HOST_BROWSER
+/* Pass 1's view of the V8-assisted walk: the merged frames of the stack the exception was thrown on, copied out (pass
+ * 1 runs filters, i.e. managed code, while it walks), and how far its trace has got through them. */
+typedef struct {
+	MonoWasmSwFrame *frames;
+	int n, next;
+	gboolean on;
+} WasmSwExc;
+
+static void
+wasm_sw_exc_begin (WasmSwExc *x, MonoException *mono_ex)
+{
+	MonoWasmSwFrame *sw;
+	int n;
+	memset (x, 0, sizeof (*x));
+	if (!mono_ex)
+		return;
+	n = mono_wasm_stackwalk_begin (MONO_WASM_SW_C_EXC, 0, &sw);
+	if (n < 0)
+		return;
+	x->frames = (MonoWasmSwFrame *) g_memdup (sw, (guint) (sizeof (MonoWasmSwFrame) * (gsize) MAX (n, 1)));
+	x->n = n;
+	x->on = TRUE;
+	mono_wasm_stackwalk_end ();
+}
+
+static void
+wasm_sw_exc_end (WasmSwExc *x)
+{
+	g_free (x->frames);
+	x->frames = NULL;
+	x->on = FALSE;
+}
+
+/* The merged frame this unwinder frame is: an interpreter frame by its InterpFrame, anything else (an IL_STATE record, a
+ * plain LMF) by method. -1 = not ahead of the cursor, and the caller stops using the merged list for this exception. */
+static int
+wasm_sw_exc_find (WasmSwExc *x, StackFrameInfo *frame, MonoMethod *method)
+{
+	int k;
+	if (frame->type == FRAME_TYPE_INTERP) {
+		for (k = x->next; k < x->n; ++k)
+			if (x->frames [k].src == MONO_WASM_SW_SRC_INTERP && x->frames [k].sfi.interp_frame == frame->interp_frame)
+				return k;
+		/* a phantom (interp.c interp_lmf_mark_phantom): the unwinder shows it as the interpreter frame of a callee the
+		 * merged list has as its JIT or AOT frame */
+	}
+	for (k = x->next; k < x->n; ++k)
+		if (x->frames [k].src != MONO_WASM_SW_SRC_INTERP && mono_wasm_stackwalk_same_method (x->frames [k].sfi.method, method))
+			return k;
+	return -1;
+}
+
+/* Record merged frames [x->next, upto) -- the ones the unwinder never reaches -- and, when `self`, frame `upto` itself
+ * (the one it just reached), as tagged entries. Same rules as the legacy recording: runtime-invoke wrappers and
+ * native transitions are left out, dynamic methods are kept alive, and the trace stops at 1000 frames. */
+static GList *
+wasm_sw_exc_record (WasmSwExc *x, int upto, gboolean self, GList *trace_ips, GSList **dynamic_methods, int *frame_count)
+{
+	int k, end = self ? upto + 1 : upto;
+	for (k = x->next; k < end && k < x->n; ++k) {
+		StackFrameInfo *f = &x->frames [k].sfi;
+		MonoMethod *m = f->method;
+		if (!m || !f->ji || (f->type != FRAME_TYPE_INTERP && f->type != FRAME_TYPE_MANAGED))
+			continue;
+		/* a frame only V8 sees is reported only when it is user code, as CoreCLR shows no stubs */
+		if (k != upto && m->wrapper_type != MONO_WRAPPER_NONE && m->wrapper_type != MONO_WRAPPER_DYNAMIC_METHOD)
+			continue;
+		if (m->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE)
+			continue;
+		if ((*frame_count)++ >= 1000)
+			continue;
+		trace_ips = g_list_prepend (trace_ips, WASM_SW_TRACE_IP (f->il_offset));
+		trace_ips = g_list_prepend (trace_ips, WASM_SW_TRACE_TAG);
+		trace_ips = g_list_prepend (trace_ips, f->ji);
+		if (m->dynamic)
+			*dynamic_methods = g_slist_prepend (*dynamic_methods, m);
+	}
+	x->next = MAX (x->next, end);
+	return trace_ips;
+}
+#endif
+
+static MonoArray *
+get_current_trace (gint32 skip, MonoBoolean need_file_info)
+{
+	ERROR_DECL (error);
+	GArray *a = g_array_new (FALSE, FALSE, sizeof (CurTraceFrame));
+	MonoArray *res = NULL;
+	guint first = 0, i;
+
+#ifdef HOST_BROWSER
+	wasm_sw_consumer = MONO_WASM_SW_C_TRACE;
+#endif
+	mono_walk_stack_with_ctx (cur_trace_collect, NULL, MONO_UNWIND_LOOKUP_IL_OFFSET, a);
+#ifdef HOST_BROWSER
+	wasm_sw_consumer = 0;
+#endif
+	while (first < a->len && trace_frame_is_stack_api ((&g_array_index (a, CurTraceFrame, first))->method))
+		first++;
+	first += skip > 0 ? (guint) skip : 0;
+	if (first > a->len)
+		first = a->len;
+
+	HANDLE_FUNCTION_ENTER ();
+	res = mono_array_new_checked (mono_defaults.stack_frame_class, a->len - first, error);
+	if (!is_ok (error))
+		goto fail;
+	MONO_HANDLE_PIN (res);
+	MonoObjectHandle sf_h;
+	sf_h = MONO_HANDLE_NEW (MonoObject, NULL);
+	for (i = first; i < a->len; ++i) {
+		CurTraceFrame *t = &g_array_index (a, CurTraceFrame, i);
+		MonoStackFrame *sf = (MonoStackFrame *) mono_object_new_checked (mono_defaults.stack_frame_class, error);
+		if (!is_ok (error))
+			goto fail;
+		MONO_HANDLE_ASSIGN_RAW (sf_h, sf);
+		MonoReflectionMethod *rm = mono_method_get_object_checked (t->method, NULL, error);
+		if (!is_ok (error))
+			goto fail;
+		MONO_OBJECT_SETREF_INTERNAL (sf, method, rm);
+		sf->method_index = 0xffffff;
+		sf->native_offset = t->native_offset;
+		sf->il_offset = t->il_offset;
+		if (need_file_info) {
+			MonoDebugSourceLocation *location = t->il_offset >= 0 ? mono_debug_lookup_source_location_by_il (t->method, t->il_offset, NULL) : NULL;
+			if (location && location->source_file) {
+				MonoString *filename = mono_string_new_checked (location->source_file, error);
+				if (!is_ok (error)) {
+					mono_debug_free_source_location (location);
+					goto fail;
+				}
+				MONO_OBJECT_SETREF_INTERNAL (sf, filename, filename);
+				sf->line = location->row;
+				sf->column = location->column;
+			}
+			mono_debug_free_source_location (location);
+		}
+		mono_array_setref_internal (res, i - first, sf);
+	}
+	goto exit;
+fail:
+	mono_error_set_pending_exception (error);
+	res = NULL;
+exit:
+	g_array_free (a, TRUE);
+	HANDLE_FUNCTION_RETURN_VAL (res);
+}
+
 MonoArray*
 mono_get_trace (MonoException *exc, gint32 skip, MonoBoolean need_file_info)
 {
 	ERROR_DECL (error);
 	MonoArray *res;
-	MonoArray *ta = exc->trace_ips;
+	MonoArray *ta;
 	MonoDebugSourceLocation *location;
 	int i, len;
 
+	if (!exc)
+		return get_current_trace (skip, need_file_info);
+	ta = exc->trace_ips;
 	if (ta == NULL) {
 		/* Exception is not thrown yet */
 		res = mono_array_new_checked (mono_defaults.stack_frame_class, 0, error);
@@ -1154,13 +1385,43 @@ mono_get_trace (MonoException *exc, gint32 skip, MonoBoolean need_file_info)
 		gpointer generic_info = trace_ip.generic_info;
 		MonoMethod *method;
 
+		if (generic_info == WASM_SW_TRACE_TAG && trace_ip.ji) {
+			/* a frame the V8-assisted walk recorded: method, and the IL offset in `ip` (WASM_SW_TRACE_IP) */
+			MonoReflectionMethod *rm;
+			method = jinfo_get_method (trace_ip.ji);
+			rm = mono_method_get_object_checked (method, NULL, error);
+			if (!is_ok (error))
+				goto fail;
+			MONO_OBJECT_SETREF_INTERNAL (sf, method, rm);
+			sf->method_index = 0xffffff;
+			sf->method_address = 0;
+			sf->native_offset = -1;
+			sf->il_offset = WASM_SW_TRACE_IL (ip);
+			if (need_file_info) {
+				location = sf->il_offset >= 0 ? mono_debug_lookup_source_location_by_il (method, sf->il_offset, NULL) : NULL;
+				if (location && location->source_file) {
+					MonoString *filename = mono_string_new_checked (location->source_file, error);
+					if (!is_ok (error)) {
+						mono_debug_free_source_location (location);
+						goto fail;
+					}
+					MONO_OBJECT_SETREF_INTERNAL (sf, filename, filename);
+					sf->line = location->row;
+					sf->column = location->column;
+				}
+				mono_debug_free_source_location (location);
+			}
+			mono_array_setref_internal (res, i - skip, sf);
+			continue;
+		}
+
 		if (trace_ip.ji) {
 			ji = trace_ip.ji;
 		} else {
 			ji = mono_jit_info_table_find_internal (ip, TRUE, FALSE);
 			if (ji == NULL) {
-				/* Unmanaged frame */
-				mono_array_setref_internal (res, i, sf);
+				/* Unmanaged frame. res is indexed from `skip`: writing at i overran it by `skip` (R516) */
+				mono_array_setref_internal (res, i - skip, sf);
 				continue;
 			}
 		}
@@ -1391,6 +1652,40 @@ walk_stack_full(MonoJitStackWalk func, MonoContext* start_ctx, MonoJitTlsData* j
 	memcpy (&ctx, start_ctx, sizeof (MonoContext));
 	memset (reg_locations, 0, sizeof (reg_locations));
 
+#ifdef HOST_BROWSER
+	/* The current thread is walked by asking V8 (exceptions-wasm-stackwalk.inc), which also sees the JIT and AOT
+	 * frames this unwinder cannot -- for the consumers that OPT IN (wasm_sw_consumer: a StackTrace). Every other
+	 * caller keeps the LMF-only walk: mono_method_get_last_managed alone, for Type.GetType's assembly resolution, ran
+	 * ~1 M walks by 26.2's title, which as V8 walks cost 47.6 s of boot (R516). Another thread's stack is not V8's to
+	 * give, and an async walk must not call JS. */
+	if (wasm_sw_consumer && jit_tls == mono_tls_get_jit_tls () && !async && !wasm_sw_force_legacy) {
+		MonoWasmSwFrame *sw;
+		int nsw = mono_wasm_stackwalk_begin (wasm_sw_consumer, 0, &sw);
+		if (nsw >= 0) {
+			GArray *merged = mono_wasm_stackwalk_verify_on () ? g_array_new (FALSE, FALSE, sizeof (MonoMethod *)) : NULL;
+			gboolean stopped = FALSE;
+			for (int i = 0; i < nsw && !stopped; ++i) {
+				MonoMethod *m;
+				frame = sw [i].sfi;
+				if (!frame.actual_method)
+					frame.actual_method = frame.method;
+				if (!(unwind_options & MONO_UNWIND_LOOKUP_IL_OFFSET))
+					frame.il_offset = -1;
+				if (merged && trace_frame_reportable (&frame, &m))
+					g_array_append_val (merged, m);
+				stopped = func (&frame, &ctx, user_data);
+			}
+			mono_wasm_stackwalk_end ();
+			if (merged) {
+				if (!stopped)   /* a walk the callback cut short has nothing complete to compare */
+					wasm_sw_verify (merged, start_ctx, jit_tls, lmf);
+				g_array_free (merged, TRUE);
+			}
+			return;
+		}
+	}
+#endif
+
 	unwinder_init (&unwinder);
 
 #ifdef HOST_WASI
@@ -1461,6 +1756,53 @@ next:
 	}
 }
 
+#ifdef HOST_BROWSER
+static gboolean
+wasm_sw_verify_collect (StackFrameInfo *frame, MonoContext *ctx, gpointer data)
+{
+	MonoMethod *m;
+	if (trace_frame_reportable (frame, &m))
+		g_array_append_val ((GArray *) data, m);
+	return FALSE;
+}
+
+/* MONO_WASM_STACKWALK_VERIFY: every frame the legacy walk finds must be in the merged list, in the same order. A frame
+ * may match the same merged entry as the one before it -- the legacy walk lists an interpreter frame twice when a
+ * finally or filter re-enters it, the merged one once. A failure is printed (first 8) with both lists. */
+static void
+wasm_sw_verify (GArray *merged, MonoContext *start_ctx, MonoJitTlsData *jit_tls, MonoLMF *lmf)
+{
+	static int printed;
+	GArray *legacy = g_array_new (FALSE, FALSE, sizeof (MonoMethod *));
+	guint i, j = 0;
+	gboolean ok = TRUE;
+	wasm_sw_force_legacy = TRUE;
+	walk_stack_full (wasm_sw_verify_collect, start_ctx, jit_tls, lmf, MONO_UNWIND_DEFAULT, legacy);
+	wasm_sw_force_legacy = FALSE;
+	for (i = 0; i < legacy->len && ok; ++i) {
+		MonoMethod *m = g_array_index (legacy, MonoMethod *, i);
+		while (j < merged->len && !mono_wasm_stackwalk_same_method (g_array_index (merged, MonoMethod *, j), m))
+			j++;
+		ok = j < merged->len;
+	}
+	mono_wasm_stackwalk_verify_result (ok);
+	if (!ok && printed++ < 8) {
+		printf ("WASM_STACKWALK_VERIFY_FAIL legacy=%u merged=%u first_missing=%u\n", legacy->len, merged->len, i - 1);
+		for (j = 0; j < legacy->len; ++j) {
+			char *n = mono_method_get_full_name (g_array_index (legacy, MonoMethod *, j));
+			printf ("  legacy[%u] %s\n", j, n);
+			g_free (n);
+		}
+		for (j = 0; j < merged->len; ++j) {
+			char *n = mono_method_get_full_name (g_array_index (merged, MonoMethod *, j));
+			printf ("  merged[%u] %s\n", j, n);
+			g_free (n);
+		}
+	}
+	g_array_free (legacy, TRUE);
+}
+#endif
+
 /**
  * mono_walk_stack_full:
  * \param func callback to call for each stack frame
@@ -1516,6 +1858,41 @@ mono_get_frame_info (gint32 skip,
 	MONO_ARCH_CONTEXT_DEF;
 
 	g_assert (skip >= 0);
+
+	/* The icall reports *iloffset when no debug location exists. The legacy walk has always reported 0 there. */
+	*iloffset = 0;
+
+#ifdef HOST_BROWSER
+	{
+		/* The V8-assisted walk (exceptions-wasm-stackwalk.inc). The only caller is StackFrame.BuildStackFrame, which
+		 * passes the user's skip + 3: its own three frames as the legacy unwinder counted them. Here the stack API's
+		 * own frames are dropped by what they are (trace_frame_is_stack_api), so only the user's skip is applied, and
+		 * every wrapper is invisible, as on CoreCLR. */
+		MonoWasmSwFrame *sw;
+		int nsw = mono_wasm_stackwalk_begin (MONO_WASM_SW_C_FRAMEINFO, skip + 4, &sw);
+		if (nsw >= 0) {
+			int left = skip >= 3 ? skip - 3 : 0, i;
+			gboolean leading = TRUE, found = FALSE;
+			for (i = 0; i < nsw && !found; ++i) {
+				MonoMethod *m;
+				if (!trace_frame_reportable (&sw [i].sfi, &m))
+					continue;
+				if (leading && trace_frame_is_stack_api (m))
+					continue;
+				leading = FALSE;
+				if (left-- > 0)
+					continue;
+				*out_method = m;
+				*native_offset = sw [i].sfi.native_offset;
+				*iloffset = sw [i].sfi.il_offset;
+				*out_location = sw [i].sfi.il_offset >= 0 ? mono_debug_lookup_source_location_by_il (m, sw [i].sfi.il_offset, NULL) : NULL;
+				found = TRUE;
+			}
+			mono_wasm_stackwalk_end ();
+			return found;
+		}
+	}
+#endif
 
 	if (mono_llvm_only && mono_aot_mode != MONO_AOT_MODE_LLVMONLY_INTERP) {
 		GSList *l, *ips;
@@ -1968,6 +2345,12 @@ handle_exception_first_pass (MonoContext *ctx, MonoObject *obj, gint32 *out_filt
 	initial_ctx = *ctx;
 
 	unwinder_init (&unwinder);
+#ifdef HOST_BROWSER
+	/* R516: the trace names the JIT and AOT frames this unwinder cannot see, from the V8-assisted walk. A continuation
+	 * (a rethrow, whose trace so far was handed in) keeps the legacy recording. */
+	WasmSwExc swx;
+	wasm_sw_exc_begin (&swx, initial_trace_ips ? NULL : mono_ex);
+#endif
 
 	while (1) {
 		MonoContext new_ctx;
@@ -1981,6 +2364,11 @@ handle_exception_first_pass (MonoContext *ctx, MonoObject *obj, gint32 *out_filt
 
 		unwind_res = unwinder_unwind_frame (&unwinder, jit_tls, NULL, ctx, &new_ctx, NULL, &lmf, NULL, &frame);
 		if (!unwind_res) {
+#ifdef HOST_BROWSER
+			if (swx.on)   /* the frames below the last one this unwinder reached */
+				trace_ips = wasm_sw_exc_record (&swx, swx.n, FALSE, trace_ips, &dynamic_methods, &frame_count);
+			wasm_sw_exc_end (&swx);
+#endif
 			setup_stack_trace (mono_ex, &dynamic_methods, trace_ips, FALSE);
 			g_list_free (trace_ips);
 			return result;
@@ -2027,7 +2415,19 @@ handle_exception_first_pass (MonoContext *ctx, MonoObject *obj, gint32 *out_filt
 					 mono_method_full_name (method, TRUE));
 		}
 
-		if (method->wrapper_type != MONO_WRAPPER_RUNTIME_INVOKE && mono_ex) {
+		gboolean sw_recorded = FALSE;
+#ifdef HOST_BROWSER
+		if (swx.on && mono_ex) {
+			int k = wasm_sw_exc_find (&swx, &frame, method);
+			if (k >= 0) {
+				trace_ips = wasm_sw_exc_record (&swx, k, method->wrapper_type != MONO_WRAPPER_RUNTIME_INVOKE, trace_ips, &dynamic_methods, &frame_count);
+				sw_recorded = TRUE;
+			} else {
+				swx.on = FALSE;   /* out of step with the merged list: the legacy recording takes over from here */
+			}
+		}
+#endif
+		if (!sw_recorded && method->wrapper_type != MONO_WRAPPER_RUNTIME_INVOKE && mono_ex) {
 			// avoid giant stack traces during a stack overflow
 			if (frame_count < 1000) {
 				trace_ips = g_list_prepend (trace_ips, ip);
@@ -2140,6 +2540,9 @@ handle_exception_first_pass (MonoContext *ctx, MonoObject *obj, gint32 *out_filt
 						frame.native_offset = GPTRDIFF_TO_INT ((char*)ei->handler_start - (char*)ji->code_start);
 						*catch_frame = frame;
 						result = MONO_FIRST_PASS_HANDLED;
+						#ifdef HOST_BROWSER
+						wasm_sw_exc_end (&swx);
+						#endif
 						return result;
 					}
 				}
@@ -2170,6 +2573,9 @@ handle_exception_first_pass (MonoContext *ctx, MonoObject *obj, gint32 *out_filt
 							unwind_res = unwinder_unwind_frame (&unwinder, jit_tls, NULL, &new_ctx, &new_ctx, NULL, &lmf, NULL, &frame);
 						}
 					}
+					#ifdef HOST_BROWSER
+					wasm_sw_exc_end (&swx);
+					#endif
 					return result;
 				}
 				mono_error_cleanup (isinst_error);
@@ -3772,7 +4178,9 @@ mini_llvmonly_load_exception (void)
 				gpointer p = mono_array_get_internal (ta, gpointer, i + j);
 				trace_ips = g_list_append (trace_ips, p);
 			}
-			if (ip == curr_ip)
+			/* MONO_RETURN_ADDRESS () is NULL on wasm: comparing it would cut the trace at the first entry whose ip
+			 * word is 0, a position that means nothing here (R516) */
+			if (ip && ip == curr_ip)
 				break;
 		}
 

@@ -914,6 +914,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean self_has_byaddr G_GNUC_UNUSED = FALSE;  /* stats: method takes >=1 by-addr vtype arg */
 	WasmBuf body, out;
 	WjBody *wj_stored_body = NULL;   /* the relocatable body, handed to the registry on successful registration */
+	/* R516: the stack walk's view of this body -- its inlinees, and the call sites framing found */
+	WjSwInl *wj_sw_tab = NULL;
+	WjSwRange *wj_sw_ranges = NULL;
+	int wj_sw_n = 0;
+	WasmSites *wj_sw_sites [1] = { NULL };
 	MonoBasicBlock *bb;
 	MonoInst *ins;
 	int i, cnt [4] = { 0, 0, 0, 0 }, base [4], run [4] = { 0, 0, 0, 0 };
@@ -1041,6 +1046,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 
 	wasm_buf_init (&body);
 	wasm_buf_init_relocs (&body);   /* every call site and type index in it is a hole; see wasm-encoder.h */
+	wj_sw_tab = wj_sw_inl_freeze (cfg, &wj_sw_ranges, &wj_sw_n);   /* R516: inlining is done; tag call sites below */
 	{ extern int mono_wasm_jit_s2;   /* plan2x S2: "this method has a tier-1 body", for the hot rule's callee test */
 	  if (G_UNLIKELY (mono_wasm_jit_s2 & 1) && cfg->wasm_jit_tier < 2)
 		mono_wasm_jit_s2_note_body (cfg); }
@@ -4068,6 +4074,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			int my_ord = sl_ord++;   /* bump for EVERY ins (incl. terminated-skipped) to stay aligned with the SLOTLIVE walk */
 			if (terminated) continue;   /* skip instrs after a bb terminator (e.g. the OP_BR following OP_CALL_HANDLER) */
 			wj_origin_ins (&body, cfg, ins);
+			wj_sw_tag_ins (&body, cfg, ins, wj_sw_ranges, wj_sw_n);
 			{ extern int mono_wasm_jit_site_count;   /* call-site census: diagnostic, never in a timing arm */
 			  wj_site_cur = NULL;
 			  if (G_UNLIKELY (mono_wasm_jit_site_count) && wj_site_is_call (ins->opcode))
@@ -5089,8 +5096,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		} \
 		if (!wasm_guard_memaddr (&body, &lc, ins->dreg, (gint32) ins->inst_offset)) { fail = "store addr guard"; goto done; } \
 		if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store base"; goto done; } if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "store val"; goto done; } \
-		if (PFX) wasm_u8 (&body, (PFX)); \
-		wasm_op (&body, (WOP)); wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
+		if (PFX) { wasm_op (&body, (WasmOpcode) (PFX)); wasm_u8 (&body, (guint8) (WOP)); } \
+		else wasm_op (&body, (WOP)); \
+		wasm_memarg (&body, (AL), (guint32) ins->inst_offset); } while (0)
 			case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: STOREM (WASM_OP_I32_STORE, 2); break;
 			case OP_STOREI1_MEMBASE_REG: STOREM (WASM_OP_I32_STORE8, 0); break;
 			case OP_STOREI2_MEMBASE_REG: STOREM (WASM_OP_I32_STORE16, 1); break;
@@ -5140,7 +5148,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (!wasm_ld (&body, &lc, ins->dreg)) { fail = "store base"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "store val"; goto done; }
 				wasm_op (&body, r8 ? WASM_OP_I64_REINTERPRET_F64 : WASM_OP_I32_REINTERPRET_F32);
-				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX);
+				wasm_op (&body, WASM_OP_ATOMIC_PREFIX);
 				wasm_u8 (&body, r8 ? 0x18 /* i64.atomic.store */ : 0x17 /* i32.atomic.store */);
 				wasm_memarg (&body, r8 ? 3 : 2, (guint32) ins->inst_offset);
 				wj_count (WJC_ATOMIC_LOWERED);
@@ -5165,7 +5173,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (ins->inst_offset < 0) { fail = "atomic offset"; goto done; }
 				if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; }
-				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
+				wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
 				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
 				if (post >= 0) wasm_op (&body, post);
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; }
@@ -5190,7 +5198,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "rmw addr guard"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "rmw base"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "rmw val"; goto done; }
-				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
+				wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
 				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
 				if (ins->opcode == OP_ATOMIC_ADD_I4 || ins->opcode == OP_ATOMIC_ADD_I8) {
 					if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "rmw val"; goto done; }
@@ -5211,7 +5219,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "cas base"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg3)) { fail = "cas cmp"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg2)) { fail = "cas val"; goto done; }
-				wasm_u8 (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
+				wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, (guint8) sub);
 				wasm_memarg (&body, (guint32) al, (guint32) ins->inst_offset);
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "cas dreg"; goto done; }
 				wj_count (al == 3 ? WJC_ATOMIC_I8_LOWERED : WJC_ATOMIC_LOWERED);
@@ -8272,6 +8280,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 	}
 
 	wasm_origin_push (&body, WJO_THROW_SITES);
+	wasm_site_set (&body, 0, -1);   /* R516: shared raise sites serve many instructions: no one IL offset */
 	/* Shared raise sites, innermost first: close throw[t], then emit its one call to
 	 * mono_wasm_jit_raise_corlib. Only reachable via `br_if $throw_t`, since the dispatch loop above
 	 * never falls through and every raise ends in `unreachable`.
@@ -8522,6 +8531,9 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 			am [0].uses_calls = uses_calls ? 1 : 0;
 			am [0].uses_eh_tag = uses_eh_tag ? 1 : 0;
 			am [0].eh_tpool = eh_type_idx;
+			am [0].body_imethod = cfg->wasm_jit_caller_imethod;
+			am [0].sw_inl = wj_sw_tab;
+			am [0].sw_ninl = wj_sw_n;
 			wj_asm_policy_init (&pol, FALSE /* keep self-recursion indirect, as it has always been */);
 			wasm_buf_init (&out);
 			/*
@@ -8564,7 +8576,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				WjAsmDeps sdeps;
 				int di;
 				memset (&sdeps, 0, sizeof (sdeps));
-				wj_assemble (am, 1, 1, &pol, &out, NULL, &sdeps);
+				wj_assemble (am, 1, 1, &pol, &out, NULL, &sdeps, wj_sw_sites);
 				for (di = 0; di < sdeps.n; ++di) {
 					int before = cfg->wasm_jit_result.ndirect_deps;
 					wj_result_add_direct_dep (&cfg->wasm_jit_result, sdeps.slot [di],
@@ -8581,7 +8593,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				}
 			}
 #else
-			wj_assemble (am, 1, 1, &pol, &out, NULL, NULL);
+			wj_assemble (am, 1, 1, &pol, &out, NULL, NULL, NULL);
 #endif
 			/* Keep the relocatable body. Framing consumed nothing -- the buffers still hold instruction
 			 * bytes and relocations, unresolved -- so this method can later be re-framed alongside others
@@ -8590,8 +8602,14 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 			wj_stored_body = wj_body_take (cfg->method, mname, &body, &ethunk, param_types, (guint32) nwparams,
 			                               ret_vt, groups, extra_types, (guint32) nextra,
 			                               uses_calls, uses_eh_tag, eh_type_idx);
-			if (wj_stored_body)
+			if (wj_stored_body) {
 				wj_stored_body->t1down = cfg->wasm_jit_t1_down;
+				wj_stored_body->body_imethod = cfg->wasm_jit_caller_imethod;
+				if (wj_sw_tab) {
+					wj_stored_body->sw_inl = (WjSwInl *) g_memdup (wj_sw_tab, (guint) (sizeof (WjSwInl) * (gsize) (wj_sw_n + 1)));
+					wj_stored_body->sw_ninl = wj_sw_n;
+				}
+			}
 		}
 		wasm_buf_free (&ethunk);
 	}
@@ -8696,6 +8714,12 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 			guint32 payload = wj_payload_new ();   /* W1 C0: this module, here and in the registry */
 			char ierr [512]; ierr [0] = 0;   /* R470: room for the R459 [h ...] probe after V8's message */
 			memcpy (cached, out.data, out.len);
+			/* R516: what a V8 frame in this module is -- method, and the InterpMethod its IL came from -- for the
+			 * stack walk, keyed by the payload every instantiation of these bytes is handed. */
+			{ const void *swi = wj_sw_tab;
+			  mono_wasm_stackwalk_module_note (payload, 1, &cfg->method, (gpointer const *) &cfg->wasm_jit_caller_imethod,
+			                                   (const WasmSites *const *) wj_sw_sites, &swi, &wj_sw_n,
+			                                   (const guint8 *) cached, (int) out.len); }
 			/* Validate by instantiating once on THIS thread (also populates this thread's table).
 			 * If the module is invalid (a codegen bug for some opcode shape), bail to the interpreter
 			 * here rather than letting another thread trap on a placeholder slot at invoke time. */
@@ -8845,6 +8869,9 @@ done:
 	wj_body_free (wj_stored_body);   /* NULL once the registry has taken it */
 	wj_stored_body = NULL;
 	wasm_buf_free (&body);
+	g_free (wj_sw_tab);
+	g_free (wj_sw_ranges);
+	wasm_sites_free (wj_sw_sites [0]);
 #ifdef HOST_BROWSER
 #endif
 	if (G_UNLIKELY (mono_wasm_jit_stats) && wj_gen_t0) {

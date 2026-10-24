@@ -2627,6 +2627,13 @@ wj_instantiate_local_once (int e_slot, int f_slot, const void *bytes, int len, c
 			}
 			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $7, c: $8, v: $9, n: $10, d: $11, m: $12, b: $13, i: $14, g: Module._mono_wasm_jit_worker_action_addr () }, h: Module.__wjHelperImports });
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
+			/* R516: name this instance's frames for the stack walk (exceptions-wasm-stackwalk.inc): every instantiation of
+			 * these bytes, on any worker, carries the same payload id, and that names the module's record. */
+			if ($15) {
+				if (!Module.__wjsw)
+					Module.__wjsw = ({ inst: new WeakMap (), main: null, cls: new Map () });
+				Module.__wjsw.inst.set (inst, $15 | 0);
+			}
 			/* AN F-SLOT ONLY EVER HOLDS A JIT `f` FROM A MODULE THIS EMITTER PRODUCED, and that is a
 			 * load-bearing invariant, not an observation: it is what lets a caller bake a functype for
 			 * an f-slot call without a runtime kind test (AOT bodies are reached through their own
@@ -2680,7 +2687,8 @@ wj_instantiate_local_once (int e_slot, int f_slot, const void *bytes, int len, c
 	   (int) (intptr_t) mono_wasm_jit_vcall_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_vcall_pic_cap_addr (),
 	   (int) (intptr_t) mono_wasm_jit_delegate_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_delegate_pic_cap_addr (),
 	   (int) (intptr_t) mono_wasm_jit_scratch (),
-	   (int) (intptr_t) mono_wasm_jit_cur_island_il_state_addr ());
+	   (int) (intptr_t) mono_wasm_jit_cur_island_il_state_addr (),
+	   (int) payload);
 	WJ_JS_BLOCKING_END (__wj_cookie, __wj_sd, __wj_entered);
 	if (_ok && e_slot > 0 && f_slot > 0) {   /* R322: a validate-only call installed nothing */
 		/* Physical installation is not dispatch admission. A freshly compiled module can have unchecked
@@ -2729,6 +2737,7 @@ wj_instantiate_batch_local_once (const int *e_slots, const int *f_slots, int n, 
 		if (f_slots [i] > 0)
 			wj_lazy_ensure_bank_of_slot (f_slots [i]);   /* Phase 5: as in instantiate_local */
 	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
+	EM_ASM ({ Module.__wjswPending = $0; }, (int) payload);   /* R516: the payload, past the EM_ASM below's argument limit */
 	_ok = EM_ASM_INT ({
 		var es = $0 < 0 ? $0 + 4294967296 : $0;
 		var fs = $1 < 0 ? $1 + 4294967296 : $1;
@@ -2798,6 +2807,14 @@ wj_instantiate_batch_local_once (const int *e_slots, const int *f_slots, int n, 
 			}
 			var inst = new WebAssembly.Instance (new WebAssembly.Module (b), { m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports && wasmExports["__cpp_exception"] }, s: { p: wasmExports && wasmExports["__stack_pointer"], l: $8, c: $9, v: $10, n: $11, d: $12, m: $13, b: $14, i: $15, g: Module._mono_wasm_jit_worker_action_addr () }, h: Module.__wjHelperImports });
 			if (op) HEAPF64[op / 8] = performance.now () - t0;
+			/* R516: name this instance's frames for the stack walk (exceptions-wasm-stackwalk.inc): every instantiation of
+			 * these bytes, on any worker, carries the same payload id, and that names the module's record. */
+			if (Module.__wjswPending) {   /* set just before this call: this EM_ASM is at emscripten's 16-argument limit */
+				if (!Module.__wjsw)
+					Module.__wjsw = ({ inst: new WeakMap (), main: null, cls: new Map () });
+				Module.__wjsw.inst.set (inst, Module.__wjswPending | 0);
+				Module.__wjswPending = 0;
+			}
 			/* TWO PASSES, and `es / 4` rather than `es >> 2`. Both are the same bug seen twice.
 			 *
 			 * `>>` is ToInt32 in JS, so a pointer at or above 2^31 -- which g_malloc hands out routinely

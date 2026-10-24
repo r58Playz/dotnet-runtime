@@ -260,7 +260,35 @@ typedef struct {
 	 * each byte of this body serves, or NULL. Carried like hints; the module assembler emits it as the custom
 	 * section "wj.origin". Diagnostic only -- a custom section changes no code. */
 	struct _WasmOrigins *origins;
+	/* Call sites, for the managed stack walk (R516, exceptions-wasm-stackwalk.inc). `site_il`/`site_inl` is the
+	 * emitter's current (IL offset, inline index) -- inline 0 is the method itself, k its k-th inlinee, IL -1
+	 * unknown -- copied into every reloc as it is recorded (wasm_site_set). A SERIALIZED body gets `sites`: the
+	 * offset of every call opcode written at a hole, with the reloc's tag. Changes no code. */
+	gint32 site_il;
+	guint16 site_inl;
+	struct _WasmSites *sites;
+	/* The site KEY tracker (see WasmSites.kd): `op_start` is where the last wasm_op began, `key_src` the start of
+	 * the last memory access since the last call or control op (-1: none), `key_pending` the reloc whose call has
+	 * not yet been followed by a memory access in its run (-1: none). */
+	guint32 op_start;
+	gint32 key_src;
+	gint32 key_pending;
 } WasmBuf;
+
+/* A call site's KEY. V8 gives a call inside a `try` of the same frame no source position (TurboFan generates it
+ * at the block's CheckException, which is not in InstructionSelector::IsSourcePositionUsed), so such a frame
+ * reports the last positioned instruction before its call: in practice a memory access (R516). The key is the
+ * start of the last memory access before the call in its straight-line run, recorded only when the run also has
+ * one AFTER the call -- that one bounds the key's reach, so a position equal to the key can only be this call. */
+typedef struct _WasmSites {
+	guint32 *off;    /* offset of a call / call_indirect opcode in the serialized body, increasing */
+	gint32  *il;
+	guint16 *inl;
+	guint16 *kd;     /* off - key, 0: no key */
+	guint32  n, cap;
+} WasmSites;
+
+void wasm_sites_free (WasmSites *st);
 
 /* One origin TRANSITION: from `off` on, the bytes serve (tag, meth, il, ilop) until the next transition.
  * `nrel` is how many relocations had been recorded when it was: a hole is zero bytes long, so a transition and
@@ -355,7 +383,13 @@ typedef struct {
 	guint16  tpool;        /* index into the owning member's type block (0 = its own sig, 1 = its thunk's) */
 	guint32  table_index;  /* HELPER: the C function pointer. CALL/SELF: the callee's f-slot. */
 	gpointer sym;          /* CALL: callee identity (a MonoMethod*), for co-location and the ABI check */
+	gint32   site_il;      /* the emitter's site tag when the hole was recorded (WasmBuf.site_il / site_inl) */
+	guint16  site_inl;
+	guint16  site_kd;      /* a call's key (WasmSites.kd): off - key in the low 15 bits (0: none), WASM_SITE_KD_CLOSED */
 } WasmReloc;
+
+#define WASM_SITE_KD_CLOSED 0x8000   /* a memory access followed the call in its run: the key may be used */
+#define WASM_SITE_KD_MASK   0x7fff
 
 typedef struct _WasmRelocs {
 	WasmReloc *r;
@@ -390,6 +424,8 @@ void wasm_origins_set_methods (WasmBuf *b, char **mnames, guint32 nmeth);
  * sequence would be rewritten into `local.tee N` -- deleting the call's effect on the stack.
  */
 void wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, gpointer sym);
+/* The site tag the next relocs carry (see WasmBuf.site_il). */
+void wasm_site_set (WasmBuf *b, guint16 inl, gint32 il);
 
 /*
  * Emit `src` into `out` with every hole filled: `fix[k]` resolves `src->relocs->r[k]`, and a type index

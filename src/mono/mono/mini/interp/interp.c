@@ -762,6 +762,18 @@ interp_pop_lmf (MonoLMFExt *ext)
 	mono_pop_lmf (&ext->lmf);
 }
 
+/* A PHANTOM INTERP_EXIT: its frame stands in for a callee that is NOT running in the interpreter -- a JIT or AOT body
+ * entered from native code, or one still being compiled -- so no mono_interp_exec_method activation is behind it. The
+ * V8-assisted stack walk (exceptions-wasm-stackwalk.inc) must not treat it as an interpreter segment, and it is told
+ * so here: an ext never uses lmf.method (mono_push_lmf writes only previous_lmf; interp_push_lmf zeroes the rest),
+ * so a non-NULL one marks a phantom and names its callee. Call after interp_push_lmf. */
+static inline void
+interp_lmf_mark_phantom (MonoLMFExt *ext, InterpFrame *frame)
+{
+	MonoMethod *m = (frame && frame->imethod) ? frame->imethod->method : NULL;
+	ext->lmf.method = m ? m : (MonoMethod *) (gsize) 4;
+}
+
 #if HOST_BROWSER
 /* Global "a thread is compiling" flag. mono_wasm_force_compile -> mini_method_compile is the ONLY
  * compilation in the interp-only runtime, and it is NOT safe to run concurrently here (the wasm
@@ -4333,8 +4345,12 @@ wj_jit_work_pending (void)
 		wj_reemit_overflow_head != NULL;
 }
 
+/* FRAME/IP: the interpreter frame making the call, or NULL from a site that has none. When given, the threshold
+ * compile below runs with that frame on the LMF chain: a compile can run a cctor, i.e. managed code that may walk
+ * the stack, and without an INTERP_EXIT this mono_interp_exec_method activation has no segment for the V8-assisted
+ * walk to pair with (exceptions-wasm-stackwalk.inc). Pushed only around the compile, never on the per-call path. */
 static void
-wasm_jit_maybe_compile (InterpMethod *cmethod)
+wasm_jit_maybe_compile (InterpMethod *cmethod, InterpFrame *frame, const guint16 *ip)
 {
 	extern int mono_wasm_jit_auto, mono_wasm_jit_thresh;
 	/* Tier off (MONO_WASM_JIT_AUTO=0): nothing is ever compiled, so there is nothing queued to drain or
@@ -4380,7 +4396,14 @@ wasm_jit_maybe_compile (InterpMethod *cmethod)
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ISLAND_ATTEMPT);
 		{
 			int budget = 1;
+			MonoLMFExt wj_mc_ext;
+			if (frame) {
+				frame->state.ip = ip;
+				interp_push_lmf (&wj_mc_ext, frame);
+			}
 			r = wasm_jit_compile_root (cmethod->method, &budget);
+			if (frame)
+				interp_pop_lmf (&wj_mc_ext);
 		}
 		{ extern int mono_wasm_jit_verbose;
 		  if (G_UNLIKELY (mono_wasm_jit_verbose >= 2)) {
@@ -6472,7 +6495,8 @@ interp_entry (InterpEntryData *data)
 		 * mono_wasm_jit_invoke_caught; without it the unwinder reaches the AOT entry's incomplete plain
 		 * save-LMF (method == NULL) and exceptions-wasm aborts. */
 		interp_push_lmf (&wj_entry_ext, &frame);
-		wasm_jit_maybe_compile (frame.imethod);
+		interp_lmf_mark_phantom (&wj_entry_ext, &frame);
+		wasm_jit_maybe_compile (frame.imethod, NULL, NULL);
 	}
 	/* wasm-JIT e-slot redirect: if the target method has itself been wasm-JITted (a live entry thunk),
 	 * run its COMPILED wasm body via the e-thunk instead of interpreting it. This is what makes a JITted
@@ -7196,7 +7220,7 @@ mono_wasm_jit_late_fslot (InterpMethod *imethod)
 	 * as the missing interpreter call edge. This runs before the generated caller spills arguments into
 	 * GC-invisible scratch, so island compilation and any resulting GC remain safe. */
 	if (wj_slot_hot_retry_eligible (imethod->wasm_jit_slot))
-		wasm_jit_maybe_compile (imethod);
+		wasm_jit_maybe_compile (imethod, NULL, NULL);
 	imethod = interp_imethod_current (imethod, TRUE);
 	if (imethod->wasm_jit_fslot > 0) {
 		/* _live: admit() alone also succeeds on a cycle break, which instantiates nothing. Handing back an
@@ -8015,7 +8039,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		 * permanently strands the target in the interpreter (profile13: registered -6%, interp-routed +40%).
 		 * This can re-enter while compiling, so publish the scratch recipe only after it returns. */
 		if (imethod->wasm_jit_slot <= 0)
-			wasm_jit_maybe_compile (imethod);
+			wasm_jit_maybe_compile (imethod, NULL, NULL);
 		/* Function tables are per-thread. The cached InterpMethod identity is process-wide, but its e-slot
 		 * must still be admitted on this worker before call_delegate can enter it. */
 		if (imethod->wasm_jit_slot > 0) {
@@ -8097,7 +8121,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		return FALSE;
 	}
 	if (imethod->wasm_jit_slot <= 0)
-		wasm_jit_maybe_compile (imethod);
+		wasm_jit_maybe_compile (imethod, NULL, NULL);
 	if (imethod->wasm_jit_slot > 0) {
 		extern int mono_wasm_jit_admit_live (int desc_id);
 		if (mono_wasm_jit_admit_live (imethod->wasm_jit_desc)) {
@@ -8691,7 +8715,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	 * override is JITted (slot>0) or permanently bailed (slot==-1); honours MONO_WASM_JIT_AUTO). */
 	gboolean had_fslot = imethod->wasm_jit_fslot > 0;   /* JITted on entry (vfast_had) vs compiled by the call below (vfast_new) */
 	if (imethod->wasm_jit_fslot <= 0)
-		wasm_jit_maybe_compile (imethod);
+		wasm_jit_maybe_compile (imethod, NULL, NULL);
 	if (imethod->wasm_jit_fslot > 0) {
 		extern int mono_wasm_jit_admit_live (int desc_id);
 		/* Only return the f-slot if THIS thread actually instantiated that module. Admission can fail to
@@ -9443,6 +9467,61 @@ interp_imethod_for_il_state (MonoMethod *method, MonoMethodILState *il)
 			return b;
 	}
 	return mono_interp_get_imethod (method);
+}
+
+/* For the V8-assisted stack walk (exceptions-wasm-stackwalk.inc). */
+
+/* The InterpMethod a JIT EH record's frame was compiled against, or NULL if `il` is not such a record (an AOT
+ * il_state). The walk matches a record to its JIT frame by this, not by method: recursion puts one method on the
+ * stack many times. */
+gpointer mono_interp_ehrec_body (MonoMethodILState *il);
+gpointer
+mono_interp_ehrec_body (MonoMethodILState *il)
+{
+	return wj_ehrec_is_record_il (il) ? (gpointer) wj_ehrec_of_il (il)->body : NULL;
+}
+
+/* TRUE if the IL `imethod` was compiled from has since been replaced by a body swap: a frame running it reports no
+ * IL offset, because a consumer can only read an offset against the method's CURRENT IL (IKVM's line tables, R516).
+ * Tier-up copies share the epoch, so only a real swap counts. interp_imethod_current is safe to call concurrently. */
+gboolean mono_interp_imethod_superseded (gpointer imethod);
+gboolean
+mono_interp_imethod_superseded (gpointer imethod)
+{
+	InterpMethod *im = (InterpMethod *) imethod;
+	if (!im || (!im->replaced_by && !(im->optimized_imethod && im->optimized_imethod->replaced_by)))
+		return FALSE;
+	return interp_imethod_current (im, TRUE)->body_epoch != im->body_epoch;
+}
+
+/* An interpreter frame's InterpMethod (StackFrameInfo.interp_frame). */
+gpointer mono_interp_frame_imethod (gpointer interp_frame);
+gpointer
+mono_interp_frame_imethod (gpointer interp_frame)
+{
+	return interp_frame ? (gpointer) ((InterpFrame *) interp_frame)->imethod : NULL;
+}
+
+/* The IL offset an interpreter frame is at, from the seq points of the compilation it is RUNNING (jinfo->seq_points),
+ * never the per-MonoMethod table: that one is last-writer-wins across tier-up and body generations (transform.c's
+ * publication FIXME). -1 when the frame has no saved ip (only a frame that called out has one), no seq points, or runs
+ * a superseded body. The offset is the previous seq point's, i.e. the start of the statement making the call. */
+int mono_interp_frame_il_offset (gpointer interp_frame);
+int
+mono_interp_frame_il_offset (gpointer interp_frame)
+{
+	InterpFrame *f = (InterpFrame *) interp_frame;
+	InterpMethod *im = f ? f->imethod : NULL;
+	SeqPoint sp;
+	int nofs;
+	if (!im || !f->state.ip || !im->code || !im->jinfo || !im->jinfo->seq_points)
+		return -1;
+	if (mono_interp_imethod_superseded (im))
+		return -1;
+	nofs = GPTRDIFF_TO_INT ((guint8 *) (f->state.ip - 1) - (guint8 *) im->code);
+	if (nofs < 0 || !mono_seq_point_find_prev_by_native_offset ((MonoSeqPointInfo *) im->jinfo->seq_points, nofs, &sp))
+		return -1;
+	return sp.il_offset;
 }
 
 static const WjEhRecLayout wj_ehrec_layout = {
@@ -10611,6 +10690,10 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
 	 * catch up the stack (observed: GSON ConstructorConstructor's `catch (NoSuchMethodException)` escaping).
 	 * Only the jiterpreter-thunk fast path above skips the LMF (validated). */
 	interp_push_lmf (&ext, frame);
+	/* Under wj_residual `frame` is the synthesized frame of the AOT CALLEE (interp_entry's residual branch,
+	 * wasm_jit_aot_call_lean), not an interpreter caller: no exec_method activation runs it. */
+	if (wj_residual)
+		interp_lmf_mark_phantom (&ext, frame);
 
 	if (mono_aot_mode == MONO_AOT_MODE_LLVMONLY_INTERP) {
 		/* Catch the exception thrown by the native code using a try-catch */
@@ -10899,6 +10982,14 @@ do_transform_method (InterpMethod *imethod, InterpFrame *frame, ThreadContext *c
 	gboolean push_lmf = frame->parent != NULL;
 	MonoException *ex = NULL;
 	ERROR_DECL (error);
+
+#if HOST_BROWSER
+	/* ...except on the browser, where an INTERP_EXIT also marks that a mono_interp_exec_method activation is on the
+	 * native stack, which the V8-assisted stack walk pairs with (exceptions-wasm-stackwalk.inc). Transforming a ROOT
+	 * frame can load types and so run managed resolve handlers that walk the stack. NULL interp data is an empty
+	 * segment: the frame iterator yields nothing for it, and the GC and hot-reload walks of the chain stop at NULL. */
+	push_lmf = TRUE;
+#endif
 
 	/* Use the parent frame as the current frame is not complete yet */
 	if (push_lmf)
@@ -12295,7 +12386,7 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
 		 * (already JITted or permanently bailed) and no re-emission/promotion work is pending -- every other \
 		 * maybe_compile site (IC misses, compile exits) still drains. */ \
 		if (!mono_wasm_jit_lean_try_invoke || wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) || wj_jit_work_pending ()) \
-			wasm_jit_maybe_compile (cmethod); \
+			wasm_jit_maybe_compile (cmethod, frame, ip); \
 		gint32 wj_eslot = cmethod->wasm_jit_slot; \
 		if (G_UNLIKELY (wj_eslot > 0)) { \
 			extern int mono_wasm_jit_admit_live (int desc_id); \
@@ -17844,7 +17935,8 @@ mono_jiterp_interp_entry (void *res)
 			 * wasm-JIT residual helper. Keep the prepared interp frame on the LMF chain while compilation
 			 * safepoints and while a compiled non-EH body runs. */
 			interp_push_lmf (&wj_entry_ext, &frame);
-			wasm_jit_maybe_compile (wj_rm);
+			interp_lmf_mark_phantom (&wj_entry_ext, &frame);
+			wasm_jit_maybe_compile (wj_rm, NULL, NULL);
 		}
 		if (G_UNLIKELY (wj_rm->wasm_jit_slot > 0) && !wj_rm->is_invoke) {
 			/* _live, not plain admit. This site is the worst place to accept admit()'s cycle-break "yes":

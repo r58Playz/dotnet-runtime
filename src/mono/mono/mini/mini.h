@@ -1454,6 +1454,7 @@ typedef struct {
 	guint8           wasm_no_gi2;            /* R411: the retry without them (a body over T2_MAX_BODY) */
 	guint8           wasm_jit_t1_down;       /* R451: mono_wasm_force_compile's ordinary-policy downgrade recompile */
 	gpointer         wasm_origin_inl;        /* MONO_WASM_JIT_ORIGIN: accepted inlinees' IL ranges (WjOriginInl list) */
+	gpointer         wasm_sw_inl;            /* R516: accepted inlinees, always (WjSwInlRec list, mempool): the stack walk's inline frames */
 	/* plan2x S2 (MONO_WASM_JIT_S2 & 2): the inlining size gate's verdict for one site, consumed by inline_method when
 	 * its (ip, callee) match, and the inline chain's frequency (calls per root entry; < 0 = unknown). */
 	const guint8    *wasm_s2_gate_ip;
