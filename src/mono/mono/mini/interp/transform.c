@@ -5752,7 +5752,11 @@ retry_emit:
 		}
 		td->in_start = td->ip;
 
-		if (in_offset == bb->end)
+		// The IL bblock cursor has to catch up rather than step: a retry pass jumps td->ip over the bblocks it
+		// already emitted, past bb->end, and a cursor left behind on a dead IL bblock makes every bblock emitted
+		// after it look dead too (SKIPPING DEAD OP), so a bblock reached only by a backward branch comes out
+		// empty and the branch to it loops forever.
+		while (in_offset >= bb->end)
 			bb = bb->next;
 
 		/* Checks that a jump target isn't in the middle of opcode offset */
