@@ -750,22 +750,9 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 		WjBody *b = re->body;
 		e_slots [i] = re->e;
 		f_slots [i] = re->f;
-		members [i].method = b->method;
-		members [i].name = b->name;   /* resolved by whoever compiled this member; see WjBody.name */
-		members [i].f_slot = re->f;
-		members [i].f_body = &b->f_body;
-		members [i].e_body = &b->e_body;
-		members [i].param_types = b->param_types;
-		members [i].nparams = b->nparams;
-		members [i].ret_type = b->ret_type;
-		members [i].extra_types = b->extra_types;
-		members [i].nextra = b->nextra;
-		members [i].groups = b->groups;
-		members [i].nlocal_groups = 4;
-		members [i].uses_calls = b->uses_calls;
-		members [i].uses_eh_tag = b->uses_eh_tag;
-		members [i].eh_tpool = b->eh_tpool;
-		members [i].body_imethod = b->body_imethod;
+		/* The shared filler, as the copies below use. The inline copy this replaces never set sw_inl / sw_ninl, so a
+		 * re-framed member's stack-walk record had no inlinee table (plan velvety-cocke A0). */
+		wj_member_from_body (&members [i], b, re->f);
 	}
 	for (i = 0; i < ncopy; ++i) {
 		WjRegEntry *cre = copy_ids [i] > 0 && copy_ids [i] <= wj_reg_n ? wj_reg_at (copy_ids [i] - 1) : NULL;
