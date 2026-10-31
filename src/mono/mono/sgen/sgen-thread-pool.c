@@ -174,10 +174,15 @@ thread_func (void *data)
 
 	sgen_client_thread_register_worker ();
 
+	/* A thread works every context whose num_threads exceeds its index (get_work / has_priority_work skip the others
+	 * with `continue`), so it must init every such context. This used to `break` at the first context it is not in:
+	 * with the old-gen context larger than the nursery one (DOTNET_PROCESSOR_COUNT above the CPU count), the extra
+	 * threads took old-gen work with a NULL per-thread free list and two of them corrupted the major heap
+	 * (MINECRAFT-FINDINGS R518 addendum 4). */
 	for (current_context = 0; current_context < contexts_num; current_context++) {
 		if (worker_index >= pool_contexts [current_context].num_threads ||
 				!pool_contexts [current_context].thread_init_func)
-			break;
+			continue;
 
 		thread_data = (pool_contexts [current_context].thread_datas) ? pool_contexts [current_context].thread_datas [worker_index] : NULL;
 		pool_contexts [current_context].thread_init_func (thread_data);
@@ -273,6 +278,13 @@ sgen_thread_pool_start (void)
 
 	if (!threads_num)
 		return;
+
+#ifdef HOST_BROWSER
+	/* Once per process: the worker layout the R518 bug depended on (old-gen context larger than the nursery one). */
+	printf ("[sgen-pool] threads=%d contexts=%d workers=%d/%d/%d\n", threads_num, contexts_num,
+		contexts_num > 0 ? pool_contexts [0].num_threads : 0, contexts_num > 1 ? pool_contexts [1].num_threads : 0,
+		contexts_num > 2 ? pool_contexts [2].num_threads : 0);
+#endif
 
 	mono_os_mutex_init (&lock);
 	mono_os_cond_init (&work_cond);
