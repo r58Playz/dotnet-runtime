@@ -252,6 +252,108 @@ mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *k
 			mono_threads_exit_gc_safe_region_internal (cookie, &sd);        \
 	} while (0)
 
+/* MONO_WASM_JIT_OUTLINE_CENSUS totals (plan velvety-cocke phase 0), filled by wj_oc_census in mini-wasm-emitter.inc and
+ * printed by mono_wasm_jit_dump_stats. Plain adds from every compiling worker, like the counters. First index: 0 tier 1,
+ * 1 tier 2. A region is "ok" when phase 1's rules would outline it; params and caps are not rules yet. */
+enum { WJ_OC_OK, WJ_OC_R_CLAUSE, WJ_OC_R_END, WJ_OC_R_TERMINAL, WJ_OC_R_EDGE, WJ_OC_R_EXITS, WJ_OC_R_LABEL, WJ_OC_NREASON };
+static const char *const wj_oc_reason_name [WJ_OC_NREASON] = { "ok", "clause", "end", "terminal", "edge", "exits", "label" };
+#define WJ_OC_NSZ 13   /* region bytes: <8, 8-15, 16-31, ..., 8K-16K, >=16K */
+#define WJ_OC_NPB 9    /* live-ins: 0, 1, 2, 3-4, 5-8, 9-16, 17-24, 25-32, >32 */
+#define WJ_OC_NRB 7    /* live-outs: 0, 1, 2, 3-4, 5-8, 9-16, >16 */
+#define WJ_OC_NT 5     /* projection thresholds: an ok region moves when bytes >= T and bytes > its stub */
+static const int wj_oc_thresh [WJ_OC_NT] = { 0, 32, 64, 128, 256 };
+static const char *const wj_oc_pb_name [WJ_OC_NPB] = { "0", "1", "2", "3-4", "5-8", "9-16", "17-24", "25-32", ">32" };
+static const char *const wj_oc_rb_name [WJ_OC_NRB] = { "0", "1", "2", "3-4", "5-8", "9-16", ">16" };
+static gint64 wj_oc_sz [2][2][WJ_OC_NSZ][3];          /* ok: [tier][has a call][size] {n, bytes, stub bytes} */
+static gint64 wj_oc_pb [2][WJ_OC_NSZ][WJ_OC_NPB][2];  /* ok, liveness run: [tier][size][live-ins] {n, bytes} */
+static gint64 wj_oc_rb [2][WJ_OC_NSZ][WJ_OC_NRB][2];  /* ok, liveness run: [tier][size][live-outs] {n, bytes} */
+static gint64 wj_oc_why [2][WJ_OC_NREASON][2];        /* every region: [tier][reason] {n, bytes} */
+static gint64 wj_oc_seed [2][8][2];                   /* ok: [tier][seed mask: 1 out_of_line, 2 doomed, 4 never ran] {n, bytes} */
+static gint64 wj_oc_prof [2][7][2];                   /* tier-2 blocks: [statically cold][no IL, no flag found, never ran at its
+                                                       * own start, never ran by containment, never ran by inference, ran at
+                                                       * its own start, ran by containment] {n, bytes} -- see wj_oc_regions */
+static gint64 wj_s2_bb_emitted;                       /* MONO_WASM_JIT_S2_BB flags emitted (wj_s2_bb_flag) */
+static gint64 wj_prof_hint [4];                       /* S2_BB=2: profile hints, tier-2 bodies, never-ran blocks, blocks */
+static gint64 wj_oc_proj [2][WJ_OC_NT][2];            /* [tier][T] {body bytes, projected main-function bytes} */
+static gint64 wj_oc_capfit [WJ_OC_NT];                /* tier-2 bodies over T2_MAX_BODY whose largest function would fit */
+enum { WJ_OC_M_METHODS, WJ_OC_M_WITH, WJ_OC_M_REGIONS, WJ_OC_M_COLD, WJ_OC_M_UNREACHED, WJ_OC_M_NOLIVE, WJ_OC_M_ENSURE,
+       WJ_OC_M_THROWBR, WJ_OC_M_IN_ARG, WJ_OC_M_IN_FRAME, WJ_OC_M_IN_VALUE, WJ_OC_M_CAPPED, WJ_OC_NMISC };
+static gint64 wj_oc_misc [2][WJ_OC_NMISC];
+
+static int
+wj_oc_szb (guint32 bytes)
+{
+	int b = 0;
+	if (bytes < 8)
+		return 0;
+	while ((bytes >> (b + 4)) && b < WJ_OC_NSZ - 2)
+		b++;
+	return b + 1;   /* 8-15 -> 1, 16-31 -> 2, ..., >=16K -> 12 */
+}
+
+static void
+wj_oc_dump (void)
+{
+	int t, c, z, k;
+	extern int mono_wasm_jit_outline_census;
+	if (!mono_wasm_jit_outline_census)
+		return;
+	for (t = 0; t < 2; ++t) {
+		gint64 *m = wj_oc_misc [t];
+		printf ("[wasm-jit outline-census] t%d methods=%lld with_regions=%lld regions=%lld cold_blocks=%lld unreached=%lld"
+			" nolive=%lld | ok: ensure=%lld throwbr=%lld live-ins arg=%lld frame=%lld value=%lld\n", t + 1,
+			(long long) m [WJ_OC_M_METHODS], (long long) m [WJ_OC_M_WITH], (long long) m [WJ_OC_M_REGIONS],
+			(long long) m [WJ_OC_M_COLD], (long long) m [WJ_OC_M_UNREACHED], (long long) m [WJ_OC_M_NOLIVE],
+			(long long) m [WJ_OC_M_ENSURE], (long long) m [WJ_OC_M_THROWBR], (long long) m [WJ_OC_M_IN_ARG],
+			(long long) m [WJ_OC_M_IN_FRAME], (long long) m [WJ_OC_M_IN_VALUE]);
+		printf ("[wasm-jit outline-census] t%d regions by verdict (n/bytes):", t + 1);
+		for (k = 0; k < WJ_OC_NREASON; ++k)
+			printf (" %s=%lld/%lld", wj_oc_reason_name [k], (long long) wj_oc_why [t][k][0], (long long) wj_oc_why [t][k][1]);
+		printf (" | ok by seed (1 out_of_line, 2 doomed, 4 never ran at tier 1):");
+		for (k = 1; k < 8; ++k)
+			if (wj_oc_seed [t][k][0])
+				printf (" %d=%lld/%lld", k, (long long) wj_oc_seed [t][k][0], (long long) wj_oc_seed [t][k][1]);
+		printf ("\n");
+		printf ("[wasm-jit outline-census] t%d projection (T: body bytes -> main-function bytes):", t + 1);
+		for (k = 0; k < WJ_OC_NT; ++k)
+			printf (" %d: %lld -> %lld", wj_oc_thresh [k], (long long) wj_oc_proj [t][k][0], (long long) wj_oc_proj [t][k][1]);
+		printf ("\n");
+		for (c = 0; c < 2; ++c)
+			for (z = 0; z < WJ_OC_NSZ; ++z)
+				if (wj_oc_sz [t][c][z][0])
+					printf ("[wasm-jit outline-census] t%d size %s %d+ n=%lld bytes=%lld stub=%lld\n", t + 1, c ? "call" : "nocall",
+						z ? 1 << (z + 2) : 0, (long long) wj_oc_sz [t][c][z][0], (long long) wj_oc_sz [t][c][z][1],
+						(long long) wj_oc_sz [t][c][z][2]);
+		for (z = 0; z < WJ_OC_NSZ; ++z)
+			for (k = 0; k < WJ_OC_NPB; ++k)
+				if (wj_oc_pb [t][z][k][0])
+					printf ("[wasm-jit outline-census] t%d ins %d+ in=%s n=%lld bytes=%lld\n", t + 1, z ? 1 << (z + 2) : 0,
+						wj_oc_pb_name [k], (long long) wj_oc_pb [t][z][k][0], (long long) wj_oc_pb [t][z][k][1]);
+		for (z = 0; z < WJ_OC_NSZ; ++z)
+			for (k = 0; k < WJ_OC_NRB; ++k)
+				if (wj_oc_rb [t][z][k][0])
+					printf ("[wasm-jit outline-census] t%d outs %d+ out=%s n=%lld bytes=%lld\n", t + 1, z ? 1 << (z + 2) : 0,
+						wj_oc_rb_name [k], (long long) wj_oc_rb [t][z][k][0], (long long) wj_oc_rb [t][z][k][1]);
+	}
+	{ extern int mono_wasm_jit_s2_bb;
+	  if (mono_wasm_jit_s2_bb)
+		for (c = 0; c < 2; ++c)
+			printf ("[wasm-jit outline-census] t2 blocks by tier-1 flag (n/bytes; %lld flags emitted), %s: no-il=%lld/%lld"
+				" no-flag=%lld/%lld never-ran=%lld/%lld never-ran-contained=%lld/%lld never-ran-inferred=%lld/%lld"
+				" ran=%lld/%lld ran-contained=%lld/%lld\n",
+				(long long) wj_s2_bb_emitted, c ? "statically cold" : "not statically cold",
+				(long long) wj_oc_prof [c][0][0], (long long) wj_oc_prof [c][0][1], (long long) wj_oc_prof [c][1][0],
+				(long long) wj_oc_prof [c][1][1], (long long) wj_oc_prof [c][2][0], (long long) wj_oc_prof [c][2][1],
+				(long long) wj_oc_prof [c][3][0], (long long) wj_oc_prof [c][3][1], (long long) wj_oc_prof [c][4][0],
+				(long long) wj_oc_prof [c][4][1], (long long) wj_oc_prof [c][5][0], (long long) wj_oc_prof [c][5][1],
+				(long long) wj_oc_prof [c][6][0], (long long) wj_oc_prof [c][6][1]); }
+	printf ("[wasm-jit outline-census] t2 over the cap: %lld; would fit (largest function + the module's other bytes) at T=",
+		(long long) wj_oc_misc [1][WJ_OC_M_CAPPED]);
+	for (k = 0; k < WJ_OC_NT; ++k)
+		printf ("%s%d: %lld", k ? " " : "", wj_oc_thresh [k], (long long) wj_oc_capfit [k]);
+	printf ("\n");
+}
+
 /* tiering.c's body-swap census. Declared here rather than including interp/tiering.h, which is an
  * interpreter-private header. */
 extern gint32 mono_interp_relink_replaced, mono_interp_relink_late;
@@ -963,6 +1065,12 @@ mono_wasm_jit_dump_stats (void)
 					WJC_(WJC_COLD_BYTES_HANDLER), WJC_(WJC_COLD_BYTES_THROW), WJC_(WJC_COLD_BYTES_OTHER),
 					WJC_(WJC_COLD_CALLS_HANDLER), WJC_(WJC_COLD_CALLS_THROW), WJC_(WJC_COLD_CALLS_OTHER),
 					WJC_(WJC_COLD_T2_BYTES_COLD), WJC_(WJC_COLD_T2_BYTES_ALL));
+				wj_oc_dump ();
+				{ extern int mono_wasm_jit_s2_bb;
+				  if (mono_wasm_jit_s2_bb)
+					printf ("[wasm-jit prof-hints] hinted=%lld tier2_bodies=%lld never_ran_blocks=%lld of %lld flags=%lld (s2_bb=%d)\n",
+						(long long) wj_prof_hint [0], (long long) wj_prof_hint [1], (long long) wj_prof_hint [2],
+						(long long) wj_prof_hint [3], (long long) wj_s2_bb_emitted, mono_wasm_jit_s2_bb); }
 				{ extern int mono_wasm_jit_t2_unit;
 				  if (mono_wasm_jit_t2_unit)
 					printf ("[wasm-jit t2u] roots=%lld sites=%lld callees=%lld | self=%lld wrapper=%lld notjit=%lld unstable=%lld eh=%lld big=%lld eligible=%lld (hot=%lld sites=%lld bytes=%lld) overflow=%lld (t2_unit=%d)\n",

@@ -28,6 +28,7 @@ wasm_buf_init (WasmBuf *b)
 	b->site_il = -1;
 	b->site_inl = 0;
 	b->sites = NULL;
+	b->llog = NULL;
 	b->op_start = 0;
 	b->key_src = -1;
 	b->key_pending = -1;
@@ -535,6 +536,16 @@ void
 wasm_op_local (WasmBuf *b, WasmOpcode op, guint32 local_idx)
 {
 	guint32 start;
+
+	if (b->llog) {
+		WasmLocalLog *lg = b->llog;
+		if (lg->n == lg->cap) {
+			lg->cap = lg->cap ? lg->cap * 2 : 1024;
+			lg->v = (guint32 *) g_realloc (lg->v, sizeof (guint32) * lg->cap);
+		}
+		lg->v [lg->n++] = local_idx << 2 |
+			(op == WASM_OP_LOCAL_GET ? WASM_LLOG_GET : op == WASM_OP_LOCAL_SET ? WASM_LLOG_SET : WASM_LLOG_TEE);
+	}
 
 	/* `local.set N` followed immediately by `local.get N` is `local.tee N`: set pops, get pushes the same
 	 * value back, tee does both. Identical semantics, 2 bytes instead of 4. The emitter produces this pair

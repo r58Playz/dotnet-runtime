@@ -996,6 +996,7 @@ mono_wasm_jit_auto_init (void)
 #endif
 	{ extern int mono_wasm_jit_s4c; const char *s4 = g_getenv ("MONO_WASM_JIT_S4C"); if (s4 && *s4) mono_wasm_jit_s4c = atoi (s4); }
 	{ extern int mono_wasm_jit_cfgc; const char *cc = g_getenv ("MONO_WASM_JIT_CFGC"); if (cc && *cc) mono_wasm_jit_cfgc = atoi (cc); }
+	{ extern int mono_wasm_jit_outline_census; const char *oc = g_getenv ("MONO_WASM_JIT_OUTLINE_CENSUS"); if (oc && *oc) mono_wasm_jit_outline_census = atoi (oc); }
 	{ extern int mono_wasm_jit_cfg_nest; const char *cn = g_getenv ("MONO_WASM_JIT_CFG_NEST"); if (cn && *cn) mono_wasm_jit_cfg_nest = atoi (cn); }
 	{ extern int mono_wasm_jit_stelem_obj; const char *so = g_getenv ("MONO_WASM_JIT_STELEM_OBJ"); if (so && *so) mono_wasm_jit_stelem_obj = atoi (so); }
 	{ extern int mono_wasm_jit_s4_sel_lo, mono_wasm_jit_s4_sel_hi; const char *ss = g_getenv ("MONO_WASM_JIT_S4_SEL");
@@ -1068,6 +1069,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_s2_hot_cost, "MONO_WASM_JIT_S2_HOT_COST", 1, 100000)
 	WJ_T2_KNOB (mono_wasm_jit_s2_budget, "MONO_WASM_JIT_S2_BUDGET", 0, 1000000)
 	WJ_T2_KNOB (mono_wasm_jit_s2_cold, "MONO_WASM_JIT_S2_COLD", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_s2_bb, "MONO_WASM_JIT_S2_BB", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_s3, "MONO_WASM_JIT_S3", 0, 15)
 	WJ_T2_KNOB (mono_wasm_jit_s4, "MONO_WASM_JIT_S4", 0, 3)
 	WJ_T2_KNOB (mono_wasm_jit_t2_strict, "MONO_WASM_JIT_T2_STRICT", 0, 1)
@@ -1246,6 +1248,12 @@ int mono_wasm_jit_s2_hot_limit = 200;   /* MONO_WASM_JIT_S2_HOT_LIMIT: IL-byte l
 int mono_wasm_jit_s2_hot_cost = 800;    /* MONO_WASM_JIT_S2_HOT_COST: inline_method's cost cap at a hot site */
 int mono_wasm_jit_s2_budget = 3000;     /* MONO_WASM_JIT_S2_BUDGET: IL bytes per root admitted above the static limit */
 int mono_wasm_jit_s2_cold = 1;          /* MONO_WASM_JIT_S2_COLD: 1 = never inline a site that never executed */
+/* MONO_WASM_JIT_S2_BB (plan velvety-cocke A phase 2): every tier-1 block sets a flag the first time it runs, in an S2 record
+ * keyed (NULL, the block's IL buffer, IL offset | WJ_S2_BB) -- one record per IL block, shared by every tier-1 body that
+ * holds it (wj_s2_bb_flag). 1 = the flags only (the outlining census then also seeds tier-2 regions with blocks whose flag
+ * is still 0); 2 = also, at tier 2, branch-hint a successor no tier-1 body ran (WJ_COND_HINT, `[wasm-jit prof-hints]`).
+ * Costs tier 1 a load and a branch per block executed. */
+int mono_wasm_jit_s2_bb = 0;
 /* MONO_WASM_JIT_S3 (plan2x S3, class-hierarchy analysis), a bit mask -- see mono_class_cha_word (class-setup-vtable.c)
  * for the record, which is kept whenever this is non-zero:
  *   1  guarded inlining: a virtual site with no profile prediction whose base no loaded class overrides inlines the
@@ -1364,6 +1372,12 @@ int mono_wasm_jit_s4c = 0;
  * WASM_JIT_CFGC <tier> <class E/S/I> <loops> <depth> <bbs> <method> -- whether its CFG is stackifiable in mono's own
  * block order (wj_cfg_stackify_class). Diagnostic only. */
 int mono_wasm_jit_cfgc = 0;
+/* MONO_WASM_JIT_OUTLINE_CENSUS (plan velvety-cocke, outlining phase 0): for every compile that finishes emission, the cold
+ * regions outlining could move into an aux function -- out_of_line and doomed blocks, grouped single-entry -- with their
+ * bytes, calls, GC points, exits, live-ins/outs and the stub each would need (wj_oc_census). 1 = the
+ * [wasm-jit outline-census] totals plus a WASM_JIT_OUTLINE_CENSUS m line per body of 32 KB or more; 2 = also an r line
+ * per region of 16 B or more in those bodies. Changes no bytes. */
+int mono_wasm_jit_outline_census = 0;
 /* MONO_WASM_JIT_CFG_NEST (plan A5): a method the br_table dispatcher would take is emitted with real nested wasm
  * loops/blocks -- 1: when its CFG is stackifiable in mono's block order (wj_nest_plan proves the schedule first;
  * R422); 2: also after wj_cfg_sort re-orders javac's rotated loops header-first (R424-R426: Minecraft tick -12.5%

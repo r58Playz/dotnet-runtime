@@ -484,12 +484,28 @@ in fresh isolated Chrome.
 | IKVM on mono 10 (x64 minijit) | 0.6110 | x1.54 — mono's compiler vs RyuJIT |
 | TeaVM wasm, linear memory (browser) | 0.415 | x1.23 |
 | TeaVM wasm-gc (browser) | 0.430 | x1.28 |
-| **ours (wasm JIT, browser)** | **1.1317** | **x1.85 over mono native — OUR BACKEND, the codegen target** |
-| mono's interpreter, for scale | 3.0485 | the tier is worth 2.69x over interpreting |
+| **ours (wasm JIT, browser), R440, 2026-10-04** | **0.544** | **x1.62** — steady state (protocol below), n=4; **1.28x TeaVM FULL** on the same protocol (0.423), 1.20x in cycles; under mono's own x64 minijit row |
+| ours, the shipped config, 2026-10-31 | 1.07-1.14 | x3.2-3.4 — **a 2x REGRESSION (R523)**, see below |
+| ours, 2026-09 (the old row) | 1.1317 | x1.85 over mono native — history |
+| mono's interpreter, for scale | 3.0485 | the tier was worth 2.69x over interpreting at 1.1317, 5.6x at R440 |
 
-We are **3.36x off HotSpot** and **2.40x TeaVM on the same V8**.
+**At R440 we were 1.62x HotSpot and 1.28x TeaVM FULL on the same V8** (1.20x in cycles, `j2d/r440/ss`). The rows above
+ours are 12-batch means (`BENCHMARKING.md`; JDK 25 still reads 0.336 that way on 2026-10-31); ours are steady state.
+**Since 2026-10-18 the shipped config measures 1.07-1.14 ms/step (R523):** IKVM's lazy class loading leaves types that
+jbox2d's hottest methods name unloaded -- `ContactListener`, which the bench never uses -- and IKVM's RelinkBody waits for
+them forever, so those methods stay on IKVM's generation-1 lazy-link bodies. `?wj.IKVM_LAZY_LOAD_STUCK=8` gives 0.61, but
+loads more than HotSpot would: HotSpot loads such a type only as a hot method's signature class, at the C2 request
+(`Method::load_signature_classes`, `compileBroker.cpp:1426-1431` in jdk-25.0.4.1). Minecraft does not resolve it: the
+same knob moved the server tick -1.6% in cycles and the client -4.9%, every pair overlapping (R523 addendum, Q60, n=3).
 
-**x1.85 is not a pass-configuration gap.** Diffed against mono's `DEFAULT_OPTIMIZATIONS` we ADD `SSA`,
+**Quote jbox2d from R440's protocol:** `j2d/run.mjs ours <dir> --no-perf --no-attr --schedule 600,200,60
+--window-batches 40,60` -- pinned to the P-cores (0-7), batches 41-60 of 60, because tier-2 compiles still land in a
+12-batch run's window (R416). `benchstats.mjs` reports the 12-batch mean and pins only with `MC_TASKSET` (on the E-cores the
+kernel reads ~1.9 ms/step): counters, not timing. **Before quoting any jbox2d or Minecraft timing, read its
+`[IKVM lazybody] stuck #N` lines** -- a hot method named there runs IKVM's generation-1 dispatch, and the number measures
+that, not the tier (R523).
+
+**The old x1.85 over mono's native minijit was not a pass-configuration gap.** Diffed against mono's `DEFAULT_OPTIMIZATIONS` we ADD `SSA`,
 `ABCREM`, `FLOAT32`; the only thing mono native has that we could have is `PEEPHOLE`, which V8 subsumes. So
 it is backend OUTPUT quality — shadow GC frame, dispatch machinery, the `s.p` chain, no
 cross-module inlining. **We ARE the middle end**: we emit wasm as the LLVM path does and V8 does register
@@ -513,7 +529,9 @@ calls" are not the same thing on a one-method-per-module tier.
 
 **Minecraft adds machinery worth x1.34** that a jbox2d kernel cannot exercise: the unresolved-member
 dispatch pool 13.91%, our dispatch/IC/interp-boundary helpers 6.56%, Java type-check machinery 3.82%, class
-loading/mixins 1.29%. The largest is IKVM's, not ours. 3.36 x 1.34 = **~4.5x explained work-rate gap**.
+loading/mixins 1.29%. The largest is IKVM's, not ours. 3.36 x 1.34 = **~4.5x explained work-rate gap** -- built on the
+2026-09 kernel gap. Since R440 the kernel is ~1.6x HotSpot while the server tick is still ~5x JDK 8 (R458): the kernel no
+longer explains the game's gap.
 (That first pool was originally labelled "MethodHandle/invokedynamic adapters" and **that label is wrong** —
 R225 §4: real `java.lang.invoke` is **0.168%**. It is IKVM's lazy-linking fallback for unloadable types, and
 Java has no `invokedynamic` for fields, which the `__field_NNNN` binders in the profile prove.)
@@ -1253,7 +1271,8 @@ Use `262p` (peaceful copy of 262b) for in-game windows. Details: `MINECRAFT-HARN
 | `bootcheck.mjs` | Boot-only PASS/FAIL for one configuration, ~2 min instead of ~9. Marker times from Play; `--keep-going` for timing runs, `--stall-s` (default 120 s of app silence = STALL), `--dump-on-stall` (mono thread dump + /proc snapshot), `--jprop`, memory at the title |
 | `boot/abboot.sh` | Interleaved (ABBA) bootcheck arms -> `boots.tsv` (first frame, title, heap at title). The boot A/B tool |
 | `arm.sh` | One arm of a boot-crash A/B: N sequential bootchecks under one knob set, reported as crashes/valid |
-| `bench.mjs`, `benchseeded.mjs`, `benchstats.mjs` | The jbox2d fixed-work kernel — low variance, checksum-gated, the right tool for a within-binary A/B and for cross-VM reference rows. `benchstats` captures the JIT's own stats lines |
+| `j2d/run.mjs` | **The jbox2d timing tool** (R416-R440): one run of `ours` / TeaVM / HotSpot arms, pinned to 0-7, `--schedule` + `--window-batches` for the steady-state protocol (see "How far off native"), `--no-perf` for timing alone, `--knob K=V`, `--dumps` |
+| `bench.mjs`, `benchseeded.mjs`, `benchstats.mjs` | The jbox2d fixed-work kernel — low variance, checksum-gated, the right tool for a within-binary A/B and for cross-VM reference rows. `benchstats` captures the JIT's own stats lines; its `mean` is the 12-batch mean and it pins only with `MC_TASKSET`, so it is not a timing tool. `benchstats` and `j2d/run.mjs` press the launcher's Play (`driveLauncher`); before 2026-10-31 neither did, and every jbox2d run since the R514 launcher produced nothing. `bench.mjs` and `benchseeded.mjs` still do not |
 | `perfrun.mjs` | Perf capture of one **jbox2d** bench run, producing the `.jitted` file the pattern/size readers take (the kernel-workload counterpart to `mcperf.mjs`) |
 | `seedbuild.mjs` | Rebuild `scratchpad/mcsr/seed` (see Housekeeping), or make another seed: `--dest mcsr/seed-X --tar /X.tar` from an OPFS export copied into the dev server's `frontend/public` (delete it after), then register it in `lib/seeds.mjs` |
 | `serve-coep.mjs` | Minimal static server with COOP/COEP headers |

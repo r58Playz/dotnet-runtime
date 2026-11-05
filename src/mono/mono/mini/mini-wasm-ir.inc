@@ -1707,6 +1707,64 @@ wj_s2_count_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins)
 	wj_count (WJC_S2_SITES);
 }
 
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_S2_BB: a tier-1 block's has-run flag (see the knob). Keyed by the IL alone, so a tier-2 block reads as never
+ * run only if NO tier-1 body holding its IL ever ran it -- the conservative direction for a cold claim. */
+#define WJ_S2_BB 0x20000000
+
+static void
+wj_s2_bb_flag (WasmBuf *b, MonoCompile *cfg, MonoBasicBlock *bb)
+{
+	gconstpointer code;
+	gint32 il;
+	WjS2Rec *r;
+	guint32 addr;
+	if (!wj_s2_site_of (cfg, bb->cil_code, &code, &il) || !(r = wj_s2_get (NULL, code, il | WJ_S2_BB)))
+		return;
+	addr = (guint32) (gsize) &r->count;
+	wasm_i32_const (b, 0);
+	wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, addr);
+	wasm_op (b, WASM_OP_I32_EQZ);
+	wasm_op (b, WASM_OP_IF); wasm_u8 (b, 0x40);
+	wasm_i32_const (b, 0);
+	wasm_i32_const (b, 1);
+	wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, addr);
+	wasm_op (b, WASM_OP_END);
+	wj_s2_bb_emitted++;
+}
+
+/* A block's tier-1 flag: 0 never ran, 1 ran -- read at the block's own IL start, or, for a block mono made mid-IL (an
+ * inlined call's continuation, a type check's arm) or one whose start no tier-1 body flagged, through the tier-1 IL block
+ * that CONTAINS it: the nearest flagged start at or before the IL of its first instruction, in the same IL buffer
+ * (*contained set). An IL block that never started ran nothing inside it, so "never" stays sound; "ran" may be wrong in
+ * the hot direction only. -2 no IL at all, -1 no flagged start within WJ_S2_BB_SCAN bytes before it. */
+#define WJ_S2_BB_SCAN 512
+static int
+wj_s2_bb_state (MonoCompile *cfg, MonoBasicBlock *bb, gboolean *contained)
+{
+	gconstpointer code;
+	gint32 il, k;
+	WjS2Rec *r;
+	MonoInst *ins;
+	*contained = FALSE;
+	if (wj_s2_site_of (cfg, bb->cil_code, &code, &il)) {
+		if ((r = wj_s2_find (NULL, code, il | WJ_S2_BB)))
+			return r->count != 0;
+	} else {
+		const guint8 *ip = NULL;
+		MONO_BB_FOR_EACH_INS (bb, ins)
+			if (ins->cil_code) { ip = ins->cil_code; break; }
+		if (!wj_s2_site_of (cfg, ip, &code, &il))
+			return -2;
+	}
+	*contained = TRUE;
+	for (k = il; k >= 0 && k > il - WJ_S2_BB_SCAN; --k)
+		if ((r = wj_s2_find (NULL, code, k | WJ_S2_BB)))
+			return r->count != 0;
+	return -1;
+}
+#endif
+
 /* The entry counter of a tier-1 body (NULL if the table is full), and the "has a tier-1 body" mark. */
 static gint32 *
 wj_s2_entry_word (MonoCompile *cfg)
