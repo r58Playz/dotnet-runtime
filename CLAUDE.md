@@ -16,7 +16,7 @@ file leaves out.
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
 | the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
 | IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm` |
-| the GL stack | `~/Documents/android-wasm/mesa-wink`, branch `wink` -- see **The GL stack** |
+| the GL stack (mesa-wink) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/native-deps/mesa-wink`, its own repo (branch `wink`, origin `MercuryWorkshop/mesa-wink`; ikvm-wasm-build ignores it) -- see **The GL stack** |
 | measurement harness | `wjharness/` (tracked; `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/` -- see **The harness** |
 | **the findings log -- read before proposing anything** | `scratchpad/notes/MINECRAFT-FINDINGS.md` (untracked) |
 | chromium / V8 source | `~/Documents/chromium/src` (v8 at `src/v8`) |
@@ -354,9 +354,9 @@ there runs IKVM's generation-1 dispatch, and the number measures that, not the t
 
 ## The GL stack: mesa-wink, GL on the main thread (R477)
 
-Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. `bash wink/build.sh --variant=mt --emsdk=$HOME/emsdk --test`
-builds it and runs its smoke suite; it reaches the app through ikvm-wasm-build's GLFW port (`tools/native-deps`:
-`build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`). GL runs on the browser's main thread
+Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. In the mesa-wink checkout, `bash wink/build.sh --variant=mt
+--emsdk=$HOME/emsdk --test` builds it and runs its smoke suite. It reaches the app through ikvm-wasm-build's GLFW port
+(`tools/native-deps`: `build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`). GL runs on the browser's main thread
 (`?wj.WINK_GL_MAIN`, default 1): the render thread only records (Mesa's glthread), and wink executes on main. At Q60
 with Minecraft's limiter lifted that is ~170-185 fps, and the render thread (63% JIT-tier Java) is the limiter (R479).
 
@@ -367,9 +367,11 @@ with Minecraft's limiter lifted that is ~170-185 fps, and the render thread (63%
   `window.WINK_GL_MAIN`, and deploy refuses without that test (the Makefile's copy is not what deploy runs).
 * **A GPU readback on main stalls the render thread too.** gex_wgpu keeps CPU shadows only for indirect command buffers
   and buffers up to 64 KiB (`GEX_WGPU_ADOPT_SHADOW`); the census's `GPU readbacks a frame on main` must read 0.
-* **Write-mapped persistent buffers are re-sent whole at every submit.** 26.2's Sodium maps 32 MB that way: 16 fps, 108
-  with `GEX_WGPU_PERSIST_EXPLICIT=1` (an uncommitted mesa-wink patch, R509). 26.2's per-frame `glClientWaitSync` is two
-  round trips through main, unfixed.
+* **A write-mapped persistent buffer is re-sent at every submit** unless it is FLUSH_EXPLICIT and non-coherent (GL leaves
+  its unflushed writes undefined, and `glFlushMappedBufferRange` already uploaded the rest); other mappings send a diff.
+  26.2's Sodium maps a 32 MB staging buffer that way, and sending it whole was 16 fps against 108 (R509; unconditional
+  since mesa-wink 51eb6bdb). Read `gex-wgpu: persistent mappings sent X MiB a submit`. 26.2's per-frame
+  `glClientWaitSync` is two round trips through main, unfixed.
 * The ~62 fps ceiling exists only in the headless harness (compare GL configurations with `MC_UNCAPPED=1`). Past it, the
   seed's `maxFps:120` holds (`?wj.IKVM_GAME_OPTIONS=maxFps:260` lifts it). Below the limiter, read cycles a frame, not fps.
 * Traps: an edit to the `emscripten-glfw` checkout needs `emscripten-glfw.patch` regenerated, or `build-glfw.sh`
