@@ -273,7 +273,21 @@ typedef struct {
 	guint32 op_start;
 	gint32 key_src;
 	gint32 key_pending;
+	/* Local-op log (WasmLocalLog), or NULL. Changes no bytes. */
+	struct _WasmLocalLog *llog;
 } WasmBuf;
+
+/* Every wasm_op_local call on a buffer whose `llog` is set, in call order, as idx << 2 | WASM_LLOG_*. Logged as CALLED:
+ * a get the tee peephole folds into the set before it still reads as set-then-get, which is what it means. The emitter
+ * attaches one to a function body for the outlining census (MONO_WASM_JIT_OUTLINE_CENSUS); the array is g_malloc'd and
+ * the attacher frees it. */
+typedef struct _WasmLocalLog {
+	guint32 *v;
+	guint32 n, cap;
+} WasmLocalLog;
+#define WASM_LLOG_GET 0u
+#define WASM_LLOG_SET 1u
+#define WASM_LLOG_TEE 2u
 
 /* A call site's KEY. V8 gives a call inside a `try` of the same frame no source position (TurboFan generates it
  * at the block's CheckException, which is not in InstructionSelector::IsSourcePositionUsed), so such a frame
