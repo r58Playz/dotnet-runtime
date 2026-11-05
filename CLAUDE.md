@@ -1,1307 +1,552 @@
 # Working in this fork
 
 This is a fork of `dotnet/runtime` carrying a **runtime wasm JIT for mono** (`src/mono/mono/mini/mini-wasm.c`,
-`wasm-encoder.c`). It compiles mono IR to a fresh WebAssembly module per method at runtime, in the browser.
-Its target workload is Minecraft 1.16.1 + Fabric + Sodium/Lithium running under IKVM, and the goal is frame
-rate.
+`wasm-encoder.c`). It compiles mono IR to a fresh WebAssembly module per method, at runtime, in the browser. The
+workload is Minecraft (1.16.1 + Fabric + Sodium/Lithium, and 26.2) under IKVM, and the goal is frame rate.
 
-Read this before editing the wasm JIT backend or before proposing a performance change. Most of what follows
-exists because a previous pass got it wrong at real cost.
+Read this before editing the backend or proposing a performance change. Most of it exists because a previous pass got
+it wrong at real cost. Round numbers (`R258`) point into the findings log, which holds the evidence and the history this
+file leaves out.
 
 ## Where things are
 
 | | |
 |---|---|
-| the backend | `src/mono/mono/mini/mini-wasm.c` + five `#include`d `.inc` files, `wasm-encoder.c` |
-| ... `-emitter.inc` | IR -> wasm lowering, the biggest piece |
-| ... `-ir.inc` | the relocatable body (`WjBody`), `wj_assemble`, the call forms |
-| ... `-batching.inc` | co-location: the planner, `rebatch`, `batch_bind`, rollback |
-| ... `-publish.inc` | asynchronous republication: the epoch log, the per-worker drain |
-| ... `-diagnostics.inc` | counters and dumps |
-| ... `mini-wasm.c` itself | knobs, the registry, admission, the GC shadow frame |
-| the assembler (`wj_assemble`) | resolves a body's relocations and frames N members into one module |
+| the backend | `src/mono/mono/mini/mini-wasm.c` (knobs, registry, admission, GC shadow frame) + its `#include`d `.inc` files: `-emitter` IR -> wasm, `-ir` the relocatable body (`WjBody`) and `wj_assemble`, `-batching` co-location, `-publish` asynchronous republication, `-lazy` lazy f-slot pools, `-vslow`, `-diagnostics`; and `wasm-encoder.c` |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
 | the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
-| **the GL stack: mesa-wink** | `~/Documents/android-wasm/mesa-wink`, branch `wink` (origin `mercuryworkshop/mesa-wink`): Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. `bash wink/build.sh --variant=mt --emsdk=$HOME/emsdk --test` builds it and runs its smoke suite in all three modes. Linked through ikvm-wasm-build's GLFW port (`tools/native-deps`: `build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`); gl4es, Krypton and MobileGL are gone. See **The GL stack** below |
-| IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm` — branch `wasm`, and it is CLEAN; the uncommitted IKVM-side work is in **ikvmcraft** (`loader/IkvmWasm.cs`, `loader/Transforms/Bench/`) |
-| measurement harness | `wjharness/` (tracked; run tools as `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/{state,runs,notes}` -- see **The harness** |
-| **the running log — read before proposing anything** | `scratchpad/notes/MINECRAFT-FINDINGS.md` (untracked) |
-| chromium/V8 source, for checking claims about V8 | `~/Documents/chromium/src` (v8 at `src/v8`) |
+| IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm` |
+| the GL stack | `~/Documents/android-wasm/mesa-wink`, branch `wink` -- see **The GL stack** |
+| measurement harness | `wjharness/` (tracked; `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/` -- see **The harness** |
+| **the findings log -- read before proposing anything** | `scratchpad/notes/MINECRAFT-FINDINGS.md` (untracked) |
+| chromium / V8 source | `~/Documents/chromium/src` (v8 at `src/v8`) |
 | split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
-| **the canonical emsdk** (3.1.56) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` — frozen from `~/fna-wasm/FNA-WASM-Build` (`emsdk*.patch`, applied by `freeze-emsdk.sh`). The app links `dotnet.native.wasm` against ITS cache (`IkvmWasm.csproj` `WasmCachePath`), so a libc/pthread/wasmfs question is answered there, not in this repo's `src/mono/browser/emsdk`. Patching a system-library source means rebuilding the archives that hold it (`embuilder build --force <lib>`, `EM_FROZEN_CACHE=0`) and redeploying. **embuilder CLEARS THE WHOLE CACHE first when `cache/sanity.txt` names a different toolchain path** (R502: 305 archives gone, publish then failed on `crtbegin.o`); rebuild with `freeze-emsdk.sh`'s embuilder list, which compiles the in-place patched sources |
+| the canonical emsdk (3.1.56) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` -- see **Building** |
 
-`MINECRAFT-FINDINGS.md` is a long numbered log. The alternative to reading the relevant part is re-running an
-experiment that already has an answer; several entries exist only because an earlier one was not read.
+The findings log is long. The alternative to reading the relevant part is re-running an experiment that already has an
+answer.
 
 ## Comment rules
 
-The backend is ~28% comments and that is fine — the reasoning is the valuable part. What is not fine is a
-comment that misleads.
+The backend is ~28% comments and that is fine. A comment that misleads is not.
 
-1. **A knob's default is stated once, at its initialiser, and nowhere else.** Comments saying "DEFAULT OFF"
-   on a line whose initialiser is `1` have shipped here, including on the hottest path in the emitter.
-2. **Never leave an argument for a value the code does not hold.** Do not leave prose arguing for 2 on a line
-   that says 1 because measurement went the other way.
-3. **A number without a workload is not a result.** Two workloads are in use: the jbox2d fixed-work kernel
-   (homogeneous, low variance, good for within-binary A/B and cross-VM reference rows) and full Minecraft
-   (three phases, ~12% floor, thermally throttled box). A percentage from one says nothing about the other.
-   Give date, n and spread where possible; if you do not know a number's provenance, say so rather than
-   inventing it.
-4. **When a result is retracted, fix the comment that carried it.** A retracted fps win sat in the source for
-   months after the A/B that killed it.
-5. **A failed experiment belongs in `MINECRAFT-FINDINGS.md`, not in the source.** Its result and the
-   reason the reasoning was wrong are what stop the next reader re-running it, so they must survive --
-   but in the log, cited from code by round (`/* ... see R258 */`). Keep in code only what a reader must
-   know to edit the line in front of them: the invariant, the default, and the trap that is not visible
-   locally. When you evict a narrative from a comment, paste it into the log in the same change (the log is
-   untracked, so nothing else carries it).
-6. **If you cite V8 behaviour, cite the file.** The source is checked out locally; "V8 probably..." is not a
-   reason to ship anything.
+1. **A knob's default is stated once, at its initialiser.** "DEFAULT OFF" on a line whose initialiser is `1` has shipped
+   here, on the hottest path in the emitter.
+2. **Never leave an argument for a value the code does not hold.**
+3. **A number without a workload is not a result.** jbox2d (homogeneous, low variance: within-binary A/B and cross-VM
+   rows) and Minecraft (three phases, ~12% floor) say nothing about each other. Give date, n and spread; if you do not
+   know a number's provenance, say so.
+4. **When a result is retracted, fix the comment that carried it.**
+5. **A failed experiment belongs in the findings log, not the source**, cited by round (`/* ... see R258 */`). Keep in
+   code the invariant, the default and the trap that is not visible locally. When you evict a narrative from a comment,
+   paste it into the log in the same change (the log is untracked, so nothing else carries it).
+6. **If you cite V8 behaviour, cite the file.** "V8 probably..." is not a reason to ship anything.
 
-## Verified V8 facts — do not re-derive, do not guess
+## Verified V8 facts
 
-Checked against `~/Documents/chromium/src/v8`. The facts below were verified on V8 15.4.77; the tree is now
-**15.5.35** (`include/v8-version.h`), so a cited line number may have drifted, and the INSTALLED browser is a third
-version (R233 add.4). If something surprising turns up, re-check against that tree rather than trusting this list.
+Checked against `~/Documents/chromium/src/v8` (15.4.77, re-checked in part on 15.5.35; the installed browser is a third
+version). Line numbers drift: if something surprising turns up, re-check the tree rather than this list.
 
-* **Every `WebAssembly.Module` is its own code space, and every worker re-validates it** (R345). `NewNativeModule`
-  reserves a fresh RWX region per module (`wasm/wasm-code-manager.cc:2617-2654`), at least 2 x
-  `OverheadPerCodeSpace` (a far jump table of ~153 builtins x 16 B) ≈ 8 KB after page rounding, all of it counted
-  in VmData. Large RWX VMAs do NOT show pooling: V8 places reservations back to back (a sequential
-  `next_code_space_hint_`, `:2335-2336`) and the kernel merges them into one VMA. And `SyncCompile`
-  decodes and validates every function body BEFORE the NativeModuleCache lookup (`wasm/wasm-engine.cc:615-640`,
-  lookup at `module-compiler.cc:2079`), so a cache hit saves compilation, not validation.
+* **V8 never inlines across modules.** Inlining candidates come from a module's own call sites, and an imported function
+  scores 0 (`wasm/inlining-tree.h`), so with one method per module **mono's inliner is the only cross-method inliner in
+  the pipeline**. V8 does speculatively inline `call_indirect` targets in the SAME instance (`CallIndirectIC`,
+  `builtins/wasm.tq`): co-locating a hot target makes its IC call inlinable too. Caps: `wasm_inlining_max_size` 500 wire
+  bytes, budget 5000 nodes (`flags/flag-definitions.h`).
+* **The three call forms** (read off emitted x86): `call <funcidx>` (module-local) is one `call rel32` and the only
+  inlinable form; `call <import>` is ~6 instructions ending in an indirect `call *` (`BuildImportedFunctionTargetAndImplicitArg`,
+  `wasm/turboshaft-graph-interface.cc`), so converting calls to imports buys almost nothing; `call_indirect` is ~15
+  (bounds, canonical-type check, index arithmetic, `call *`), and V8 does not fold a constant index into a direct call.
+* **`local.get` / `local.set` / `local.tee` emit nothing** (`LocalGet` is an SSA rename). Local count and copy chains are
+  wire size only; what costs is how many values are live across a call.
+* **An imported MUTABLE global costs 4 extra loads per access**, against one hoisted load for an immutable import or a
+  module-defined global (`compiler/turboshaft/wasm-lowering-reducer.h`). `s.p` (`__stack_pointer`) is the only one, and
+  every framed method reads and writes it.
+* **V8 eliminates no linear-memory load and has no wasm LICM** (every load is `.NotLoadEliminable()`; the passes are in
+  `compiler/turboshaft/wasm-optimize-phase.cc`). Load CSE and LICM happen in mono's middle end or nowhere (R378).
+* **Every `WebAssembly.Module` is its own code space** (~8 KB of VmData at least), **and every worker re-validates it**:
+  a NativeModuleCache hit saves compilation, not validation (`wasm/wasm-engine.cc` `SyncCompile`, R345).
+* **A function may declare at most 50,000 params plus locals** (`kV8MaxWasmFunctionLocals`); past it the module fails
+  with `local count too large`. The emitter refuses such a method first (`WASM_MAX_FUNCTION_LOCALS`, counter `locals_overflow`).
+* **Implicit null checks are WasmGC-only** (`null_checks_for_struct_op`).
+* **A call inside a `try` of its own frame has no source position in TurboFan code** (R516); the CallSite reports the
+  last positioned instruction before it. An EH method's whole body is a `try`, so the stack walk keys its call sites
+  (`WasmSites.kd`) instead of trusting positions.
+* Classifier trap: a case-insensitive "compile" matches the `-turbofan` suffix of every symbol. Strip
+  `-\d+-(turbofan|liftoff)$` first.
 
-* **`local.get` / `local.set` / `local.tee` emit zero instructions.** `LocalGet` is
-  `result->op = ssa_env_[imm.index]` (`wasm/turboshaft-graph-interface.cc:1030-1043`). Local count, reuse and
-  copy chains are a **wire-size** question only. What costs is how many values are live across a call.
-* **V8 can never inline anything this emitter produces.** Inlining candidates come from a module's own call
-  sites, and an imported function has `wire_byte_size_ == 0` so its score is 0 (`wasm/inlining-tree.h:79-85`).
-  One method per module ⇒ every cross-method call is a real call, permanently. **mono's own inliner is the
-  only inliner in the pipeline.** The one qualification (R351): V8 collects `call_indirect` feedback and
-  speculatively inlines SAME-INSTANCE targets (`CallIndirectIC`, `builtins/wasm.tq:821-835`;
-  `wasm_inlining_call_indirect` defaults true); cross-instance calls are marked and never inlined. Every f-slot
-  call crosses instances today, so this changes nothing yet -- but co-locating an IC's hot target in the same
-  module makes that IC call inlinable too, not just the calls converted to `call <funcidx>`. Relevant flags: `wasm_inlining_max_size` **500** wire bytes, budget 5000 TF
-  nodes (`flags/flag-definitions.h:2170-2192`).
-* **The three call forms, by cost** (verified by reading emitted x86, not inferred):
-  * `call <funcidx>` (module-local) — a real direct `call rel32`, and the **only** form V8 can inline through.
-  * `call <import>` — **not** a cheap direct call. V8 lowers it through
-    `BuildImportedFunctionTargetAndImplicitArg` into `BuildWasmCall(..., kWasmIndirectFunction)`, the same
-    path `call_indirect` takes (`wasm/turboshaft-graph-interface.cc:2715-2723`, `-inl.h:64-105`). ~6
-    instructions ending in an indirect `call *`. It saves only the table bounds check and canonical-type
-    check; **the indirect branch survives.** This is why converting 100% of predicted arms to imports moved
-    nothing measurable, and it is the argument for co-location over import conversion.
-  * `call_indirect` — table bounds check, canonical-type check, index→code-pointer arithmetic, validity
-    check, `call *`: **~15 x86 instructions where a module-local call is 1.** V8 does **not** fold a constant
-    `call_indirect` index into a direct call.
-* **An imported *mutable* global costs 4 extra loads per access** — two hoisted instance-field loads plus a
-  buffer-element load and an offset load (`compiler/turboshaft/wasm-lowering-reducer.h:1079-1110`) — against
-  one hoisted load and a constant-offset access for a module-defined one (`:1129-1145`). `s.p`
-  (`__stack_pointer`) is the only mutable import, and every framed method reads *and writes* it.
-* **A function may declare at most 50,000 PARAMS PLUS LOCALS.** `kV8MaxWasmFunctionLocals`
-  (`wasm/wasm-limits.h:50`); `num_locals_` is seeded from the signature's parameter count
-  (`wasm/function-body-decoder-impl.h:1880`), accumulated per local group (`:1938`), and a group that
-  crosses the cap is rejected with **`local count too large`** (`:1920-1921`). This is a `CompileError`
-  from `WebAssembly.Module()`, i.e. the module never instantiates. The emitter refuses such a method
-  before emitting (`WASM_MAX_FUNCTION_LOCALS`, counter `locals_overflow`); 1.16.1's
-  `BlockStateFlattening:.cctor` is the known member and emits 1.9 MB. Note this is the ONE place where
-  local COUNT is not purely a wire-size question -- see the local-ops fact above for everything else.
-* **V8's implicit null checks are WasmGC-only** (`null_checks_for_struct_op`, `wasm-lowering-reducer.h:405-425`).
-* **V8 eliminates no linear-memory load, and has no wasm LICM.** Every wasm memory load is built
-  `.NotLoadEliminable()` (`wasm/turboshaft-graph-interface.cc:8268-8284`); the wasm optimize phase is
-  LateEscapeAnalysis, MachineOptimization, MemoryOptimization, BranchElimination, LateLoadElimination,
-  ValueNumbering (`compiler/turboshaft/wasm-optimize-phase.cc:25-28`). So every load mono emits executes, and load
-  CSE / LICM can only happen in mono's middle end (R378). Checked on 15.5.35.
-* **Classifier warning:** a case-insensitive match for "compile" hits the `-turbofan` SUFFIX on every symbol
-  and reports ~88% of the window. Strip `-\d+-(turbofan|liftoff)$` before matching.
-* **A call inside a `try` of its own frame has NO source position in TurboFan code** (R516, 15.5.35). The instruction
-  selector generates it at the block's `CheckException` terminator (`compiler/backend/instruction-selector.cc:2983-2987`),
-  and `IsSourcePositionUsed` (`:1373-1421`) lists `DidntThrowOp` but not `CheckExceptionOp`. `WasmFrame::position`
-  (`execution/frames.cc:3669`) then answers `GetSourcePositionBefore` (`wasm/wasm-code-manager.cc:626-634`): the last
-  positioned instruction before the return pc, in practice a memory access a few bytes earlier. Liftoff does position
-  them. An EH method's whole body is a `try`, so a CallSite position in one is not its call opcode -- which is why the
-  stack walk's call sites carry KEYS (`wasm-encoder.h`, WasmSites.kd).
+## Verified mono, emscripten and IKVM facts
 
-## Verified mono-on-wasm facts
+* **A deterministic compile failure must never be `retriable`.** `retriable` parks the method with its hit count reset,
+  and it re-accrues the threshold in ~1.5 s: one 1.9 MB `.cctor` compiled 15 times over and took 22.4 s of boot, with
+  nothing logged (R289). `CompileError` is deterministic and permanent; `LinkError` is per-worker (imports are) and
+  stays retriable.
+* **`mono_thread_info_yield()` is a no-op** here, so `while (CAS) yield();` is an unbounded busy spin. The backend's CAS
+  loops are test-and-test-and-set, bounded and counted (`[wasm-jit spin]`). A shared spinlock is the first suspect for
+  "two threads at 92% on the same few bytes of code".
+* **Nothing that blocks properly is safe under a JIT lock**: `mono_thread_info_sleep(ms>0)` leaves a GC-safe region on
+  wake, which is a rendezvous-drain site (`mono-threads-coop.c`), so it can enter the drain under a lock the drain wants.
+* **An interpreted `calli` to a native pointer needs a build-time trampoline for its signature** (R497).
+  `CalliSignatureCollector` adds every unmanaged calli's cookie to the table WasmAppBuilder generates. A miss is
+  `g_error("CANNOT HANDLE INTERP ICALL SIG ...")`, which on a worker reads as `verdict=spin` with no fault (verdict class
+  `interp-native-sig`). Check calli shapes before taking an assembly off AOT.
+* **A partial AOT profile is worse than none unless it is closed over direct calls** (R498): an AOT'd call to an
+  out-of-profile method of the same image goes indirect and may enter the interpreter. No profile ships: the AOT
+  whitelist is CoreLib, IKVM.Runtime, IKVM.ByteCode and System.Memory (ikvmcraft `loader/IkvmWasm.csproj`).
+* **emscripten 3.1.56 can deadlock main on its own proxying lock** (R479). FNA-WASM-Build's `emsdk.7.patch` backports
+  the fix (upstream 21a3a81daf); a deploy carries it if the served wasm's `do_proxy` is 136 B, not 84.
+* **wasmfs's OPFS backend caches negative lookups** (R491, `emsdk.9.patch`). JS that creates OPFS entries directly must
+  call `opfsInvalidate()` (ikvmcraft `frontend/src/opfs.ts`), or the game will not see them.
+* **IKVM's relink drain must never finish a type or call a Java class loader** (R514). It runs on a ThreadPool thread; a
+  `loadClass` there can take a class's loading lock and then Mixin's `synchronized` transformer, which the mixin thread
+  holds while it needs the same class -- the 26.2 boot hang. `ByteCodeHelper.InRelinkDrain` makes Finish and loads
+  refuse (`[IKVM lazybody] ... drainRefused`). **Before adding work to the drain, check it cannot reach a loader or
+  another type's Finish** (R515's RelinkTarget did, and hung 4 of 4 boots). R527's signature loads (`IKVM_LAZY_SIGLOAD`)
+  run on the generation-1 Java thread, and never inside a `loadClass` or a class definition.
+* **Managed stack walks ask V8** (R516, `exceptions-wasm-stackwalk.inc`, `MONO_WASM_STACKWALK_V8`). mono's LMF chain
+  sees only interpreter segments and EH records, so JIT and AOT frames without clauses were invisible to StackFrame,
+  getCallerClass and exception traces. A walk merges V8's CallSites with the LMF chain. It is opt-in by consumer: keep
+  anything that only wants an assembly on the LMF walk (`Type.GetType` walks ~1 M times a boot; as V8 walks that was
+  47.6 s). A phantom INTERP_EXIT push must be marked (`interp_lmf_mark_phantom`). In `[wasm-jit stackwalk]` every
+  `fallback` and `verify fail` must read 0; `MONO_WASM_STACKWALK_VERIFY=1` checks each walk against the legacy one.
 
-* **A deterministic compile failure must never be marked `retriable`.** `retriable` routes to
-  `WASM_JIT_COMPILE_BLOCKED` -> **PARKED with `wasm_jit_hits` reset** (`interp.c`), re-attempted a
-  threshold later -- and a long-running method re-accrues that threshold on its own back-edges in
-  ~1.5 s. So a condition that cannot clear recompiles forever: `BlockStateFlattening:.cctor` ran 15
-  full compiles of a 1.9 MB body back to back and ate **22.4 s of boot** with `registered` flat and no
-  fault logged (R289). The split that holds: **`CompileError` is deterministic** (re-emission produces
-  the same bytes) and is now permanent; **`LinkError` is per-worker** (imports are per-worker) and stays
-  retriable. Measured over the whole archived corpus: 20,499 CompileError vs 131 LinkError.
-
-* **`mono_thread_info_yield()` IS A NO-OP.** `mono_threads_platform_yield()` is `{ return TRUE; }`
-  (`utils/mono-threads-wasm.c:169-172`). So any `while (CAS...) mono_thread_info_yield ();` in this tree
-  is an unbounded, unyielding busy spin, and "spin politely" is not a thing that happens here. Both CAS
-  loops in the backend were that shape and are now test-and-test-and-set, bounded and counted
-  (`[wasm-jit spin]`). **A shared spinlock is also the only thing that can put two DIFFERENT threads on
-  the SAME ~22 bytes of generated code**, which is what R275 measured on the world-load hang — so this is
-  the first thing to price against any "two threads at 92% CPU" reading.
-* **emscripten 3.1.56 can deadlock the MAIN thread on its own proxying lock (R479, fixed by backport).** `do_proxy` holds
-  the system queue's mutex across a malloc; a main-thread futex wait SPINS and yields into
-  `emscripten_proxy_execute_queue`, which re-locks that mutex. So a contended malloc at the moment main first proxies to a
-  thread (an async JSExport at boot) hangs the page with main at 100% and every worker asleep. Upstream fixed it in
-  21a3a81daf (#24565); FNA-WASM-Build's `emsdk.7.patch` backports it into the frozen emsdk, which needs `embuilder build
-  --force libc-mt libc-mt-debug` there. Proof a deploy carries it: the served wasm's `do_proxy` is 136 B, not 84. The
-  harness used to file this hang as a network `env` failure, from the last log line alone.
-* **An interpreted `calli` to a native function pointer needs a build-time trampoline for its signature (R497).** The
-  interpreter reaches natives through `mono_wasm_get_interp_to_native_trampoline(cookie)`, a table WasmAppBuilder
-  generates at APP build time, and it used to collect pinvoke and icall cookies only -- so IKVM.Java's 1,103 JNI stubs and
-  lwjgl's (all `calli`) were covered only while AOT'd or JIT'd. `CalliSignatureCollector` now adds every unmanaged
-  calli's cookie. A miss is `g_error("CANNOT HANDLE INTERP ICALL SIG ...")`, and **on a worker g_error does not end the
-  run**: `exit(1)` returns into `eg_unreachable`'s `for(;;)` and the 3 s force-exit timer cannot run on a spinning thread,
-  so it reads `verdict=spin`, `faults=[]` (verdict class `interp-native-sig` now names it). Before taking an assembly off
-  AOT, check its calli shapes are in the table.
-* **A partial AOT profile is worse than none unless it is closed over direct calls (R498).** In profile-only llvm-only
-  AOT, a call from an AOT'd method to a same-image method OUTSIDE the profile compiles to an indirect ftndesc call that
-  may enter the interpreter (`calls.c` `can_enter_interp`), and LLVM inlines small direct callees inside the image, so
-  they never show in V8's perf map. Cutting IKVM.Java's profile to "what ran" cost 1.2 s of boot and to the hot set
-  2.0 s; the same sets closed over direct callees (`call`/`newobj`/`ldftn`/non-virtual `callvirt`) cost nothing at 10.5%
-  of the profile. No profile ships today: since ikvmcraft 6d1a3ed (2026-10-18) the AOT whitelist is CoreLib,
-  IKVM.Runtime, IKVM.ByteCode and System.Memory (`loader/IkvmWasm.csproj` `AOTWhitelist`), and IKVM.Java is not AOT'd. If
-  a profile comes back, close it over direct calls (R499's list was never committed).
-* **Nothing that blocks properly is safe at those sites.** `mono_thread_info_sleep(ms>0)` does
-  `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
-  (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the
-  drain can want.
-* **IKVM's relink drain must never finish a type or call a Java class loader (R514).** It runs on a .NET ThreadPool
-  thread, and finishing or linking a class can enter Knot's `loadClass`, which takes that class's loading lock and then
-  Mixin's `synchronized` transformer. The thread applying mixins holds that monitor and can need the same class: R500's
-  boot hang (~1 boot in 12-16 on the user's build, 6 of 25 on R514's first builds; always right after `LazyDfuTransform`
-  is applied to `DataFixerBuilder$Result`), caught with `bootcheck --dump-on-stall`. `PrepareRelinkBatch` called
-  `DeclaringType.Finish()` and `ResolveMethod()`, which finishes every parameter and return type. Now
-  `ByteCodeHelper.InRelinkDrain` makes both refuse (throw before changing state; the relink is declined), counted as
-  `[IKVM lazybody] ... drainRefused finish= load=`: 12-14 loader calls refused per 26.2 boot, 0 hangs in 12 boots after.
-  **Before adding work to the drain, check it cannot reach a Java loader or another type's Finish** -- FinishRelinkBatch's
-  RelinkTarget (a default method's types) was such work, ran outside the guard, and hung 4 of 4 capped boots (R515).
-  `IKVM_LAZY_LOAD_STUCK` was the same shape (it loaded on the drain before `InRelinkDrain` was set) and is deleted (R527);
-  the signature loads that replaced it (`IKVM_LAZY_SIGLOAD`) run on the generation-1 Java thread, and never inside a
-  loadClass or a class definition.
-* **Managed stack walks ask V8 (R516, `exceptions-wasm-stackwalk.inc`, `MONO_WASM_STACKWALK_V8`).** mono's walker sees only
-  the LMF chain -- interpreter segments and the EH records of methods WITH clauses -- so every JIT and AOT frame without
-  clauses was invisible, and every consumer (CoreLib's StackFrame/StackTrace, IKVM's getCallerClass, StackWalker,
-  exception traces) counted frames that were not there; that was the "no caller frame" `setAccessible` failure and the
-  reason for ikvmcraft's two MixedAOT transforms, now deleted. A walk captures V8's CallSites once (EM_JS) and merges
-  them with the LMF chain: a JIT frame names its module record through a per-worker `WeakMap<Instance, payload>`, a
-  main-module frame maps to an AOT method by function index, each `mono_interp_exec_method` splices the next
-  interpreter segment. Before touching it:
-  - **It is opt-in by consumer** (StackFrame, current-thread StackTrace -- one `GetTrace(null)` --, exception pass 1, and
-    `walk_stack_full` only when `wasm_sw_consumer` is set). `Type.GetType` walks through `mono_method_get_last_managed`
-    ~1 M times a boot; as V8 walks that cost 47.6 s. Keep a consumer that only wants an assembly on the LMF walk.
-  - **A phantom INTERP_EXIT** (one pushed for a callee that is not interpreted) is marked through the ext's unused
-    `lmf.method` (`interp_lmf_mark_phantom`); a new such push must mark it or the merge mis-pairs a frame.
-  - **The seq-points hash no longer owns its values on the browser** (`init_jit_mem_manager`): a newer compilation of a
-    method (a tier-up copy, an IKVM body swap) used to free the older one's seq points while its jinfo still pointed at
-    them, and the walk reads exactly those for long-running frames (`seq-points-data.c:54` abort on 1.16.1).
-  - A frame running a body an IKVM relink superseded reports IL -1 (no line), by design.
-  Costs +3.6% to the first frame and +4.5% to the title of a 26.2 boot (~27.8 k walks, ~140 us each). In
-  `[wasm-jit stackwalk]` every `fallback` field and `verify fail` must read 0; `MONO_WASM_STACKWALK_VERIFY=1` checks each
-  walk against the legacy one, and ikvmcraft's `?wj.IKVM_STACKWALK_SELFTEST=1` checks caller, position, trace and line
-  cases (the walk off fails them).
-
-## Architecture invariants — check a design against these before building it
+## Architecture invariants -- check a design against these before building it
 
 ### Bytes are process-wide; instantiation and admission are per-worker
 
-There is no module broadcast. **The emitted BYTES are published once and are identical for every worker**;
-each worker then calls `new WebAssembly.Module(bytes)` and `new WebAssembly.Instance(module, imports)`
-**itself**, supplying **per-worker imports** (`mini-wasm.c`, the `EM_ASM` at the instantiate sites):
+There is no module broadcast. The emitted bytes are published once and are identical for every worker; each worker
+instantiates them itself, with per-worker imports (the `EM_ASM` at the instantiate sites):
 
 ```js
-{ m: { h: wasmMemory },      // shared linear memory
-  f: { f: wasmTable },       // this worker's function table
-  x: { e: wasmExports["__cpp_exception"] },
-  s: { p, l, c, v, n, d, m, b, i, g } }   // the per-thread globals, indices 0..9
+{ m: { h: wasmMemory }, f: { f: wasmTable }, x: { e: wasmExports["__cpp_exception"] }, s: { p, l, c, v, n, d, m, b, i, g } }
 ```
 
-Repeated `new WebAssembly.Module` on identical bytes is cheap because V8 keys its in-process
-`NativeModuleCache` on the wire bytes — that is a V8-internal cache, unrelated to Blink's on-disk
-`CachedMetadata` code cache.
+* **Emitted bytes must not depend on anything per-thread**; that would defeat V8's in-process cache keyed on wire
+  bytes. An f-slot NUMBER is process-wide and fine to bake.
+* **Per-thread data reaches a module through imported globals**: `global.get` of an immutable import resolves per
+  worker for one load. Indices 0..9 are a hard-coded contract with the emitter (`wasm-encoder.c`, before
+  `emit_import_section`); `s.p` is the only mutable one. Adding a global is not free.
+* **`s.g` is how a worker learns anything**: one i32 per worker in a process-wide slab. Non-zero sends the emitted
+  safepoint to its helper (the GC wants to suspend, or a publication is not adopted here yet). Writers only set; only
+  the owning worker clears. One word for both conditions keeps the check to one load per back-edge (R268).
+* Installation is per-worker, which is why admission gates entry rather than generated code testing anything.
 
-Three consequences, all load-bearing:
+### A JS worker outlives its pthreads (R293)
 
-* **Emitted bytes must not depend on anything per-thread.** Deriving a form from TLS makes a module
-  unshareable and defeats the cache. An f-slot NUMBER is process-wide, so baking it as a constant is fine.
-* **Per-thread data reaches a module through IMPORTED GLOBALS, and this works.** A `global.get` of an
-  immutable import resolves per worker while the bytes stay identical — the emitter already does this nine
-  times (`wasm-encoder.c`): `s.p` `__stack_pointer` (index 0, the only MUTABLE one), `s.l`/`s.c`
-  = `&wj_slot_live`/`_cap`, `s.v`/`s.n` = `&wj_vcall_pic`/`_cap`, `s.d`/`s.m` = `&wj_delegate_pic`/`_cap`,
-  `s.b` = this worker's scratch base, `s.i` = `&mono_wasm_jit_cur_island_il_state`, `s.g` = this worker's
-  SAFEPOINT ACTION WORD (see below). Cost is one load, not the four a mutable import costs. **Adding a
-  global is not free**: indices 0..9 are a hard-coded contract with the emitter. The import COUNT is now
-  derived from the name table rather than hand-maintained; when it was not, falling out of step produced
-  "section was shorter than expected size" and `registered` 0 from boot.
+Emscripten reuses workers: the next `pthread_create` can get the same worker (instance, function table, JS realm) with
+a new TLS block and stack. So the function table, `Module.__wjSlotFn` and every JIT instance are per WORKER, while
+`wj_slot_live`, the PICs, `wj_scratch` and the island state are per PTHREAD, and every instance imports the
+instantiating pthread's `__thread` addresses. `mono_jiterp_wasm_jit_worker_reuse` resets the worker as each pthread is
+set up on it (`[wasm-jit reuse]`; `foreign_scratch` must read 0). Do not fix it by discarding trampolines (R293b left
+threads on the slow C boundary). **Before storing anything per worker, ask what happens when the pthread that built it
+has exited.**
 
-  **`s.g` is how a worker learns anything at all.** It is one i32, per worker, in a process-wide slab (not
-  `__thread` -- other threads write it). Non-zero means the emitted safepoint must take its out-of-line
-  helper: the GC wants to suspend, or a code publication has not been adopted here yet. Either writer only
-  ever SETS; only the owning worker clears, by re-deriving both conditions. Folding the two into one word
-  is what keeps the emitted check at ONE LOAD -- testing them separately cost two extra loads, an `i32.ne`
-  and an `i32.or` on every loop back-edge in the tier (R268).
-* **INSTALLATION is per-worker, which is why admission gates entry** rather than the emitted code testing
-  anything.
+### Admission's contract: generated code carries no liveness check
 
-### A JS worker outlives its pthreads — "per-worker" and "per-thread" are NOT the same thing (R293)
+Generated code `call_indirect`s an f-slot with no check. Admission installs a method's whole direct-call closure before
+the method may go live. So:
 
-Emscripten reuses workers: when a pthread exits, `returnWorkerToPool` frees its block — struct, TLS **and
-stack** — and the next `pthread_create` can hand the SAME worker (same wasm instance, same function table,
-same JS realm) to a new pthread with a new TLS block. A run takes up ~60-80 pthreads on a 16-worker pool
-(`[wasm-jit bounds] worker_slots`). So the function table, `infoTable`, `Module.__wjSlotFn` and every JIT
-instance are **per worker**, while `wj_slot_live`, the PICs, `wj_scratch` and the island state are
-**per pthread** — and every JIT instance imports the INSTANTIATING pthread's `__thread` addresses.
+* Proving a dependency is the right method is not proving its slot is installed on this worker. What matters at runtime
+  is `mono_wasm_jit_slot_live(<the f-slot the caller baked>)`. If the callee re-registered, that slot never goes live.
+* **A refusal is retried at the next dispatch at full DFS cost, and the rate is not self-limiting**: R244 measured 14-23
+  million `admitDepNotLive` per run, 26% of the client thread, with `registered` flat. Before adding a refusal, decide
+  whether its condition can ever clear, and count it. `registered` staying flat is not evidence of health.
 
-The new pthread's own state starts empty, so anything it admits is re-instantiated correctly. What it can
-reach without admitting is whatever the worker kept: the jiterpreter's interp-entry trampolines (which bake
-`&wj_slot_live`) and guard-free adapters, and through them the old instances — running against FREED TLS.
-Measured with the reset off: **158,104 helper calls in one run were handed another pthread's scratch**
-(`foreign_scratch`), and R292's recurring OOB is the first `*s.i` store of exactly such code.
-`mono_jiterp_wasm_jit_worker_reuse` now runs as each pthread is set up on a worker
-(`MONO_WASM_JIT_REUSE_RESET`, `[wasm-jit reuse]`; `foreign_scratch` must read 0): the guarded trampoline
-reads the CURRENT pthread's bitmap through a per-worker cell it re-points, guard-free adapters are demoted to
-it, e/f slots go back to the placeholder. **Do not "fix" this by discarding trampolines** — the first version
-did, and a taken-up thread was then left on the C `interp_entry` boundary (~4 M instr/tick on the server
-thread in 2 of 3 runs, R293b), because the only adapter install that works is at flush time. `slow_live`
-counts exactly that cost.
+### `table[fslot] != null` is not a liveness test
 
-**Before storing anything per worker that code will consume, ask what happens when the pthread that
-built it has exited.** A `__thread` address baked into a module, a trampoline or a JS-side cache is a
-pointer into memory that will be freed while the thing holding it stays callable.
+Unallocated slots are prefilled with a real function, `mono_jiterp_placeholder_jit_call` `(i32,i32,i32,i32)->void`,
+body `*thrown = 999`. Called with another signature it traps (`function signature mismatch`); called with that one it
+silently writes 999 through its fourth argument. The authoritative test is the per-pthread bitmap
+`mono_wasm_jit_slot_live()`. **Before trusting anything found at an f-slot, ask whether THIS thread put it there.**
+The converse is load-bearing too: an f-slot only ever holds a JIT `f` from this emitter (AOT bodies are reached through
+their own table indices and functypes), which is what lets a caller bake an f-slot functype with no kind test.
 
-### Admission's contract, and why generated code carries no liveness check
+### Lazy tier-1 f-slots: a pool slot is callable before its callee exists (R361-R366)
 
-Generated code `call_indirect`s an f-slot with **no liveness check at all**. The entire job of the admission
-DFS is to install a method's complete direct-call closure *before* that method may go live. Therefore:
+A direct call to a callee that is not JITted and not AOT-backed reserves an e/f pair from a per-functype pool
+(`mini-wasm-lazy.inc`). On every worker that instantiated the slot's BANK, the f-slot holds a stub that binds the real
+callee (`mono_wasm_jit_late_fslot`) or runs it in the interpreter.
 
-* Proving a dependency is the right method with the right ABI is **not** the same as proving its slot is
-  installed on this worker. Both must be checked, and the one that matters at runtime is
-  `mono_wasm_jit_slot_live(<the f-slot the caller baked>)`.
-* Refusing admission is **recoverable and normal**: return 0, state 0, and the next dispatch retries — but
-  **only for a TRANSIENT condition, and the retry rate is not self-limiting.** "Refusals in the hundreds per
-  run cost nothing" was this file's claim and **R244 measured 14-23 MILLION per run**
-  (`admitDepNotLive`, 99.97% of all refusals), costing 26% of the client thread and 39% of the server tick,
-  with `registered` perfectly flat the whole time. A refusal discards the entire DFS walk and the next
-  dispatch redoes it, so **routing a PERMANENT condition into the retry path spins forever.** The specific
-  trap: `mono_wasm_jit_admit(dep)` has already installed the dep at its CURRENT f-slot by the time
-  `mono_wasm_jit_slot_live(ds->slot[i])` tests the slot the CALLER BAKED — if the callee re-registered, that
-  slot can never become live. **Before adding a refusal, decide whether its condition can ever clear, and
-  count it; `registered` staying flat is not evidence of health.**
+* **A pool slot's real f is written only by admission, after its dependency walk**: callers go live against the stub,
+  so the moment a real f lands, every caller on that worker calls it. The compiling worker validates without
+  installing, and a slot's bank is instantiated BEFORE any real f in it (a later bank would write the stub back).
+* Admission ensures a pool dep's bank and does not descend into it, except for a callee registered no-GC at that slot
+  (`wj_lazy_dep_needs_real`). A pool slot is not otherwise credited no-GC: bind can compile and run a cctor.
+* "Bank instantiated" is per pthread, and a bank bakes no TLS (the stub gets scratch from a helper, never `s.b`).
+* Must read 0: `[wasm-jit lazy]` orphan, bank_fail, repair, notreal, drift, dead. `residual` counts callees the pool
+  refused, which run through the interpreter.
 
-### The prefilled placeholder — `table[fslot] != null` is NOT a liveness test
+### mono's rare paths are our common ones
 
-`mono_jiterp_allocate_table_entry` hands out slots from a range the jiterpreter **prefills with a real,
-callable function**: `mono_jiterp_placeholder_jit_call`, signature `(i32,i32,i32,i32)->void`, body
-`*thrown = 999` (`interp.c`, filled in `jiterpreter-support.ts`). A slot this worker has not instantiated:
-
-* **traps** if you `call_indirect` it with any other signature — this is the `function signature mismatch`
-  class; and
-* **works** if the expected type happens to be that one common shape — writing 999 through the caller's
-  fourth argument as a pointer. Silent heap corruption, no LinkError, no trap, no diagnostic.
-
-The authoritative test is the per-thread bitmap `mono_wasm_jit_slot_live()`. The function table is
-per-WORKER for dynamic entries, so a process-wide bitmap cannot answer this; the bitmap is per-PTHREAD,
-which is stricter than the table and is only correct because a worker take-up resets the table to match
-(R293, above). `Module.__wjSlotFn` is the worker's record of what it installed, not a liveness test.
-**Before binding, calling or trusting anything found at an f-slot, ask whether THIS thread put it there.**
-
-**The converse invariant is also load-bearing:** an f-slot only ever holds a JIT `f` from a module this
-emitter produced. AOT bodies are reached through their own table indices and their own `at`/`at_ne`
-functypes, never through an f-slot. That is what lets a caller bake a functype for an f-slot call with no
-runtime kind test, and what makes an ABI change safe to apply to every f-slot functype at once.
-
-### mono's rare paths are our COMMON ones, so the JIT must not assert on metadata it is handed
-
-A type-load failure is exceptional on most workloads. **Under IKVM it is ordinary control flow — an
-unloadable type IS a failed load** — so upstream code that treats it as "cannot happen" fires here
-routinely. `compute_bb_regions` was the one consumer of `clause_is_dead` that did not guard
-(`mini.c:2386`, `:2535`, `:3960` and `mini-llvm.c:13480` all did), so
-`method_make_alwaysthrow_typeloadfailure` — which removes every basic block and marks every clause dead —
-left the clause table naming blocks that no longer existed, and the JIT aborted the process instead of
-compiling a throw stub.
-
-The general rule this makes explicit: **a bad body arrives as a COMPILE REQUEST, not at load time.**
-`mono_interp_replace_method_body` swaps a whole header into a live wrapper ~4,500x per run, so the JIT can
-be handed an inconsistent one at any moment, and `g_assert` there loses the entire run over one method the
-interpreter is executing correctly. Convert to a counted bail on the existing pattern
-(`mono_wasm_jit_note_bad_eh_clause`), and put the bounds check FIRST — the original line indexed the array
-before the assert could fire, so an out-of-range offset was already an OOB read and the abort was the good
-case.
-
-**But check reachability before converting anything.** Four asserts on that list turned out to be in
-`get_call_info`, which is `static` with zero callers on this target, and whose only failure value
-(`ArgInvalid`) is handled by no consumer — so converting them would have turned an unreachable abort into
-reachable silent bad codegen (R282).
+Under IKVM a type-load failure is ordinary control flow, and `mono_interp_replace_method_body` swaps whole headers into
+live wrappers thousands of times a run, so **a bad body arrives as a compile request.** A `g_assert` there loses the run
+over one method the interpreter runs correctly: convert it into a counted bail (`mono_wasm_jit_note_bad_eh_clause`),
+bounds check first. **Check reachability before converting**: four such asserts sat in `get_call_info`, which has no
+callers here, and converting them would have made an unreachable abort into reachable bad codegen (R282).
 
 ### Resolve and consume in the same breath
 
-Repeated bug shape, found in four separate subsystems: **something is looked up or validated on one thread,
-then USED later, after a window in which another thread may have changed it.** The symptom differs every
-time, which is why it kept being diagnosed as unrelated problems — name-section symbolisation faulting during
-assembly, a ranked shadow list going stale between passes, devirt targets resolved at emit time deadlocking
-on a cross-thread classloader call, an f-slot assumed callable because it was non-null.
+Found in four subsystems: something looked up or validated on one thread, then used after a window in which another
+thread changed it. Resolve and consume together, or re-resolve at use. An early pass (ranking, batching, sorting) may
+decide **order, never identity**: a stale size mis-ranks, a stale pointer frames the wrong function.
 
-**The rule:** resolve and consume in the same breath, or re-resolve at the point of use. If a design needs the
-two separated — ranking, batching, sorting all do — the early pass may decide **order or priority only**,
-never identity: a stale size mis-ranks, which costs nothing; a stale pointer frames the wrong function.
+* **No metadata operation is safe to add to a worker-side compile section.** `mono_method_get_full_name` can trigger
+  lazy type resolution, and `mono_interp_get_imethod` CREATES on a miss: use `mono_interp_peek_imethod` for a predicate
+  whose answer does not need one.
+* **A guard that catches a race must count its catches.** A counter stuck at 0 means the guard is dead code.
 
-Two corollaries:
+### An array indexed by a global id is sized per pthread (R489)
 
-* **A metadata operation is never safe to add to a worker-side compile section**, however innocuous it looks.
-  `mono_method_get_full_name` walks signatures and can trigger lazy type resolution.
-  **`mono_interp_get_imethod` is not a lookup** — on a miss it CREATES an InterpMethod (`m_method_alloc0` plus
-  `mono_method_signature_internal`) under the jit-mm lock, and its lookup asserts on an uninitialised
-  `interp_code_hash`. Use `mono_interp_peek_imethod` for a predicate. **But the rule is not "never call
-  get_imethod here":** it is *a predicate whose ANSWER does not depend on creating one must not create one*.
-  The lazy pool's reservation (`mono_wasm_jit_lazy_im`) genuinely needs the creation -- the reservation lives on
-  the InterpMethod -- as the island DFS did before it was deleted (R366), where peeking wedged boot.
-* **A guard that catches a race must COUNT its catches, and non-zero is then the healthy reading.** A catch
-  counter stuck at 0 forever means the guard is dead code, not that the race is impossible.
+Every WRITE through a descriptor or slot id ensures the array first; ensuring at the walk's entry is not enough.
+`wj_admit_install_only` wrote batch generations past the end of such an array, and that was the heap corruption behind
+the world-load hang, the changed module bytes and the sgen faults (`[wasm-jit bounds] desc_grow=` counts the growth).
+
+### The scratch belongs to one call until that call has copied it out (R500)
+
+A JIT->interpreter call spills its arguments into the pthread's scratch. Anything that runs managed code between the
+spill and the copy (preparing or transforming a cold callee runs IKVM code, whose residuals reuse the scratch) hands the
+callee another call's arguments. `wj_call_interp_inner` snapshots first; `WASM_JIT_ARGS_CLOBBERED` counts the catches
+(1-2 a world creation is normal).
 
 ### An EH method's LMF record lives in its own frame (R353)
 
-With `MONO_WASM_JIT_EH_REC=1` (the default) an EH-bearing method links a `WjEhRec` -- a MonoLMFExt plus its
-il_state -- from its OWN C-stack frame into the thread's LMF chain, where the island design used a per-thread
-chunk array. So **an exit that skips the unlink leaves the chain pointing into dead stack**, which the next
-frame overwrites; the island equivalent pointed into stable memory and only went stale. Every exit therefore
-unlinks: EMIT_REF_LEAVE and the landing pad's no-handler rethrow, inline when the record is the head, else through
-`mono_wasm_jit_ehrec_unlink`, which unlinks through a stale INNER LMF but leaves a head pass 1 rewound PAST the
-record (restoring that resurrects retired frames). The interp->JIT boundary pops records of frames below its saved
-C SP. **Before adding an exit path to an EH method, or a way out of one that is not a C++ unwind through its
-landing pad, decide how it unlinks the record.** `[wasm-jit ehrec] dispatch_norec` must read 0.
+An EH method links a `WjEhRec` from its own C-stack frame into the thread's LMF chain (`MONO_WASM_JIT_EH_REC`), so **an
+exit that skips the unlink leaves the chain pointing into dead stack.** Every exit unlinks (EMIT_REF_LEAVE, the landing
+pad's no-handler rethrow, `mono_wasm_jit_ehrec_unlink`), and the interp->JIT boundary pops records below its saved C SP.
+Before adding an exit to an EH method, decide how it unlinks. `[wasm-jit ehrec] dispatch_norec` must read 0.
 
-### Lazy tier-1 f-slots: a pool slot is callable before its callee exists (R361-R365)
+### Ownership: publish before you free, and prefer leaking
 
-A direct call to a callee that is not JITted and not AOT-backed does not fail the compile (the island machinery that
-used to force-compile such callees is deleted, R366): the emitter RESERVES the callee an e/f pair from a per-functype pool
-(`mini-wasm-lazy.inc`), and the f-slot holds, on every worker that instantiated its BANK, a stub of that functype
-(`wasm_module_lazy_bank`) that binds the real callee through `mono_wasm_jit_late_fslot` or runs it in the
-interpreter. This turns three of the invariants above around, so before touching admission, installation or no-GC
-credit:
+Registry entries, depsets and batch descriptors are read lock-free by other workers, and nothing recalls a published
+pointer. Old arrays stay allocated. Publish the contents, `mono_memory_barrier()`, then the pointer or count. A rollback
+stops new readers only; do not free what was published. Retired registry bytes are freed only once readers have left
+(`MONO_WASM_JIT_RETIRE_FREE`).
 
-* **A pool slot's real f is written only by admission, after its dependency walk.** Callers go live against the
-  STUB, so the moment a real f lands in the slot every caller on that worker calls it. The compiling worker therefore
-  validates without installing (the R322 path), `mono_wasm_jit_instantiate_local`/`_batch_local` instantiate the
-  slot's bank BEFORE any real f in it (a later bank instantiation would write the stub back, and admission's cache
-  would then hand the stub its own slot to tail-call forever), and bind checks the table holds what this worker
-  installed (`WJC_LAZY_REPAIR` counts a violation instead of hanging).
-* **Admission never descends into a pool dep**; it ensures the bank. The one exception is a callee registered no-GC
-  AT that slot, which is admitted for real so a caller may be credited for it (`wj_lazy_dep_needs_real`).
-* **A pool slot is not credited no-GC otherwise** -- bind can compile, instantiate and run a cctor. Because callers
-  now compile BEFORE their callees, that credit is mostly unavailable at tier 1 (pin elision 96% -> 85%, R362);
-  tier 2 re-emits after the callees exist and gets it back.
-* **"Bank instantiated" is per pthread** (a worker take-up re-applies every stub, R293), and a bank bakes no TLS:
-  the stub gets its scratch from a helper, never `s.b`.
+### There is ONE call profile
 
-A callee the pool refuses (AOT-backed, permanently un-JITtable, a wrapper other than synchronized/dynamic-method, a
-functype it cannot stub) takes the residual -- nothing brings it up by force any more, and a devirt arm whose target
-cannot be reserved is simply dropped. Must read 0: `[wasm-jit lazy]` orphan, bank_fail, repair, notreal, drift, dead.
-`bind` is the liveness check, `residual` counts the refusals routed through the interpreter. Against the island
-path: registered -39%, instantiations -43%, peak VmData -700 to -900 MiB (first config under the sandboxed 8 GiB in
-every soak run), boot not worse, server tick neutral over four batches (R361-R365).
+`InterpMethod.wasm_jit_profile` (`WjCallProfile`, interp.c) is the only record of what a method's virtual and delegate
+sites dispatch to. Only `wj_prof_record` writes it, fed by the interpreter's virtual and delegate dispatch and by the
+JIT's IC miss (~79% of observations). Devirt prediction, IC sizing and the batch planner read it. Not profiles, and not
+to be merged into it: `wj_vcall_pic` / `wj_delegate_pic` (per-thread dispatch state; only the miss path feeds the
+profile) and `wj_entry_edges` (interp->JIT transitions). A stable IC id is not a profile record's id: reusing the
+record's makes two sites calling the same base share a PIC slot.
 
-### Ownership: publish before you free, and prefer leaking to freeing
+### Retained raw `MonoMethod *` are not always dereferenceable
 
-Registry entries, depsets and batch descriptors are read **lock-free by other workers**. A pointer published
-into the registry may be held by a worker that is mid-walk, and nothing recalls it. So:
+The registry and the profile keep raw pointers while IKVM creates and frees dynamic types. It shows three ways: an OOB in
+`jit_mm_for_method`, an assert in `mono_class_get_flags`, a misaligned `a_cas` in `mono_mem_manager_lock`.
+`mono_interp_peek_imethod` does not protect: it dereferences first.
 
-* **Old arrays intentionally remain allocated.** Retention is bounded and cheap; a use-after-free here
-  presents as an intermittent `memory access out of bounds` far from the free.
-* Publish the contents, `mono_memory_barrier()`, *then* publish the pointer/count that makes them reachable.
-* On a rollback, restoring the pointer stops NEW readers only. Do not free what you published.
+* Answer a one-bit question by recording the bit where it becomes true, in a set keyed by the pointer (hashing never
+  dereferences): `mono_wasm_jit_callee_perm_unjittable`. In `[wasm-jit permset]`, `adds` is the liveness check and
+  `full` must be 0.
+* `mono_wasm_jit_method_usable` (`MONO_WASM_JIT_BADMETH`) catches the detectable subset only.
+* **Test every retained pointer you are about to dereference, not the one it was kept beside** (R479: an entry's
+  `logical_imethod` was freed while its method passed). The freed set keys InterpMethods too.
+* Still retained: `WjRegEntry.body_method` / `.logical_method`, `WjProfSite.id_targets[]`, `WjDepSet.method[]`,
+  `wj_sync_inner_canon`, `WjLazySlot.method` (tested with `mono_wasm_jit_method_known_dead`). The root fix, stop
+  retaining or purge on free, is not done.
 
-### There is ONE call profile — do not add a second
+## Where we stand against other JVMs
 
-`InterpMethod.wasm_jit_profile` -> `WjCallProfile` (interp.c) is the single record of what a method's virtual
-and delegate call sites dispatch to. It is written by exactly one function, `wj_prof_record`, from three
-observation points — the interpreter's virtual dispatch, its delegate dispatch, and the JITted code's IC MISS
-(`wj_vcall_pic_publish`) — and read by emit-time devirt prediction, IC sizing, and the batch planner. **~79%
-of its observations come from the JIT's IC miss**, i.e. from the half that used to be invisible to the
-emitter, so a reader that skips it is skipping most of the data.
+jbox2d fixed-work, one jar, every run checksum-gated, R440 protocol, Chromium 156, n=4 a row (2026-11-04, R526, R527):
 
-Two things nearby are NOT profiles and must not be merged into it:
-
-* **`wj_vcall_pic` / `wj_delegate_pic`** are per-thread DISPATCH STATE, per-thread because f-slot installation
-  is. Only the MISS path feeds the profile; keep the hit path a pure TLS load.
-* **`wj_entry_edges`** counts interp->JIT TRANSITIONS keyed (caller, callee) and caches method names at record
-  time so the main-thread JS dump never takes a lock. Folding it in would spend the profile's bounded site
-  slots (12 per block, up to `MONO_WASM_JIT_PROF_BLOCKS` chained blocks, R311) on a different question and
-  change which sites survive eviction — i.e. change codegen.
-
-And one trap already paid for: **a stable inline-cache id is not the same granularity as a profile record.**
-The record is keyed by callee base method; an IC belongs to one call site. Reusing the record's id makes two
-sites in one method that call the same base share a PIC slot.
-
-### Retained raw `MonoMethod *` are not always dereferenceable — PARTLY GUARDED
-
-The registry and the call profile keep raw `MonoMethod *` for the process lifetime while IKVM generates
-dynamic types continuously, so such a pointer is not always dereferenceable by the time the emitter or
-admission consults it. **It has three faces, not two**: `memory access out of bounds` inside
-`jit_mm_for_method` / `mono_interp_*_imethod`; an assertion in `mono_class_get_flags`
-(`class-accessors.c:90`, which arrives *inside* a mono assertion and so is easily misfiled as a managed
-cast failure); and a **misaligned `a_cas`** inside `mono_mem_manager_lock` — alignment is a hint for
-ordinary wasm loads but is ENFORCED for atomics, so a misaligned CAS means the mutex address was garbage.
-
-**`peek` does not protect against this, and two rounds treated it as though it did.**
-`mono_interp_peek_imethod` avoids CREATING an InterpMethod (a different hazard, an uninitialised
-`interp_code_hash`); its first statement is still `jit_mm_for_method (method)`, which dereferences the
-method and its class four times before any guard can run.
-
-What exists now, and what each thing is worth:
-
-* **`mono_wasm_jit_callee_perm_unjittable` no longer dereferences at all** (R282). It needed one bit, so
-  the bit is RECORDED where it becomes true — the five sites that write `wasm_jit_slot = -1` — into an
-  append-only pointer set and answered by lookup. **Hashing a pointer never dereferences it**, which is
-  the property a range check can never have. Read `[wasm-jit permset]`: `adds` is the liveness check (0
-  means the set is never populated and the rest of the line is meaningless), `full` must stay 0, `stale`
-  counts the one path that can falsify an entry.
-* **`mono_wasm_jit_method_usable`** (`MONO_WASM_JIT_BADMETH`, default 1) converts the DETECTABLE subset
-  into a counted refusal at four sites. It does **not** make retention safe — a freed-but-in-range
-  pointer still passes — and `WJC_BADMETH_SEEN` is its liveness check.
-* **Still open:** `WjRegEntry.body_method`/`.logical_method`, `WjProfSite.id_targets[]`, `WjDepSet.method[]`,
-  `wj_sync_inner_canon` and the lazy pool's `WjLazySlot.method` all still retain raw pointers (`wj_block_tab` and
-  `wj_waiter_key` went with the islands, R367). `canon_subst` measures `wj_sync_inner_canon` at ~300/run; bind and
-  the interpreter leg test `WjLazySlot.method` with `mono_wasm_jit_method_known_dead` first (`[wasm-jit lazy]
-  dead=` must read 0). The root fix is to stop retaining, or to purge on `mono_mem_manager_free`; neither is done.
-* **A retained PAIR goes stale one half at a time (R479).** The freed-method set forgets an address when a new method
-  is created there -- correct for the method, but a registry entry's `logical_imethod` still names the OLD
-  InterpMethod (a DynamicMethod's lives in its `mp`, destroyed with it), so testing the method alone passed and the B4
-  planner read through freed memory four times. The set now also keys InterpMethod pointers (marked in
-  `interp_free_method`, revived at InterpMethod creation). **Test every retained pointer you are about to
-  dereference, not the one it was retained beside.**
-* **An instrumentation gap to fix before quoting those counters:** `WJC_BADMETH_SEEN` is an AGGREGATE
-  over all sites, so `registry=0 profile=0` cannot distinguish "ran and caught nothing" from "never ran".
-  Those two counters had no caller at all for months and read exactly the same then. A per-site
-  denominator is needed before either zero is evidence.
-
-## How far off native we are, and what closes it
-
-Durable reference points — properties of HotSpot, CoreCLR and TeaVM, not of this emitter, so they do not go
-stale. jbox2d fixed-work, every row checksum-gated (`ikvm-bench/BENCHMARKING.md`); browser rows median of 3
-in fresh isolated Chrome.
-
-| row | ms/step | factor |
-|---|---|---|
-| openjdk (HotSpot) | 0.3364 | 1.00x |
-| IKVM on CoreCLR 10 | 0.3968 | x1.18 — IKVM's IL translation, off-limits |
-| IKVM on mono 10 (x64 minijit) | 0.6110 | x1.54 — mono's compiler vs RyuJIT |
-| TeaVM wasm, linear memory (browser) | 0.415 | x1.23 |
-| TeaVM wasm-gc (browser) | 0.430 | x1.28 |
-| **ours (wasm JIT, browser), R440, 2026-10-04** | **0.544** | **x1.62** — steady state (protocol below), n=4; **1.28x TeaVM FULL** on the same protocol (0.423), 1.20x in cycles; under mono's own x64 minijit row |
-| ours, the shipped config, 2026-11-04 (R527) | 0.60 | x1.79 — n=4; 0.495 (x1.47) with lazy class loading off, see below |
-| ours, 2026-09 (the old row) | 1.1317 | x1.85 over mono native — history |
-| mono's interpreter, for scale | 3.0485 | the tier was worth 2.69x over interpreting at 1.1317, 5.6x at R440 |
-
-**At R440 we were 1.62x HotSpot and 1.28x TeaVM FULL on the same V8** (1.20x in cycles, `j2d/r440/ss`). The rows above
-ours are 12-batch means (`BENCHMARKING.md`; JDK 25 still reads 0.336 that way on 2026-10-31); ours are steady state.
-**Lazy class loading (2026-10-18) cost jbox2d 2x, and R527 took most of it back.** It left types jbox2d's hottest methods
-name unloaded (`ContactListener`, passed only as null; `ChainShape`, on a path never taken), and RelinkBody waited for them
-forever, so those methods stayed on IKVM's generation-1 lazy-link bodies (1.07-1.14 ms/step, R523). IKVM now does what
-HotSpot does at the C2 request (`Method::load_signature_classes`): at `IKVM_LAZY_SIGLOAD` probes it loads a hot method's
-signature classes on its own thread, then relinks partially (`IKVM_LAZY_PARTIAL`) for what stays unloaded -- 0.60, and
-exactly JDK 25's 132 jbox2d classes defined. **The residual (+22% against 0.495 with lazy class loading off) is erased
-signatures**: a class not loaded when its user linked is `object modopt(__<Unloadable>)` in the baked CLR signature, so
-generation 2 casts after every use, and `TreeNodeStack.push` grows to 143 IL bytes against tier 2's 120-byte guarded-inline
-cap (R527 has the census and the two levers not taken). Minecraft: neutral (Q60 n=3, R527).
-
-**Quote jbox2d from R440's protocol:** `wj j2d/run ours <dir> --no-perf --no-attr --schedule 600,200,60
---window-batches 40,60` -- pinned to the P-cores (0-7), batches 41-60 of 60, because tier-2 compiles still land in a
-12-batch run's window (R416). `benchstats.mjs` reports the 12-batch mean and pins only with `MC_TASKSET` (on the E-cores the
-kernel reads ~1.9 ms/step): counters, not timing. **Before quoting any jbox2d or Minecraft timing, read its
-`[IKVM lazybody] stuck #N` lines** -- a hot method named there runs IKVM's generation-1 dispatch, and the number measures
-that, not the tier (R523).
-
-**The old x1.85 over mono's native minijit was not a pass-configuration gap.** Diffed against mono's `DEFAULT_OPTIMIZATIONS` we ADD `SSA`,
-`ABCREM`, `FLOAT32`; the only thing mono native has that we could have is `PEEPHOLE`, which V8 subsumes. So
-it is backend OUTPUT quality — shadow GC frame, dispatch machinery, the `s.p` chain, no
-cross-module inlining. **We ARE the middle end**: we emit wasm as the LLVM path does and V8 does register
-allocation, so mono's native-minijit row does not bound us.
-
-**The tier does not run at -O0, and the CONSUMER no longer sets this.** The default string is baked into the
-runtime at `mini.c:3258-3259` — `"inline,consprop,copyprop,deadce,branch,cfold,loop,alias-analysis,ssa,abcrem"`
-— parsed by `wasm_jit_extra_opt()` (`mini.c:3241-3306`) and applied at `mini.c:3514` as a REPLACEMENT of
-`cfg->opt`, not a filter. `index.ts`'s `wasm_jit` object is now nearly empty ("the runtime's defaults are the
-product's defaults"); grepping ikvmcraft for `consprop` finds nothing. Two things in that string are inert:
-**`loop` never runs LICM** — `mono_ssa_loop_invariant_code_motion`'s single call site (`mini.c:4095`) is gated
-on `COMPILE_LLVM`, forced FALSE for us — and `alias-analysis` is locals-only (`alias-analysis.c:3`), so it
-does nothing for the heap accesses where our load gap against TeaVM lives. The only real mono flag we could
-enable and do not is `AGGRESSIVE_INLINING`; `PEEPHOLE`/`SCHED`/`LEAF`/`SSAPRE` are unreachable or have zero
-implementation behind them.
-
-**`MONO_OPT_INLINE` does not reach the Java call graph.** `method-to-ir.c:8198` admits a candidate only if the
-site is non-virtual, the target is non-virtual, or the target is FINAL — and IKVM emits `callvirt` for every
-non-final Java method. Measured effect: bodies +4.4%, calls per method **+1.0%**. "More inlining" and "fewer
-calls" are not the same thing on a one-method-per-module tier.
-
-**Minecraft adds machinery worth x1.34** that a jbox2d kernel cannot exercise: the unresolved-member
-dispatch pool 13.91%, our dispatch/IC/interp-boundary helpers 6.56%, Java type-check machinery 3.82%, class
-loading/mixins 1.29%. The largest is IKVM's, not ours. 3.36 x 1.34 = **~4.5x explained work-rate gap** -- built on the
-2026-09 kernel gap. Since R440 the kernel is ~1.6x HotSpot while the server tick is still ~5x JDK 8 (R458): the kernel no
-longer explains the game's gap.
-(That first pool was originally labelled "MethodHandle/invokedynamic adapters" and **that label is wrong** —
-R225 §4: real `java.lang.invoke` is **0.168%**. It is IKVM's lazy-linking fallback for unloadable types, and
-Java has no `invokedynamic` for fields, which the `__field_NNNN` binders in the profile prove.)
-
-**The client-thread gap is ~30x in instructions and 18.6x in CPU — MEASURED, not a floor (R240).** The old
-`>=11.1x` was a lower bound only because native was GPU-bound with unknown CPU cost. With `maxFps` capped so
-the GPU is unsaturated, a matched native harness (`wjharness/native/`) gives:
-
-| | ours | native | ratio |
+| | ms/step | vs JDK 25 | M cycles / M instructions a step |
 |---|---|---|---|
-| client thread, M instr/frame | 165.2 | 5.40 | **~30x** |
-| client thread, CPU ms/frame | 36.6 | 1.97 | 18.6x |
-| **client thread, instruction RATE** | **4.51 G/s** | **2.86 G/s** | **0.63x** |
+| OpenJDK 25 (HotSpot) | 0.314 | 1.00x | 1.48 / 2.85 |
+| TeaVM FULL (AOT to wasm, linear memory) | 0.417 | 1.33x | 1.97 / 5.61 |
+| ours, lazy class loading off | 0.495 | 1.58x | |
+| **ours, shipped** | **0.60** | **1.91x** | 2.76 / 8.33 |
+| CheerpJ 5.0, JS engine, Java 8 | 1.162 | 3.70x | 5.44 / 16.08 |
+| CheerpJ 5.0, WasmGC engine, Java 8 | 1.188 | 3.78x | 5.50 / 21.87 |
+| CheerpJ 5.0, JS engine, Java 25 (like-for-like: IKVM's class library is Java 25's) | 1.250 | 3.98x | 5.96 / 17.15 |
 
-**We retire instructions FASTER than native and still need ~30x more of them.** IPC, caches, memory stalls
-and "wasm/V8 execute slowly" are excluded as explanations. **Stop quoting `>=11.1x`**; compare the CPU ratio,
-not the instruction ratio, against the 4.5x chain above, since that chain is built from time ratios.
+* **Our best was 0.544 at R440** (2026-10-04, when TeaVM read 0.423 on the same protocol: 1.28x). The shipped row's
+  counters were taken in the same relinked state through a knob R527 deleted. For scale, from 2026-09 (12-batch means):
+  IKVM on CoreCLR 0.397, IKVM on mono's x64 minijit 0.611, mono's interpreter 3.05.
+* **The gap to R440 is erased signatures** (R527): a class not loaded when its user linked is
+  `object modopt(__<Unloadable>)` in the baked CLR signature, so generation 2 casts after every use, and
+  `TreeNodeStack.push` grows to 143 IL bytes against tier 2's 120-byte guarded-inline cap (`MONO_WASM_JIT_T2_GI_SIZE`).
+  R527 has the census and the two levers not taken.
+* **CheerpJ** (R526): the JS engine maps Java objects to JS objects and runs its hottest method at 3.6x our cycles;
+  outside its generated code, megamorphic keyed-store ICs and a subtype test that walks class metadata cost it most. Its
+  WasmGC engine runs this jar only on Java 8 (an illegal cast at startup on 17+). Like ours it emits one module per
+  compiled unit, and it puts a `ref.cast` before every field access.
+* **WasmGC is not the faster target**: TeaVM's wasm-gc backend is slower than its linear-memory one on the same V8
+  (0.430 vs 0.415, R180).
 
-**MEASURE ON THE SERVER TICK, NOT THE CLIENT FRAME (R244).** Native's client frame is only **2.80 of its
-5.17 M/f** of actual Java — the rest is Mesa 0.99, OpenAL 0.48, libm/libc 0.38 — so every "x native" ratio
-computed against 5.17 understates the managed gap. Our client thread is likewise diluted by ~35 M instr/frame
-of GL stack, chromium and V8 that is out of scope. **Native's server tick is 90.9% real Java** (9.642 of
-10.61 M/tick, re-derived R269) and ours carries no GL, no chromium and no `Unsafe` traffic, so it
-decomposes cleanly. The rest of native's tick is JVM stubs (itable/vtable/i2c) 0.389, other 0.340,
-libjvm/native libs 0.239 -- **the 94% this said before counted the JVM's own stubs and native libs as
-Java**, which inflates the codegen term and deflates the machinery one.
-**The shipped-build figure has MOVED and the old one is stale.** 2026-09-12's `ship-baseline` read
-**172.0 M/tick = 16.2x** (1.91x machinery x 8.45x codegen, real Java 76.35 against native's 9.642; stated
-as 2.3x x 7.6x before R269 re-derived the denominator). The path to it, same instrument and workload:
-**32.8x** (with the R244 admission regression) -> **18.2x** (fixed) -> **16.5x** (`LAZY_SIG`) ->
-**16.2x** (`RELINK_JITTED`).
+**Quote jbox2d from R440's protocol:** `wj j2d/run ours <dir> --no-perf --no-attr --schedule 600,200,60 --window-batches
+40,60`. It pins to `WJ_PCPUS` and reads batches 41-60 of 60, because tier-2 compiles still land in a 12-batch window
+(R416). **Before quoting any jbox2d or Minecraft timing, read the `[IKVM lazybody] stuck #N` lines**: a hot method named
+there runs IKVM's generation-1 dispatch, and the number measures that, not the tier (R523).
 
-**Since then IKVM's IN-PLACE RELINK landed and is the largest measured win of the line:**
+### What the gap is made of
 
-| build | M instr/tick | note |
-|---|---|---|
-| relink OFF (`IKVM_LAZY_RECOMPILE=0`) | 188.4 | R277, 2 captures |
-| **relink ON (shipped)** | **165.4** | **-12.2%**, non-overlapping both rows, = 15.6x native |
-| + the four defect fixes | 161.8 | R279 plateau |
-| R280h | 155.2 / 155.5 | both `IKVM_LAZY_CTORS` arms |
-| control before the flip, 2026-09-23 | 149.1 / 158.1 | R299 D arms |
-| the R299 levers ON by default | 139.7 / 142.1 | R299 Z arms, **-8.3%**, same binary, 0 skipped ticks |
-| **current: + R311 method identity & profile delivery** | **115.9 / 115.0** | R311, **-8.9%** raw G vs its OFF arms (128.0 / 125.3), same binary, equal ticks |
+* **Minecraft's server tick is ~5x JDK 8 in both cycles and instructions** (R458: 68.7 M cycles and 52.7 M instructions
+  a tick against 13.0 and 10.4; ~47 M instructions on R527's build). Per instruction, our back end stalls like
+  HotSpot's. Our front end is 1.6-2.5x worse (icache, iTLB, BTB), and that tax follows CODE VOLUME, not placement: C1's
+  byte cut took 6-10% off it (R459), while packing the hot set into 28 modules took nothing (R463). The levers are fewer
+  executed instructions and smaller hot functions, not cheaper instructions.
+* **The kernel no longer explains the game**: jbox2d is ~2x HotSpot while the tick is ~5x. Minecraft adds machinery a
+  kernel does not exercise: IKVM's unresolved-member dispatch (the lazy-link fallback for unloadable types -- NOT
+  `java.lang.invoke`, which is small), our dispatch, IC and boundary helpers, Java type checks, `Unsafe` emulation (no
+  fast path) and monitors.
+* **The bottleneck is the call boundary.** Call infrastructure was 35.7% of the server thread executed (R290: the
+  prologue band with the `s.p` chain, dynamic and constant `call_indirect`, V8 frames), plus ~12% in our helpers.
+  Guards, spills and memory traffic are downstream of call density. Judge a change by whether it removes calls, shortens
+  prologues or shortens live ranges across calls (`wj callinfra`).
+* **Do not lead a plan with inlining or devirt.** On this workload HotSpot's whole inlining family is worth 2.24x and
+  its devirtualization 1.37x (R240), and a HotSpot with no inliner was still 13.6x cheaper than us. TeaVM with every
+  pass off still runs 1.71x HotSpot (passes are a third of its advantage), and its devirt and inlining are mutually
+  redundant (`call_indirect` count: 35 baseline, 791 with both off), so never measure one alone.
+* **Our per-method baseline is the codegen problem**: one method of 64 bytecode bytes is 256 B of x86 in a no-inline
+  HotSpot and was 7,936 B with 162 calls in ours (R240). The per-method gap spans 2x to 40x (R244); near-parity methods
+  exist, so the tail has findable causes.
+* **There is no wasm, V8 or memory-model barrier**: TeaVM is 1.33x HotSpot on this V8, in linear memory.
+* **We ARE the middle end.** V8 allocates the registers, and mono's register allocators are all excluded for
+  `COMPILE_WASM`. The tier's optimization string is baked into the runtime (`wasm_jit_extra_opt`, `mini.c`, replacing
+  `cfg->opt`); in it `loop` never runs LICM (that call is gated on `COMPILE_LLVM`) and `alias-analysis` is locals-only.
+  `MONO_OPT_INLINE` admits only non-virtual sites or final targets and IKVM emits `callvirt` for every non-final Java
+  method, so Java calls inline only through guarded inlining (`MONO_WASM_JIT_GUARDED_INLINE`, tier 2).
 
-The five levers (`GUARDED_INLINE`, `INLINE_LEAF=64`, `LAZY_COLD=1`, `VCALL_MEMO`, `FRAME_ZERO=0`) cut **our
-emitted code** (the real-Java bucket) 77.5 -> 64.6 M/tick, reproducing R292's figure for that bucket. The total's
-run-to-run spread comes from the JIT-helper and lazy-link buckets (+-3-5 M/tick), so quote the total as -6 to -8%.
-They were blocked for months by the recurring OOB, which was worker reuse (R293), not inlining.
+### Dispatch: what can become a direct call
 
-The mechanism is far more robust than the timing total: the **IKVM lazy-link dispatch pool HALVED**
-(52.38 -> 25.24 M/tick, -51.8%) and the server **completed 2,405 ticks against 2,050 in the same window
-(+17.3%)** — the unconfounded comparison when tick counts differ. Four defect fixes took installs from
-2,250 with 1,978 failures to **4,500 with 0** (R276/R278). `IKVM_LAZY_INPLACE=1` and
-`IKVM_LAZY_RECOMPILE` (default on) are shipped; `IKVM_LAZY_RECOMPILE=0` is the one-knob A/B that takes
-the whole feature off the path.
+* Only `wj_emit_method_call` emits `WASM_RELOC_CALL`, the one relocation the assembler turns into `call <funcidx>`, and
+  only for a callee that already has an f-slot. So the reachable set is the devirt predicted arms, and only
+  RE-EMISSION creates the holes co-location fills: never A/B the two separately. An IC site (`WASM_RELOC_INDIRECT`)
+  stays indirect until devirt covers it; delegates and inline-AOT calls are indirect by construction (~39% of dispatch
+  when last split), so even full devirt coverage caps direct dispatch near 61%.
+* **A guarded arm pays above ~15% capture**, above ~50% if its target does not co-locate (then the "direct" call is
+  itself a `call_indirect`): an arm hit is ~3 x86 + `call`, an IC hit ~21. Co-location is the precondition for an arm.
+* **The devirt census counts SITES, not executions.** Weight a bucket by execution before spending on it (`no_fslot` was
+  3.1% of sites and 0.0% of hot IC execution). 99.3% of profile observations arrive after the method was JITted, so
+  raising the JIT threshold cannot convert `no_rec`; re-emission can.
+* Most IC misses were inheritance, not polymorphism (R310). R311's method-identity check (`vt->klass->vtable[slot]`
+  against the cached method) took them from 119-128 M to 31-32 M a window, and the server tick 8.9% down.
 
-**Quote the number with its date and instrument.** These are cross-binary readings taken on a box whose
-same-arm spread on the lazy-link bucket is ~20%, so the ordering is solid and the individual figures are
-not to three digits.
-
-**Skipped ticks are the outcome metric to quote alongside it, and they moved further than the ratio did:
-519-527 per 120 s window -> 40.** M instr/tick divides by EXECUTED ticks, so it partly hides a server
-that is failing to keep up; the skip count does not. Where two arms complete the same tick count, compare
-raw G instructions instead -- that is the only fully unconfounded row.
-
-**Re-derive this split on the build you are about to change** -- and pick the server tid EXPLICITLY.
-`native/buckets.py` falls back to the `realize_glenv` marker when `--tid` is omitted, which selects the
-CLIENT thread; dividing client instructions by TICKS silently reports a plausible number for the wrong
-thread. `native/servertid.py` resolves it by which symbols the thread actually ran (both busy threads
-are named `DedicatedWorker`, so ranking by CPU does not identify them). Use
-`native/buckets.py --ticks` and `native/join.py --thread "Server thread"`. Two gotchas: the server tick is
-**not actually 20 Hz for us** (376 of 2,406 ticks skipped in a window; native skips zero), and `join.py` must
-select the ONE tid perf counted — three threads are named `Render thread`.
-
-**THE PER-METHOD GAP IS NOT UNIFORM — it spans 2x to 40x** (R244, server-tick join, 390 matched, 7.2x on
-matched mass): `TickEntryQueue.setTickAtIndex` **2x**, `selectTicks` 10x, `class_3215.method_12121` 26x,
-`class_2945.method_12783` 39x. Near-parity methods EXIST, so "the managed model costs 7x" is a mean over a
-wide distribution, not a tax, and the 30-40x tail has a findable cause. Bound every such row: HotSpot inlines,
-so `ABSENT` means "the cost is not there", not "it never ran", and rows past ~20 rest on single-digit samples.
-
-**Composition of our client thread** (R240, 2026-09-10 build): IKVM machinery **32.9%**, our JIT helpers +
-mono runtime + GL + corlib **30.8%**, real Java 26.8%, chromium/libc 9.4%. On methods present in BOTH profiles
-we are **13.5x — not the 15.7x R240 published**, which was inflated ~20% by the pooled-Render-thread bug
-(R244). Note this census is task-clock and its build already carried R244's admission regression.
-
-**Four pools nothing had named, client thread, 2026-09-07** (R244): `sun.misc.Unsafe` emulation **11.7 M/f**
-(no fast path at all — every `putInt` stackallocs, binary-searches the field table, then reflectively
-read-modify-writes the whole field, inside an exception filter); the GL stack **25.0 M/f vs native's 1.12,
-~22x**, of which 8.64 is the per-GL-call boundary inside the chromium binary (WebGL validation + GPU command
-buffer 41.6%, typed-array views over wasm memory 22.8%, V8<->Blink dispatch 13.5%); monitors **5.0 M/f**; real
-`java.lang.invoke` **3.8 M/f = 2.29%**, counting the whole adapter chain (`MethodHandleUtil/DynamicMethodBuilder`,
-`DMH.`/`BMH.`, `PairwiseConvert`) — R225's 0.168% counted only symbols literally named `java.lang.invoke.*`
-and is a strict subset, not a contradiction.
-
-**Deleting ALL machinery on both sides still leaves 11.1x** (165.2 -> 60.0 -> 5.40), so the per-method term
-dominates and grows as machinery is harvested. **Always re-derive these shares on the build you are about to
-change**: the same buckets read 46.5% / 30.1% / 14.3% on the 2026-09-06 `base-client` census, and using those
-stale numbers oversized one lever by 2.8x. Three symbols went to ZERO between those builds (`call_interp`
-4.27 -> 0.00 M/f, `interp_entry` 2.06 -> 0.06, `set_il_offset` 1.69 -> 0.00) and `wj_prof_site` fell 18x.
-
-**HotSpot's own optimizations, measured on this workload (R240), cap whole categories:**
-
-| arm | client M instr/frame | vs stock |
-|---|---|---|
-| stock | 5.40 | 1.00x |
-| `novirt` (`-XX:TypeProfileWidth=0 -XX:-UseTypeProfile`) | 7.39 | **1.37x** |
-| `noinl` (`-XX:-Inline`) | 12.12 | **2.24x** |
-
-**A HotSpot with NO inliner is still 13.6x cheaper than us.** So the whole inlining family is worth at most
-2.24x and devirtualization 1.37x — real, but an order of magnitude short of the gap. R221 §2's 1.205x/1.132x
-were fps through a GPU ceiling and are superseded. **Do not lead a plan with inlining or devirt.**
-
-**Our per-method baseline, not our inlining, is the codegen problem.** Paired x86 (hsdis, R240):
-`class_2818::method_8320` is 64 B of bytecode -> HotSpot C2 928 B, HotSpot **no-inline 256 B**, ours
-**7,936 B with 162 calls, 47 indirect**. Inlining makes HotSpot's code BIGGER (256 -> 928) and faster, so the
-8.5x-vs-stock figure understates it: against a no-inline HotSpot we are **31x**.
-
-**TeaVM's OPTIMIZER is only 33% of its advantage.** Every pass off, TeaVM still runs 1.71x of HotSpot.
-Single-pass, checksum-gated: devirt +19.3%, inlining +13.0%, ScalarReplacement+RepeatedFieldRead +8.3%,
-all-off +33.1%. So call lowering dominates among passes (~25% net) but passes are the minority term. The rest
-is architecture: one closed-world module compiled ahead of time, no runtime tiering, no GC shadow frame, no
-interpreter boundary, no IC dispatch, and 4.2 declared locals per function against our 28.1. **Do NOT cite
-that last pair as codegen quality (R244):** ~22 of our 28 are a FIXED scaffolding block
-(`mini-wasm.c:8290-8378` — dispatch/IC/delegate/EH/addr slots) declared in every function including a
-one-line setter, whose measured floor is 23 locals. The vreg-derived count is ~6, i.e. ~1.4x TeaVM, and
-locals are a WIRE-SIZE question only. There is also no register allocator in this path at all —
-`mono_local_regalloc`/`mono_linear_scan`/`mono_arch_allocate_vars` are all excluded for `COMPILE_WASM`, so
-V8 allocates and the 39.7% `mov` share answers to call density and to the per-def GC shadow-frame mirror
-(`mini-wasm.c:4716-4756`: 4 wasm ops + a store on every def of every reference), not to our local assignment.
-**Devirt and inlining are MUTUALLY REDUNDANT** — TeaVM's emitted `call_indirect` count is 35 baseline, 33 with
-inlining off, 176 with devirt off, **791 with both off** — so never measure one alone and call it "the value
-of devirtualization". Three passes mono lacks entirely: `Devirtualization` (no CHA), `ScalarReplacement`/
-escape analysis, and `GlobalValueNumbering` (we have only local `lcse`).
-
-**There is no wasm, V8 or memory-model barrier.** TeaVM reaches 1.23x with linear memory on this same V8, and
-being in a browser costs a good wasm compiler ~1.02x. Both of those explanations are closed.
-
-## Where the time actually goes (in-game plateau, ~25 fps / 40 ms)
-
-**The server tick's cycle gap IS its instruction gap (R458, stall census on both JVMs, four GP events per group, no
-multiplexing).** 68.7 M cycles / 52.7 M instructions per tick against JDK 8's 13.0 / 10.4: 5.30x and 5.04x, IPC 0.767 vs
-0.806. **Per instruction our BACK END stalls like HotSpot's** (execution stalls 0.855 vs 0.882, L3-pending 0.508 vs
-0.653 -- HotSpot's tick is memory-bound too); **our FRONT END is 1.6-2.5x worse per instruction** (icache data/tag stalls,
-iTLB walks, and BACLEARS 21x per tick -- BTB misses; machine clears and SMC are ~0). The front-end tax follows CODE
-VOLUME, not placement: C1's byte cut took 6-10% off it (R459), packing the whole hot set into 28 modules took nothing
-(R463). And the same body loads cost 2.5x HotSpot's cycles each (R461: 30.5 k L3 misses per tick in field loads alone,
-more than HotSpot's whole tick), with allocation only <= 1.8x HotSpot's bytes (R465). So ~3x needs ~40% fewer executed
-instructions, or the front-end tax and the load latency attacked directly -- not cheaper instructions.
-
-* **57.03%** of the window is code this emitter generates; 30.83% "AOT image"; ~1.8% V8; 12.14% outside
-  JIT-emitted code (chromium, GL emulation, kernel). Measured, `perf-imp`, 126,498 ingame samples.
-* **The "AOT image" bucket is NOT one thing and is not immovable.** Split over its 1,710 symbols: AOT-compiled
-  MANAGED code **12.63%** of window (the same managed program, AOT'd because the emitter bails or AOT measured
-  better — addressable in principle, led by IKVM type-check helpers), **our own JIT tier's runtime helpers
-  8.01%**, mono runtime C (GC, metadata, interp) 3.70%, libc/emscripten/GL 6.49%.
-* **~7% of the window is the JIT tier's OWN helpers:** `vcall_resolve_fslot` **3.41%** (the IC MISS path, 2nd
-  hottest symbol in the window), `admit`+`admit_live` 0.98% (on the dispatch path), `wj_prof_site`+
-  `wj_prof_record` 1.10%, `get_virtual_method_fast` 0.82%, `set_il_offset` 0.44%, `call_interp` 0.31%. A devirt
-  predicted arm never reaches `vcall_resolve_fslot`, so devirt coverage attacks this pool and the dispatch
-  pool at once.
-* Only **two threads** do work (server tick 99.6% of a core, client render 87.5%) out of twelve. The server
-  tick is a SEPARATE THREAD, so tick work never lands inside a client frame.
-* Inside our generated code, by *executed* instruction: **14.85% real computation**, **32.21% register
-  pressure**, 24.47% guards/branches, 27.98% heap. **The register-pressure bucket is three things and only one
-  is ours**: push/pop frame **10.97%** (V8's own wasm frame — removed only by fewer calls), reg-reg mov 9.77%
-  (the allocator's), spill store 6.85% + reload 4.63%. Spills are long-lived values, not scratch:
-  **reload:store = 4.22**, and write-once-early slots are 17.4% of slots but 30.1% of reload traffic. Do NOT
-  treat "register pressure" as a standalone target; it is a symptom of call density and forced live ranges.
-* **~20%** of time is in the first 24 bytes of a function (prologue; AOT code is 12%), and **10-21%** is inside
-  a `call_indirect` dispatch preamble. 71% of calls emitted in hot bodies are indirect.
-* **AOT is not known to be better codegen than ours.** A `--kind aot` vs `--kind ours` comparison is
-  CONFOUNDED — they are different WORKLOADS (AOT runs `instanceof` helpers and classpath; ours runs meshing and
-  game logic). Same instrument, same window: real compute is 13.78% of our tier vs 12.52% of AOT's; we are
-  worse only on register pressure (30.98% vs 24.48%) and better on guards (26.69% vs 34.50%). The ~87%
-  overhead is the managed execution model on wasm, not this emitter. Do not re-assert "AOT is better" without
-  measuring the same methods both ways.
-
-**The ceiling on call-form work: converting EVERY call to direct is worth ~13% of frame time** (dispatch is
-22.2% of our tier and our tier is ~60% of the window). The PROLOGUE is a separate ~12%-of-frame pool that only
-INLINING unlocks. **The bottleneck is the call boundary**; guards, spills and memory traffic are downstream of
-it. Judge a proposed change by whether it removes calls, shortens prologues, or shortens live ranges across
-calls.
-
-**The call infrastructure, EXECUTED, on the server thread (R290, PEBS, 2026-09-22, 152.1 M instr/tick): 35.7%
-of the thread** -- our prologue band 10.6% (the `s.p` read chain, write-back, frame zeroing, first pin),
-dynamic-index `call_indirect` 9.4%, constant-index `call_indirect` 5.9%, V8 frame pro/epilogue 5.2%, near-call
-spills ~2.4%, import calls 1.9% -- plus 12.2% in the JIT tier's own helpers. `wj callinfra` is the
-instrument (`--band-split` splits the prologue, `--edges` dumps callee/caller/form). Split of the prologue band
-on the all-levers build (R294): **the `s.p` imported-mutable-global chain alone is 8.3 M/tick = 6.1%**, frame
-zeroing 2.95 (plus `memory.fill` for frames over 64 B, outside the band). **Two corrections this made:** R269
-sized co-location's pool ~3x too small, and R240 add.5's "prologue: nothing to take" was a static count.
-
-### The executed dispatch split, and the hard ceiling on direct calls
-
-Measured with `profile_fast=1` (costs ~7%; ratios valid, timings void), 90 s in-game window:
-
-| route | executed | of ALL dispatch | can it be DIRECT? |
-|---|---|---|---|
-| devirt predicted arm | 1,030,605,081 | **39.2%** | **YES** — `WASM_RELOC_CALL` |
-| IC (inline hit 25.1% + AOT-IC 4.6% + miss 5.0% + helper 0.8%) | 567,690,313 | 21.6% | no |
-| delegate (`fast_delegate`) | 524,858,165 | 20.0% | no |
-| inline AOT direct | 505,946,820 | 19.2% | no |
-
-Within the vtable-virtual pool: devirt 64.5% / IC 35.5%. **The ceiling on direct calls is 39.2% and it is
-structural**: only `wj_emit_method_call` emits `WASM_RELOC_CALL`, the only relocation the assembler can turn
-into `call <funcidx>`; the IC path emits `WASM_RELOC_INDIRECT`, which "can never become a direct call, only
-its functype is relocated". Delegates and inline-AOT calls are indirect by construction. Currently **25.0%**
-of all dispatch is a real `call rel32`. Even at 100% devirt coverage, delegate (20%) + inline AOT (19%) cap
-direct dispatch near **61%**.
-
-Raising that ceiling means raising devirt COVERAGE, not more shadow tuning. **Do not convert an "arm-local %"
-into a "% of dispatch"** using the arm's share of the VCALL POOL — that overstates direct dispatch ~2x.
-
-### The devirt census is per-site and unweighted — never plan from it alone
-
-`[wasm-jit devirt]` counts SITES at emit time. A site executed a billion times counts the same as one executed
-twice, so the biggest-looking bucket is routinely not the one carrying traffic. Execution-weighted:
-
-| cause | IN-GAME WINDOW | % of SITES | over/under-weight |
-|---|---|---|---|
-| **alt-receiver at a site that DID devirt** | **32.5%** | n/a | — |
-| `no_rec` | 32.2% | 28.1% | x0.87 |
-| `poly` | 30.7% | 7.9% | **x6.59** |
-| `cold` | 4.6% | 9.0% | x0.60 |
-| `no_fslot` | **0.0%** | 3.1% | **x0.11** |
-
-`no_fslot` is 0.0% of hot IC execution — cutting it 69% via threshold knobs is worth nothing on the plateau;
-it is a boot/worldgen effect. **Weight a devirt bucket by execution before spending on it.**
-
-**"`no_rec` is cold branches that never execute" is WRONG** — those sites take 34M hits per window. The
-reconciliation: **99.3% of profile observations arrive AFTER the method was JITted**, so raising the JIT
-threshold adds pre-JIT interp observations (the wrong channel) while the record does exist later from the IC's
-own misses. **Re-emission can convert `no_rec`; the threshold structurally cannot.**
-
-Where the hot IC volume is: polymorphic dispatch **63.2%** (alt-receiver 32.5% + poly 30.7%), re-emission
-**32.2%**, everything else 4.6%.
-
-**Most IC MISSES were not polymorphism but inheritance (R310), and are now absorbed (R311).** Classified against
-the site's front-runner, **~68% of in-game IC misses were another receiver class resolving to the SAME method**
-(Entity subclasses calling an inherited Entity method), ~21% a genuinely different method, ~5.5% dropped by the
-profile cap. The vtable-keyed 1-way PIC missed on every class change. R311's method-identity check
-(`vt->klass->vtable[slot]` against the cached method, class-virtual non-generic sites only) took published
-misses 119-128M -> 31-32M per window and the server tick -8.9%. "poly" and "alt-receiver" above are both keyed
-on the receiver VTABLE and so overstate true polymorphism; what remains is ~27M different-method misses.
-
-**Cost model for a guarded arm, counted off emitted code.** Arm hit = `i32.load; i32.ne; br_if` then
-`call <funcidx>` = **~3 x86 + 1**. IC hit = 2 loads + cmp + jne + unpack + `call_indirect` = **~21 x86**. An
-extra arm pays its guard on ALL traffic reaching it and saves (ic − direct) on what it captures, so it wins
-above **capture > 3/20 ≈ 15%** — and above **~50%** if the target does NOT co-locate, because then the
-"direct" call is itself a `call_indirect`. **Co-location is the precondition for another arm, not a bonus.**
-
-## Closed leads — do not re-run these
-
-Round numbers are kept **in this section only**, because tracing a closure back to its experiment is the whole
-point of it.
+## Closed leads -- do not re-run these
 
 | lead | why it is closed |
 |---|---|
-| GC as a cost | ~0.3% of wall, confirmed five independent ways |
-| **the GC/object model as a performance lever** | ~1.6% of frame, and its alternative is WORSE. Pin stores are 2.55% of emitted instructions, frame-zero 0.63%, and **GC points outnumber ref defs 1.84:1**, so a safepoint model stores per GC point and roughly DOUBLES them (R126, re-derived R180). wasm locals are not addressable or enumerable from outside the module, which is why the shadow frame exists at all — precise stack maps are not available at any price |
-| **WasmGC as a redesign target** | CLOSED ON EVIDENCE, not feasibility (R180). TeaVM ships both backends, same source/V8/machine: **wasm-gc 0.430 vs linear memory 0.415 — wasm-gc is SLOWER.** The reachability objection (mono's heap, metadata, GC and the AOT half all share linear-memory objects with JIT'd code) is the second reason, not the first |
-| exception handling as a cost | 0.240% of window in self time across 37 EH symbols; ALL interpretation is 0.749%. `mono_llvm_cpp_catch_exception` sits on 92.5% of stacks but is a STRUCTURAL wrapper frame around protected regions, not an exception in flight. Frames meaning an exception is actually in flight are **0.08-0.19% of stacks**. The real EH cost is that `mono_method_check_inlining` refuses ANY method with a clause |
-| interpreter in the hot path | `mono_interp_exec_method` occurs 1.12x per stack; 72% of stacks have exactly the one thread-entry frame |
-| Liftoff / V8 tiering | 59.3% of our self time is `turbofan`, 0.41% `liftoff`; **98.41% of our tier's executed time is already TurboFan-tiered**, so tier-up is not what blocks inlining — callee LOCALITY is. The plateau residue is ~1.8% of server cycles (425 warm functions' Liftoff bodies plus `WasmLiftoffFrameSetup`, which every Liftoff entry calls under `wasm_inlining`), and the `compilationPriority` section that could release it is an EXPERIMENTAL V8 feature the product's Chrome skips (R370) |
-| local renaming, coalescing, `local.tee`, copy-chain elimination as *runtime* levers | V8 source proves local ops are free; these are wire-size only |
-| helper-import cap | not binding: max 30 declared in any hot module, median 3, cap 192 |
-| `IKVM_LAZY_BODIES=0` | 11.2% WORSE; the shipped setting is already optimal |
-| `MONO_WASM_JIT_RELINK_JITTED=0` (refusing an IKVM body swap once the wasm JIT compiled generation 1) | **SHIPS 1**, but **the shape has changed and the measurement has not been redone** (R268). R252 measured **-5.2%** server tick (430.7 -> 408.3 G instructions over an identical 2,406 ticks; IKVM `late` 619 -> 37, installs 3,250 -> 3,750, no cost bucket rose) on a design where gen 1 stayed live and gen 2 took a **FRESH e/f pair**. That design is gone: generation 2 now keeps the descriptor and the pair and is republished, because a fresh pair means already-co-located and already-devirted callers never reach generation 2, and because a detour requires same-slot replacement. `relinkRefreshed` is 574/run with only **4 in-game**, so R252's number says nothing about whether the republication machinery pays for itself in the plateau. The INTERPRETER half of the refusal stays unconditional -- tier-up across two different ILs asserts in `lookup_patchpoint_data` |
-| carrying a gen-1 PERMANENT bail into gen 2 as a lever | **MEASURES ZERO** (R252). `WJC_RELINK_BAIL_CLEARED` is 0 over a full run: IKVM's relink hook IS the method's first execution, where a method is untried or already live, so the `-1` state is never reached there. The arm is kept and the zero recorded at the site -- without the counter it would read as a shipped fix forever |
-| `IKVM_LAZY_SIG=0` (refusing lazy-body candidates whose signature carries an unloadable) | **NOW SHIPS 1** (R251). Admitting them is worth **-9.5% server tick, -52% skipped ticks, +14.4% ticks completed**, both orders, n=2/arm, non-overlapping. Dispatch pool 47.9 -> 36.4 M/tick, type-check pool 11.6 -> 7.3 (generation 2 emits a plain checkcast where generation 1 needed the dynamic chain). **The 2026-09-10 arm that measured this a WASH is superseded, not contradicted**: it ran on the build carrying the R244 admission regression, so its +3.993 admission / +3.321 interpreter loss was mostly the regression. Residual churn on the fixed build is +0.8 M/tick, 8:1 against the win |
-| `__<>DynamicBinder__` receiver castclass | load-bearing — the adapter's cast *is* the type check; removing it turns a ClassCastException into memory corruption |
-| shrinking `__<>MHC` stubs as a ~6% lever | their `call_indirect` density is cold alternative dispatch routes, one of which runs per invoke |
-| `MONO_WASM_JIT_INLINE_ILOFS=1` | 9.8% worse on p50 at ±1.1% |
-| raising `MONO_INLINELIMIT` above the default 20 | closed on mechanism: bodies +3.5-4.4%, saturating by 60, and calls/method goes UP 1.0%. Costs nothing at boot; buys nothing measurable |
-| ikvmc static compilation of Minecraft+Fabric | out of scope on product grounds: runtime version loading and drop-in mods are requirements |
-| `MONO_WASM_JIT_COALESCE` | inert by construction — see the local-ops V8 fact |
-| `MONO_WASM_JIT_DIRECT_IMPORT` (method imports) | converted 100% of predicted arms (6,892/6,909, R157) and moved nothing (R158-R159, +0.7% at ±8.7%): an import call is still an indirect branch. Method imports have since been REMOVED, which also deleted the whole admission-ordering/deferral problem |
-| `MONO_WASM_JIT_THREAD_SP` (threading the frame pointer as a parameter) | **REFUTED, R218.** jbox2d, 6 rounds both orders, checksum-gated, tier fully alive: median **1.2485 -> 1.7375 ms/step, +39.2%**, non-overlapping 6/6. The plan's reasoning — "params are `local.get`, which is free" — conflates two things: `local.get` of an EXISTING local is free; ADDING A PARAMETER is an argument materialisation at every call site plus one more live incoming value in every callee, on a tier already at 32.21% register pressure. **Price a calling-convention change at the CALL SITES, never as a local-op count.** (`s.p` traffic is 4.4-5.3% of window and threading removes only 1 of its 3 ops.) If revisited, the parameter must go TRAILING — a leading param shifts every argument index the prologue pin stores read |
-| `MONO_WASM_JIT_STABLE_IC_IDS` | reusing the profile record's id makes two sites in one method that call the same base share a PIC slot — 6,345 emissions per boot. Ships 0 |
-| `MONO_WASM_JIT_DELEGATE_OBJ_PIC` (object-keyed delegate cache) | **R193: works and is not worth it.** Miss-path publications 88,209,759 -> **1,996** (44,000x) while the emitted stub shrinks **1,311 -> 1,289 B (-1.7%)** — the `wj_slot_live` probe costs back what the site-id derivation saved, and that probe is unavoidable because the cached f-slot NUMBER is process-wide while its INSTALLATION is per worker. Sized before spending an arm: ~4.8% of delegate dispatches were missing the recipe, so the ceiling is ~0.26% of window. Ships 0 |
-| `MONO_WASM_JIT_REEMIT` (re-emission with a matured profile) | **The OPTIONAL, profile-driven arm still ships 0. The broker it uses is no longer optional**: an IKVM body swap enqueues a MANDATORY replacement through the same queue regardless of this knob (`wasm_jit_reemit_required`), so "REEMIT=0" no longer means "no re-emission ran". Read `WJC_REEMIT_REQUIRED_*` before concluding anything about a run. **Measured on the shipped config
-with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A/B on this knob compares
-"mandatory only" against "mandatory + profile-driven", never "off" against "on". For the optional arm: **mechanism sound, population wrong, and throughput-bound.** Re-emitted bodies reach 54.7% devirt coverage against 28.1% run-wide, but are 2.25% of sites, so run-wide coverage moves ~+0.6 pts. What binds, in order: **drain reach** (56,667 queued vs ~5,800 gated) > **compile-lock contention** (`busy=5,134` vs `done=189`) > co-location conflict (`batched=496`). Note the trigger must not key off `wasm_jit_invoke_in`, which is incremented only under `mono_wasm_jit_stats` — any arm run without `--stats` measures nothing. `MONO_WASM_JIT_COLOCATE_DEPS=0` + re-emission WEDGED (2 of 2) — **but that arm can no longer be run: there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no such variable anywhere in the tree (R245). Co-location is unconditional.** Ships 0 |
-| module batching **as it was originally built** | measured negative four times (-26.6%, -35.7%, -13.0%, regression) for two mechanical reasons, and BOTH are now gone: producing a batched body cost a full `mini_method_compile` per member (bodies are now relocatable and re-framing is a memcpy), and the planner planned a plateau ONCE, on a quiescence this workload never reaches. Do not re-run the OLD arms or re-tune `batch_max`/`batch_bytes` (measured non-binding). **Co-location is UNCONDITIONAL** — R245 verified there is no `MONO_WASM_JIT_COLOCATE_DEPS` getenv and no variable behind it, so the `=1`/`=0` arms this file used to describe are not performable. Same for `MONO_WASM_JIT_SCC_COLOCATE`, which several comments still offer as an in-binary A/B. `COLOCATE_MERGE` and `COLOCATE_MAX` are real |
-| **raising co-location's STATIC capture** | **R258's CLOSURE IS RETRACTED (R269) -- the measurement stands, the conclusion does not.** R258 read the tick at **-1.2% against a control arm whose own spread was 5.0%**, i.e. it could not have resolved its own lever: sized independently, converting the ~27.4% of dispatch that is a devirt arm still going indirect is worth **~2.5-3.7 M/tick = 1.5-2.2% of the thread**, under half that spread. CLAUDE.md's own rule -- under ~12%, measure the MECHANISM, not the outcome -- was not applied to R258 itself. **And co-location is NOT independent of re-emission**: `WASM_RELOC_CALL` is only emitted when the callee already has an f-slot, so only re-emission creates the holes co-location fills (REEMIT=0 -> 1 measured **+1,077 devirt arms, +1,258 absolute module-local calls**). Never A/B the two separately again. The original R258 text follows, still true as measurement: **CLOSED ON OUTCOME (R258)** `MONO_WASM_JIT_COLOCATE_MERGE=1` moved captured call edges **32.4% -> 44.2%** and `callform local` **+126%** -- and the server tick did not move: OFF mean 167.0 (spread 8.4 = 5.0%), ON mean 165.1, a difference of **-1.2%, one quarter of the control arm's own spread**. The reason is that execution-weighted co-residency only went **4.47% -> 6.53%**, and 2.1 points against a ~5% IC-miss share of dispatch is ~0.1% of dispatch. Ships 0. **Static capture is not the binding constraint; execution weight is.** If this is revisited the target is a profile-weighted global partitioner -- `partreach.py` puts the cap-16 ceiling at 96.4% and a global agglomerative partition at 51.5% of the residual, and an offline seed-and-grow reaches 79% of call edges internal at 16 members, 85.5% execution-weighted |
-| **co-location as a route to "most dispatch is a direct call"** | CLOSED ON STRUCTURE (R195). The reachable set is only the devirt predicted arms — both `WASM_RELOC_CALL` sites are gated on the callee already having an f-slot, so a callee un-JITted at emit time has NO hole and only RE-EMISSION can convert it. Arm-local plateaus ~30% because **co-location is a PARTITION and the arm graph is not partitionable**: if two callers hold arms on the same target, only one can have it co-resident. Proof it is the partition and not tuning: surviving refusals are **100% caps, 0 rules**, and doubling `COLOCATE_MAX` bought **+1.5 points**. `max=64`+`bytes=131072` also CRASHES (undiagnosed); `max=32` is clean. The mechanism that bypasses a partition is DUPLICATION — shadow copies |
-| **hot-set consolidation (`MONO_WASM_JIT_B4_HOT`, plan P2's ceiling)** | **CLOSED (R463).** The 600 hottest live bodies (98.2% of the plateau's heat, tier 1 and tier 2) framed into 28 modules ~130 s after join, 0 refused: cycles -0.2%, instructions +1.1%, icache/iTLB/BACLEARS per instruction flat (pooled, 13 arms). Neither the partition (R195/R258) nor the PLACEMENT binds: the front-end tax is code volume. The knob stays as the instrument |
-| **SCC co-location as a source of reach** | 7 modules / 24 members per boot against a ~24,000-method tier. Cycles are rare on this workload. It was kept as a correctness mechanism until R366 deleted it with the islands: a lazy pool slot lets cycle members bake each other's f-slot before either exists, so nothing needs ordering. Never a performance lever |
-| shadow copies — cap sweeps (`WJ_SHADOW_MAX`, `MONO_WASM_JIT_SHADOW_BYTES`) | **CLOSED after ranking, R201/R202.** SELECTION ORDER was the real variable: ranking candidates by **sites/bytes descending** gives 63.7% arm-local with 2.8% FEWER bodies than encounter order at identical caps. After that, raising the caps drove `ShadowCap` to 0 and conversion did **not** move — with ranked selection the candidate SUPPLY is exhausted. **A cap closed as "non-binding" is closed only for the population it was measured on** — an earlier sweep saw 169 shadows where the current stack has 23,202, and its closure had to be retracted. Ships `MONO_WASM_JIT_SHADOW=0`; plateau is ~63% arm-local ≈ ~54% of executed dispatch direct, at **+50% bodies**, and the timing cost of that is still unpriced |
-| `shadowNojit` as evidence about the AOT wall | the counter is a TAUTOLOGY: shadow collection walks `WASM_RELOC_CALL`, which only ever names an already-JITted callee, so `nojit` cannot fire. AOT callees emit `WASM_RELOC_AOT` and are never candidates |
-| "55% of real call sites target the main module" as a co-location ceiling | RETRACTED (R180) — that is a STATIC SITE COUNT. From 2,598,503 caller->callee edge instances, **93.66% of calls out of our tier land in our own tier** and only 6.24% in AOT code. The AOT wall is not what limits co-location reach |
-| **"process-wide modules cannot reach `__thread` state"** | RETRACTED — wrong, and it wrongly closed the monitor inline-CAS lever. See the imported-globals invariant above |
-| `IKVM_LAZY_CTORS` (relinking constructors) | **Ships 0, and do not re-run the A/B.** The mechanism is correct and clean -- +208 generation-2 bodies (4,293 -> 4,501), 0 failures, 0 faults over 4 healthy runs, `bad_offsets=0` -- but the server tick is a WASH (155.2 -> 155.5). The lazy-link bucket moved -14.4% in the predicted direction and at the predicted magnitude, and that is **not resolvable on this instrument**: the same-arm spread on that bucket is ~20% (R277's `a0`/`b0` were the same arm and read 27.37 vs 22.43). A ~1.8%-of-thread lever against a ~20% instrument spread is the closure, not the sample size. The durable result of that round is the RUNTIME fix it forced out (`clause_is_dead`) |
-| **the B4 drainer's double retire as the module-corruption cause** | **REFUTED (R470).** Real in the code -- `wj_reemit_drain_one` framed B4 groups outside the compile section every other registry writer holds, so two writers could snapshot one entry's bytes and both retire them -- and now closed (`MONO_WASM_JIT_B4_SECTION=1`, a retire guard counting `dup`). But with the fix on and off the corruption came back in both arms and the guard caught `dup=0` in all 8 runs. Its tick cost is unmeasured |
-| monitors / inflated locks as a mutex-traffic problem | every lock IS inflated (`monitor.c:1013`: an object whose identity hash has ever been taken can never use the thin lock again, and Java takes identity hashes constantly), but the recoverable part is NOT mutex traffic — `mono_monitor_try_enter_inflated` already has an uncontended CAS fast path. The ~3.2% is CALL OVERHEAD around one CAS. Synchronized wrappers ARE JITted, so an inline CAS has somewhere to attach. Unbuilt, ceiling ~1.5-2% |
+| GC, or the GC/object model, as a lever | ~0.3% of wall. Pin stores and frame zeroing are ~3% of emitted instructions, and GC points outnumber ref defs 1.84:1, so a safepoint model roughly doubles the stores (R126, R180) |
+| WasmGC as a redesign target | slower than linear memory in TeaVM (R180) and no faster than JS in CheerpJ (R526); mono's heap, metadata and AOT half share linear-memory objects with JIT code |
+| exception handling as a cost | 0.24% self. `mono_llvm_cpp_catch_exception` on 92.5% of stacks is a wrapper frame, not an exception in flight. The real cost: the inliner refuses any method with a clause |
+| the interpreter on the hot path | `mono_interp_exec_method` 1.12x per stack; 72% of stacks hold only the thread-entry frame |
+| Liftoff / V8 tiering | 98.4% of the tier's time is TurboFan; the residue is ~1.8%, and `compilationPriority` is experimental (R370) |
+| local renaming, coalescing, `local.tee`, copy chains (`MONO_WASM_JIT_COALESCE`) | local ops are free in V8; wire size only |
+| method imports (`MONO_WASM_JIT_DIRECT_IMPORT`) | 100% of arms converted and nothing moved: an import call is still an indirect branch (R157-R159) |
+| the frame pointer as a parameter (`MONO_WASM_JIT_THREAD_SP`) | +39% on jbox2d (R218). Adding a parameter costs at every call site: price a calling-convention change there |
+| `MONO_WASM_JIT_INLINE_ILOFS=1` | 9.8% worse: it kept the il_state pointer live across every call (`s.i` re-derives it per store) |
+| raising `MONO_INLINELIMIT` | bodies +3.5-4.4%, calls per method +1% |
+| `MONO_WASM_JIT_STABLE_IC_IDS` | two sites calling the same base share a PIC slot |
+| `MONO_WASM_JIT_DELEGATE_OBJ_PIC` | 44,000x fewer miss publications and a stub only 1.7% smaller: the per-worker liveness probe is unavoidable (R193) |
+| profile-driven re-emission (`MONO_WASM_JIT_REEMIT`) | sound and throughput-bound (drain reach, compile-lock contention). An IKVM body swap enqueues MANDATORY re-emission whatever this knob says, so `REEMIT=0` is not "no re-emission": read `WJC_REEMIT_REQUIRED_*` |
+| more static co-location capture (`COLOCATE_MERGE`, `COLOCATE_MAX`) | co-location is a partition: two callers with arms on one target cannot both hold it (R195). Capture 32 -> 44% moved execution-weighted co-residency 4.5 -> 6.5% (R258). `max=64` + `bytes=131072` crashes |
+| hot-set consolidation (`MONO_WASM_JIT_B4_HOT`) | 98% of the plateau's heat in 28 modules: cycles -0.2%, front-end stalls flat (R463). Kept as an instrument |
+| SCC co-location, shadow copies | deleted. Cycles are rare; shadows bought ~63% arm-local at +50% bodies (R201) |
+| `IKVM_LAZY_BODIES=0` | 11.2% worse |
+| refusing unloadable-signature relink candidates | admitting them (`IKVM_LAZY_SIG=1`, ikvmcraft) is -9.5% server tick (R251) |
+| `IKVM_LAZY_CTORS=1` | clean mechanism, a wash on the tick against a ~20% instrument spread (R280) |
+| `MONO_WASM_JIT_RELINK_JITTED=0` | R252's -5.2% for `1` was measured on a design since replaced (generation 2 now republishes in place), and not re-measured (R268) |
+| removing the `__<>DynamicBinder__` receiver castclass | it IS the type check; without it a ClassCastException becomes memory corruption |
+| the B4 drainer's double retire as the heap-corruption cause | refuted (R470); the writer was R489's |
+| monitors as mutex traffic | the uncontended CAS fast path exists; the ~3% is call overhead around it. An inline CAS is unbuilt, ceiling ~1.5-2% |
+| ikvmc static compilation of Minecraft | out of scope: runtime version loading and drop-in mods are requirements |
 
 ## The GL stack: mesa-wink, GL on the main thread (R477)
 
-**GL runs on the browser's main thread** (`?wj.WINK_GL_MAIN`, default 1; 0 = on the render worker with an
-OffscreenCanvas). The render thread only records GL calls -- Mesa's glthread -- and wink runs them, and WebGPU, on main.
-Uncapped, 2026-10-06 (j2d/w2k, n=2 per arm, a 20 s window 30 s after join): main 70.4 / 67.3 fps, worker 57.6 / 59.6;
-the render thread 32 M cycles a frame against 52. **2026-10-07, after R479's readback fix, Q60 window with Minecraft's
-limiter lifted: 169-185 fps, the client 18.7-20.6 M cycles a frame (j2d/w7, n=5), and the render thread ~93% of a core
--- it, not GL, is the limiter now; 63% of it is JIT-tier Java.** Three things make that true, and each is easy to undo:
+Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. `bash wink/build.sh --variant=mt --emsdk=$HOME/emsdk --test`
+builds it and runs its smoke suite; it reaches the app through ikvm-wasm-build's GLFW port (`tools/native-deps`:
+`build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`). GL runs on the browser's main thread
+(`?wj.WINK_GL_MAIN`, default 1): the render thread only records (Mesa's glthread), and wink executes on main. At Q60
+with Minecraft's limiter lifted that is ~170-185 fps, and the render thread (63% JIT-tier Java) is the limiter (R479).
 
-* **Any GL call that returns a value or reads client memory is a round trip through main's event loop**, unless
-  glthread handles it on the render thread: it COPIES client-array draws, buffer uploads over 8 KiB and client-memory
-  TexImage2D/TexSubImage2D (transient blocks freed on main; `MESA_GLTHREAD_REMOTE_COPY=0` waits instead), and ANSWERS
-  the VAO binding and the whole fog state itself. Every 240 swaps the log reads `wink: the GL thread waited for the main
-  thread N times a frame (by GL call and pname) ...; read live M` -- in game N should be ~0 and M MUST be 0. A new
-  per-frame query in a mod shows up there by name; answer it in glthread rather than accept the wait.
-* **The canvas must not be transferred** in that mode: `wjharness/build/deploy.sh`'s post-publish patch decides it (the
-  Makefile has a copy that deploy does NOT run) and must test `window.WINK_GL_MAIN`; deploy refuses without it.
-* **gex_wgpu keeps no CPU copy of a GPU buffer by default.** It adopts one only for indirect command buffers and buffers
-  of 64 KiB or less (`GEX_WGPU_ADOPT_SHADOW`): without it, every Sodium `glMultiDrawArraysIndirect` was a GPU readback.
-  **A readback on main stalls the render thread too**: main waits on the GPU while glthread's queue fills behind it. At
-  16 KiB, Sodium's ~16.5-17.5 KiB per-frame command buffer missed the rule -- one readback a frame cost 4.4 ms of every
-  ~12 ms frame as "blocked on a full queue" (R479; 83 -> 109 fps uncapped with only that fixed, 112 with the deeper
-  queue too -- single 20 s diags 30 s after join, so the 109/112 split is noise). The census line's `GPU readbacks a
-  frame on main` must read 0, and its `blocked ... on a full queue of N batches` should read ~0 (glthread's remote queue is
-  64 batches of 8 KiB; `WINK_GLTHREAD_BATCHES` puts the old 8 back). Keep shadows that narrow -- they are wasm heap the
-  managed side does not get.
-* **gex_wgpu re-sends every write-mapped persistent buffer WHOLE at every submit** (`gex_wgpu_flush_persistent_maps`,
-  unless a shader writes it). 1.16.x never noticed (0.5 MiB a submit); 26.2's Sodium 0.9 maps a 32,000,000-byte staging
-  buffer that way, ~260 MiB a frame through queue.writeBuffer on main: **16 fps, 108 with `GEX_WGPU_PERSIST_EXPLICIT=1`**
-  (R509; an uncommitted mesa-wink patch, default off). Read `gex-wgpu: persistent mappings sent X MiB a submit`. And
-  26.2's `GlCommandEncoder.submit()` does `glFenceSync` + `glClientWaitSync` every frame -- two round trips through main
-  that serialize the render thread with it (census `2.0 times a frame`); unfixed.
+* **A GL call that returns a value or reads client memory is a round trip through main's event loop**, unless glthread
+  answers or copies it. The line every 240 swaps (`wink: the GL thread waited for the main thread N times a frame ...;
+  read live M`) should read N ~0 and M 0 in game; answer a new per-frame query in glthread.
+* **The canvas must not be transferred**: `wjharness/build/deploy.sh`'s post-publish patch decides it by testing
+  `window.WINK_GL_MAIN`, and deploy refuses without that test (the Makefile's copy is not what deploy runs).
+* **A GPU readback on main stalls the render thread too.** gex_wgpu keeps CPU shadows only for indirect command buffers
+  and buffers up to 64 KiB (`GEX_WGPU_ADOPT_SHADOW`); the census's `GPU readbacks a frame on main` must read 0.
+* **Write-mapped persistent buffers are re-sent whole at every submit.** 26.2's Sodium maps 32 MB that way: 16 fps, 108
+  with `GEX_WGPU_PERSIST_EXPLICIT=1` (an uncommitted mesa-wink patch, R509). 26.2's per-frame `glClientWaitSync` is two
+  round trips through main, unfixed.
+* The ~62 fps ceiling exists only in the headless harness (compare GL configurations with `MC_UNCAPPED=1`). Past it, the
+  seed's `maxFps:120` holds (`?wj.IKVM_GAME_OPTIONS=maxFps:260` lifts it). Below the limiter, read cycles a frame, not fps.
+* Traps: an edit to the `emscripten-glfw` checkout needs `emscripten-glfw.patch` regenerated, or `build-glfw.sh`
+  refuses; wink's suite hangs with "no result" ~1 run in 4 on upstream cases, so re-run once; `GEX_*`, `MESA_*` and
+  `WINK_*` reach the driver through `?wj.<NAME>=`.
 
-**The ~62 fps ceiling exists only in the headless harness** (OffscreenCanvas/BeginFrame pacing; vsync is off). A headed
-browser follows the display. Compare GL configurations with `MC_UNCAPPED=1`. **Past that, Minecraft's OWN limiter (the
-seed's `maxFps:120`) holds an uncapped run at ~112-120 fps**, with the render thread idle the rest of each frame:
-`?wj.IKVM_GAME_OPTIONS=maxFps:260` (ikvmcraft `IkvmWasm.cs`, rewrites options.txt lines at launch) lifts it. Below the
-limiter, read the render thread's cycles a frame, not fps.
+## Building and deploying
 
-Traps: edits to the `emscripten-glfw` checkout need the patch regenerated (`git -C emscripten-glfw diff HEAD >
-emscripten-glfw.patch`) or `build-glfw.sh` refuses to build. wink's suite hangs with "no result" ~1 run in 4 in UPSTREAM
-cases (the plain page, `wvk_draw`); re-run once before believing it. `GEX_*`, `MESA_*` and `WINK_*` variables reach the
-driver through `?wj.<NAME>=` like the runtime's (the C environment is shared; a worker's `Module.winkEnv` is not).
-
-## Building: the runtime and the app are two different builds
-
-The **runtime** (this repo) is built and packed with
+The runtime (this repo), ~9 min. A plain `./build.sh mono` is not this build:
 
 ```
-WASM_ENABLE_JSPI=true ../FNA-WASM-Build/build-dotnet.sh . true ./dotnet-jspi.zip     # ~9 min
+WASM_ENABLE_JSPI=true ../FNA-WASM-Build/build-dotnet.sh . true ./dotnet-jspi.zip
 ```
 
-A plain `./build.sh mono` is NOT that build and its pack has to be hand-patched.
-
-Then **deploy it**, which is a separate step and is not optional:
-
-```
-wjharness/wj deploy '<a string constant your change added>'                         # ~12 min
-```
-
-Copying the zip over `statics/dotnet.zip` is not a deploy — the bytes the page loads are
-`frontend/public/_framework/dotnet.native.<hash>.wasm`, which only changes when the loader is republished.
-`deploy.sh` republishes, applies the two mandatory post-publish patches, and **PROVES the marker is in the
-served bytes over HTTP**. A whole measurement matrix once ran on a stale runtime.
-
-**Choosing a marker:** it must be a string constant that lands in the wasm — a `printf` literal works. A
-`static` function's NAME does not: it can be inlined away and then never appears in the name section. If a
-change adds no string, add a verbose-gated `printf` on the path it changes; that also gives you a way to count
-the new behaviour. If a change is a REVERT, prove it both ways — the new marker present *and* the reverted
-build's marker absent (`grep -ac` on the served wasm).
-
-Before either, `wj csyn <file>` compiles one source file with the real command line in under a
-second. It checks both compilation databases, which matters: `mini-wasm.c` builds twice, with and without
-`HOST_BROWSER`.
-
-**`csyn.sh` COMPILES BUT DOES NOT LINK, and that gap has now cost two builds.** `mini-wasm.c`,
-`interp.c`, `transform.c` and `tiering.c` are all linked into **`mono-aot-cross`** as well as the runtime,
-while most of the JIT lives inside `mini-wasm.c`'s `#ifdef HOST_BROWSER`. So a call added into that region
-from any of those files compiles cleanly in both databases and then fails the real build with
-`ld.lld: error: undefined symbol`, ~9 minutes in. **Guard the CALL SITE with `#if HOST_BROWSER`** —
-`interp.c` already carries a comment explaining this at its own probe site, three lines above the pattern
-that was copied without it.
-
-## Build the product configuration: `make build AOT=true`
-
-**The shipped build is MIXED-AOT** — corlib and IKVM are AOT-compiled, the rest is JIT/interp. In
-`~/Documents/ikvm-wasm/ikvmcraft` that is:
+Then **deploy**, ~12 min, which is not optional. The page loads `frontend/public/_framework/dotnet.native.<hash>.wasm`,
+which changes only when the loader is republished; deploy republishes, applies the post-publish patches and proves the
+marker is in the SERVED bytes (a whole matrix once ran on a stale runtime):
 
 ```
-make build AOT=true        # NOT `make build`
+wjharness/wj deploy '<a string constant your change added>'
 ```
 
-`make build` alone produces a non-AOT build that **is not the product and does not boot**. It fails
-deterministically (bootcheck 0/3) ~44 s in with an assertion at `loader.c:1826` from `interp_delegate_ctor`,
-or, with the JIT tier denied for `Sort`, with `RuntimeError: memory access out of bounds`. **Neither is a real
-regression** — both are artifacts of the missing AOT half. This once cost most of a session: the non-AOT build
-was mistaken for a broken HEAD and the crash chased through eleven knob bisections. **If a boot fails in a way
-that looks like a runtime regression, check the build command before believing it.**
+A marker must be a string that lands in the wasm (a `printf` literal; not a static function's name, which can be
+inlined away). Prove a revert both ways: the new marker present and the reverted build's absent.
+
+* **`wj csyn <file>`** compiles one file with the real command line in under a second, against both compilation
+  databases (`mini-wasm.c` builds with and without `HOST_BROWSER`). **It does not link**: `mini-wasm.c`, `interp.c`,
+  `transform.c` and `tiering.c` also link into `mono-aot-cross`, so a call into `mini-wasm.c`'s `HOST_BROWSER` region
+  needs its CALL SITE under `#if HOST_BROWSER`, or the real build fails at link ~9 minutes in.
+* **The product is mixed-AOT: `make build AOT=true`** in ikvmcraft. `make build` alone does not boot (a `loader.c:1826`
+  assertion ~44 s in, or an OOB). That is the missing AOT half, not a regression: check the build command before
+  believing a boot failure.
+* **IKVM.Runtime**: `wj ikvm-runtime --install` builds it the way ikvm-wasm-build does and stages it into ikvmcraft,
+  keeping the replaced DLL in `state/arms/ikvm-runtime/`. Prove it is served by the DLL's sha256.
+* **The canonical emsdk** is ikvmcraft's `statics/emsdk`, frozen from FNA-WASM-Build's `emsdk*.patch` by
+  `freeze-emsdk.sh`. The app links against ITS cache (`IkvmWasm.csproj` `WasmCachePath`), so libc, pthread and wasmfs
+  questions are answered there, not in this repo's `src/mono/browser/emsdk`. Patching a system library means
+  `embuilder build --force <lib>` with `EM_FROZEN_CACHE=0`, then a redeploy. **embuilder clears the whole cache when
+  `cache/sanity.txt` names another toolchain path** (R502); rebuild with `freeze-emsdk.sh`'s list. Re-extracting
+  `statics/emsdk.zip` reverts patches 5-9.
+* **Never edit a source file while a build of it is in flight.** The binary's contents become unknowable, and so does
+  every number taken on it. Treat the build and deploy windows as read-only and queue the edits.
 
 ## Measurement discipline
 
-The box is an i7-1360P. It sits at ~95-98 C whenever the game is in-game, and that is the normal
-operating point of this cooling profile, **not** evidence that a measurement arm was slowed. **The
-"throttles 2106 -> 1403 MHz within a single run" claim is RETRACTED** (R227 addendum 3, re-confirmed
-2026-09-10): measured live during an in-game arm, the busy P-cores hold **3.6-3.7 GHz**. The old figure
-is an ALL-CORE number and this workload is not all-core — only two threads do work (R184), so Dell's
-~45 W BIOS PL1/PL2 spread over 2-3 active cores sustains near-peak clocks. (Do not read the RAPL zones:
-they report 256 W on a 28 W part because they are ineffective here.)
+**The box** (i7-1360P) sits at 95-98 C in game, and that is normal: 2-3-core arms hold 3.6-3.7 GHz. Builds and deploys
+are all-core and do throttle. Measure on mains power (preflight refuses on battery). Ambient desktop load is the confound
+that is real, and preflight's refusal for it is worth obeying.
 
-**The rule splits by workload**: treat all-core work (builds, deploys) as power-limited and expect
-throttling; treat 2-3-core measurement arms as running at ~3.7 GHz. preflight's thermal warning is
-therefore uninformative on this box rather than merely unactionable. Ambient desktop load is the
-confound that IS real — preflight refusing an arm for that is worth obeying.
+**Reading a run**
 
-* **`GC_MAJOR: (LOS overflow)` does not mean the LOS is full.** Every allocation over 8,000 B checks the major trigger
-  (major + LOS > survivors + max(33%, 128 MB)), and large objects arrive ~540/s at boot, so one of them is always first
-  to notice; all automatic majors read so in 1.16.5 and 26.2 alike (R510). JDK 25's 8,192-element buffers and its
-  ClassFile API's 16 KB `int[]`s are what fill the LOS; `memaudit/loscensus.js` diffs it by kind.
-* **`mode=stall` is NOT a fault.** `worldGenMode` classifies world-generation DURATION (the documented
-  ~20%-incidence bimodality, ~19 s vs ~90 s); a `stall` run routinely completes with `faults=[]` and
-  `verdict=ok`. Read `verdict`, which is the one field that says whether a run counts against the build,
-  and which excludes `env` / `never-started` / `killed`. This session conflated the two once.
-* **`ok` is not a verdict either** — it is a progress flag set the instant `benchEnd` is seen, unaffected
-  by faults, so a run can be `ok:true` while trapping.
-* **`inplace ok=` is quantised to 250** (it prints at `n % 250 == 0`), so its last value is a FLOOR and a
-  change under 250 installs is invisible in it. Use `gen2 clean=`, which is exact. This nearly produced a
-  wrong delta twice.
-* **When a counter's total exceeds the sum of its attributed parts, the gap is the finding.** Three of
-  eight `InPlaceFailed` increments are bulk `Add(..., n)`, so only 336 of 1,978 failures reached the two
-  instrumented catch sites — and the amplifier was in the gap.
-* **A bucket named for what it EXCLUDES hides what it contains.** "Class has other bridges" was accurate
-  and was misread as "no bridge for this site"; it actually meant "a bridge for exactly this site, under a
-  different kind". One extra comparison was the whole answer.
-* **"Structural, stop here" needs a higher evidence bar than "keep going"**, because only one of them ends
-  the investigation. That framing closed a fixable 5% as structural for a day.
-* **fps is unusable on this box; composition SHARES are not.** Two control runs of an IDENTICAL config:
-  `vcall_resolve_fslot` 4.723% / 4.683% (**0.8%**), `InstanceCheck` 2.642 / 2.658 (0.6%) — against **fps 15.10 /
-  18.03 (19.4%)**. Client-thread instruction shares are ~20x more reproducible than frame rate. **Quote
-  shares; treat any fps delta under ~20% as nothing.**
-* **"N consecutive clean runs" is not a gate unless you state its probability (R269).** At the measured
-  **4/21 = 19%** fault rate, P(10 consecutive clean) = **12.1%** and P(20) = **1.5%** -- so a 10-run clean
-  streak is a routine outcome of an UNCHANGED build. Distinguishing 19% from a halved ~10% at p<0.05 needs
-  on the order of 150 runs per arm. Size a stability gate against the base rate, or call it a smoke test.
-* **The fps floor is ~12%, not ~5%** (from 359 fault-free runs / 29 repeated identical configs): median
-  same-config fpsTail spread is **11.5% on a >=100 s window** and **22.9% on a 60 s one**. Resolving a 5%
-  effect against that needs ~10+ rounds per arm. For anything under ~12%, **measure the MECHANISM**
-  (`tiershape.py` resolves 0.23%, `hotinsn.py`, a tier dump) rather than the frame rate.
-* **Run BOTH ORDERS.** Rounds 1-3 with arm A first gave non-overlapping ranges favouring A, 3/3 — reversing
-  the order reversed the result, and the real rule was that **the arm running SECOND was slower in 6 of 6**.
-  A single-order interleave cannot see that. **Never quote non-overlapping ranges from one order.** Use
-  `mcab.mjs --cooldown-ms` before every arm; interleaving alone does not cancel the bias. **The 240 s
-  cooldown is mostly wasted** now that the thermal premise is retracted (~16 min per four-arm matrix);
-  R194's order effect stands as an OBSERVATION but its thermal explanation does not, so keep running
-  both orders and stop discounting single-order results as thermally confounded.
-* **Use protocol Q60 for Minecraft censuses** (`--warm-ms 160000 --bench-ms 60000 --no-walk --no-save-quit`;
-  `hwrun.sh`'s defaults since R418). `--warm-ms` DEFAULTS TO 0, so a bare in-game window measures the RAMP.
-  Measured on the server tick (R418, `stabslice.py` over R417's eight censuses; times from world join):
-  - 0-20 s ~100-114 M instr/tick (catch-up), 60 s ~67, settled ~61-64 from ~100 s, then a ~-3% drift.
-  - **An A/B needs the window to start ~200 s after join.** A 160-220 s window lost the GC probe's +4.6%; 100-160 s
-    showed nothing.
-  - **A 60 s window at 200-260 s measures what the old 120 s one did** (same effect, separated in instructions AND
-    cycles; base spread 4.0% / 7.5% vs 3.3% / 7.0%). 30 s windows hold for instructions but cycles spread 10.6%.
-  - **The 6,000-tick autosave lands ~300 s after join** (+17 M instr/tick for 10 s). It sat INSIDE the old
-    `--warm-ms 180000 --bench-ms 120000` window (~220-340 s) and added ~2% to every reading.
-  - The harness spends ~38 s settling before the hold starts, so `--warm-ms 160000` puts the window at ~198-258 s.
-  - Re-run `stabslice.py <rundirs> --trace` before trusting Q60 on a new world or mod set.
-  - An arm is ~7 min (was ~9.5): boot+menu+world ~135 s is fixed.
-  - **Between-run world variance is ~+-3.5% per run** (each run holds its own level for the whole window; R418
-    addendum: a b g g b validation could not separate the nursery effect). n=2 per arm resolves only >~6-7%; use
-    n=3 per arm (A B B A B A, ~44 min) for 3-6% effects, and the mechanism alone below that.
-  - hwrun queues each arm's census to run during the NEXT arm's boot. **Call `hwrun.sh <batchdir> --drain` after
-    a batch's last arm**, before reading any `<tag>.census.txt`.
-* **The ramp is not JIT warmup — it is work we are too slow to clear.** Q1 vs Q4 per frame: mono JIT compile
-  ~0 -> ~0, V8 compile 2.0 -> 0.4. Both compilers are DONE before the window opens. What drains is
-  MethodHandle/invokedynamic linking (103.5 -> 47.2 M/frame), chunk/world meshing (67.2 -> 27.7) and IC miss
-  (33.4 -> 21.1). Native pays the identical transient and clears it in seconds. **Ramp length is a symptom of
-  the 4-5x gap, not a separate warmup problem.**
-* **Read `verdict` first, then the three `[wasm-jit ...]` bound lines.** `[wasm-jit bounds]`
-  (`install_budget_out`, `rv_retry dropped/try_max`, `worker_slots full`), `[wasm-jit spin]`
-  (`pub_reraise_max`, the two lock spin high-waters) and `[wasm-jit permset]` (`adds` is the liveness
-  check; `full` must be 0). These are bumped UNGATED, so they are readable with `MONO_WASM_JIT_STATS=0`
-  at no measurement cost — and `mono_wasm_jit_liveness(14..17)` exposes the four that matter without
-  `--dumps` at all, which is the only way to read a wedged run whose main thread never returns from
-  `Runtime.evaluate`.
-* **Assert the tier is alive before reading any timing**: `registered` unchanged (~1,845-1,863 during
-  world.generate on the current config), `tableExhausted 0`, `faults []`. A wrong functype on an import fails
-  *instantiation*, not the call, so the method silently falls back to the interpreter — it looks like a
-  performance result. A whole session was once run against a dead JIT tier.
-* **Measure the mechanism before the outcome.** A tier dump or a `hotinsn.py` run takes minutes and says
-  whether a change did what it was supposed to; an fps A/B takes hours and says only whether the number moved.
-* **Measure on mains power.** On battery the platform drops to a power-saving profile: R454's base mapping run fell in a
-  dock unplug and came back with a slow boot, a worker stall and an in-game window whose frame counter never moved
-  (`ingameVoid`). `lib/preflight.mjs` now refuses on battery and warns off the `performance` power profile.
-* **The native reference reads the Prism instance's own `options.txt`, and a manual session rewrites it.** On 2026-10-05 a
-  manual stress run left `renderDistance:32` in it, and the next natrun arm ran at 32 chunks (discarded; the
-  integrated server's view distance follows it). `natrun.sh` snapshots nothing, but the instance's `minecraft/logs/`
-  date every session. `natrun.sh` now refuses (VOID) unless `renderDistance` is 12 (`NAT_RENDER_DISTANCE`).
-* **Pin every arm of a comparison the same way (`MC_TASKSET`), and never compare across batches that differ in it.**
-  Chromium counts CPUs through `sched_getaffinity` (`base/system/sys_info_posix.cc:157-159`) and sizes its thread pool
-  at max(3, CPUs - 1) (`base/task/thread_pool/thread_pool_instance.cc:94`), so the pin changes the renderer's thread
-  count (55-57 pinned to 8 CPUs, 63-64 unpinned), its stack reservations and its concurrent compile zones -- i.e. peak
-  VmData. R449 compared unpinned arms against a pinned base and first blamed desktop load. Run the base in the SAME batch.
-* **Prefer a within-binary knob A/B to a cross-binary comparison.** A cross-binary reading at this spread
-  cannot support a 4% claim however tidy the mechanism sounds.
-* **Count ABSOLUTE quantities, not shares of a moving denominator.** Every mechanism in the direct-call path
-  changes the NUMBER of arms, so "arm-local %" moves with its own denominator and reads as an effect. A
-  matched pair on `colocate_deps` (an arm that **can no longer be run** — R245: the knob does not exist):
-  OFF looked better at 74.6% vs 58.3% arm-local, but ON produced **13,697
-  local arms against 12,041** — 13.7% MORE direct calls. The same trap retired three separate conclusions in
-  one session. A larger tier is also usually MORE METHODS COMPILED, not bloat — check the module count before
-  reading MB as waste. Tier size varies run to run (28,110 vs 30,893 modules), so do not rank two configs on
-  <2 points from single runs.
-* **`ic_hit` / `ic_miss` ARE NOT DISJOINT -- do not quote an IC miss rate from them (R269).** Shipped
-  config: `ic_hit=106,557,211 ic_miss=212,832,944 vfast_had=213,364,188`. `ic_miss` tracks `vfast_had` to
-  0.25% and implies a 66.6% miss rate against the 9.0% measured in-game: two routes are being counted at
-  one site.
-* **Do not compute a share until every route has a counter, and assert the parts are DISJOINT as well as
-  summing to the whole.** This has cost five rounds. Once the IC was called 79% of dispatch because the pool
-  had no term for the devirt arm; once delegates were put at 43% because two counters were bumped
-  unconditionally at the same two sites and double-counted (the real answer is ~20%). An uncounted route does
-  not show up as a gap — **it shows up as everything else looking bigger.**
-* **A counter that names an action must be bumped where the action HAPPENS, not where it is decided.** One
-  read `DelegateDevirtArm 750` with `FastDelegateDevirt 0` for a whole run: the resolution block ran
-  unconditionally while the emitting code sat inside a default-off knob's branch. If the decision and the
-  action live in different functions or `if` arms, count both and assert they are equal.
-* **A diagnostic behind a default-off knob is not evidence of absence**, and "every error counter is zero" is
-  a statement about the counters you have, not about the run.
-* **A diagnostic that rides in the module can change what the module IS (R460).** `MONO_WASM_JIT_ORIGIN`'s `wj.origin`
-  section was ~half of a giant's module and the tier-2 cap (T2_MAX_BODY) measured the whole module, so every ORIGIN run
-  -- capture gates AND ledger mapping runs -- refused tier-2 bodies a normal run admits (LivingEntity.travel, 76 KB of
-  function, read "down"). Fixed: the cap subtracts `wasm_last_origin_section_len`. Mapping runs before the fix have a
-  more tier-1-heavy population than the runs they explain.
-* **Verify a tool's classifier before trusting its output.** Five classifier bugs of the same shape have
-  shipped here: a `scriptId === 0` clause that reported our tier as 2.80% of the window when it is ~60%; a
-  category ordering that classified `call *0x18(%rbx)` as a memory access and reported dispatch as 0.0%; a
-  dispatch mask that counted import calls as `call_indirect` preambles; a load/store split that read every
-  indexed store as a LOAD (`heap STORE` 0.01% where the truth is 7.89%); the `-turbofan` suffix match above.
-  **The pattern is identical every time: the classifier was written from a plausible mental model of the
-  emitted code and never checked against it.** `hotinsn.py --selftest` exists for this and needs no capture.
-* **Test a correctness GATE against known-good data before believing its verdict.** A checksum gate once
-  printed MISMATCH over 25 runs whose checksums were identical, because the TSV's last field carried a
-  trailing newline. A gate that fails CLOSED is as dangerous as a classifier that fails open.
-* **A gate that cannot reach the case a change introduces is not evidence about that change.** Two encoder
-  oracles passed 400/400 and 300/300 byte-identical across a change they were structurally incapable of
-  testing; `enctest`'s t4 exists because of that.
-* **When a diagnostic prints nothing, walk the call chain from the printf OUTWARD to the trigger** before
-  concluding anything about the symbol. One "missing export" was in fact a harness flag: the dump is reached
-  only via `globalThis.dumpWasmJit()`, which `mcbench.mjs` calls only under `--dumps`.
-* **A leftover compiler daemon will silently tax one arm.** The runtime build's `VBCSCompiler` starts under
-  the REPO-LOCAL `./.dotnet/dotnet` with its own pipe name, so a system-SDK `dotnet build-server shutdown`
-  does not reach it. `preflight` refuses to measure while one is alive, and **that refusal is worth obeying
-  rather than passing `--force`**: the daemon exits partway through, taxing the arms UNEQUALLY. Use
-  `killdaemons.sh` (exit 0 = safe), which matches preflight's own pattern — a filter checking only
-  `VBCSCompiler` misses the `MSBuild.dll` half.
-* **`pgrep -f` / `pkill -f` MATCHES THE SEARCHER.** This has cost three incidents, twice killing the invoking
-  shell (one took a build with it, leaving corrupt intermediates and a *spurious* compile failure). The
-  bracket trick does not help when the pattern sits in a heredoc and so lands in the outer shell's own argv.
-  **Find candidates by command line, keep only those whose `comm` is the expected executable, never kill
-  self**, and prefer `pgrep` + explicit `kill <pid>` over `pkill`.
-* **NEVER EDIT A SOURCE FILE WHILE A BUILD OF IT IS IN FLIGHT.** The build reads each file at a moment you do
-  not control, so a file edited during it makes the binary's contents *unknowable* and every number taken on
-  it unusable. One arm came back at 1.45x its control and could not be attributed. The edits were behind a
-  default-off knob and *very probably* inert — which is exactly the trap. A build is ~9 min and a deploy ~12;
-  treat that whole window as read-only and queue the edits.
-* **The network stall is defused** — `IKVM_DEFUSE_RANKED_AUTH=1` is the harness default. MCSR Ranked's account
-  validation never reaches a terminal socket status under this net bridge, so the modded main screen never
-  finishes; that is the "no log output at all for 90s" signature. It is BENCHMARK-ONLY and it CHANGES WHAT THE
-  GAME DOES, so it goes through the URL like every other knob and stays visible in each run's recorded command
-  line.
-* **When testing whether a hung run recovered, filter to lines the APP emits** (`src/dotnet/log.ts`,
-  FabricLoader, IkvmClassLoader). Chromium keeps writing `gcm/registration_request` and `gpu_blocklist` errors
-  for minutes after the page is dead, and counting those as progress once produced a confident "it recovered"
-  that was exactly backwards.
+* **Read `verdict` first**: it is the one field saying whether a run counts against the build (it excludes `env`,
+  `never-started` and `killed`). `mode=stall` classifies world-generation duration, not a fault, and `ok` is only a
+  progress flag. Then read the ungated bound lines (`[wasm-jit bounds]`, `[wasm-jit spin]`, `[wasm-jit permset]`), which
+  are valid with stats off; `mono_wasm_jit_liveness(14..17)` reads them from a wedged run.
+* **Assert the tier is alive before reading any timing**: `registered` sane, `tableExhausted 0`, `faults []`. A wrong
+  functype fails instantiation and silently falls back to the interpreter, which looks like a performance result.
+* `inplace ok=` is quantised to 250; use `gen2 clean=`. `GC_MAJOR: (LOS overflow)` does not mean the LOS is full (R510).
+* When a counter's total exceeds the sum of its attributed parts, the gap is the finding.
 
-### Long-running work: put it in a transient systemd unit
+**Comparing**
 
-**Background tasks are killed when their owning agent exits unless it is async.** The harness's cleanup calls
-`killShellTasksForAgent`, and having a backgrounded shell is not enough to skip it. The kill acts on the
-spawned process handle, so `setsid` + `disown` does **not** protect the work — the real work must live in a
-cgroup the handle has no reference to.
+* **fps is unusable on this box; composition shares are not** (an identical config twice: shares within 1%, fps 19%
+  apart). The fps floor is ~12% (11.5% on windows of 100 s or more, 23% on 60 s). Under ~12%, **measure the mechanism**
+  (`tiershape`, `hotinsn`, a tier dump), not the outcome.
+* **Measure on the server tick, not the client frame.** Native's client frame is half Mesa, OpenAL and libc; its server
+  tick is ~91% real Java. Name the server tid explicitly (`native/servertid.py`; `buckets.py` without `--tid` picks the
+  CLIENT thread). Our ticks skip, so per-tick figures divide by executed ticks: quote skipped ticks too, and compare raw
+  totals when tick counts match.
+* **Use protocol Q60 for Minecraft** (`hwrun`'s defaults: `--warm-ms 160000 --bench-ms 60000 --no-walk
+  --no-save-quit`, a window ~198-258 s after join, before the ~300 s autosave). A bare in-game window measures the ramp.
+  World variance is ~+-3.5% a run: n=3 per arm (A B B A B A) for 3-6% effects, the mechanism below that. Run
+  `hwrun.sh <batch> --drain` after a batch's last arm, before reading its censuses.
+* **Run both orders**: in one series the arm running second was slower 6 of 6. Never quote non-overlapping ranges from
+  a single order.
+* **Pin every arm the same way (`MC_TASKSET`)**, and never compare batches that differ in it: chromium sizes its thread
+  pool from `sched_getaffinity` (R449).
+* **Prefer a within-binary knob A/B.** A cross-binary reading at this spread cannot carry a 4% claim.
+* **Count absolute quantities, not shares of a moving denominator.** "Arm-local %" fell while local arms rose 13.7%.
+* **Do not compute a share until every route has a counter and the routes are DISJOINT** (`ic_hit` and `ic_miss` are
+  not). An uncounted route shows up as everything else looking bigger.
+* **"N consecutive clean runs" is not a gate without its probability**: at a 19% fault rate, 10 clean in a row happens
+  12% of the time on an unchanged build. Size a stability gate against the base rate, or call it a smoke test. An
+  intervention against an intermittent fault needs a positive control.
 
-`wj bg <name> -- <cmd...>` does this (a transient `systemd-run --user` service carrying the shell's environment; log
-and exit code in `$WJ_RUNS/.bg/<name>.{log,rc}`, `wj bg <name>` for status) -- then poll the sentinel. **Use a transient SERVICE, not `--scope`**: a scope runs in the calling process's
-session and dies with the invoking shell exactly as `setsid` does. **And do not rely on a backgrounded watcher
-for notification** — a `run_in_background` watcher is killed after ~5 minutes while the unit it watches runs
-to completion. Put the WORK in the unit and use a direct sentinel check as the backstop.
+**Instruments**
 
-**Symptom of getting this wrong:** the run's browser AND its node driver vanish together, the sentinel is never
-written, and there is NO stall message. Do NOT diagnose it as an app or JIT fault. Three explanations were
-asserted here before the harness source was read and all are wrong: a duration limit, memory pressure, and
-"~30 minutes of user inactivity" (a selection effect — killed tasks have a median lifetime of 1.5 min).
+* **Bump a counter where the action HAPPENS, not where it is decided.** If they live apart, count both and assert equal.
+* A diagnostic behind a default-off knob is not evidence of absence, and **a diagnostic that rides in the module changes
+  what the module is** (R460: the `MONO_WASM_JIT_ORIGIN` section pushed bodies over the tier-2 size cap).
+* **Verify a classifier against the emitted code before trusting it** (five have shipped wrong; `hotinsn.py --selftest`).
+  **Test a gate against known-good data** (a checksum gate failed closed on a trailing newline). **A gate that cannot
+  reach the case a change introduces is not evidence about it** (`enctest`'s t4).
+* When a diagnostic prints nothing, walk the call chain from the printf outward to its trigger before concluding anything.
+* To tell whether a hung run recovered, count only lines the APP emits; chromium keeps logging after the page is dead.
 
-### The world-load hang is a SPIN, not a block
+**Hygiene**
 
-Caught live (R275): two threads at **~92% CPU**, both `state=R` with `wchan=0`, concentrated on five
-addresses spanning ~22 bytes of `[anon:v8]`; a third worker in `__futex_wait`. `Debugger.pause` could not
-interrupt the page or any of 8 workers within 7 s. App-side it is total quiescence — `JIT_ADMIT
-registered` frozen, OPFS counts frozen, `faults=[]`, then nothing for 20 minutes.
+* A leftover compiler daemon taxes one arm unequally: `wj killdaemons` (exit 0 = safe). Preflight refuses while one is
+  alive; obey it rather than passing `--force`.
+* **`pgrep -f` / `pkill -f` match the searcher**: three incidents, two of them killing the invoking shell. Match by
+  command line, keep only the expected `comm`, never kill self, and `kill <pid>` explicitly.
+* `IKVM_DEFUSE_RANKED_AUTH=1` (the harness default) stops MCSR Ranked's account check from hanging the main screen. It
+  changes what the game does, so it goes through the URL and stays visible in each run's command line.
+* The native reference reads the Prism instance's own `options.txt`, which a manual session rewrites; `natrun.sh`
+  refuses unless `renderDistance` is 12.
 
-**Every earlier description of it as "stopped" or "blocked" was wrong about the mechanism**, and the two
-need opposite next instruments, so the driver now classifies them: `verdict=spin` (no app progress AND a
-thread running with `wchan=0`) versus `verdict=wedge` (no app progress, all threads asleep). On a spin it
-captures 12 s of perf automatically. That capture is only readable because `worldwait` now passes
-`--perf-basic-prof` by default — R275's own capture had no symbol map and its five addresses stayed
-nameless, which is the whole reason the round ended undiagnosed.
+### Hangs, heap corruption and traps
 
-**ROOT CAUSE FOUND (R454x): it is `mallinfo()` looping forever on a corrupt heap chunk.** ikvmcraft's frontend polls
-`_ikvm_native_used_mb()` every 5 s on the MAIN thread (`frontend/src/dotnet/index.ts`, a UI memory stat), which calls
-`mallinfo()` (`loader/Emscripten.c:69`). A spin capture (`j2d/r454b/spin-b-1`, symbolised with `ledger/perfread.py` +
-`jitindex`) has 59,422 of 59,436 main-thread cycle samples in `dlmallinfo` for a full minute, ~38 billion loads with
-ONE L1 miss, touching exactly two data addresses: dlmalloc's walk advances by each chunk's size field, so a header
-whose size reads 0 is walked forever -- holding dlmalloc's global lock, which is why every allocating worker then sits in
-`__futex_wait` and the app goes quiet. So the hang is a DETECTOR: the real bug is whatever zeroes a malloc chunk header.
-Stopping the poll removes the hang; the corruption was found separately (R489, below). The paragraph below predates this.
-
-**With the poll gone the corruption surfaces as MODULE BYTES that change after validation (R462, R464).** A group module
-("memory index exceeds number of declared memories") and a lazy bank ("invalid value type 0xb9") failed V8 validation
-on bytes another worker had validated -- new fault texts, ~2 of 45 runs on 2026-10-05. `MONO_WASM_JIT_BYTES_CHECK=1`
-(block hashes at first instantiation, re-checked at every later one, `WASM_JIT_BYTES_CHANGED` + the 16 bytes before the
-buffer; `[wasm-jit bytes] changed` MUST be 0) is the instrument. Its first two versions reported RECYCLED addresses --
-never-published buffers (refused registrations, invalid modules, failed groups, batched re-emits' standalone bytes) are
-freed after their validating instantiation, and the next buffer at that address read as "changed"; R464's "live lazy
-bank handed out twice" was exactly that shape and is NOT established. The third version forgets those six frees and
-re-records an address whose length or producer kind changed; only a report on a matching kind and length is evidence.
-
-**Where it stands (R470, R471).** The detector now also forgets buffers the RECLAIM frees (retired registry bytes are freed
-once readers leave -- `MONO_WASM_JIT_RETIRE_FREE=1` -- which the detector's original "never freed" premise missed), so a
-`changed` report is real. What the reports show: live module, bank and GC-heap memory overwritten by ALIGNED 32-bit zeros
-or runs of small integers, the allocator header intact -- managed stores through a stale or wrong base, not a chunk
-shared by two owners. **Refuted as the cause:** the B4 drainer framing outside the compile section (a real two-writer
-violation of R320's seqlock, now serialized by `MONO_WASM_JIT_B4_SECTION=1`, with a published-bytes retire guard
-counting `[wasm-jit retire] dup`): both arms corrupted with `dup=0`. **Not it either:** a recorded pthread stack or TLS,
-live or dead, or a freed JIT block (`MONO_WASM_JIT_BYTES_CHECK=1` prints `WASM_JIT_BYTES_OWNER` for each overlap; o1-3
-had none). **A cluster, not a rate:** 6 of 12 runs faulted between 20:07 and 21:59 on 2026-10-05 across three deploys, then 0
-of 61 since on two binaries -- including 12 of 12 clean on the exact binary that had faulted 3 of 6 (R471, j2d/s22). It
-first read as "J3 raised the rate"; that is retracted. Something about that window mattered and was not recorded (the
-driver keeps no fps or display state); the corruption itself (R454x/R462) predates J3. Found in R489:
-
-**THE WRITER (R489): `wj_admit_install_only` stored `wj_desc_generation [desc_id]` without growing the per-pthread desc
-arrays.** The install-closure walk reaches every dependency and batch member of the admission root, and only the root was
-ensured; a republished descriptor keeps its old id while its callees register after it, so the walk met ids past the
-pthread's capacity and wrote their batch GENERATIONS (small, growing integers; zeros for generation 0; runs of one value
-across a batch's consecutive ids) `(desc_id - cap) * 4` bytes past the array's end, into module bytes, chunk links,
-mempools and sgen headers -- the faces above. Same binary, h2's config: bound on 0 of 5 runs with stray writes, bound
-off 3 of 6 with up to 1,750 past-the-end stores a run, and the stray values ARE the generations the detector printed.
-Now unconditional, counted as `[wasm-jit bounds] desc_grow=` (small and non-zero is normal). **The rule it breaks: an
-array indexed by a GLOBAL id (descriptor, slot) is sized per pthread, so every WRITE ensures it -- not the walk's entry.**
-**The instrument that found it, for the next one -- REMOVED, restore with `git revert b5779c96628`** (it re-applies
-763ae3c1686): `MONO_FREE_QUARANTINE_MB=256` (eglib `gmem.c`, browser only, default off) poisons
-every `g_free`d block (and growing `g_realloc`'s old one), holds it until 256 MB of later frees push it out, and reports a
-block written meanwhile as `FREE_QUARANTINE_HIT` with the changed words, its first 8 words from BEFORE the free (they name
-the object), freer/evictor and ms timestamps, then `WASM_JIT_COUNTERS_AT_HIT` and the R471 owner report. Read the VALUES:
-they named this writer when four rounds of reading code had not. It costs memory (h4 run 1 peaked at 7.6 GB VmData; no
-baseline run without it was taken), and a stale READ of a block it holds sees poison (`0xA5C3E1F7`) -- h4 run 1's
-`class-accessors.c:93` assert during a RuntimeResolve is probably one (not verified). On 26.2 boot hangs ~40% of the time
-under it at mixin apply (R500; also without it, rarely -- a lock-order deadlock, probably) -- set `--title-timeout-s 300`
-on the driver.
-
-**THE SECOND WRITER (R500, 26.2 world gen): a residual's spilled arguments overwritten during the callee's warmup.** A
-JIT->interpreter call spills `this` and its arguments into the pthread's SCRATCH (`+8*j`) and `wj_call_interp_inner`
-read them only after `wasm_jit_prepare_interp_callee` / `wj_argshape` / the code-type decision -- which transform a cold
-callee (a vslow IC hit can hand back an InterpMethod whose current generation is untransformed) and so run IKVM managed
-code whose own residuals reuse the same scratch. The callee ran with another call's arguments:
-`LightmapRenderStateExtractor.extract`'s `state` was IKVM's `globalTypeToTypeWrapper` Tables, and its first store zeroed
-the low byte of the next object's vtable (`SGEN_BAD_DESC`, `loader.c:1827`). Fixed by snapshotting the argument slots and
-the vret pointer into the C frame first (which also pins them) and restoring them before the read;
-`WASM_JIT_ARGS_CLOBBERED #n: <callee>` counts it -- 1-2 a world creation is normal. **The rule: anything in the scratch
-is one call's until that call has copied it out; between the spill and the copy nothing may run managed code, or the
-copy must be taken first.** The instruments that found it -- `MONO_GC_HEADER_AUDIT=1` (kept: 32-byte headers checked at
-each collection's start and end, the low-byte face repaired and named with the slot before it) and `MONO_GC_STORE_WATCH=1`
-(removed; `git apply scratchpad/state/patches/r500-instruments.patch`: names the interpreter or JIT store into a watched object's
-trailing bytes, with the method and a JS stack) -- are written up in MINECRAFT-FINDINGS.md R500.
-
-**Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
-The rendezvous carry list could not drop a permanent refusal, which re-raises `WJ_ACT_PUB` forever and
-puts a full drain on every loop back-edge; and both CAS loops were unyielding busy spins (see the
-mono-on-wasm facts). On a healthy run all their counters read ~0, so **the arms are unexercised, not
-validated**. The reading that settles it has to come from a HANGING run. If one shows `pub_reraise_max`,
-`rv_retry try_max` and both `spin_max` small, neither is the cause — say so and read the capture rather
-than defending them. Four explanations for the earlier failures were each proposed before the evidence
-was gathered and all four were wrong.
-
-**wasmfs's OPFS backend caches negative lookups (R491, FNA-WASM-Build `emsdk.9.patch`).** A name the browser reported
-missing is answered locally until the cache is invalidated; creates and moves through wasmfs drop the name. **JS that creates
-OPFS entries directly must call `opfsInvalidate()` (ikvmcraft `frontend/src/opfs.ts`, i.e.
-`Module._wasmfs_opfs_invalidate_negative_cache`) or the game will not see them.** OPFS_BLOCKED's `neg` row counts hits,
-inserts, invalidations and overflows. It took the reload from ~19 to ~10 s (JDK_Canonicalize probed `/minecraft/file:` ~85,000
-times a boot). The app links the in-place `statics/emsdk`, which is ahead of the FNA-WASM-Build release zip (patches 5-9):
-re-extracting `statics/emsdk.zip` reverts them.
-
-### Debugging a wasm trap
-
-* **Raise the stack limit first.** V8 defaults to **10 frames** and every `WORKER_TRAP_STACK` this harness
-  captured was truncated at exactly that, which is why traps routinely read as runaway recursion and why
-  callers stayed invisible. `--js-flags=--stack-trace-limit=64` is now unconditional in `mcdrive.mjs`'s
-  `launchGame`. It must be `--js-flags`, not `Error.stackTraceLimit` from an init script: the flag is
-  process-wide and so reaches WORKERS, and workers are where these faults happen.
-* **Symbolise; do not read the top frame and guess.** V8 reports MODULE-relative offsets and the split DWARF
-  is CODE-SECTION-relative:
-
-  ```
-  dwarf_addr = v8_addr - 0x1ac2fc          # the CODE section VMA; confirm with llvm-objdump --headers
-  llvm-symbolizer --obj=<...>/loader/obj/dotnet.native.debug.wasm --inlines <dwarf_addr>
-  ```
-
-  Confirm the base by looking up the enclosing subprogram's `DW_AT_low_pc` first. `llvm-dwarfdump --lookup`
-  on the UNrebased address silently returns nothing, which reads like "no debug info" rather than "wrong
-  base". **The symbolizer's inline function NAMES are mis-attributed under LTO — ignore them; the LINE
-  NUMBERS come from the line table and are correct.**
-* **A truncated stack and a runaway stack look identical** unless you check whether the last frame is a
-  plausible root.
-* **Date a trap class before reading code.** Grepping archived logs for the class (restricted to stacks
-  containing the frame that characterises it) costs one command and has killed a plausible
-  "the recent commit did it" theory outright.
-* **An intervention against an intermittent fault needs a POSITIVE CONTROL.** At ~33% incidence, four
-  consecutive clean runs mean little; run the control arm too.
+* **`verdict=spin`** (no app progress, a thread running with `wchan=0`; perf is captured automatically) and
+  **`verdict=wedge`** (no progress, all threads asleep) need opposite next instruments.
+* The old world-load hang was `dlmallinfo` walking forever over a zeroed chunk header (R454x): a detector for heap
+  corruption, whose writers were R489's and R500's (see the invariants). 26.2's boot hang at mixin apply was R514's lock
+  order; `bootcheck --dump-on-stall` catches one.
+* Instruments for the next writer: `MONO_WASM_JIT_BYTES_CHECK=1` (`[wasm-jit bytes] changed` must be 0);
+  `MONO_GC_HEADER_AUDIT=1` (sgen headers checked at each collection); the free quarantine `MONO_FREE_QUARANTINE_MB=256`
+  (removed; `git revert b5779c96628`), whose hit VALUES named R489's writer after four rounds of reading code had not;
+  `MONO_GC_STORE_WATCH=1` (`git apply scratchpad/state/patches/r500-instruments.patch`).
+* **Traps**: V8 keeps 10 frames by default, so `mcdrive` passes `--js-flags=--stack-trace-limit=64` (a flag, so it
+  reaches workers); a truncated stack and a runaway one look alike. Symbolise rather than guess: V8 reports
+  module-relative offsets and the split DWARF is code-section-relative, so run `llvm-symbolizer
+  --obj=<ikvmcraft>/loader/obj/dotnet.native.debug.wasm --inlines <v8_addr - code_vma>` (`llvm-objdump --headers`;
+  confirm against the enclosing subprogram's `DW_AT_low_pc`). An unrebased lookup silently returns nothing. Under LTO the
+  inline function NAMES are wrong and the line numbers right. Date a trap class against `state/corpus` before reading
+  code.
 
 ## The harness: `wjharness/` is code, `scratchpad/` is data
 
 The measurement harness is tracked in `wjharness/` and runs as `wjharness/wj <tool>` (`wj ls`; the tool tables are in
-`wjharness/README.md`). Start with its readers, not `perf report`, which takes minutes per query on these captures. Its data
-root, `$WJ_HOME` (default `scratchpad/`, excluded via `.git/info/exclude` -- never add it), is NOT RECOVERABLE and has three
-parts with different rules:
+`wjharness/README.md`). Start with its readers, not `perf report`, which takes minutes per query on these captures. Its
+data root, `$WJ_HOME` (default `scratchpad/`, excluded via `.git/info/exclude`, never add it), is NOT RECOVERABLE and has
+three parts with different rules:
 
-* **`state/`** -- persistent; `wj reap` refuses it at any depth. `seeds/` are browser profiles holding Minecraft, the mods,
-  `options.txt` and a save in OPFS, reflink-copied for every run. **They are load-bearing**: without one the app
-  re-downloads Minecraft inside the boot phase and boot measures the network, each is a user's OPFS export that cannot be
-  rebuilt without its tar, and one was deleted once by a cleanup. `refs/` holds captures later rounds compare against
-  (`j2d-r440-ss`, ...), `arms/` the built reference arms (TeaVM, CheerpJ jars, the jvmti agent, replaced IKVM.Runtime
-  DLLs), `native/` the native reference's staging, `corpus/` the archived run logs `lib/verdict.mjs` is validated against,
-  `patches/` instrument patches kept for re-application.
-* **`runs/<date>-<tag>/`** -- every driver's output, disposable by construction. A driver refuses an output directory
-  inside `wjharness/`. **A round's launcher lives in its run directory**; a script a second round needs is promoted into
-  `wjharness/`, made portable and committed.
-* **`notes/`** -- `MINECRAFT-FINDINGS.md`, untracked.
+* **`state/`** is persistent; `wj reap` refuses it at any depth. `seeds/` are browser profiles holding Minecraft, the
+  mods, `options.txt` and a save in OPFS, reflink-copied for every run. **They are load-bearing**: without one the app
+  re-downloads Minecraft during boot and boot measures the network, and each is a user's OPFS export that cannot be
+  rebuilt without its tar. `refs/` holds captures later rounds compare against (`j2d-r440-ss`, ...), `arms/` the built
+  reference arms (TeaVM, CheerpJ, the jvmti agent, replaced IKVM.Runtime DLLs), `native/` the native reference's staging,
+  `corpus/` the archived run logs `lib/verdict.mjs` is validated against, `patches/` instrument patches.
+* **`runs/<date>-<tag>/`** holds every driver's output and is disposable by construction. A driver refuses an output
+  directory inside `wjharness/`. **A round's launcher lives in its run directory**; a script a second round needs is
+  promoted into `wjharness/`, made portable and committed.
+* **`notes/`** holds `MINECRAFT-FINDINGS.md`, untracked.
 
-Data a round cites as `j2d/<name>`, `p<NN>`, `r<NNN>` is under `scratchpad/legacy/wj/` until deleted; the kept ones are
+Data a round cites as `j2d/<name>`, `p<NN>` or `r<NNN>` is under `scratchpad/legacy/wj/` until deleted; the kept ones are
 `state/refs/j2d-<name>`.
 
 * **No tool names a machine.** Locations come from `wjharness/lib/paths.mjs`: the environment, then
   `~/.config/wjharness/machine.env` (template `wjharness/machine.env.example`), then autodetection. A tool that needs an
-  unconfigured checkout refuses and names the key. `wj doctor` reports what is missing; `wj selftest` (seconds: syntax,
-  the verdict and hotinsn selftests, enctest, and a gate that fails if any tool names this machine's paths) is the check to
-  run after editing the harness. CPU sets are `WJ_PCPUS` (an arm's pin: the P-cores here), `WJ_CENSUS_CPUS`,
-  `WJ_BOOT_CPUS`; the raw-code perf event sets (`hwrun`, `natrun`, `fe/events.sh`) refuse on a CPU they were not written for.
-* **Before measuring, `wj fit`** (dev server up, `killdaemons`, preflight passing). **Long work under `wj bg`.**
+  unconfigured checkout refuses and names the key. `wj doctor` reports what is missing. `wj selftest` (syntax, the
+  verdict and hotinsn selftests, enctest, and a gate that fails if any tool names this machine's paths) is the check to
+  run after editing the harness. CPU sets are `WJ_PCPUS` (an arm's pin, the P-cores here), `WJ_CENSUS_CPUS` and
+  `WJ_BOOT_CPUS`; the raw-code perf event sets (`hwrun`, `natrun`, `fe/events.sh`) refuse on a CPU they were not
+  written for.
+* **Before measuring, run `wj fit`** (dev server up, `killdaemons`, preflight passing).
+* **Long work goes under `wj bg <name> -- <cmd>`**: a transient `systemd-run --user` SERVICE (not `--scope`, which dies
+  with the calling shell), log and exit code in `$WJ_RUNS/.bg/<name>.{log,rc}`. An agent's background shells are killed
+  when it exits, and `setsid` + `disown` does not protect them. If a run's browser AND its node driver vanish together
+  with no stall message, that is this, not an app fault. Poll the sentinel; do not rely on a backgrounded watcher.
 * **Only `wj reap` deletes** (dry run by default): dead-pid `/tmp/perf-*.map`, old profiles in `runs/`, isolate logs.
-  `/tmp` is a RAM-backed tmpfs and `--perf-basic-prof` writes a ~240 MB map per capture: 100 stale ones left 2.7 G free and
-  runs died at PAGE LOAD, reading as a browser bug (R280f). Anything a run writes into a RAM-backed filesystem needs an
-  owner at teardown (`runSession` drops its maps), not a periodic sweep.
-* **`--perf-basic-prof` and `--perf-prof` imply `--log`** (`v8/src/flags/flag-definitions.h:4516-4517`), which drops an
+  `/tmp` is a RAM-backed tmpfs and `--perf-basic-prof` writes a ~240 MB map per capture; stale ones once left 2.7 G free
+  and runs died at page load, reading as a browser bug (R280f). Anything a run writes there needs an owner at teardown.
+* **`--perf-basic-prof` and `--perf-prof` imply `--log`** (`v8/src/flags/flag-definitions.h`), which drops an
   `isolate-*-v8.log` per isolate into the browser's cwd. A new launcher that passes either must pass
   `--no-logfile-per-isolate --logfile=+` too.
-* **A failed run keeps its browser profile**: it holds the OPFS save and the crash-time state and is the only copy.
-* **A terminal fault ends the run** (`MONO_WASM: forcing abort`, `js-oom`, `em-abort`, `renderer-crash`, `wasm-link` --
-  `verdict.mjs`), instead of sitting out the budget; a wasm TRAP does not, because a worker can die and the run still
-  produce a complete window.
+* **A failed run keeps its browser profile**: it holds the OPFS save and the crash-time state, and is the only copy.
+* **A terminal fault ends the run** (`MONO_WASM: forcing abort`, `js-oom`, `em-abort`, `renderer-crash`, `wasm-link`;
+  see `verdict.mjs`). A wasm TRAP does not, because a worker can die and the run still produce a complete window.
 * **`perf inject` is opt-in** (`mcperf --inject`): the python readers parse the raw jitdump, and inject's success path
-  deletes it. **perf silently mis-attaches** (a 0.3 MB map and 133 samples read as a valid low-overhead run): gate on the
-  symbol-map size.
-* **Whole-process captures on this hybrid part use `task-clock`, not `cycles`**: `cycles:u` opens on `cpu_core` only and
+  deletes it. **perf can silently mis-attach** (a 0.3 MB map and 133 samples read as a valid low-overhead run): gate on
+  the symbol map's size.
+* **Whole-process captures on this hybrid CPU use `task-clock`, not `cycles`**: `cycles:u` opens on `cpu_core` only, so
   every sample from a thread on an E-core is silently missing. Per-thread hardware censuses pin to the P-cores instead.
-* **Chromium's own frames need debuginfod, by build-id**, and a distro keeps only a window of versions: a capture against a
-  chromium whose debuginfo is gone stays `[unknown]` forever (`lib/debuginfo.mjs`, `PERFRAW_DSO_SYMS=1`).
-* **`--marker` checks the managed assemblies too** (`lib/provenance.mjs`): markers match raw bytes, so a method or type
-  name works for IKVM.Runtime, an env-var name does not (it is UTF-16 in `#US`) -- compare the served DLL's sha256 instead.
+* **Chromium's own frames need debuginfod, by build-id**, and a distro keeps only a window of versions: a capture
+  against a chromium whose debuginfo is gone stays `[unknown]` forever (`lib/debuginfo.mjs`, `PERFRAW_DSO_SYMS=1`).
+* **`--marker` checks the managed assemblies too** (`lib/provenance.mjs`). Markers match raw bytes, so a method or type
+  name works for IKVM.Runtime but an env-var name does not (it is UTF-16 in `#US`); compare the DLL's sha256 instead.
 * **World generation varies ~3x on an unchanged build, and in-game fps is comparable only once the server has caught
   up** (`mcdrive` waits and records whether it settled); `mcab` refuses a verdict at `--rounds 1`.
 * Do not commit `*.orig-backup` files.
