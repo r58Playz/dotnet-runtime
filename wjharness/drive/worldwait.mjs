@@ -232,11 +232,11 @@ const OUT = defaultOut("worldwait", outIdx >= 0 && args[outIdx + 1] ? args[outId
 
 /* REFUSE unknown flags rather than ignoring them. */
 {
-  const KNOWN = new Set(["--runs", "--stats", "--dumps", "--force", "--out", "--knob", "--ro", "--bench-ms",
+  const KNOWN = new Set(["--runs", "--stats", "--dumps", "--force", "--out", "--knob", "--ro", "--bench-ms", "--seed",
                          "--warm-ms", "--no-walk", "--walk", "--headless", "--no-headless", "--uamem",
                          "--gcpace", "--parkfix", "--parknanos", "--codecache", "--memtrace", "--seconds",
                          "--gclog", "--v8gc", "--worker-probe", "--smaps", "--maps-snapshot", "--vmledger", "--vmpeek"]);
-  const takesValue = new Set(["--runs", "--out", "--knob", "--ro", "--bench-ms", "--warm-ms", "--seconds",
+  const takesValue = new Set(["--runs", "--out", "--knob", "--ro", "--bench-ms", "--warm-ms", "--seconds", "--seed",
                               "--gcpace", "--parknanos", "--codecache", "--worker-probe"]);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
