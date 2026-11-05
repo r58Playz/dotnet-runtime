@@ -1,0 +1,40 @@
+<!doctype html>
+<!-- CheerpJ arm of j2d/run.mjs (2026-11-04): the SAME jar as ours / HotSpot (bench.jar, sha256 eabfcc8c...),
+     run by CheerpJ's loader from its CDN. Query: v=<java version, default 8>, gc=1 (the experimental WasmGC engine),
+     args=W,S,N (the jar's positional schedule), loader=<major.minor, default 5.0>. System.out reaches the console,
+     where run.mjs reads the [bench] lines. -->
+<html><head><meta charset="utf-8"><title>jbox2d / CheerpJ</title></head>
+<body><pre id="console"></pre>
+<script>
+  // CheerpJ writes System.out into #console, not the JS console: forward each complete line, for run.mjs's CDP tap.
+  const pre = document.getElementById("console");
+  let sent = 0;
+  new MutationObserver(() => {
+    const t = pre.textContent; let k;
+    while ((k = t.indexOf("\n", sent)) >= 0) { console.log(t.slice(sent, k)); sent = k + 1; }
+  }).observe(pre, { childList: true, characterData: true, subtree: true });
+  // Errors reach run.mjs's console tap, and a heartbeat tells a busy main thread (no beats) from an idle wait (beats).
+  addEventListener("error", (e) => console.log(`[cj] error ${e.message} ${e.filename}:${e.lineno}`));
+  addEventListener("unhandledrejection", (e) => console.log(`[cj] rejection ${e.reason && e.reason.stack || e.reason}`));
+  const T0 = performance.now();
+  setInterval(() => console.log(`[cj] beat ${((performance.now() - T0) / 1000).toFixed(0)} s`), 10000);
+  const q = new URLSearchParams(location.search);
+  const LOADER = q.get("loader") || "5.0";
+  const s = document.createElement("script");
+  s.src = `https://cjrtnc.leaningtech.com/${LOADER}/loader.js`;
+  s.onload = async () => {
+    try {
+      const opts = { version: Number(q.get("v") || 8), status: "none" };
+      if (q.get("gc") === "1") opts.wasmGC = true;
+      console.log(`[cj] init ${JSON.stringify(opts)} loader ${LOADER} isolated ${self.crossOriginIsolated}`);
+      await cheerpjInit(opts);
+      const args = (q.get("args") || "").split(",").filter(Boolean);
+      const jar = q.get("jar") || "bench.jar";   // gcprobe.jar: j2d/cjprobe.mjs
+      console.log(`[cj] run /app/${jar} ${args.join(" ")}`);
+      const rc = await cheerpjRunJar(`/app/${jar}`, ...args);
+      console.log(`[cj] exit ${rc}`);
+    } catch (e) { console.log(`[cj] LOAD FAILED ${e && e.stack || e}`); }
+  };
+  s.onerror = () => console.log("[cj] LOAD FAILED loader script");
+  document.head.appendChild(s);
+</script></body></html>
