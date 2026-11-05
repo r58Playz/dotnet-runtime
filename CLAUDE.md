@@ -178,8 +178,9 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   `[IKVM lazybody] ... drainRefused finish= load=`: 12-14 loader calls refused per 26.2 boot, 0 hangs in 12 boots after.
   **Before adding work to the drain, check it cannot reach a Java loader or another type's Finish** -- FinishRelinkBatch's
   RelinkTarget (a default method's types) was such work, ran outside the guard, and hung 4 of 4 capped boots (R515).
-  `IKVM_LAZY_LOAD_STUCK`'s `LoadStuckDependencies` (default 0) is the same shape: it calls the entry's loader on the drain
-  thread BEFORE `InRelinkDrain` is set (`ByteCodeHelper.cs` ~892 vs ~909). Do not ship it as it stands.
+  `IKVM_LAZY_LOAD_STUCK` was the same shape (it loaded on the drain before `InRelinkDrain` was set) and is deleted (R527);
+  the signature loads that replaced it (`IKVM_LAZY_SIGLOAD`) run on the generation-1 Java thread, and never inside a
+  loadClass or a class definition.
 * **Managed stack walks ask V8 (R516, `exceptions-wasm-stackwalk.inc`, `MONO_WASM_STACKWALK_V8`).** mono's walker sees only
   the LMF chain -- interpreter segments and the EH records of methods WITH clauses -- so every JIT and AOT frame without
   clauses was invisible, and every consumer (CoreLib's StackFrame/StackTrace, IKVM's getCallerClass, StackWalker,
@@ -489,18 +490,21 @@ in fresh isolated Chrome.
 | TeaVM wasm, linear memory (browser) | 0.415 | x1.23 |
 | TeaVM wasm-gc (browser) | 0.430 | x1.28 |
 | **ours (wasm JIT, browser), R440, 2026-10-04** | **0.544** | **x1.62** — steady state (protocol below), n=4; **1.28x TeaVM FULL** on the same protocol (0.423), 1.20x in cycles; under mono's own x64 minijit row |
-| ours, the shipped config, 2026-10-31 | 1.07-1.14 | x3.2-3.4 — **a 2x REGRESSION (R523)**, see below |
+| ours, the shipped config, 2026-11-04 (R527) | 0.60 | x1.79 — n=4; 0.495 (x1.47) with lazy class loading off, see below |
 | ours, 2026-09 (the old row) | 1.1317 | x1.85 over mono native — history |
 | mono's interpreter, for scale | 3.0485 | the tier was worth 2.69x over interpreting at 1.1317, 5.6x at R440 |
 
 **At R440 we were 1.62x HotSpot and 1.28x TeaVM FULL on the same V8** (1.20x in cycles, `j2d/r440/ss`). The rows above
 ours are 12-batch means (`BENCHMARKING.md`; JDK 25 still reads 0.336 that way on 2026-10-31); ours are steady state.
-**Since 2026-10-18 the shipped config measures 1.07-1.14 ms/step (R523):** IKVM's lazy class loading leaves types that
-jbox2d's hottest methods name unloaded -- `ContactListener`, which the bench never uses -- and IKVM's RelinkBody waits for
-them forever, so those methods stay on IKVM's generation-1 lazy-link bodies. `?wj.IKVM_LAZY_LOAD_STUCK=8` gives 0.61, but
-loads more than HotSpot would: HotSpot loads such a type only as a hot method's signature class, at the C2 request
-(`Method::load_signature_classes`, `compileBroker.cpp:1426-1431` in jdk-25.0.4.1). Minecraft does not resolve it: the
-same knob moved the server tick -1.6% in cycles and the client -4.9%, every pair overlapping (R523 addendum, Q60, n=3).
+**Lazy class loading (2026-10-18) cost jbox2d 2x, and R527 took most of it back.** It left types jbox2d's hottest methods
+name unloaded (`ContactListener`, passed only as null; `ChainShape`, on a path never taken), and RelinkBody waited for them
+forever, so those methods stayed on IKVM's generation-1 lazy-link bodies (1.07-1.14 ms/step, R523). IKVM now does what
+HotSpot does at the C2 request (`Method::load_signature_classes`): at `IKVM_LAZY_SIGLOAD` probes it loads a hot method's
+signature classes on its own thread, then relinks partially (`IKVM_LAZY_PARTIAL`) for what stays unloaded -- 0.60, and
+exactly JDK 25's 132 jbox2d classes defined. **The residual (+22% against 0.495 with lazy class loading off) is erased
+signatures**: a class not loaded when its user linked is `object modopt(__<Unloadable>)` in the baked CLR signature, so
+generation 2 casts after every use, and `TreeNodeStack.push` grows to 143 IL bytes against tier 2's 120-byte guarded-inline
+cap (R527 has the census and the two levers not taken). Minecraft: neutral (Q60 n=3, R527).
 
 **Quote jbox2d from R440's protocol:** `wj j2d/run ours <dir> --no-perf --no-attr --schedule 600,200,60
 --window-batches 40,60` -- pinned to the P-cores (0-7), batches 41-60 of 60, because tier-2 compiles still land in a
