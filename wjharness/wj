@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# wj -- the harness entry point. Resolves the configuration once (lib/paths.mjs), exports it, and runs a tool.
+#
+#   wj <tool> [args...]       run a tool by name: `wj worldwait --runs 3`, `wj perfraw <dir>`, `wj j2d/run ours <dir>`
+#                             (searched in every code directory; qualify with its directory when a name is ambiguous)
+#   wj ls                     every tool, by directory
+#   wj paths                  the resolved configuration
+#   wj doctor                 check configuration and the external tools the harness needs
+#   wj selftest               every self-check that needs no capture or browser
+#   wj reap [--apply] ...     prune runs/ (dry run by default; never touches state/ or notes/)
+#   wj bg <name> -- <cmd...>  run <cmd> in a transient systemd --user service, so it survives the shell that started it;
+#                             log and exit code land in $WJ_RUNS/.bg/<name>.{log,rc}. `wj bg <name>` alone prints status.
+set -euo pipefail
+WJ_SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WJ_HARNESS_DIR=$(dirname "$WJ_SELF")
+eval "$(node "$WJ_HARNESS_DIR/lib/paths.mjs" --sh)"
+# `wj` on PATH for everything it runs, so a launcher or a `wj bg` command can call it by name.
+case ":$PATH:" in *":$WJ_HARNESS:"*) ;; *) export PATH="$WJ_HARNESS:$PATH" ;; esac
+DIRS=(drive j2d read fe ledger tier native boot memaudit build live enctest lib)
+
+run_file () {   # run_file <path> args...
+  local f=$1; shift
+  case "$f" in
+    *.mjs|*.js) exec node "$f" "$@" ;;
+    *.py) exec python3 "$f" "$@" ;;
+    *.sh) exec bash "$f" "$@" ;;
+    *) exec "$f" "$@" ;;
+  esac
+}
+
+find_tool () {   # find_tool <name> -> path(s), one per line
+  local n=$1 d e
+  if [[ "$n" == */* ]]; then
+    for e in "" .mjs .py .sh .js; do [ -f "$WJ_HARNESS/$n$e" ] && { echo "$WJ_HARNESS/$n$e"; return; }; done
+    return
+  fi
+  for d in "${DIRS[@]}"; do
+    for e in "" .mjs .py .sh .js; do [ -f "$WJ_HARNESS/$d/$n$e" ] && echo "$WJ_HARNESS/$d/$n$e"; done
+  done
+}
+
+cmd=${1:-}
+[ -n "$cmd" ] || { sed -n '2,13p' "$WJ_SELF" | sed 's/^# \{0,1\}//'; exit 0; }
+shift
+case "$cmd" in
+  -h|--help|help) sed -n '2,13p' "$WJ_SELF" | sed 's/^# \{0,1\}//' ;;
+  paths) node "$WJ_HARNESS/lib/paths.mjs" --sh | sed 's/^export //' ;;
+  ls)
+    for d in "${DIRS[@]}"; do
+      [ -d "$WJ_HARNESS/$d" ] || continue
+      printf '%-9s' "$d/"; (cd "$WJ_HARNESS/$d" && ls -p | grep -v / | grep -E '\.(mjs|py|sh|js)$' | tr '\n' ' '); echo
+    done ;;
+  doctor) exec node "$WJ_HARNESS/lib/doctor.mjs" "$@" ;;
+  selftest) exec bash "$WJ_HARNESS/lib/selftest.sh" "$@" ;;
+  reap) exec bash "$WJ_HARNESS/build/reap.sh" "$@" ;;
+  bg)
+    name=${1:?usage: wj bg <name> -- <cmd...>}; shift
+    dir="$WJ_RUNS/.bg"; mkdir -p "$dir"
+    if [ $# -eq 0 ]; then
+      if [ -f "$dir/$name.rc" ]; then echo "$name: exited $(cat "$dir/$name.rc")"
+      elif systemctl --user is-active --quiet "wj-$name"; then echo "$name: running (log $dir/$name.log)"
+      else echo "$name: unknown"; fi
+      exit 0
+    fi
+    [ "${1:-}" = "--" ] && shift
+    rm -f "$dir/$name.rc"
+    # A transient SERVICE, not --scope: a scope lives in the caller's session and dies with it (CLAUDE.md). A service
+    # starts from the user manager's environment, so carry this shell's whole environment across (MC_TASKSET, knobs...).
+    envargs=()
+    while read -r v; do
+      case "$v" in _|SHLVL|PWD|OLDPWD|BASH_FUNC_*|*[!A-Za-z0-9_]*) continue ;; esac
+      envargs+=("--setenv=$v")
+    done < <(compgen -e)
+    systemd-run --user --quiet --collect --unit="wj-$name" --working-directory="$PWD" "${envargs[@]}" -- \
+      bash -c '"$@" > "$0.log" 2>&1; echo $? > "$0.rc"' "$dir/$name" "$@"
+    echo "started wj-$name; log $dir/$name.log, exit code -> $dir/$name.rc" ;;
+  *)
+    mapfile -t hits < <(find_tool "$cmd")
+    if [ ${#hits[@]} -eq 0 ]; then echo "wj: no tool named '$cmd' (wj ls)" >&2; exit 1; fi
+    if [ ${#hits[@]} -gt 1 ]; then
+      echo "wj: '$cmd' is ambiguous, qualify it:" >&2
+      for h in "${hits[@]}"; do echo "  wj ${h#"$WJ_HARNESS"/}" | sed -E 's/\.(mjs|py|sh|js)$//' >&2; done
+      exit 1
+    fi
+    run_file "${hits[0]}" "$@" ;;
+esac

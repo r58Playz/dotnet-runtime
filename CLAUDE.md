@@ -24,8 +24,8 @@ exists because a previous pass got it wrong at real cost.
 | the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
 | **the GL stack: mesa-wink** | `~/Documents/android-wasm/mesa-wink`, branch `wink` (origin `mercuryworkshop/mesa-wink`): Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. `bash wink/build.sh --variant=mt --emsdk=$HOME/emsdk --test` builds it and runs its smoke suite in all three modes. Linked through ikvm-wasm-build's GLFW port (`tools/native-deps`: `build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`); gl4es, Krypton and MobileGL are gone. See **The GL stack** below |
 | IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm` — branch `wasm`, and it is CLEAN; the uncommitted IKVM-side work is in **ikvmcraft** (`loader/IkvmWasm.cs`, `loader/Transforms/Bench/`) |
-| measurement harness | `scratchpad/wj/` (see **The instruments**) |
-| **the running log — read before proposing anything** | `scratchpad/wj/MINECRAFT-FINDINGS.md` |
+| measurement harness | `wjharness/` (tracked; run tools as `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/{state,runs,notes}` -- see **The harness** |
+| **the running log — read before proposing anything** | `scratchpad/notes/MINECRAFT-FINDINGS.md` (untracked) |
 | chromium/V8 source, for checking claims about V8 | `~/Documents/chromium/src` (v8 at `src/v8`) |
 | split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
 | **the canonical emsdk** (3.1.56) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` — frozen from `~/fna-wasm/FNA-WASM-Build` (`emsdk*.patch`, applied by `freeze-emsdk.sh`). The app links `dotnet.native.wasm` against ITS cache (`IkvmWasm.csproj` `WasmCachePath`), so a libc/pthread/wasmfs question is answered there, not in this repo's `src/mono/browser/emsdk`. Patching a system-library source means rebuilding the archives that hold it (`embuilder build --force <lib>`, `EM_FROZEN_CACHE=0`) and redeploying. **embuilder CLEARS THE WHOLE CACHE first when `cache/sanity.txt` names a different toolchain path** (R502: 305 archives gone, publish then failed on `crtbegin.o`); rebuild with `freeze-emsdk.sh`'s embuilder list, which compiles the in-place patched sources |
@@ -53,7 +53,8 @@ comment that misleads.
    reason the reasoning was wrong are what stop the next reader re-running it, so they must survive --
    but in the log, cited from code by round (`/* ... see R258 */`). Keep in code only what a reader must
    know to edit the line in front of them: the invariant, the default, and the trap that is not visible
-   locally. When you evict a narrative from a comment, paste it into the log in the same commit.
+   locally. When you evict a narrative from a comment, paste it into the log in the same change (the log is
+   untracked, so nothing else carries it).
 6. **If you cite V8 behaviour, cite the file.** The source is checked out locally; "V8 probably..." is not a
    reason to ship anything.
 
@@ -160,8 +161,9 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   may enter the interpreter (`calls.c` `can_enter_interp`), and LLVM inlines small direct callees inside the image, so
   they never show in V8's perf map. Cutting IKVM.Java's profile to "what ran" cost 1.2 s of boot and to the hot set
   2.0 s; the same sets closed over direct callees (`call`/`newobj`/`ldftn`/non-virtual `callvirt`) cost nothing at 10.5%
-  of the profile. That closed list is what ships: ikvmcraft `aotprofile/ikvm_java.methods.txt`, regenerated with
-  `make aot-java-methods` (R499).
+  of the profile. No profile ships today: since ikvmcraft 6d1a3ed (2026-10-18) the AOT whitelist is CoreLib,
+  IKVM.Runtime, IKVM.ByteCode and System.Memory (`loader/IkvmWasm.csproj` `AOTWhitelist`), and IKVM.Java is not AOT'd. If
+  a profile comes back, close it over direct calls (R499's list was never committed).
 * **Nothing that blocks properly is safe at those sites.** `mono_thread_info_sleep(ms>0)` does
   `MONO_ENTER_GC_SAFE`, and *leaving* a GC-safe region is itself one of the rendezvous-drain call sites
   (`mono-threads-coop.c:435`) — so sleeping inside a JIT lock re-enters the drain from under a lock the
@@ -176,6 +178,8 @@ version (R233 add.4). If something surprising turns up, re-check against that tr
   `[IKVM lazybody] ... drainRefused finish= load=`: 12-14 loader calls refused per 26.2 boot, 0 hangs in 12 boots after.
   **Before adding work to the drain, check it cannot reach a Java loader or another type's Finish** -- FinishRelinkBatch's
   RelinkTarget (a default method's types) was such work, ran outside the guard, and hung 4 of 4 capped boots (R515).
+  `IKVM_LAZY_LOAD_STUCK`'s `LoadStuckDependencies` (default 0) is the same shape: it calls the entry's loader on the drain
+  thread BEFORE `InRelinkDrain` is set (`ByteCodeHelper.cs` ~892 vs ~909). Do not ship it as it stands.
 * **Managed stack walks ask V8 (R516, `exceptions-wasm-stackwalk.inc`, `MONO_WASM_STACKWALK_V8`).** mono's walker sees only
   the LMF chain -- interpreter segments and the EH records of methods WITH clauses -- so every JIT and AOT frame without
   clauses was invisible, and every consumer (CoreLib's StackFrame/StackTrace, IKVM's getCallerClass, StackWalker,
@@ -498,7 +502,7 @@ loads more than HotSpot would: HotSpot loads such a type only as a hot method's 
 (`Method::load_signature_classes`, `compileBroker.cpp:1426-1431` in jdk-25.0.4.1). Minecraft does not resolve it: the
 same knob moved the server tick -1.6% in cycles and the client -4.9%, every pair overlapping (R523 addendum, Q60, n=3).
 
-**Quote jbox2d from R440's protocol:** `j2d/run.mjs ours <dir> --no-perf --no-attr --schedule 600,200,60
+**Quote jbox2d from R440's protocol:** `wj j2d/run ours <dir> --no-perf --no-attr --schedule 600,200,60
 --window-batches 40,60` -- pinned to the P-cores (0-7), batches 41-60 of 60, because tier-2 compiles still land in a
 12-batch run's window (R416). `benchstats.mjs` reports the 12-batch mean and pins only with `MC_TASKSET` (on the E-cores the
 kernel reads ~1.9 ms/step): counters, not timing. **Before quoting any jbox2d or Minecraft timing, read its
@@ -538,7 +542,7 @@ Java has no `invokedynamic` for fields, which the `__field_NNNN` binders in the 
 
 **The client-thread gap is ~30x in instructions and 18.6x in CPU — MEASURED, not a floor (R240).** The old
 `>=11.1x` was a lower bound only because native was GPU-bound with unknown CPU cost. With `maxFps` capped so
-the GPU is unsaturated, a matched native harness (`scratchpad/wj/nativemc/`) gives:
+the GPU is unsaturated, a matched native harness (`wjharness/native/`) gives:
 
 | | ours | native | ratio |
 |---|---|---|---|
@@ -598,11 +602,11 @@ that is failing to keep up; the skip count does not. Where two arms complete the
 raw G instructions instead -- that is the only fully unconfounded row.
 
 **Re-derive this split on the build you are about to change** -- and pick the server tid EXPLICITLY.
-`nativemc/buckets.py` falls back to the `realize_glenv` marker when `--tid` is omitted, which selects the
+`native/buckets.py` falls back to the `realize_glenv` marker when `--tid` is omitted, which selects the
 CLIENT thread; dividing client instructions by TICKS silently reports a plausible number for the wrong
-thread. `nativemc/servertid.py` resolves it by which symbols the thread actually ran (both busy threads
+thread. `native/servertid.py` resolves it by which symbols the thread actually ran (both busy threads
 are named `DedicatedWorker`, so ranking by CPU does not identify them). Use
-`nativemc/buckets.py --ticks` and `nativemc/join.py --thread "Server thread"`. Two gotchas: the server tick is
+`native/buckets.py --ticks` and `native/join.py --thread "Server thread"`. Two gotchas: the server tick is
 **not actually 20 Hz for us** (376 of 2,406 ticks skipped in a window; native skips zero), and `join.py` must
 select the ONE tid perf counted — three threads are named `Render thread`.
 
@@ -718,7 +722,7 @@ calls.
 **The call infrastructure, EXECUTED, on the server thread (R290, PEBS, 2026-09-22, 152.1 M instr/tick): 35.7%
 of the thread** -- our prologue band 10.6% (the `s.p` read chain, write-back, frame zeroing, first pin),
 dynamic-index `call_indirect` 9.4%, constant-index `call_indirect` 5.9%, V8 frame pro/epilogue 5.2%, near-call
-spills ~2.4%, import calls 1.9% -- plus 12.2% in the JIT tier's own helpers. `scratchpad/wj/callinfra.py` is the
+spills ~2.4%, import calls 1.9% -- plus 12.2% in the JIT tier's own helpers. `wj callinfra` is the
 instrument (`--band-split` splits the prologue, `--edges` dumps callee/caller/form). Split of the prologue band
 on the all-levers build (R294): **the `s.p` imported-mutable-global chain alone is 8.3 M/tick = 6.1%**, frame
 zeroing 2.95 (plus `memory.fill` for frames over 64 B, outside the band). **Two corrections this made:** R269
@@ -843,7 +847,7 @@ limiter lifted: 169-185 fps, the client 18.7-20.6 M cycles a frame (j2d/w7, n=5)
   the VAO binding and the whole fog state itself. Every 240 swaps the log reads `wink: the GL thread waited for the main
   thread N times a frame (by GL call and pname) ...; read live M` -- in game N should be ~0 and M MUST be 0. A new
   per-frame query in a mod shows up there by name; answer it in glthread rather than accept the wait.
-* **The canvas must not be transferred** in that mode: `scratchpad/mcsr/deploy.sh`'s post-publish patch decides it (the
+* **The canvas must not be transferred** in that mode: `wjharness/build/deploy.sh`'s post-publish patch decides it (the
   Makefile has a copy that deploy does NOT run) and must test `window.WINK_GL_MAIN`; deploy refuses without it.
 * **gex_wgpu keeps no CPU copy of a GPU buffer by default.** It adopts one only for indirect command buffers and buffers
   of 64 KiB or less (`GEX_WGPU_ADOPT_SHADOW`): without it, every Sodium `glMultiDrawArraysIndirect` was a GPU readback.
@@ -885,7 +889,7 @@ A plain `./build.sh mono` is NOT that build and its pack has to be hand-patched.
 Then **deploy it**, which is a separate step and is not optional:
 
 ```
-scratchpad/mcsr/deploy.sh '<a string constant your change added>'                    # ~12 min
+wjharness/wj deploy '<a string constant your change added>'                         # ~12 min
 ```
 
 Copying the zip over `statics/dotnet.zip` is not a deploy — the bytes the page loads are
@@ -899,7 +903,7 @@ change adds no string, add a verbose-gated `printf` on the path it changes; that
 the new behaviour. If a change is a REVERT, prove it both ways — the new marker present *and* the reverted
 build's marker absent (`grep -ac` on the served wasm).
 
-Before either, `scratchpad/wj/csyn.sh <file>` compiles one source file with the real command line in under a
+Before either, `wj csyn <file>` compiles one source file with the real command line in under a
 second. It checks both compilation databases, which matters: `mini-wasm.c` builds twice, with and without
 `HOST_BROWSER`.
 
@@ -1109,11 +1113,8 @@ confound that IS real — preflight refusing an arm for that is worth obeying.
 spawned process handle, so `setsid` + `disown` does **not** protect the work — the real work must live in a
 cgroup the handle has no reference to.
 
-```
-systemd-run --user --quiet --unit=<name> --working-directory=<dir> -- bash -c '<work>; echo $? > <sentinel>'
-```
-
-then poll the sentinel. **Use a transient SERVICE, not `--scope`**: a scope runs in the calling process's
+`wj bg <name> -- <cmd...>` does this (a transient `systemd-run --user` service carrying the shell's environment; log
+and exit code in `$WJ_RUNS/.bg/<name>.{log,rc}`, `wj bg <name>` for status) -- then poll the sentinel. **Use a transient SERVICE, not `--scope`**: a scope runs in the calling process's
 session and dies with the invoking shell exactly as `setsid` does. **And do not rely on a backgrounded watcher
 for notification** — a `run_in_background` watcher is killed after ~5 minutes while the unit it watches runs
 to completion. Put the WORK in the unit and use a direct sentinel check as the backstop.
@@ -1201,7 +1202,7 @@ the vret pointer into the C frame first (which also pins them) and restoring the
 is one call's until that call has copied it out; between the spill and the copy nothing may run managed code, or the
 copy must be taken first.** The instruments that found it -- `MONO_GC_HEADER_AUDIT=1` (kept: 32-byte headers checked at
 each collection's start and end, the low-byte face repaired and named with the slot before it) and `MONO_GC_STORE_WATCH=1`
-(removed; `git apply scratchpad/wj/r500-instruments.patch`: names the interpreter or JIT store into a watched object's
+(removed; `git apply scratchpad/state/patches/r500-instruments.patch`: names the interpreter or JIT store into a watched object's
 trailing bytes, with the method and a JS stack) -- are written up in MINECRAFT-FINDINGS.md R500.
 
 **Two mechanisms have been fixed that could produce this; NEITHER is confirmed as the cause.**
@@ -1248,150 +1249,55 @@ re-extracting `statics/emsdk.zip` reverts them.
 * **An intervention against an intermittent fault needs a POSITIVE CONTROL.** At ~33% incidence, four
   consecutive clean runs mean little; run the control arm too.
 
-## The instruments
+## The harness: `wjharness/` is code, `scratchpad/` is data
 
-Everything below is in `scratchpad/wj/` and is **untracked** — treat the tools as valuable and the captures as
-disposable. Start with these rather than `perf report`, which takes minutes per query on these captures.
+The measurement harness is tracked in `wjharness/` and runs as `wjharness/wj <tool>` (`wj ls`; the tool tables are in
+`wjharness/README.md`). Start with its readers, not `perf report`, which takes minutes per query on these captures. Its data
+root, `$WJ_HOME` (default `scratchpad/`, excluded via `.git/info/exclude` -- never add it), is NOT RECOVERABLE and has three
+parts with different rules:
 
-### Drivers — run a real workload
+* **`state/`** -- persistent; `wj reap` refuses it at any depth. `seeds/` are browser profiles holding Minecraft, the mods,
+  `options.txt` and a save in OPFS, reflink-copied for every run. **They are load-bearing**: without one the app
+  re-downloads Minecraft inside the boot phase and boot measures the network, each is a user's OPFS export that cannot be
+  rebuilt without its tar, and one was deleted once by a cleanup. `refs/` holds captures later rounds compare against
+  (`j2d-r440-ss`, ...), `arms/` the built reference arms (TeaVM, CheerpJ jars, the jvmti agent, replaced IKVM.Runtime
+  DLLs), `native/` the native reference's staging, `corpus/` the archived run logs `lib/verdict.mjs` is validated against,
+  `patches/` instrument patches kept for re-application.
+* **`runs/<date>-<tag>/`** -- every driver's output, disposable by construction. A driver refuses an output directory
+  inside `wjharness/`. **A round's launcher lives in its run directory**; a script a second round needs is promoted into
+  `wjharness/`, made portable and committed.
+* **`notes/`** -- `MINECRAFT-FINDINGS.md`, untracked.
 
-**Every driver now drives the launcher and takes a seed (R514).** Since ikvmcraft 246560a the page shows a launcher and
-nothing boots until Play; `lib/mcdrive.mjs` `driveLauncher` types the seed's version pair and presses it. A seed
-(`lib/seeds.mjs`: `mcsr` (default, 1.16.1), `165`, `262u`, `262b`, `262p`) carries its profile, version, title/join
-lines, menu keys, save+quit Tab count and benign log lines; pick one with `--seed NAME` or `MC_SEED`. Phases `boot.toframe`
-(Play -> first frame, the first `Reloading ResourceManager`) and `boot.reload` are measured from the `play` mark.
-Use `262p` (peaceful copy of 262b) for in-game windows. Details: `MINECRAFT-HARNESS.md`, "Seeds, versions and the launcher".
+Data a round cites as `j2d/<name>`, `p<NN>`, `r<NNN>` is under `scratchpad/legacy/wj/` until deleted; the kept ones are
+`state/refs/j2d-<name>`.
 
-| tool | what it does |
-|---|---|
-| `worldwait.mjs` | **The current default for fault and counter batches.** `--runs N --stats --bench-ms N --knob K=V`; drives boot -> world -> in-game, prints per-run `faults=[...]`, the admit/tier line, partition and memory sampling |
-| `mcab.mjs` | Interleaved A/B over full Minecraft with the variance made explicit instead of assumed away. `--cooldown-ms` |
-| `mcbench.mjs` | Wall-clock A/B, one fresh isolated browser per run. `--stats --dumps` to reach `dumpWasmJit()` |
-| `mcperf.mjs` | Non-interactive perf capture of ONE run, sliced into the three phases. `--warm-ms` matters |
-| `bootcheck.mjs` | Boot-only PASS/FAIL for one configuration, ~2 min instead of ~9. Marker times from Play; `--keep-going` for timing runs, `--stall-s` (default 120 s of app silence = STALL), `--dump-on-stall` (mono thread dump + /proc snapshot), `--jprop`, memory at the title |
-| `boot/abboot.sh` | Interleaved (ABBA) bootcheck arms -> `boots.tsv` (first frame, title, heap at title). The boot A/B tool |
-| `arm.sh` | One arm of a boot-crash A/B: N sequential bootchecks under one knob set, reported as crashes/valid |
-| `j2d/run.mjs` | **The jbox2d timing tool** (R416-R440): one run of `ours` / TeaVM / HotSpot arms, pinned to 0-7, `--schedule` + `--window-batches` for the steady-state protocol (see "How far off native"), `--no-perf` for timing alone, `--knob K=V`, `--dumps` |
-| `bench.mjs`, `benchseeded.mjs`, `benchstats.mjs` | The jbox2d fixed-work kernel — low variance, checksum-gated, the right tool for a within-binary A/B and for cross-VM reference rows. `benchstats` captures the JIT's own stats lines; its `mean` is the 12-batch mean and it pins only with `MC_TASKSET`, so it is not a timing tool. `benchstats` and `j2d/run.mjs` press the launcher's Play (`driveLauncher`); before 2026-10-31 neither did, and every jbox2d run since the R514 launcher produced nothing. `bench.mjs` and `benchseeded.mjs` still do not |
-| `perfrun.mjs` | Perf capture of one **jbox2d** bench run, producing the `.jitted` file the pattern/size readers take (the kernel-workload counterpart to `mcperf.mjs`) |
-| `seedbuild.mjs` | Rebuild `scratchpad/mcsr/seed` (see Housekeeping), or make another seed: `--dest mcsr/seed-X --tar /X.tar` from an OPFS export copied into the dev server's `frontend/public` (delete it after), then register it in `lib/seeds.mjs` |
-| `serve-coep.mjs` | Minimal static server with COOP/COEP headers |
-| `nativemc/natrun.sh`, `natstat.py` | **The native reference.** Drives native OpenJDK Minecraft on the MATCHED Prism instance (same save, mods sha256-identical) and reports **M instructions/frame** per thread, the same metric as our side. `EXTRA_JAVA=` for ablation arms (`novirt`, `noinl`). Read its README before use: three defects in the old `jvminline.sh` and two Xwayland traps are documented there, and `results/HARNESS-DEFECTS-2026-09-11.md` for the five that were live in these tools until R244 |
-| `nativemc/join.py`, `split.py` | Per-method join of an async-profiler collapsed profile against our census, on IKVM-preserved Java names; and the bucket split by whether a method exists on native at all. `--thread "Server thread"` selects the clean instrument. **Both resolve the ONE tid perf counted out of the sibling `perf.txt`** — three threads are named `Render thread` and pooling them deflated every native figure 16.7% (R244) |
-| `nativemc/buckets.py` | **Per-BUCKET instructions/frame (or per tick) for one of our threads, against native's WHOLE frame.** The framing that stops a 7%-of-thread pool reading as small. Refuses to run on a task-clock capture. `--show <bucket>` prints a bucket's symbols — **use it before quoting the table**; it found six classifier misses on its own first run |
-| `jvminline.sh`, `jvmfps.py` | **SUPERSEDED by `nativemc/`** — it reports fps (unusable) and its in-world gate polls `wpstateout.txt`, which state-output 1.2.3 never creates, so it can never pass |
-
-### Capture readers
-
-| tool | what it does |
-|---|---|
-| `perfraw.py` | **Primary.** Parses `perf.data` directly (0.6 s for 299 MB), resolves against the `--perf-basic-prof` map or the jitdump, and **reads the call chains**. `--phase ingame --by-thread --inclusive`, `--tid N`, `--marker SYM`, `--tsv`. Handles fixed-period captures (`perf record -c N`), whose sample_type omits PERIOD and shifts the callchain 8 bytes. **`PERFRAW_DSO_SYMS=1` names native samples** (`DSO:<path>!<function>`): chromium ships stripped and Arch's debuginfod serves its `.symtab` by build-id -- without it the chromium share (WebGPU, Blink, V8 runtime) is one opaque bucket |
-| `hotinsn.py` | Resolves each sample to the exact x86 instruction. `--bands` (prologue vs body), `--dispatch`, `--kind ours\|aot\|v8`, `--feeder` (splits the `add %r14,reg` decompression pool by what fed it — the `s.p` attribution). **Run `--selftest` before quoting a feeder number** |
-| `callform-x86.py` | Disassembles `call *` sites out of a jitdump and groups them by what the preamble CONTAINS. Use this whenever a claim depends on telling `call <import>` from `call_indirect` — only the latter has the table bounds check |
-| `codegencensus.py`, `spillsites.py` | What KIND of instruction the hot set spends bytes on; where inside a hot method TurboFan spills |
-| `pattern.mjs`, `split.mjs` | Program-wide attribution by EMITTER CONSTRUCT; subsystem split of steady-state time |
-| `mcreport.mjs`, `mccause.mjs`, `mcdiff.mjs` | Per-phase attribution (thread / binary / subsystem); inclusive cost of a cause and who is responsible; compare two CAPTURES for changes no knob can toggle |
-| `symclass.py`, `lib/symclass.mjs`, `jitsym.py` | Symbol classes from a `perf report` dump; the classifier library; resolving samples against a jitdump without `perf inject` |
-| `jitdumpsize.py`, `pairsize.py` | Emitted x86 size per JIT'd function; paired RyuJIT-vs-ours x86 size for the SAME method |
-| `gcshare.py`, `windecay.py` | STW GC share of the window; whether fps plateaus or keeps sliding |
-| `stabslice.py` | **Where the server tick stabilises and whether a shorter window measures the same thing** (R418): instructions per tick in slices from world join (`--trace`), and per-window means against the full window (`--wins`). The evidence behind protocol Q60; re-run it on a new world/mod set |
-| `offcpu.sh`, `offcpu.mjs`, `threadwait.mjs` | Off-CPU attribution during the in-game window; per-thread run / runqueue-wait / sleep accounting and what each thread waited on |
-| `stallcatch.sh` | Capture perf until a STALLED world.generate lands |
-| `replaylogs.mjs` | Re-derive phases from ARCHIVED logs using the driver's own markers — no re-run needed |
-| `memtrace.mjs`, `workerheap.mjs` | Parse a chromium memory-infra trace; per-worker JS heap snapshots |
-
-### Tier dumps and static analysis
-
-| tool | what it does |
-|---|---|
-| `wasmtier.mjs` | Snapshots the ENTIRE tier (~24-30k modules) as emitted bytecode over one automated run. Passes `dumps: true`, so **one run yields BOTH the call-form reach and the counter census** — pairing a reach number with a census from a different run is the same confound as a cross-binary reading |
-| `vcallreach.py` | Static virtual-dispatch census over a tier dump: sites split into Delegate.Invoke vs ordinary virtual, how many carry a devirt arm, and **what call form each arm dispatches with**. Self-validating — every body must decode to exactly its declared end, so **report the "undecoded" count**; a non-zero one means the rest is meaningless. This, not `hotinsn`, is the tool for "did a change alter call forms" |
-| `devirtreach.py`, `wjpatterns.py` | Static devirt COVERAGE over a dump; what share of module-local calls could V8 inline |
-| `tiershape.py` | **The refactor gate.** Per-method STRUCTURAL identity between two dumps (opcodes, type/function/local indices, branch depths, run-dependent immediates blanked). **Noise floor is ~0.7%, NOT the 0.15% this table used to claim** — measured 2026-09-11 against a same-binary CONTROL: **158 of 22,816** common methods differ between two runs of ONE binary. The old figure (18 of 12,291) is stale because the tier nearly doubled, and more methods means more callees that JIT in one run and not the other. **ALWAYS run a same-binary control pair alongside the A/B**: at 0.15% a verified-inert refactor reads as a 4x failure (R241 measured 0.63% against a 0.69% control). Also pass `--show` large — it prints ~20 diffs and truncates, and the visible ones are not a representative sample |
-| `tierid.py` | Per-method BYTE identity, as a SET comparison (a method can be emitted more than once per run, so one name maps to a set of hashes and two runs agree when the sets are equal). Complement to `tiershape.py`, not a replacement — a naive byte-identity gate does not work |
-| `tierdiff.py`, `tiergraph.py` | Aggregate shape between two dumps; duplication/fragmentation structure of the tier |
-| `bodysize.py`, `inlinable.py`, `bytecost.mjs`, `depcycles.py` | Per-function wire size and the share under V8's 500 B inline cap; how many sites batching made inlinable; whether module SIZE costs anything or only COUNT; co-location admission cycle sizes |
-| `memsplit.mjs` | Splits our memory traffic into GC-shadow-frame vs real heap field/array access |
-| `compare.mjs` | Side-by-side codegen: our output vs TeaVM wasm-gc for the same Java source (`~/Documents/ikvm-wasm/teavm`) |
-
-### Live telemetry over CDP
-
-| tool | what it does |
-|---|---|
-| `sigtrap.mjs` | **Catches `function signature mismatch` IN THE ACT and reads the function table at the faulting slot.** The right first instrument for any f-slot/placeholder trap |
-| `trace-exceptions.mjs` | Fully headless CDP exception tracer |
-| `callform.mjs`, `profstat.mjs` | Call-form census / call-profile telemetry read at titleReady |
-| `jitcov.mjs`, `statsdump.mjs` | What registered, what bailed, what is blocking islands; counters before/after the timed batches |
-| `patchstats.mjs` | Per-isolate guard-free-adapter install tally (`globalThis.__wj_patch_stats`) |
-| `ringprobe.mjs` | Census of OUTBOUND interp-residual callees, deduped on the ring's monotonic index. The ring holds 128 entries against ~58 residuals/step, so **read the SHAPE, not totals**. Requires `MONO_WASM_JIT_STATS=1` |
-| `lcsereach.mjs` | LCSE reach across the warmup boundary |
-| `console.mjs` | Dump matching console output of one run (for `DUMP_IR` / `VERBOSE` / `STATS` output) |
-
-### Gates and hygiene
-
-| tool | what it does |
-|---|---|
-| `csyn.sh` | One-file syntax check with the real build's command line, both compilation databases. Sub-second. **Does NOT link** — see the build section |
-| `lib/verdict.mjs` | **The fault taxonomy and the run verdict, shared by every driver.** 14 classes each with a STABLE KEY, so batches are comparable: a mono assert is `mono-assert:loader.c:1826`, not an anonymous `fault`. `selftest()` runs real signatures taken from archived logs |
-| `faultcensus.mjs` | Per-class fault census over the archived corpus (`--since`, `--json`). **`--disjoint` runs the disjointness invariant over all ~3,500 real logs**, which is what catches the classifier bugs a sample-based selftest cannot: the sample test passed while five were live |
-| `depcheck.py` | **The admission-contract gate.** `depcheck.py <graph.log> <dump.wat\|dir>` — every f-slot BAKED into a body against every f-slot a descriptor DECLARES. An undeclared one is unadmittable by construction and becomes a `function signature mismatch` on the first worker that reaches it (R285). **Both inputs must come from ONE run** — f-slot numbers are per-run — and it REFUSES below a 25% ownership ratio rather than reporting a cross-run pairing as clean. `wasmtier.mjs --depgraph` emits both from one run |
-| `reap.sh` | Dead-pid `/tmp/perf-*.map`, orphaned profiles, v8 isolate logs. Refuses to run if the seed profile is missing. `--apply` to act; dry-run by default |
-| `enctest/run.sh` | Host-side encoder gates in seconds. t1/t2 diff against frozen framers, t3 is the serializer round-trip, **t4 is structural** — it checks the assembler at `nexport < nmembers`, which t1/t2 cannot reach; t5 re-framing, t6 branch hints, **t7 frames lazy stub banks and EXECUTES them in node** (tail-call bind, interpreter leg, throw, the i32 pin frame). Run it before believing anything else about the encoder |
-| `killdaemons.sh` | Kills leftover Roslyn/MSBuild build servers using preflight's own match, safely. Exit 0 = safe to measure. Run before every measurement |
-| `wjcsync.py` | Re-index the JS counter mirror after `WJC_*` entries change in the C enum. **Use this instead of hand-editing the mirror in `lib/mcdrive.mjs`** |
-| `lib/preflight.mjs` | Refuses to measure on a box that is unfit (thermal, CPU contention, build daemons). Obey the refusal |
-| `lib/` | `mcdrive.mjs` is the Minecraft driver (launch, seed, phases, counters, memory/partition sampling, knob plumbing); `browser.mjs` is chrome/CDP for the jbox2d-era tools; also `provenance.mjs`, `thermal.mjs`, `wasmnames.mjs`, `debuginfo.mjs` |
-
-**That gap is CLOSED**: a `MONO_WASM: forcing abort` (and every other class `verdict.mjs` marks terminal —
-`js-oom`, `em-abort`, `renderer-crash`, `wasm-link`) now ends the run immediately instead of sitting out
-the 420/480 s budget, so one abort no longer takes the rest of the batch with it. A wasm TRAP deliberately
-still does not abort the run: a worker can die and the run go on to produce a complete window.
-
-## Housekeeping
-
-`scratchpad/` is excluded via `.git/info/exclude`, not `.gitignore` — it holds tens of GB of captures and must
-never be added. **It is also not recoverable**: a deleted tool is gone. Chrome profile dumps are ~1 GB each and
-jitdumps ~4 GB; keep the newest of each kind and delete the rest. Do not commit `*.orig-backup` files.
-
-**`/tmp` is a 7.7 G tmpfs, i.e. RAM, and `--perf-basic-prof` writes a ~240 MB `/tmp/perf-<pid>.map` per
-run.** Nothing used to remove them: 100 stale maps = 4.9 GiB left 2.7 G free, and runs then died at PAGE
-LOAD — before any app code — so it read as a browser bug or a flaky deploy, and two arms were nearly
-blamed on the change under test (R280f). Now handled at three levels, and all three are needed:
-`runSession` drops the maps of every process under its profile at teardown (before `game.kill()`, so the pids still
-resolve; the renderer alone used to be dropped, and its small siblings' maps leaked 340 files in a day) unless a spin
-capture needs them; `scratchpad/wj/reap.sh` sweeps dead-pid maps, orphaned profiles and v8
-isolate logs, and **REFUSES TO RUN if `scratchpad/mcsr/seed` is missing**; and `preflight` gates on
-ABSOLUTE free bytes in `/tmp`, not a percentage — R280f happened at 64% full, under the old 70% threshold.
-
-**A diagnostic that is free per run is not free per batch.** This harness has produced that failure twice
-from two directions (jitdumps at ~4 GB, symbol maps at ~240 MB), and turning on `--perf-basic-prof` by
-default took `/tmp` from 62 MB to 741 MB in three runs before the teardown fix. Anything written per run
-into a RAM-backed filesystem needs an owner at teardown, not a periodic sweep — a sweep only helps if
-someone remembers, and the failure it prevents does not look like a disk problem.
-
-**`--perf-basic-prof` and `--perf-prof` imply `--log`** (`v8/src/flags/flag-definitions.h:4516-4517`), and V8's
-default per-isolate log file then drops an `isolate-<addr>-<pid>-v8.log` per isolate (~64 per run) into the
-browser's CWD -- 8,103 had piled up in `scratchpad/wj`, more in the repo root. Every launcher now passes
-`--no-logfile-per-isolate --logfile=+` (`lib/mcdrive.mjs` `launchGame`, `j2d/run.mjs`, `perfrun.mjs`): `+` is an
-already-unlinked `tmpfile()`, and the perf map / jitdump are separate listeners, unaffected. **A new launcher that
-passes either perf flag must pass the pair too.**
-
-**Browser profiles:** ~1 GB per run, reflink-copied from the seed. `reapProfile` drops them on a clean
-run and **KEEPS them on a failure**, where they hold the OPFS save and the crash-time state and are the
-only copy. 340 of them (333 GB apparent) had accumulated in `mc-out` plus 40 in `/var/tmp`.
-
-`perf inject` is opt-in (`--inject`), not implied by `--jitdump`: every python reader here parses the raw
-jitdump directly, inject's success path DELETES those dumps, and it was measured still running at 8m20s on a
-3.1 GB dump. Capture size 9.2 GB -> 4.2 GB with it off.
-
-`perf` also **silently mis-attaches**: one capture produced a 0.3 MB / 3,967-symbol map and 133 samples where a
-good run has ~206 MB / ~2.0M, and it reads as a valid low-overhead run (its fps was the highest of the night).
-**Gate on the symbol-map size.**
-
-**`scratchpad/mcsr/seed` is load-bearing and is NOT crash-harness leftovers.** It is a ~690 MB browser profile
-holding Minecraft 1.16.1 + Fabric, the mods, `options.txt` and the "New World" save in OPFS. `mcdrive.mjs`
-reflink-copies it for every run; without it the app re-downloads Minecraft *inside the boot phase* and boot
-measures the network. It is easy to mistake for junk because it sits in the otherwise-dead `mcsr/` directory —
-it was in fact deleted once during a cleanup. Rebuild with `node scratchpad/wj/seedbuild.mjs` (~1 minute; the
-dev server must be up). The same holds for every `mcsr/seed-*` profile `lib/seeds.mjs` names (seed-165, seed-262u,
-seed-262b, seed-262p): each is a user's OPFS export and is not regenerable without the tar.
+* **No tool names a machine.** Locations come from `wjharness/lib/paths.mjs`: the environment, then
+  `~/.config/wjharness/machine.env` (template `wjharness/machine.env.example`), then autodetection. A tool that needs an
+  unconfigured checkout refuses and names the key. `wj doctor` reports what is missing; `wj selftest` (seconds: syntax,
+  the verdict and hotinsn selftests, enctest, and a gate that fails if any tool names this machine's paths) is the check to
+  run after editing the harness. CPU sets are `WJ_PCPUS` (an arm's pin: the P-cores here), `WJ_CENSUS_CPUS`,
+  `WJ_BOOT_CPUS`; the raw-code perf event sets (`hwrun`, `natrun`, `fe/events.sh`) refuse on a CPU they were not written for.
+* **Before measuring, `wj fit`** (dev server up, `killdaemons`, preflight passing). **Long work under `wj bg`.**
+* **Only `wj reap` deletes** (dry run by default): dead-pid `/tmp/perf-*.map`, old profiles in `runs/`, isolate logs.
+  `/tmp` is a RAM-backed tmpfs and `--perf-basic-prof` writes a ~240 MB map per capture: 100 stale ones left 2.7 G free and
+  runs died at PAGE LOAD, reading as a browser bug (R280f). Anything a run writes into a RAM-backed filesystem needs an
+  owner at teardown (`runSession` drops its maps), not a periodic sweep.
+* **`--perf-basic-prof` and `--perf-prof` imply `--log`** (`v8/src/flags/flag-definitions.h:4516-4517`), which drops an
+  `isolate-*-v8.log` per isolate into the browser's cwd. A new launcher that passes either must pass
+  `--no-logfile-per-isolate --logfile=+` too.
+* **A failed run keeps its browser profile**: it holds the OPFS save and the crash-time state and is the only copy.
+* **A terminal fault ends the run** (`MONO_WASM: forcing abort`, `js-oom`, `em-abort`, `renderer-crash`, `wasm-link` --
+  `verdict.mjs`), instead of sitting out the budget; a wasm TRAP does not, because a worker can die and the run still
+  produce a complete window.
+* **`perf inject` is opt-in** (`mcperf --inject`): the python readers parse the raw jitdump, and inject's success path
+  deletes it. **perf silently mis-attaches** (a 0.3 MB map and 133 samples read as a valid low-overhead run): gate on the
+  symbol-map size.
+* **Whole-process captures on this hybrid part use `task-clock`, not `cycles`**: `cycles:u` opens on `cpu_core` only and
+  every sample from a thread on an E-core is silently missing. Per-thread hardware censuses pin to the P-cores instead.
+* **Chromium's own frames need debuginfod, by build-id**, and a distro keeps only a window of versions: a capture against a
+  chromium whose debuginfo is gone stays `[unknown]` forever (`lib/debuginfo.mjs`, `PERFRAW_DSO_SYMS=1`).
+* **`--marker` checks the managed assemblies too** (`lib/provenance.mjs`): markers match raw bytes, so a method or type
+  name works for IKVM.Runtime, an env-var name does not (it is UTF-16 in `#US`) -- compare the served DLL's sha256 instead.
+* **World generation varies ~3x on an unchanged build, and in-game fps is comparable only once the server has caught
+  up** (`mcdrive` waits and records whether it settled); `mcab` refuses a verdict at `--rounds 1`.
+* Do not commit `*.orig-backup` files.
