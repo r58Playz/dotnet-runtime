@@ -875,6 +875,15 @@ int mono_wasm_jit_eh_jtab = 0;
  * with a 2 MB nursery (shipped 64 MB): 0 -> mono-assert class-accessors.c:90 in 3 of 5, 1 -> 0 of 5 (two of them with a
  * collection inside the window); findings log, round B2. */
 int mono_wasm_jit_exc_pin = 1;
+/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): inline methods with exception clauses, importing their clauses into
+ * the root (method-to-ir.c WjEhInst). A bitmask: 1 = finally/fault callees, 2 = catch callees, 4 = a root without
+ * clauses of its own may gain them (it then pays the EH record and loses the clause-free emitter paths), 8 = tier 1
+ * too, 32 = cold handlers (an inlinee's catch/fault handler IL is not charged to its inline size or cost, and calls in
+ * it are not inlined), 64 = the negative control: inlinee clauses left out of the runtime table (tests only; it must
+ * change an EH corpus's checksum). Needs EH_JTAB bit 1 and EH_REC (mini.c). */
+int mono_wasm_jit_eh_inline = 0;
+/* MONO_WASM_JIT_EH_INLINE_MAXCL: the most clauses a root may hold with its inlinees' added */
+int mono_wasm_jit_eh_inline_maxcl = 32;
 /* MONO_WASM_JIT_AOT_BYREF (R356): the emitter's inline direct-AOT call also takes callees with byref PARAMETERS (the
  * ByteCodeHelper volatile/CAS helpers IKVM emits for every Java volatile/atomic access), instead of routing them
  * through the JIT->interp residual. p79 b t t b, server tick: the residual route 1.99 -> 0.58 M instr and 2.18 ->
@@ -1127,6 +1136,8 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_exc_pin, "MONO_WASM_JIT_EXC_PIN", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_eh_inline, "MONO_WASM_JIT_EH_INLINE", 0, 0x7f)
+	WJ_T2_KNOB (mono_wasm_jit_eh_inline_maxcl, "MONO_WASM_JIT_EH_INLINE_MAXCL", 0, 4096)
 	WJ_T2_KNOB (mono_wasm_jit_aot_byref, "MONO_WASM_JIT_AOT_BYREF", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aot_static_unbox, "MONO_WASM_JIT_AOT_STATIC_UNBOX", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_unit, "MONO_WASM_JIT_T2_UNIT", 0, 2)

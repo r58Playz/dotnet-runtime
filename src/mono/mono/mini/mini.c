@@ -1824,6 +1824,11 @@ mono_destroy_compile (MonoCompile *cfg)
 {
 	mono_empty_compile (cfg);
 
+	/* plan zany-beacon E1: cfg->header may be a mempool clone carrying inlinee clauses; free what was fetched */
+	if (cfg->wasm_eh_orig_header) {
+		cfg->header = cfg->wasm_eh_orig_header;
+		cfg->wasm_eh_orig_header = NULL;
+	}
 	mono_metadata_free_mh (cfg->header);
 
 	g_hash_table_destroy (cfg->spvars);
@@ -3300,6 +3305,7 @@ static __thread gboolean wasm_jit_policy_t1_only;
 /* plan2x S0b: set by mono_wasm_force_compile's strict retry (MONO_WASM_JIT_T2_STRICT). */
 static __thread gboolean wasm_jit_policy_t2_strict G_GNUC_UNUSED;
 static __thread gboolean wasm_jit_policy_no_gi2 G_GNUC_UNUSED;   /* R411: retry a tier-2 body without bimorphic GI */
+static __thread gboolean wasm_jit_policy_no_ehinl G_GNUC_UNUSED; /* plan zany-beacon E1: retry without EH inlining */
 
 static guint32
 wasm_jit_extra_opt (void)
@@ -3614,6 +3620,17 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
 						cfg->wasm_gi_size = 0;
 					}
 				}
+			}
+			/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): may this compile inline methods with exception clauses?
+			 * Bits 1/2 name the clause kinds (method-to-ir.c wj_eh_inst_begin); tier 2 always, tier 1 with bit 8 (where
+			 * an inlinee that keeps a call is still abandoned, as every tier-1 inline is). Inlinee clauses live only in
+			 * this body's own table, so exception pass 1/2 must read it (EH_JTAB bit 1), and the table reaches the
+			 * runtime through the EH record (EH_REC). Off for force_compile's retry below. */
+			{
+				extern int mono_wasm_jit_eh_inline, mono_wasm_jit_eh_jtab, mono_wasm_jit_eh_rec;
+				if ((mono_wasm_jit_eh_inline & 3) && (mono_wasm_jit_eh_jtab & 1) && mono_wasm_jit_eh_rec &&
+				    !wasm_jit_policy_no_ehinl && (cfg->wasm_jit_tier >= 2 || (mono_wasm_jit_eh_inline & 8)))
+					cfg->wasm_eh_inline = TRUE;
 			}
 #endif
 			/* Opt-in: emit llvmonly indirect-dispatch IR (ftndesc) for virtual/interp calls.
@@ -4626,6 +4643,25 @@ mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
 	}
 	cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
 #ifdef HOST_BROWSER
+	/* plan zany-beacon E1: a compile that imported inlinee clauses and then failed permanently is recompiled ONCE
+	 * without EH inlining -- an inlinee's shape must never cost the root its tier. Deterministic (the retry imports no
+	 * inlinee clause), so it cannot loop, and never marked retriable. */
+	if (cfg && cfg->wasm_eh_ninst > 1 && cfg->wasm_jit_result.e_slot <= 0 && !cfg->wasm_jit_result.retriable) {
+		extern void mono_wasm_jit_count (int idx);
+		static gint32 ehinl_retry_prints;
+		/* what the inlinee shape broke: the first 16, field reads only (fail_reason is a static literal) */
+		if (mono_atomic_inc_i32 (&ehinl_retry_prints) <= 16)
+			printf ("[wasm-jit ehinl] retry %s.%s:%s instances=%d after: %s (bail %d)\n", m_class_get_name_space (method->klass),
+				m_class_get_name (method->klass), method->name, cfg->wasm_eh_ninst - 1,
+				cfg->wasm_jit_result.fail_reason ? cfg->wasm_jit_result.fail_reason : "?", cfg->wasm_jit_result.bail);
+		mono_destroy_compile (cfg);
+		mono_wasm_jit_count (WJC_EHINL_RETRY);
+		wasm_jit_policy_no_ehinl = TRUE;
+		cfg = mini_method_compile (method, 0, (JitFlags) (JIT_FLAG_RUN_CCTORS | JIT_FLAG_WASM_FORCE), 0, -1);
+		wasm_jit_policy_no_ehinl = FALSE;
+		if (cfg && cfg->wasm_jit_result.e_slot > 0)
+			mono_wasm_jit_count (WJC_EHINL_RETRY_OK);
+	}
 	/* R411: a tier-2 body that took bimorphic-GI arms and came out over T2_MAX_BODY is retried ONCE at tier 2 without them
 	 * (qb g0: LivingEntity.tickMovement went 90,851 B -> over the cap -> tier 1). Deterministic, so it cannot loop. */
 	if (cfg && cfg->wasm_jit_tier >= 2 && cfg->wasm_gi2_n > 0 && cfg->wasm_jit_result.e_slot <= 0 &&
