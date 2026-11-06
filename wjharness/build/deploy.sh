@@ -176,9 +176,11 @@ if [ "${#WS[@]}" -gt 1 ]; then
 fi
 W="${WS[0]}"
 echo "deploy: served wasm = $(basename "$W")  $(( $(stat -c%s "$W") / 1048576 )) MB  ($(stat -c%y "$W" | cut -d. -f1))"
-# Size is the cheapest AOT check there is: ~188 MB with AOT, ~35 MB without. If this number moves by 5x
-# between deploys, the workload changed even though the runtime source did not.
-if [ "$(stat -c%s "$W")" -lt 100000000 ] && [ "${AOT:-true}" != "false" ]; then
+# Size is the cheapest AOT check there is: ~86 MB (82 MiB) with the AOT whitelist (CoreLib, IKVM.Runtime,
+# IKVM.ByteCode, System.Memory; 2026-11-05), ~35 MB without. The threshold was 100 MB from when the whole app was
+# AOT'd (~188 MB) and warned on every correct deploy since the whitelist. If this number moves by 2x between deploys,
+# the workload changed even though the runtime source did not.
+if [ "$(stat -c%s "$W")" -lt 60000000 ] && [ "${AOT:-true}" != "false" ]; then
 	echo "  WARNING: AOT was requested but the wasm is small — check /tmp/ikvmcraft-publish.log" >&2
 fi
 
