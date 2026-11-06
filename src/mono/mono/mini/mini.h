@@ -348,6 +348,18 @@ typedef struct MonoCallInst MonoCallInst;
 typedef struct MonoCallArgParm MonoCallArgParm;
 typedef struct MonoMethodVar MonoMethodVar;
 typedef struct MonoBasicBlock MonoBasicBlock;
+
+/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): one inlined method whose exception clauses the root imported. Its IL
+ * occupies the EH positions [base, base + size), past the root's code and every earlier instance's, so the runtime's
+ * interval tests (mono_wasm_jit_eh_dispatch, the E0 table) see its clauses nested in nothing; the clauses enclosing its
+ * call site (at parent_pos) are repeated over its range as "shadow" table entries (mini-wasm-emitter.inc). */
+typedef struct WjEhInst {
+	gint32 base, size;               /* EH positions [base, base + size): the inlinee's IL */
+	gint32 parent_pos;               /* the call site's EH position */
+	gint32 first, n;                 /* its clauses: cfg->header->clauses [first, first + n), at EH positions */
+	MonoExceptionClause *local;      /* [n] the same clauses at the inlinee's own IL offsets (its header is freed) */
+	MonoBasicBlock **handler_bb;     /* [n] each clause's handler entry block */
+} WjEhInst;
 typedef struct MonoSpillInfo MonoSpillInfo;
 
 extern MonoCallSpec *mono_jit_trace_calls;
@@ -537,6 +549,10 @@ struct MonoBasicBlock {
 	 * the function epilog.
 	 */
 	guint out_of_line : 1;
+	/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): the block's EH position -- root IL offset, or an EH-inlined
+	 * instance's base + its own IL offset (method-to-ir.c, WjEhInst). Stamped by NEW_BBLOCK and per IL instruction
+	 * like real_offset; -1 for blocks created after import. Read only by a compile that EH-inlined something. */
+	gint32 wasm_eh_pos;
 	/* Caches the result of uselessness calculation during optimize_branches */
 	guint not_useless : 1;
 	/* Whenever the decompose_array_access_opts () pass needs to process this bblock */
@@ -1455,6 +1471,23 @@ typedef struct {
 	guint8           wasm_jit_t1_down;       /* R451: mono_wasm_force_compile's ordinary-policy downgrade recompile */
 	gpointer         wasm_origin_inl;        /* MONO_WASM_JIT_ORIGIN: accepted inlinees' IL ranges (WjOriginInl list) */
 	gpointer         wasm_sw_inl;            /* R516: accepted inlinees, always (WjSwInlRec list, mempool): the stack walk's inline frames */
+	/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): importing inlinees' exception clauses. All of it is inert unless
+	 * wasm_eh_inline is set for the compile (mini.c), and an instance exists only if wasm_eh_ninst > 0. */
+	guint8           wasm_eh_inline;         /* the policy: this compile may import inlinee clauses */
+	guint8           wasm_eh_want;           /* inline_method -> the next mono_method_to_ir: become an EH instance */
+	guint8           wasm_eh_in_handler;     /* the method being imported is (transitively) inlined inside a handler */
+	MonoMethodHeader *wasm_eh_orig_header;   /* what cfg->header was cloned from: restored before it is freed */
+	MonoMethodHeader *wasm_eh_cur_header;    /* the header of the method being imported */
+	gint32           wasm_eh_root_size;      /* the root's code size: EH positions below it are root IL offsets */
+	gint32           wasm_eh_root_nclauses;  /* cfg->header->clauses [0, n) are the root's own */
+	gint32           wasm_eh_pos;            /* the EH position of the IL instruction being imported; -1 after import */
+	gint32           wasm_eh_base;           /* the method being imported: its base (0 = the root), -1 = no clauses of its own */
+	gint32           wasm_eh_first;          /* ... and its first clause in cfg->header */
+	gint32           wasm_eh_cur;            /* ... and its instance (0 = the root) */
+	gint32           wasm_eh_next_base;      /* the next instance's base */
+	WjEhInst        *wasm_eh_inst;           /* [1, wasm_eh_ninst): index 0 stands for the root and is unused */
+	int              wasm_eh_ninst;          /* 0 = nothing EH-inlined (1 + instances once one exists) */
+	int              wasm_eh_inst_cap;
 	/* plan2x S2 (MONO_WASM_JIT_S2 & 2): the inlining size gate's verdict for one site, consumed by inline_method when
 	 * its (ip, callee) match, and the inline chain's frequency (calls per root entry; < 0 = unknown). */
 	const guint8    *wasm_s2_gate_ip;
@@ -2602,6 +2635,11 @@ typedef struct {
 	 * body instead of the interpreter's (interp.c WjEhJt), built at the first throw through such a frame and published
 	 * once; NULL until then. Never freed, like the table. */
 	gpointer jt;
+	/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): positions at or past root_size belong to EH-inlined instances;
+	 * inst [3 * i] is instance i's base, [3 * i + 1] its size, [3 * i + 2] its call site's position (ninst = 0: none).
+	 * mono_wasm_jit_ehrec_root_il maps a position back to the root IL offset of its outermost call site. */
+	gint32 root_size, ninst;
+	gint32 *inst;
 } WasmEhTable;
 /* Returns the dense bbidx of the handler to dispatch to (>=0), or -1 to rethrow (no local handler).
  * A FINALLY/FAULT handler's bbidx is tagged with WJ_EH_DISPATCH_FINALLY_BIT so the wasm landing pad

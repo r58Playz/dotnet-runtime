@@ -781,6 +781,7 @@ handle_gsharedvt_ldaddr (MonoCompile *cfg)
 #define NEW_BBLOCK(cfg,bblock) do { \
 		(bblock) = (MonoBasicBlock *)mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoBasicBlock)); \
 		(bblock)->block_num = cfg->num_bblocks++; \
+		(bblock)->wasm_eh_pos = (cfg)->wasm_eh_pos; \
 	} while (0)
 
 #define ADD_BBLOCK(cfg,b) do { \

@@ -535,6 +535,12 @@ arch_unwind_frame (MonoJitTlsData *jit_tls,
 				 * mono_method_get_header_internal -- i.e. this line. It was the single largest identified boot
 				 * cost, and it is pure bookkeeping: only try_offset/try_len are ever read from the header. */
 				int il_offset = ((MonoMethodILState*)frame->il_state)->il_offset;
+#ifdef HOST_BROWSER
+				{   /* MONO_WASM_JIT_EH_INLINE (plan E1): an EH-inlined instance's position -> its root call site */
+					extern int mono_wasm_jit_ehrec_root_il (MonoMethodILState *il);
+					il_offset = mono_wasm_jit_ehrec_root_il ((MonoMethodILState*)frame->il_state);
+				}
+#endif
 				int clause_index = mini_get_interp_callbacks ()->find_il_clause_for_offset (frame->method, frame->il_state, il_offset);
 
 				if (clause_index == -2) {
@@ -1226,8 +1232,14 @@ cur_trace_collect (StackFrameInfo *frame, MonoContext *ctx, gpointer data)
 		return FALSE;
 	t.native_offset = frame->native_offset;
 	t.il_offset = frame->il_offset;
-	if (frame->type == FRAME_TYPE_IL_STATE && frame->il_state)
+	if (frame->type == FRAME_TYPE_IL_STATE && frame->il_state) {
+#ifdef HOST_BROWSER
+		extern int mono_wasm_jit_ehrec_root_il (MonoMethodILState *il);
+		t.il_offset = mono_wasm_jit_ehrec_root_il ((MonoMethodILState *) frame->il_state);   /* plan E1 */
+#else
 		t.il_offset = ((MonoMethodILState *) frame->il_state)->il_offset;
+#endif
+	}
 	g_array_append_val ((GArray *) data, t);
 	return FALSE;
 }

@@ -3969,10 +3969,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		eh_table->method = cfg->method;
 		eh_table->body = cfg->wasm_jit_caller_imethod;   /* H1: what an EH record of this body resolves through */
 		eh_table->name = mname ? g_strdup (mname) : NULL;   /* diagnostics */
+		/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): EH-inlined instances (method-to-ir.c WjEhInst). Their blocks
+		 * carry EH positions past the root's code, their clauses are table entries at those positions, and every entry
+		 * whose try holds an instance's call site is repeated over the instance's range (a shadow), right after the
+		 * instance's own -- so the runtime's first-match and nesting tests (eh_dispatch, the E0 table) stay plain
+		 * interval tests, with an instance's own clauses inside the ones around its call. */
+		gboolean _e1 = cfg->wasm_eh_ninst > 1;
+		int _ecap = (int) cfg->header->num_clauses + 8, _ne = 0;
+		WasmEhClause *_ents;
 		eh_table->nbbs = N;
-		eh_table->nclauses = (gint32) cfg->header->num_clauses;
 		eh_table->il_offsets = (gint32 *) g_malloc0 (sizeof (gint32) * (N > 0 ? N : 1));
-		eh_table->clauses = (WasmEhClause *) g_malloc0 (sizeof (WasmEhClause) * (eh_table->nclauses > 0 ? eh_table->nclauses : 1));
 		for (_d = 0; _d < N; ++_d) eh_table->il_offsets [_d] = -1;
 		{
 			MonoBasicBlock *_prev = NULL;
@@ -3998,10 +4004,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * Fabric's mixin bootstrap died during boot. `auto=0` (whole JIT tier off) at the same limit
 				 * boots fine, which is what pins it here rather than in the inliner. */
 				gint32 _off = -1;
-				if (bb->cil_code) {
+				if (_e1 && bb->wasm_eh_pos >= cfg->wasm_eh_root_size) {
+					_off = bb->wasm_eh_pos;   /* E1: an instance's block (or one inlined inside an instance) */
+				} else if (bb->cil_code) {
 					if (bb->cil_code >= cfg->header->code &&
 					    bb->cil_code < cfg->header->code + cfg->header->code_size)
 						_off = (gint32) (bb->cil_code - cfg->header->code);
+					else if (_e1 && _prev && _prev->region == bb->region && bbidx [_prev->block_num] >= 0 &&
+					         bbidx [_prev->block_num] < N && eh_table->il_offsets [bbidx [_prev->block_num]] >= 0)
+						/* E1: an inlinee's block with no EH position of its own (made after the import): a block of
+						 * the same region before it has the same protection, wherever its position lies */
+						_off = eh_table->il_offsets [bbidx [_prev->block_num]];
 					else
 						_off = (gint32) bb->real_offset;   /* inlined: cil_code belongs to the inlinee */
 				}
@@ -4023,9 +4036,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				_prev = bb;
 			}
 		}
-		for (_ci = 0; _ci < cfg->header->num_clauses; ++_ci) {
+		_ents = (WasmEhClause *) g_malloc0 (sizeof (WasmEhClause) * _ecap);
+		for (_ci = 0; _ci < (_e1 ? (guint) cfg->wasm_eh_root_nclauses : cfg->header->num_clauses); ++_ci) {
 			MonoExceptionClause *_c = &cfg->header->clauses [_ci];
-			WasmEhClause *_wc = &eh_table->clauses [_ci];
+			WasmEhClause *_wc = &_ents [_ne++];
 			MonoBasicBlock *_hb; int _hbb = -1;
 			_wc->flags = (gint16) _c->flags;
 			_wc->try_start = (gint32) _c->try_offset;
@@ -4041,9 +4055,55 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				    _hb->cil_code >= cfg->header->code &&
 				    _hb->cil_code < cfg->header->code + cfg->header->code_size &&
 				    (gint32) (_hb->cil_code - cfg->header->code) == (gint32) _c->handler_offset) { _hbb = bbidx [_hb->block_num]; break; }
-			if (_hbb < 0) { fail = "eh handler bb not found"; goto done; }
+			if (_hbb < 0) { g_free (_ents); fail = "eh handler bb not found"; goto done; }
 			_wc->handler_bbidx = _hbb;
 		}
+		if (_e1) {
+			extern int mono_wasm_jit_eh_inline;
+			eh_table->root_size = cfg->wasm_eh_root_size;
+			eh_table->ninst = cfg->wasm_eh_ninst - 1;
+			eh_table->inst = (gint32 *) g_malloc0 (sizeof (gint32) * 3 * eh_table->ninst);
+			for (int _k = 1; _k < cfg->wasm_eh_ninst; ++_k) {
+				WjEhInst *_in = &cfg->wasm_eh_inst [_k];
+				int _nprev;
+				eh_table->inst [3 * (_k - 1)] = _in->base;
+				eh_table->inst [3 * (_k - 1) + 1] = _in->size;
+				eh_table->inst [3 * (_k - 1) + 2] = _in->parent_pos;
+				if (_ne + _in->n + _ne >= _ecap) {   /* own entries plus at most one shadow per entry so far */
+					_ecap = 2 * (_ne + _in->n + _ne) + 8;
+					_ents = (WasmEhClause *) g_realloc (_ents, sizeof (WasmEhClause) * _ecap);
+				}
+				_nprev = _ne;
+				/* bit 64, the negative control: the instance's own clauses are left out (tests only) */
+				for (int _i = 0; _i < _in->n && !(mono_wasm_jit_eh_inline & 64); ++_i) {
+					MonoExceptionClause *_c = &_in->local [_i];
+					WasmEhClause *_wc = &_ents [_ne++];
+					MonoBasicBlock *_hb;
+					int _hbb = -1;
+					for (_hb = cfg->bb_entry; _hb; _hb = _hb->next_bb)   /* the recorded block, if still in the chain */
+						if (_hb == _in->handler_bb [_i]) { _hbb = bbidx [_hb->block_num]; break; }
+					if (_hbb < 0) { g_free (_ents); fail = "eh inlinee handler bb not found"; goto done; }
+					_wc->flags = (gint16) _c->flags;
+					_wc->try_start = _in->base + (gint32) _c->try_offset;
+					_wc->try_len = (gint32) _c->try_len;
+					_wc->catch_class = _c->flags == MONO_EXCEPTION_CLAUSE_NONE ? _c->data.catch_class : NULL;
+					_wc->handler_bbidx = _hbb;
+				}
+				/* shadows: every entry before this instance's own whose try holds its call site, in table order (inner
+				 * first: the root's are in ECMA order, and an earlier instance's own come before its shadows) */
+				for (int _e = 0; _e < _nprev; ++_e) {
+					if (!(_in->parent_pos >= _ents [_e].try_start && _in->parent_pos < _ents [_e].try_start + _ents [_e].try_len))
+						continue;
+					_ents [_ne] = _ents [_e];
+					_ents [_ne].try_start = _in->base;
+					_ents [_ne].try_len = _in->size;
+					_ne++;
+					mono_wasm_jit_count (WJC_EHINL_SHADOWS);
+				}
+			}
+		}
+		eh_table->nclauses = _ne;
+		eh_table->clauses = _ents;
 	}
 
 	/* prescan: does this method have any OP_*CALL_MEMBASE (a virtual/interface call = an inline-IC site)?

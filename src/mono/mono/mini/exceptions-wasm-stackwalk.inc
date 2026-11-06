@@ -807,7 +807,10 @@ wjsw_claim (WjswScratch *s, int li, int nitems, MonoMethod *m, gpointer body, gb
 			match = mono_wasm_stackwalk_same_method (it->method, m);
 		if (match) {
 			if (it->kind == WJSW_L_ILSTATE) {
-				*il_offset = it->il->il_offset;
+				{   /* plan E1: an EH-inlined instance's position -> its root call site */
+					extern int mono_wasm_jit_ehrec_root_il (MonoMethodILState *il);
+					*il_offset = mono_wasm_jit_ehrec_root_il (it->il);
+				}
 				WJSW_COUNT (WJSW_C_REC_OK);
 			}
 			if (it->method && it->method != m)

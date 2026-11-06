@@ -547,17 +547,26 @@ wj_inline_call_allowed (MonoCompile *cfg, MonoMethod *cmethod)
  * an inlinee aborts the outer inline. The block is found in cil_offset_to_bb, scanning back as the pre-pass does --
  * never through cfg->cbb, which an inlined call or an emitted branch moves to a new bblock without the flag. Inside an
  * inlinee, cil_start / cil_offset_to_bb are the inlinee's own (inline_method swaps them). Plain field reads only. */
+static gboolean wj_eh_off_in_handler (MonoCompile *cfg, guint32 off, gboolean cold_only);   /* E1, below */
+
 static gboolean
 wj_cold_call_site (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, const guint8 *ip)
 {
 #ifdef HOST_BROWSER
-	extern int mono_wasm_jit_inline_cold_call;
-	if (G_LIKELY (!mono_wasm_jit_inline_cold_call) || !COMPILE_WASM (cfg) || !cfg->wasm_inline_allow_calls)
+	extern int mono_wasm_jit_inline_cold_call, mono_wasm_jit_eh_inline;
+	if (!COMPILE_WASM (cfg) || !cfg->wasm_inline_allow_calls)
 		return FALSE;
 	if (!method || method->wrapper_type != MONO_WRAPPER_NONE || !cmethod ||
 	    (cmethod->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL))
 		return FALSE;
-	if (!cfg->cil_offset_to_bb || !cfg->cil_start || !ip || ip < cfg->cil_start)
+	if (!cfg->cil_start || !ip || ip < cfg->cil_start)
+		return FALSE;
+	/* MONO_WASM_JIT_EH_INLINE bit 32 (plan E1): a call in an EH instance's catch/fault handler is cold as well (and
+	 * lands in the same cold_call counters) */
+	if (cfg->wasm_eh_inline && (mono_wasm_jit_eh_inline & 32) && cfg->wasm_eh_base > 0 &&
+	    wj_eh_off_in_handler (cfg, GPTRDIFF_TO_UINT32 (ip - cfg->cil_start), TRUE))
+		return TRUE;
+	if (G_LIKELY (!mono_wasm_jit_inline_cold_call) || !cfg->cil_offset_to_bb)
 		return FALSE;
 	for (gssize off = ip - cfg->cil_start; off >= 0; --off) {
 		if (off < cfg->cil_offset_to_bb_len && cfg->cil_offset_to_bb [off])
@@ -1378,7 +1387,9 @@ compute_bb_regions (MonoCompile *cfg)
 	 * body -- see mark_bb_in_region. Fail the COMPILE (invalid program), which mono_method_to_ir
 	 * turns into a -1 return at `cleanup:` and mini_method_compile hands back as a failed cfg; the
 	 * wasm JIT then bails this one method and the interpreter keeps running it. */
-	for (guint i = 0; i < header->num_clauses; ++i) {
+	/* E1 (wj_eh_regions): appended inlinee clauses carry EH positions, not root IL offsets */
+	guint nroot = cfg->wasm_eh_ninst > 1 ? (guint) cfg->wasm_eh_root_nclauses : header->num_clauses;
+	for (guint i = 0; i < nroot; ++i) {
 		MonoExceptionClause *clause = &header->clauses [i];
 		gboolean ok = TRUE;
 
@@ -1425,6 +1436,222 @@ compute_bb_regions (MonoCompile *cfg)
 }
 
 
+/* ---- MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): importing an inlinee's exception clauses ----------------------
+ * EH positions (WjEhInst, mini.h): the root's IL offsets, then each EH-inlined instance's own IL shifted to
+ * [base, base + size), past everything allocated before it. The import keeps the position of the IL instruction being
+ * imported in cfg->wasm_eh_pos and stamps it on cfg->cbb and on every new block, like real_offset; an inlinee without
+ * clauses of its own keeps its call site's position (base -1), as real_offset keeps the root's. Clauses appended to
+ * cfg->header (a clone) carry positions. While a method is being imported, LEAVE / ENDFINALLY consult its own header at
+ * its own IL offsets, and exception variables are keyed by position (wj_eh_key), so the root's and an inlinee's
+ * handler offsets cannot collide. After the root's import, compute_bb_regions marks the root's clauses and
+ * wj_eh_regions the instances' blocks; the emitter gives instance blocks their positions and repeats the clauses around
+ * each call site over the instance's range ("shadow" entries, mini-wasm-emitter.inc). Inert unless cfg->wasm_eh_inline. */
+
+/* the exception-variable key of a handler at `off` in the method being imported */
+static inline int
+wj_eh_key (MonoCompile *cfg, guint32 off)
+{
+	return cfg->wasm_eh_inline && cfg->wasm_eh_base > 0 ? cfg->wasm_eh_base + (int) off : (int) off;
+}
+
+/* the clauses of the method being imported, at its own IL offsets: NULL when cfg->header answers (no EH inlining), or
+ * when it has no clauses of its own (*n = 0) */
+static MonoMethodHeader *
+wj_eh_cur_clauses (MonoCompile *cfg, guint *n, guint *first)
+{
+	*n = 0;
+	*first = 0;
+	if (!cfg->wasm_eh_inline || !cfg->wasm_eh_cur_header)
+		return NULL;
+	if (cfg->wasm_eh_base < 0)
+		return cfg->wasm_eh_cur_header;
+	*n = cfg->wasm_eh_cur_header->num_clauses;
+	*first = (guint) cfg->wasm_eh_first;
+	return cfg->wasm_eh_cur_header;
+}
+
+/* is IL offset `off` of the method being imported inside one of its handlers (any kind)? */
+static gboolean
+wj_eh_off_in_handler (MonoCompile *cfg, guint32 off, gboolean cold_only)
+{
+	guint n, first;
+	MonoMethodHeader *h = wj_eh_cur_clauses (cfg, &n, &first);
+	for (guint i = 0; h && i < n; ++i) {
+		MonoExceptionClause *c = &h->clauses [i];
+		if (cold_only && c->flags != MONO_EXCEPTION_CLAUSE_NONE && c->flags != MONO_EXCEPTION_CLAUSE_FAULT)
+			continue;
+		if (MONO_OFFSET_IN_HANDLER (c, off) || (c->flags == MONO_EXCEPTION_CLAUSE_FILTER && MONO_OFFSET_IN_FILTER (c, off)))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/* The region an EH position gets, by compute_bb_regions' precedence (the first handler holding it, by clause index,
+ * else the first try): an instance's own clauses, then those around its call site, out to the root's. */
+static int
+wj_eh_region_at (MonoCompile *cfg, gint32 pos)
+{
+	while (pos >= cfg->wasm_eh_root_size) {
+		WjEhInst *k = NULL;
+		for (int i = 1; i < cfg->wasm_eh_ninst; ++i)
+			if (pos >= cfg->wasm_eh_inst [i].base && pos < cfg->wasm_eh_inst [i].base + cfg->wasm_eh_inst [i].size) {
+				k = &cfg->wasm_eh_inst [i];
+				break;
+			}
+		if (!k)
+			return -1;
+		guint32 o = (guint32) (pos - k->base);
+		for (int i = 0; i < k->n; ++i) {
+			MonoExceptionClause *c = &k->local [i];
+			if (MONO_OFFSET_IN_HANDLER (c, o)) {
+				int kind = c->flags == MONO_EXCEPTION_CLAUSE_FINALLY ? MONO_REGION_FINALLY :
+					c->flags == MONO_EXCEPTION_CLAUSE_FAULT ? MONO_REGION_FAULT : MONO_REGION_CATCH;
+				return ((k->first + i + 1) << 8) | kind | c->flags;
+			}
+		}
+		for (int i = 0; i < k->n; ++i)
+			if (MONO_OFFSET_IN_CLAUSE (&k->local [i], o))
+				return ((k->first + i + 1) << 8) | k->local [i].flags;
+		pos = k->parent_pos;
+	}
+	/* a root IL offset: the region compute_bb_regions gave the root block holding it */
+	for (gint32 off = MIN (pos, cfg->cil_offset_to_bb_len - 1); off >= 0; --off)
+		if (cfg->cil_offset_to_bb [off])
+			return cfg->cil_offset_to_bb [off]->region;
+	return -1;
+}
+
+/* after compute_bb_regions (root blocks, and every inlined block at its root call site): the instances' blocks */
+static void
+wj_eh_regions (MonoCompile *cfg)
+{
+	for (MonoBasicBlock *bb = cfg->bb_entry; bb; bb = bb->next_bb)
+		if (bb->wasm_eh_pos >= cfg->wasm_eh_root_size)
+			bb->region = wj_eh_region_at (cfg, bb->wasm_eh_pos);
+}
+
+/* An inlinee whose clauses inline_method admitted: check their shape, then make it an instance -- clone cfg->header
+ * (once), append its clauses at EH positions, and make it the method being imported. FALSE (counted) refuses it. */
+static gboolean
+wj_eh_inst_begin (MonoCompile *cfg, MonoMethod *method, MonoMethodHeader *header)
+{
+#ifdef HOST_BROWSER
+	extern int mono_wasm_jit_eh_inline, mono_wasm_jit_eh_inline_maxcl;
+	guint n = header->num_clauses;
+
+	/* the kinds the knob admits (never a filter: the emitter has none), resolved catch classes, clauses inside the
+	 * code, nested or disjoint, and no finally/fault try inside a finally/fault handler (the emitter's one
+	 * finally_ind would make it bail the ROOT) */
+	for (guint i = 0; i < n; ++i) {
+		MonoExceptionClause *c = &header->clauses [i];
+		gboolean fin = c->flags == MONO_EXCEPTION_CLAUSE_FINALLY || c->flags == MONO_EXCEPTION_CLAUSE_FAULT;
+		if (c->flags == MONO_EXCEPTION_CLAUSE_NONE ? !(mono_wasm_jit_eh_inline & 2) : !fin || !(mono_wasm_jit_eh_inline & 1)) {
+			mono_wasm_jit_count (WJC_EHINL_REFUSED_KIND);
+			return FALSE;
+		}
+		if (c->flags == MONO_EXCEPTION_CLAUSE_NONE && !c->data.catch_class) {
+			mono_wasm_jit_count (WJC_EHINL_REFUSED_CLASS);
+			return FALSE;
+		}
+		if (c->try_offset + c->try_len > header->code_size || c->handler_offset + c->handler_len > header->code_size) {
+			mono_wasm_jit_count (WJC_EHINL_REFUSED_NEST);
+			return FALSE;
+		}
+		for (guint j = 0; j < n; ++j) {
+			MonoExceptionClause *d = &header->clauses [j];
+			guint32 cs = c->try_offset, ce = cs + c->try_len, ds = d->try_offset, de = ds + d->try_len;
+			if (j == i)
+				continue;
+			if (!(ce <= ds || de <= cs) && !((cs <= ds && de <= ce) || (ds <= cs && ce <= de))) {
+				mono_wasm_jit_count (WJC_EHINL_REFUSED_NEST);
+				return FALSE;
+			}
+			if (fin && (d->flags == MONO_EXCEPTION_CLAUSE_FINALLY || d->flags == MONO_EXCEPTION_CLAUSE_FAULT) &&
+			    MONO_OFFSET_IN_HANDLER (d, c->try_offset)) {
+				mono_wasm_jit_count (WJC_EHINL_REFUSED_NEST);
+				return FALSE;
+			}
+		}
+	}
+	/* inside a handler: its code would run under a clause whose handler is executing -- a second finally_ind user, or
+	 * a try nested in a catch the liveness pass does not see as nested (RyuJIT refuses catch and filter sites too) */
+	if (cfg->wasm_eh_in_handler) {
+		mono_wasm_jit_count (WJC_EHINL_REFUSED_SITE);
+		return FALSE;
+	}
+	if ((int) (cfg->header->num_clauses + n) > mono_wasm_jit_eh_inline_maxcl) {
+		mono_wasm_jit_count (WJC_EHINL_REFUSED_CAP);
+		return FALSE;
+	}
+	if (cfg->gshared || cfg->method->wrapper_type != MONO_WRAPPER_NONE || method->wrapper_type != MONO_WRAPPER_NONE ||
+	    (cfg->wasm_eh_root_nclauses == 0 && !(mono_wasm_jit_eh_inline & 4))) {
+		mono_wasm_jit_count (WJC_EHINL_REFUSED_OTHER);
+		return FALSE;
+	}
+
+	/* clone cfg->header once, so its clause array can grow; mono_destroy_compile frees the original */
+	if (!cfg->wasm_eh_orig_header) {
+		MonoMethodHeader *o = cfg->header;
+		gsize sz = MONO_SIZEOF_METHOD_HEADER + o->num_locals * sizeof (MonoType *);
+		MonoMethodHeader *h = (MonoMethodHeader *) mono_mempool_alloc0 (cfg->mempool, sz);
+		memcpy (h, o, sz);
+		h->is_transient = FALSE;
+		cfg->wasm_eh_orig_header = o;
+		cfg->header = h;
+	}
+	MonoMethodHeader *h = cfg->header;
+	guint old = h->num_clauses;
+	MonoExceptionClause *cl = (MonoExceptionClause *) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoExceptionClause) * (old + n));
+	if (old)
+		memcpy (cl, h->clauses, sizeof (MonoExceptionClause) * old);
+	if (cfg->wasm_eh_ninst + 1 >= cfg->wasm_eh_inst_cap) {
+		int cap = cfg->wasm_eh_inst_cap ? cfg->wasm_eh_inst_cap * 2 : 8;
+		WjEhInst *a = (WjEhInst *) mono_mempool_alloc0 (cfg->mempool, sizeof (WjEhInst) * cap);
+		if (cfg->wasm_eh_ninst)
+			memcpy (a, cfg->wasm_eh_inst, sizeof (WjEhInst) * cfg->wasm_eh_ninst);
+		cfg->wasm_eh_inst = a;
+		cfg->wasm_eh_inst_cap = cap;
+	}
+	if (cfg->wasm_eh_ninst == 0)
+		cfg->wasm_eh_ninst = 1;   /* index 0 stands for the root */
+	WjEhInst *k = &cfg->wasm_eh_inst [cfg->wasm_eh_ninst];
+	memset (k, 0, sizeof (*k));
+	k->base = cfg->wasm_eh_next_base;
+	k->size = (gint32) header->code_size;
+	k->parent_pos = cfg->wasm_eh_pos;
+	k->first = (gint32) old;
+	k->n = (gint32) n;
+	k->local = (MonoExceptionClause *) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoExceptionClause) * n);
+	memcpy (k->local, header->clauses, sizeof (MonoExceptionClause) * n);
+	k->handler_bb = (MonoBasicBlock **) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoBasicBlock *) * n);
+	for (guint i = 0; i < n; ++i) {
+		cl [old + i] = header->clauses [i];
+		cl [old + i].try_offset += (guint32) k->base;
+		cl [old + i].handler_offset += (guint32) k->base;
+	}
+	h->clauses = cl;
+	h->num_clauses = old + n;
+	{
+		gboolean *dead = (gboolean *) mono_mempool_alloc0 (cfg->mempool, sizeof (gboolean) * (old + n));
+		if (cfg->clause_is_dead && old)
+			memcpy (dead, cfg->clause_is_dead, sizeof (gboolean) * old);
+		cfg->clause_is_dead = dead;
+	}
+	if (!cfg->exvars)
+		cfg->exvars = g_hash_table_new (NULL, NULL);
+	if (!cfg->spvars)
+		cfg->spvars = g_hash_table_new (NULL, NULL);
+	cfg->wasm_eh_next_base += (gint32) header->code_size;
+	cfg->wasm_eh_base = k->base;
+	cfg->wasm_eh_first = (gint32) old;
+	cfg->wasm_eh_cur = cfg->wasm_eh_ninst;
+	cfg->wasm_eh_ninst++;
+	return TRUE;
+#else
+	return FALSE;
+#endif
+}
+
 /*
  * Return the index of the innermost finally/fault clause whose handler contains
  * OFFSET, or -1 if there is none. The clauses are ordered from inner to outer,
@@ -1435,7 +1662,18 @@ ip_get_finally_clause_index (MonoCompile *cfg, int offset)
 {
 	MonoMethodHeader *header = cfg->header;
 	MonoExceptionClause *clause;
+	guint e1_n, e1_first;
+	MonoMethodHeader *e1_h = wj_eh_cur_clauses (cfg, &e1_n, &e1_first);
 
+	if (e1_h) {   /* E1: the method being imported, at its own IL offsets; the index is into cfg->header */
+		for (guint i = 0; i < e1_n; ++i) {
+			clause = &e1_h->clauses [i];
+			if ((clause->flags == MONO_EXCEPTION_CLAUSE_FINALLY || clause->flags == MONO_EXCEPTION_CLAUSE_FAULT) &&
+			    MONO_OFFSET_IN_HANDLER (clause, GINT_TO_UINT32 (offset)))
+				return GUINT_TO_INT (e1_first + i);
+		}
+		return -1;
+	}
 	for (guint i = 0; i < header->num_clauses; ++i) {
 		clause = &header->clauses [i];
 		if (clause->flags != MONO_EXCEPTION_CLAUSE_FINALLY && clause->flags != MONO_EXCEPTION_CLAUSE_FAULT)
@@ -1454,13 +1692,21 @@ mono_find_leave_clauses (MonoCompile *cfg, guchar *ip, guchar *target)
 	MonoMethodHeader *header = cfg->header;
 	MonoExceptionClause *clause;
 	GList *res = NULL;
+	guint n = header->num_clauses, first = 0;
+	guint e1_n, e1_first;
+	MonoMethodHeader *e1_h = wj_eh_cur_clauses (cfg, &e1_n, &e1_first);
 
-	for (guint i = 0; i < header->num_clauses; ++i) {
+	if (e1_h) {   /* E1: the method being imported, at its own IL offsets; indices into cfg->header */
+		header = e1_h;
+		n = e1_n;
+		first = e1_first;
+	}
+	for (guint i = 0; i < n; ++i) {
 		clause = &header->clauses [i];
 		if (MONO_OFFSET_IN_CLAUSE (clause, GPTRDIFF_TO_UINT32(ip - header->code)) &&
 		    (!MONO_OFFSET_IN_CLAUSE (clause, GPTRDIFF_TO_UINT32(target - header->code)))) {
 			MonoLeaveClause *leave = mono_mempool_alloc0 (cfg->mempool, sizeof (MonoLeaveClause));
-			leave->index = i;
+			leave->index = first + i;
 			leave->clause = clause;
 
 			res = g_list_append_mempool (cfg->mempool, res, leave);
@@ -5058,7 +5304,8 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 		WJ_T2R_WHY ("NoInlining");
 	if (method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)
 		WJ_T2R_WHY ("synchronized");
-	if (header.has_clauses)
+	/* MONO_WASM_JIT_EH_INLINE (plan E1): inline_method / mono_method_to_ir import the clauses (wj_eh_inst_begin) */
+	if (header.has_clauses && !(cfg->wasm_eh_inline && method->wrapper_type == MONO_WRAPPER_NONE))
 		WJ_T2R_WHY ("clauses");
 
 	if (method->flags & METHOD_ATTRIBUTE_REQSECOBJ)
@@ -5189,6 +5436,34 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 			eff_size = wj_il_hot_size (header.code, header.code_size);
 			if (eff_size < GINT_TO_UINT32 (limit))
 				wj_gi_count (WJC_INLINE_COLD_THROW_ADMIT);
+		}
+	}
+	/* MONO_WASM_JIT_EH_INLINE bit 32 (plan E1): an EH callee's catch/fault handler IL does not count either -- the
+	 * smaller of the two sizes, since R318's throw segments can be those same handlers. Nested handlers count once. */
+	{
+		extern int mono_wasm_jit_eh_inline;
+		if (header.has_clauses && cfg->wasm_eh_inline && (mono_wasm_jit_eh_inline & 32) && eff_size >= GINT_TO_UINT32 (limit)) {
+			ERROR_DECL (eh_err);
+			MonoMethodHeader *mh = mono_method_get_header_checked (method, eh_err);
+			if (mh) {
+				guint32 cold = 0;
+				for (guint i = 0; i < mh->num_clauses; ++i) {
+					MonoExceptionClause *c = &mh->clauses [i];
+					gboolean inner = FALSE;
+					if (c->flags != MONO_EXCEPTION_CLAUSE_NONE && c->flags != MONO_EXCEPTION_CLAUSE_FAULT)
+						continue;
+					for (guint j = 0; j < mh->num_clauses && !inner; ++j)
+						inner = j != i && (mh->clauses [j].flags == MONO_EXCEPTION_CLAUSE_NONE || mh->clauses [j].flags == MONO_EXCEPTION_CLAUSE_FAULT) &&
+							MONO_OFFSET_IN_HANDLER (&mh->clauses [j], c->handler_offset);
+					if (!inner)
+						cold += c->handler_len;
+				}
+				if (cold < header.code_size && header.code_size - cold < eff_size)
+					eff_size = header.code_size - cold;
+				mono_metadata_free_mh (mh);
+			} else {
+				mono_error_cleanup (eh_err);
+			}
 		}
 	}
 #endif
@@ -6008,6 +6283,13 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	double prev_s2_ctx;
 	gboolean s2_hot;
 	int s2_cap;
+	/* E1 (MONO_WASM_JIT_EH_INLINE): the importing method's EH state, and what to roll back if this inline is abandoned */
+	gboolean eh_want = FALSE, eh_site_in_handler = FALSE, eh_made, prev_eh_in_handler;
+	int eh_self;   /* the instance this callee became (0: none; a nested callee's does not count) */
+	gint32 prev_eh_base, prev_eh_pos, prev_eh_first, prev_eh_cur, prev_eh_next_base;
+	MonoMethodHeader *prev_eh_cur_header;
+	int prev_eh_ninst;
+	guint prev_eh_nclauses;
 
 	g_assert (cfg->exception_type == MONO_EXCEPTION_NONE);
 
@@ -6050,10 +6332,19 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	 * in-place body swap (tiering.c replace_method_body_locked) can install a generation-2 header in between, and
 	 * inlinee clauses are never imported (only the root's are), so a clause here would be silently dropped. Only
 	 * reachable in practice once generation-1 bodies stop being excluded by their calls (MONO_WASM_JIT_INLINE_CALLS). */
+	/* E1: is the call site inside a handler -- of the method being imported, or (transitively) of a method it was
+	 * inlined into? No call site (ip NULL) counts as one. */
+	if (cfg->wasm_eh_inline)
+		eh_site_in_handler = cfg->wasm_eh_in_handler || !ip || !cfg->cil_start ||
+			wj_eh_off_in_handler (cfg, GPTRDIFF_TO_UINT32 (ip - cfg->cil_start), FALSE);
 	if (COMPILE_WASM (cfg) && !inline_always && cheader->num_clauses) {
-		wj_p3_count (WJC_INLINE_CLAUSE_RECHECK);
-		mono_metadata_free_mh (cheader);
-		return 0;
+		if (cfg->wasm_eh_inline && cmethod->wrapper_type == MONO_WRAPPER_NONE) {
+			eh_want = TRUE;   /* E1: mono_method_to_ir checks the clauses of the header it imports (wj_eh_inst_begin) */
+		} else {
+			wj_p3_count (WJC_INLINE_CLAUSE_RECHECK);
+			mono_metadata_free_mh (cheader);
+			return 0;
+		}
 	}
 
 	if (is_empty && cheader->code_size == 1 && cheader->code [0] == CEE_RET)
@@ -6117,7 +6408,30 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	if (cfg->wasm_inl_sp < (int) G_N_ELEMENTS (cfg->wasm_inl_stack))
 		cfg->wasm_inl_stack [cfg->wasm_inl_sp] = cmethod;
 	cfg->wasm_inl_sp++;
+	prev_eh_base = cfg->wasm_eh_base;
+	prev_eh_pos = cfg->wasm_eh_pos;
+	prev_eh_first = cfg->wasm_eh_first;
+	prev_eh_cur = cfg->wasm_eh_cur;
+	prev_eh_cur_header = cfg->wasm_eh_cur_header;
+	prev_eh_in_handler = cfg->wasm_eh_in_handler;
+	prev_eh_ninst = cfg->wasm_eh_ninst;
+	prev_eh_nclauses = cfg->header->num_clauses;
+	prev_eh_next_base = cfg->wasm_eh_next_base;
+	if (cfg->wasm_eh_inline) {
+		cfg->wasm_eh_in_handler = eh_site_in_handler;
+		cfg->wasm_eh_base = -1;   /* no clauses of its own, unless wj_eh_inst_begin makes it an instance */
+		cfg->wasm_eh_want = eh_want;
+	}
 	costs = mono_method_to_ir (cfg, cmethod, sbblock, ebblock, rvar, sp, real_offset, virtual_);
+	cfg->wasm_eh_want = FALSE;
+	eh_self = cfg->wasm_eh_inline && cfg->wasm_eh_base > 0 ? cfg->wasm_eh_cur : 0;   /* before the restore below */
+	cfg->wasm_eh_base = prev_eh_base;
+	cfg->wasm_eh_pos = prev_eh_pos;
+	cfg->wasm_eh_first = prev_eh_first;
+	cfg->wasm_eh_cur = prev_eh_cur;
+	cfg->wasm_eh_cur_header = prev_eh_cur_header;
+	cfg->wasm_eh_in_handler = prev_eh_in_handler;
+	eh_made = cfg->wasm_eh_ninst > prev_eh_ninst;
 	cfg->wasm_inl_sp--;
 #ifdef HOST_BROWSER
 	wj_inline_last_costs = costs;   /* W3 census: the outermost inline_method's costs, read by the GI gate's late refusal */
@@ -6152,6 +6466,15 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 			printf ("INLINE END %s -> %s\n", mono_method_full_name (cfg->method, TRUE), mono_method_full_name (cmethod, TRUE));
 		if (COMPILE_WASM (cfg)) {
 			wj_p3_count (WJC_INLINE_ACCEPTED);   /* the ACTION: counted at the accepted return (R315) */
+#ifdef HOST_BROWSER
+			if (eh_self) {   /* E1: counted once per accepted EH instance, with the clauses it brought */
+				WjEhInst *k = &cfg->wasm_eh_inst [eh_self];
+				mono_wasm_jit_count (WJC_EHINL_ACCEPTED);
+				for (int c = 0; c < k->n; ++c)
+					mono_wasm_jit_count (k->local [c].flags == MONO_EXCEPTION_CLAUSE_NONE ? WJC_EHINL_CATCH :
+						k->local [c].flags == MONO_EXCEPTION_CLAUSE_FINALLY ? WJC_EHINL_FINALLY : WJC_EHINL_FAULT);
+			}
+#endif
 			if (s2_hot) {   /* plan2x S2: a raised site, accepted -- paid out of the root's S2 budget */
 				wj_p3_count (WJC_S2_INLINED);
 				cfg->wasm_s2_spent += (gint32) cheader->code_size;
@@ -6189,7 +6512,9 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 		if (prev_cbb->out_count == 1)
 			mono_merge_basic_blocks (cfg, prev_cbb, sbblock);
 
-		if ((prev_cbb->out_count == 1) && (prev_cbb->out_bb [0]->in_count == 1) && (prev_cbb->out_bb [0] != ebblock))
+		/* E1: not an EH instance's first block -- a try starting at its IL 0 would merge into the call site's block
+		 * and lose its EH position (and its try region) */
+		if (!eh_self && (prev_cbb->out_count == 1) && (prev_cbb->out_bb [0]->in_count == 1) && (prev_cbb->out_bb [0] != ebblock))
 			mono_merge_basic_blocks (cfg, prev_cbb, prev_cbb->out_bb [0]);
 
 		if ((ebblock->in_count == 1) && ebblock->in_bb [0]->out_count == 1) {
@@ -6198,7 +6523,7 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 			if (prev->next_bb == ebblock) {
 				mono_merge_basic_blocks (cfg, prev, ebblock);
 				cfg->cbb = prev;
-				if ((prev_cbb->out_count == 1) && (prev_cbb->out_bb [0]->in_count == 1) && (prev_cbb->out_bb [0] == prev)) {
+				if (!eh_self && (prev_cbb->out_count == 1) && (prev_cbb->out_bb [0]->in_count == 1) && (prev_cbb->out_bb [0] == prev)) {
 					mono_merge_basic_blocks (cfg, prev_cbb, prev);
 					cfg->cbb = prev_cbb;
 				}
@@ -6256,6 +6581,17 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 		cfg->exception_type = MONO_EXCEPTION_NONE;
 
 		clear_cfg_error (cfg);
+
+		/* E1: the abandoned inline's clauses and instances (its nested ones too) go; their blocks are unlinked, and
+		 * exception variables left keyed in the abandoned range are reused harmlessly by whatever is laid there next */
+		if (eh_made) {
+			cfg->header->num_clauses = prev_eh_nclauses;
+			cfg->wasm_eh_ninst = prev_eh_ninst;
+			cfg->wasm_eh_next_base = prev_eh_next_base;
+#ifdef HOST_BROWSER
+			mono_wasm_jit_count (WJC_EHINL_ROLLBACK);
+#endif
+		}
 
 		/* This gets rid of the newly added bblocks */
 		cfg->cbb = prev_cbb;
@@ -7731,6 +8067,9 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 	MonoType **param_types;
 	int n, start_new_bblock;
 	int num_calls = 0, inline_costs = 0;
+	/* E1 (MONO_WASM_JIT_EH_INLINE bit 32): costs an EH instance accrues inside its catch/fault handlers */
+	int wj_cold_costs = 0, wj_cold_prev_costs = 0;
+	gboolean wj_cold_prev = FALSE, wj_cold_on = FALSE;
 	guint num_args;
 	GSList *class_inits = NULL;
 	gboolean dont_verify, dont_verify_stloc, readonly = FALSE;
@@ -7880,8 +8219,32 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 
 	if (cfg->method == method) {
 		cfg->real_offset = 0;
+		/* E1: the root's IL offsets are EH positions; instances are laid out past its code */
+		cfg->wasm_eh_cur_header = header;
+		cfg->wasm_eh_base = 0;
+		cfg->wasm_eh_pos = 0;
+		cfg->wasm_eh_first = 0;
+		cfg->wasm_eh_cur = 0;
+		cfg->wasm_eh_root_size = (gint32) header->code_size;
+		cfg->wasm_eh_root_nclauses = (gint32) header->num_clauses;
+		cfg->wasm_eh_next_base = (gint32) header->code_size;
 	} else {
 		cfg->real_offset = inline_offset;
+		cfg->wasm_eh_cur_header = header;
+		if (cfg->wasm_eh_want) {
+			/* E1: inline_method admitted this callee's clauses (it read them on its own fetch of the header; these
+			 * are the ones being imported) */
+			cfg->wasm_eh_want = FALSE;
+			if (header->num_clauses && !wj_eh_inst_begin (cfg, method, header)) {
+				/* not INLINE_FAILURE: it does nothing for a wrapper, and this import must not go on without its clauses */
+				inline_failure (cfg, "EH inline shape");
+				goto exception_exit;
+			}
+#ifdef HOST_BROWSER
+			{ extern int mono_wasm_jit_eh_inline;
+			  wj_cold_on = cfg->wasm_eh_base > 0 && (mono_wasm_jit_eh_inline & 32); }
+#endif
+		}
 	}
 
 	cfg->cil_offset_to_bb = (MonoBasicBlock **)mono_mempool_alloc0 (cfg->mempool, sizeof (MonoBasicBlock*) * header->code_size);
@@ -8050,6 +8413,52 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 		cfg->cbb = start_bblock;
 		cfg->args = arg_array;
 		mono_save_args (cfg, sig, inline_args);
+
+		/* E1: an EH instance's clauses, set up as the root's are above -- try starts, handler blocks (flagged, or
+		 * mono_bb_ordering empties them: nothing branches to a handler), finally exception variables, the catch
+		 * object -- with exception variables keyed by EH position, and each handler entry block recorded for the
+		 * emitter's clause table */
+		if (cfg->wasm_eh_inline && cfg->wasm_eh_base > 0 && cfg->wasm_eh_cur > 0) {
+			WjEhInst *k = &cfg->wasm_eh_inst [cfg->wasm_eh_cur];
+			for (unsigned int i = 0; i < header->num_clauses; ++i) {
+				MonoBasicBlock *try_bb;
+				MonoExceptionClause *clause = &header->clauses [i];
+				GET_BBLOCK (cfg, try_bb, ip + clause->try_offset);
+				try_bb->try_start = TRUE;
+				GET_BBLOCK (cfg, tblock, ip + clause->handler_offset);
+				tblock->flags |= BB_EXCEPTION_HANDLER;
+				k->handler_bb [i] = tblock;
+				if (clause->flags == MONO_EXCEPTION_CLAUSE_FINALLY)
+					mono_create_exvar_for_offset (cfg, wj_eh_key (cfg, clause->handler_offset));
+				if (*(ip + clause->handler_offset) == CEE_POP)
+					tblock->flags |= BB_EXCEPTION_DEAD_OBJ;
+				if (clause->flags == MONO_EXCEPTION_CLAUSE_FINALLY || clause->flags == MONO_EXCEPTION_CLAUSE_FAULT) {
+					MONO_INST_NEW (cfg, ins, OP_START_HANDLER);
+					MONO_ADD_INS (tblock, ins);
+					if (clause->flags == MONO_EXCEPTION_CLAUSE_FAULT)
+						tblock->flags |= BB_EXCEPTION_UNSAFE;
+				}
+				if (clause->flags == MONO_EXCEPTION_CLAUSE_NONE) {
+					tblock->in_scount = 1;
+					tblock->in_stack = (MonoInst **)mono_mempool_alloc (cfg->mempool, sizeof (MonoInst*));
+					tblock->in_stack [0] = mono_create_exvar_for_offset (cfg, wj_eh_key (cfg, clause->handler_offset));
+					cfg->cbb = tblock;
+#ifdef MONO_CONTEXT_SET_LLVM_EXC_REG
+					if (!cfg->compile_llvm) {
+						MONO_INST_NEW (cfg, ins, OP_GET_EX_OBJ);
+						ins->dreg = tblock->in_stack [0]->dreg;
+						MONO_ADD_INS (tblock, ins);
+					}
+#else
+					{
+						MonoInst *dummy_use;
+						EMIT_NEW_DUMMY_USE (cfg, dummy_use, tblock->in_stack [0]);
+					}
+#endif
+				}
+			}
+			cfg->cbb = start_bblock;
+		}
 	}
 
 	if (cfg->method == method && cfg->self_init && cfg->compile_aot && !COMPILE_LLVM (cfg)) {
@@ -8362,6 +8771,18 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			cfg->real_offset = GPTRDIFF_TO_UINT (ip - header->code);
 		else
 			cfg->real_offset = inline_offset;
+		if (cfg->wasm_eh_inline) {
+			/* E1: this instruction's EH position (an inlinee without clauses keeps its call site's) */
+			if (cfg->wasm_eh_base >= 0)
+				cfg->wasm_eh_pos = cfg->wasm_eh_base + GPTRDIFF_TO_INT (ip - header->code);
+			/* bit 32: what the previous instruction cost is not charged if it sat in a catch/fault handler */
+			if (wj_cold_on) {
+				if (wj_cold_prev)
+					wj_cold_costs += inline_costs - wj_cold_prev_costs;
+				wj_cold_prev = wj_eh_off_in_handler (cfg, GPTRDIFF_TO_UINT32 (ip - header->code), TRUE);
+				wj_cold_prev_costs = inline_costs;
+			}
+		}
 		cfg->ip = ip;
 
 		context_used = 0;
@@ -8490,6 +8911,8 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 		}
 
 		cfg->cbb->real_offset = cfg->real_offset;
+		if (cfg->wasm_eh_inline)
+			cfg->cbb->wasm_eh_pos = cfg->wasm_eh_pos;
 
 		if (cfg->verbose_level > 3)
 			printf ("converting (in B%d: stack: %d) %s", cfg->cbb->block_num, GPTRDIFF_TO_INT (sp - stack_start), mono_disasm_code_one (NULL, method, ip, NULL));
@@ -13148,7 +13571,7 @@ field_access_end:
 					if (clause->flags != MONO_EXCEPTION_CLAUSE_FINALLY)
 						continue;
 
-					MonoInst *abort_exc = (MonoInst *)mono_find_exvar_for_offset (cfg, clause->handler_offset);
+					MonoInst *abort_exc = (MonoInst *)mono_find_exvar_for_offset (cfg, wj_eh_key (cfg, clause->handler_offset));
 					MonoBasicBlock *dont_throw;
 
 					/*
@@ -14164,7 +14587,7 @@ mono_ldptr:
 			if (handler_offset == -1)
 				UNVERIFIED;
 
-			EMIT_NEW_TEMPLOAD (cfg, load, mono_find_exvar_for_offset (cfg, handler_offset)->inst_c0);
+			EMIT_NEW_TEMPLOAD (cfg, load, mono_find_exvar_for_offset (cfg, wj_eh_key (cfg, handler_offset))->inst_c0);
 			MONO_INST_NEW (cfg, ins, OP_RETHROW);
 			ins->sreg1 = load->dreg;
 			MONO_ADD_INS (cfg->cbb, ins);
@@ -14403,8 +14826,23 @@ all_bbs_done:
 
 	cfg->ip = NULL;
 
+	if (wj_cold_on) {   /* E1 bit 32: settle the last instruction, then uncharge the handlers */
+		if (wj_cold_prev)
+			wj_cold_costs += inline_costs - wj_cold_prev_costs;
+		if (wj_cold_costs > 0 && inline_costs >= 0)
+			inline_costs = MAX (0, inline_costs - wj_cold_costs);
+	}
+
 	if (cfg->method == method) {
 		compute_bb_regions (cfg);
+		if (cfg->wasm_eh_ninst > 1) {   /* E1 */
+			wj_eh_regions (cfg);
+#ifdef HOST_BROWSER
+			if (cfg->wasm_eh_root_nclauses == 0)
+				mono_wasm_jit_count (WJC_EHINL_NEW_EH_ROOT);
+#endif
+		}
+		cfg->wasm_eh_pos = -1;   /* blocks made after the import have no EH position */
 	} else {
 		MonoBasicBlock *cbb;
 		/* get_most_deep_clause () in mini-llvm.c depends on this for inlined bblocks */

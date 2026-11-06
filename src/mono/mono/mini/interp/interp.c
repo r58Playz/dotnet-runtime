@@ -9521,6 +9521,32 @@ mono_interp_ehrec_body (MonoMethodILState *il)
 	return d ? d->body : NULL;
 }
 
+/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): the root IL offset behind a JIT EH record's IL offset. A position in
+ * an EH-inlined instance (at or past the table's root_size) maps to its call site's, out to the root's; anything else
+ * comes back as it is, and a position no instance holds as -1. For stack traces and the interpreter's own clause
+ * lookup, which know only the root's IL. */
+int mono_wasm_jit_ehrec_root_il (MonoMethodILState *il);
+int
+mono_wasm_jit_ehrec_root_il (MonoMethodILState *il)
+{
+	int off = il->il_offset;
+	if (!wj_ehrec_is_record_il (il))
+		return off;
+	WasmEhTable *t = wj_ehrec_of_il (il)->desc;
+	if (!t || t->ninst <= 0)
+		return off;
+	for (int hops = 0; off >= t->root_size && hops <= t->ninst; ++hops) {
+		int k;
+		for (k = 0; k < t->ninst; ++k)
+			if (off >= t->inst [3 * k] && off < t->inst [3 * k] + t->inst [3 * k + 1])
+				break;
+		if (k == t->ninst)
+			return -1;
+		off = t->inst [3 * k + 2];
+	}
+	return off < t->root_size ? off : -1;
+}
+
 /* --- MONO_WASM_JIT_EH_JTAB (plan zany-beacon E0): a JIT EH frame's clauses for exception pass 1/2, from the compiled
  * body's own table ----------------------------------------------------------------------------------------------
  * Pass 1/2 (mini-exceptions.c) test a frame's clauses with is_address_protected (ji, ei, ip): an address against each

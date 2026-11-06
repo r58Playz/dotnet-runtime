@@ -1461,6 +1461,21 @@ enum {
 	WJC_EXC_RAISED,              /* MONO_WASM_JIT_EXC_PIN: exceptions thrown through the JIT raise paths (raise_corlib, throw) */
 	WJC_EXC_PINNED,              /* ... pinned across exception pass 1/2 */
 	WJC_EXC_GC_DURING,           /* ... during which a nursery collection ran (the window the pin closes) */
+	WJC_EHINL_ACCEPTED,          /* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): inlines accepted with their clauses imported */
+	WJC_EHINL_CATCH,             /* ... catch clauses imported by them */
+	WJC_EHINL_FINALLY,           /* ... finally clauses */
+	WJC_EHINL_FAULT,             /* ... fault clauses */
+	WJC_EHINL_REFUSED_KIND,      /* an EH callee refused: a clause kind the knob does not admit (or a filter) */
+	WJC_EHINL_REFUSED_CLASS,     /* ... a catch clause whose class did not resolve */
+	WJC_EHINL_REFUSED_NEST,      /* ... clauses that overlap without nesting, or a finally/fault try inside such a handler */
+	WJC_EHINL_REFUSED_SITE,      /* ... the call site is inside a handler (of the root or an enclosing inlinee) */
+	WJC_EHINL_REFUSED_CAP,       /* ... the root's clause total would pass MONO_WASM_JIT_EH_INLINE_MAXCL */
+	WJC_EHINL_REFUSED_OTHER,     /* ... a wrapper or shared-generic root, or a new EH root without bit 4 */
+	WJC_EHINL_ROLLBACK,          /* an EH instance whose inline was then abandoned (its clauses dropped again) */
+	WJC_EHINL_NEW_EH_ROOT,       /* roots with no clauses of their own that finished import with inlinee clauses */
+	WJC_EHINL_SHADOWS,           /* shadow table entries emitted (a clause enclosing an EH-inlined call site, over its range) */
+	WJC_EHINL_RETRY,             /* compiles with inlinee clauses that failed permanently, retried without EH inlining */
+	WJC_EHINL_RETRY_OK,          /* ... and the retry succeeded */
 	WJC_MAX
 };
 
