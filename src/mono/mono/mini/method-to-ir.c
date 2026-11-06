@@ -538,6 +538,37 @@ wj_inline_call_allowed (MonoCompile *cfg, MonoMethod *cmethod)
 	return TRUE;
 }
 
+/* MONO_WASM_JIT_INLINE_COLD_CALL (2026-11-05): is the call at `ip` inside an IL basic block that ends in a `throw`? The
+ * get_basic_blocks pre-pass marks such a block out_of_line before import. A call there runs at most once, on the way
+ * to the throw -- exception-message construction, mostly -- so the importer neither inlines it nor charges it the
+ * ramped CALL_COST: inlining Validate.inclusiveBetween's String.format and StringBuilder message builds is what took
+ * the hot block-access chain over T2_COST (findings log, 2026-11-05). R318 discounts the same blocks from the SIZE
+ * gate only. Where a call may stay only (the per-compile policy: tier 2, INLINE_CALLS): at tier 1 a call left inside
+ * an inlinee aborts the outer inline. The block is found in cil_offset_to_bb, scanning back as the pre-pass does --
+ * never through cfg->cbb, which an inlined call or an emitted branch moves to a new bblock without the flag. Inside an
+ * inlinee, cil_start / cil_offset_to_bb are the inlinee's own (inline_method swaps them). Plain field reads only. */
+static gboolean
+wj_cold_call_site (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, const guint8 *ip)
+{
+#ifdef HOST_BROWSER
+	extern int mono_wasm_jit_inline_cold_call;
+	if (G_LIKELY (!mono_wasm_jit_inline_cold_call) || !COMPILE_WASM (cfg) || !cfg->wasm_inline_allow_calls)
+		return FALSE;
+	if (!method || method->wrapper_type != MONO_WRAPPER_NONE || !cmethod ||
+	    (cmethod->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL))
+		return FALSE;
+	if (!cfg->cil_offset_to_bb || !cfg->cil_start || !ip || ip < cfg->cil_start)
+		return FALSE;
+	for (gssize off = ip - cfg->cil_start; off >= 0; --off) {
+		if (off < cfg->cil_offset_to_bb_len && cfg->cil_offset_to_bb [off])
+			return cfg->cil_offset_to_bb [off]->out_of_line;
+	}
+	return FALSE;
+#else
+	return FALSE;
+#endif
+}
+
 /* R316b (plan Phase 3.5): the InterpMethod whose call profile describes the call sites IR'd inside the inlinee being
  * entered -- where the interpreter, and that method's own tier-1 IC misses, filed them. Only under the per-compile
  * policy: a tier-1 inlinee keeps no calls. The peek never creates, and `cmethod` is live because it is being
@@ -684,6 +715,8 @@ MONO_DISABLE_WARNING(4127) /* conditional expression is constant */
 
 #define BRANCH_COST 10
 #define CALL_COST 10
+/* MONO_WASM_JIT_INLINE_COLD_CALL: what a call site inside a throw block is charged (flat; num_calls is not advanced) */
+#define WJ_COLD_CALL_COST CALL_COST
 /* Used for the JIT */
 #define INLINE_LENGTH_LIMIT 20
 /*
@@ -1013,7 +1046,8 @@ field_access_failure (MonoCompile *cfg, MonoMethod *method, MonoClassField *fiel
 /* W3 census (MONO_WASM_JIT_SITE_COUNT): the guarded-inline verdict at a virtual call site, read back by the emitter's
  * site record of the call that survives (mini-wasm-ir.inc). N/C/P no prediction (no record, cold, polymorphic), S
  * self, V valuetype, B refused before, G signature, X census only, E clauses, Z size, O other check_inlining, L
- * refused late, I inlined (what survives is the fallback call). */
+ * refused late, I inlined (what survives is the fallback call), T a call in a throw block left a call on purpose
+ * (MONO_WASM_JIT_INLINE_COLD_CALL). */
 static void
 wj_site_gi_note (MonoCompile *cfg, const guint8 *ip, char code)
 {
@@ -7090,7 +7124,14 @@ handle_ctor_call (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fs
 		return;
 	}
 
-	if ((cfg->opt & MONO_OPT_INLINE) && wj_check_inlining_t2 (cfg, cmethod) &&
+	/* MONO_WASM_JIT_INLINE_COLD_CALL: a constructor called in a throw block (the StringBuilder of an exception message)
+	 * stays a call. Decided before the gate, which has side effects; counted only where inlining was otherwise possible
+	 * (exception constructors are never inlined anyway). */
+	gboolean ctor_cold = wj_cold_call_site (cfg, cfg->current_method, cmethod, ip);
+	if (ctor_cold && (cfg->opt & MONO_OPT_INLINE) &&
+	    !mono_class_is_subclass_of_internal (cmethod->klass, mono_defaults.exception_class, FALSE))
+		wj_p3_count (cfg->method == cfg->current_method ? WJC_INLINE_COLD_CALL_ROOT : WJC_INLINE_COLD_CALL);
+	if ((cfg->opt & MONO_OPT_INLINE) && !ctor_cold && wj_check_inlining_t2 (cfg, cmethod) &&
 			   !mono_class_is_subclass_of_internal (cmethod->klass, mono_defaults.exception_class, FALSE)) {
 		int costs;
 
@@ -9121,6 +9162,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			gboolean direct_icall; direct_icall = FALSE;
 			gboolean tailcall_calli; tailcall_calli = FALSE;
 			gboolean noreturn; noreturn = FALSE;
+			gboolean wj_cold; wj_cold = FALSE;   /* MONO_WASM_JIT_INLINE_COLD_CALL: this site is in a throw block */
 			gboolean gshared_static_virtual; gshared_static_virtual = FALSE;
 #ifdef TARGET_WASM
 			gboolean needs_LMF; needs_LMF = FALSE;
@@ -9411,6 +9453,9 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			}
 
 #ifdef HOST_BROWSER
+			/* MONO_WASM_JIT_INLINE_COLD_CALL: decided once, BEFORE any inline gate -- the gates have side effects (the S2
+			 * gate's site state, the census) that a site we will not inline must not leave behind. */
+			wj_cold = wj_cold_call_site (cfg, method, cmethod, ip);
 			/*
 			 * GUARDED DEVIRTUALIZED INLINING (MONO_WASM_JIT_GUARDED_INLINE).
 			 *
@@ -9478,7 +9523,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			 * blocks down already calls check_inlining on this compile path, so running it under the
 			 * knob is no new exposure; running it for sites we have decided not to inline would be.
 			 */
-			if (cfg->compile_wasm && !gi_active &&
+			if (cfg->compile_wasm && !gi_active && !wj_cold &&
 			    (mono_wasm_jit_guarded_inline || G_UNLIKELY (mono_wasm_jit_stats)) &&
 			    (cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual &&
 			    virtual_ && cmethod && (cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) &&
@@ -9814,7 +9859,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 #ifdef HOST_BROWSER
 			wj_t2r_last_char = 0;
 #endif
-			if ((cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual &&
+			if ((cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual && !wj_cold &&
 				(!virtual_ || !(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) || MONO_METHOD_IS_FINAL (cmethod)) &&
 			    wj_check_inlining_t2 (cfg, cmethod)) {
 				int costs;
@@ -9861,6 +9906,15 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 			/* W3 census (R406): why the ordinary inliner left this call (tier 2; the GI gate notes virtual sites) */
 			if (wj_t2r_last_char && !gi_active)
 				wj_site_gi_note (cfg, ip, wj_t2r_last_char);
+			else if (wj_cold) {
+				/* the action: this call stays a call because its block ends in a throw (counted here, where it happens) */
+				wj_site_gi_note (cfg, ip, 'T');
+				wj_p3_count (cfg->method == method ? WJC_INLINE_COLD_CALL_ROOT : WJC_INLINE_COLD_CALL);
+				if (virtual_)
+					wj_p3_count (WJC_INLINE_COLD_GI);   /* a callvirt: guarded inlining was not attempted either */
+				if (cfg->verbose_level > 2)
+					printf ("INLINE COLD %s -> %s\n", mono_method_full_name (cfg->method, TRUE), mono_method_full_name (cmethod, TRUE));
+			}
 #endif
 
 			pass_mrgctx = need_mrgctx_arg (cfg, cmethod);
@@ -10079,7 +10133,13 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				}
 			}
 
-			inline_costs += CALL_COST * MIN(10, num_calls++);
+			/* MONO_WASM_JIT_INLINE_COLD_CALL: a call in a throw block runs at most once, on the way to the throw -- a flat
+			 * cost, and it does not advance num_calls, so it no longer makes every later hot call dearer. Not zero: a call
+			 * left standing is 1-3 KB of x86 (R371), so some size pressure stays. */
+			if (wj_cold)
+				inline_costs += WJ_COLD_CALL_COST;
+			else
+				inline_costs += CALL_COST * MIN(10, num_calls++);
 
 			/*
 			 * Synchronized wrappers.

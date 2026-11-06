@@ -386,6 +386,55 @@ is_address_protected (MonoJitInfo *ji, MonoJitExceptionInfo *ei, gpointer ip)
 	return TRUE;
 }
 
+#ifdef HOST_BROWSER
+/*
+ * MONO_WASM_JIT_EH_JTAB (plan zany-beacon E0): for a JIT EH frame (a record-mode island), answer the clause loops of
+ * pass 1/2 from the compiled body's own clause table (interp.c mono_wasm_jit_ehjt_frame: a synthetic jinfo whose
+ * addresses encode the clause nesting tree) instead of the interpreter's jinfo for the method -- the foundation for
+ * inlining methods with clauses, which the interpreter never had. Bit 1 substitutes, bit 2 compares the two answers
+ * clause for clause, in the order the loops test them, and counts disagreements ([wasm-jit ehjt]). Only what the clause
+ * loops read changes; callers run this after the stack trace was recorded from the interpreter's jinfo.
+ * The interpreter's answer is the inexact one where two clauses share a try start: its address is the innermost
+ * containing clause's interpreter try_start, which a shorter clause starting there also covers, so a frame past the
+ * shorter clause's end is reported inside it (26.2's FabricModCompat.parseModMetadata, findings log round B2).
+ */
+static void
+wasm_ehjt_frame (StackFrameInfo *frame, MonoJitInfo **ji, gpointer *ip)
+{
+	extern int mono_wasm_jit_eh_jtab;
+	extern gboolean mono_wasm_jit_ehjt_frame (MonoMethodILState *il, MonoJitInfo **ji, gpointer *ip);
+	extern void mono_wasm_jit_ehjt_note (gboolean disagree, MonoMethodILState *il, MonoJitInfo *iji, gpointer iip, int na,
+		MonoJitExceptionInfo **pa, MonoJitInfo *tji, gpointer tip, int nb, MonoJitExceptionInfo **pb);
+	MonoJitInfo *tji = NULL;
+	gpointer tip = NULL;
+
+	if (G_LIKELY (!mono_wasm_jit_eh_jtab) || frame->type != FRAME_TYPE_IL_STATE || !frame->il_state)
+		return;
+	if (!mono_wasm_jit_ehjt_frame (frame->il_state, &tji, &tip))
+		return;
+	if ((mono_wasm_jit_eh_jtab & 2) && *ji) {
+		MonoJitExceptionInfo *pa [32], *pb [32];
+		int na = 0, nb = 0;
+		for (guint32 i = 0; i < (*ji)->num_clauses && na < 32; i++)
+			if (is_address_protected (*ji, &(*ji)->clauses [i], *ip))
+				pa [na++] = &(*ji)->clauses [i];
+		for (guint32 i = 0; i < tji->num_clauses && nb < 32; i++)
+			if (is_address_protected (tji, &tji->clauses [i], tip))
+				pb [nb++] = &tji->clauses [i];
+		gboolean same = na == nb;
+		for (int k = 0; same && k < na; ++k)
+			same = pa [k]->flags == pb [k]->flags &&
+				(pa [k]->flags != MONO_EXCEPTION_CLAUSE_NONE || pa [k]->data.catch_class == pb [k]->data.catch_class);
+		mono_wasm_jit_ehjt_note (!same, frame->il_state, *ji, *ip, na, pa, tji, tip, nb, pb);
+	}
+	if (mono_wasm_jit_eh_jtab & 1) {
+		*ji = tji;
+		*ip = tip;
+		frame->ji = tji;
+	}
+}
+#endif
+
 #ifdef MONO_ARCH_HAVE_UNWIND_BACKTRACE
 
 #if 0
@@ -2443,6 +2492,10 @@ handle_exception_first_pass (MonoContext *ctx, MonoObject *obj, gint32 *out_filt
 			result = MONO_FIRST_PASS_CALLBACK_TO_NATIVE;
 		}
 
+#ifdef HOST_BROWSER
+		if (in_interp)
+			wasm_ehjt_frame (&frame, &ji, &ip);
+#endif
 		for (guint32 i = clause_index_start; i < ji->num_clauses; i++) {
 			MonoJitExceptionInfo *ei = &ji->clauses [i];
 			gboolean filtered = FALSE;
@@ -2871,6 +2924,10 @@ mono_handle_exception_internal (MonoContext *ctx, MonoObject *obj, gboolean resu
 			ip = (guint8*)ji->code_start + frame.native_offset;
 		else
 			ip = MONO_CONTEXT_GET_IP (ctx);
+#ifdef HOST_BROWSER
+		if (in_interp && clause_index_start == 0)   /* a resumed LLVM finally indexes the jinfo it started with */
+			wasm_ehjt_frame (&frame, &ji, &ip);
+#endif
 
 		method = jinfo_get_method (ji);
 		// frame_count ++;

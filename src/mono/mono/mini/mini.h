@@ -2594,6 +2594,14 @@ typedef struct {
 	WasmEhClause *clauses;  /* [nclauses], in table (innermost/first-checked) order */
 	MonoMethod *method;      /* method whose active wasm-JIT island owns the authoritative IL offset */
 	const char *name;       /* method full name (diagnostics only) */
+	/* The InterpMethod this body was compiled against (cfg->wasm_jit_caller_imethod). An EH record (WjEhRec.desc, R353)
+	 * points at its body's table, and reaches the InterpMethod through here (H1: after a body swap the frame still runs
+	 * this compilation, not the method's current one). */
+	gpointer body;
+	/* MONO_WASM_JIT_EH_JTAB (plan zany-beacon E0): the synthetic MonoJitInfo exception pass 1/2 read for a frame of this
+	 * body instead of the interpreter's (interp.c WjEhJt), built at the first throw through such a frame and published
+	 * once; NULL until then. Never freed, like the table. */
+	gpointer jt;
 } WasmEhTable;
 /* Returns the dense bbidx of the handler to dispatch to (>=0), or -1 to rethrow (no local handler).
  * A FINALLY/FAULT handler's bbidx is tagged with WJ_EH_DISPATCH_FINALLY_BIT so the wasm landing pad

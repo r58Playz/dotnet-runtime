@@ -3690,8 +3690,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); \
 	wasm_i32_const (&body, (gint32) _L->magic_key); wasm_op (&body, WASM_OP_I32_XOR); EHREC_I32_STORE (_L->magic); \
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, (gint32) (intptr_t) cfg->method); EHREC_I32_STORE (_L->il_method); \
-	/* the InterpMethod this body was compiled against: an exception in this frame resolves clauses through it (H1) */ \
-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, (gint32) (intptr_t) cfg->wasm_jit_caller_imethod); EHREC_I32_STORE (_L->body); \
+	/* this body's EH table: it carries the InterpMethod the body was compiled against (an exception in this frame resolves \
+	 * clauses through it, H1) and, under MONO_WASM_JIT_EH_JTAB, the body's own clauses for exception pass 1/2 */ \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, (gint32) (intptr_t) eh_table); EHREC_I32_STORE (_L->desc); \
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, -1); EHREC_I32_STORE (_L->il_offset); \
 	/* prev = cur_island_il_state; finally_sp = the finally-save depth */ \
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
@@ -3966,6 +3967,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		guint _ci; int _d;
 		eh_table = (WasmEhTable *) g_malloc0 (sizeof (WasmEhTable));
 		eh_table->method = cfg->method;
+		eh_table->body = cfg->wasm_jit_caller_imethod;   /* H1: what an EH record of this body resolves through */
 		eh_table->name = mname ? g_strdup (mname) : NULL;   /* diagnostics */
 		eh_table->nbbs = N;
 		eh_table->nclauses = (gint32) cfg->header->num_clauses;
