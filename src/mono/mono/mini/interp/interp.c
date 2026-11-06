@@ -8949,8 +8949,35 @@ mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj, gpointer 
  * an in-method wasm catch or the interp e-thunk boundary (mono_wasm_jit_invoke_caught), which relies on
  * the resume-state pass 1 already set. NEVER returns. Called only after pass-1, so it does NOT itself
  * touch thrown_exc/resume-state — pass 1 owns that, exactly like mini_llvmonly_throw_exception. */
+/* MONO_WASM_JIT_EXC_PIN (2026-11-05, findings log round B2): the exception a JIT raise path is about to throw, pinned
+ * from before exception pass 1 until the landing pad's own pinned handle (jit_tls->thrown_exc, below) holds it. Without
+ * it the object lives only in C locals -- invisible to sgen on wasm, which scans the linear-memory stack, handles and
+ * roots, not wasm locals -- while pass 1 can reach a GC (a JIT EH frame's first throw TRANSFORMS its InterpMethod:
+ * interp_compile_interp_method). A raise_corlib exception is reachable from nothing else, so a nursery collection in that
+ * window moved it and pass 1's isinst read sgen's filler class: mono-assert class-accessors.c:90 in URLClassPath$Loader.
+ * findResource (R522's unattributed fault). At the shipped 64 MB nursery the window opens ~once per 300-900 k raises;
+ * a 2 MB nursery reproduces the assert in 3 of 5 unpinned boots and none of 5 pinned. */
+static MonoGCHandle
+wj_exc_pin (MonoObject *exc)
+{
+	extern int mono_wasm_jit_exc_pin;
+	mono_wasm_jit_count (WJC_EXC_RAISED);
+	if (!mono_wasm_jit_exc_pin || !exc)
+		return 0;
+	mono_wasm_jit_count (WJC_EXC_PINNED);
+	return mono_gchandle_new_internal (exc, TRUE);
+}
+
+/* the evidence: did a collection run while pass 1/2 held the exception? */
 static void
-wasm_jit_cpp_unwind (MonoObject *exc)
+wj_exc_gc_note (int gc0)
+{
+	if (mono_gc_collection_count (0) != gc0)
+		mono_wasm_jit_count (WJC_EXC_GC_DURING);
+}
+
+static void
+wasm_jit_cpp_unwind (MonoObject *exc, MonoGCHandle pin)
 {
 	/* Stash the managed exception in jit_tls->thrown_exc so a JITted in-method `catch <x.e>` landing pad
 	 * can load it (mini_llvmonly_load_exception) for the type check + OP_GET_EX_OBJ. pass 1 set only the
@@ -8982,6 +9009,9 @@ wasm_jit_cpp_unwind (MonoObject *exc)
 	} else {
 		jit_tls->thrown_exc = mono_gchandle_new_internal (exc, TRUE);
 	}
+	/* thrown_exc (pinned) holds it now: the raise path's own pin can go */
+	if (pin)
+		mono_gchandle_free_internal (pin);
 	mono_llvm_start_native_unwind ();
 	g_assert_not_reached ();   /* the C++ throw above does not return */
 }
@@ -9013,9 +9043,12 @@ mono_wasm_jit_raise_corlib (int exc_id)
 	case 9:  ex = mono_get_exception_execution_engine (NULL); break;
 	default: ex = mono_get_exception_arithmetic (); break;   /* unreachable: emitter only emits ids 0-9 (WJ_EXC_IDS) */
 	}
+	MonoGCHandle pin = wj_exc_pin ((MonoObject *) ex);
+	int gc0 = mono_gc_collection_count (0);
 	memset (&ctx, 0, sizeof (ctx));
 	MONO_CONTEXT_SET_SP (&ctx, &ctx);
 	mono_handle_exception (&ctx, (MonoObject *) ex);   /* pass 1: run finallys + install resume-state for the handler */
+	wj_exc_gc_note (gc0);
 	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
 		/* handler is in native code (not expected for a JITted method invoked from interp) */
 		mono_restore_context (&ctx);
@@ -9024,7 +9057,7 @@ mono_wasm_jit_raise_corlib (int exc_id)
 	/* pass 1 either installed resume-state (handler in an interp/outer frame) OR stopped at a JITted island
 	 * whose OWN wasm landing pad catches the cpp unwind (e.g. a checked-op corlib exception caught by the
 	 * SAME JITted method). Either way it is delivered by the native unwind below, which never returns. */
-	wasm_jit_cpp_unwind ((MonoObject *) ex);   /* C++-unwind to the nearest landing pad; never returns */
+	wasm_jit_cpp_unwind ((MonoObject *) ex, pin);   /* C++-unwind to the nearest landing pad; never returns */
 }
 
 /*
@@ -9054,9 +9087,12 @@ wasm_jit_throw_internal (MonoObject *exc, gboolean rethrow)
 		mex->trace_ips = NULL;
 	}
 	mono_error_cleanup (error);
+	MonoGCHandle pin = wj_exc_pin (exc);
+	int gc0 = mono_gc_collection_count (0);
 	memset (&ctx, 0, sizeof (ctx));
 	MONO_CONTEXT_SET_SP (&ctx, &ctx);
 	mono_handle_exception (&ctx, exc);   /* pass 1: run finallys + install resume-state for the handler */
+	wj_exc_gc_note (gc0);
 	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
 		mono_restore_context (&ctx);
 		g_assert_not_reached ();
@@ -9065,7 +9101,7 @@ wasm_jit_throw_internal (MonoObject *exc, gboolean rethrow)
 	 * hits the interp->JIT boundary) OR stopped at a JITted island whose OWN wasm landing pad catches the
 	 * cpp unwind (e.g. a `throw` caught by the SAME JITted method). Either way the exception is delivered by
 	 * the native unwind below, which never returns. */
-	wasm_jit_cpp_unwind (exc);   /* C++-unwind to the nearest landing pad; never returns */
+	wasm_jit_cpp_unwind (exc, pin);   /* C++-unwind to the nearest landing pad; never returns */
 }
 
 void
@@ -9414,10 +9450,12 @@ typedef struct {
 	guint32 magic;                  /* WJ_EHREC_MAGIC ^ (guint32) &il */
 	MonoMethodILState *prev;        /* the cur_island_il_state this record shadows */
 	gint32 finally_sp;              /* wj_finally_exc_sp at entry */
-	/* The InterpMethod this body was compiled against (a compile-time constant). Exception handling for this frame
-	 * resolves its clauses through it, not through the method's CURRENT InterpMethod: after a body swap those are
-	 * compilations of different IL, and the frame is still running the old one (H1). 0 = use the current one. */
-	InterpMethod *body;
+	/* This compiled body's EH table (a compile-time constant; never freed). desc->body is the InterpMethod the body was
+	 * compiled against: exception handling for this frame resolves its clauses through it, not through the method's
+	 * CURRENT InterpMethod -- after a body swap those are compilations of different IL, and the frame is still running
+	 * the old one (H1); NULL body = use the current one. Under MONO_WASM_JIT_EH_JTAB, desc's own clauses answer
+	 * exception pass 1/2 instead (mono_wasm_jit_ehjt_frame). */
+	WasmEhTable *desc;
 	MonoMethodILState il;           /* method + il_offset only */
 } WjEhRec;
 
@@ -9462,7 +9500,8 @@ static InterpMethod *
 interp_imethod_for_il_state (MonoMethod *method, MonoMethodILState *il)
 {
 	if (il && wj_ehrec_is_record_il (il)) {
-		InterpMethod *b = wj_ehrec_of_il (il)->body;
+		WasmEhTable *d = wj_ehrec_of_il (il)->desc;
+		InterpMethod *b = d ? (InterpMethod *) d->body : NULL;
 		if (b && b->method == method)
 			return b;
 	}
@@ -9478,7 +9517,216 @@ gpointer mono_interp_ehrec_body (MonoMethodILState *il);
 gpointer
 mono_interp_ehrec_body (MonoMethodILState *il)
 {
-	return wj_ehrec_is_record_il (il) ? (gpointer) wj_ehrec_of_il (il)->body : NULL;
+	WasmEhTable *d = wj_ehrec_is_record_il (il) ? wj_ehrec_of_il (il)->desc : NULL;
+	return d ? d->body : NULL;
+}
+
+/* --- MONO_WASM_JIT_EH_JTAB (plan zany-beacon E0): a JIT EH frame's clauses for exception pass 1/2, from the compiled
+ * body's own table ----------------------------------------------------------------------------------------------
+ * Pass 1/2 (mini-exceptions.c) test a frame's clauses with is_address_protected (ji, ei, ip): an address against each
+ * clause's [try_start, try_end). For a JIT EH frame they used the INTERPRETER's jinfo for the method -- clause ranges in
+ * interpreter bytecode -- and the address the interpreter's clause lookup derives from the record's IL offset. That
+ * cannot describe clauses the interpreter never had (an inlinee's). Here the body's WasmEhTable answers instead: its
+ * clauses become a SYNTHETIC jinfo whose addresses encode the clauses' nesting tree. Each clause gets [lo, hi) from a
+ * depth-first numbering, so an address at a clause's lo is inside exactly that clause and its ancestors; the jinfo lists
+ * them in post-order, inner before outer -- ECMA's first-match order, a try range equal to another's nesting the later
+ * clause around the earlier. A frame's address is the lo of the innermost clause whose IL try range holds the record's
+ * IL offset, or an address no clause protects. code_start is the table's own address: never executed, never looked up
+ * by address, only distinct. Clauses that overlap without nesting have no tree: no jinfo, the interpreter's is used. */
+typedef struct {
+	MonoJitInfo *ji;      /* n clauses, post-order */
+	gint32 n;
+	gint32 *order;        /* [n] the table clause index of each jinfo clause */
+	gint32 *lo;           /* [n] by TABLE clause index: the clause's address offset */
+	gint32 unprotected;   /* an address offset inside no clause */
+} WjEhJt;
+
+#define WJ_EHJT_UNNESTED ((gpointer) (gsize) 1)
+
+/* does clause p enclose clause c (index order breaks a tie of equal ranges: the later encloses the earlier)? */
+static gboolean
+wj_ehjt_encloses (const WasmEhClause *p, int pi, const WasmEhClause *c, int ci)
+{
+	gint32 ps = p->try_start, pe = p->try_start + p->try_len, cs = c->try_start, ce = c->try_start + c->try_len;
+	if (!(ps <= cs && ce <= pe))
+		return FALSE;
+	return ps != cs || pe != ce || pi > ci;
+}
+
+static void
+wj_ehjt_dfs (const WasmEhTable *t, const gint32 *parent, int c, gint32 *counter, gint32 *lo, gint32 *hi, gint32 *order, gint32 *norder)
+{
+	lo [c] = (*counter)++;
+	for (int k = 0; k < t->nclauses; ++k)
+		if (parent [k] == c)
+			wj_ehjt_dfs (t, parent, k, counter, lo, hi, order, norder);
+	hi [c] = *counter;
+	order [(*norder)++] = c;
+}
+
+static WjEhJt *
+wj_ehjt_build (WasmEhTable *t)
+{
+	int n = t->nclauses;
+	gint32 *parent = g_new (gint32, n), *lo = g_new0 (gint32, n), *hi = g_new0 (gint32, n), *order = g_new0 (gint32, n);
+	for (int c = 0; c < n; ++c) {
+		const WasmEhClause *a = &t->clauses [c];
+		int best = -1;
+		for (int p = 0; p < n; ++p) {
+			const WasmEhClause *b = &t->clauses [p];
+			if (p == c)
+				continue;
+			gint32 as = a->try_start, ae = as + a->try_len, bs = b->try_start, be = bs + b->try_len;
+			if (!(ae <= bs || be <= as) && !((as <= bs && be <= ae) || (bs <= as && ae <= be))) {
+				/* overlapping without nesting: there is no tree */
+				g_free (parent); g_free (lo); g_free (hi); g_free (order);
+				return NULL;
+			}
+			if (!wj_ehjt_encloses (b, p, a, c))
+				continue;
+			if (best < 0 || b->try_len < t->clauses [best].try_len || (b->try_len == t->clauses [best].try_len && p < best))
+				best = p;
+		}
+		parent [c] = best;
+	}
+	gint32 counter = 0, norder = 0;
+	for (int c = 0; c < n; ++c)
+		if (parent [c] < 0)
+			wj_ehjt_dfs (t, parent, c, &counter, lo, hi, order, &norder);
+	g_assert (norder == n);
+	guint8 *code = (guint8 *) t;
+	MonoJitInfo *ji = (MonoJitInfo *) g_malloc0 (mono_jit_info_size ((MonoJitInfoFlags) 0, n, 0));
+	mono_jit_info_init (ji, t->method, code, n + 4, (MonoJitInfoFlags) 0, n, 0);
+	for (int j = 0; j < n; ++j) {
+		int c = order [j];
+		MonoJitExceptionInfo *ei = &ji->clauses [j];
+		ei->flags = (guint32) t->clauses [c].flags;
+		ei->try_start = code + lo [c];
+		ei->try_end = code + hi [c];
+		ei->handler_start = code + n + 2;   /* outside every try: nothing resumes here (the landing pad dispatches) */
+		ei->clause_index = c;
+		ei->try_offset = (guint32) t->clauses [c].try_start;
+		ei->try_len = (guint32) t->clauses [c].try_len;
+		if (t->clauses [c].flags == MONO_EXCEPTION_CLAUSE_NONE)
+			ei->data.catch_class = (MonoClass *) t->clauses [c].catch_class;
+	}
+	WjEhJt *jt = g_new0 (WjEhJt, 1);
+	jt->ji = ji;
+	jt->n = n;
+	jt->order = order;
+	jt->lo = lo;
+	jt->unprotected = n + 1;
+	g_free (parent);
+	g_free (hi);
+	return jt;
+}
+
+/* The synthetic jinfo and the address of the frame behind `il`, if it is a JIT EH record whose table has a clause tree.
+ * Built at the first throw through a frame of the body and published once (CAS; a loser frees its unpublished copy). */
+gboolean mono_wasm_jit_ehjt_frame (MonoMethodILState *il, MonoJitInfo **out_ji, gpointer *out_ip);
+gboolean
+mono_wasm_jit_ehjt_frame (MonoMethodILState *il, MonoJitInfo **out_ji, gpointer *out_ip)
+{
+	if (!il || !wj_ehrec_is_record_il (il))
+		return FALSE;
+	WjEhRec *rec = wj_ehrec_of_il (il);
+	WasmEhTable *t = rec->desc;
+	if (!t) {
+		mono_wasm_jit_count (WJC_EHJT_NODESC);
+		return FALSE;
+	}
+	if (t->nclauses <= 0 || t->method != il->method)
+		return FALSE;
+	gpointer cur = mono_atomic_load_ptr (&t->jt);
+	if (!cur) {
+		WjEhJt *built = wj_ehjt_build (t);
+		gpointer mine = built ? (gpointer) built : WJ_EHJT_UNNESTED;
+		gpointer prev = mono_atomic_cas_ptr (&t->jt, mine, NULL);
+		if (prev) {
+			if (built) {
+				g_free (built->ji); g_free (built->order); g_free (built->lo); g_free (built);
+			}
+			cur = prev;
+		} else {
+			cur = mine;
+			mono_wasm_jit_count (built ? WJC_EHJT_BUILT : WJC_EHJT_UNNESTED);
+		}
+	}
+	if (cur == WJ_EHJT_UNNESTED)
+		return FALSE;
+	WjEhJt *jt = (WjEhJt *) cur;
+	extern int mono_wasm_jit_eh_jtab;
+	gint32 off = rec->il.il_offset, pos = jt->unprotected;
+	/* bit 4, the compare mode's negative control (tests only): the table answers "no clause" for every frame */
+	for (int j = 0; j < jt->n && !(mono_wasm_jit_eh_jtab & 4); ++j) {
+		const WasmEhClause *c = &t->clauses [jt->order [j]];
+		if (off >= c->try_start && off < c->try_start + c->try_len) {
+			pos = jt->lo [jt->order [j]];
+			break;
+		}
+	}
+	*out_ji = jt->ji;
+	*out_ip = (guint8 *) jt->ji->code_start + pos;
+	mono_wasm_jit_count (WJC_EHJT_FRAMES);
+	return TRUE;
+}
+
+/* compare mode (MONO_WASM_JIT_EH_JTAB bit 2): mini-exceptions.c compared the two answers for one frame -- the clauses
+ * protecting the interpreter's address (pa, from its jinfo iji) and the table's (pb, from tji). The first 24
+ * disagreements print both answers, both clause lists and which InterpMethod the interpreter's answer came from (the
+ * record's body, or the method's current one after a body swap): field reads only, no names formatted, nothing loaded. */
+static gint32 wj_ehjt_prints;
+void mono_wasm_jit_ehjt_note (gboolean disagree, MonoMethodILState *il, MonoJitInfo *iji, gpointer iip, int na,
+	MonoJitExceptionInfo **pa, MonoJitInfo *tji, gpointer tip, int nb, MonoJitExceptionInfo **pb);
+void
+mono_wasm_jit_ehjt_note (gboolean disagree, MonoMethodILState *il, MonoJitInfo *iji, gpointer iip, int na,
+	MonoJitExceptionInfo **pa, MonoJitInfo *tji, gpointer tip, int nb, MonoJitExceptionInfo **pb)
+{
+	if (!disagree)
+		return;
+	mono_wasm_jit_count (WJC_EHJT_DISAGREE);
+	if (na == 0)
+		mono_wasm_jit_count (WJC_EHJT_DISAGREE_UNREACH);
+	int n = mono_atomic_inc_i32 (&wj_ehjt_prints);
+	if (n > 24 || !il || !wj_ehrec_is_record_il (il))
+		return;
+	WasmEhTable *t = wj_ehrec_of_il (il)->desc;
+	MonoMethod *m = il->method;
+	InterpMethod *body = t ? (InterpMethod *) t->body : NULL;
+	InterpMethod *used = interp_imethod_for_il_state (m, il);
+	InterpMethod *cur = mono_interp_peek_imethod (m);
+	GString *g = g_string_new (NULL);
+	g_string_append_printf (g, "[wasm-jit ehjt] DISAGREE #%d %s.%s:%s il=%d | interp n=%d:", n,
+		m ? m_class_get_name_space (m->klass) : "?", m ? m_class_get_name (m->klass) : "?", m ? m->name : "?", il->il_offset, na);
+	for (int k = 0; k < na; ++k)
+		g_string_append_printf (g, " c%d/f%u/%s", (int) (pa [k] - iji->clauses), pa [k]->flags,
+			pa [k]->flags == MONO_EXCEPTION_CLAUSE_NONE && pa [k]->data.catch_class ? m_class_get_name (pa [k]->data.catch_class) : "-");
+	g_string_append_printf (g, " | table n=%d:", nb);
+	for (int k = 0; k < nb; ++k)
+		g_string_append_printf (g, " c%d/f%u/%s", pb [k]->clause_index, pb [k]->flags,
+			pb [k]->flags == MONO_EXCEPTION_CLAUSE_NONE && pb [k]->data.catch_class ? m_class_get_name (pb [k]->data.catch_class) : "-");
+	g_string_append_printf (g, " | interp ip=+%d", (int) ((guint8 *) iip - (guint8 *) iji->code_start));
+	g_string_append_printf (g, " | used=%s transformed=%d (body=%p cur=%p used=%p) il_try_ranges:",
+		used == body ? "body" : used == cur ? "cur" : "other", used ? (int) used->transformed : -1, (void *) body, (void *) cur, (void *) used);
+	if (used && used->transformed && used->il_try_ranges)
+		for (int i = 0; i < used->num_clauses; ++i)
+			g_string_append_printf (g, " %d+%d", used->il_try_ranges [i * 2], used->il_try_ranges [i * 2 + 1]);
+	g_string_append_printf (g, " | interp ji %d:", iji->num_clauses);
+	for (guint32 i = 0; i < iji->num_clauses; ++i) {
+		MonoJitExceptionInfo *e = &iji->clauses [i];
+		g_string_append_printf (g, " c%u/f%u/[%d,%d)/%s", i, e->flags, (int) ((guint8 *) e->try_start - (guint8 *) iji->code_start),
+			(int) ((guint8 *) e->try_end - (guint8 *) iji->code_start),
+			e->flags == MONO_EXCEPTION_CLAUSE_NONE && e->data.catch_class ? m_class_get_name (e->data.catch_class) : "-");
+	}
+	if (t) {
+		g_string_append_printf (g, " | table %d:", t->nclauses);
+		for (int i = 0; i < t->nclauses; ++i)
+			g_string_append_printf (g, " c%d/f%d/%d+%d/%s", i, t->clauses [i].flags, t->clauses [i].try_start, t->clauses [i].try_len,
+				t->clauses [i].flags == MONO_EXCEPTION_CLAUSE_NONE && t->clauses [i].catch_class ? m_class_get_name ((MonoClass *) t->clauses [i].catch_class) : "-");
+	}
+	g_string_append_printf (g, " | table ip=+%d\n", (int) ((guint8 *) tip - (guint8 *) tji->code_start));
+	printf ("%s", g->str);
+	g_string_free (g, TRUE);
 }
 
 /* TRUE if the IL `imethod` was compiled from has since been replaced by a body swap: a frame running it reports no
@@ -9537,7 +9785,7 @@ static const WjEhRecLayout wj_ehrec_layout = {
 	G_STRUCT_OFFSET (WjEhRec, il),
 	G_STRUCT_OFFSET (WjEhRec, il) + G_STRUCT_OFFSET (MonoMethodILState, method),
 	G_STRUCT_OFFSET (WjEhRec, il) + G_STRUCT_OFFSET (MonoMethodILState, il_offset),
-	G_STRUCT_OFFSET (WjEhRec, body),
+	G_STRUCT_OFFSET (WjEhRec, desc),
 	WJ_EHREC_MAGIC,
 	MONO_LMFEXT_IL_STATE
 };

@@ -749,6 +749,11 @@ int mono_wasm_jit_fast_tls = 1;
 /* MONO_WASM_JIT_INLINE_COLD_THROW (R318, plan Phase 3.4): throw-terminated IL segments are not counted toward the inline
  * size limit, under the per-compile policy only (tier 2, INLINE_CALLS). */
 int mono_wasm_jit_inline_cold_throw = 1;
+/* MONO_WASM_JIT_INLINE_COLD_CALL: a call site inside an IL block that ends in a throw is not inlined and is charged a flat
+ * cost (method-to-ir.c wj_cold_call_site), under the per-compile policy only. R318 above discounts those blocks from the
+ * SIZE gate; this keeps the COST gate and the inliner out of them. 2026-11-05: every traced cost refusal of the hot
+ * block-access chain was exception-message code inlined into such a block (findings log). Census char 'T'. */
+int mono_wasm_jit_inline_cold_call = 0;
 /* MONO_WASM_JIT_INLINE_BFI (R319): inline a method of a BeforeFieldInit class whose cctor has not run, without running it.
  * BeforeFieldInit only requires the cctor before a static FIELD access, and such an access inside the inlinee is still
  * guarded (method-to-ir's ldsfld path: a runtime init check, or INLINE_FAILURE "class init"). Shipped with the wave-1
@@ -857,6 +862,19 @@ int mono_wasm_jit_t2_max_body = 106496;
  * on the Minecraft server tick: the island helpers 2.98 -> 0.08 M instr/tick, all instructions -3.6%, calls -9.6%;
  * cycles unresolved on that instrument (the helpers were ~1 M cycles/tick). 0 = the island calls. */
 int mono_wasm_jit_eh_rec = 1;
+/* MONO_WASM_JIT_EH_JTAB (plan zany-beacon E0): where exception pass 1/2 read a JIT EH frame's clauses. 0 = the
+ * interpreter's jinfo for the method, found through the record (today's path); bit 1 = the JIT's own clause table for the
+ * compiled body (interp.c mono_wasm_jit_ehjt_frame), the foundation for inlining methods with clauses, whose clauses the
+ * interpreter never had; bit 2 = compare the two answers, counting disagreements in [wasm-jit ehjt]; bit 4 = a wrong
+ * table (every frame unprotected), the compare's negative control -- 6, never with bit 1. Needs MONO_WASM_JIT_EH_REC
+ * (records carry the table). */
+int mono_wasm_jit_eh_jtab = 0;
+/* MONO_WASM_JIT_EXC_PIN: the JIT raise paths (interp.c raise_corlib / throw) pin the exception from before exception
+ * pass 1 until the landing pad's pinned thrown_exc handle holds it -- otherwise only C locals hold it, which sgen does not
+ * see on wasm, while pass 1 can reach a GC. A rooting fix, so on; 0 is the positive control. 2026-11-05, 1.16.1 boots
+ * with a 2 MB nursery (shipped 64 MB): 0 -> mono-assert class-accessors.c:90 in 3 of 5, 1 -> 0 of 5 (two of them with a
+ * collection inside the window); findings log, round B2. */
+int mono_wasm_jit_exc_pin = 1;
 /* MONO_WASM_JIT_AOT_BYREF (R356): the emitter's inline direct-AOT call also takes callees with byref PARAMETERS (the
  * ByteCodeHelper volatile/CAS helpers IKVM emits for every Java volatile/atomic access), instead of routing them
  * through the JIT->interp residual. p79 b t t b, server tick: the residual route 1.99 -> 0.58 M instr and 2.18 ->
@@ -1082,6 +1100,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_prof_origin, "MONO_WASM_JIT_PROF_ORIGIN", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_fast_tls, "MONO_WASM_JIT_FAST_TLS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_ldaddr_ref, "MONO_WASM_JIT_LDADDR_REF", 0, 1)
@@ -1106,6 +1125,8 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_aggr_inline_blocks, "MONO_WASM_JIT_AGGR_INLINE_BLOCKS", 0, 10000000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)
+	WJ_T2_KNOB (mono_wasm_jit_exc_pin, "MONO_WASM_JIT_EXC_PIN", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aot_byref, "MONO_WASM_JIT_AOT_BYREF", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aot_static_unbox, "MONO_WASM_JIT_AOT_STATIC_UNBOX", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_unit, "MONO_WASM_JIT_T2_UNIT", 0, 2)

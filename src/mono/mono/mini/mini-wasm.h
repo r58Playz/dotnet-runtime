@@ -1449,6 +1449,18 @@ enum {
 	WJC_DESC_GROW,               /* R489: closure installs whose descriptor was past this pthread's desc arrays (grown first; each was a store past their end) */
 	WJC_REACH_OOB,               /* R489: reach walks that met a descriptor past their stamp array (answered "reachable") */
 	WJC_PROMOTE_ONCE_SKIP,       /* R493: Lever A promotions refused because the caller was entered only once (a <clinit>) */
+	WJC_INLINE_COLD_CALL,        /* MONO_WASM_JIT_INLINE_COLD_CALL: call sites in a throw block of an INLINEE left a call (not inlined, flat cost) */
+	WJC_INLINE_COLD_CALL_ROOT,   /* ... in a throw block of the method being compiled */
+	WJC_INLINE_COLD_GI,          /* ... of those, callvirt sites (guarded inlining not attempted either) */
+	WJC_EHJT_FRAMES,             /* MONO_WASM_JIT_EH_JTAB: JIT EH frames exception pass 1/2 answered from the JIT's own clause table */
+	WJC_EHJT_NODESC,             /* ... a JIT EH record with no table (MUST be 0 when on) */
+	WJC_EHJT_DISAGREE,           /* compare mode: the JIT table and the interpreter's jinfo protect a position with different clauses (MUST be 0) */
+	WJC_EHJT_DISAGREE_UNREACH,   /* ... of which the interpreter's side protects nothing (it resets unreachable try ranges, transform.c) */
+	WJC_EHJT_UNNESTED,           /* bodies whose clauses do not nest (partial overlap): no table jinfo, the interpreter's is used */
+	WJC_EHJT_BUILT,              /* synthetic jinfos built (one per EH body at its first throw) */
+	WJC_EXC_RAISED,              /* MONO_WASM_JIT_EXC_PIN: exceptions thrown through the JIT raise paths (raise_corlib, throw) */
+	WJC_EXC_PINNED,              /* ... pinned across exception pass 1/2 */
+	WJC_EXC_GC_DURING,           /* ... during which a nursery collection ran (the window the pin closes) */
 	WJC_MAX
 };
 
@@ -1485,7 +1497,7 @@ void mono_wasm_jit_census_note_entry (int eslot);
 
 /* Byte offsets of interp.c's WjEhRec (R353), for the emitter, which cannot see MonoLMFExt from here. */
 typedef struct {
-	int size, previous_lmf, lmf_addr, lmf_method, kind, il_state, magic, prev, finally_sp, il, il_method, il_offset, body;
+	int size, previous_lmf, lmf_addr, lmf_method, kind, il_state, magic, prev, finally_sp, il, il_method, il_offset, desc;
 	guint32 magic_key;
 	int kind_il_state;
 } WjEhRecLayout;
