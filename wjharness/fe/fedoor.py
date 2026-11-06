@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""fedoor.py <capdir> [--event fe_l1i_miss] [--top 30] [--callers N] [--tick-only] -- the DOORS: for every front-end miss sample of the server thread that
+"""fedoor.py <capdir> [--event fe_l1i_miss] [--top 30] [--callers N] [--tick-only | --part P] -- the DOORS: for every front-end miss sample of the server thread that
 lands OUTSIDE our JIT tier, the function our code called to get there (the frame directly below the first `ours` frame in the
 sample's call chain). Ranks the exits from generated code by the misses they cause. Samples whose chain reaches no `ours`
 frame are counted apart (an excursion not entered from our code, or a chain broken in native code without frame pointers).
-Native frames are named with PERFRAW_DSO_SYMS=1 (set here)."""
+Native frames are named with PERFRAW_DSO_SYMS=1 (set here).
+--part keeps one of feclass.PARTS ('tick work', 'tasks', 'idle wait', 'other'); --tick-only = --part 'tick work' (a sample
+whose chain reaches MinecraftServer.tick). Before 2026-11-05 --tick-only dropped only samples under waitForTasks /
+parkNanos, which kept the wait loop's clock reads as tick work (feclass.py)."""
 import collections, os, sys
 os.environ["PERFRAW_DSO_SYMS"] = "1"
 here = os.path.dirname(os.path.abspath(__file__))
@@ -16,8 +19,8 @@ d = a[0]
 EV = opt("--event", "fe_l1i_miss")
 TOP = int(opt("--top", "30"))
 import re
-TICK = "--tick-only" in a   # drop samples whose chain passes through the idle wait between ticks (see fepart.py)
-IDLE = re.compile(r"class_1255:method_20813 |LockSupport:parkNanos ")
+from feclass import classify
+PART = "tick work" if "--tick-only" in a else opt("--part")
 r = subprocess.run([sys.executable, paths.tool("servertid.py"), d], capture_output=True, text=True)
 stid = int(r.stdout.strip().splitlines()[-1])
 cap, syms, ph = perfraw.open_capture(d, want_chains=True, event=EV)
@@ -48,7 +51,7 @@ tot = out = 0
 for tid, ip, t, chain in cap.window(t0, t1):
     if tid != stid:
         continue
-    if TICK and any(IDLE.search(name(x)[1]) for x in [ip] + [y for y in (chain or [])[1:] if y < perfraw.Symbols.CTX_FLOOR]):
+    if PART and classify([name(x)[1] for x in [ip] + [y for y in (chain or [])[1:] if y < perfraw.Symbols.CTX_FLOOR]]) != PART:
         continue
     tot += 1
     k, nm = name(ip)
@@ -72,7 +75,7 @@ for tid, ip, t, chain in cap.window(t0, t1):
     else:
         doors[door[0] + " :: " + door[1]] += 1
 
-print(f"{d}: server tid {stid}; {tot} {EV} samples, {out} ({100 * out / max(tot, 1):.1f}%) outside our tier")
+print(f"{d}: server tid {stid}{' (' + PART + ' only)' if PART else ''}; {tot} {EV} samples, {out} ({100 * out / max(tot, 1):.1f}%) outside our tier")
 print(f"  of those: {sum(doors.values())} reached through a call from our code, {sum(nochain.values())} with no `ours` frame in the chain")
 print(f"\ntop {TOP} doors (the function our code called), share of ALL {EV} samples:")
 for k, v in doors.most_common(TOP):

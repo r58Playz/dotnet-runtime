@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""fepart.py <capdir> [--event fe_l1i_miss] [--idle REGEX] -- split the server thread's samples into the IDLE WAIT between
-ticks (a call chain through Minecraft's wait-for-tasks, class_1255.method_20813, or LockSupport.parkNanos) and everything else
-(the tick's work), for the front-end event and for cycles, with the region split of the tick-work misses."""
-import bisect, collections, os, re, subprocess, sys
+"""fepart.py <capdir> [--event fe_l1i_miss] -- split the server thread's samples into tick work, tasks run between ticks,
+the idle wait's own machinery, and other (feclass.py has the definitions and the 2026-11-05 correction), for the
+front-end event and for cycles, with the region split of the tick-work misses."""
+import bisect, collections, os, subprocess, sys
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib")); import paths  # noqa: E402,F401 -- every harness code dir on sys.path
 import perfraw, hotinsn
+from feclass import classify, PARTS
 
 a = sys.argv[1:]
 opt = lambda n, dflt=None: a[a.index(n) + 1] if n in a else dflt
 d = a[0]
 EV = opt("--event", "fe_l1i_miss")
-IDLE = re.compile(opt("--idle", r"class_1255:method_20813 |LockSupport:parkNanos "))
 r = subprocess.run([sys.executable, paths.tool("servertid.py"), d], capture_output=True, text=True)
 stid = int(r.stdout.strip().splitlines()[-1])
 dumps = sorted((os.path.getsize(os.path.join(d, f)), os.path.join(d, f)) for f in os.listdir(d) if f.startswith("jit-") and f.endswith(".dump"))
@@ -31,8 +31,7 @@ def run(ev):
     for tid, ip, t, chain in cap.window(t0, t1):
         if tid != stid:
             continue
-        idle = any((n := fn(x)) and IDLE.search(n) for x in [ip] + list(chain or [])[1:] if x < perfraw.Symbols.CTX_FLOOR)
-        k = "idle wait" if idle else "tick work"
+        k = classify([fn(x) for x in [ip] + list(chain or [])[1:] if x < perfraw.Symbols.CTX_FLOOR])
         part[k] += 1
         n = fn(ip)
         rg = hotinsn.kind_of(n) if n else ("native" if (syms.lookup(ip) or b"").startswith(b"DSO:") else "other")
@@ -42,10 +41,10 @@ def run(ev):
 
 mp, mr = run(EV)
 cp, cr = run("cycles")
-mt, ct = sum(mp.values()), sum(cp.values())
-print(f"{d}: server tid {stid}; {mt} {EV}, {ct} cycles samples")
+mt, ct = max(sum(mp.values()), 1), max(sum(cp.values()), 1)
+print(f"{d}: server tid {stid}; {sum(mp.values())} {EV}, {sum(cp.values())} cycles samples")
 print(f"{'':12s} {'misses %':>9s} {'cycles %':>9s} {'misses/cycle vs mean':>21s}")
-for k in ("tick work", "idle wait"):
+for k in PARTS:
     m, c = 100 * mp[k] / mt, 100 * cp[k] / ct
     print(f"{k:12s} {m:9.2f} {c:9.2f} {m / c if c else float('nan'):21.2f}")
 print("\ntick work only, by region (share of tick-work misses / of tick-work cycles):")

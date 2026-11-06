@@ -58,12 +58,22 @@ def mkey(s):
 # time-supplier lambda are INLINED into their callers, so the runtime they call is charged to the JIT'd stubs it
 # enters instead -- glfwGetTime, Unsafe.park, Unsafe.putObject (LockSupport.setBlocker) -- and the two names above
 # read ~0 (b7: 0.04 M against g2's 3.65 M; the stubs carry ~4.5 M). The b4/sc site census (2026-10-01) shows the
-# stubs' server-thread callers: putObject/park 100% from method_20813 / method_18857 (runTasks), glfwGetTime from
-# the time check behind MinecraftServer.method_20415 (shouldKeepTicking, ~470 calls/tick) except one tier-0 site at
-# ~2 calls/tick. So on the SERVER thread these are idle; on another thread they need not be.
+# stubs' server-thread callers: putObject/park 100% from method_20813 / method_18857 (managedBlock), glfwGetTime from
+# the haveTime check in MinecraftServer.method_20415 (pollTaskInternal; haveTime itself is method_3866) and in the
+# `() -> !haveTime()` lambda of waitUntilNextTick (method_16208) -- ~470 calls/tick -- except one tier-0 site at ~2
+# calls/tick. So on the SERVER thread these are idle; on another thread they need not be.
+# JDK 25 names (IKVM's class library since 2026-10): the stubs are IKVM.Java.Externs.jdk.internal.misc.Unsafe.park /
+# .putReferenceVolatile (LockSupport.setBlocker), and the clock is charged to org.lwjgl.system.JNI.invokeD. The
+# 2026-11-05 census puts ~20 of invokeD's ~505 server calls a tick in tick work (feclass.py), so charging it all to the
+# idle loop overstates the loop by ~4% of invokeD's 1.46 M instructions. The JDK 8 names stay for older ledgers.
 IDLE = {'net.minecraft.class_1255.method_20813', 'com.mojang.blaze3d.platform.GLX.lambda$_initGlfw$2',
         'net.minecraft.class_1255.method_18857', 'net.minecraft.server.MinecraftServer.method_20415',
-        'org.lwjgl.glfw.GLFW.glfwGetTime', 'sun.misc.Unsafe.park', 'sun.misc.Unsafe.putObject'}
+        'net.minecraft.server.MinecraftServer.method_16208',
+        'org.lwjgl.glfw.GLFW.glfwGetTime', 'sun.misc.Unsafe.park', 'sun.misc.Unsafe.putObject',
+        'org.lwjgl.system.JNI.invokeD', 'java.util.concurrent.locks.LockSupport.parkNanos',
+        'java.util.concurrent.locks.LockSupport.setBlocker', 'jdk.internal.misc.Unsafe.park',
+        'IKVM.Java.Externs.jdk.internal.misc.Unsafe.park',
+        'IKVM.Java.Externs.jdk.internal.misc.Unsafe.putReferenceVolatile'}
 
 def rows(path):
     with open(path) as f:
