@@ -323,6 +323,13 @@ export function classifyLine (line) {
    * match a bare type name -- so the claim above no longer holds for it. It scored all four p23 runs as
    * `linkage-error:NoSuchMethodError` (R300). */
   if (/\bGC_PIN_CLASS:/.test(line)) return null;
+  /* NOR IS A METHOD BEING COUNTED OR CAPTURED. The JIT tier's tab-separated census records name methods in mono's
+   * `Class:member` form -- MONO_WASM_JIT_SITE_COUNT's `WASM_JIT_SITE\t...\tvoid java.lang.LinkageError:.ctor (string)`
+   * and MONO_WASM_JIT_CAPTURE's `WASM_JIT_CAPTURE_BEGIN\t...` -- so every census and ledger mapping run scored
+   * `linkage-error:LinkageError:.ctor` (R519 saw the capture case; 2026-11-05's census and mapping runs both). Only
+   * these two records, matched with their TAB: the space-separated WASM_JIT_* records (ADMIT_FAIL, VSLOW_FAIL,
+   * WILD_STORE, ...) report real faults and stay classified. */
+  if (/WASM_JIT_(?:SITE|CAPTURE_BEGIN)\t/.test(line)) return null;
   for (const r of RULES) {
     if (!r.rx.test(line)) continue;
     if (r.not && r.not.test(line)) continue;
@@ -485,6 +492,8 @@ const CASES = [
   ["[IkvmClassLoader] 'java.lang.ClassCastException' loaded from URLClassLoader", null, null],
   ["[t32a8c008][MONO:Mono] GC_PIN_CLASS:      1  stack:0      static:0      other:1       java.lang.NoSuchMethodError", null, null],
   ["[MONO] GC_PIN_CLASS:      3  stack:3      static:0      other:0       java.lang.ClassCastException", null, null],
+  ['[473752:473752:1105/151130.516966:INFO:CONSOLE:13] "WASM_JIT_SITE\t1\t187\t0\td\t4\t0x19f16cb0\t0x19671438\tvoid java.lang.LinkageError:.ctor (string)\t-\tjava.lang.Error:.ctor\t-\t-1", source: https://localhost:5021/src/dotnet/log.ts (13)', null, null],
+  ['[466745:466745:1105/145950.719218:INFO:CONSOLE:13] "WASM_JIT_CAPTURE_BEGIN\t17906\tm1\t652\tvoid java.lang.IncompatibleClassChangeError:.ctor (string)", source: https://localhost:5021/src/dotnet/log.ts (13)', null, null],
   ["[wasm-jit stats] registered=32057 bailed=12 invalid=0", null, null],
   ["Preparing spawn area: 83%", null, null],
   ["[bench] fps=14.3 frames=1820", null, null],

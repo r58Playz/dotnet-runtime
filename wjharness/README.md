@@ -127,7 +127,8 @@ measured from the launcher's Play.
 | `armcmp` | Side-by-side per-arm table from a batch's census files |
 | `gcshare`, `gctime`, `gcphases`, `gcalloc` | STW GC share of a window; GC pauses per phase (`MONO_LOG_LEVEL=debug`); per sgen phase (`MONO_GC_DEBUG=2`); allocation by site |
 | `faultcensus` | Per-class fault census over `state/corpus` + `runs/` (`--since`, `--json`); **`--disjoint`** runs the disjointness invariant over every real log |
-| `fe/*` | Front-end misses by region (`fesites`), the door into native code (`fedoor`), native functions (`fenative`), idle vs tick work (`fepart`), top-down (`fe`) |
+| `fe/*` | Front-end misses by region (`fesites`), the door into native code (`fedoor`, `--tick-only` / `--part`), native functions (`fenative`), tick work vs tasks vs the idle wait (`fepart`; the split is `feclass.py`, corrected 2026-11-05), top-down (`fe`) |
+| `sitewhy`, `inltree` | The call-site census by inline verdict (`--tier`, `--no-phantoms` drops FAST_TLS's non-calls); mono's verbose inline trees (`MONO_VERBOSE_METHOD=<root>;...`) with costs of refused subtrees |
 | `ledger/refresh` | The gap ledger: one mapping run -> ours ledger, optional HotSpot ledger, joined report (needs `D8`) |
 | `j2d/prep`, `j2d/wledger`, `j2d/hsledger`, `j2d/counts`, `j2d/report`, `cjledger`, `cjcapture`, `cjprobe` | jbox2d ledgers and counts per run; CheerpJ codegen capture and GC-contract probe |
 | `native/buckets`, `join`, `split`, `servertid`, `natstat`, `natcensus` | Per-bucket instructions against native's whole frame; per-method join on Java names; the server tid **by the symbols it ran** (both busy threads are `DedicatedWorker`). `--tid`/`--thread` explicitly, always |
@@ -143,7 +144,7 @@ measured from the launcher's Play.
 | `depcheck` | The admission contract: every f-slot baked into a body against every one a descriptor declares. Both inputs from ONE run |
 | `enctest/run.sh` | Host-side encoder gates in seconds (framers, serializer, re-framing, stub banks executed in node). Run before believing anything about the encoder |
 | `deploy` | Republish ikvmcraft against `$DOTNET_ZIP`, apply the post-publish patches, restart `$DEV_UNIT`, prove the marker in the SERVED bytes |
-| `ikvm-runtime` | Rebuild IKVM.Runtime (R516's recipe); `--install` stages it into ikvmcraft (dir + zip), keeping the replaced DLL in `state/arms/ikvm-runtime/` |
+| `ikvm-runtime` | Rebuild IKVM.Runtime (R516's recipe); `--java` also rebuilds IKVM.Java with the new ikvmc (needed for map.xml / import-time intrinsics); `--install` stages into ikvmcraft (dir + zip), keeping the replaced DLLs in `state/arms/ikvm-runtime/` and `state/arms/ikvm-java/` |
 | `csyn` | One-file syntax check with the real command line, both compilation databases. Does NOT link |
 | `killdaemons` | Kill leftover Roslyn/MSBuild servers by preflight's own match, safely. Exit 0 = safe to measure |
 | `wjcsync` | Re-index the JS counter mirrors (jitbench.ts, lib/mcdrive.mjs) after `WJC_*` changes in the C enum |

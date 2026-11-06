@@ -9,8 +9,12 @@ Reads <outdir>/mods/*.wasm (capture.py), writes <outdir>/x86/<sha16>.pkl: {func_
 declarations), which is also wj.origin's base (verified against p45 readLock: every position lands on a
 load/store/call opcode).
 
-The d8 is V8 15.3.76.13 (= the game's Chromium 153.0.8010.52) patched with --wasm-all-source-positions, which makes
-instruction selection record a position for EVERY instruction instead of only calls and trapping memory accesses.
+The d8 must be the browser's exact V8 (read it off the binary: `strings <chromium> | grep -E '^1[0-9][.][0-9]+[.][0-9]+[.][0-9]+$'`;
+live code only matches its own version) patched with --wasm-all-source-positions
+($WJ_STATE/patches/v8-wasm-all-source-positions.patch, 3 lines), which makes instruction selection record a position
+for EVERY instruction instead of only calls and trapping memory accesses. Build: a gclient checkout of
+v8.git@refs/tags/<version>, the patch, `gn gen out/rel` with is_debug=false v8_enable_disassembler=true, `autoninja d8`.
+The browser updates under you; when it does, wledger's `layout_mismatch` climbs and the d8 needs rebuilding.
 --single-threaded keeps print output in compile order. --only restricts to modules defining one of the listed
 function names (the sampled set), which is what keeps this minutes instead of an hour."""
 import array, os, pickle, re, subprocess, sys
@@ -21,8 +25,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import wasmmod
 
 D8 = paths.cfg('D8')   # a release d8 matching the browser's V8 (machine.env); --d8 overrides
+# --no-wasm-inlining: with Liftoff off, TurboFan inlines module-local direct calls with NO feedback, on a static budget
+# (`set_no_liftoff_inlining_budget(InliningTree::NoLiftoffBudget(..))` under `!v8_flags.liftoff`,
+# v8/src/wasm/turboshaft-graph-interface.cc ~380). The browser runs with Liftoff on and never takes that path; it inlines
+# only from Liftoff feedback, which d8 cannot have. Without the flag every co-located group's functions came out up to
+# 4x larger than the live code and failed the layout gate (46 of 208 on R526's jbox2d run). The functions the browser
+# DID inline from feedback still fail the gate and read module-unmatched, which is the correct outcome.
 FLAGS = ['--single-threaded', '--print-wasm-code', '--wasm-all-source-positions', '--no-liftoff',
-         '--no-wasm-lazy-compilation', '--no-wasm-tier-up']
+         '--no-wasm-lazy-compilation', '--no-wasm-tier-up', '--no-wasm-inlining']
 JS = r'''
 for (let i = 0; i < arguments.length; ++i) {
   const f = arguments[i];
