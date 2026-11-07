@@ -554,9 +554,48 @@ sgen_process_fin_stage_entries (void)
 	process_stage_entries (NUM_FIN_STAGE_ENTRIES, &next_fin_stage_entry, fin_stage_entries, process_fin_stage_entry);
 }
 
+#ifdef HOST_WASM
+/*
+ * wasm fork: `obj` was allocated by the caller a moment ago (object_new_common_tail) and nothing references it but C
+ * locals. The loop below can wait in two GC-safe regions -- add_stage_entry's back-off sleep while another thread
+ * drains the stage, and LOCK_GC when it is contended -- so another thread's collection can run inside them. Desktop
+ * sgen relies on `obj` being on the stack and therefore pinned; on wasm a C local is a wasm local, which the
+ * conservative stack scan cannot see, so that collection freed `obj`, and the caller staged freed memory for
+ * finalization and returned it to managed code: a dangling java.lang.ref.Reference.weakRef, type confusion on the next
+ * virtual call through it, and `no object of size` from sgen_finalize_in_range (findings log, 2026-11-07, finalizer
+ * registration: 6 of 6 runs corrupt without the pin, 0 of 6 with it). So `obj` stays in a volatile slot of this frame
+ * for the whole call: LLVM never promotes a volatile alloca, so the slot is in the linear-memory stack the scan covers
+ * and the object is pinned, which also keeps every raw copy of it valid.
+ */
+static int fin_reg_pin = 1;   /* MONO_GC_FIN_PIN: DEFAULT 1. 0 is the positive control only (it corrupts the heap). */
+static gboolean fin_reg_inited;
+static gint32 fin_reg_across_gc;   /* registrations a collection overlapped, pinned or not */
+
+static gint32
+fin_reg_gc_count (void)
+{
+	return mono_atomic_load_i32 (&mono_gc_stats.minor_gc_count) + mono_atomic_load_i32 (&mono_gc_stats.major_gc_count);
+}
+#endif
+
 void
 sgen_object_register_for_finalization (GCObject *obj, SGenFinalizationProc user_data)
 {
+#ifdef HOST_WASM
+	GCObject * volatile pin_slot = NULL;
+	gint32 gc_before = fin_reg_gc_count ();
+	gboolean in_nursery = ptr_in_nursery (obj);
+
+	if (G_UNLIKELY (!fin_reg_inited)) {
+		const char *e = g_getenv ("MONO_GC_FIN_PIN");
+		if (e && *e)
+			fin_reg_pin = *e != '0';
+		fin_reg_inited = TRUE;
+		g_print ("[sgen fin-reg] pin %d (MONO_GC_FIN_PIN, default 1)\n", fin_reg_pin);
+	}
+	if (fin_reg_pin)
+		pin_slot = obj;
+#endif
 	while (add_stage_entry (NUM_FIN_STAGE_ENTRIES, &next_fin_stage_entry, fin_stage_entries, obj, user_data) == -1) {
 		if (try_lock_stage_for_processing (NUM_FIN_STAGE_ENTRIES, &next_fin_stage_entry)) {
 			LOCK_GC;
@@ -564,6 +603,16 @@ sgen_object_register_for_finalization (GCObject *obj, SGenFinalizationProc user_
 			UNLOCK_GC;
 		}
 	}
+#ifdef HOST_WASM
+	if (G_UNLIKELY (fin_reg_gc_count () != gc_before)) {
+		/* Do not dereference obj here: unpinned, it may be freed memory. */
+		gint32 n = mono_atomic_inc_i32 (&fin_reg_across_gc);
+		if (n <= 4 || (n & 1023) == 0)
+			g_print ("[sgen fin-reg] a collection ran during the finalizer registration of %p (nursery %d, pinned %d): %d so far\n",
+				(void *) obj, in_nursery, fin_reg_pin, n);
+	}
+	pin_slot = NULL;
+#endif
 }
 
 /* LOCKING: requires that the GC lock is held */
