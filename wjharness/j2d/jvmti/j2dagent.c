@@ -3,7 +3,11 @@
  * -XX:+PrintAssembly, which disassembles on the compiler thread and so delays tier-up: on 2026-10-03 JDK 21 ran this
  * jar at 0.50 ms/step under PrintAssembly against 0.36 without, with 69% of the window outside any printed blob.
  *
- *   java -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -agentpath:libj2dagent.so=<out file> ...
+ *   java -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -agentpath:libj2dagent.so=<out file>[,lite] ...
+ *
+ * `,lite` (native/mcnative.sh, native/mccmp.py) writes no C or B records: only names, nmethod ranges and pc maps, which
+ * is all an inlining-aware stack needs, at a fraction of the output a Minecraft run would otherwise write under the lock
+ * every compiler thread takes here.
  *
  * Output (text, one record per line; every address hex, every time CLOCK_MONOTONIC ns, the clock perf -k 1 uses):
  *   N <id> <class sig>::<name><sig>        a method, interned
@@ -26,10 +30,11 @@ static jvmtiEnv *jv;
 static FILE *out;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 
-#define NSLOT (1 << 16)
+#define NSLOT (1 << 20)   /* methods interned, inlinees included: Minecraft passes 2^16 */
 static jmethodID seen[NSLOT];
 static int seen_id[NSLOT];
 static int next_id = 1;
+static int lite;
 
 static unsigned long long now_ns(void) {
 	struct timespec ts;
@@ -62,7 +67,7 @@ static int intern(jmethodID m) {
 			fprintf(out, "N %d %s::%s%s\n", id, cs ? cs : "?", mn ? mn : "?", ms ? ms : "");
 			jint bn = 0;
 			unsigned char *bc = NULL;
-			if ((*jv)->GetBytecodes(jv, m, &bn, &bc) == JVMTI_ERROR_NONE && bc) {
+			if (!lite && (*jv)->GetBytecodes(jv, m, &bn, &bc) == JVMTI_ERROR_NONE && bc) {
 				fprintf(out, "B %d ", id);
 				hex(bc, bn);
 				fputc('\n', out);
@@ -91,9 +96,12 @@ static void JNICALL on_load(jvmtiEnv *e, jmethodID m, jint size, const void *add
 			for (int k = 0; k < r->pcinfo[i].numstackframes; k++)
 				intern(r->pcinfo[i].methods[k]);
 	}
-	fprintf(out, "M %llu %lx %d %d\nC ", t, (unsigned long)addr, size, id);
-	hex((const unsigned char *)addr, size);
-	fputc('\n', out);
+	fprintf(out, "M %llu %lx %d %d\n", t, (unsigned long)addr, size, id);
+	if (!lite) {
+		fputs("C ", out);
+		hex((const unsigned char *)addr, size);
+		fputc('\n', out);
+	}
 	for (const jvmtiCompiledMethodLoadRecordHeader *h = info; h; h = h->next) {
 		if (h->kind != JVMTI_CMLR_INLINE_INFO) continue;
 		const jvmtiCompiledMethodLoadInlineRecord *r = (const void *)h;
@@ -134,7 +142,11 @@ static void JNICALL on_death(jvmtiEnv *e, JNIEnv *j) {
 JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *opts, void *reserved) {
 	(void)reserved;
 	if ((*vm)->GetEnv(vm, (void **)&jv, JVMTI_VERSION_1_0) != JNI_OK) return 1;
-	out = fopen(opts && *opts ? opts : "j2dagent.txt", "w");
+	char path[4096];
+	snprintf(path, sizeof path, "%s", opts && *opts ? opts : "j2dagent.txt");
+	char *comma = strrchr(path, ',');
+	if (comma && !strcmp(comma, ",lite")) { *comma = 0; lite = 1; }
+	out = fopen(path, "w");
 	if (!out) return 1;
 	setvbuf(out, NULL, _IOFBF, 1 << 22);
 	jvmtiCapabilities c;

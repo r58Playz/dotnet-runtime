@@ -15,7 +15,7 @@ wjharness/                tracked; `wj ls` lists every tool
   fe/                     front-end (i-cache / iTLB / BTB) readers and event set (R525)
   ledger/                 the per-function gap ledger (ours vs HotSpot): capture d8x86 ledger hsledger gap refresh
   tier/                   tier dumps and static gates: wasmtier tiershape tierid vcallreach bodysize depcheck
-  native/                 the native Minecraft reference: natrun, buckets, join, servertid, ...
+  native/                 the native Minecraft reference: mcstage, mcnative, mccmp, mcinsn (standalone); natrun, buckets, join, servertid, ...
   boot/                   boot attribution: bootattr stages critpath segs trend natboot
   memaudit/               heap censuses evaluated in the page
   live/                   CDP telemetry: sigtrap trace-exceptions console
@@ -96,7 +96,12 @@ wj deploy '<a string your change added>'                      # after build-dotn
 | `seedbuild` | Build a seed from an OPFS export: `--dest $WJ_STATE/seeds/seed-X --tar /X.tar` (tar copied into the dev server's `frontend/public`, deleted after), then register it in `lib/seeds.mjs` |
 | `wgen262`, `vcmp` | 26.2 world generation driver; version-compare driver with `--seed`, screenshots per key (`--probe`) |
 | `ensure-server` | Bring `$DEV_UNIT` up and wait for a real 200 (race-free against the dying process holding the port) |
-| `native/natrun` | **The native reference**: native OpenJDK Minecraft on the matched Prism instance, M instructions/frame per thread. Refuses unless `renderDistance` is 12; restores the pristine world from `$NW_TAR` every run |
+| `native/mcstage` | `[--tar T --version V --name N]` Builds a **standalone** native stage, `$WJ_STATE/native/<name>/` (default `sa`, 1.16.1 MCSR; `sa262n` = 26.2 no mods from `state/seeds/ikvmcraft-262n.tar`): the game dir, mods, config, options and save from the tar ours plays (`$NW_TAR`), the classpath (sha1-checked) and LWJGL natives from `$PRISM_HOME`, read-only. Nothing under Prism is written |
+| `native/mcnative` | **The native reference, standalone**: HotSpot (`--jdk 25` default) on a fresh copy of the stage (`--stage NAME`; joins by menu replay for MCSR, `--quickPlaySingleplayer` otherwise), menu replayed on a private Xwayland, captured the way `hwrun` captures ours (Q60 window, hwrun's event set, `-k 1 -g`, `phases.json`, `[mcw]` markers), with `jcmd Compiler.perfmap` and `j2dagent` (`,lite`; `--agent-full` adds code bytes) for HotSpot's inlining. P-cores pinned |
+| `native/mccmp` | **Ours vs native on the server tick**: hardware table, kind of code, the tick partitioned by anchors (where in the game), methods charged and inclusive, and methods out of line with the tick's own ratio. Several runs a side. Native frames are expanded through HotSpot's inlining map; ours are physical (see its header) |
+| `native/jarcensus` | How Minecraft's bytecode changed across versions (`--prism 1.16.1,26.2,...`): method sizes against the inlining caps, EH methods, interface calls, casts, invokedynamic by bootstrap. Static only |
+| `native/mcinsn` | The executed x86 instruction mix of the server tick, both sides through `hotinsn`'s classifier. Needs `mcnative --agent-full` and an ours capture taken with `--jitdump` |
+| `native/natrun` | The older native reference: plays the Prism instance IN PLACE (`$PRISM_INSTANCE`: its options, mods and saves), JDK 8, M instructions/frame per thread. Its mod set is not ours (2026-11-06: the instance holds mcsrranked 6.0.4 beside 5.8.1); prefer `mcnative` |
 
 ### Seeds
 
@@ -160,5 +165,9 @@ measured from the launcher's Play.
   with `state/arms/jvmti/libj2dagent.so` for the ledger: `bash j2d/jvmti/build.sh`.
 * **CheerpJ**: `j2d/cheerpj/index.html` (tracked) over `state/arms/cheerpj/{bench.jar,gcprobe.jar}`; the loader comes from
   Leaning Technologies' CDN.
-* **Native Minecraft**: the Prism instance (`$PRISM_INSTANCE`), `state/native/stage` (`cp.single` = Prism's `-cp` minus
-  NewLaunch.jar, `natives/` = the lwjgl natives), async-profiler under `state/native/`.
+* **Native Minecraft, standalone** (`mcnative`): `bash native/mcstage.sh` builds `state/native/sa/` from `$NW_TAR` and
+  `$PRISM_HOME`; the JVMTI agent is `state/arms/jvmti/libj2dagent.so` (`bash j2d/jvmti/build.sh`, shared with the jbox2d
+  ledger). JDKs are `$JAVA_HOME_<N>`.
+* **Native Minecraft, in place** (`natrun`, older): the Prism instance (`$PRISM_INSTANCE`), `state/native/stage`
+  (`cp.single` = Prism's `-cp` minus NewLaunch.jar, `natives/` = the lwjgl natives). Its async-profiler is gone from
+  `state/native/`, so it now runs without the per-method census.

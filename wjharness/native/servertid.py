@@ -29,8 +29,11 @@ tids = [t for t, _ in busy]
 if not tids:
     sys.exit(f"no DedicatedWorker threads in {d}")
 
-SERVER = re.compile(r"ServerTickScheduler|net\.minecraft\.class_3218|selectTicks|class_1937:method_8398")
-CLIENT = re.compile(r"wink_present|gex_wgpu|class_761|WorldRenderer")
+# 1.16.1 intermediary names, and 26.x's Mojang names for the same classes (26.x ships unobfuscated): ServerLevel =
+# class_3218, LevelTicks = Lithium's/vanilla's tick scheduler, LevelRenderer = class_761 (WorldRenderer).
+SERVER = re.compile(r"ServerTickScheduler|net\.minecraft\.class_3218|selectTicks|class_1937:method_8398"
+                    r"|net\.minecraft\.server\.level\.ServerLevel:|net\.minecraft\.world\.ticks\.LevelTicks:|ServerChunkCache:")
+CLIENT = re.compile(r"wink_present|gex_wgpu|class_761|WorldRenderer|net\.minecraft\.client\.renderer\.LevelRenderer:")
 
 best = None
 for t in tids:

@@ -36,7 +36,7 @@ pmu_require () {
 wj_setenv_args () {
   local v
   while read -r v; do
-    case "$v" in WJ_*|IKVMCRAFT|IKVM_SRC|IKVM_BUILD|MESA_WINK|TEAVM_*|CHROMIUM_SRC|PRISM_INSTANCE|NW_TAR|D8|FNA_WASM_BUILD|DOTNET_ZIP|EMSDK|CHROME_BIN|SERVE_URL|DEV_UNIT|DEV_CMD|JAVA_HOME_*|PATH) printf -- '--setenv=%s\n' "$v" ;; esac
+    case "$v" in WJ_*|IKVMCRAFT|IKVM_SRC|IKVM_BUILD|MESA_WINK|TEAVM_*|CHROMIUM_SRC|PRISM_*|NW_TAR|D8|FNA_WASM_BUILD|DOTNET_ZIP|EMSDK|CHROME_BIN|SERVE_URL|DEV_UNIT|DEV_CMD|JAVA_HOME_*|PATH) printf -- '--setenv=%s\n' "$v" ;; esac
   done < <(compgen -e)
 }
 

@@ -92,7 +92,14 @@ const EXTRACT = (tarUrl) => `(async () => {
       if (type === "L") {                                  // GNU long name: the NAME is this entry's payload
         await need(padded); longName = dec.decode(take(padded).subarray(0, size)).replace(/\\0+$/, ""); continue;
       }
-      if (type === "x" || type === "g") { await need(padded); take(padded); continue; }   // pax headers
+      // pax headers: a per-file "x" header may carry the real path (records "<len> path=<value>\\n"), which is how
+      // Python's tarfile writes a name over 100 bytes; skipping it put 12 libraries of seed-262n under their truncated
+      // ustar names (2026-11-06). Global "g" headers carry nothing this reader needs.
+      if (type === "x" || type === "g") {
+        await need(padded); const rec = dec.decode(take(padded).subarray(0, size));
+        if (type === "x") { const m = /(?:^|\\n)\\d+ path=([^\\n]*)\\n/.exec(rec); if (m) longName = m[1]; }
+        continue;
+      }
       name = name.replace(/^\\.?\\//, "").replace(/\\/+$/, "");
       S.cur = name;
       if (type === "5") { if (name) { await getDir(name); S.dirs++; } await need(padded); take(padded); continue; }

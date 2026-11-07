@@ -33,8 +33,11 @@ export const MCSR_DIR = SEEDS_DIR();
  *   SystemReport.ignoreErrors catches oshi's hardware probe failing in a browser (no udev, no JNA, Auxv) -- "Failed
  *   retrieving info for group ..." with a NoClassDefFoundError; Fabric's Hooks.startClient setting the system look and
  *   feel fails in headless AWT (XToolkit -> GraphicsEnvironment: "Could not initialize class LocalGE"); Controlify's
- *   SDLNativesLoader finds no SDL3 and runs without controllers. */
-const BENIGN_262 = /Could not initialize class oshi\.|at oshi\.|Could not initialize class LocalGE|no SDL3 in java\.library\.path/;
+ *   SDLNativesLoader finds no SDL3 and runs without controllers. Without mods (262n, 2026-11-06) Minecraft's own
+ *   narrator also fails, caught: text2speech's NarratorLinux loads flite through JNA, whose Native cannot initialise in a
+ *   browser ("Could not initialize class com.sun.jna.Native" from NativeLibrary.<clinit>; native logs "Error while
+ *   loading the narrator" the same way). */
+const BENIGN_262 = /Could not initialize class oshi\.|at oshi\.|Could not initialize class LocalGE|no SDL3 in java\.library\.path|Could not initialize class com\.sun\.jna\.Native|at com\.sun\.jna\.|text2speech/;
 const keys = (s, waits = {}) => s.split(/\s+/).filter(Boolean).map((k) => [k, k, waits[k] ?? (k === "Enter" ? 2500 : 900)]);
 
 /* Read off screenshots after every key (vcmp R509 for 1.16.5 and 26.2; autoworld.sh for MCSR). Keyboard only:
@@ -82,6 +85,33 @@ export const SEEDS = {
     dir: "seed-262b", version: "26.2", fabric: "0.19.5",
     what: "26.2 + Fabric, Fabulously Optimized 14.1.1 trimmed to 43 mods (+Iris, Lithium, ModernFix), RD 12, survival/normal (2026-10-21 tar)",
     titleRx: /Game took [\d.]+ seconds to start|Overlay is removed!/,
+    joinRx: /joined the game/,
+    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
+    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
+    quitTabs: null,
+    benignRx: BENIGN_262,
+  },
+  /* 26.2 with NO mods: Fabric 0.19.5 alone (the app launches <version>-fabric-<loader> only), the 262b save set to
+   * peaceful, the vanilla resource pack, vsync off. Built 2026-11-06 from the 2026-10-21 tar by
+   * runs/2026-11-06-262/mktar.py into state/seeds/ikvmcraft-262n.tar; mcstage builds the native stage `sa262n` from the
+   * same tar. Vanilla logs no "title screen is up" line: the marker is the last atlas the 26.2 reload creates (native
+   * log, 2026-11-06), and the menu re-drive covers a press that lands under the fading overlay. */
+  "262n": {
+    dir: "seed-262n", version: "26.2", fabric: "0.19.5",
+    what: "26.2 + Fabric 0.19.5, NO mods; the 262b save set to peaceful, RD 12 (2026-11-06)",
+    titleRx: /Created: \d+x\d+x\d+ minecraft:textures\/atlas\/shulker_boxes\.png-atlas/,
+    joinRx: /joined the game/,
+    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
+    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
+    quitTabs: null,
+    benignRx: BENIGN_262,
+  },
+  /* 262n plus one diagnostic mod (runs/2026-11-06-262/diag: wjdiag, mixins into MappedRegistry.freeze and
+   * FileToIdConverter.listMatchingResources) for 26.2's registry race. Not a measurement seed. */
+  "262d": {
+    dir: "seed-262d", version: "26.2", fabric: "0.19.5",
+    what: "262n + the wjdiag registry-race diagnostic mod (not for measurement)",
+    titleRx: /Created: \d+x\d+x\d+ minecraft:textures\/atlas\/shulker_boxes\.png-atlas/,
     joinRx: /joined the game/,
     genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
     menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
