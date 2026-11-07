@@ -1928,6 +1928,33 @@ mono_wasm_jit_s2_gi_site_freq (MonoCompile *cfg)
 	return -1;
 }
 
+/* MONO_WASM_JIT_EH_INLINE bits 128 / 256: as mono_wasm_jit_s2_site_freq, but the site's count is hot arm + fallback (a
+ * direct site has only the latter) and a nested site scales by cfg->wasm_eh_ctx, which inline_method sets at guarded
+ * inlines too -- so a site inside a GI-inlined callee has a frequency. Read only by the EH decisions. */
+double mono_wasm_jit_s2_eh_site_freq (MonoCompile *cfg);
+double
+mono_wasm_jit_s2_eh_site_freq (MonoCompile *cfg)
+{
+	extern int mono_wasm_jit_s2_min;
+	gconstpointer code = cfg->cil_start;
+	const guint8 *ip = cfg->ip;
+	WjS2Rec *e;
+	gint64 n;
+	gint32 il;
+	if (!code || !ip || ip < (const guint8 *) code || !cfg->header)
+		return -1;
+	il = (gint32) (ip - (const guint8 *) code);
+	e = wj_s2_find (cfg->method, cfg->header->code, -1);
+	if (e && (guint32) e->count >= (guint32) mono_wasm_jit_s2_min && (n = wj_s2_gi_count (cfg->method, code, il)) >= 0)
+		return (double) n / (double) (guint32) e->count;
+	if (cfg->inline_depth > 0 && cfg->wasm_eh_ctx >= 0 && cfg->current_method) {
+		e = wj_s2_find (cfg->current_method, code, -1);
+		if (e && (guint32) e->count >= (guint32) mono_wasm_jit_s2_min && (n = wj_s2_gi_count (cfg->current_method, code, il)) >= 0)
+			return cfg->wasm_eh_ctx * (double) n / (double) (guint32) e->count;
+	}
+	return -1;
+}
+
 double mono_wasm_jit_s2_site_freq (MonoCompile *cfg);
 double
 mono_wasm_jit_s2_site_freq (MonoCompile *cfg)

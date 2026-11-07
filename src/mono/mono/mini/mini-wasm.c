@@ -880,8 +880,15 @@ int mono_wasm_jit_exc_pin = 1;
  * clauses of its own may gain them (it then pays the EH record and loses the clause-free emitter paths), 8 = tier 1
  * too, 32 = cold handlers (an inlinee's catch/fault handler IL is not charged to its inline size or cost, and calls in
  * it are not inlined), 64 = the negative control: inlinee clauses left out of the runtime table (tests only; it must
- * change an EH corpus's checksum). Needs EH_JTAB bit 1 and EH_REC (mini.c). */
+ * change an EH corpus's checksum), 128 = the size gates (the ordinary limit and S2's hot-site raise) weigh an EH
+ * callee's HOT bytes (method-to-ir.c wj_il_eh_hot_size), and S2's hot-site limit may come from the EH frequency (S2's,
+ * continued through guarded inlines) where S2 has none; with 32 the code only a handler reaches (IKVM's Java catch body,
+ * after the clauses) is cold too, 256 = with 4, a root without clauses gains them only at a site of
+ * >= EH_INLINE_ROOT_PCT calls per 100 root entries (the EH frequency). Needs EH_JTAB bit 1 and EH_REC (mini.c). */
 int mono_wasm_jit_eh_inline = 0;
+/* MONO_WASM_JIT_EH_INLINE_ROOT_PCT: EH_INLINE bit 256's threshold, calls of the EH callee per 100 root entries. Below
+ * 100: a one-call site reads just under 1.00 (the root's entry is counted before the site; findings log 2026-11-06). */
+int mono_wasm_jit_eh_inline_root_pct = 90;
 /* MONO_WASM_JIT_EH_INLINE_MAXCL: the most clauses a root may hold with its inlinees' added */
 int mono_wasm_jit_eh_inline_maxcl = 32;
 /* MONO_WASM_JIT_AOT_BYREF (R356): the emitter's inline direct-AOT call also takes callees with byref PARAMETERS (the
@@ -1136,7 +1143,8 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_exc_pin, "MONO_WASM_JIT_EXC_PIN", 0, 1)
-	WJ_T2_KNOB (mono_wasm_jit_eh_inline, "MONO_WASM_JIT_EH_INLINE", 0, 0x7f)
+	WJ_T2_KNOB (mono_wasm_jit_eh_inline, "MONO_WASM_JIT_EH_INLINE", 0, 0x1ff)
+	WJ_T2_KNOB (mono_wasm_jit_eh_inline_root_pct, "MONO_WASM_JIT_EH_INLINE_ROOT_PCT", 0, 1000000)
 	WJ_T2_KNOB (mono_wasm_jit_eh_inline_maxcl, "MONO_WASM_JIT_EH_INLINE_MAXCL", 0, 4096)
 	WJ_T2_KNOB (mono_wasm_jit_aot_byref, "MONO_WASM_JIT_AOT_BYREF", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aot_static_unbox, "MONO_WASM_JIT_AOT_STATIC_UNBOX", 0, 1)

@@ -1483,6 +1483,12 @@ wj_eh_off_in_handler (MonoCompile *cfg, guint32 off, gboolean cold_only)
 		if (MONO_OFFSET_IN_HANDLER (c, off) || (c->flags == MONO_EXCEPTION_CLAUSE_FILTER && MONO_OFFSET_IN_FILTER (c, off)))
 			return TRUE;
 	}
+	/* bit 128: cold also covers what only a handler reaches -- IKVM's Java catch body, placed after the clauses */
+	if (cold_only && h && n && cfg->wasm_eh_cur > 0 && cfg->wasm_eh_cur < cfg->wasm_eh_ninst) {
+		WjEhInst *k = &cfg->wasm_eh_inst [cfg->wasm_eh_cur];
+		if (k->cold && off < (guint32) k->size && k->cold [off])
+			return TRUE;
+	}
 	return FALSE;
 }
 
@@ -1529,6 +1535,187 @@ wj_eh_regions (MonoCompile *cfg)
 		if (bb->wasm_eh_pos >= cfg->wasm_eh_root_size)
 			bb->region = wj_eh_region_at (cfg, bb->wasm_eh_pos);
 }
+
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_EH_INLINE bit 128: the IL bytes of an EH method that run when nothing throws -- what the size gate
+ * weighs instead of its IL size (findings log, 2026-11-06 "the EH callees' IL, broken down"). IKVM's IL is mostly
+ * something else there: a CLR catch handler holds only the MapException stub, and the Java catch body is placed after
+ * the clauses, reached by the stub's leave; javac's finally is a fault copy per try range; and the clause layout
+ * leaves unreachable leaves, br.s self-loops and doubled endfinallys (DataTracker.getEntry: 309 IL bytes, 139 run).
+ * Counted: instructions reachable from offset 0 without entering a catch / fault / filter handler (a finally handler
+ * is entered when reachable code lies in its try), less those from which every path throws (R318's segments are a
+ * subset), nops, and br / leave to the next instruction. `cold`, if given (code_size bytes, zeroed here), marks the
+ * bytes reachable only through a handler or not at all. Pure IL decoding and the header's clause table, as
+ * wj_il_hot_size: no token is resolved. Anything undecodable, a branch off an instruction boundary, or a method past
+ * WJ_EH_HOT_SCAN_MAX answers code_size and leaves `cold` all zero, i.e. changes nothing. */
+#define WJ_EH_HOT_SCAN_MAX 4096
+static guint32
+wj_il_eh_hot_size (const unsigned char *code, guint32 size, const MonoExceptionClause *cl, guint ncl, guint8 *cold)
+{
+	enum { INS = 1, NORMAL = 2, ANY = 4, THROWS = 8, PAD = 16 };
+	guint8 *st;
+	guint32 *work, nwork = 0, hot = 0;
+	gboolean ok = TRUE, changed;
+
+	if (cold)
+		memset (cold, 0, size);
+	if (!code || !size || size > WJ_EH_HOT_SCAN_MAX)
+		return size;
+	st = (guint8 *) g_malloc0 (size + 1);
+	work = (guint32 *) g_malloc ((size + ncl + 1) * sizeof (guint32));
+	/* instruction boundaries */
+	for (const unsigned char *ip = code; ip < code + size;) {
+		const unsigned char *p = ip;
+		MonoOpcodeEnum op;
+		int n = mono_opcode_value_and_size (&p, code + size, &op);
+		if (n <= 0 || ip + n > code + size) {
+			ok = FALSE;
+			break;
+		}
+		st [ip - code] |= INS;
+		ip += n;
+	}
+	for (guint i = 0; ok && i < ncl; ++i)
+		if (cl [i].try_offset + cl [i].try_len > size || cl [i].handler_offset + cl [i].handler_len > size ||
+		    !(st [cl [i].handler_offset] & INS))
+			ok = FALSE;
+
+/* the successors of the instruction at `o`, as `t`; a target off a boundary fails the whole measure */
+#define WJ_EH_FOR_SUCC(o, t, body) do { \
+		const unsigned char *_ip = code + (o), *_p = _ip; \
+		MonoOpcodeEnum _op; \
+		int _n = mono_opcode_value_and_size (&_p, code + size, &_op); \
+		guint32 _next = (o) + (guint32) _n; \
+		gint64 _t; \
+		switch (mono_opcodes [_op].argument) { \
+		case MonoShortInlineBrTarget: \
+			_t = (gint64) _next + (gint8) _ip [_n - 1]; \
+			if (_t < 0 || _t >= (gint64) size || !(st [_t] & INS)) { ok = FALSE; break; } \
+			{ guint32 t = (guint32) _t; body; } \
+			break; \
+		case MonoInlineBrTarget: \
+			_t = (gint64) _next + (gint32) read32 (_ip + _n - 4); \
+			if (_t < 0 || _t >= (gint64) size || !(st [_t] & INS)) { ok = FALSE; break; } \
+			{ guint32 t = (guint32) _t; body; } \
+			break; \
+		case MonoInlineSwitch: { \
+			guint32 _cnt = read32 (_ip + 1); \
+			if ((gint64) 5 + 4 * (gint64) _cnt != _n) { ok = FALSE; break; } \
+			for (guint32 _j = 0; _j < _cnt && ok; ++_j) { \
+				_t = (gint64) _next + (gint32) read32 (_ip + 5 + 4 * _j); \
+				if (_t < 0 || _t >= (gint64) size || !(st [_t] & INS)) { ok = FALSE; break; } \
+				{ guint32 t = (guint32) _t; body; } \
+			} \
+			break; \
+		} \
+		default: \
+			break; \
+		} \
+		if (ok && _next < size && _op != MONO_CEE_JMP && _op != MONO_CEE_THROW && _op != MONO_CEE_RETHROW && \
+		    mono_opcodes [_op].flow_type != MONO_FLOW_BRANCH && mono_opcodes [_op].flow_type != MONO_FLOW_RETURN) { \
+			guint32 t = _next; body; \
+		} \
+	} while (0)
+
+#define WJ_EH_REACH(flag) do { \
+		while (ok && nwork) { \
+			guint32 o = work [--nwork]; \
+			WJ_EH_FOR_SUCC (o, t, if (!(st [t] & (flag))) { st [t] |= (flag); work [nwork++] = t; }); \
+		} \
+	} while (0)
+
+	/* the normal path: from 0, then each finally whose try it reaches, until none is added */
+	if (ok) {
+		st [0] |= NORMAL;
+		work [nwork++] = 0;
+		WJ_EH_REACH (NORMAL);
+	}
+	do {
+		changed = FALSE;
+		for (guint i = 0; ok && i < ncl; ++i) {
+			if (cl [i].flags != MONO_EXCEPTION_CLAUSE_FINALLY || (st [cl [i].handler_offset] & NORMAL))
+				continue;
+			for (guint32 o = cl [i].try_offset; o < cl [i].try_offset + cl [i].try_len; ++o)
+				if (st [o] & NORMAL) {
+					st [cl [i].handler_offset] |= NORMAL;
+					work [nwork++] = cl [i].handler_offset;
+					WJ_EH_REACH (NORMAL);
+					changed = TRUE;
+					break;
+				}
+		}
+	} while (ok && changed);
+	/* everything reachable at all: the normal path, and every handler and filter from there */
+	for (guint32 o = 0; ok && o < size; ++o)
+		if (st [o] & NORMAL)
+			st [o] |= ANY;
+	for (guint i = 0; ok && i < ncl; ++i) {
+		guint32 roots [2] = { cl [i].handler_offset, cl [i].flags == MONO_EXCEPTION_CLAUSE_FILTER ? cl [i].data.filter_offset : cl [i].handler_offset };
+		for (int r = 0; r < 2 && ok; ++r) {
+			if (roots [r] >= size || !(st [roots [r]] & INS)) {
+				ok = FALSE;
+				break;
+			}
+			if (!(st [roots [r]] & ANY)) {
+				st [roots [r]] |= ANY;
+				work [nwork++] = roots [r];
+				WJ_EH_REACH (ANY);
+			}
+		}
+	}
+	/* must throw: the least fixpoint over the normal path, scanned backward (straight-line code settles in one pass) */
+	for (int pass = 0; ok && pass < 64; ++pass) {
+		changed = FALSE;
+		for (gint64 o = (gint64) size - 1; o >= 0; --o) {
+			if ((st [o] & (INS | NORMAL | THROWS)) != (INS | NORMAL))
+				continue;
+			const unsigned char *p = code + o;
+			MonoOpcodeEnum op;
+			mono_opcode_value_and_size (&p, code + size, &op);
+			gboolean all = op == MONO_CEE_THROW || op == MONO_CEE_RETHROW, any = FALSE;
+			if (!all && op != MONO_CEE_JMP && mono_opcodes [op].flow_type != MONO_FLOW_RETURN) {
+				all = TRUE;
+				WJ_EH_FOR_SUCC ((guint32) o, t, { any = TRUE; if (!(st [t] & THROWS)) all = FALSE; });
+				all = all && any;
+			}
+			if (all) {
+				st [o] |= THROWS;
+				changed = TRUE;
+			}
+		}
+		if (!changed)
+			break;
+	}
+	/* the count, and the cold map */
+	for (const unsigned char *ip = code; ok && ip < code + size;) {
+		const unsigned char *p = ip;
+		MonoOpcodeEnum op;
+		int n = mono_opcode_value_and_size (&p, code + size, &op);
+		guint32 o = (guint32) (ip - code), next = o + (guint32) n;
+		gboolean pad = op == MONO_CEE_NOP;
+		if (!pad && mono_opcodes [op].flow_type == MONO_FLOW_BRANCH) {
+			guint32 tgt = 0;
+			WJ_EH_FOR_SUCC (o, t, tgt = t);
+			pad = tgt == next;
+		}
+		if ((st [o] & (NORMAL | THROWS)) == NORMAL && !pad)
+			hot += (guint32) n;
+		if (cold && !(st [o] & NORMAL))
+			memset (cold + o, 1, n);
+		ip += n;
+	}
+#undef WJ_EH_REACH
+#undef WJ_EH_FOR_SUCC
+	g_free (work);
+	g_free (st);
+	if (!ok) {
+		if (cold)
+			memset (cold, 0, size);
+		return size;
+	}
+	return hot;
+}
+#endif
 
 /* An inlinee whose clauses inline_method admitted: check their shape, then make it an instance -- clone cfg->header
  * (once), append its clauses at EH positions, and make it the method being imported. FALSE (counted) refuses it. */
@@ -1588,6 +1775,19 @@ wj_eh_inst_begin (MonoCompile *cfg, MonoMethod *method, MonoMethodHeader *header
 		mono_wasm_jit_count (WJC_EHINL_REFUSED_OTHER);
 		return FALSE;
 	}
+	/* bit 256: the FIRST instance of a root without clauses makes it an EH root, which pays the R353 record on every
+	 * activation; the callee's own activations pay it too, and inlining removes theirs. So only at a site the profile
+	 * puts at >= EH_INLINE_ROOT_PCT calls per 100 root entries (cfg->wasm_eh_ctx: inline_method set it to this site's
+	 * EH frequency, which continues through guarded inlines; -1 = unknown, refused). The root's BB_ILOFS stores still
+	 * grow with its body. */
+	if ((mono_wasm_jit_eh_inline & 256) && cfg->wasm_eh_root_nclauses == 0 && cfg->wasm_eh_ninst <= 1) {
+		extern int mono_wasm_jit_eh_inline_root_pct;
+		if (cfg->wasm_eh_ctx < 0 || cfg->wasm_eh_ctx * 100.0 < (double) mono_wasm_jit_eh_inline_root_pct) {
+			mono_wasm_jit_count (WJC_EHINL_ROOT_COLD);
+			return FALSE;
+		}
+		mono_wasm_jit_count (WJC_EHINL_ROOT_HOT);
+	}
 
 	/* clone cfg->header once, so its clause array can grow; mono_destroy_compile frees the original */
 	if (!cfg->wasm_eh_orig_header) {
@@ -1624,6 +1824,10 @@ wj_eh_inst_begin (MonoCompile *cfg, MonoMethod *method, MonoMethodHeader *header
 	k->local = (MonoExceptionClause *) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoExceptionClause) * n);
 	memcpy (k->local, header->clauses, sizeof (MonoExceptionClause) * n);
 	k->handler_bb = (MonoBasicBlock **) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoBasicBlock *) * n);
+	if ((mono_wasm_jit_eh_inline & 128) && header->code_size <= WJ_EH_HOT_SCAN_MAX) {
+		k->cold = (guint8 *) mono_mempool_alloc0 (cfg->mempool, header->code_size);
+		wj_il_eh_hot_size (header->code, header->code_size, header->clauses, n, k->cold);
+	}
 	for (guint i = 0; i < n; ++i) {
 		cl [old + i] = header->clauses [i];
 		cl [old + i].try_offset += (guint32) k->base;
@@ -5347,6 +5551,25 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 		limit = limit_override;
 
 #ifdef HOST_BROWSER
+	/* the size the S2 gates weigh: the IL size, or with MONO_WASM_JIT_EH_INLINE bit 128 an EH callee's hot bytes */
+	guint32 s2_size = header.code_size;
+	gint64 eh_hot = -1;
+	{
+		extern int mono_wasm_jit_eh_inline;
+		if (header.has_clauses && cfg->wasm_eh_inline && (mono_wasm_jit_eh_inline & 128) && header.code_size <= WJ_EH_HOT_SCAN_MAX) {
+			ERROR_DECL (hot_err);
+			MonoMethodHeader *mh = mono_method_get_header_checked (method, hot_err);
+			if (mh) {
+				eh_hot = wj_il_eh_hot_size (mh->code, mh->code_size, mh->clauses, mh->num_clauses, NULL);
+				if (eh_hot < (gint64) s2_size)
+					s2_size = (guint32) eh_hot;
+				mono_metadata_free_mh (mh);
+			} else {
+				mono_error_cleanup (hot_err);
+			}
+		}
+	}
+	cfg->wasm_s2_gate_size = (gint32) s2_size;
 	/* plan2x S2 (MONO_WASM_JIT_S2 & 2): tier 2's ORDINARY inliner (limit_override <= 0; a guarded-inline site's
 	 * tier-1 counter sees only its fallback) reads the site's tier-1 frequency. Never executed -> refused; hot ->
 	 * a larger limit, if the callee has a tier-1 body of its own or makes no call (R372: an AOT-backed callee's
@@ -5378,9 +5601,9 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 				wj_gi_count (WJC_S2_GI_COLD);
 				cfg->wasm_s2_gate_ip = NULL;
 				WJ_T2R_WHY ("s2: the guarded site never executed at tier 1");
-			} else if (gf * 100.0 >= (double) mono_wasm_jit_s2_hot_pct && header.code_size >= GINT_TO_UINT32 (limit) &&
-			           limit < mono_wasm_jit_s2_hot_limit && header.code_size < GINT_TO_UINT32 (mono_wasm_jit_s2_hot_limit) &&
-			           cfg->wasm_s2_spent + (int) header.code_size <= mono_wasm_jit_s2_budget &&
+			} else if (gf * 100.0 >= (double) mono_wasm_jit_s2_hot_pct && s2_size >= GINT_TO_UINT32 (limit) &&
+			           limit < mono_wasm_jit_s2_hot_limit && s2_size < GINT_TO_UINT32 (mono_wasm_jit_s2_hot_limit) &&
+			           cfg->wasm_s2_spent + (int) s2_size <= mono_wasm_jit_s2_budget &&
 			           (mono_wasm_jit_s2_has_body (method) || (header.code && wj_il_is_call_free (header.code, header.code_size)))) {
 				wj_gi_count (WJC_S2_GI_RAISED);
 				limit = mono_wasm_jit_s2_hot_limit;
@@ -5407,9 +5630,9 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 				wj_gi_count (WJC_S2_WARM);
 			} else {
 				wj_gi_count (WJC_S2_HOT);
-				if (header.code_size >= GINT_TO_UINT32 (limit) && limit < mono_wasm_jit_s2_hot_limit &&
-				    header.code_size < GINT_TO_UINT32 (mono_wasm_jit_s2_hot_limit)) {
-					if (cfg->wasm_s2_spent + (int) header.code_size > mono_wasm_jit_s2_budget)
+				if (s2_size >= GINT_TO_UINT32 (limit) && limit < mono_wasm_jit_s2_hot_limit &&
+				    s2_size < GINT_TO_UINT32 (mono_wasm_jit_s2_hot_limit)) {
+					if (cfg->wasm_s2_spent + (int) s2_size > mono_wasm_jit_s2_budget)
 						wj_gi_count (WJC_S2_BUDGET_OUT);
 					else if (!mono_wasm_jit_s2_has_body (method) &&
 					         !(header.code && wj_il_is_call_free (header.code, header.code_size)))
@@ -5420,6 +5643,29 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 						cfg->wasm_s2_gate_hot = TRUE;
 					}
 				}
+			}
+		}
+		/* MONO_WASM_JIT_EH_INLINE bits 128 / 256: the EH frequency -- S2's, but continued through GUARDED inlines too (a
+		 * GI site sets no S2 context unless MONO_WASM_JIT_S2 & 4), read only by the EH decisions: inline_method makes it
+		 * the inlinee's cfg->wasm_eh_ctx, bit 256's new-root rule reads that, and below an EH callee at a site S2 has
+		 * no frequency for gets the hot-site limit from it. DataTracker.getEntry is the case: its sites are inside
+		 * DataTracker.get, GI-inlined into one-call getters (findings log, 2026-11-06). */
+		cfg->wasm_eh_gate_ip = NULL;
+		if (COMPILE_WASM (cfg) && cfg->wasm_eh_inline && cfg->wasm_jit_tier >= 2 && (mono_wasm_jit_s2 & 1)) {
+			extern double mono_wasm_jit_s2_eh_site_freq (MonoCompile *cfg);
+			double ef = mono_wasm_jit_s2_eh_site_freq (cfg);
+			cfg->wasm_eh_gate_ip = cfg->ip;
+			cfg->wasm_eh_gate_callee = method;
+			cfg->wasm_eh_gate_f = ef;
+			if (eh_hot >= 0 && limit_override <= 0 && (mono_wasm_jit_s2 & 2) && cfg->wasm_s2_gate_ip == cfg->ip &&
+			    cfg->wasm_s2_gate_callee == method && cfg->wasm_s2_gate_f < 0 && !cfg->wasm_s2_gate_hot &&
+			    ef * 100.0 >= (double) mono_wasm_jit_s2_hot_pct && s2_size >= GINT_TO_UINT32 (limit) &&
+			    limit < mono_wasm_jit_s2_hot_limit && s2_size < GINT_TO_UINT32 (mono_wasm_jit_s2_hot_limit) &&
+			    cfg->wasm_s2_spent + (int) s2_size <= mono_wasm_jit_s2_budget &&
+			    (mono_wasm_jit_s2_has_body (method) || (header.code && wj_il_is_call_free (header.code, header.code_size)))) {
+				mono_wasm_jit_count (WJC_EHINL_FREQ_RAISED);
+				limit = mono_wasm_jit_s2_hot_limit;
+				cfg->wasm_s2_gate_hot = TRUE;
 			}
 		}
 	}
@@ -5464,6 +5710,25 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 			} else {
 				mono_error_cleanup (eh_err);
 			}
+		}
+	}
+	/* bit 128: the hot bytes, when fewer (counted where they decide). Each callee measured is printed once, the first
+	 * 512 (the pointer is compared, never dereferenced; a race between compile threads can only repeat a line). */
+	if (eh_hot >= 0) {
+		static MonoMethod *hot_seen [512];
+		static int hot_nseen;
+		int hi;
+		for (hi = 0; hi < hot_nseen && hot_seen [hi] != method; ++hi)
+			;
+		if (hi == hot_nseen && hot_nseen < (int) G_N_ELEMENTS (hot_seen)) {
+			hot_seen [hot_nseen++] = method;
+			printf ("[wasm-jit ehinl] hot %s:%s il=%u gate=%u hot=%lld limit=%d\n", m_class_get_name (method->klass),
+				method->name, header.code_size, eff_size, (long long) eh_hot, limit);
+		}
+		if ((guint32) eh_hot < eff_size) {
+			if (eff_size >= GINT_TO_UINT32 (limit) && (guint32) eh_hot < GINT_TO_UINT32 (limit))
+				mono_wasm_jit_count (WJC_EHINL_HOT_ADMIT);
+			eff_size = (guint32) eh_hot;
 		}
 	}
 #endif
@@ -6280,8 +6545,9 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	MonoGenericContext *prev_generic_context;
 	gboolean ret_var_set, prev_ret_var_set, prev_disable_inline, virtual_ = FALSE;
 	gpointer prev_wasm_inline_im;
-	double prev_s2_ctx;
+	double prev_s2_ctx, prev_eh_ctx;
 	gboolean s2_hot;
+	gint32 s2_charge = 0;
 	int s2_cap;
 	/* E1 (MONO_WASM_JIT_EH_INLINE): the importing method's EH state, and what to roll back if this inline is abandoned */
 	gboolean eh_want = FALSE, eh_site_in_handler = FALSE, eh_made, prev_eh_in_handler;
@@ -6393,6 +6659,7 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	s2_hot = FALSE;
 	if (COMPILE_WASM (cfg) && cfg->wasm_s2_gate_ip && cfg->wasm_s2_gate_ip == ip && cfg->wasm_s2_gate_callee == cmethod) {
 		s2_hot = cfg->wasm_s2_gate_hot;
+		s2_charge = cfg->wasm_s2_gate_size > 0 ? cfg->wasm_s2_gate_size : (gint32) cheader->code_size;
 		cfg->wasm_s2_ctx = cfg->wasm_s2_gate_f;
 		wj_p3_count (WJC_S2_CTX_MATCH);
 	} else {
@@ -6401,6 +6668,10 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 			wj_p3_count (WJC_S2_CTX_MISS);
 	}
 	cfg->wasm_s2_gate_ip = NULL;
+	/* EH_INLINE bits 128 / 256: the inlinee's EH frequency (calls per root entry; -1 unknown), from the gate's */
+	prev_eh_ctx = cfg->wasm_eh_ctx;
+	cfg->wasm_eh_ctx = cfg->wasm_eh_gate_ip && cfg->wasm_eh_gate_ip == ip && cfg->wasm_eh_gate_callee == cmethod ? cfg->wasm_eh_gate_f : -1;
+	cfg->wasm_eh_gate_ip = NULL;
 
 	if (ip && *ip == CEE_CALLVIRT && !(cmethod->flags & METHOD_ATTRIBUTE_STATIC))
 		virtual_ = TRUE;
@@ -6454,6 +6725,7 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	cfg->disable_inline = prev_disable_inline;
 	cfg->wasm_cur_inline_im = prev_wasm_inline_im;
 	cfg->wasm_s2_ctx = prev_s2_ctx;
+	cfg->wasm_eh_ctx = prev_eh_ctx;
 	cfg->inline_depth --;
 
 	{ extern int mono_wasm_jit_s2_hot_cost;   /* plan2x S2: a hot site's cost cap, when it is the larger */
@@ -6477,7 +6749,7 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 #endif
 			if (s2_hot) {   /* plan2x S2: a raised site, accepted -- paid out of the root's S2 budget */
 				wj_p3_count (WJC_S2_INLINED);
-				cfg->wasm_s2_spent += (gint32) cheader->code_size;
+				cfg->wasm_s2_spent += s2_charge;
 			}
 			if (cfg->wasm_jit_tier >= 2)
 				cfg->wasm_jit_result.t2_inlined++;   /* R316d */

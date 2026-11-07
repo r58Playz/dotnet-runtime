@@ -1476,6 +1476,10 @@ enum {
 	WJC_EHINL_SHADOWS,           /* shadow table entries emitted (a clause enclosing an EH-inlined call site, over its range) */
 	WJC_EHINL_RETRY,             /* compiles with inlinee clauses that failed permanently, retried without EH inlining */
 	WJC_EHINL_RETRY_OK,          /* ... and the retry succeeded */
+	WJC_EHINL_HOT_ADMIT,         /* EH_INLINE bit 128: EH callees under the size limit only by their hot bytes (gate evaluations) */
+	WJC_EHINL_ROOT_HOT,          /* EH_INLINE bit 256: a root without clauses allowed its first instance (site frequency) */
+	WJC_EHINL_ROOT_COLD,         /* ... refused it (site below EH_INLINE_ROOT_PCT, or no profile) */
+	WJC_EHINL_FREQ_RAISED,       /* EH_INLINE bit 128: an EH callee given the S2 hot-site limit by the EH frequency (S2 had none) */
 	WJC_MAX
 };
 

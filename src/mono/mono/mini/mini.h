@@ -359,6 +359,7 @@ typedef struct WjEhInst {
 	gint32 first, n;                 /* its clauses: cfg->header->clauses [first, first + n), at EH positions */
 	MonoExceptionClause *local;      /* [n] the same clauses at the inlinee's own IL offsets (its header is freed) */
 	MonoBasicBlock **handler_bb;     /* [n] each clause's handler entry block */
+	guint8 *cold;                    /* [size] or NULL: IL bytes off its normal path (EH_INLINE bit 128, wj_il_eh_hot_size) */
 } WjEhInst;
 typedef struct MonoSpillInfo MonoSpillInfo;
 
@@ -1494,6 +1495,12 @@ typedef struct {
 	MonoMethod      *wasm_s2_gate_callee;
 	double           wasm_s2_gate_f;
 	gboolean         wasm_s2_gate_hot;
+	gint32           wasm_s2_gate_size;      /* the IL size the gate weighed (EH_INLINE bit 128: an EH callee's hot bytes) */
+	/* EH_INLINE bits 128 / 256: S2's frequency continued through guarded inlines too, for the EH decisions only */
+	const guint8    *wasm_eh_gate_ip;
+	MonoMethod      *wasm_eh_gate_callee;
+	double           wasm_eh_gate_f;
+	double           wasm_eh_ctx;            /* the method being imported: calls per root entry (< 0 = unknown) */
 	double           wasm_s2_ctx;
 	gint32           wasm_s2_spent;          /* IL bytes admitted above the static limit at hot sites, this compile */
 	gboolean         wasm_t2_strict;         /* plan2x S0b: the strict tier-2 retry after a T2_MAX_BODY failure */
