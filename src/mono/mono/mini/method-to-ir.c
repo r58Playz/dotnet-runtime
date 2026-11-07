@@ -8250,8 +8250,21 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 	cfg->cil_offset_to_bb = (MonoBasicBlock **)mono_mempool_alloc0 (cfg->mempool, sizeof (MonoBasicBlock*) * header->code_size);
 	cfg->cil_offset_to_bb_len = header->code_size;
 
-	if (cfg->verbose_level > 2)
+	if (cfg->verbose_level > 2) {
 		printf ("method to IR %s\n", mono_method_full_name (method, TRUE));
+		/* The clause table, so a verbose listing's IL can be split into try bodies and handlers. Field reads only:
+		 * catch_class was resolved with the header. */
+		printf ("[il clauses] code_size %u, %u clauses\n", header->code_size, header->num_clauses);
+		for (guint ci = 0; ci < header->num_clauses; ++ci) {
+			MonoExceptionClause *c = &header->clauses [ci];
+			MonoClass *cc = c->flags == MONO_EXCEPTION_CLAUSE_NONE ? c->data.catch_class : NULL;
+			printf ("[il clause] %u %s try IL_%04x-IL_%04x handler IL_%04x-IL_%04x %s%s%s\n", ci,
+				c->flags == MONO_EXCEPTION_CLAUSE_NONE ? "catch" : c->flags == MONO_EXCEPTION_CLAUSE_FINALLY ? "finally"
+				: c->flags == MONO_EXCEPTION_CLAUSE_FAULT ? "fault" : c->flags == MONO_EXCEPTION_CLAUSE_FILTER ? "filter" : "?",
+				c->try_offset, c->try_offset + c->try_len, c->handler_offset, c->handler_offset + c->handler_len,
+				cc ? m_class_get_name_space (cc) : "", cc && *m_class_get_name_space (cc) ? "." : "", cc ? m_class_get_name (cc) : "-");
+		}
+	}
 
 	param_types = (MonoType **)mono_mempool_alloc (cfg->mempool, sizeof (MonoType*) * num_args);
 	if (sig->hasthis)
