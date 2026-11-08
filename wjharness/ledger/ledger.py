@@ -3,7 +3,7 @@
 (emitter construct | mono opcode, source method, IL offset, IL opcode); runtime/AOT code charged to the JIT call
 site that entered it.
 
-  ledger.py <rundir> <capdir> --tid N [--window t0,t1] [--ticks N] [--out PREFIX]
+  ledger.py <rundir> <capdir> --tid N [--window t0,t1] [--ticks N] [--out PREFIX] [--align]
 
 rundir: an mcperf capture taken with MONO_WASM_JIT_ORIGIN=1 MONO_WASM_JIT_CAPTURE=1, --jitdump, and
         MCPERF_EVENT=cpu_core/instructions/upp,cpu_core/cycles/upp MCPERF_PERIOD=2000003
@@ -36,6 +36,7 @@ def opt(k, d=None): return a[a.index(k) + 1] if k in a else d
 rundir, capdir = a[0], a[1]
 tid = int(opt('--tid'))
 outp = opt('--out', os.path.join(capdir, 'ledger'))
+ALIGN = '--align' in a
 
 jpath = max(glob.glob(os.path.join(rundir, 'jit-*.dump')), key=os.path.getsize)
 idx = JitIndex(jpath)
@@ -108,6 +109,54 @@ def masked_equal(code, fn):
         return False
     return True
 
+# --align: THE BROWSER'S OWN FEEDBACK INLINING. TurboFan in the browser inlines a call_indirect target it saw in Liftoff
+# (CallIndirectIC, same instance), which d8 cannot reproduce (Note 2026-11-05, the d8 rebuild); such a function never
+# masked_equals its capture, and on 26.2 the hottest function of the tick was one (LevelChunk.getBlockState, 11.8 M
+# instr/tick unmatched, 2026-11-07). V8 INSERTS the callee's code and leaves the rest alone there: 4,747 of d8's 4,786
+# instructions recur in the live code with the same mnemonic, registers and addressing form, in order. So align the two
+# instruction streams (constants masked: displacements, immediates and jump targets move when code is inserted), take
+# d8's offset for every aligned live instruction, and tag the inserted runs 'v8:inlined-callee'. Accepted only when
+# >= ALIGN_MIN of d8's instructions align; counted as 'aligned' in record matching, apart from 'matched'.
+ALIGN_MIN = 0.90
+_HEX = re.compile(r'0x[0-9a-f]+')
+def _decode(code):
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as f:
+        f.write(code); p = f.name
+    try:
+        out = subprocess.run(['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64', '--no-show-raw-insn', p],
+                             capture_output=True, text=True).stdout
+    finally:
+        os.unlink(p)
+    ins = []
+    for l in out.splitlines():
+        mm = re.match(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$', l)
+        if mm:
+            ins.append((int(mm.group(1), 16), mm.group(2) + ' ' + _HEX.sub('K', mm.group(3))))
+    return ins
+def aligned_map(live, fn):
+    """(live instruction starts, {live start: d8 start}, aligned share of d8) or None."""
+    import difflib
+    D = _decode(fn['code']); L = _decode(live)
+    if not D or not L:
+        return None
+    sm = difflib.SequenceMatcher(None, [k for _, k in D], [k for _, k in L], autojunk=False)
+    amap = {}
+    for b in sm.get_matching_blocks():
+        for j in range(b.size):
+            amap[L[b.b + j][0]] = D[b.a + j][0]
+    share = len(amap) / len(D)
+    return ([o for o, _ in L], amap, share) if share >= ALIGN_MIN else None
+def live_to_d8(fn, off):
+    """d8 offset for a live offset of an ALIGNED function (any byte inside an instruction: fp-chain return
+    addresses are ra - 1), or None inside code V8 inserted."""
+    st = fn['lstarts']
+    k = bisect.bisect_right(st, off) - 1
+    if k < 0:
+        return None
+    d = fn['amap'].get(st[k])
+    return None if d is None else d + (off - st[k])
+
 # POSITION CLASSES. A PEBS cycles sample charges a retirement stall to the oldest unretired instruction, so cycles on
 # the first instruction after a CALL are mostly the return / front-end bubble, and cycles on a branch target or a
 # function's first instruction are mostly fetch; only MID-BLOCK cycles are the instruction's own (data) stalls. Decoded
@@ -179,6 +228,22 @@ def matched(r):
                     fn['pcls'] = position_classes(fn, code, idx.start[r])
                     del fn['code']   # only the layout, the position table and the classes are needed from here on
                     res = (sha, fi, fn); break
+            if res is None and ALIGN and is_jit_name(m.group(1)):
+                for sha in cands:
+                    fn = load_fn(sha, fi)
+                    al = aligned_map(code, fn) if fn is not None else None
+                    if al:
+                        fn['lstarts'], fn['amap'], fn['ashare'] = al
+                        fn['pcls'] = position_classes(fn, b'', 0)   # d8's own branch structure; no live jump tables
+                        del fn['code']
+                        res = (sha, fi, fn)
+                        print(f'  aligned {m.group(1)[:90]}: {fn["ashare"]:.1%} of d8 instructions, '
+                              f'{len(fn["lstarts"]) - len(fn["amap"])} live instructions inserted', flush=True)
+                        break
+                if res is not None:
+                    match_stats['aligned'] += 1
+                    match[key] = res
+                    return res
             match_stats['matched' if res else ('cand_mismatch' if is_jit_name(m.group(1)) else 'cand_mismatch_nonjit')] += 1
         else:
             match_stats['no_capture_jit' if is_jit_name(m.group(1)) else 'aot_or_runtime'] += 1
@@ -189,6 +254,10 @@ def matched(r):
 
 _ocache = {}
 def origin_of(mt, off):
+    if 'amap' in mt[2]:
+        off = live_to_d8(mt[2], off)
+        if off is None:
+            return ('v8:inlined-callee', module(mt[0]).names.get(mt[1]), -1, None)
     k = (id(mt[2]), off)
     v = _ocache.get(k)
     if v is None:
@@ -196,6 +265,10 @@ def origin_of(mt, off):
     return v
 
 def pos_of(mt, off):
+    if 'amap' in mt[2]:
+        off = live_to_d8(mt[2], off)
+        if off is None:
+            return POS[0]
     return POS[mt[2]['pcls'].get(off, 0)]
 
 def _origin_of(mt, off):

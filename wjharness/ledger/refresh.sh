@@ -19,7 +19,9 @@ step "server tid";       tid=$(cap python3 ledger/servertid2.py "$RUN" | tail -1
 step "captures";         cap python3 ledger/capture.py "$RUN/game.log" "$OUT/cap"
 step "sampled set";      cap python3 ledger/sampled.py "$RUN" --tid "$tid" > "$OUT/sampled.txt"
 step "d8 compile";       cap python3 ledger/d8x86.py "$OUT/cap" -j 3 --only "$OUT/sampled.txt" | tail -1
-step "ours ledger";      cap python3 ledger/ledger.py "$RUN" "$OUT/cap" --tid "$tid" --out "$OUT/ours" > "$OUT/ours.txt"
+# --align: recover functions the browser's feedback inlining re-laid out (ledger.py's header; 2026-11-07, 26.2's
+# getBlockState). Only functions with no exact match are aligned; 'aligned' is counted apart in record matching.
+step "ours ledger";      cap python3 ledger/ledger.py "$RUN" "$OUT/cap" --tid "$tid" --out "$OUT/ours" --align > "$OUT/ours.txt"
 head -12 "$OUT/ours.txt"
 if [ -n "$HS" ]; then
   step "HotSpot ledger"; cap python3 ledger/hsledger.py "$HS" --ticks "$HSTICKS" --out "$OUT/hs" > "$OUT/hs.txt"
