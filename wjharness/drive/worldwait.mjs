@@ -34,7 +34,7 @@ import { join } from "path";
 import { defaultOut, RUNS as RUNS_DIR } from "../lib/paths.mjs";
 
 const args = process.argv.slice(2);
-/* --seed NAME|DIR (lib/seeds.mjs), else MC_SEED, else mcsr */
+/* --seed NAME|DIR (lib/seeds.mjs), else MC_SEED, else 262n (DEFAULT_SEED) */
 const SEED = seedFromArgs(args);
 const num = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? Number(args[i + 1]) : d; };
 const RUNS = num("runs", 8);

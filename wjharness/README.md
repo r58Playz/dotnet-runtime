@@ -70,10 +70,11 @@ census, the last E-cores), `WJ_BOOT_CPUS` (everything but the census CPUs).
 ```sh
 wj fit                                                        # wait until preflight passes
 wj j2d/run ours $WJ_RUNS/x/d1 --no-perf --no-attr --schedule 600,200,60 --window-batches 40,60   # jbox2d, R440 protocol
-wj worldwait --runs 3 --stats --bench-ms 60000                # Minecraft faults + counters
+wj worldwait --runs 3 --stats --bench-ms 60000               # Minecraft faults + counters (default seed 262n, the target)
 wj hwrun $WJ_RUNS/2026-11-05-x a1 --knob K=V                  # one Q60 hardware-census arm; ... then:
 wj hwrun $WJ_RUNS/2026-11-05-x --drain
-wj bootcheck --seed 262b --dump-on-stall                      # boot only, ~2 min
+wj mcnative --out $WJ_RUNS/2026-11-05-x/n1                    # the HotSpot 25 reference for the same workload (sa262n)
+wj bootcheck --dump-on-stall                                  # boot only, ~2 min
 wj deploy '<a string your change added>'                      # after build-dotnet.sh; proves the marker is SERVED
 ```
 
@@ -96,8 +97,8 @@ wj deploy '<a string your change added>'                      # after build-dotn
 | `seedbuild` | Build a seed from an OPFS export: `--dest $WJ_STATE/seeds/seed-X --tar /X.tar` (tar copied into the dev server's `frontend/public`, deleted after), then register it in `lib/seeds.mjs` |
 | `wgen262`, `vcmp` | 26.2 world generation driver; version-compare driver with `--seed`, screenshots per key (`--probe`) |
 | `ensure-server` | Bring `$DEV_UNIT` up and wait for a real 200 (race-free against the dying process holding the port) |
-| `native/mcstage` | `[--tar T --version V --name N]` Builds a **standalone** native stage, `$WJ_STATE/native/<name>/` (default `sa`, 1.16.1 MCSR; `sa262n` = 26.2 no mods from `state/seeds/ikvmcraft-262n.tar`): the game dir, mods, config, options and save from the tar ours plays (`$NW_TAR`), the classpath (sha1-checked) and LWJGL natives from `$PRISM_HOME`, read-only. Nothing under Prism is written |
-| `native/mcnative` | **The native reference, standalone**: HotSpot (`--jdk 25` default) on a fresh copy of the stage (`--stage NAME`; joins by menu replay for MCSR, `--quickPlaySingleplayer` otherwise), menu replayed on a private Xwayland, captured the way `hwrun` captures ours (Q60 window, hwrun's event set, `-k 1 -g`, `phases.json`, `[mcw]` markers), with `jcmd Compiler.perfmap` and `j2dagent` (`,lite`; `--agent-full` adds code bytes) for HotSpot's inlining. P-cores pinned |
+| `native/mcstage` | `[--tar T --version V --name N]` Builds a **standalone** native stage, `$WJ_STATE/native/<name>/` (default `sa262n` = 26.2 no mods from `state/seeds/ikvmcraft-262n.tar`; `sa` = 1.16.1 MCSR with `--tar $NW_TAR --version 1.16.1-fabric-0.19.3 --name sa`): the game dir, mods, config, options and save from the tar ours plays, the classpath (sha1-checked) and LWJGL natives from `$PRISM_HOME`, read-only. Nothing under Prism is written |
+| `native/mcnative` | **The native reference, standalone**: HotSpot (`--jdk 25` default), or IKVM on native CoreCLR (`--ikvm $WJ_STATE/arms/ikvm-clr10[/env-classic.sh]`: the arm's README; CoreCLR writes its own perf map, no agent), on a fresh copy of the stage (`--stage NAME`, default `sa262n`; `--warm-s` defaults to the stage's Q60 offset, 183 s, or 198 s on `sa`; joins by menu replay for MCSR, `--quickPlaySingleplayer` otherwise), menu replayed on a private Xwayland, captured the way `hwrun` captures ours (Q60 window, hwrun's event set, `-k 1 -g`, `phases.json`, `[mcw]` markers), with `jcmd Compiler.perfmap` and `j2dagent` (`,lite`; `--agent-full` adds code bytes) for HotSpot's inlining. P-cores pinned |
 | `native/mccmp` | **Ours vs native on the server tick**: hardware table, kind of code, the tick partitioned by anchors (where in the game), methods charged and inclusive, and methods out of line with the tick's own ratio. Several runs a side. Native frames are expanded through HotSpot's inlining map; ours are physical (see its header) |
 | `native/jarcensus` | How Minecraft's bytecode changed across versions (`--prism 1.16.1,26.2,...`): method sizes against the inlining caps, EH methods, interface calls, casts, invokedynamic by bootstrap. Static only |
 | `native/mcinsn` | The executed x86 instruction mix of the server tick, both sides through `hotinsn`'s classifier. Needs `mcnative --agent-full` and an ours capture taken with `--jitdump` |
@@ -105,15 +106,17 @@ wj deploy '<a string your change added>'                      # after build-dotn
 
 ### Seeds
 
-`--seed NAME` on any driver, or `MC_SEED`. Profiles under `state/seeds/`:
+`--seed NAME` on any driver, or `MC_SEED`. **The default is `262n`, the performance target** (26.2 on Fabric Loader, no
+mods, peaceful; see CLAUDE.md). It became the default on 2026-11-08: a run before then without `--seed` measured `mcsr`.
+26.2 has one seed. The modded packs `262u`, `262b` and `262p` and the registry-race diagnostic `262d` were retired that
+day to `state/retired/2026-11-08/` (with the native stages `sa262d` and `fo262`); move one back into `state/seeds/` and
+restore its `lib/seeds.mjs` entry from git to use it. Profiles under `state/seeds/`:
 
 | seed | profile | version | what |
 |---|---|---|---|
-| `mcsr` (default) | `seed` | 1.16.1 + Fabric 0.19.3 | MCSR Ranked, "New World" pre-generated to the 83% knee |
+| **`262n`** (default, target) | `seed-262n` | 26.2 + Fabric 0.19.5 | **no mods**; the user's 2026-10-21 "New World" save set to **peaceful** (it spawns at night), vanilla resource pack, vsync off, RD 12, OpenGL backend; built from `state/seeds/ikvmcraft-262n.tar`, and so is the native stage `sa262n` |
+| `mcsr` | `seed` | 1.16.1 + Fabric 0.19.3 | MCSR Ranked, "New World" pre-generated to the 83% knee: the 1.16.1 regression workload |
 | `165` | `seed-165` | 1.16.5 + 0.19.5 | 10 mods incl. Iris + BSL, RD 12 |
-| `262u` | `seed-262u` | 26.2 + 0.19.5 | Fabulously Optimized, 149 mods, RD 2 |
-| `262b` | `seed-262b` | 26.2 + 0.19.5 | FO trimmed to 43 mods, RD 12, survival/normal |
-| `262p` | `seed-262p` | 26.2 + 0.19.5 | 262b set to peaceful: use it for in-game windows |
 
 Each entry in `lib/seeds.mjs` carries the title / join lines, the menu key path into the save, the save+quit Tab count,
 and `benignRx` (lines that seed logs on every healthy boot). `bootcheck`'s `boot.toframe` and `boot.reload` phases are
@@ -134,7 +137,7 @@ measured from the launcher's Play.
 | `faultcensus` | Per-class fault census over `state/corpus` + `runs/` (`--since`, `--json`); **`--disjoint`** runs the disjointness invariant over every real log |
 | `fe/*` | Front-end misses by region (`fesites`), the door into native code (`fedoor`, `--tick-only` / `--part`), native functions (`fenative`), tick work vs tasks vs the idle wait (`fepart`; the split is `feclass.py`, corrected 2026-11-05), top-down (`fe`) |
 | `sitewhy`, `inltree` | The call-site census by inline verdict (`--tier`, `--no-phantoms` drops FAST_TLS's non-calls); mono's verbose inline trees (`MONO_VERBOSE_METHOD=<root>;...`) with costs of refused subtrees |
-| `ledger/refresh` | The gap ledger: one mapping run -> ours ledger, optional HotSpot ledger, joined report (needs `D8`) |
+| `ledger/refresh` | The gap ledger: one mapping run -> ours ledger, optional HotSpot ledger, joined report (needs `D8`). `ledger.py --align` (on in refresh) recovers functions whose live layout V8's feedback inlining changed: d8's instructions are aligned to the live ones and the inserted callee code is tagged `v8:inlined-callee` |
 | `j2d/prep`, `j2d/wledger`, `j2d/hsledger`, `j2d/counts`, `j2d/report`, `cjledger`, `cjcapture`, `cjprobe` | jbox2d ledgers and counts per run; CheerpJ codegen capture and GC-contract probe |
 | `native/buckets`, `join`, `split`, `servertid`, `natstat`, `natcensus` | Per-bucket instructions against native's whole frame; per-method join on Java names; the server tid **by the symbols it ran** (both busy threads are `DedicatedWorker`). `--tid`/`--thread` explicitly, always |
 | `boot/bootattr`, `stages`, `critpath`, `segs`, `trend`, `natboot` | Boot attribution by anchor, stages, the client thread's critical path, HotSpot's boot reference |
@@ -165,9 +168,9 @@ measured from the launcher's Play.
   with `state/arms/jvmti/libj2dagent.so` for the ledger: `bash j2d/jvmti/build.sh`.
 * **CheerpJ**: `j2d/cheerpj/index.html` (tracked) over `state/arms/cheerpj/{bench.jar,gcprobe.jar}`; the loader comes from
   Leaning Technologies' CDN.
-* **Native Minecraft, standalone** (`mcnative`): `bash native/mcstage.sh` builds `state/native/sa/` from `$NW_TAR` and
-  `$PRISM_HOME`; the JVMTI agent is `state/arms/jvmti/libj2dagent.so` (`bash j2d/jvmti/build.sh`, shared with the jbox2d
-  ledger). JDKs are `$JAVA_HOME_<N>`.
+* **Native Minecraft, standalone** (`mcnative`): `bash native/mcstage.sh` builds `state/native/sa262n/` from
+  `state/seeds/ikvmcraft-262n.tar` and `$PRISM_HOME` (`sa`, 1.16.1, from `$NW_TAR`); the JVMTI agent is
+  `state/arms/jvmti/libj2dagent.so` (`bash j2d/jvmti/build.sh`, shared with the jbox2d ledger). JDKs are `$JAVA_HOME_<N>`.
 * **Native Minecraft, in place** (`natrun`, older): the Prism instance (`$PRISM_INSTANCE`), `state/native/stage`
   (`cp.single` = Prism's `-cp` minus NewLaunch.jar, `natives/` = the lwjgl natives). Its async-profiler is gone from
   `state/native/`, so it now runs without the per-method census.

@@ -37,7 +37,7 @@ const KEYS = [
   ["TEAVM_BASELINE", "served root of the 2026-07-27 TeaVM baseline arm", undefined],
   ["CHROMIUM_SRC", "a chromium checkout (src/, v8 at src/v8), for checking V8 claims", undefined],
   ["PRISM_INSTANCE", "the native Prism instance natrun drives (MCSRRanked-Linux-1.16.1-Basic)", undefined],
-  ["NW_TAR", "the OPFS export tar ours plays (mods, config, options, save): natrun restores its world from it, mcstage stages it whole", undefined],
+  ["NW_TAR", "the OPFS export tar ours plays (mods, config, options, save): natrun restores its world from it; mcstage stages it whole for the 1.16.1 stage `sa` (--tar)", undefined],
   ["PRISM_HOME", "Prism Launcher's data dir: mcstage reads libraries/, assets/ and meta/org.lwjgl3 from it, read-only", () => {
     const d = join(HOME, ".local", "share", "PrismLauncher"); return existsSync(join(d, "libraries")) ? d : undefined; }],
   ["D8", "a d8 binary for ledger/d8x86.py", undefined],

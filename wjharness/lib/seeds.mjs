@@ -7,7 +7,9 @@
 // has its own log lines for "the title screen is up" and its own keyboard path into the save.
 //
 // Pick one with `--seed NAME` on a driver or `MC_SEED=NAME` (a name below, or a profile directory). The
-// default stays `mcsr`, so every driver that predates this file keeps measuring what it always measured.
+// default is `262n`, the performance target (2026-11-08; it was `mcsr` until then, so a run directory from before
+// that date without `--seed` measured 1.16.1). 26.2 has ONE seed: the modded packs (262u, 262b, 262p) and the
+// registry-race diagnostic (262d) were retired on 2026-11-08 to $WJ_STATE/retired/2026-11-08 (findings log).
 //
 // Per entry:
 //   dir         profile directory under $WJ_HOME/state/seeds
@@ -42,6 +44,8 @@ const keys = (s, waits = {}) => s.split(/\s+/).filter(Boolean).map((k) => [k, k,
 
 /* Read off screenshots after every key (vcmp R509 for 1.16.5 and 26.2; autoworld.sh for MCSR). Keyboard only:
  * mouse buttons never reach Minecraft through emscripten-glfw headless, focus moves with Tab, Enter activates. */
+export const DEFAULT_SEED = "262n";
+
 export const SEEDS = {
   mcsr: {
     dir: "seed", version: "1.16.1", fabric: "0.19.3",
@@ -70,61 +74,19 @@ export const SEEDS = {
     menu: keys("Tab Enter Tab ArrowDown Tab Enter", { Enter: 3000 }),
     quitTabs: null,
   },
-  "262u": {
-    dir: "seed-262u", version: "26.2", fabric: "0.19.5",
-    what: "26.2 + Fabric, Fabulously Optimized (149 mods), RD 2 (R509-R513)",
-    /* Fabulously Optimized turns ModernFix's measure_time off; RRLS logs this when the overlay leaves */
-    titleRx: /Game took [\d.]+ seconds to start|Overlay is removed!/,
-    joinRx: /joined the game/,
-    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
-    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
-    quitTabs: null,
-    benignRx: BENIGN_262,
-  },
-  "262b": {
-    dir: "seed-262b", version: "26.2", fabric: "0.19.5",
-    what: "26.2 + Fabric, Fabulously Optimized 14.1.1 trimmed to 43 mods (+Iris, Lithium, ModernFix), RD 12, survival/normal (2026-10-21 tar)",
-    titleRx: /Game took [\d.]+ seconds to start|Overlay is removed!/,
-    joinRx: /joined the game/,
-    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
-    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
-    quitTabs: null,
-    benignRx: BENIGN_262,
-  },
-  /* 26.2 with NO mods: Fabric 0.19.5 alone (the app launches <version>-fabric-<loader> only), the 262b save set to
-   * peaceful, the vanilla resource pack, vsync off. Built 2026-11-06 from the 2026-10-21 tar by
-   * runs/2026-11-06-262/mktar.py into state/seeds/ikvmcraft-262n.tar; mcstage builds the native stage `sa262n` from the
-   * same tar. Vanilla logs no "title screen is up" line: the marker is the last atlas the 26.2 reload creates (native
-   * log, 2026-11-06), and the menu re-drive covers a press that lands under the fading overlay. */
+  /* THE DEFAULT and the performance target. 26.2 with NO mods: Fabric 0.19.5 alone (the app launches
+   * <version>-fabric-<loader> only), the vanilla resource pack, vsync off, RD 12, and the user's 2026-10-21 "New World"
+   * save (from the retired modded pack 262b) with its difficulty set to PEACEFUL (level.dat
+   * Data/difficulty_settings/difficulty, by scratchpad/legacy/wj/nbtedit.py). The save spawns at night, so a normal
+   * difficulty would put zombies on the player and could end a walking window on the death screen. Built 2026-11-06
+   * from the 2026-10-21 tar by runs/2026-11-06-262/mktar.py into state/seeds/ikvmcraft-262n.tar; mcstage builds the
+   * native stage `sa262n` from the same tar (its level.dat reads peaceful too). Vanilla logs no "title screen is up"
+   * line: the marker is the last atlas the 26.2 reload creates (native log, 2026-11-06), and the menu re-drive covers
+   * a press that lands under the fading overlay. */
   "262n": {
     dir: "seed-262n", version: "26.2", fabric: "0.19.5",
-    what: "26.2 + Fabric 0.19.5, NO mods; the 262b save set to peaceful, RD 12 (2026-11-06)",
+    what: "26.2 + Fabric 0.19.5, NO mods, the save set to peaceful, RD 12 (2026-11-06): the performance target",
     titleRx: /Created: \d+x\d+x\d+ minecraft:textures\/atlas\/shulker_boxes\.png-atlas/,
-    joinRx: /joined the game/,
-    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
-    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
-    quitTabs: null,
-    benignRx: BENIGN_262,
-  },
-  /* 262n plus one diagnostic mod (runs/2026-11-06-262/diag: wjdiag, mixins into MappedRegistry.freeze and
-   * FileToIdConverter.listMatchingResources) for 26.2's registry race. Not a measurement seed. */
-  "262d": {
-    dir: "seed-262d", version: "26.2", fabric: "0.19.5",
-    what: "262n + the wjdiag registry-race diagnostic mod (not for measurement)",
-    titleRx: /Created: \d+x\d+x\d+ minecraft:textures\/atlas\/shulker_boxes\.png-atlas/,
-    joinRx: /joined the game/,
-    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
-    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
-    quitTabs: null,
-    benignRx: BENIGN_262,
-  },
-  /* 262b with the save's difficulty set to peaceful (level.dat Data/difficulty_settings/difficulty, rewritten by an NBT
-   * round trip that changes only that string; scratchpad/wj/nbtedit.py, 2026-10-21). The save spawns at night among zombies,
-   * so a walking window on 262b can end on the death screen; use this one for repeatable in-game measurement. */
-  "262p": {
-    dir: "seed-262p", version: "26.2", fabric: "0.19.5",
-    what: "262b with the save set to peaceful (no hostile mobs), for in-game windows",
-    titleRx: /Game took [\d.]+ seconds to start|Overlay is removed!/,
     joinRx: /joined the game/,
     genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
     menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
@@ -138,7 +100,7 @@ export const SEEDS = {
  * A directory that is no registry entry's gets the generic modern markers and no menu: it can boot to the
  * title, and a caller that wants a world must pass its own menu.
  */
-export function resolveSeed (seed = process.env.MC_SEED || "mcsr") {
+export function resolveSeed (seed = process.env.MC_SEED || DEFAULT_SEED) {
   if (seed && typeof seed === "object") return seed;
   const name = String(seed);
   if (SEEDS[name]) return { name, ...SEEDS[name], dir: join(MCSR_DIR, SEEDS[name].dir) };
@@ -155,7 +117,7 @@ export function resolveSeed (seed = process.env.MC_SEED || "mcsr") {
   };
 }
 
-/* `--seed X` from an argv, else MC_SEED, else mcsr. */
+/* `--seed X` from an argv, else MC_SEED, else DEFAULT_SEED. */
 export function seedFromArgs (args) {
   const i = args.indexOf("--seed");
   return resolveSeed(i >= 0 ? args[i + 1] : undefined);

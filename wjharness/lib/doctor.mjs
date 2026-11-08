@@ -6,7 +6,7 @@ import { execSync, spawnSync } from "child_process";
 import { existsSync, statfsSync, accessSync, constants, readFileSync } from "fs";
 import { join } from "path";
 import { resolved, KEY_DOCS, machineFile, cfg, HARNESS } from "./paths.mjs";
-import { SEEDS } from "./seeds.mjs";
+import { SEEDS, DEFAULT_SEED } from "./seeds.mjs";
 
 let bad = 0, warned = 0;
 const line = (st, what, detail = "") => {
@@ -31,7 +31,7 @@ const fstype = sh(`stat -f -c %T ${JSON.stringify(home)}`);
 if (fstype && !/btrfs|xfs/.test(fstype)) line("warn", `WJ_HOME is on ${fstype}`, "no reflinks: every run copies its 0.5-0.8 GB seed in full");
 for (const [name, s] of Object.entries(SEEDS)) {
   const p = join(home, "state", "seeds", s.dir);
-  existsSync(p) ? line("ok", `seed ${name} (${s.dir})`) : line(name === "mcsr" ? "MISSING" : "warn", `seed ${name}: ${p}`, "wj seedbuild, or restore it from its OPFS tar");
+  existsSync(p) ? line("ok", `seed ${name} (${s.dir})`) : line(name === DEFAULT_SEED ? "MISSING" : "warn", `seed ${name}: ${p}`, "wj seedbuild, or restore it from its OPFS tar");
 }
 
 console.log("\nsibling checkouts");

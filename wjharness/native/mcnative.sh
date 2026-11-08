@@ -2,15 +2,21 @@
 # mcnative.sh -- the STANDALONE native Minecraft reference, captured the way hwrun.sh captures ours, so the same readers
 # (hwcensus, perfraw, mccmp) read both sides.
 #
-#   mcnative.sh [--jdk 25] [--out DIR] [--warm-s 198] [--bench-s 60] [--no-perf] [--taskset CPUS] [--java-opt OPT]...
-#               [--force] [--keep-game] [--agent-full]
+#   mcnative.sh [--stage sa262n] [--jdk 25 | --ikvm ARM] [--out DIR] [--warm-s 183] [--bench-s 60] [--no-perf]
+#               [--taskset CPUS] [--java-opt OPT]... [--force] [--keep-game] [--agent-full]
+#
+# --ikvm ARM runs the same stage on IKVM over NATIVE CoreCLR instead of HotSpot (2026-11-08): ARM is a directory with
+# jre/bin/java and an env.sh to source (or the path of another env file in it, for another IKVM configuration) ($WJ_STATE/arms/ikvm-clr10: ikvmcraft's served IKVM DLLs on Microsoft's CoreCLR
+# 10.0.14, see its README.md). No HotSpot flags, no JVMTI agent, no jcmd: with perf, CoreCLR writes its own perf map
+# (DOTNET_PerfMapEnabled=3) into the run directory as perf-<pid>.map, where the readers find HotSpot's. Boot and world
+# load are minutes, not seconds, so the window and join waits are longer (MCN_WINDOW_S, MCN_JOIN_S).
 #
 # THE WORKLOAD is the stage mcstage.sh builds from the tar ours plays: the same mods, config, options.txt and save,
 # copied fresh into <out>/game for every run (the save advances as it plays). Nothing under Prism is touched; Prism
 # supplies libraries, LWJGL and asset objects, read-only.
 #
-# THE CAPTURE matches protocol Q60 (hwrun.sh): the window opens --warm-s after the world is joined (Q60 lands ~198 s
-# after join) and lasts --bench-s; perf records hwrun's event set at hwrun's periods with frame-pointer call chains
+# THE CAPTURE matches protocol Q60 (hwrun.sh): the window opens --warm-s after the world is joined (Q60 lands ~183 s
+# after join on 262n, the default stage sa262n; ~198 s on 1.16.1's mcsr, stage sa) and lasts --bench-s; perf records hwrun's event set at hwrun's periods with frame-pointer call chains
 # (-k 1 -g), the window is written to phases.json as the `ingame` phase in CLOCK_MONOTONIC, and game.log carries
 # `[mcw] START` / `[mcw] END` around it, so hwcensus's tick denominator (window x 20 - logged "ticks behind") is the
 # same rule on both sides. Java frames are named by `jcmd Compiler.perfmap` taken after the window (JDK 17+; under
@@ -24,11 +30,12 @@
 # UUID of "ikvmcraft", whose playerdata the save holds (another UUID spawns a fresh entity at world spawn).
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/env.sh"
-JDK=25; OUT=""; WARM=198; BENCH=60; PERF=1; CPUS="$WJ_PCPUS"; JOPTS=(); FORCE=0; KEEP=0; AGMODE=",lite"; STAGE=sa
+JDK=25; IKVM=""; OUT=""; WARM=""; BENCH=60; PERF=1; CPUS="$WJ_PCPUS"; JOPTS=(); FORCE=0; KEEP=0; AGMODE=",lite"; STAGE=sa262n
 while [ $# -gt 0 ]; do
   case "$1" in
     --jdk) JDK=$2; shift ;;
-    --stage) STAGE=$2; shift ;;   # a stage mcstage.sh built: sa (1.16.1 + MCSR Ranked), sa262n (26.2, no mods), ...
+    --ikvm) IKVM=$2; shift ;;
+    --stage) STAGE=$2; shift ;;   # a stage mcstage.sh built: sa262n (26.2, no mods: the target), sa (1.16.1 + MCSR Ranked)
     --out) OUT=$2; shift ;;
     --warm-s) WARM=$2; shift ;;
     --bench-s) BENCH=$2; shift ;;
@@ -42,6 +49,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+# Q60's offset after join is the seed's (hwrun's --warm-ms is fixed; the join lands at a different time per seed)
+[ -n "$WARM" ] || { [ "$STAGE" = sa ] && WARM=198 || WARM=183; }
 SA="${SA:-$WJ_STATE/native/$STAGE}"
 [ -s "$SA/cp.txt" ] && [ -e "$SA/natives/liblwjgl.so" ] && [ -d "$SA/template/saves/New World" ] \
   || { echo "[mcn] VOID: no stage at $SA -- run: wj mcstage"; exit 1; }
@@ -50,10 +59,20 @@ SA="${SA:-$WJ_STATE/native/$STAGE}"
 MC_MAIN=net.fabricmc.loader.impl.launch.knot.KnotClient; MC_ASSET_INDEX=1.16; MC_GAME_VERSION=1.16.1; MC_VERSION_TYPE=release; MC_JOIN=mcsr
 [ -e "$SA/launch.env" ] && . "$SA/launch.env"
 PH=$(need PRISM_HOME "asset objects are read from \$PRISM_HOME/assets")
-JH=$(need "JAVA_HOME_$JDK" "the JDK this run uses (--jdk $JDK)")
-JAVA="$JH/bin/java"
+if [ -n "$IKVM" ]; then
+  # --ikvm ARM sources ARM/env.sh; --ikvm ARM/<file>.sh sources that file instead (another IKVM configuration, same arm)
+  IKVMENV="$IKVM/env.sh"; [ -f "$IKVM" ] && { IKVMENV=$(realpath "$IKVM"); IKVM=$(dirname "$IKVMENV"); }
+  IKVM=$(cd "$IKVM" 2>/dev/null && pwd) && [ -x "$IKVM/jre/bin/java" ] && [ -f "$IKVMENV" ] \
+    || { echo "[mcn] VOID: --ikvm needs a directory with jre/bin/java and env.sh (or one of its env files)"; exit 1; }
+  . "$IKVMENV"; JH=""; JAVA="$IKVM/jre/bin/java"; RUNTIME="ikvm-clr:$(basename "$IKVMENV" .sh)"; HEAPF=()
+  WINDOW_S="${MCN_WINDOW_S:-900}"; JOIN_S="${MCN_JOIN_S:-1200}"
+else
+  JH=$(need "JAVA_HOME_$JDK" "the JDK this run uses (--jdk $JDK)")
+  JAVA="$JH/bin/java"; RUNTIME="hotspot"; HEAPF=(-Xms6144m -Xmx6144m)
+  WINDOW_S="${MCN_WINDOW_S:-180}"; JOIN_S="${MCN_JOIN_S:-360}"
+fi
 [ "$PERF" = 1 ] && pmu_require
-OUT="${OUT:-$(wj_rundir "mcnative-$STAGE-jdk$JDK")}"; OUT=$(wj_outdir "$OUT") || exit 1; mkdir -p "$OUT"
+OUT="${OUT:-$(wj_rundir "mcnative-$STAGE-$([ -n "$IKVM" ] && echo ikvmclr || echo "jdk$JDK")")}"; OUT=$(wj_outdir "$OUT") || exit 1; mkdir -p "$OUT"
 LOG="$OUT/game.log"; : > "$LOG"
 mono () { python3 -c 'import time; print(f"{time.monotonic():.6f}")'; }   # perf -k 1's clock
 note () { echo "[mcn] $*" | tee -a "$OUT/mcn.txt"; }
@@ -69,7 +88,7 @@ XDISP=":$XN"; XGEOM="${XGEOM:-1600x900}"
 
 G="$OUT/game"
 cp -a --reflink=auto "$SA/template" "$G"
-note "out=$OUT stage=$STAGE ($MC_GAME_VERSION, join $MC_JOIN) jdk=$JDK warm=${WARM}s bench=${BENCH}s perf=$PERF cpus=$CPUS display=$XDISP"
+note "out=$OUT stage=$STAGE ($MC_GAME_VERSION, join $MC_JOIN) runtime=$RUNTIME${IKVM:+ ($IKVM)} jdk=$JDK warm=${WARM}s bench=${BENCH}s perf=$PERF cpus=$CPUS display=$XDISP"
 "$JAVA" -version > "$OUT/java-version.txt" 2>&1
 
 setsid Xwayland "$XDISP" -geometry "$XGEOM" > "$OUT/xwayland.log" 2>&1 &
@@ -104,7 +123,10 @@ DISPLAY="$XDISP" glxinfo -B 2>/dev/null | grep -E "OpenGL renderer|OpenGL core p
 # 2026-11-06 a mob's tickMovement read 72x ours because HotSpot had inlined it into its caller's frame).
 # -XX:+DebugNonSafepoints records pc descriptors between safepoints too; it changes debug info, not code.
 PFP=()
-if [ "$PERF" = 1 ]; then
+if [ "$PERF" = 1 ] && [ -n "$IKVM" ]; then
+  # perf map only (3: no jitdump), tier in each name, written straight into the run directory
+  export DOTNET_PerfMapEnabled=3 DOTNET_PerfMapShowOptimizationTiers=1 DOTNET_PerfMapJitDumpPath="$OUT"
+elif [ "$PERF" = 1 ]; then
   AG="$WJ_STATE/arms/jvmti/libj2dagent.so"
   [ -e "$AG" ] || void "no JVMTI agent at $AG -- run: wj j2d/jvmti/build.sh"
   PFP=(-XX:+PreserveFramePointer -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints "-agentpath:$AG=$OUT/j2dagent.txt$AGMODE")
@@ -114,7 +136,7 @@ fi
 GARGS=(--userType legacy); [ "$MC_JOIN" = quickplay ] && GARGS=(--quickPlaySingleplayer "New World")
 cd "$G"
 setsid env -u WAYLAND_DISPLAY DISPLAY="$XDISP" taskset -c "$CPUS" \
-  "$JAVA" "${PFP[@]}" "${JOPTS[@]}" -Duser.language=en -Xms6144m -Xmx6144m \
+  "$JAVA" "${PFP[@]}" "${JOPTS[@]}" -Duser.language=en "${HEAPF[@]}" \
     -Djava.library.path="$SA/natives" -Dorg.lwjgl.librarypath="$SA/natives" \
     -cp "$(cat "$SA/cp.txt")" "$MC_MAIN" \
     --gameDir "$G" --assetsDir "$PH/assets" --assetIndex "$MC_ASSET_INDEX" --version "$MC_GAME_VERSION" \
@@ -134,7 +156,7 @@ done
 note "java pid=$JPID ($(head -1 "$OUT/java-version.txt"))"
 
 WID=""
-for i in $(seq 1 90); do
+for i in $(seq 1 $((WINDOW_S / 2))); do
   WID=$(DISPLAY="$XDISP" xdotool search --name "Minecraft" 2>/dev/null | head -1)
   [ -n "$WID" ] && break
   alive || { grep -a -m1 -A8 "Crash Report\|Exception in thread\|Error:" "$LOG" | sed 's/^/[mcn]   /'; void "java exited before a window appeared"; }
@@ -164,13 +186,13 @@ for i in $(seq 1 180); do
 done
 else
 # quickplay: the integrated server logs the player joining, the same line ours' harness keys on (lib/seeds.mjs joinRx)
-for i in $(seq 1 180); do
+for i in $(seq 1 $((JOIN_S / 2))); do
   grep -aq "ikvmcraft joined the game" "$LOG" && { JOIN=$(mono); break; }
   alive || void "java exited before joining"
   sleep 2
 done
 fi
-[ -n "$JOIN" ] || void "never reached in-world in 360 s"
+[ -n "$JOIN" ] || void "never reached in-world in $JOIN_S s"
 note "in world; window opens in ${WARM}s"
 sleep "$WARM"
 alive || void "java exited during warm-up"
@@ -203,7 +225,10 @@ INW=0
 if [ "$MC_JOIN" = mcsr ]; then grep -a "StateOutput State:" "$LOG" | tail -1 | grep -q inworld && INW=1
 else grep -aq "ikvmcraft left the game" "$LOG" || INW=1; fi
 if [ "$PERF" = 1 ]; then
-  if [ -x "$JH/bin/jcmd" ] && [ "$JDK" -ge 17 ]; then
+  if [ -n "$IKVM" ]; then
+    [ -s "$OUT/perf-$JPID.map" ] && note "CoreCLR perf map: $(wc -l < "$OUT/perf-$JPID.map") symbols" \
+      || note "WARNING: no CoreCLR perf map at $OUT/perf-$JPID.map -- JIT frames stay unnamed"
+  elif [ -x "$JH/bin/jcmd" ] && [ "$JDK" -ge 17 ]; then
     "$JH/bin/jcmd" "$JPID" Compiler.perfmap "$OUT/perf-$JPID.map" > "$OUT/perfmap.log" 2>&1 \
       || note "WARNING: jcmd Compiler.perfmap failed: $(tail -1 "$OUT/perfmap.log")"
   else
@@ -214,9 +239,9 @@ if [ "$PERF" = 1 ]; then
   PRPID=""
 fi
 SKIP=$(awk '/\[mcw\] START/{w=1} /\[mcw\] END/{w=0} w && /ticks behind/ { if (match($0, /or ([0-9]+) ticks behind/, m)) s += m[1] } END {print s+0}' "$LOG")
-python3 - "$OUT" "$T0" "$T1" "$JOIN" "$JDK" "$JPID" "$STID" "${RTID:-0}" "$INW" "$SKIP" "$CPUS" "$PERF" "${JOPTS[*]:-}" <<'EOF'
+python3 - "$OUT" "$T0" "$T1" "$JOIN" "$JDK" "$JPID" "$STID" "${RTID:-0}" "$INW" "$SKIP" "$CPUS" "$PERF" "${JOPTS[*]:-}" "$RUNTIME" "$IKVM" <<'EOF'
 import json, os, sys
-out, t0, t1, join, jdk, pid, stid, rtid, inw, skip, cpus, perf, jopts = sys.argv[1:]
+out, t0, t1, join, jdk, pid, stid, rtid, inw, skip, cpus, perf, jopts, runtime, ikvm = sys.argv[1:]
 t0, t1, join = float(t0), float(t1), float(join)
 v = "ok" if inw == "1" else "left-world"
 json.dump({"phases": [{"name": "ingame", "t0": t0, "t1": t1}], "join": join, "native": True},
@@ -224,7 +249,8 @@ json.dump({"phases": [{"name": "ingame", "t0": t0, "t1": t1}], "join": join, "na
 json.dump({"verdict": v, "jdk": int(jdk), "java_version": open(os.path.join(out, "java-version.txt")).read().splitlines()[0],
            "pid": int(pid), "server_tid": int(stid), "render_tid": int(rtid), "window_s": t1 - t0,
            "window_after_join_s": t0 - join, "skipped_ticks": int(skip), "taskset": cpus, "perf": perf == "1",
-           "preserve_frame_pointer": perf == "1", "jvmti_agent": perf == "1", "java_opts": jopts,
+           "preserve_frame_pointer": perf == "1" and runtime == "hotspot", "jvmti_agent": perf == "1" and runtime == "hotspot",
+           "java_opts": jopts, "runtime": runtime, "ikvm_arm": ikvm or None,
            "stage": open(os.path.join(os.environ.get("SA") or os.path.join(os.environ["WJ_STATE"], "native", "sa"), "STAGE.txt")).read().splitlines()[-1]},
           open(os.path.join(out, "run.json"), "w"), indent=1)
 print(f"[mcn] verdict: {v} | window {t1 - t0:.1f}s at +{t0 - join:.0f}s after join | {skip} ticks skipped")

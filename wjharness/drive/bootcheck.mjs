@@ -13,7 +13,7 @@
 // Usage:
 //   wj bootcheck [--seed NAME] [--knob k=v ...] [--jprop k=v ...] [--timeout 260] [--tag NAME]
 //
-// --seed (lib/seeds.mjs, default MC_SEED, else mcsr) chooses the profile, the version typed into the launcher and the
+// --seed (lib/seeds.mjs, default MC_SEED, else 262n) chooses the profile, the version typed into the launcher and the
 // title line. Since the 2026-10-21 launcher nothing boots until Play is pressed, so this attaches CDP to press it;
 // marker times print relative to Play, and `firstFrame` (the loading overlay) is the first thing a player sees.
 import { launchGame, buildUrl, seedProfile, sleep, markersFor, seedFromArgs, cdpConnect, driveLauncher, launcherState, monotonic } from "../lib/mcdrive.mjs";
