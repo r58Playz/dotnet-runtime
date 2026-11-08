@@ -36,7 +36,7 @@ for (let i = 1; i <= RUNS; i++) {
   const name = `jstats-${i}`;
   const profile = join(OUT, `profile-${name}`);
   const logPath = join(OUT, `${name}.log`);
-  seedProfile(profile);
+  seedProfile(profile, { seed: "mcsr" });   // the profile its bench.jar always came from, whatever the Minecraft default is
   console.log(`=== run ${i}/${RUNS} ===`);
   const game = launchGame({ url, profile, logPath, headless: true });
   const t0 = Date.now();

@@ -2,10 +2,11 @@
 //   -- reproduce a fault in 26.2's INITIAL world generation, with the faulting worker's full stack.
 //
 // The MCSR-era drivers (worldwait/mcbench/runSession) cannot reach this: their markers are StateOutput's and their
-// menu path is 1.16.1's. This one boots mcsr/seed-262 (seedbuild.mjs from an OPFS tar of the 26.2 + Fabric pack),
-// deletes its "New World" so Singleplayer opens Create World directly, presses the app's Play button, and drives
-// Minecraft by keyboard: Tab x N + Enter (Singleplayer), then Enter (Create New World). A screenshot follows every
-// key, so a miscounted Tab is visible instead of looking like a hang.
+// menu path is 1.16.1's. This one boots a 26.2 seed, deletes its "New World" so Singleplayer opens Create World
+// directly, presses the app's Play button, and drives Minecraft by keyboard: Tab x N + Enter (Singleplayer), then Enter
+// (Create New World). A screenshot follows every key, so a miscounted Tab is visible instead of looking like a hang.
+// The default seed is 262n, the only 26.2 seed since 2026-11-08. Every run before then used the modded 262b, and the
+// Tab count has not been re-read on vanilla's title screen: check the first screenshots.
 //
 // WHY CDP ON EVERY WORKER: a worker that aborts surfaces in the stderr log as one line ("worker sent an error!"),
 // and dotnet proxies worker console.* to the page, where the stack is the page's. The faulting frames only exist
@@ -24,7 +25,7 @@ import { runDir, assertOutdir } from "../lib/paths.mjs";
 const args = process.argv.slice(2);
 const str = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
 /* a registry name (lib/seeds.mjs) or a 26.2 profile directory */
-const SEEDDEF = (() => { const d = resolveSeed(str("seed", "262b")); return { ...d, version: d.version || "26.2", fabric: d.fabric || "0.19.5" }; })();
+const SEEDDEF = (() => { const d = resolveSeed(str("seed", "262n")); return { ...d, version: d.version || "26.2", fabric: d.fabric || "0.19.5" }; })();
 const SEED = SEEDDEF.dir;
 const TIMEOUT_S = Number(str("timeout-s", 1200));
 const TITLE_TABS = Number(str("title-tabs", 1));

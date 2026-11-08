@@ -47,7 +47,7 @@ import { mkdirSync, rmSync, existsSync, readdirSync, writeFileSync, readFileSync
 import { join, resolve } from "path";
 
 const args = process.argv.slice(2);
-/* --seed NAME|DIR (lib/seeds.mjs), else MC_SEED, else mcsr */
+/* --seed NAME|DIR (lib/seeds.mjs), else MC_SEED, else 262n (DEFAULT_SEED) */
 const SEED = seedFromArgs(args);
 const has = (n) => args.includes(`--${n}`);
 const num = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? Number(args[i + 1]) : d; };
@@ -202,12 +202,20 @@ async function reattachAtInworld (name) {
     windowEdge(name);
     return;
   }
-  if (name !== "inworld" || !recPid) return;
+  if (name !== "inworld") return;
   let c = null;
   try {
     c = await cdpConnect();
     const now = await rendererPid(c);
-    if (now && now !== recPid) {
+    /* No pid at startup (2026-11-07, seed 262n: no renderer dominated within rendererPid's 60 s) used to leave the
+     * whole run unprofiled while it went on to play a full window. inworld is still before the warm-up hold, so
+     * attaching here covers the measured window; only boot is lost. */
+    if (now && !recPid) {
+      console.log(`[mcperf] no renderer pid at startup; attaching perf to ${now} at inworld (boot is not captured)`);
+      startPerf(now);
+    } else if (!now && !recPid) {
+      console.error("!! renderer pid still unresolved at inworld — this run is UNPROFILED");
+    } else if (now && now !== recPid) {
       console.log(`[mcperf] renderer moved ${recPid} -> ${now} since attach; restarting perf on the live one`);
       await stopPerf();
       /* stopPerf latches `stopping` and sets recEnd; both must be cleared or the FINAL stop becomes a
@@ -387,7 +395,7 @@ let conn = null;
 try {
   conn = await cdpConnect();
   const pid = await rendererPid(conn);
-  if (!pid) console.error("!! could not resolve the renderer pid — this run is UNPROFILED");
+  if (!pid) console.error("!! could not resolve the renderer pid at startup — retrying at inworld");
   else startPerf(pid);
 } catch (e) {
   console.error(`!! perf attach failed (${e && e.message}) — this run is UNPROFILED`);

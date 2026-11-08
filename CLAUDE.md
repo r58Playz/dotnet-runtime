@@ -2,7 +2,14 @@
 
 This is a fork of `dotnet/runtime` carrying a **runtime wasm JIT for mono** (`src/mono/mono/mini/mini-wasm.c`,
 `wasm-encoder.c`). It compiles mono IR to a fresh WebAssembly module per method, at runtime, in the browser. The
-workload is Minecraft (1.16.1 + Fabric + Sodium/Lithium, and 26.2) under IKVM, and the goal is frame rate.
+workload is Minecraft under IKVM, and the goal is frame rate.
+
+**The performance target is Minecraft 26.2 with no mods, still launched through Fabric Loader (0.19.5)** (2026-11-07):
+seed `262n` on our side, stage `sa262n` for native HotSpot, both the same save set to peaceful. Both are the harness
+defaults (since 2026-11-08; a run before then without `--seed` measured 1.16.1). Optimize for it and quote it. 26.2
+has this one seed: the modded 26.2 packs were retired (`state/retired/2026-11-08`). 1.16.1 + Fabric + Sodium/Lithium
+(`--seed mcsr`) remains a correctness and regression workload, but a result on it does not transfer: 26.2's gap to
+HotSpot is wider on every counter (**Where we stand**), and its hot code is vanilla's, not Sodium's or Lithium's.
 
 Read this before editing the backend or proposing a performance change. Most of it exists because a previous pass got
 it wrong at real cost. Round numbers (`R258`) point into the findings log, which holds the evidence and the history this
@@ -248,6 +255,110 @@ The registry and the profile keep raw pointers while IKVM creates and frees dyna
 
 ## Where we stand against other JVMs
 
+### Minecraft 26.2 with no mods (the target) against HotSpot 25
+
+Server thread per tick, Q60 window (60 s, opening ~183 s after join), both sides pinned to the P-cores, 0 skipped ticks;
+native JDK 25.0.5 n=3, ours 2bc83b4fdce with default knobs n=3; mean (range). 2026-11-06, `runs/2026-11-06-262`,
+findings note "26.2 with no mods against HotSpot 25":
+
+| M per tick | HotSpot 25 | IKVM on native CoreCLR 10 | ours | ours / HotSpot | ours / CoreCLR |
+|---|---|---|---|---|---|
+| cycles | 18.58 (18.24-19.18) | 37.00 (36.30-37.38) | 101.06 (99.63-103.25) | 5.44x | 2.73x |
+| instructions | 15.09 (14.88-15.25) | 28.31 (27.88-28.90) | 93.77 (92.86-94.35) | 6.21x | 3.31x |
+| calls | 0.106 | 0.672 | 0.620 | 5.87x | 0.92x |
+| indirect branches | 0.056 | 0.530 | 0.565 | 10.15x | 1.07x |
+| loads | 4.63 | 9.23 | 33.74 | 7.29x | 3.65x |
+| stores | 1.38 | 3.39 | 19.62 | 14.20x | 5.79x |
+| IPC | 0.81 | 0.77 | 0.93 | | |
+
+**IKVM on native CoreCLR is the CLR-hosted reference** (2026-11-08, n=3, `runs/2026-11-08-ikvmclr` k2-k4,
+`$WJ_STATE/arms/ikvm-clr10`: ikvmcraft's served IKVM DLLs on Microsoft's CoreCLR 10.0.14, `mcnative --ikvm`;
+findings note "IKVM on native CoreCLR"). It is 1.99x HotSpot in cycles and 1.88x in instructions, so of our 5.44x,
+~2x is IKVM on a CLR and ~2.7x is wasm, our JIT and mono. **It makes as many calls and indirect branches as we do**
+(6.3x and 9.5x HotSpot's): the call COUNT is IKVM's translation, which RyuJIT with tiered PGO does not inline away
+either. What it does not pay is our cost per call: ~42 instructions a call against our ~151, and a fifth of our
+stores. Read it with three caveats:
+* its IKVM links eagerly (`IKVM_LAZY_CLASS_LOADING=0`, upstream IKVM's mode). With the wasm app's switches it is 58.2 M
+  cycles (n=1): IKVM's in-place relink is mono-only, so every candidate keeps generation 1, whose lazy-link machinery
+  (dynamic binder, `DelegateShuffleThunk`, dynamic casts) runs on every call. A MonoMod relink backend (generation 1's
+  code jumps to generation 2; `$WJ_STATE/arms/ikvm-clr10-relink`, findings note "a MonoMod relink backend") takes
+  instructions 63.05 -> 39.81 (n=2 / n=3, same binary) and cycles ~-22%, still +39% instructions over classic;
+* workstation GC runs young collections on the server thread (~4.5 M cycles of its 37.0, `gc_heap` card scanning,
+  mark, relocate, and `RhpNewFast`), where HotSpot's G1 runs them on its own threads; without them it is ~1.75x;
+* two patches let it run at all and change no steady-state code: libcoreclr skips the debugger's metadata copy on every
+  type load (R517), and IKVM.Runtime tolerates a re-entrant finish after `CreateType`, which 26.2's `TimeSource`
+  triggers on CoreCLR only (the arm's README).
+
+1.16.1 on the same protocol reads 4.38x cycles and 5.16x instructions (`runs/2026-11-06-native`), with 16% of its gap in
+the idle wait between ticks; 26.2 has none (`tickServer` holds 99.6% of our thread). Reproduce with
+`runs/2026-11-06-262/batch.sh` (interleaved `hwrun` and `mcnative --warm-s <ours' offset>`, on the default seed and
+stage), read with `wj native/mccmp` and `wj native/mcinsn`; the purpose cut below is `ledger/refresh.sh` +
+`ledger.py --align`.
+
+**The 78.7 M-instruction gap.** Kind of code partitions the whole gap; each other cut covers the part it names.
+
+* **By kind of code**: our JIT'd Java against HotSpot's compiled Java is 78.95 vs 14.43 (5.47x), 82% of the gap. The
+  rest is code HotSpot has no counterpart for, 14.8 against 0.66 of stubs and libjvm: the IKVM runtime 4.04, tier
+  helpers 3.76, mono C 2.47, IKVM interface/bridge stubs 1.16, mono wrappers 0.96.
+* **By purpose (ours only: the call boundary is half of what we execute).** The gap ledger on the current build
+  (`runs/2026-11-07-262ledger`, one mapping run, 2026-11-07: 90.74 M instructions and 107.17 M cycles a tick, 3.4%
+  unmapped) puts call, frame and dispatch machinery at **47.3 M instructions (52%) and 56.9 M cycles (53%), three times
+  HotSpot's whole tick**:
+  * calls and dispatch 23.8 M instructions / 31.0 M cycles: METHOD_CALL 7.2, dispatch loads 4.8 (vtable / IMT / guard
+    loads, 15.9 M cycles), DYN_CALL 4.4, VCALL_PIC 3.5, DISPATCH 2.3;
+  * frame, entry and exit 14.6 / 20.7: FRAME (the `s.p` chain) 7.8, RETURN 2.4, EXIT 1.1, and V8's own prologue and
+    entry 2.7 instructions but 8.7 M cycles;
+  * EH records 3.0 (EH_PUSH 2.1, BB_ILOFS 0.7), safepoint polls 3.0, GC shadow-frame PIN stores 2.9.
+
+  Method bodies are 29.1 M (32%): branches 9.4 (53% of them guards mono expands around `callvirt`), heap loads 7.1
+  (73% `ldfld`; 21.5 M cycles, the largest single cycle sink), explicit null and bounds checks 4.7 (`ldfld` 1.9,
+  `callvirt` 1.1; wasm has no implicit null check), arithmetic 2.9, and 1.47 M `mfence`s at Java volatile READS
+  (`PalettedContainer.data` 0.90, `AtomicInteger.get` 0.33): the access gets a SEQ barrier, which the emitter lowers
+  to `atomic.fence` and V8 to `mfence` (`instruction-selector-x64.cc` `VisitMemoryBarrier`). They cost ~2.4 M cycles
+  (2.2%), and HotSpot emits nothing for a volatile read. Non-JIT code is 11.2 M; its largest item is IKVM's
+  `getClassFromObject`, 3.2 M (below). On 1.16.1 the same ledger read machinery 40%, bodies 34%, runtime 22%
+  (2026-11-05). Tier-1 code is 4.5% of instructions and 12.7% of cycles.
+* **By instruction class** (generated Java code, one capture a side): the computation itself is only 2.4x (+4.4 M);
+  the gap is around it. Memory is 7.6x (+26.4: loads +19.5, stores +6.8), guards and branches 6.1x (+18.9: cmp/test
+  +10.5, jcc +7.9), registers and frame 6.0x (+15.7: spill/reload +7.5, moves +6.4, push/pop +1.9), calls +0.6. Our
+  heap loads and stores include the GC shadow frame, the EH record and `s.p` (linear memory); HotSpot's frame is
+  `%rsp`-relative and counts as spills. hwrun's and mcnative's instruction event is not PEBS-precise, so a sample
+  skids onto a later instruction: in `j1a`, 0 samples land on an `mfence` and 2,610 on the instruction after one.
+  Read classes from this cut, not single instructions; use the ledger's precise events for those.
+* **By subsystem, entity ticking is the gap.** In instructions, entities are 10.71 vs 69.77 (6.5x) and chunk ticking
+  3.74 vs 19.80 (5.3x). In cycles, entities are 8.27 vs 67.24 (8.1x, 72% of the 82.5 M cycle gap) and chunk ticking
+  (random ticks, spawning) is 8.43 vs 24.07 (2.9x). Chunk ticking is memory-bound on both sides (native IPC 0.44).
+  Entity code runs at a lower IPC than HotSpot's (1.04 vs 1.30), so it costs more than its instruction count. Inside
+  it no subsystem dominates: mob AI (`GoalSelector.tick`), movement and collision (`Entity.move`, `BlockCollisions`,
+  `checkInsideBlocks`) each read 7-9x in cycles, `checkInsideBlocks` 12.6x.
+* **Block-state access is the largest single place**: `LevelChunk.getBlockState` exclusive is 17.32 vs 3.05 M
+  instructions (18% of the gap), about the tick's own ratio. Its stores are not: 27% of all ours (5.37 M a tick
+  against 0.044), in a lookup whose Java stores nothing. Its `catch Throwable` (a crash report) makes it an EH method,
+  which mono will not inline, and which pays the R353 record on every call. EH scaffolding is 2.0 of the 6.4 M a tick
+  the ledger charges to its own IL (EH_PUSH 1.58). Its live function is 29 KB of x86 with its tier-2 inlines and
+  V8's. This is 1.16.1's DataTracker.get shape, and `MONO_WASM_JIT_EH_INLINE` did not pay there.
+* **Out of line with the tick's 6.21x** is the modern-Java machinery the bytecode census predicted (excess in M
+  instructions a tick, inclusive and partly nested):
+  * `ArrayList.addAll` +1.87, `toArray` +1.48 and `Arrays.copyOf` +1.38, each 16-18x. `copyOf` asks for the array's
+    `getClass()`, and IKVM answers that through a ConditionalWeakTable lookup for every array: `getClassFromObject`
+    executes 3.2 M a tick, 3.5% of ours.
+  * `Holder$Reference.value` +1.39 (115x, a field getter).
+  * `LevelHeightAccessor.getMaxY` +1.03 (211x, an interface default method), plus IKVM's forwarding stubs on its
+    implementors, frames HotSpot does not have.
+  * `TagKey.hashCode` +0.87: an identity hash through mono's C.
+  * `EnumMap.containsKey` and `EnumMap.get`, which call `getClass()` again.
+  * `Thread.currentThread`, 0.74 as a frame of its own (R317's FAST_TLS lowering does not reach these sites).
+  * `LegacyRandomSource.next` at 60x: an AtomicLong CAS through `Unsafe` emulation.
+
+  The top 45 methods hold 72% of the gap; 375 methods carry more than 0.01 M a tick each.
+
+**26.2's bytecode has more and smaller methods** (`native/jarcensus`, against 1.16.1): 2.1x the methods, p90 80 B
+against 112, 76% at or under HotSpot's 35-byte always-inline size, more `invokeinterface` / `invokestatic` /
+`invokedynamic` per instruction, 1,754 records and 950 default methods. Each default method gets an IKVM forwarding stub
+per implementor. So the call boundary and the inliner weigh more on 26.2 than on 1.16.1.
+
+### jbox2d (the kernel)
+
 jbox2d fixed-work, one jar, every run checksum-gated, R440 protocol, Chromium 156, n=4 a row (2026-11-04, R526, R527):
 
 | | ms/step | vs JDK 25 | M cycles / M instructions a step |
@@ -281,26 +392,30 @@ there runs IKVM's generation-1 dispatch, and the number measures that, not the t
 
 ### What the gap is made of
 
-* **Minecraft's server tick is ~5x JDK 8 in both cycles and instructions** (R458: 68.7 M cycles and 52.7 M instructions
-  a tick against 13.0 and 10.4; ~47 M instructions on R527's build). Per instruction, our back end stalls like
-  HotSpot's. Our front end is 1.6-2.5x worse (icache, iTLB, BTB), and that tax follows CODE VOLUME, not placement: C1's
-  byte cut took 6-10% off it (R459), while packing the hot set into 28 modules took nothing (R463). The levers are fewer
-  executed instructions and smaller hot functions, not cheaper instructions.
-* **The kernel no longer explains the game**: jbox2d is ~2x HotSpot while the tick is ~5x. Minecraft adds machinery a
+Most of the evidence below was taken on 1.16.1 and is labelled so; re-establish a rule on 26.2 before leaning on its
+number.
+
+* **The tick's gap is executed instructions more than their cost**: 26.2 is 6.21x HotSpot 25 in instructions and 5.44x in
+  cycles, and 1.16.1 was ~5x JDK 8 in both (R458). On 1.16.1, per instruction our back end stalls like HotSpot's. Our
+  front end was 1.6-2.5x worse (icache, iTLB, BTB), and that tax follows CODE VOLUME, not placement: C1's byte cut took
+  6-10% off it (R459), while packing the hot set into 28 modules took nothing (R463). The levers are fewer executed
+  instructions and smaller hot functions, not cheaper instructions. On 26.2, entity code runs at a lower IPC than
+  HotSpot's (1.04 vs 1.30); its front end has not been measured.
+* **The kernel no longer explains the game**: jbox2d is ~2x HotSpot while the 26.2 tick is ~6x. Minecraft adds machinery a
   kernel does not exercise: IKVM's unresolved-member dispatch (the lazy-link fallback for unloadable types -- NOT
   `java.lang.invoke`, which is small), our dispatch, IC and boundary helpers, Java type checks, `Unsafe` emulation (no
-  fast path) and monitors.
-* **The bottleneck is the call boundary.** Call infrastructure was 35.7% of the server thread executed (R290: the
-  prologue band with the `s.p` chain, dynamic and constant `call_indirect`, V8 frames), plus ~12% in our helpers.
+  fast path), monitors, and on 26.2 IKVM's default-method forwarding stubs and `getClass()` on arrays.
+* **The bottleneck is the call boundary.** On 1.16.1, call infrastructure was 35.7% of the server thread executed (R290:
+  the prologue band with the `s.p` chain, dynamic and constant `call_indirect`, V8 frames), plus ~12% in our helpers.
   Guards, spills and memory traffic are downstream of call density. Judge a change by whether it removes calls, shortens
   prologues or shortens live ranges across calls (`wj callinfra`).
-* **Do not lead a plan with inlining or devirt.** On this workload HotSpot's whole inlining family is worth 2.24x and
-  its devirtualization 1.37x (R240), and a HotSpot with no inliner was still 13.6x cheaper than us. TeaVM with every
-  pass off still runs 1.71x HotSpot (passes are a third of its advantage), and its devirt and inlining are mutually
-  redundant (`call_indirect` count: 35 baseline, 791 with both off), so never measure one alone.
-* **Our per-method baseline is the codegen problem**: one method of 64 bytecode bytes is 256 B of x86 in a no-inline
-  HotSpot and was 7,936 B with 162 calls in ours (R240). The per-method gap spans 2x to 40x (R244); near-parity methods
-  exist, so the tail has findable causes.
+* **Do not lead a plan with inlining or devirt.** On 1.16.1, HotSpot's whole inlining family is worth 2.24x and its
+  devirtualization 1.37x (R240), and a HotSpot with no inliner was still 13.6x cheaper than us. TeaVM with every pass
+  off still runs 1.71x HotSpot (passes are a third of its advantage), and its devirt and inlining are mutually redundant
+  (`call_indirect` count: 35 baseline, 791 with both off), so never measure one alone.
+* **Our per-method baseline is the codegen problem**: one 1.16.1 method of 64 bytecode bytes is 256 B of x86 in a
+  no-inline HotSpot and was 7,936 B with 162 calls in ours (R240). The per-method gap spans 2x to 40x (R244);
+  near-parity methods exist, so the tail has findable causes.
 * **There is no wasm, V8 or memory-model barrier**: TeaVM is 1.33x HotSpot on this V8, in linear memory.
 * **We ARE the middle end.** V8 allocates the registers, and mono's register allocators are all excluded for
   `COMPILE_WASM`. The tier's optimization string is baked into the runtime (`wasm_jit_extra_opt`, `mini.c`, replacing
@@ -329,7 +444,8 @@ there runs IKVM's generation-1 dispatch, and the number measures that, not the t
 |---|---|
 | GC, or the GC/object model, as a lever | ~0.3% of wall. Pin stores and frame zeroing are ~3% of emitted instructions, and GC points outnumber ref defs 1.84:1, so a safepoint model roughly doubles the stores (R126, R180) |
 | WasmGC as a redesign target | slower than linear memory in TeaVM (R180) and no faster than JS in CheerpJ (R526); mono's heap, metadata and AOT half share linear-memory objects with JIT code |
-| exception handling as a cost | 0.24% self. `mono_llvm_cpp_catch_exception` on 92.5% of stacks is a wrapper frame, not an exception in flight. The real cost: the inliner refuses any method with a clause |
+| exception handling as a cost | 0.24% self. `mono_llvm_cpp_catch_exception` on 92.5% of stacks is a wrapper frame, not an exception in flight. What does cost is the R353 record every activation of an EH method pays (3.0 M a tick on 26.2, 2026-11-07). |
+| inlining methods with clauses (`MONO_WASM_JIT_EH_INLINE`) | three Q60 A/Bs on 1.16.1 (2026-11-06): +3.6% cycles at 39, +1.5% at 35, +3.5% at 423 with the hot callee (DataTracker.getEntry) admitted, calls flat. A clause-free caller that takes an EH callee becomes an EH root and pays the record itself. It pays only if a root can gain clauses without a per-activation record (E4, unbuilt) |
 | the interpreter on the hot path | `mono_interp_exec_method` 1.12x per stack; 72% of stacks hold only the thread-entry frame |
 | Liftoff / V8 tiering | 98.4% of the tier's time is TurboFan; the residue is ~1.8%, and `compilationPriority` is experimental (R370) |
 | local renaming, coalescing, `local.tee`, copy chains (`MONO_WASM_JIT_COALESCE`) | local ops are free in V8; wire size only |
@@ -358,7 +474,10 @@ Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. In the mesa-wink checkou
 --emsdk=$HOME/emsdk --test` builds it and runs its smoke suite. It reaches the app through ikvm-wasm-build's GLFW port
 (`tools/native-deps`: `build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`). GL runs on the browser's main thread
 (`?wj.WINK_GL_MAIN`, default 1): the render thread only records (Mesa's glthread), and wink executes on main. At Q60
-with Minecraft's limiter lifted that is ~170-185 fps, and the render thread (63% JIT-tier Java) is the limiter (R479).
+on 1.16.1 with Minecraft's limiter lifted that is ~170-185 fps, and the render thread (63% JIT-tier Java) is the limiter
+(R479). The 26.2 target runs vanilla's renderer (no Sodium). Its census line reads 2.0 waits a frame on main (one FenceSync
+and one ClientWaitSync, the round trips below), 0 read live, 0 GPU readbacks and 0.00 MiB of persistent mappings a
+submit (`runs/2026-11-06-262/ours/o2a`). Its frame rate and client-thread profile have not been measured.
 
 * **A GL call that returns a value or reads client memory is a round trip through main's event loop**, unless glthread
   answers or copies it. The line every 240 swaps (`wink: the GL thread waited for the main thread N times a frame ...;
@@ -441,10 +560,13 @@ that is real, and preflight's refusal for it is worth obeying.
   tick is ~91% real Java. Name the server tid explicitly (`native/servertid.py`; `buckets.py` without `--tid` picks the
   CLIENT thread). Our ticks skip, so per-tick figures divide by executed ticks: quote skipped ticks too, and compare raw
   totals when tick counts match.
-* **Use protocol Q60 for Minecraft** (`hwrun`'s defaults: `--warm-ms 160000 --bench-ms 60000 --no-walk
-  --no-save-quit`, a window ~198-258 s after join, before the ~300 s autosave). A bare in-game window measures the ramp.
-  World variance is ~+-3.5% a run: n=3 per arm (A B B A B A) for 3-6% effects, the mechanism below that. Run
-  `hwrun.sh <batch> --drain` after a batch's last arm, before reading its censuses.
+* **Use protocol Q60 for Minecraft, on the default seed `262n`** (`hwrun`'s defaults: `--warm-ms 160000 --bench-ms
+  60000 --no-walk --no-save-quit`; the window opens ~183 s after join on 262n and ~198 s on mcsr, before the ~300 s
+  autosave). A bare in-game window measures the ramp. On 1.16.1 world variance is ~+-3.5% a run; 262n's n=3 ranges were 3.6% in cycles
+  and 1.6% in instructions (2026-11-06). Use n=3 per arm (A B B A B A) for 3-6% effects, and measure the mechanism below
+  that. Run `hwrun.sh <batch> --drain` after a batch's last arm, before reading its censuses. For the native side use
+  `mcnative` (default stage `sa262n`, default `--warm-s` 183 s), not `natrun`, which plays a Prism instance whose mods
+  are not ours.
 * **Run both orders**: in one series the arm running second was slower 6 of 6. Never quote non-overlapping ranges from
   a single order.
 * **Pin every arm the same way (`MC_TASKSET`)**, and never compare batches that differ in it: chromium sizes its thread
@@ -474,8 +596,9 @@ that is real, and preflight's refusal for it is worth obeying.
   alive; obey it rather than passing `--force`.
 * **`pgrep -f` / `pkill -f` match the searcher**: three incidents, two of them killing the invoking shell. Match by
   command line, keep only the expected `comm`, never kill self, and `kill <pid>` explicitly.
-* `IKVM_DEFUSE_RANKED_AUTH=1` (the harness default) stops MCSR Ranked's account check from hanging the main screen. It
-  changes what the game does, so it goes through the URL and stays visible in each run's command line.
+* `IKVM_DEFUSE_RANKED_AUTH=1` (passed on `mcsr` only; other seeds get `=0`) stops MCSR Ranked's account check from
+  hanging the main screen. It changes what the game does, so it goes through the URL and stays visible in each run's
+  command line.
 * The native reference reads the Prism instance's own `options.txt`, which a manual session rewrites; `natrun.sh`
   refuses unless `renderDistance` is 12.
 

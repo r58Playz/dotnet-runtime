@@ -10,15 +10,16 @@
 # ikvmcraft/libraries (the copy ours runs), sha1-checked the same way. Nothing under Prism is written.
 #
 #   mcstage.sh [--tar T] [--version V] [--name N]
-#     defaults: --tar $NW_TAR --version 1.16.1-fabric-0.19.3 --name sa   (1.16.1 + MCSR Ranked, the R458 workload)
-#     26.2 no-mods: --tar $WJ_STATE/seeds/ikvmcraft-262n.tar --version 26.2-fabric-0.19.5 --name sa262n
+#     defaults: --tar $WJ_STATE/seeds/ikvmcraft-262n.tar --version 26.2-fabric-0.19.5 --name sa262n   (26.2, no mods,
+#               peaceful: seed 262n, the performance target)
+#     1.16.1 + MCSR Ranked (the R458 workload): --tar $NW_TAR --version 1.16.1-fabric-0.19.3 --name sa
 #
 # Output: cp.txt (the classpath), natives/ (LWJGL .so), template/ (the tar's minecraft/ game dir, minus Fabric's .fabric
 # cache), client.jar, lib/ (libraries Prism lacked), launch.env (main class, asset index, version, join method),
 # STAGE.txt (provenance). The old stage is replaced only when the new one is complete.
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/env.sh"
-TAR=""; VER="1.16.1-fabric-0.19.3"; NAME="sa"
+TAR="$WJ_STATE/seeds/ikvmcraft-262n.tar"; VER="26.2-fabric-0.19.5"; NAME="sa262n"
 while [ $# -gt 0 ]; do
   case "$1" in
     --tar) TAR=$2; shift ;;
@@ -28,7 +29,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ -n "$TAR" ] || TAR=$(need NW_TAR "the tar ours plays: the stage's mods, config, options and save come from it")
+[ -s "$TAR" ] || { echo "mcstage: no tar at $TAR (the tar ours plays: the stage's mods, config, options and save come from it)" >&2; exit 1; }
 PH=$(need PRISM_HOME "Prism Launcher's data dir (libraries/, assets/, meta/)")
 SA="$WJ_STATE/native/$NAME"
 NEW="$SA.new"

@@ -1103,7 +1103,7 @@ class LogTail {
  * memory twice and 2.4 GB of debris already put this box into reclaim and cost ~9% on the next reading.
  */
 export function seedProfile (dest, { seed } = {}) {
-  /* a registry name (lib/seeds.mjs), a directory, or a resolved definition; default MC_SEED, else mcsr */
+  /* a registry name (lib/seeds.mjs), a directory, or a resolved definition; default MC_SEED, else 262n (DEFAULT_SEED) */
   seed = resolveSeed(seed).dir;
   if (!existsSync(seed)) throw new Error(`no seed profile at ${seed} — a fresh profile would re-download Minecraft mid-boot`);
   rmSync(dest, { recursive: true, force: true });
@@ -2372,7 +2372,7 @@ export async function runSession ({
    * was never exercised; pass false for a run that must end exactly where the old harness ended it. */
   saveQuit = true,
   /* Which seed (lib/seeds.mjs): the launcher's version, the title/join markers, the menu path, the quit Tab count.
-   * Must be the seed the profile was copied from. Default MC_SEED, else mcsr. */
+   * Must be the seed the profile was copied from. Default MC_SEED, else 262n (DEFAULT_SEED). */
   seed = undefined,
   /* menuSteps: the key presses that take the main screen into a world; default the seed's. */
   menuSteps = null,

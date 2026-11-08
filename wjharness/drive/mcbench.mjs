@@ -31,7 +31,7 @@ import { join, resolve } from "path";
 import { defaultOut, STATE } from "../lib/paths.mjs";
 
 const args = process.argv.slice(2);
-/* --seed NAME|DIR (lib/seeds.mjs), else MC_SEED, else mcsr */
+/* --seed NAME|DIR (lib/seeds.mjs), else MC_SEED, else 262n (DEFAULT_SEED) */
 const SEED = seedFromArgs(args);
 const has = (n) => args.includes(`--${n}`);
 const num = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? Number(args[i + 1]) : d; };
