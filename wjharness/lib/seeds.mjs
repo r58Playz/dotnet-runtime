@@ -77,7 +77,7 @@ export const SEEDS = {
   /* THE DEFAULT and the performance target. 26.2 with NO mods: Fabric 0.19.5 alone (the app launches
    * <version>-fabric-<loader> only), the vanilla resource pack, vsync off, RD 12, and the user's 2026-10-21 "New World"
    * save (from the retired modded pack 262b) with its difficulty set to PEACEFUL (level.dat
-   * Data/difficulty_settings/difficulty, by scratchpad/legacy/wj/nbtedit.py). The save spawns at night, so a normal
+   * Data/difficulty_settings/difficulty, by drive/nbtedit.py). The save spawns at night, so a normal
    * difficulty would put zombies on the player and could end a walking window on the death screen. Built 2026-11-06
    * from the 2026-10-21 tar by runs/2026-11-06-262/mktar.py into state/seeds/ikvmcraft-262n.tar; mcstage builds the
    * native stage `sa262n` from the same tar (its level.dat reads peaceful too). Vanilla logs no "title screen is up"
