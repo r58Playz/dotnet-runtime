@@ -273,8 +273,12 @@ findings note "26.2 with no mods against HotSpot 25":
 
 **IKVM on native CoreCLR is the CLR-hosted reference** (2026-11-08, n=3, `runs/2026-11-08-ikvmclr` k2-k4,
 `$WJ_STATE/arms/ikvm-clr10`: ikvmcraft's served IKVM DLLs on Microsoft's CoreCLR 10.0.14, `mcnative --ikvm`;
-findings note "IKVM on native CoreCLR"). It is 1.99x HotSpot in cycles and 1.88x in instructions, so of our 5.44x,
-~2x is IKVM on a CLR and ~2.7x is wasm, our JIT and mono. **It makes as many calls and indirect branches as we do**
+findings note "IKVM on native CoreCLR"). It is 1.99x HotSpot in cycles and 1.88x in instructions. Run in OUR IKVM
+configuration (lazy class loading with in-place relinks, through a MonoMod backend: 46.67 M cycles, 39.81 M
+instructions, 2026-11-08, `$WJ_STATE/arms/ikvm-clr10-relink`), our 5.44x splits as **~2.0x IKVM on any CLR x ~1.25x
+lazy linking's residue (1.39x in instructions; still there with every relink installed) x ~2.17x wasm, mono and our
+JIT (2.36x in instructions)**. 2.17x is therefore the ceiling of backend-only work; the rest needs IKVM's output
+changed (findings note "the limit of backend work"). **It makes as many calls and indirect branches as we do**
 (6.3x and 9.5x HotSpot's): the call COUNT is IKVM's translation, which RyuJIT with tiered PGO does not inline away
 either. What it does not pay is our cost per call: ~42 instructions a call against our ~151, and a fifth of our
 stores. Read it with three caveats:
@@ -467,6 +471,7 @@ number.
 | the B4 drainer's double retire as the heap-corruption cause | refuted (R470); the writer was R489's |
 | monitors as mutex traffic | the uncontended CAS fast path exists; the ~3% is call overhead around it. An inline CAS is unbuilt, ceiling ~1.5-2% |
 | ikvmc static compilation of Minecraft | out of scope: runtime version loading and drop-in mods are requirements |
+| IKVM lazy class loading off (`IKVM_LAZY_CLASS_LOADING=0`) as a speed lever | stays ON: eager linking works only for mod sets that happen to load under IKVM's eager loading, and full mod compatibility is a requirement (2026-11-08). Its cost (x1.25 cycles on CoreCLR even with every relink; R527's erased signatures on jbox2d) is won back inside lazy mode. Measuring it off as an instrument is fine; proposing to ship it is not |
 
 ## The GL stack: mesa-wink, GL on the main thread (R477)
 
@@ -639,7 +644,9 @@ three parts with different rules:
   promoted into `wjharness/`, made portable and committed.
 * **`notes/`** holds `MINECRAFT-FINDINGS.md`, untracked.
 
-Data a round cites as `j2d/<name>`, `p<NN>` or `r<NNN>` is under `scratchpad/legacy/wj/` until deleted; the kept ones are
+Data a round cites as `j2d/<name>`, `p<NN>` or `r<NNN>` is under `scratchpad/legacy/wj/`, text only: its perf captures,
+perf maps, jitdumps, browser profiles and `*.wasm` / `*.pkl` / `*.dll` were deleted on 2026-11-08 (manifest
+`notes/LEGACY-DELETION-2026-11-08.txt`), and its logs, reports and launchers remain. The captures kept whole are
 `state/refs/j2d-<name>`.
 
 * **No tool names a machine.** Locations come from `wjharness/lib/paths.mjs`: the environment, then

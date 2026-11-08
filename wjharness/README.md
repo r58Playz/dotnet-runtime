@@ -9,7 +9,7 @@ reference arms) and reads what they produce. Code only: nothing here is output, 
 wjharness/                tracked; `wj ls` lists every tool
   wj                      entry point
   lib/                    paths (the one resolver), mcdrive (the Minecraft driver), browser, seeds, verdict, preflight, ...
-  drive/                  run a workload: worldwait bootcheck mcperf mcab mcbench hwrun abboot arm fit seedbuild wgen262 vcmp
+  drive/                  run a workload: worldwait bootcheck mcperf mcab mcbench hwrun abboot arm fit seedbuild nbtedit wgen262 vcmp
   j2d/                    jbox2d: run (the timing tool), counts, the wasm / HotSpot / CheerpJ ledgers, cheerpj/, jvmti/
   read/                   capture readers: perfraw hotinsn hwcensus callinfra memclass stabslice armcmp gc* faultcensus
   fe/                     front-end (i-cache / iTLB / BTB) readers and event set (R525)
@@ -95,6 +95,7 @@ wj deploy '<a string your change added>'                      # after build-dotn
 | `j2d/run` | **The jbox2d timing tool**: `ours`, TeaVM (`teavm tvfull tvsimple tvfull60 tvsimple60`), HotSpot (`hs8 hs21 hs25`), CheerpJ (`cj<V> cjgc<V>`), pinned to `$WJ_PCPUS`. `--schedule` + `--window-batches` for the steady-state protocol, `--no-perf` for timing, `--events A|B|C` for the ledger sets |
 | `benchstats` | jbox2d counters (`[wasm-jit ...]` stat lines). Its `mean` is the 12-batch mean and it pins only with `MC_TASKSET`: counters, not timing |
 | `seedbuild` | Build a seed from an OPFS export: `--dest $WJ_STATE/seeds/seed-X --tar /X.tar` (tar copied into the dev server's `frontend/public`, deleted after), then register it in `lib/seeds.mjs` |
+| `nbtedit` | `<level.dat in> <out>`: an NBT round trip that sets a 26.2 save's difficulty to peaceful and changes nothing else (seeds 262p, 262n) |
 | `wgen262`, `vcmp` | 26.2 world generation driver; version-compare driver with `--seed`, screenshots per key (`--probe`) |
 | `ensure-server` | Bring `$DEV_UNIT` up and wait for a real 200 (race-free against the dying process holding the port) |
 | `native/mcstage` | `[--tar T --version V --name N]` Builds a **standalone** native stage, `$WJ_STATE/native/<name>/` (default `sa262n` = 26.2 no mods from `state/seeds/ikvmcraft-262n.tar`; `sa` = 1.16.1 MCSR with `--tar $NW_TAR --version 1.16.1-fabric-0.19.3 --name sa`): the game dir, mods, config, options and save from the tar ours plays, the classpath (sha1-checked) and LWJGL natives from `$PRISM_HOME`, read-only. Nothing under Prism is written |
