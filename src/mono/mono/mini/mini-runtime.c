@@ -1678,7 +1678,16 @@ mono_resolve_patch_target_ext (MonoMemoryManager *mem_manager, MonoMethod *metho
 		guint32 rva;
 
 		mono_metadata_field_info (patch_info->data.token->image, field_index - 1, NULL, &rva, NULL);
-		target = mono_image_rva_map (patch_info->data.token->image, rva);
+		guint32 rva_size = 0;
+		if (mono_image_is_webcil_range (patch_info->data.token->image)) {
+			/* the image reads RVA data on demand (R529) and needs the length: the field type's size */
+			MonoClass *fklass = NULL;
+			MonoClassField *rfield = mono_field_from_token_checked (patch_info->data.token->image, patch_info->data.token->token, &fklass, NULL, error);
+			return_val_if_nok (error, NULL);
+			int dummy_align;
+			rva_size = (guint32)mono_type_size (rfield->type, &dummy_align);
+		}
+		target = mono_image_rva_map_sized (patch_info->data.token->image, rva, rva_size);
 		break;
 	}
 	case MONO_PATCH_INFO_R4:

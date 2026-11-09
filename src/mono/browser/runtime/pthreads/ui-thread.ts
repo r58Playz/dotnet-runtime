@@ -76,28 +76,32 @@ function monoWorkerMessageHandler (worker: PThreadWorker, wasmModule: WebAssembl
     pthreadId = message.info?.pthreadId ?? 0;
     worker.info = Object.assign({}, worker.info, message.info);
     switch (message.monoCmd) {
-        case WorkerToMainMessageType.preload:
-            {
-                const wasmMemory = runtimeHelpers.getMemory();
-                const handlers = [];
-                const knownHandlers = ["onExit", "onAbort", "print", "printErr"];
-                for (const handler of knownHandlers) {
-                    if (Object.prototype.propertyIsEnumerable.call(Module, handler)) {
-                        handlers.push(handler);
-                    }
+        case WorkerToMainMessageType.preload: {
+            const wasmMemory = runtimeHelpers.getMemory();
+            const handlers: string[] = [];
+            const knownHandlers = ["onExit", "onAbort", "print", "printErr"];
+            for (const handler of knownHandlers) {
+                if (Object.prototype.propertyIsEnumerable.call(Module, handler)) {
+                    handlers.push(handler);
                 }
-                // this one shot port from setupPreloadChannelToMainThread
-                message.port!.postMessage({
+            }
+            // this one shot port from setupPreloadChannelToMainThread. The reply waits until every assembly is registered
+            // (R529): it carries the on-demand webcil wrappers, and the worker cannot run a pthread before it arrives.
+            const port = message.port!;
+            runtimeHelpers.afterWebcilRange.promise.then(() => {
+                port.postMessage({
                     type: "pthread",
                     cmd: MainToWorkerMessageType.applyConfig,
                     config: JSON.stringify(runtimeHelpers.config),
                     monoThreadInfo: JSON.stringify(worker.info),
                     handlers,
                     wasmMemory,
-                    wasmModule
+                    wasmModule,
+                    webcilModules: (globalThis as any).__monoWebcilModules,
                 });
-            }
+            });
             break;
+        }
         case WorkerToMainMessageType.pthreadCreated:
             thread = new ThreadImpl(pthreadId, worker, message.port!);
             worker.thread = thread;

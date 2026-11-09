@@ -2072,7 +2072,7 @@ mono_method_get_header_internal (MonoMethod *method, MonoError *error)
 	if (!loc) {
 		rva = mono_metadata_decode_row_col (&img->tables [MONO_TABLE_METHOD], idx - 1, MONO_METHOD_RVA);
 
-		loc = mono_image_rva_map (img, rva);
+		loc = mono_image_rva_map_method_body (img, rva);
 	}
 
 	if (!loc) {
@@ -2125,7 +2125,7 @@ mono_method_metadata_has_header (MonoMethod *method)
 
 	if (!loc) {
 		rva = mono_metadata_decode_row_col (&img->tables [MONO_TABLE_METHOD], idx - 1, MONO_METHOD_RVA);
-		loc = mono_image_rva_map (img, rva);
+		loc = mono_image_rva_map_method_body (img, rva);
 	}
 
 	return loc != NULL;

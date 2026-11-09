@@ -839,7 +839,7 @@ get_module_event_data (
 		module_data->module_il_pdb_path = "";
 		module_data->module_il_pdb_age = 0;
 
-		if (image && image->image_info) {
+		if (image && image->image_info && !mono_image_is_webcil_range (image)) {
 			MonoPEDirEntry *debug_dir_entry = (MonoPEDirEntry *)&image->image_info->cli_header.datadir.pe_debug;
 			if (debug_dir_entry->size) {
 				ImageDebugDirectory debug_dir;

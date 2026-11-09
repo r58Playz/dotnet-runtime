@@ -64,6 +64,7 @@ export function setRuntimeGlobals (globalObjects: GlobalObjects) {
         gitHash,
         coreAssetsInMemory: createPromiseController<void>(),
         allAssetsInMemory: createPromiseController<void>(),
+        afterWebcilRange: createPromiseController<void>(),
         dotnetReady: createPromiseController<any>(),
         afterInstantiateWasm: createPromiseController<void>(),
         afterPreRun: createPromiseController<void>(),

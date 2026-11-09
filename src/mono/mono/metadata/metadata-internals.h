@@ -298,8 +298,22 @@ typedef struct {
 	 * Note that in that case MonoImage:raw_data is not equal to MonoImageStorage:raw_data
 	 */
 	int32_t webcil_section_adjustment;
+	/* Non-NULL when the webcil payload is not in raw_data but in a webcil wrapper's passive data segment, read on
+	 * demand (image.c, R529). raw_data then holds only the webcil header and section table. */
+	struct _MonoWebcilRange *webcil_range;
 #endif
 } MonoImageStorage;
+
+/* RVA mapping that also works for an image whose webcil payload is read on demand (R529): the caller states how many
+ * bytes it will read (sized) or that the RVA is a method body, whose length the header gives. */
+char *mono_image_rva_map_sized (MonoImage *image, guint32 addr, guint32 size);
+char *mono_image_rva_map_method_body (MonoImage *image, guint32 addr);
+gboolean mono_image_is_webcil_range (MonoImage *image);
+/* Registration by the host (browser driver.c) before the image opens: EAGER is the bundled data pointer it registers
+ * (the webcil header + section table, EAGER_LEN bytes); HANDLE names the wrapper module; READER copies LEN payload bytes
+ * at OFFSET to DST and returns FALSE on failure. */
+void mono_image_webcil_range_register (const char *eager, guint32 eager_len, int handle, guint32 payload_size);
+void mono_image_webcil_range_set_reader (gboolean (*reader) (int handle, void *dst, guint32 offset, guint32 len));
 
 struct _MonoImage {
 	/*

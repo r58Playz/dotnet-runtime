@@ -7,7 +7,7 @@ import cwraps from "./cwraps";
 import { wasm_load_icu_data } from "./icu";
 import { Module, browserVirtualAppBase, loaderHelpers, mono_assert, runtimeHelpers } from "./globals";
 import { mono_log_info, mono_log_debug, parseSymbolMapFile } from "./logging";
-import { mono_wasm_load_bytes_into_heap_persistent } from "./memory";
+import { getU32, mono_wasm_load_bytes_into_heap_persistent } from "./memory";
 import { endMeasure, MeasuredBlock, startMeasure } from "./profiler";
 import { AssetEntry } from "./types";
 import { VoidPtr } from "./types/emscripten";
@@ -79,6 +79,41 @@ export function instantiate_asset (asset: AssetEntry, url: string, bytes: Uint8A
     }
     endMeasure(mark, MeasuredBlock.instantiateAsset, asset.name);
     ++loaderHelpers.actual_instantiated_assets_count;
+}
+
+/*
+ * R529: an assembly whose webcil wrapper exports getWebcilRange stays out of linear memory. The wrapper is instantiated
+ * against this memory and kept as globalThis.__monoWebcilModules / __monoWebcilInstances [handle] (the main thread may
+ * not instantiate a module this size synchronously); workers get the modules in their preload reply (ui-thread.ts) and
+ * instantiate lazily (driver.c mono_wasm_webcil_range_read_js). mono registers only the webcil header and section table
+ * and reads the rest on demand. Returns false when the module is unusable, and the caller loads the file whole.
+ */
+export async function instantiate_webcil_range_asset (asset: AssetEntry, url: string, module: WebAssembly.Module): Promise<boolean> {
+    const G = globalThis as any;
+    const virtualName: string = typeof (asset.virtualPath) === "string" ? asset.virtualPath : asset.name;
+    let instance: WebAssembly.Instance;
+    try {
+        instance = await WebAssembly.instantiate(module, { webcil: { memory: (Module as any).wasmMemory } });
+    } catch (err: any) {
+        mono_log_info(`webcil range: ${virtualName} not instantiable (${err}), loading it whole`);
+        return false;
+    }
+    const sizePtr = Module._malloc(4);
+    (instance.exports.getWebcilSize as any)(sizePtr);
+    const payloadSize = getU32(sizePtr);
+    Module._free(sizePtr);
+    const modules: WebAssembly.Module[] = G.__monoWebcilModules || (G.__monoWebcilModules = []);
+    const instances: WebAssembly.Instance[] = G.__monoWebcilInstances || (G.__monoWebcilInstances = []);
+    const handle = modules.length;
+    modules.push(module);
+    instances[handle] = instance;
+    if (cwraps.mono_wasm_add_webcil_range_assembly(virtualName, handle, payloadSize) !== 0) {
+        mono_log_info(`webcil range: ${virtualName} has no webcil payload, loading it whole`);
+        return false;
+    }
+    mono_log_debug(() => `Registered ${virtualName} on demand: payload ${payloadSize} bytes in wrapper ${handle} from ${url}`);
+    ++loaderHelpers.actual_instantiated_assets_count;
+    return true;
 }
 
 export async function instantiate_symbols_asset (pendingAsset: AssetEntryInternal): Promise<void> {

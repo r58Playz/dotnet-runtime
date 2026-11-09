@@ -71,6 +71,9 @@ mono_get_pe_debug_info_full (MonoImage *image, guint8 *out_guid, gint32 *out_age
 	debug_dir_entry = (MonoPEDirEntry *) &image->image_info->cli_header.datadir.pe_debug;
 	if (!debug_dir_entry || !debug_dir_entry->size)
 		return FALSE;
+	/* the debug directory is read through raw_data, which holds only the header of an on-demand image (R529) */
+	if (mono_image_is_webcil_range (image))
+		return FALSE;
 
 	int offset = mono_cli_rva_image_map (image, debug_dir_entry->rva);
 	for (guint32 idx = 0; idx < debug_dir_entry->size / sizeof (ImageDebugDirectory); ++idx) {
