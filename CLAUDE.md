@@ -101,6 +101,11 @@ version). Line numbers drift: if something surprising turns up, re-check the tre
   whitelist is CoreLib, IKVM.Runtime, IKVM.ByteCode and System.Memory (ikvmcraft `loader/IkvmWasm.csproj`).
 * **emscripten 3.1.56 can deadlock main on its own proxying lock** (R479). FNA-WASM-Build's `emsdk.7.patch` backports
   the fix (upstream 21a3a81daf); a deploy carries it if the served wasm's `do_proxy` is 136 B, not 84.
+* **dlmalloc's memalign never reuses its own freed block for the same request** (R528): it mallocs request + alignment
+  + 12 and returns the slack, so the freed chunk is exactly the request. Every sgen block came through it (LOS objects,
+  major arenas, mono_valloc), and the holes ratcheted sbrk to ~1.1 GB over in-use under chunk loading: the 26.2 OOM.
+  `mono_valloc_aligned` now serves those alignments by malloc + slack (`MONO_WASM_VALLOC_SLACK`); keep new aligned
+  allocations on that path, and read free chunks by exact size (`runs/2026-11-08-memwalk/freesizes.js`).
 * **wasmfs's OPFS backend caches negative lookups** (R491, `emsdk.9.patch`). JS that creates OPFS entries directly must
   call `opfsInvalidate()` (ikvmcraft `frontend/src/opfs.ts`), or the game will not see them.
 * **IKVM's relink drain must never finish a type or call a Java class loader** (R514). It runs on a ThreadPool thread; a
