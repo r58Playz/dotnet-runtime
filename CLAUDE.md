@@ -114,6 +114,11 @@ version). Line numbers drift: if something surprising turns up, re-check the tre
   refuse (`[IKVM lazybody] ... drainRefused`). **Before adding work to the drain, check it cannot reach a loader or
   another type's Finish** (R515's RelinkTarget did, and hung 4 of 4 boots). R527's signature loads (`IKVM_LAZY_SIGLOAD`)
   run on the generation-1 Java thread, and never inside a `loadClass` or a class definition.
+* **A created TypeBuilder has no member builders** (R531, `MONO_SRE_RELEASE`, sre.c `ves_icall_TypeBuilder_release_builders`):
+  unless it is generic or an enum, its MethodDef, FieldDef and pseudo tokens move to the image's `resolved_tokens`, its
+  overrides to `released_overrides`, and `methods` / `ctors` / `fields` / `properties` / `events` are null from then on. New
+  code that reads those arrays after CreateType, C or managed, must go through `created` or the maps. A dynamic-token lookup
+  asks `resolved_tokens` before the token table and again after a miss.
 * **Managed stack walks ask V8** (R516, `exceptions-wasm-stackwalk.inc`, `MONO_WASM_STACKWALK_V8`). mono's LMF chain
   sees only interpreter segments and EH records, so JIT and AOT frames without clauses were invisible to StackFrame,
   getCallerClass and exception traces. A walk merges V8's CallSites with the LMF chain. It is opt-in by consumer: keep

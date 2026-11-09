@@ -668,6 +668,41 @@ namespace System.Reflection.Emit
             }
         }
 
+        // R531: a created type's member builders leave the pseudo-token dictionaries, and each pseudo token moves to the
+        // image's resolved map (release_token, sre.c) if the runtime still maps it to that builder. A builder asked for
+        // again afterwards gets a fresh pseudo token, which keeps it alive again.
+        internal void ReleasePseudoTokens(RuntimeMethodBuilder[]? methods, int num_methods, RuntimeConstructorBuilder[]? ctors,
+            RuntimeFieldBuilder[]? fields, int num_fields)
+        {
+            lock (this)
+            {
+                if (inst_tokens == null && inst_tokens_open == null)
+                    return;
+                if (methods != null)
+                    for (int i = 0; i < num_methods; i++)
+                        ReleasePseudoToken(methods[i]);
+                if (ctors != null)
+                    foreach (RuntimeConstructorBuilder cb in ctors)
+                        ReleasePseudoToken(cb);
+                if (fields != null)
+                    for (int i = 0; i < num_fields; i++)
+                        ReleasePseudoToken(fields[i]);
+            }
+        }
+
+        private void ReleasePseudoToken(MemberInfo? member)
+        {
+            if (member == null)
+                return;
+            if (inst_tokens != null && inst_tokens.Remove(member, out int token))
+                _ = release_token(member, token);
+            if (inst_tokens_open != null && inst_tokens_open.Remove(member, out int open_token))
+                _ = release_token(member, open_token);
+        }
+
+        [MethodImplAttribute(MethodImplOptions.InternalCall)]
+        private extern bool release_token(object obj, int token);
+
         internal int GetToken(MemberInfo member)
         {
             if (member is ConstructorBuilder || member is MethodBuilder || member is FieldBuilder)

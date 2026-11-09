@@ -3633,9 +3633,9 @@ mono_reflection_method_get_handle (MonoObject *method, MonoError *error)
 void
 mono_reflection_get_dynamic_overrides (MonoClass *klass, MonoMethod ***overrides, int *num_overrides, MonoError *error)
 {
+	HANDLE_FUNCTION_ENTER ();
 	MonoReflectionTypeBuilder *tb;
-	int onum;
-	MonoReflectionMethod *m;
+	int onum, k;
 
 	error_init (error);
 	*overrides = NULL;
@@ -3644,45 +3644,77 @@ mono_reflection_get_dynamic_overrides (MonoClass *klass, MonoMethod ***overrides
 	g_assert (image_is_dynamic (klass->image));
 
 	if (!mono_class_has_ref_info (klass))
-		return;
+		goto leave;
 
 	tb = mono_class_get_ref_info_raw (klass); /* FIXME use handles */
 	g_assert (is_sre_type_builder (mono_object_class (tb)));
 
+	/*
+	 * A type whose builders were released (R531, ves_icall_TypeBuilder_release_builders) has its overrides in the
+	 * image's released-overrides map, stored BEFORE its member arrays are dropped, and no entry when it had none. A NULL
+	 * array read after a miss means a release ran in between, so the map is asked again. The array is held through a
+	 * handle and walked to its length, not tb->num_methods: a release can zero the count under a reader (the slots past
+	 * num_methods are NULL, so the two walks agree).
+	 */
+	MonoDynamicImage *dimg;
+	dimg = (MonoDynamicImage *)klass->image;
+	if (mono_dynamic_image_get_released_overrides (dimg, klass, overrides, num_overrides))
+		goto leave;
+	MonoArrayHandle methods;
+	methods = MONO_HANDLE_NEW (MonoArray, tb->methods);
+	if (MONO_HANDLE_IS_NULL (methods)) {
+		mono_dynamic_image_get_released_overrides (dimg, klass, overrides, num_overrides);
+		goto leave;
+	}
+
+	int nslots;
+	nslots = (int)mono_array_handle_length (methods);
+	MonoReflectionMethodBuilderHandle mb;
+	mb = MONO_HANDLE_NEW (MonoReflectionMethodBuilder, NULL);
+	MonoArrayHandle om;
+	om = MONO_HANDLE_NEW (MonoArray, NULL);
+	MonoObjectHandle m;
+	m = MONO_HANDLE_NEW (MonoObject, NULL);
+
 	onum = 0;
-	if (tb->methods) {
-		for (gint32 i = 0; i < tb->num_methods; ++i) {
-			MonoReflectionMethodBuilder *mb =
-				mono_array_get_internal (tb->methods, MonoReflectionMethodBuilder*, i);
-			if (mb->override_methods)
-				onum += mono_array_length_internal (mb->override_methods);
-		}
+	for (gint32 i = 0; i < nslots; ++i) {
+		MONO_HANDLE_ARRAY_GETREF (mb, methods, i);
+		if (MONO_HANDLE_IS_NULL (mb))
+			continue;
+		MONO_HANDLE_GET (om, mb, override_methods);
+		if (!MONO_HANDLE_IS_NULL (om))
+			onum += (int)mono_array_handle_length (om);
 	}
 
 	if (onum) {
 		*overrides = g_new0 (MonoMethod*, onum * 2);
 
-		onum = 0;
-		for (gint32 i = 0; i < tb->num_methods; ++i) {
-			MonoReflectionMethodBuilder *mb =
-				mono_array_get_internal (tb->methods, MonoReflectionMethodBuilder*, i);
-			if (mb->override_methods) {
-				for (mono_array_size_t j = 0; j < mono_array_length_internal (mb->override_methods); ++j) {
-					m = mono_array_get_internal (mb->override_methods, MonoReflectionMethod*, j);
+		k = 0;
+		for (gint32 i = 0; i < nslots; ++i) {
+			MONO_HANDLE_ARRAY_GETREF (mb, methods, i);
+			if (MONO_HANDLE_IS_NULL (mb))
+				continue;
+			MONO_HANDLE_GET (om, mb, override_methods);
+			if (MONO_HANDLE_IS_NULL (om))
+				continue;
+			for (mono_array_size_t j = 0; j < mono_array_handle_length (om) && k < onum; ++j) {
+				MONO_HANDLE_ARRAY_GETREF (m, om, j);
 
-					(*overrides) [onum * 2] = mono_reflection_method_get_handle ((MonoObject*)m, error);
-					return_if_nok (error);
-					(*overrides) [onum * 2 + 1] = mb->mhandle;
+				(*overrides) [k * 2] = mono_reflection_method_get_handle (MONO_HANDLE_RAW (m), error);
+				goto_if_nok (error, leave);
+				(*overrides) [k * 2 + 1] = MONO_HANDLE_GETVAL (mb, mhandle);
 
-					g_assert (mb->mhandle);
+				g_assert (MONO_HANDLE_GETVAL (mb, mhandle));
 
-					onum ++;
-				}
+				k ++;
 			}
 		}
+		onum = k;
 	}
 
 	*num_overrides = onum;
+leave:
+	HANDLE_FUNCTION_RETURN ();
 }
 
 /*
@@ -4320,6 +4352,223 @@ failure:
 	mono_loader_unlock ();
 failure_unlocked:
 	return MONO_HANDLE_CAST (MonoReflectionType, NULL_HANDLE);
+}
+
+/*
+ * R531: releasing a created type's member builders.
+ *
+ * Once a non-generic TypeBuilder is created, its RuntimeMethodBuilder / RuntimeConstructorBuilder / RuntimeFieldBuilder
+ * objects (and their parameters, custom-attribute blobs and names) are needed only to resolve tokens. Three references keep
+ * them: the dynamic image's token table (a MethodDef or FieldDef token keeps its builder for the image's lifetime), the
+ * module's pseudo-token dictionaries (RuntimeModuleBuilder.inst_tokens / inst_tokens_open: every field builder, and every
+ * method builder IL calls), and the TypeBuilder's member arrays. This icall moves the builders' real tokens to the
+ * image's resolved_tokens map, as the runtime members they resolve to (dynamic-image.c), and stores the type's MethodImpl
+ * overrides for lazy vtable setup (mono_reflection_get_dynamic_overrides). On TRUE, RuntimeTypeBuilder.CreateTypeInfoCore
+ * releases the pseudo tokens (ves_icall_ModuleBuilder_release_token) and drops the member arrays. A builder something else
+ * still holds stays alive and keeps working (a token asked for again re-registers it): on 26.2 IKVM's member wrappers keep
+ * ~35% of the method builders and ~17% of the field builders (R531).
+ *
+ * Refused, leaving everything as it was: generic types and enums, a builder without its runtime member, and an override
+ * whose target would need managed code to resolve.
+ */
+enum {
+	SRE_REL_TYPES, SRE_REL_OFF, SRE_REL_NOT_CREATED, SRE_REL_GENERIC, SRE_REL_OVERRIDE, SRE_REL_NOHANDLE,
+	SRE_REL_METHOD_TOK, SRE_REL_FIELD_TOK, SRE_REL_TOK_KEPT, SRE_REL_PSEUDO_TOK, SRE_REL_PSEUDO_KEPT, SRE_REL_OVERRIDES,
+	SRE_REL_N
+};
+static gint64 sre_release_stats [SRE_REL_N];
+static int sre_release_knob = -1; /* MONO_SRE_RELEASE, default 1 */
+
+static gboolean
+sre_release_enabled (void)
+{
+	int v = sre_release_knob;
+	if (G_UNLIKELY (v < 0)) {
+		char *e = g_getenv ("MONO_SRE_RELEASE");
+		v = e ? (atoi (e) != 0) : 1;
+		g_free (e);
+		sre_release_knob = v;
+	}
+	return v != 0;
+}
+
+static void
+sre_release_note (int what, gint64 n)
+{
+	gint64 now = mono_atomic_add_i64 (&sre_release_stats [what], n);
+	if (what != SRE_REL_TYPES && what != SRE_REL_OFF)
+		return;
+	if (now != 1 && (now & 8191))
+		return;
+	gint64 *c = sre_release_stats;
+	g_printerr ("[sre-release] types released %" G_GINT64_FORMAT " (off %" G_GINT64_FORMAT "), refused: not created %" G_GINT64_FORMAT
+		" generic/enum %" G_GINT64_FORMAT " override %" G_GINT64_FORMAT " no member %" G_GINT64_FORMAT "; tokens moved: method %" G_GINT64_FORMAT
+		" field %" G_GINT64_FORMAT " pseudo %" G_GINT64_FORMAT ", kept (re-pointed) %" G_GINT64_FORMAT " + pseudo %" G_GINT64_FORMAT
+		"; with overrides %" G_GINT64_FORMAT "; resolved lookups %" G_GINT64_FORMAT "\n",
+		c [SRE_REL_TYPES], c [SRE_REL_OFF], c [SRE_REL_NOT_CREATED], c [SRE_REL_GENERIC], c [SRE_REL_OVERRIDE], c [SRE_REL_NOHANDLE],
+		c [SRE_REL_METHOD_TOK], c [SRE_REL_FIELD_TOK], c [SRE_REL_PSEUDO_TOK], c [SRE_REL_TOK_KEPT], c [SRE_REL_PSEUDO_KEPT],
+		c [SRE_REL_OVERRIDES], mono_dynamic_image_released_hits);
+}
+
+MonoBoolean
+ves_icall_TypeBuilder_release_builders (MonoReflectionTypeBuilderHandle ref_tb, MonoError *error)
+{
+	HANDLE_FUNCTION_ENTER ();
+	MonoBoolean released = FALSE;
+	MonoMethod **pairs = NULL;
+	int onum = 0, k = 0;
+
+	if (!sre_release_enabled ()) {
+		sre_release_note (SRE_REL_OFF, 1);
+		goto leave;
+	}
+
+	MonoType *type;
+	type = MONO_HANDLE_GETVAL (MONO_HANDLE_CAST (MonoReflectionType, ref_tb), type);
+	MonoClass *klass;
+	klass = type ? mono_class_from_mono_type_internal (type) : NULL;
+	if (!klass || !klass->wastypebuilder || mono_class_has_failure (klass)) {
+		sre_release_note (SRE_REL_NOT_CREATED, 1);
+		goto leave;
+	}
+	if (klass->enumtype || mono_class_is_gtd (klass) || mono_class_is_ginst (klass) || MONO_HANDLE_GETVAL (ref_tb, generic_container) ||
+	    !MONO_HANDLE_IS_NULL (MONO_HANDLE_NEW_GET (MonoArray, ref_tb, generic_params))) {
+		sre_release_note (SRE_REL_GENERIC, 1);
+		goto leave;
+	}
+
+	MonoReflectionModuleBuilderHandle module;
+	module = MONO_HANDLE_NEW_GET (MonoReflectionModuleBuilder, ref_tb, module);
+	MonoDynamicImage *dimg;
+	dimg = MONO_HANDLE_GETVAL (module, dynamic_image);
+	MonoArrayHandle methods, ctors, fields;
+	methods = MONO_HANDLE_NEW_GET (MonoArray, ref_tb, methods);
+	ctors = MONO_HANDLE_NEW_GET (MonoArray, ref_tb, ctors);
+	fields = MONO_HANDLE_NEW_GET (MonoArray, ref_tb, fields);
+	int nmethods, nctors, nfields;
+	nmethods = MONO_HANDLE_IS_NULL (methods) ? 0 : MIN (MONO_HANDLE_GETVAL (ref_tb, num_methods), (int)mono_array_handle_length (methods));
+	nctors = MONO_HANDLE_IS_NULL (ctors) ? 0 : (int)mono_array_handle_length (ctors);
+	nfields = MONO_HANDLE_IS_NULL (fields) ? 0 : MIN (MONO_HANDLE_GETVAL (ref_tb, num_fields), (int)mono_array_handle_length (fields));
+	MonoObjectHandle elem;
+	elem = MONO_HANDLE_NEW (MonoObject, NULL);
+
+	/* Validate before changing anything. These loops allocate nothing managed and take no lock, so the raw reads of
+	 * each element are stable between its GETREF and its last use. */
+	for (int i = 0; i < nmethods; ++i) {
+		MONO_HANDLE_ARRAY_GETREF (elem, methods, i);
+		if (MONO_HANDLE_IS_NULL (elem))
+			continue;
+		MonoReflectionMethodBuilder *mb = (MonoReflectionMethodBuilder *)MONO_HANDLE_RAW (elem);
+		if (!mb->mhandle) {
+			sre_release_note (SRE_REL_NOHANDLE, 1);
+			goto leave;
+		}
+		if (mb->override_methods)
+			onum += (int)mono_array_length_internal (mb->override_methods);
+	}
+	for (int i = 0; i < nctors; ++i) {
+		MONO_HANDLE_ARRAY_GETREF (elem, ctors, i);
+		if (!MONO_HANDLE_IS_NULL (elem) && !((MonoReflectionCtorBuilder *)MONO_HANDLE_RAW (elem))->mhandle) {
+			sre_release_note (SRE_REL_NOHANDLE, 1);
+			goto leave;
+		}
+	}
+	for (int i = 0; i < nfields; ++i) {
+		MONO_HANDLE_ARRAY_GETREF (elem, fields, i);
+		if (!MONO_HANDLE_IS_NULL (elem) && !((MonoReflectionFieldBuilder *)MONO_HANDLE_RAW (elem))->handle) {
+			sre_release_note (SRE_REL_NOHANDLE, 1);
+			goto leave;
+		}
+	}
+
+	/* The overrides as mono_reflection_get_dynamic_overrides pairs them: (overridden, overrider). Only targets that
+	 * resolve without managed code: a RuntimeMethodInfo, or a method builder that has its MonoMethod. */
+	if (onum) {
+		pairs = g_new0 (MonoMethod *, onum * 2);
+		for (int i = 0; i < nmethods; ++i) {
+			MONO_HANDLE_ARRAY_GETREF (elem, methods, i);
+			if (MONO_HANDLE_IS_NULL (elem))
+				continue;
+			MonoReflectionMethodBuilder *mb = (MonoReflectionMethodBuilder *)MONO_HANDLE_RAW (elem);
+			if (!mb->override_methods)
+				continue;
+			for (mono_array_size_t j = 0; j < mono_array_length_internal (mb->override_methods) && k < onum; ++j) {
+				MonoObject *om = mono_array_get_internal (mb->override_methods, MonoObject *, j);
+				MonoClass *omk = om ? mono_object_class (om) : NULL;
+				MonoMethod *target = NULL;
+				if (omk && is_sr_mono_method (omk))
+					target = ((MonoReflectionMethod *)om)->method;
+				else if (omk && mono_is_sre_method_builder (omk))
+					target = ((MonoReflectionMethodBuilder *)om)->mhandle;
+				if (!target) {
+					sre_release_note (SRE_REL_OVERRIDE, 1);
+					goto leave;
+				}
+				pairs [k * 2] = target;
+				pairs [k * 2 + 1] = mb->mhandle;
+				k++;
+			}
+		}
+		/* stored before the arrays go: see mono_reflection_get_dynamic_overrides */
+		mono_dynamic_image_set_released_overrides (dimg, klass, k, pairs);
+		pairs = NULL;
+		sre_release_note (SRE_REL_OVERRIDES, 1);
+	}
+
+	/* The real tokens. Each moves only if the table still maps it to this builder. */
+	for (int i = 0; i < nmethods; ++i) {
+		MONO_HANDLE_ARRAY_GETREF (elem, methods, i);
+		if (MONO_HANDLE_IS_NULL (elem))
+			continue;
+		MonoReflectionMethodBuilder *mb = (MonoReflectionMethodBuilder *)MONO_HANDLE_RAW (elem);
+		guint32 tok = MONO_TOKEN_METHOD_DEF | mb->table_idx;
+		MonoMethod *member = mb->mhandle;
+		sre_release_note (mono_dynamic_image_release_token (dimg, tok, elem, member, FALSE) ? SRE_REL_METHOD_TOK : SRE_REL_TOK_KEPT, 1);
+	}
+	for (int i = 0; i < nctors; ++i) {
+		MONO_HANDLE_ARRAY_GETREF (elem, ctors, i);
+		if (MONO_HANDLE_IS_NULL (elem))
+			continue;
+		MonoReflectionCtorBuilder *cb = (MonoReflectionCtorBuilder *)MONO_HANDLE_RAW (elem);
+		guint32 tok = MONO_TOKEN_METHOD_DEF | cb->table_idx;
+		MonoMethod *member = cb->mhandle;
+		sre_release_note (mono_dynamic_image_release_token (dimg, tok, elem, member, FALSE) ? SRE_REL_METHOD_TOK : SRE_REL_TOK_KEPT, 1);
+	}
+	/* a field's FieldDef token is typebuilder_setup_one_field's: first_idx + i, and the class keeps first_idx - 1 */
+	for (int i = 0; i < nfields; ++i) {
+		MONO_HANDLE_ARRAY_GETREF (elem, fields, i);
+		if (MONO_HANDLE_IS_NULL (elem))
+			continue;
+		MonoClassField *member = ((MonoReflectionFieldBuilder *)MONO_HANDLE_RAW (elem))->handle;
+		guint32 tok = mono_metadata_make_token (MONO_TABLE_FIELD, mono_class_get_first_field_idx (klass) + 1 + i);
+		sre_release_note (mono_dynamic_image_release_token (dimg, tok, elem, member, TRUE) ? SRE_REL_FIELD_TOK : SRE_REL_TOK_KEPT, 1);
+	}
+
+	released = TRUE;
+	sre_release_note (SRE_REL_TYPES, 1);
+leave:
+	g_free (pairs);
+	HANDLE_FUNCTION_RETURN_VAL (released);
+}
+
+/* A pseudo token's turn (RuntimeModuleBuilder.ReleasePseudoTokens): moved like a real one, if it still maps to builder. */
+MonoBoolean
+ves_icall_ModuleBuilder_release_token (MonoReflectionModuleBuilderHandle mb, MonoObjectHandle builder, guint32 token, MonoError *error)
+{
+	MonoClass *k = mono_handle_class (builder);
+	gpointer member = NULL;
+	gboolean is_field = FALSE;
+	if (mono_is_sre_method_builder (k))
+		member = MONO_HANDLE_GETVAL (MONO_HANDLE_CAST (MonoReflectionMethodBuilder, builder), mhandle);
+	else if (mono_is_sre_ctor_builder (k))
+		member = MONO_HANDLE_GETVAL (MONO_HANDLE_CAST (MonoReflectionCtorBuilder, builder), mhandle);
+	else if (mono_is_sre_field_builder (k)) {
+		member = MONO_HANDLE_GETVAL (MONO_HANDLE_CAST (MonoReflectionFieldBuilder, builder), handle);
+		is_field = TRUE;
+	}
+	gboolean moved = member && mono_dynamic_image_release_token (MONO_HANDLE_GETVAL (mb, dynamic_image), token, builder, member, is_field);
+	sre_release_note (moved ? SRE_REL_PSEUDO_TOK : SRE_REL_PSEUDO_KEPT, 1);
+	return moved;
 }
 
 typedef struct {

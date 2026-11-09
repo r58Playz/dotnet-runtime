@@ -39,6 +39,21 @@ mono_dynamic_image_register_token (MonoDynamicImage *assembly, guint32 token, Mo
 gboolean
 mono_dynamic_image_is_valid_token (MonoDynamicImage *image, guint32 token);
 
+/* R531: releasing a created type's builders (sre.c ves_icall_TypeBuilder_release_builders). */
+extern gint64 mono_dynamic_image_released_hits; /* token lookups answered from resolved_tokens */
+
+gboolean
+mono_dynamic_image_release_token (MonoDynamicImage *image, guint32 token, MonoObjectHandle builder, gpointer member, gboolean is_field);
+
+gboolean
+mono_dynamic_image_lookup_resolved_token (MonoDynamicImage *image, guint32 token, gpointer *member, gboolean *is_field);
+
+void
+mono_dynamic_image_set_released_overrides (MonoDynamicImage *image, MonoClass *klass, int onum, MonoMethod **pairs);
+
+gboolean
+mono_dynamic_image_get_released_overrides (MonoDynamicImage *image, MonoClass *klass, MonoMethod ***pairs, int *onum);
+
 MonoObjectHandle
 mono_dynamic_image_get_registered_token (MonoDynamicImage *dynimage, guint32 token, MonoError *error);
 

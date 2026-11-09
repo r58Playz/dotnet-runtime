@@ -593,6 +593,12 @@ struct _MonoDynamicImage {
 	GHashTable *typeref;
 	GHashTable *handleref;
 	MonoGHashTable *tokens;
+	/* R531: the member tokens of created types, moved out of `tokens` so their builders can be collected:
+	 * token -> MonoMethod*, or MonoClassField* with the low bit set. Under the image lock. */
+	dn_simdhash_u32_ptr_t *resolved_tokens;
+	/* R531: a released type's explicit overrides (MonoClass* -> MonoDynReleasedOverrides*), which lazy vtable
+	 * construction reads once the TypeBuilder's methods array is gone (mono_reflection_get_dynamic_overrides). */
+	GHashTable *released_overrides;
 	GHashTable *blob_cache;
 	GHashTable *standalonesig_cache;
 	GList *array_methods;

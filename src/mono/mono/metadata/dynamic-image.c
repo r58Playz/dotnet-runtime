@@ -209,6 +209,84 @@ mono_dynamic_image_register_token (MonoDynamicImage *assembly, guint32 token, Mo
 }
 #endif
 
+typedef struct {
+	int onum;
+	MonoMethod **pairs;	/* [2 * onum]: (overridden, overrider), as mono_reflection_get_dynamic_overrides returns them */
+} MonoDynReleasedOverrides;
+
+/*
+ * R531: when a TypeBuilder is created, sre.c moves the tokens its method, constructor and field builders registered
+ * into resolved_tokens, as the runtime members they resolve to, and drops the TypeBuilder's member arrays: with those
+ * two references gone (and none from IKVM), a builder is collectable. Token lookups consult resolved_tokens first.
+ * Only a token whose table entry IS the builder moves, so an entry something re-pointed since is left alone.
+ */
+gboolean
+mono_dynamic_image_release_token (MonoDynamicImage *assembly, guint32 token, MonoObjectHandle builder, gpointer member, gboolean is_field)
+{
+	MONO_REQ_GC_UNSAFE_MODE;
+	gboolean moved = FALSE;
+	g_assert (member && !((gsize)member & 1));
+	dynamic_image_lock (assembly);
+	/* the builder is read through its handle only after the lock: waiting for it is GC-safe, so a GC may move it */
+	if ((MonoObject *)mono_g_hash_table_lookup (assembly->tokens, GUINT_TO_POINTER (token)) == MONO_HANDLE_RAW (builder)) {
+		gpointer v = (gpointer)((gsize)member | (is_field ? 1 : 0));
+		if (!assembly->resolved_tokens)
+			assembly->resolved_tokens = dn_simdhash_u32_ptr_new (0, NULL);
+		if (dn_simdhash_u32_ptr_try_add (assembly->resolved_tokens, token, v) != DN_SIMDHASH_ADD_INSERTED)
+			dn_simdhash_u32_ptr_try_replace_value (assembly->resolved_tokens, token, v);
+		mono_g_hash_table_remove (assembly->tokens, GUINT_TO_POINTER (token));
+		moved = TRUE;
+	}
+	dynamic_image_unlock (assembly);
+	return moved;
+}
+
+gboolean
+mono_dynamic_image_lookup_resolved_token (MonoDynamicImage *assembly, guint32 token, gpointer *member, gboolean *is_field)
+{
+	gpointer v = NULL;
+	if (!assembly->resolved_tokens)
+		return FALSE;
+	dynamic_image_lock (assembly);
+	if (assembly->resolved_tokens && !dn_simdhash_u32_ptr_try_get_value (assembly->resolved_tokens, token, &v))
+		v = NULL;
+	dynamic_image_unlock (assembly);
+	if (!v)
+		return FALSE;
+	*member = (gpointer)((gsize)v & ~(gsize)1);
+	*is_field = ((gsize)v & 1) != 0;
+	return TRUE;
+}
+
+void
+mono_dynamic_image_set_released_overrides (MonoDynamicImage *assembly, MonoClass *klass, int onum, MonoMethod **pairs)
+{
+	MonoDynReleasedOverrides *o = g_new0 (MonoDynReleasedOverrides, 1);
+	o->onum = onum;
+	o->pairs = pairs;
+	dynamic_image_lock (assembly);
+	if (!assembly->released_overrides)
+		assembly->released_overrides = g_hash_table_new (NULL, NULL);
+	g_hash_table_insert (assembly->released_overrides, klass, o);
+	dynamic_image_unlock (assembly);
+}
+
+/* A copy (the caller frees it, as it frees mono_reflection_get_dynamic_overrides' array); FALSE when none. */
+gboolean
+mono_dynamic_image_get_released_overrides (MonoDynamicImage *assembly, MonoClass *klass, MonoMethod ***pairs, int *onum)
+{
+	MonoDynReleasedOverrides *o = NULL;
+	dynamic_image_lock (assembly);
+	if (assembly->released_overrides)
+		o = (MonoDynReleasedOverrides *)g_hash_table_lookup (assembly->released_overrides, klass);
+	if (o) {
+		*onum = o->onum;
+		*pairs = (MonoMethod **)g_memdup (o->pairs, (guint)(sizeof (MonoMethod *) * 2 * o->onum));
+	}
+	dynamic_image_unlock (assembly);
+	return o != NULL;
+}
+
 static gboolean
 lookup_dyn_token (MonoDynamicImage *assembly, guint32 token, MonoObjectHandle *object_handle)
 {
@@ -231,7 +309,15 @@ MonoObjectHandle
 mono_dynamic_image_get_registered_token (MonoDynamicImage *dynimage, guint32 token, MonoError *error)
 {
 	MonoObjectHandle obj;
+	gpointer member;
+	gboolean is_field;
 	lookup_dyn_token (dynimage, token, &obj);
+	if (MONO_HANDLE_IS_NULL (obj) && mono_dynamic_image_lookup_resolved_token (dynimage, token, &member, &is_field)) {
+		/* a released builder's token (R531): the runtime member's reflection object, made on demand */
+		if (is_field)
+			return MONO_HANDLE_CAST (MonoObject, mono_field_get_object_handle (m_field_get_parent ((MonoClassField *)member), (MonoClassField *)member, error));
+		return MONO_HANDLE_CAST (MonoObject, mono_method_get_object_handle ((MonoMethod *)member, NULL, error));
+	}
 	return obj;
 }
 #else /* DISABLE_REFLECTION_EMIT */
@@ -253,7 +339,9 @@ mono_dynamic_image_get_registered_token (MonoDynamicImage *dynimage, guint32 tok
 gboolean
 mono_dynamic_image_is_valid_token (MonoDynamicImage *image, guint32 token)
 {
-	return lookup_dyn_token (image, token, NULL);
+	gpointer member;
+	gboolean is_field;
+	return lookup_dyn_token (image, token, NULL) || mono_dynamic_image_lookup_resolved_token (image, token, &member, &is_field);
 }
 
 #ifndef DISABLE_REFLECTION_EMIT
@@ -261,6 +349,28 @@ mono_dynamic_image_is_valid_token (MonoDynamicImage *image, guint32 token)
 #endif /* DISABLE_REFLECTION_EMIT */
 
 #ifndef DISABLE_REFLECTION_EMIT
+/* A released builder's token (R531), resolved as its runtime member is (sre.c's RuntimeMethodInfo / RuntimeFieldInfo
+ * branches of mono_reflection_resolve_object). Only non-generic types are released, so a field needs no inflation. */
+gint64 mono_dynamic_image_released_hits;
+
+static gboolean
+resolve_released_token (MonoDynamicImage *assembly, guint32 token, MonoClass **handle_class, MonoGenericContext *context, gpointer *result, MonoError *error)
+{
+	gpointer member;
+	gboolean is_field;
+	if (!mono_dynamic_image_lookup_resolved_token (assembly, token, &member, &is_field))
+		return FALSE;
+	mono_atomic_inc_i64 (&mono_dynamic_image_released_hits);
+	if (is_field) {
+		*handle_class = mono_defaults.fieldhandle_class;
+		*result = member;
+		return TRUE;
+	}
+	*handle_class = mono_defaults.methodhandle_class;
+	*result = context ? mono_class_inflate_generic_method_checked ((MonoMethod *)member, context, error) : member;
+	return TRUE;
+}
+
 /**
  * mono_reflection_lookup_dynamic_token:
  *
@@ -274,34 +384,40 @@ mono_dynamic_image_is_valid_token (MonoDynamicImage *image, guint32 token)
 gpointer
 mono_reflection_lookup_dynamic_token (MonoImage *image, guint32 token, gboolean valid_token, MonoClass **handle_class, MonoGenericContext *context, MonoError *error)
 {
-	HANDLE_FUNCTION_ENTER ();
-
 	MonoDynamicImage *assembly = (MonoDynamicImage*)image;
-	MonoObjectHandle obj;
 	MonoClass *klass;
+	gpointer released;
 
 	error_init (error);
+	if (!handle_class)
+		handle_class = &klass;
+	if (resolve_released_token (assembly, token, handle_class, context, &released, error))
+		return released;
+
+	HANDLE_FUNCTION_ENTER ();
+
+	MonoObjectHandle obj;
+	gpointer result = NULL;
 
 	lookup_dyn_token (assembly, token, &obj);
-	if (MONO_HANDLE_IS_NULL (obj)) {
+	if (MONO_HANDLE_IS_NULL (obj) && resolve_released_token (assembly, token, handle_class, context, &released, error)) {
+		/* released between the two lookups: a release moves a token under the image lock, so released -> table ->
+		 * released cannot miss it */
+		result = released;
+	} else if (MONO_HANDLE_IS_NULL (obj)) {
 		g_warning ("[dyn-token] NOT FOUND token=0x%08x image=%s valid_token=%d",
 			token, image ? image->name : "<null>", valid_token);
 		if (valid_token)
 			g_error ("Could not find required dynamic token 0x%08x", token);
-		else {
-			mono_error_set_execution_engine (error, "Could not find dynamic token 0x%08x", token);
-			return NULL;
+		mono_error_set_execution_engine (error, "Could not find dynamic token 0x%08x", token);
+	} else {
+		result = mono_reflection_resolve_object_handle (image, obj, handle_class, context, error);
+		if (!result) {
+			MonoObject *_o = MONO_HANDLE_RAW (obj);
+			const char *_oklass = (_o && _o->vtable && _o->vtable->klass) ? m_class_get_name (_o->vtable->klass) : "<null>";
+			g_warning ("[dyn-token] RESOLVE returned NULL token=0x%08x image=%s obj.class=%s error_ok=%d",
+				token, image ? image->name : "<null>", _oklass, is_ok (error) ? 1 : 0);
 		}
-	}
-
-	if (!handle_class)
-		handle_class = &klass;
-	gpointer const result = mono_reflection_resolve_object_handle (image, obj, handle_class, context, error);
-	if (!result) {
-		MonoObject *_o = MONO_HANDLE_RAW (obj);
-		const char *_oklass = (_o && _o->vtable && _o->vtable->klass) ? m_class_get_name (_o->vtable->klass) : "<null>";
-		g_warning ("[dyn-token] RESOLVE returned NULL token=0x%08x image=%s obj.class=%s error_ok=%d",
-			token, image ? image->name : "<null>", _oklass, is_ok (error) ? 1 : 0);
 	}
 	HANDLE_FUNCTION_RETURN_VAL (result);
 }
@@ -536,6 +652,18 @@ mono_dynamic_image_free (MonoDynamicImage *image)
 		g_hash_table_destroy (di->handleref);
 	if (di->tokens)
 		mono_g_hash_table_destroy (di->tokens);
+	if (di->resolved_tokens)
+		dn_simdhash_free (di->resolved_tokens);
+	if (di->released_overrides) {
+		GHashTableIter it;
+		gpointer k, v;
+		g_hash_table_iter_init (&it, di->released_overrides);
+		while (g_hash_table_iter_next (&it, &k, &v)) {
+			g_free (((MonoDynReleasedOverrides *)v)->pairs);
+			g_free (v);
+		}
+		g_hash_table_destroy (di->released_overrides);
+	}
 	if (di->generic_def_objects)
 		mono_g_hash_table_destroy (di->generic_def_objects);
 	if (di->blob_cache) {
