@@ -117,6 +117,9 @@ namespace System.Reflection.Emit
         // under it that takes another, so it cannot order against IKVM's or resolveLock.
         private readonly object memberLock = new object();
         private static int memberLockContended;
+        // Set once CreateTypeInfoCore has dropped the member builders (release_builders, R531): the member arrays are null
+        // from then on and member queries answer from `created`.
+        private bool membersReleased;
 
         // Counts appends that find another thread inside memberLock -- the race the lock closes -- and names the first
         // few: a guard whose catches are never counted cannot be told apart from a race that never happens.
@@ -716,6 +719,15 @@ namespace System.Reflection.Emit
         [MethodImplAttribute(MethodImplOptions.InternalCall)]
         private extern TypeInfo create_runtime_class();
 
+        // R531 (sre.c): moves the created type's builder tokens to the image's resolved map and captures its overrides.
+        // TRUE = the member arrays may be dropped. FALSE (MONO_SRE_RELEASE=0, a generic type or enum, an override that
+        // needs managed code to resolve) = nothing changed.
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2110:ReflectionToDynamicallyAccessedMembers",
+            Justification = "For instance member internal calls, the linker preserves all fields of the declaring type. " +
+            "The icall reads only the member arrays and the module; it touches neither parent nor created.")]
+        [MethodImplAttribute(MethodImplOptions.InternalCall)]
+        private extern bool release_builders();
+
         private bool is_nested_in(Type? t)
         {
             while (t != null)
@@ -893,6 +905,24 @@ namespace System.Reflection.Emit
                 if (ctors != null)
                     foreach (RuntimeConstructorBuilder ctor in ctors)
                         ctor.release_ilgen();
+            }
+
+            // Then the builders themselves (R531): with their tokens resolving without them, the pseudo-token dictionaries
+            // and these arrays are the last references mono holds. A builder IKVM still holds stays alive and usable.
+            if (created != null && !is_hidden_global_type && release_builders())
+            {
+                ((RuntimeModuleBuilder)Module).ReleasePseudoTokens(methods, num_methods, ctors, fields, num_fields);
+                lock (memberLock)
+                {
+                    membersReleased = true;
+                    methods = null;
+                    num_methods = 0;
+                    ctors = null;
+                    fields = null;
+                    num_fields = 0;
+                    properties = null;
+                    events = null;
+                }
             }
 
             if (is_hidden_global_type)
@@ -1259,6 +1289,9 @@ namespace System.Reflection.Emit
         {
             check_created();
 
+            // the builders are gone (R531): answer as CoreCLR's TypeBuilder always does, from the baked type
+            if (membersReleased)
+                return created!.GetMethods(bindingAttr);
             return GetMethodsByName(null, bindingAttr, false);
         }
 
