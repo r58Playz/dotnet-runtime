@@ -3494,7 +3494,50 @@ typedef struct {
 	guint8 body_current;     /* the stored body was compiled from the IL in force: a re-frame may clear `hooked` */
 	gint32 hook_bank;        /* lazy bank index + 1, framed over `f` alone; made at the first hook, reused by every one */
 	guint32 hook_payload;    /* W1 C0 id of the stub at `f` for the hook in force */
+	gint16 body_nparams_p1;  /* R531: the stored body's nparams + 1 (0: never had one); admission reads it after the body is retired */
 } WjRegEntry;
+
+/* R531: bodies retired because nothing can frame them again (an orphaned descriptor, a hooked one's stale IL) */
+gint32 mono_wasm_jit_bodies_dropped;
+gint64 mono_wasm_jit_bodies_dropped_bytes;
+static int wj_body_nparams (struct _WjBody *b);
+static int wj_body_bytes (struct _WjBody *b);
+
+/* An entry's stored body, read ONCE. Readers outside the compile section (admission, the stats dump's B4 dry run) must
+ * not read re->body twice: a re-emission swaps it and a retirement (wj_entry_drop_body) nulls it under them. */
+static inline struct _WjBody *
+wj_entry_body (WjRegEntry *re)
+{
+	return re ? (struct _WjBody *) mono_atomic_load_ptr ((volatile gpointer *) &re->body) : NULL;
+}
+
+/* A dependency's parameter count, which admission compares with the installed occupant of its slot: from the stored
+ * body, or from the entry once the body has been retired. -1: unknown. */
+static int
+wj_entry_nparams (WjRegEntry *re)
+{
+	struct _WjBody *b = wj_entry_body (re);
+	if (b)
+		return wj_body_nparams (b);
+	return re ? (int) re->body_nparams_p1 - 1 : -1;
+}
+
+/* Retire an entry's relocatable body when nothing can frame it again: an orphaned descriptor (its f-slot has a new
+ * owner, so no group, merge or co-location takes it) or a hooked one whose body was compiled from IL no longer in force
+ * (every framing path requires body_current, and the mandatory re-emission brings a new body). Retired, not freed: B4
+ * and admission read bodies without the compile lock. The parameter count stays on the entry (wj_entry_nparams). */
+static void
+wj_entry_drop_body (WjRegEntry *re)
+{
+	struct _WjBody *old = re->body;
+	if (!old)
+		return;
+	re->body = NULL;
+	mono_memory_barrier ();
+	mono_atomic_inc_i32 (&mono_wasm_jit_bodies_dropped);
+	mono_atomic_fetch_add_i64 (&mono_wasm_jit_bodies_dropped_bytes, wj_body_bytes (old));
+	wj_retire_payload (old, WJ_RETIRED_BODY);
+}
 
 #ifdef HOST_BROWSER
 static gboolean wj_hook_restub_local (WjRegEntry *re);   /* mini-wasm-lazy.inc */
@@ -3558,6 +3601,26 @@ wj_reg_at (int i)
 {
 	WjRegEntry *chunk = wj_reg_chunks [i / WJ_REG_CHUNK];
 	return chunk ? &chunk [i % WJ_REG_CHUNK] : NULL;
+}
+
+/* The stored bodies now, for the stats dump's [wasm-jit bodies] line. */
+void mono_wasm_jit_bodies_census (gint64 *n, gint64 *bytes);
+void
+mono_wasm_jit_bodies_census (gint64 *n, gint64 *bytes)
+{
+	gint64 nb = 0, bb = 0;
+	int i, nreg = wj_reg_n;
+	wj_reg_read_enter ();
+	for (i = 0; i < nreg; ++i) {
+		struct _WjBody *rb = wj_entry_body (wj_reg_at (i));
+		if (rb) {
+			nb++;
+			bb += wj_body_bytes (rb);
+		}
+	}
+	wj_reg_read_leave ();
+	*n = nb;
+	*bytes = bb;
 }
 
 /* R358 (MONO_WASM_JIT_T2_UNIT census): the registered wire length of descriptor `desc` (1-based), 0 if none. */
@@ -3767,6 +3830,7 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			if (old_re && old_desc != (int) (n + 1)) {
 				old_re->orphaned = 1;
 				mono_memory_barrier ();
+				wj_entry_drop_body (old_re);   /* R531: an orphan is never framed again */
 				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 				mono_wasm_jit_counters [WJC_FSLOT_ORPHANED]++;
 				{ /* B4 leaf copies (R452): a private copy of the old owner must stop standing in for this slot */
@@ -4908,11 +4972,11 @@ wj_deps_arity_bad (WjRegEntry *re)
 		int dep_id = wj_desc_for_fslot (ds->slot [i]);
 		WjRegEntry *dep = dep_id ? wj_reg_at (dep_id - 1) : NULL;
 		int len = -1, ok, want;
-		if (!dep || !dep->body)
+		want = wj_entry_nparams (dep);   /* -1 (no entry, or never a body) skips without probing, as a NULL body did before R531 */
+		if (want < 0)
 			continue;
 		ok = mono_wasm_jit_eslot_probe (ds->slot [i], &len);
-		want = wj_body_nparams (dep->body);
-		if (ok && want >= 0 && len != want)
+		if (ok && len != want)
 			return TRUE;
 	}
 	return FALSE;
@@ -5003,7 +5067,7 @@ wj_sweep_published (void)
 						 * (mono_jiterp_placeholder_jit_call). */
 						int probe_len = -1;
 						int probe_ok = mono_wasm_jit_eslot_probe (ds->slot [i], &probe_len);
-						int want_ar = (dep && dep->body) ? wj_body_nparams (dep->body) : -1;
+						int want_ar = dep ? wj_entry_nparams (dep) : -1;
 						printf ("   dep[%d] slot=%d desc=%d live=%d inst=%d probe=%d arity=%d want_ar=%d want_sig=%u have_sig=%u dep_gen=%u dep_state=%d%s\n",
 							i, ds->slot [i], dep_id, mono_wasm_jit_slot_live (ds->slot [i]),
 							wj_slot_is_installed (ds->slot [i]), probe_ok, probe_len, want_ar,
@@ -5574,7 +5638,7 @@ wj_admit_impl (int desc_id)
 			for (di = 0; vds && di < vds->n; ++di) {
 				int dd = wj_desc_for_fslot (vds->slot [di]);
 				WjRegEntry *dre = dd > 0 ? wj_reg_at (dd - 1) : NULL;
-				int want = dre ? wj_body_nparams (dre->body) : -1;
+				int want = dre ? wj_entry_nparams (dre) : -1;
 				int len = -1, pr = mono_wasm_jit_eslot_probe (vds->slot [di], &len);
 				if (want < 0 || pr == 0 || len != want) {
 					static int _n = 0;

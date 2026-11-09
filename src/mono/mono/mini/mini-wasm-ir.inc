@@ -3621,6 +3621,20 @@ wj_body_nparams (struct _WjBody *b)
 	return b ? (int) b->nparams : -1;
 }
 
+/* The heap a stored body holds (R531's census of retired bodies): code and relocations, the side tables. */
+static int
+wj_body_bytes (struct _WjBody *b)
+{
+	if (!b)
+		return 0;
+	gsize n = sizeof (WjBody) + b->f_body.cap + b->e_body.cap + sizeof (WasmFuncType) * (gsize) b->nextra + sizeof (WjEdge) * (gsize) b->nedges;
+	if (b->f_body.relocs)
+		n += sizeof (WasmReloc) * (gsize) b->f_body.relocs->cap;
+	if (b->e_body.relocs)
+		n += sizeof (WasmReloc) * (gsize) b->e_body.relocs->cap;
+	return (int) MIN (n, (gsize) G_MAXINT32);
+}
+
 static void
 wj_body_free (WjBody *b)
 {
@@ -3653,6 +3667,9 @@ wj_body_take (MonoMethod *method, const char *name, WasmBuf *f, WasmBuf *e,
 	memcpy (b->groups, groups, sizeof (WasmLocalGroup) * 4);
 	b->f_body = *f; memset (f, 0, sizeof (*f));
 	b->e_body = *e; memset (e, 0, sizeof (*e));
+	/* kept until re-framed or retired: without its doubling slack (R531) */
+	wasm_buf_shrink (&b->f_body);
+	wasm_buf_shrink (&b->e_body);
 	if (nextra) {
 		b->extra_types = (WasmFuncType *) g_malloc (sizeof (WasmFuncType) * (gsize) nextra);
 		memcpy (b->extra_types, extras, sizeof (WasmFuncType) * (gsize) nextra);
