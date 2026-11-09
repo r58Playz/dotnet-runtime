@@ -7198,7 +7198,7 @@ initialize_array_data (MonoCompile *cfg, MonoMethod *method, gboolean aot, gucha
 		if (!image_is_dynamic (method_klass_image)) {
 			guint32 field_index = mono_metadata_token_index (field_token);
 			mono_metadata_field_info (method_klass_image, field_index - 1, NULL, &rva, NULL);
-			data_ptr = mono_image_rva_map (method_klass_image, rva);
+			data_ptr = mono_image_rva_map_sized (method_klass_image, rva, (guint32)size);
 			/*g_print ("field: 0x%08x, rva: %d, rva_ptr: %p\n", read32 (ip + 2), rva, data_ptr);*/
 			/* for aot code we do the lookup on load */
 			if (aot && data_ptr)

@@ -212,6 +212,10 @@ mono_cli_rva_image_map (MonoImage *image, guint32 addr)
  * \returns the address in memory for the given RVA, or NULL if the
  * RVA is not valid for this image.
  */
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+static char *webcil_range_map (MonoImage *image, guint32 addr, guint32 size);
+#endif
+
 char *
 mono_image_rva_map (MonoImage *image, guint32 addr)
 {
@@ -219,6 +223,11 @@ mono_image_rva_map (MonoImage *image, guint32 addr)
 	const int top = iinfo->cli_section_count;
 	MonoSectionTable *tables = iinfo->cli_section_tables;
 	int i;
+
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (image->storage && image->storage->webcil_range)
+		return webcil_range_map (image, addr, 0);
+#endif
 
 #ifdef HOST_WIN32
 	if (m_image_is_module_handle (image)) {
@@ -242,6 +251,301 @@ mono_image_rva_map (MonoImage *image, guint32 addr)
 		tables++;
 	}
 	return NULL;
+}
+
+/*
+ * Webcil images read on demand (R529, browser).
+ *
+ * A webcil-in-wasm assembly whose wrapper exports getWebcilRange (d, off, n) -- memory.init of its passive payload
+ * segment from OFF -- can stay out of linear memory: the host compiles the wrapper, registers only the webcil header
+ * and section table as the bundled data (mono_image_webcil_range_register), and copies the rest in when it is first
+ * read. At load the CLI header and the whole metadata block (tables and heaps, read in place by everything) are copied;
+ * method bodies, field RVA data, managed resources and small whole sections are copied on first use into blocks cached
+ * per payload offset, and kept for the storage's lifetime (callers keep the pointers: method headers, JITted RVA data).
+ *
+ * Every reader of image bytes must go through mono_image_rva_map_sized / _method_body / get_resource: raw_data holds
+ * the header only and its raw_data_len is that header's, so an unconverted raw_data + offset read fails its own bounds
+ * check rather than reading past the buffer. An unsized mono_image_rva_map outside the metadata copies a window of at
+ * most 64 KiB and counts it (mono_webcil_range_stats [6]); it must read 0.
+ */
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+#include <pthread.h>
+
+typedef struct {
+	guint32 size;
+	char *data;
+} WebcilRangeBlock;
+
+typedef struct _MonoWebcilRange {
+	int handle;
+	guint32 payload_size;
+	mono_mutex_t lock;
+	GHashTable *blocks;		/* payload offset + 1 -> WebcilRangeBlock* */
+	GSList *retired;		/* blocks replaced by a larger read at the same offset; callers may still hold them */
+	char *metadata;			/* the metadata root and streams */
+	guint32 metadata_off, metadata_size;
+} MonoWebcilRange;
+
+typedef struct {
+	guint32 eager_len;
+	int handle;
+	guint32 payload_size;
+} WebcilRangeReg;
+
+/* images (storages) range-backed, blocks, block bytes, metadata bytes, reads, read bytes, unsized maps, refusals */
+guint64 mono_webcil_range_stats [8];
+static gboolean (*webcil_range_reader) (int handle, void *dst, guint32 offset, guint32 len);
+/* registration runs before mono_images_init, from the host's asset loading: a static lock */
+static pthread_mutex_t webcil_range_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static GHashTable *webcil_range_regs;	/* eager data pointer -> WebcilRangeReg* */
+
+void
+mono_image_webcil_range_set_reader (gboolean (*reader) (int handle, void *dst, guint32 offset, guint32 len))
+{
+	webcil_range_reader = reader;
+}
+
+void
+mono_image_webcil_range_register (const char *eager, guint32 eager_len, int handle, guint32 payload_size)
+{
+	WebcilRangeReg *r = g_new0 (WebcilRangeReg, 1);
+	r->eager_len = eager_len;
+	r->handle = handle;
+	r->payload_size = payload_size;
+	pthread_mutex_lock (&webcil_range_reg_lock);
+	if (!webcil_range_regs)
+		webcil_range_regs = g_hash_table_new (g_direct_hash, g_direct_equal);
+	g_hash_table_insert (webcil_range_regs, (gpointer)eager, r);
+	pthread_mutex_unlock (&webcil_range_reg_lock);
+}
+
+static MonoWebcilRange *
+webcil_range_for_data (const char *data, guint32 data_len)
+{
+	WebcilRangeReg *r = NULL;
+	pthread_mutex_lock (&webcil_range_reg_lock);
+	if (webcil_range_regs)
+		r = (WebcilRangeReg *)g_hash_table_lookup (webcil_range_regs, data);
+	pthread_mutex_unlock (&webcil_range_reg_lock);
+	if (!r || r->eager_len != data_len || !webcil_range_reader)
+		return NULL;
+	MonoWebcilRange *range = g_new0 (MonoWebcilRange, 1);
+	range->handle = r->handle;
+	range->payload_size = r->payload_size;
+	mono_os_mutex_init (&range->lock);
+	range->blocks = g_hash_table_new (g_direct_hash, g_direct_equal);
+	mono_atomic_inc_i64 ((gint64 *)&mono_webcil_range_stats [0]);
+	return range;
+}
+
+static void
+webcil_range_free (MonoWebcilRange *range)
+{
+	GHashTableIter it;
+	gpointer k, v;
+	g_hash_table_iter_init (&it, range->blocks);
+	while (g_hash_table_iter_next (&it, &k, &v)) {
+		g_free (((WebcilRangeBlock *)v)->data);
+		g_free (v);
+	}
+	g_hash_table_destroy (range->blocks);
+	for (GSList *l = range->retired; l; l = l->next) {
+		g_free (((WebcilRangeBlock *)l->data)->data);
+		g_free (l->data);
+	}
+	g_slist_free (range->retired);
+	g_free (range->metadata);
+	mono_os_mutex_destroy (&range->lock);
+	g_free (range);
+}
+
+static gboolean
+webcil_range_read (MonoWebcilRange *range, void *dst, guint32 off, guint32 len)
+{
+	if (off > range->payload_size || len > range->payload_size - off)
+		return FALSE;
+	mono_atomic_inc_i64 ((gint64 *)&mono_webcil_range_stats [4]);
+	mono_atomic_fetch_add_i64 ((gint64 *)&mono_webcil_range_stats [5], len);
+	return webcil_range_reader (range->handle, dst, off, len);
+}
+
+/* The payload bytes [OFF, OFF + SIZE) in a block that lives as long as the storage; a block already cached at OFF
+ * that is at least SIZE long is returned as is. Reads outside the lock; a lost race frees its own copy. */
+static char *
+webcil_range_block (MonoWebcilRange *range, guint32 off, guint32 size)
+{
+	gpointer key = GUINT_TO_POINTER (off + 1);
+	mono_os_mutex_lock (&range->lock);
+	WebcilRangeBlock *b = (WebcilRangeBlock *)g_hash_table_lookup (range->blocks, key);
+	mono_os_mutex_unlock (&range->lock);
+	if (b && b->size >= size)
+		return b->data;
+	WebcilRangeBlock *nb = g_new0 (WebcilRangeBlock, 1);
+	nb->size = size;
+	nb->data = (char *)g_malloc (size ? size : 1);
+	if (!webcil_range_read (range, nb->data, off, size)) {
+		g_free (nb->data);
+		g_free (nb);
+		return NULL;
+	}
+	mono_os_mutex_lock (&range->lock);
+	b = (WebcilRangeBlock *)g_hash_table_lookup (range->blocks, key);
+	if (b && b->size >= size) {
+		mono_os_mutex_unlock (&range->lock);
+		g_free (nb->data);
+		g_free (nb);
+		return b->data;
+	}
+	if (b)
+		range->retired = g_slist_prepend (range->retired, b);
+	g_hash_table_insert (range->blocks, key, nb);
+	mono_os_mutex_unlock (&range->lock);
+	mono_atomic_inc_i64 ((gint64 *)&mono_webcil_range_stats [1]);
+	mono_atomic_fetch_add_i64 ((gint64 *)&mono_webcil_range_stats [2], size);
+	return nb->data;
+}
+
+static char *
+webcil_range_metadata (MonoWebcilRange *range, guint32 off, guint32 size)
+{
+	char *md;
+	mono_os_mutex_lock (&range->lock);
+	if (!range->metadata) {
+		md = (char *)g_malloc (size ? size : 1);
+		if (!webcil_range_read (range, md, off, size)) {
+			g_free (md);
+			mono_os_mutex_unlock (&range->lock);
+			return NULL;
+		}
+		range->metadata_off = off;
+		range->metadata_size = size;
+		range->metadata = md;
+		mono_atomic_fetch_add_i64 ((gint64 *)&mono_webcil_range_stats [3], size);
+	}
+	md = (range->metadata_off == off && range->metadata_size == size) ? range->metadata : NULL;
+	mono_os_mutex_unlock (&range->lock);
+	return md;
+}
+
+/* The section holding ADDR: its index, the payload offset of ADDR and the bytes left in the section after it. */
+static int
+webcil_range_locate (MonoImage *image, guint32 addr, guint32 *off, guint32 *avail)
+{
+	MonoCLIImageInfo *iinfo = image->image_info;
+	for (int i = 0; i < iinfo->cli_section_count; i++) {
+		MonoSectionTable *t = &iinfo->cli_section_tables [i];
+		if (addr >= t->st_virtual_address && addr < t->st_virtual_address + t->st_raw_data_size) {
+			guint32 delta = addr - t->st_virtual_address;
+			*off = t->st_raw_data_ptr + delta;
+			*avail = t->st_raw_data_size - delta;
+			return i;
+		}
+	}
+	return -1;
+}
+
+static char *
+webcil_range_map (MonoImage *image, guint32 addr, guint32 size)
+{
+	MonoWebcilRange *range = image->storage->webcil_range;
+	MonoCLIImageInfo *iinfo = image->image_info;
+	guint32 off, avail;
+	int i = webcil_range_locate (image, addr, &off, &avail);
+	if (i < 0)
+		return NULL;
+	if (iinfo->cli_sections [i])	/* a small section copied whole by mono_image_ensure_section_idx */
+		return (char *)iinfo->cli_sections [i] + (addr - iinfo->cli_section_tables [i].st_virtual_address);
+	if (range->metadata && off >= range->metadata_off && off - range->metadata_off < range->metadata_size &&
+	    (size ? size : 1) <= range->metadata_size - (off - range->metadata_off))
+		return range->metadata + (off - range->metadata_off);
+	if (!size) {
+		size = MIN (avail, 64 * 1024);
+		gint64 n = mono_atomic_inc_i64 ((gint64 *)&mono_webcil_range_stats [6]);
+		if (n <= 8)
+			g_warning ("webcil range: unsized RVA map 0x%x in %s (copied %u bytes)", addr, image->name, size);
+	}
+	if (size > avail)
+		return NULL;
+	return webcil_range_block (range, off, size);
+}
+
+/* A method body: its length from the tiny or fat header and the extra sections after the code (ECMA-335 II.25.4). */
+static char *
+webcil_range_method_body (MonoImage *image, guint32 addr)
+{
+	MonoWebcilRange *range = image->storage->webcil_range;
+	guint32 off, avail, total;
+	guint8 h [12];
+	if (webcil_range_locate (image, addr, &off, &avail) < 0)
+		return NULL;
+	mono_os_mutex_lock (&range->lock);
+	WebcilRangeBlock *b = (WebcilRangeBlock *)g_hash_table_lookup (range->blocks, GUINT_TO_POINTER (off + 1));
+	mono_os_mutex_unlock (&range->lock);
+	if (b)	/* only a method body is cached at a method body's offset */
+		return b->data;
+	guint32 n = MIN (avail, (guint32)sizeof (h));
+	if (!n || !webcil_range_read (range, h, off, n))
+		return NULL;
+	if ((h [0] & 3) == 2) {
+		total = 1 + (h [0] >> 2);
+	} else if ((h [0] & 3) == 3 && n == sizeof (h)) {
+		guint16 flags = (guint16)(h [0] | (h [1] << 8));
+		guint32 code = (guint32)h [4] | ((guint32)h [5] << 8) | ((guint32)h [6] << 16) | ((guint32)h [7] << 24);
+		guint32 hsize = (guint32)(flags >> 12) * 4;
+		if (code > avail || hsize > avail - code)
+			return NULL;
+		total = hsize + code;
+		if (flags & 0x8) {	/* CorILMethod_MoreSects */
+			for (int k = 0; k < 64; k++) {
+				guint32 pos = (total + 3) & ~3u;
+				guint8 sh [4];
+				if (pos > avail || avail - pos < 4 || !webcil_range_read (range, sh, off + pos, 4))
+					return NULL;
+				guint32 len = (sh [0] & 0x40) ? ((guint32)sh [1] | ((guint32)sh [2] << 8) | ((guint32)sh [3] << 16)) : sh [1];
+				if (len < 4 || len > avail - pos)
+					return NULL;
+				total = pos + len;
+				if (!(sh [0] & 0x80))	/* CorILMethod_Sect_MoreSects */
+					break;
+			}
+		}
+	} else {
+		return NULL;
+	}
+	if (total > avail)
+		return NULL;
+	return webcil_range_block (range, off, total);
+}
+#endif
+
+gboolean
+mono_image_is_webcil_range (MonoImage *image)
+{
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	return image && image->storage && image->storage->webcil_range;
+#else
+	return FALSE;
+#endif
+}
+
+char *
+mono_image_rva_map_sized (MonoImage *image, guint32 addr, guint32 size)
+{
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (image->storage && image->storage->webcil_range)
+		return webcil_range_map (image, addr, size ? size : 1);
+#endif
+	return mono_image_rva_map (image, addr);
+}
+
+char *
+mono_image_rva_map_method_body (MonoImage *image, guint32 addr)
+{
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (image->storage && image->storage->webcil_range)
+		return webcil_range_method_body (image, addr);
+#endif
+	return mono_image_rva_map (image, addr);
 }
 
 /**
@@ -301,6 +605,20 @@ mono_image_ensure_section_idx (MonoImage *image, int section)
 
 	sect = &iinfo->cli_section_tables [section];
 
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (image->storage && image->storage->webcil_range) {
+		/* only a small section (.rsrc) is copied whole; .text holds the IL and resources read on demand */
+		char *p = NULL;
+		if (sect->st_raw_data_size <= 4 * 1024 * 1024)
+			p = webcil_range_block (image->storage->webcil_range, sect->st_raw_data_ptr, sect->st_raw_data_size);
+		if (!p) {
+			mono_atomic_inc_i64 ((gint64 *)&mono_webcil_range_stats [7]);
+			return FALSE;
+		}
+		iinfo->cli_sections [section] = p;
+		return TRUE;
+	}
+#endif
 	if (sect->st_raw_data_ptr + sect->st_raw_data_size > image->raw_data_len)
 		return FALSE;
 #ifdef HOST_WIN32
@@ -382,9 +700,17 @@ mono_image_load_cli_header (MonoImage *image, MonoCLIImageInfo *iinfo)
 	if (offset == INVALID_ADDRESS)
 		return FALSE;
 
-	if (offset + sizeof (MonoCLIHeader) > image->raw_data_len)
-		return FALSE;
-	memcpy (&iinfo->cli_cli_header, image->raw_data + offset, sizeof (MonoCLIHeader));
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (image->storage && image->storage->webcil_range) {
+		if (!webcil_range_read (image->storage->webcil_range, &iinfo->cli_cli_header, offset, sizeof (MonoCLIHeader)))
+			return FALSE;
+	} else
+#endif
+	{
+		if (offset + sizeof (MonoCLIHeader) > image->raw_data_len)
+			return FALSE;
+		memcpy (&iinfo->cli_cli_header, image->raw_data + offset, sizeof (MonoCLIHeader));
+	}
 
 #if G_BYTE_ORDER != G_LITTLE_ENDIAN
 #define SWAP32(x) (x) = GUINT32_FROM_LE ((x))
@@ -467,9 +793,18 @@ load_metadata_ptrs (MonoImage *image, MonoCLIImageInfo *iinfo)
 
 	size = iinfo->cli_cli_header.ch_metadata.size;
 
-	if (offset + size > image->raw_data_len)
-		return FALSE;
-	image->raw_metadata = image->raw_data + offset;
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (image->storage && image->storage->webcil_range) {
+		image->raw_metadata = webcil_range_metadata (image->storage->webcil_range, offset, size);
+		if (!image->raw_metadata)
+			return FALSE;
+	} else
+#endif
+	{
+		if (offset + size > image->raw_data_len)
+			return FALSE;
+		image->raw_metadata = image->raw_data + offset;
+	}
 	image->raw_metadata_len = size;
 
 	/* 24.2.1: Metadata root starts here */
@@ -1353,6 +1688,10 @@ mono_image_storage_dtor (gpointer self)
 	if (storage->raw_data_allocated) {
 		g_free (storage->raw_data_handle);
 	}
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (storage->webcil_range)
+		webcil_range_free (storage->webcil_range);
+#endif
 
 	g_free (storage->key);
 
@@ -1433,6 +1772,9 @@ mono_image_storage_new_raw_data (char *datac, guint32 data_len, gboolean raw_dat
 	storage->raw_data_len = data_len;
 	storage->raw_data_allocated = !!raw_data_allocated;
 	storage->raw_data_handle = datac;
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	storage->webcil_range = webcil_range_for_data (datac, data_len);
+#endif
 
 	storage->key = key;
 	MonoImageStorage *other_storage = NULL;
@@ -2430,6 +2772,23 @@ mono_image_get_resource (MonoImage *image, guint32 offset, guint32 *size)
 	if (!ch->ch_resources.rva || offset + 4 > ch->ch_resources.size)
 		return NULL;
 
+#if defined(ENABLE_WEBCIL) && defined(HOST_BROWSER)
+	if (image->storage && image->storage->webcil_range) {
+		MonoWebcilRange *range = image->storage->webcil_range;
+		guint32 base = mono_cli_rva_image_map (image, ch->ch_resources.rva), len;
+		if (base == INVALID_ADDRESS || !webcil_range_read (range, &len, base + offset, 4))
+			return NULL;
+		len = GUINT32_FROM_LE (len);
+		if (len > ch->ch_resources.size - offset - 4)
+			return NULL;
+		data = webcil_range_block (range, base + offset, 4 + len);
+		if (!data)
+			return NULL;
+		if (size)
+			*size = len;
+		return data + 4;
+	}
+#endif
 	data = mono_image_rva_map (image, ch->ch_resources.rva);
 	if (!data)
 		return NULL;
@@ -2542,7 +2901,7 @@ mono_image_get_strong_name (MonoImage *image, guint32 *size)
 
 	if (!de->size || !de->rva)
 		return NULL;
-	data = mono_image_rva_map (image, de->rva);
+	data = mono_image_rva_map_sized (image, de->rva, de->size);
 	if (!data)
 		return NULL;
 	if (size)

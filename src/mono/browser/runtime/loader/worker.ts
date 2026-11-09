@@ -12,6 +12,9 @@ export function setupPreloadChannelToMainThread () {
     const workerPort = channel.port1;
     const mainPort = channel.port2;
     workerPort.addEventListener("message", (event) => {
+        // the on-demand webcil wrappers (R529), read by driver.c mono_wasm_webcil_range_read_js
+        if (event.data.webcilModules)
+            (globalThis as any).__monoWebcilModules = event.data.webcilModules;
         const config = JSON.parse(event.data.config) as MonoConfig;
         const monoThreadInfo = JSON.parse(event.data.monoThreadInfo) as PThreadInfo;
         onMonoConfigReceived(config, monoThreadInfo);

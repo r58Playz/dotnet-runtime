@@ -153,6 +153,11 @@ export async function mono_download_assets (): Promise<void> {
         const promises_of_assets_core: Promise<AssetEntryInternal>[] = [];
         const promises_of_assets_remaining: Promise<AssetEntryInternal>[] = [];
 
+        // R529: webcil assemblies whose wrapper exports getWebcilRange are read on demand unless MONO_WASM_WEBCIL_RANGE=0
+        // (only when some assembly is a .wasm: with webcil off, nothing qualifies and boot order stays as it was)
+        const webcilRange = !ENVIRONMENT_IS_WORKER && loaderHelpers.config.environmentVariables?.["MONO_WASM_WEBCIL_RANGE"] !== "0" &&
+            [...coreAssetsToLoad, ...assetsToLoad].some(a => a.behavior === "assembly" && a.name.endsWith(".wasm"));
+        const assemblyInstantiations: Promise<void>[] = [];
         const countAndStartDownload = (asset: AssetEntryInternal, promises_list: Promise<AssetEntryInternal>[]) => {
             if (!skipInstantiateByAssetTypes[asset.behavior] && shouldLoadIcuAsset(asset)) {
                 loaderHelpers.expected_instantiated_assets_count++;
@@ -195,10 +200,21 @@ export async function mono_download_assets (): Promise<void> {
                     const data = new Uint8Array(buffer);
                     cleanupAsset(asset);
 
+                    // a webcil-in-wasm wrapper with getWebcilRange compiles now, while the runtime starts (R529)
+                    let rangeModule: Promise<WebAssembly.Module | null> | null = null;
+                    if (webcilRange && asset.behavior === "assembly" && data.length > 8 && data[0] === 0 && data[1] === 0x61 && data[2] === 0x73 && data[3] === 0x6d) {
+                        rangeModule = WebAssembly.compile(data).then(
+                            m => WebAssembly.Module.exports(m).some(e => e.name === "getWebcilRange") ? m : null,
+                            () => null);
+                    }
+
                     // wait till after onRuntimeInitialized
 
                     await runtimeHelpers.beforeOnRuntimeInitialized.promise;
-                    runtimeHelpers.instantiate_asset(asset, url, data);
+                    const module = rangeModule ? await rangeModule : null;
+                    if (!module || !await runtimeHelpers.instantiate_webcil_range_asset(asset, url, module)) {
+                        runtimeHelpers.instantiate_asset(asset, url, data);
+                    }
                 }
             } else {
                 const headersOnly = skipBufferByAssetTypes[asset.behavior];
@@ -225,11 +241,22 @@ export async function mono_download_assets (): Promise<void> {
 
         const promises_of_asset_instantiation_core: Promise<void>[] = [];
         const promises_of_asset_instantiation_remaining: Promise<void>[] = [];
+        const instantiateTracked = (downloadPromise: Promise<AssetEntryInternal>) => {
+            const p = instantiate(downloadPromise);
+            assemblyInstantiations.push(downloadPromise.then(a => a.behavior === "assembly" ? p : undefined, () => undefined));
+            return p;
+        };
         for (const downloadPromise of promises_of_assets_core) {
-            promises_of_asset_instantiation_core.push(instantiate(downloadPromise));
+            promises_of_asset_instantiation_core.push(instantiateTracked(downloadPromise));
         }
         for (const downloadPromise of promises_of_assets_remaining) {
-            promises_of_asset_instantiation_remaining.push(instantiate(downloadPromise));
+            promises_of_asset_instantiation_remaining.push(instantiateTracked(downloadPromise));
+        }
+        // workers wait for this before their config reply, so each has every wrapper before running a pthread
+        if (webcilRange) {
+            Promise.all(assemblyInstantiations).catch(() => undefined).then(() => runtimeHelpers.afterWebcilRange.promise_control.resolve());
+        } else {
+            runtimeHelpers.afterWebcilRange.promise_control.resolve();
         }
 
         // this await will get past the onRuntimeInitialized because we are not blocking via addRunDependency

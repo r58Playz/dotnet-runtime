@@ -20,7 +20,7 @@ import { export_api } from "./export-api";
 import { initializeReplacements } from "./polyfills";
 
 import { mono_wasm_stringify_as_error_with_stack } from "./logging";
-import { instantiate_asset, instantiate_symbols_asset } from "./assets";
+import { instantiate_asset, instantiate_symbols_asset, instantiate_webcil_range_asset } from "./assets";
 import { jiterpreter_dump_stats } from "./jiterpreter";
 import { forceDisposeProxies } from "./gc-handles";
 import { mono_wasm_dump_threads } from "./pthreads";
@@ -40,6 +40,7 @@ function initializeExports (globalObjects: GlobalObjects): RuntimeAPI {
         stringify_as_error_with_stack: mono_wasm_stringify_as_error_with_stack,
         instantiate_symbols_asset,
         instantiate_asset,
+        instantiate_webcil_range_asset,
         jiterpreter_dump_stats,
         forceDisposeProxies,
         utf8ToString,

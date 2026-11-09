@@ -1343,7 +1343,7 @@ method_body_object_construct (MonoClass *unused_class, MonoMethod *method, gpoin
 	if (!image_is_dynamic (image)) {
 		/* Obtain local vars signature token */
 		method_rva = mono_metadata_decode_row_col (&image->tables [MONO_TABLE_METHOD], mono_metadata_token_index (method->token) - 1, MONO_METHOD_RVA);
-		ptr = mono_image_rva_map (image, method_rva);
+		ptr = mono_image_rva_map_method_body (image, method_rva);
 		flags = *(const unsigned char *) ptr;
 		format = flags & METHOD_HEADER_FORMAT_MASK;
 		switch (format){

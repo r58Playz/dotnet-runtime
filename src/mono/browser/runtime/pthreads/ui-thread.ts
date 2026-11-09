@@ -75,15 +75,21 @@ function monoWorkerMessageHandler (worker: PThreadWorker, ev: MessageEvent<any>)
     pthreadId = message.info?.pthreadId ?? 0;
     worker.info = Object.assign({}, worker.info, message.info);
     switch (message.monoCmd) {
-        case WorkerToMainMessageType.preload:
-            // this one shot port from setupPreloadChannelToMainThread
-            message.port!.postMessage({
-                type: "pthread",
-                cmd: MainToWorkerMessageType.applyConfig,
-                config: JSON.stringify(runtimeHelpers.config),
-                monoThreadInfo: JSON.stringify(worker.info),
+        case WorkerToMainMessageType.preload: {
+            // this one shot port from setupPreloadChannelToMainThread. The reply waits until every assembly is registered
+            // (R529): it carries the on-demand webcil wrappers, and the worker cannot run a pthread before it arrives.
+            const port = message.port!;
+            runtimeHelpers.afterWebcilRange.promise.then(() => {
+                port.postMessage({
+                    type: "pthread",
+                    cmd: MainToWorkerMessageType.applyConfig,
+                    config: JSON.stringify(runtimeHelpers.config),
+                    monoThreadInfo: JSON.stringify(worker.info),
+                    webcilModules: (globalThis as any).__monoWebcilModules,
+                });
             });
             break;
+        }
         case WorkerToMainMessageType.pthreadCreated:
             thread = new ThreadImpl(pthreadId, worker, message.port!);
             worker.thread = thread;

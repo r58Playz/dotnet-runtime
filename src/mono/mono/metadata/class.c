@@ -5777,7 +5777,8 @@ mono_field_get_rva (MonoClassField *field, int swizzle)
 			if (!rva)
 				g_warning ("field %s in %s should have RVA data, but hasn't", mono_field_get_name (field), m_class_get_name (m_field_get_parent (field)));
 
-			rvaData = mono_image_rva_map (m_class_get_image (m_field_get_parent (field)), rva);
+			int dummy_align;
+			rvaData = mono_image_rva_map_sized (m_class_get_image (m_field_get_parent (field)), rva, (guint32)mono_type_size (field->type, &dummy_align));
 		} else {
 			rvaData = mono_field_get_data (field);
 		}

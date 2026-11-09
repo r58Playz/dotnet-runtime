@@ -4387,7 +4387,7 @@ mono_method_get_header_summary (MonoMethod *method, MonoMethodHeaderSummary *sum
 	img = m_class_get_image (method->klass);
 	rva = mono_metadata_decode_row_col (&img->tables [MONO_TABLE_METHOD], idx - 1, MONO_METHOD_RVA);
 
-	ptr = mono_image_rva_map (img, rva);
+	ptr = mono_image_rva_map_method_body (img, rva);
 	if (!ptr)
 		return FALSE;
 

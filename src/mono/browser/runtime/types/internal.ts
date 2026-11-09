@@ -217,6 +217,8 @@ export type RuntimeHelpers = {
 
     coreAssetsInMemory: PromiseAndController<void>,
     allAssetsInMemory: PromiseAndController<void>,
+    // every assembly asset is either registered as an on-demand webcil image or loaded whole (R529)
+    afterWebcilRange: PromiseAndController<void>,
     dotnetReady: PromiseAndController<any>,
     afterInstantiateWasm: PromiseAndController<void>,
     beforePreInit: PromiseAndController<void>,
@@ -236,6 +238,7 @@ export type RuntimeHelpers = {
     //core
     stringify_as_error_with_stack?: (error: any) => string,
     instantiate_asset: (asset: AssetEntry, url: string, bytes: Uint8Array) => void,
+    instantiate_webcil_range_asset: (asset: AssetEntry, url: string, module: WebAssembly.Module) => Promise<boolean>,
     instantiate_symbols_asset: (pendingAsset: AssetEntryInternal) => Promise<void>,
     jiterpreter_dump_stats?: (concise?: boolean) => void,
     forceDisposeProxies: (disposeMethods: boolean, verbose: boolean) => void,

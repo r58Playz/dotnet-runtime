@@ -50,6 +50,9 @@ extern void mono_register_timezones_bundle (void);
 extern void mono_wasm_set_entrypoint_breakpoint (const char* assembly_name, int method_token);
 
 extern void mono_bundled_resources_add_assembly_resource (const char *id, const char *name, const uint8_t *data, uint32_t size, void (*free_func)(void *, void*), void *free_data);
+/* image.c (R529): webcil assemblies read on demand */
+extern void mono_image_webcil_range_register (const char *eager, uint32_t eager_len, int handle, uint32_t payload_size);
+extern void mono_image_webcil_range_set_reader (int (*reader) (int handle, void *dst, uint32_t offset, uint32_t len));
 extern void mono_bundled_resources_add_assembly_symbol_resource (const char *id, const uint8_t *data, uint32_t size, void (*free_func)(void *, void *), void *free_data);
 extern void mono_bundled_resources_add_satellite_assembly_resource (const char *id, const char *name, const char *culture, const uint8_t *data, uint32_t size, void (*free_func)(void *, void*), void *free_data);
 
@@ -118,6 +121,69 @@ mono_wasm_add_assembly (const char *name, const unsigned char *data, unsigned in
 	assert (assembly_name);
 	mono_bundled_resources_add_assembly_resource (assembly_name, assembly_name, data, size, bundled_resources_free_func, assembly_name);
 	return mono_has_pdb_checksum ((char*)data, size);
+}
+
+/*
+ * Webcil assemblies read on demand (R529). The host (assets.ts) compiles a webcil-in-wasm wrapper that exports
+ * getWebcilRange (d, off, n) and keeps it out of linear memory: globalThis.__monoWebcilModules [handle] on the main
+ * thread and in every worker (the worker's preload reply carries them), __monoWebcilInstances [handle] instantiated
+ * against this memory -- asynchronously on the main thread at load, lazily in a worker. A read is one memory.init.
+ */
+EM_JS (int, mono_wasm_webcil_range_read_js, (int handle, void *dst, unsigned int off, unsigned int len), {
+	var G = globalThis;
+	var insts = G.__monoWebcilInstances || (G.__monoWebcilInstances = []);
+	var inst = insts[handle];
+	if (!inst) {
+		var mods = G.__monoWebcilModules;
+		var mod = mods && mods[handle];
+		if (!mod)
+			return 0;
+		inst = new WebAssembly.Instance(mod, { webcil: { memory: wasmMemory } });
+		insts[handle] = inst;
+	}
+	inst.exports.getWebcilRange(dst, off, len);
+	return 1;
+});
+
+static int
+webcil_range_reader (int handle, void *dst, uint32_t offset, uint32_t len)
+{
+	return mono_wasm_webcil_range_read_js (handle, dst, offset, len) != 0;
+}
+
+/* Registers assembly NAME whose payload (PAYLOAD_SIZE bytes) stays in wrapper HANDLE: only its webcil header and
+ * section table become the bundled data. Returns 0, or -1 if the payload is not a webcil image (the caller then loads
+ * the file whole). */
+EMSCRIPTEN_KEEPALIVE int
+mono_wasm_add_webcil_range_assembly (const char *name, int handle, unsigned int payload_size)
+{
+	static int reader_set;
+	if (!reader_set) {
+		mono_image_webcil_range_set_reader (webcil_range_reader);
+		reader_set = 1;
+		fprintf (stderr, "[webcil-range] assemblies read on demand from their webcil wrappers\n");
+	}
+	uint8_t hdr [28];
+	if (payload_size < sizeof (hdr) || !webcil_range_reader (handle, hdr, 0, sizeof (hdr)))
+		return -1;
+	if (memcmp (hdr, "WbIL", 4) != 0)
+		return -1;
+	uint32_t nsec = (uint32_t)hdr [8] | ((uint32_t)hdr [9] << 8);
+	uint32_t eager_len = (uint32_t)sizeof (hdr) + 16 * nsec;
+	if (eager_len > payload_size)
+		return -1;
+	char *eager = (char *)malloc (eager_len);
+	if (!eager)
+		return -1;
+	if (!webcil_range_reader (handle, eager, 0, eager_len)) {
+		free (eager);
+		return -1;
+	}
+	mono_image_webcil_range_register (eager, eager_len, handle, payload_size);
+	char *assembly_name = strdup (name);
+	assert (assembly_name);
+	mono_bundled_resources_add_assembly_resource (assembly_name, assembly_name, (const uint8_t *)eager, eager_len, bundled_resources_free_func, assembly_name);
+	return 0;
 }
 
 static void
