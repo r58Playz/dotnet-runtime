@@ -41,7 +41,13 @@ static int ms_block_size;
  * Blocks must be at least this size, meaning that if we detect a
  * page size lower than this, we'll use this instead.
  */
+#ifndef TARGET_WASM
 #define MS_BLOCK_SIZE_MIN (1024 * 16)
+#else
+/* 64 KiB (wasm's pagesize is 16 KiB): two SGEN_MAX_SMALL_OBJ_SIZE objects (32000 on wasm, sgen-conf.h) must fit in
+ * MS_BLOCK_FREE, which major_init asserts. An arena (MS_BLOCK_ALLOC_NUM blocks) is then 2 MiB. */
+#define MS_BLOCK_SIZE_MIN (1024 * 64)
+#endif
 
 #define CARDS_PER_BLOCK (ms_block_size / CARD_SIZE_IN_BYTES)
 
@@ -3037,6 +3043,9 @@ sgen_marksweep_init_internal (SgenMajorCollector *collector, gboolean is_concurr
 
 	if (ms_block_size < MS_BLOCK_SIZE_MIN)
 		ms_block_size = MS_BLOCK_SIZE_MIN;
+#ifdef HOST_WASM
+	fprintf (stderr, "[sgen-wasm] major blocks %d KiB, small objects up to %d B\n", (int)(ms_block_size / 1024), SGEN_MAX_SMALL_OBJ_SIZE);
+#endif
 
 	sgen_register_fixed_internal_mem_type (INTERNAL_MEM_MS_BLOCK_INFO, SIZEOF_MS_BLOCK_INFO);
 

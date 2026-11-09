@@ -154,8 +154,18 @@ typedef target_mword SgenDescriptor;
  * Objects bigger then this go into the large object space.  This size has a few
  * constraints.  At least two of them must fit into a major heap block.  It must also play
  * well with the run length GC descriptor, which encodes the object size.
+ *
+ * wasm: 32000, with 64 KiB major blocks (sgen-marksweep.c MS_BLOCK_SIZE_MIN) so that two still fit. There every LOS
+ * object is its own dlmalloc block (no LOS sections) and dies only at a major; at 8000, 26.2's chunk generation churned
+ * int[4096] through it and every major was LOS-triggered. 32000 halves the majors there and is not a memory lever (the
+ * light engine's 128-256 KB map clones stay in the LOS): R528 addendum. TARGET, not HOST, so the AOT compiler's
+ * managed-allocator wrappers (sgen-mono-ilgen.c) bake the same limit.
  */
+#ifdef TARGET_WASM
+#define SGEN_MAX_SMALL_OBJ_SIZE 32000
+#else
 #define SGEN_MAX_SMALL_OBJ_SIZE 8000
+#endif
 
 /*
  * This is the maximum ammount of memory we're willing to waste in order to speed up allocation.
