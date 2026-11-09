@@ -1304,7 +1304,8 @@ static int
 wj_b4_fbytes (gint32 desc)
 {
 	WjRegEntry *re = wj_reg_at (desc - 1);
-	return (re && re->body) ? (int) re->body->f_body.len : 0;
+	WjBody *rb = wj_entry_body (re);
+	return rb ? (int) rb->f_body.len : 0;
 }
 
 static int
@@ -1360,7 +1361,8 @@ mono_wasm_jit_b4_due (void)
 static int
 wj_b4_size (WjRegEntry *re)
 {
-	return (re && re->body) ? (int) (re->body->f_body.len + re->body->e_body.len) : 0;
+	WjBody *rb = wj_entry_body (re);
+	return rb ? (int) (rb->f_body.len + rb->e_body.len) : 0;
 }
 
 /* The partition over the live registry. Caller holds the registry read bracket. Returns the groups (>= 2 members,
@@ -1423,11 +1425,12 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 	n = wj_reg_n;
 	for (i = 0; i < n; ++i) {
 		WjRegEntry *re = wj_reg_at (i);
-		if (!re || !re->body || !re->body->nedges || re->e <= 0 || re->f <= 0 || wj_desc_for_fslot (re->f) != i + 1)
+		WjBody *rb = wj_entry_body (re);
+		if (!rb || !rb->nedges || re->e <= 0 || re->f <= 0 || wj_desc_for_fslot (re->f) != i + 1)
 			continue;
 		ndesc++;
-		for (k = 0; k < (int) re->body->nedges; ++k) {
-			WjEdge *ed = &re->body->edges [k];
+		for (k = 0; k < (int) rb->nedges; ++k) {
+			WjEdge *ed = &rb->edges [k];
 			int d = wj_desc_for_fslot (ed->fslot);
 			WjRegEntry *dre = (d > 0 && d <= n) ? wj_reg_at (d - 1) : NULL;
 			WjB4Edge e;
@@ -1472,8 +1475,8 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 			WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
 			gint32 ra = wj_b4_find (par, e->a), fb;
 			guint64 key;
-			WjRegEntry *are = wj_reg_at (e->a - 1);
-			if (are && are->body && are->body->t1down) {
+			WjBody *ab = wj_entry_body (wj_reg_at (e->a - 1));
+			if (ab && ab->t1down) {
 				WjRegEntry *bre = wj_reg_at (e->b - 1);
 				dup->down_w += e->w;
 				if (ra == wj_b4_find (par, e->b) && sz [ra] >= 2)
@@ -1501,8 +1504,8 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 		}
 		g_array_free (pairs, TRUE);
 		for (i = 1; i <= n; ++i) {
-			WjRegEntry *re = wj_reg_at (i - 1);
-			if (re && re->body && re->body->t1down && re->body->nedges) {
+			WjBody *rb = wj_entry_body (wj_reg_at (i - 1));
+			if (rb && rb->t1down && rb->nedges) {
 				dup->down_bodies++;
 				if (sz [wj_b4_find (par, i)] >= 2)
 					dup->down_grouped++;
@@ -1608,8 +1611,8 @@ mono_wasm_jit_b4_plan (void)
 	for (k = 0; k < ng && k < 6; ++k) {
 		printf ("[wasm-jit b4]   group %d: %d members, heat %llu:", k, g [k].n, (unsigned long long) hot [k]);
 		for (m = 0; m < g [k].n && m < 4; ++m) {
-			WjRegEntry *re = wj_reg_at (g [k].desc [m] - 1);
-			printf (" %s;", (re && re->body && re->body->name) ? re->body->name : "?");
+			WjBody *rb = wj_entry_body (wj_reg_at (g [k].desc [m] - 1));
+			printf (" %s;", (rb && rb->name) ? rb->name : "?");
 		}
 		printf ("\n");
 	}
@@ -1717,10 +1720,10 @@ wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out
 	{
 		GArray *edges = g_array_new (FALSE, FALSE, sizeof (WjB4Edge));
 		for (k = 0; k < nh; ++k) {
-			WjRegEntry *re = wj_reg_at (c [k].desc - 1);
+			WjBody *rb = wj_entry_body (wj_reg_at (c [k].desc - 1));
 			int e2;
-			for (e2 = 0; re && re->body && e2 < (int) re->body->nedges; ++e2) {
-				WjEdge *ed = &re->body->edges [e2];
+			for (e2 = 0; rb && e2 < (int) rb->nedges; ++e2) {
+				WjEdge *ed = &rb->edges [e2];
 				int d = wj_desc_for_fslot (ed->fslot);
 				guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
 				WjB4Edge e;
@@ -1795,11 +1798,11 @@ wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out
 		}
 		/* internal weight: edges whose both ends landed in one emitted group */
 		for (k = 0; k < nh; ++k) {
-			WjRegEntry *re = wj_reg_at (c [k].desc - 1);
+			WjBody *rb = wj_entry_body (wj_reg_at (c [k].desc - 1));
 			gint32 ga = remap [ingrp [wj_b4_find (par, c [k].desc)]];
 			int e2;
-			for (e2 = 0; ga >= 0 && re && re->body && e2 < (int) re->body->nedges; ++e2) {
-				WjEdge *ed = &re->body->edges [e2];
+			for (e2 = 0; ga >= 0 && rb && e2 < (int) rb->nedges; ++e2) {
+				WjEdge *ed = &rb->edges [e2];
 				int d = wj_desc_for_fslot (ed->fslot);
 				guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
 				if (d > 0 && d <= n && d != c [k].desc && heat [d] && w &&

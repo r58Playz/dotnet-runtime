@@ -937,6 +937,14 @@ mono_wasm_jit_dump_stats (void)
 		"full MUST be 0 (dup = module bytes retired while not published, i.e. a second retire, refused)\n",
 		mono_wasm_jit_retire_guard, WJC_(WJC_RETIRE_DUP), WJC_(WJC_RETIRE_GUARD_FULL), mono_wasm_jit_b4_section,
 		WJC_(WJC_B4_SECTION_BUSY), WJC_(WJC_RETIRED), WJC_(WJC_RETIRE_FREED)); }
+	{ extern void mono_wasm_jit_bodies_census (gint64 *n, gint64 *bytes);
+	  extern gint32 mono_wasm_jit_bodies_dropped;
+	  extern gint64 mono_wasm_jit_bodies_dropped_bytes;
+	  gint64 nb = 0, bb = 0;
+	  mono_wasm_jit_bodies_census (&nb, &bb);
+	  printf ("[wasm-jit bodies] stored=%lld (%.1f MiB) | dropped=%d (%.1f MiB) -- R531: relocatable bodies kept for re-framing, "
+		"and those retired with a descriptor orphaned or hooked (never framed again)\n", (long long) nb, bb / 1048576.0,
+		mono_atomic_load_i32 (&mono_wasm_jit_bodies_dropped), mono_wasm_jit_bodies_dropped_bytes / 1048576.0); }
 	printf ("[wasm-jit vroute] EXECUTED non-delegate virtual sites=%lld: devirt arm=%lld arm2=%lld slim=%lld | ic w0=%lld mid=%lld "
 		"mcache+ways=%lld | aot_ic=%lld | cold miss=%lld (PROFILE_FAST only; typed-spindle C1 route mix)\n",
 		WJC_(WJC_FAST_VSITE), WJC_(WJC_FAST_DEVIRT), WJC_(WJC_FAST_DEVIRT2), WJC_(WJC_FAST_VIC_SLIM), WJC_(WJC_FAST_VIC_W0),

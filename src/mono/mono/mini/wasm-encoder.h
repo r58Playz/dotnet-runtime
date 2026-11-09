@@ -334,6 +334,8 @@ typedef struct _WasmHints {
 } WasmHints;
 
 void wasm_buf_init  (WasmBuf *b);
+/* Release the growth slack of a buffer that is done growing (a stored relocatable body). */
+void wasm_buf_shrink (WasmBuf *b);
 void wasm_buf_free  (WasmBuf *b);
 void wasm_u8        (WasmBuf *b, guint8 v);
 void wasm_bytes     (WasmBuf *b, const guint8 *p, guint32 n);

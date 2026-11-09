@@ -425,6 +425,34 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 	out->tee_end = 0;
 }
 
+/* Drop the growth slack of a buffer that will not grow again soon: the bytes, the relocations and the branch hints
+ * each double as they fill, so a stored relocatable body kept up to half its capacity empty (R531). Appending later
+ * stays correct: every append path regrows from cap == len. */
+void
+wasm_buf_shrink (WasmBuf *b)
+{
+	if (b->data && b->cap > b->len) {
+		b->data = b->len ? (guint8 *) g_realloc (b->data, b->len) : (g_free (b->data), (guint8 *) NULL);
+		b->cap = b->len;
+	}
+	if (b->relocs && b->relocs->cap > b->relocs->n) {
+		WasmRelocs *rl = b->relocs;
+		rl->r = rl->n ? (WasmReloc *) g_realloc (rl->r, sizeof (WasmReloc) * (gsize) rl->n) : (g_free (rl->r), (WasmReloc *) NULL);
+		rl->cap = rl->n;
+	}
+	if (b->hints && b->hints->cap > b->hints->n) {
+		WasmHints *h = b->hints;
+		if (h->n) {
+			h->off = (guint32 *) g_realloc (h->off, sizeof (guint32) * (gsize) h->n);
+			h->val = (guint8 *) g_realloc (h->val, (gsize) h->n);
+		} else {
+			g_free (h->off); g_free (h->val);
+			h->off = NULL; h->val = NULL;
+		}
+		h->cap = h->n;
+	}
+}
+
 static void
 wasm_buf_ensure (WasmBuf *b, guint32 extra)
 {

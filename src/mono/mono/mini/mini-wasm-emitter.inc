@@ -9506,6 +9506,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 						 * use-after-free on a body some other worker is reading. */
 						WjBody *old_body = sre->body;
 						sre->body = wj_stored_body;
+						sre->body_nparams_p1 = wj_stored_body ? (gint16) (wj_stored_body->nparams + 1) : sre->body_nparams_p1;
 						wj_stored_body = NULL;
 						{
 							extern void mono_wasm_jit_edge_note_name (int desc, const char *name);
