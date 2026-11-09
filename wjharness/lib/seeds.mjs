@@ -93,6 +93,23 @@ export const SEEDS = {
     quitTabs: null,
     benignRx: BENIGN_262,
   },
+  /* 262n's save in CREATIVE with commands on (2026-11-08, the memory census): the player flies, and the save's datapack
+   * `memwalk` teleports it along +X, 32 blocks a step, at most one step a second, and only once the server has the
+   * chunks 9 ahead (and 7 ahead x 7 to each side) entity-ticking; it starts 1200 ticks after load and logs
+   * `[memwalk] step N` as chat every 8 steps. So every run, ours or native, loads chunks continuously along the same
+   * path at the rate its own server generates them. options.txt has pauseOnLostFocus:false. Built by
+   * runs/2026-11-08-memwalk/mk262c.py from ikvmcraft-262n.tar into state/seeds/ikvmcraft-262c.tar; native stage `sa262c`.
+   * Not a performance seed: the teleport makes chunk generation the workload. */
+  "262c": {
+    dir: "seed-262c", version: "26.2", fabric: "0.19.5",
+    what: "26.2 + Fabric 0.19.5, no mods, creative + commands, datapack teleport along +X (2026-11-08): continuous chunk loading",
+    titleRx: /Created: \d+x\d+x\d+ minecraft:textures\/atlas\/shulker_boxes\.png-atlas/,
+    joinRx: /joined the game/,
+    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
+    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
+    quitTabs: null,
+    benignRx: BENIGN_262,
+  },
 };
 
 /**
