@@ -43,6 +43,11 @@ elseif (CLR_CMAKE_TARGET_BROWSER)
         pal_threading.c
         pal_uid.c
     )
+    if (CLR_CMAKE_RUNTIME_CORECLR)
+        # CoreCLR's browser host links -nostdlib (eng/native/configureplatform.cmake): pal_networking_browser.c
+        # supplies the libc socket calls libc's syslog needs. Mono links libc, and must get libc's.
+        add_definitions(-DSYSTEM_NATIVE_STUB_LIBC_SOCKETS)
+    endif()
 else() # WASI
     list (APPEND NATIVE_SOURCES
         pal_dynamicload_wasm.c

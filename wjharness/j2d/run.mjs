@@ -116,9 +116,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const batchT = {}, batchMs = {};
 let mean = null, checksum = null, done = false, failed = null, stoppedEarly = false;
+/* --done-rx RX: the run is over when a line matches (a jar that is not the benchmark, run with --jar) */
+const DONE_RX = opt("done-rx") ? new RegExp(opt("done-rx")) : null;
 function onLine(text) {
   const t = mono();
   log.write(`${t.toFixed(6)}\t${text}\n`);
+  if (DONE_RX && DONE_RX.test(text)) done = true;
   if (!text.includes("[bench]")) return;
   let m = text.match(/\[bench\] batch (\d+)\/(\d+): ([\d.]+) ms/);
   if (m) {
@@ -152,7 +155,8 @@ if (HS) {
     // --base: another ikvmcraft dev server, e.g. rvcmp/jdk8's :5022 serving a saved IKVM flavor
     url = `${(opt("base") || serveUrl()).replace(/\/$/, "")}/?bench` + (ATTR ? "&wj.MONO_WASM_JIT_ORIGIN=1&wj.MONO_WASM_JIT_CAPTURE=1" : "")
       + args.flatMap((x, i) => x === "--knob" ? [`&wj.${args[i + 1]}`] : []).join("")   // --knob K=V (ours)
-      + (opt("schedule") ? `&jprop.bench.warmup=${SCHED[0]}&jprop.bench.batchSteps=${SCHED[1]}&jprop.bench.batches=${SCHED[2]}` : "");
+      + (opt("schedule") ? `&jprop.bench.warmup=${SCHED[0]}&jprop.bench.batchSteps=${SCHED[1]}&jprop.bench.batches=${SCHED[2]}` : "")
+      + (opt("jar") ? `&jar=${encodeURIComponent(opt("jar"))}` : "");   // --jar FILE: another jar from public/ (ours)
   } else {
     const port = 8000 + Math.floor(Math.random() * 900);
     server = spawn("node", [tool("serve-coep.mjs"), CJ ? `${join(HERE, "cheerpj")}:${join(ARMS(), "cheerpj")}` : TEAVM_DIRS[arm](), String(port)],

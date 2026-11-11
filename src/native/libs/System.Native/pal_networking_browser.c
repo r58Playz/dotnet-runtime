@@ -528,7 +528,11 @@ int32_t SystemNative_Select(int* readFds, int readFdsCount, int* writeFds, int w
     return Error_ENOTSUP;
 }
 
-// To silence linker when linking with -nostdlib and dependency from libc/syslog
+#ifdef SYSTEM_NATIVE_STUB_LIBC_SOCKETS
+// To silence linker when linking with -nostdlib and dependency from libc/syslog (CoreCLR only, see CMakeLists.txt).
+// Built into mono's static System.Native, these DEFINE libc's socket/connect/send for the whole app link, so libc's
+// are never pulled in: every native in the app, not only System.Native, got ENOTSUP (the JDK's libnio under
+// FNA-WASM-Build's WasmFS sockets, emsdk.12, 2026-11-10).
 int socket(int domain, int type, int protocol)
 {
     (void)domain;
@@ -556,4 +560,4 @@ ssize_t send(int fd, const void *buf, size_t len, int flags)
     errno = ENOTSUP;
     return -1;
 }
-
+#endif // SYSTEM_NATIVE_STUB_LIBC_SOCKETS
