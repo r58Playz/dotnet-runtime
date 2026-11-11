@@ -120,7 +120,9 @@ export const SEEDS = {
 export function resolveSeed (seed = process.env.MC_SEED || DEFAULT_SEED) {
   if (seed && typeof seed === "object") return seed;
   const name = String(seed);
-  if (SEEDS[name]) return { name, ...SEEDS[name], dir: join(MCSR_DIR, SEEDS[name].dir) };
+  /* MC_SEED_PROFILE=<profile dir>: a registered seed's launcher, menu and markers, booted from another profile -- a
+   * run's own browser-profile after it saved its world, to load that save back (2026-11-10, the OPFS save check). */
+  if (SEEDS[name]) return { name, ...SEEDS[name], dir: process.env.MC_SEED_PROFILE ? resolve(process.env.MC_SEED_PROFILE) : join(MCSR_DIR, SEEDS[name].dir) };
   const dir = resolve(name);
   const hit = Object.entries(SEEDS).find(([, s]) => join(MCSR_DIR, s.dir) === dir);
   if (hit) return { name: hit[0], ...hit[1], dir };

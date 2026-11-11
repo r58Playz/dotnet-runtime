@@ -605,8 +605,10 @@ if (JITDUMP) {
   }
 }
 
-/* The browser profile is 700 MB of reflinked seed and is of no analytical value once the run is over. */
-rmSync(profile, { recursive: true, force: true });
+/* The browser profile is 700 MB of reflinked seed and is of no analytical value once the run is over -- unless the run
+ * is there to write a save another run loads back (MC_KEEP_PROFILE=1, with MC_SEED_PROFILE on the second run). */
+if (process.env.MC_KEEP_PROFILE === "1") console.log(`[mcperf] keeping ${profile} (MC_KEEP_PROFILE=1)`);
+else rmSync(profile, { recursive: true, force: true });
 const sz = execSync(`du -sh ${JSON.stringify(outdir)} | cut -f1`, { encoding: "utf8" }).trim();
 console.log(`[mcperf] ${outdir} is ${sz}`);
 writeFileSync(join(outdir, "capture.txt"), `${final}\n`);
