@@ -21,7 +21,7 @@ import { WasmValtype } from "./jiterpreter-opcodes";
 import { mono_log_error, mono_log_info } from "./logging";
 import { utf8ToString } from "./strings";
 import WasmEnableThreads from "consts:wasmEnableThreads";
-import { mono_wasm_pthread_ptr } from "./pthreads/shared";
+import { threads_c_functions as tcwraps } from "./cwraps";
 import {
     JiterpreterTable, JiterpCounter, JitQueue, JiterpMember
 } from "./jiterpreter-enums";
@@ -197,7 +197,7 @@ class TrampolineInfo {
 let mostRecentOptions: JiterpreterOptions | undefined = undefined;
 
 function has_live_pthread () {
-    return !WasmEnableThreads || mono_wasm_pthread_ptr() !== PThreadPtrNull;
+    return !WasmEnableThreads || tcwraps.pthread_self() !== PThreadPtrNull;
 }
 
 // If a method is freed we need to remove its info (just in case another one gets
