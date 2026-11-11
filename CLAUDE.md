@@ -21,15 +21,15 @@ file leaves out.
 |---|---|
 | the backend | `src/mono/mono/mini/mini-wasm.c` (knobs, registry, admission, GC shadow frame) + its `#include`d `.inc` files: `-emitter` IR -> wasm, `-ir` the relocatable body (`WjBody`) and `wj_assemble`, `-batching` co-location, `-publish` asynchronous republication, `-lazy` lazy f-slot pools, `-vslow`, `-diagnostics`; and `wasm-encoder.c` |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
-| this branch | `wasm-jit-11.0.0` (.NET 11.0.0, emscripten 6.0.3, no JSPI), worktree `~/fna-wasm/dotnet-runtime-jit`. Rounds before 2026-11-10 cite `wasm-jspi-jit-10.0.3` (frozen at de5ea57c395); `scratchpad/notes/REBASE-11.0.0-HASHMAP.txt` maps each of its commits to this branch's (`cherry picked from` lines too) |
-| the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft-net11` (branch `net11`), `frontend/src/dotnet/index.ts`; the 10.0.3 app is `~/Documents/ikvm-wasm/ikvmcraft` |
+| this branch | `wasm-jit-11.0.0` (.NET 11.0.0, emscripten 6.0.3, no JSPI), the main checkout `~/fna-wasm/dotnet-runtime-jit`, which holds `.git` and `scratchpad/`. The 10.0.3 tree is a worktree at `~/fna-wasm/dotnet-runtime-jspi` (keep it: this branch's build uses the emscripten .NET provisioned in ITS `.dotnet`; its `scratchpad` is a symlink here). Rounds before 2026-11-10 cite `wasm-jspi-jit-10.0.3` (frozen at de5ea57c395); `scratchpad/notes/REBASE-11.0.0-HASHMAP.txt` maps each of its commits to this branch's (`cherry picked from` lines too) |
+| the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft` (branch `net11`), `frontend/src/dotnet/index.ts`; the 10.0.3 app is its worktree `~/Documents/ikvm-wasm/ikvmcraft-10.0.3` (branch `master`) |
 | IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm`; its natives from ikvm-wasm-build `net11-sockets` |
 | the GL stack (mesa-wink) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/native-deps/mesa-wink`, its own repo (branch `wink`, origin `MercuryWorkshop/mesa-wink`; ikvm-wasm-build ignores it) -- see **The GL stack** |
 | measurement harness | `wjharness/` (tracked; `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/` -- see **The harness** |
 | **the findings log -- read before proposing anything** | `scratchpad/notes/MINECRAFT-FINDINGS.md` (untracked) |
 | chromium / V8 source | `~/Documents/chromium/src` (v8 at `src/v8`) |
-| split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft-net11/loader/obj/dotnet.native.debug.wasm` |
-| the canonical emsdk (6.0.3) | `~/Documents/ikvm-wasm/ikvmcraft-net11/statics/emsdk` -- see **Building** |
+| split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
+| the canonical emsdk (6.0.3) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` -- see **Building** |
 | FNA-WASM-Build (runtime build, emsdk patches) | `~/fna-wasm/FNA-WASM-Build-net11`, branch `net11` |
 
 The findings log is long. The alternative to reading the relevant part is re-running an experiment that already has an
@@ -572,9 +572,10 @@ inlined away). Prove a revert both ways: the new marker present and the reverted
   means `embuilder build --force <lib>` with `EM_FROZEN_CACHE` set EMPTY (.NET's `.emscripten` reads it with
   `bool(os.getenv(..., 'True'))`), then a redeploy. **embuilder clears the whole cache when `cache/sanity.txt` names
   another toolchain path** (R502), and the provisioned sanity.txt names .NET's CI path; the freeze script handles both.
-* **The deploy environment for this branch**: `IKVMCRAFT=~/Documents/ikvm-wasm/ikvmcraft-net11`,
-  `FNA_WASM_BUILD=~/fna-wasm/FNA-WASM-Build-net11` (or set them in `~/.config/wjharness/machine.env`); the harness
-  defaults to `dotnet-jit.zip`.
+* **The harness needs no environment for this branch**: `~/.config/wjharness/machine.env` names `IKVMCRAFT` (the
+  `net11` checkout) and `FNA_WASM_BUILD=~/fna-wasm/FNA-WASM-Build-net11`, `WJ_HOME` defaults to this checkout's
+  `scratchpad/`, and `DOTNET_ZIP` to `dotnet-jit.zip`. To measure the 10.0.3 app, set `IKVMCRAFT` to its worktree:
+  `ensure-server` re-creates the dev server there.
 * **Never edit a source file while a build of it is in flight.** The binary's contents become unknowable, and so does
   every number taken on it. Treat the build and deploy windows as read-only and queue the edits.
 
