@@ -27,7 +27,7 @@ const FW = join(APP, "frontend", "public", "_framework");
 
 /** Files worth naming in a capture: the runtime, and the managed assemblies most likely to be stale. */
 const OF_INTEREST = [/^dotnet\.native\.[^.]+\.wasm$/, /^dotnet\.runtime\.[^.]+\.js$/,
-  /^IKVM\.Runtime\.[^.]+\.dll$/, /^IKVM\.Java\.[^.]+\.dll$/, /^IkvmWasm\.[^.]+\.dll$/,
+  /^IKVM\.Runtime\.[^.]+\.(dll|wasm)$/, /^IKVM\.Java\.[^.]+\.(dll|wasm)$/, /^IkvmWasm\.[^.]+\.(dll|wasm)$/,   // .wasm: webcil
   /* dotnet.native.<hash>.js and the worker module carry everything emscripten's JS libraries contribute at
    * LINK time -- library_pthread.js, the GL bindings, WASMFS. A change to the emsdk under
    * ikvmcraft/statics/emsdk lands ONLY here, in neither the wasm nor dotnet.runtime.js, so deploy.sh's marker

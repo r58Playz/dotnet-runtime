@@ -42,7 +42,7 @@ const KEYS = [
     const d = join(HOME, ".local", "share", "PrismLauncher"); return existsSync(join(d, "libraries")) ? d : undefined; }],
   ["D8", "a d8 binary for ledger/d8x86.py", undefined],
   ["FNA_WASM_BUILD", "the FNA-WASM-Build checkout (build-dotnet.sh)", () => resolve(REPO, "..", "FNA-WASM-Build")],
-  ["DOTNET_ZIP", "the runtime pack build-dotnet.sh writes and deploy installs", () => join(REPO, "dotnet-jspi.zip")],
+  ["DOTNET_ZIP", "the runtime pack build-dotnet.sh writes and deploy installs", () => join(REPO, "dotnet-jit.zip")],
   ["EMSDK", "the canonical emsdk (llvm-dwarfdump, embuilder)", () => cfg("IKVMCRAFT") && join(cfg("IKVMCRAFT"), "statics", "emsdk")],
   ["CHROME_BIN", "the browser every driver launches", () => which("chromium") || which("chromium-browser") || which("google-chrome-stable")],
   ["SERVE_URL", "where the dev server serves the app", () => "https://localhost:5021/"],

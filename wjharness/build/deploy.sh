@@ -40,7 +40,10 @@ unzip -q -o statics/dotnet.zip -d statics/dotnet
 # it, and anything that picks "the" wasm by globbing can grab the stale one -- which is how the first
 # version of this very script reported MISSING markers against a directory that also held the fresh
 # binary. The Makefile's `build` target removes both directories first; do the same.
-rm -rf loader/bin/Release/net10.0/publish/wwwroot/_framework frontend/public/_framework
+# The app's target framework (net10.0 on the 10.0.3 runtime, net11.0 on wasm-jit-11.0.0) names its publish directory.
+TFM=$(sed -n 's:.*<TargetFramework>\(net[0-9.]*\)</TargetFramework>.*:\1:p' loader/IkvmWasm.csproj | head -1)
+[ -n "$TFM" ] || { echo "deploy: FAIL — no <TargetFramework> in loader/IkvmWasm.csproj" >&2; exit 1; }
+rm -rf "loader/bin/Release/$TFM/publish/wwwroot/_framework" frontend/public/_framework
 
 # AND remove loader/{bin,obj} ENTIRELY -- the Makefile's `dotnetclean` does this and it is load-bearing.
 #
@@ -126,7 +129,7 @@ mkdir -p "$BUILD_TMPDIR"
 		exit 1
 	}
 
-cp -r loader/bin/Release/net10.0/publish/wwwroot/_framework frontend/public/
+cp -r "loader/bin/Release/$TFM/publish/wwwroot/_framework" frontend/public/
 
 # THE MAKEFILE'S TWO POST-PUBLISH PATCHES (Makefile:63,65), WHICH THIS SCRIPT USED TO OMIT.
 #
@@ -322,7 +325,8 @@ else   # split by split-resources.py above: the parts and the manifest are what 
 	check_served "wasm part 0" "/_framework/$(basename "$W")0" "$(stat -c%s "${W}0")" || exit 1
 	check_served "split manifest" "/_framework/split-resources.json" "$(stat -c%s frontend/public/_framework/split-resources.json)" || exit 1
 fi
-DLL="$(ls frontend/public/_framework/IKVM.Runtime.*.dll 2>/dev/null | head -1)"
+# a webcil build (WasmEnableWebcil) serves assemblies as .wasm
+DLL="$(ls frontend/public/_framework/IKVM.Runtime.*.dll frontend/public/_framework/IKVM.Runtime.*.wasm 2>/dev/null | head -1)"
 if [ -n "$DLL" ]; then
 	check_served "dll" "/_framework/$(basename "$DLL")" "$(stat -c%s "$DLL")" || exit 1
 fi

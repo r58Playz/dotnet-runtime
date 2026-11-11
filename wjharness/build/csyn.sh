@@ -30,9 +30,10 @@ out=$(python3 - "$root" "$1" <<'PY' 2>&1
 import json, os, shlex, subprocess, sys
 root, want = sys.argv[1], os.path.abspath(sys.argv[2])
 found = False
-for db in ("artifacts/obj/mono/browser.wasm.Release/compile_commands.json",
-           "artifacts/obj/mono/browser.wasm.Release/cross/compile_commands.json",
-           "artifacts/obj/native/net10.0-browser-Release-wasm/compile_commands.json"):
+import glob
+for db in ["artifacts/obj/mono/browser.wasm.Release/compile_commands.json",
+           "artifacts/obj/mono/browser.wasm.Release/cross/compile_commands.json"] + sorted(
+           os.path.relpath(p, root) for p in glob.glob(os.path.join(root, "artifacts/obj/native/net*-browser-Release-wasm/compile_commands.json"))):
     p = os.path.join(root, db)
     if not os.path.exists(p):
         continue
