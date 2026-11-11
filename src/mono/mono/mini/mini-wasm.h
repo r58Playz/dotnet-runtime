@@ -912,7 +912,7 @@ enum {
 	 *
 	 * RETIRED vs FREED is the leak reading: they should track. DEPTH_MAX is the one that matters, because
 	 * reclamation is blocked while ANY worker is inside the bracket and one parked inside a JS module
-	 * compile or a JSPI suspension defers everything -- a burst by design, unbounded in principle, so the
+	 * compile or a GC-safe region defers everything -- a burst by design, unbounded in principle, so the
 	 * high-water mark is read rather than asserted. RECLAIMS is the liveness signal: 0 with RETIRED large
 	 * means the bracket is never observed empty and the scheme has degenerated into the leak it replaced. */
 	WJC_RETIRED, WJC_RETIRE_FREED, WJC_RETIRE_RECLAIMS, WJC_RETIRE_DEPTH_MAX,

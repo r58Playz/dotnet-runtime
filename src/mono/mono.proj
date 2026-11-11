@@ -358,7 +358,8 @@
     <ItemGroup Condition="'$(TargetsBrowser)' == 'true'">
       <!-- R305: C float->int casts compile to wasm's saturating trunc_sat instead of a range check plus INT_MIN,
            so the interpreter's conv.* agree with the wasm JIT (SAT_CONV), the jiterpreter and the AOT image
-           (llvm.fpto*i.sat), and with Java's conversion rule. Shipped in every browser JSPI runs on. -->
+           (llvm.fpto*i.sat), and with Java's conversion rule. Default-on since emscripten 4; kept explicit because
+           that agreement depends on it. -->
       <_MonoCFLAGS Include="-mnontrapping-fptoint"/>
       <_MonoCXXFLAGS Include="-mnontrapping-fptoint"/>
       <_MonoCMakeArgs Include="-DENABLE_LLVM_RUNTIME=1"/>

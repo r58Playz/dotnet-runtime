@@ -103,7 +103,7 @@ extern void stackRestore (uintptr_t sp);   /* compiler-rt (stack_ops.S): sets __
 
 /* Overflow-safe probe bounds for the JIT-boundary diagnostics (mirrors mini-wasm.c wj_probe_ok):
  * the naive `a + 8 > memsz` WRAPS for a near 2^32 (e.g. an object whose first word is int -8), so the
- * probe's own speculative deref becomes the OOB trap that silently kills a JSPI-suspended thread. Also
+ * probe's own speculative deref becomes an OOB trap that kills the worker. Also
  * clamps the 65536-page (4GB) case where `pages << 16` overflows 32-bit gsize to 0. */
 static inline gsize
 wj_memsz (void)
@@ -6274,8 +6274,7 @@ typedef struct {
  * unconditionally (void returns included). Derived from the InterpEntryData instead of a thread flag:
  * the old __thread wj_residual_active stayed TRUE for the whole dynamic extent of the residual callee,
  * so ANY nested interp_entry reached from inside it — a delegate/ftndesc call into an interpreted
- * method, an AOT callee calling back into the interpreter, or a JSPI-interleaved entry on the same
- * worker — was misclassified as the residual entry (observed via the leak diagnostic this replaces):
+ * method, or an AOT callee calling back into the interpreter — was misclassified as the residual entry (observed via the leak diagnostic this replaces):
  * it took the no-write-barrier ref-return store below with a res that is NOT the scratch, and made
  * do_jit_call's jiterp-thunk path skip its LMF for a stock MINT_JIT_CALL (pass-1 then misses handlers
  * across that interp->AOT transition). Deriving from data->res is leak-proof by construction: nested
@@ -7636,8 +7635,8 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 		}
 	}
 	/* interp_entry recognises this as the residual entry by data->res pointing at the scratch result
-	 * slot (wj_entry_is_residual) — no thread flag to set/restore, so nothing can leak into nested or
-	 * JSPI-interleaved interp entries, and a C++/wasm-EH unwind out of the callee needs no cleanup. */
+	 * slot (wj_entry_is_residual) — no thread flag to set/restore, so nothing can leak into nested
+	 * interp entries, and a C++/wasm-EH unwind out of the callee needs no cleanup. */
 	interp_entry (&data);
 	/* If the callee threw, interp_entry returned with the resume-state set (and without writing the
 	 * result). Tell the JITted caller so it aborts instead of dereferencing the stale scratch slot. */
@@ -12274,8 +12273,8 @@ mono_interp_isinst (MonoObject* object, MonoClass* klass)
 #ifdef HOST_BROWSER
 	/* DIAG (isinst OOB): an object reaching here from a JITted caller (mono_wasm_jit_call_interp, e.g. the
 	 * LandPathNodeMaker pathfinding chain) has been observed with a garbage vtable -> mono_object_class()'s
-	 * vtable->klass read OOBs ("memory access out of bounds"), and because this runs on a JSPI-suspended
-	 * stack the resulting wasm trap silently kills the worker (the GC then stalls trying to suspend it),
+	 * vtable->klass read OOBs ("memory access out of bounds"), and the resulting wasm trap kills the
+	 * worker (the GC then stalls trying to suspend it),
 	 * giving a context-free crash. Validate object + vtable + klass via RAW word reads (no struct deref, so
 	 * no OOB) BEFORE mono_object_class. On garbage, log (rate-limited, greppable) and return FALSE instead
 	 * of dereferencing — the run continues so we can see how often / with what target type it happens.
@@ -12643,7 +12642,7 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
  * mono_wasm_jit_invoke_caught (which catches a C++/wasm-EH unwind escaping the JITted method; pass 1
  * already installed the interp resume-state, so CHECK_RESUME_STATE resumes / re-propagates) and
  * breaks out of the opcode. The LMF push marks the managed->native boundary so GC stack-walking and
- * cooperative/JSPI suspends inside the JITted method are handled correctly.
+ * cooperative suspends inside the JITted method are handled correctly.
  *
  * Falls through when the callee has no published slot (stays interp-resident). Jumps to
  * FALLBACK_LABEL when the slot is published but THIS thread failed to instantiate the module

@@ -3226,7 +3226,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				lcse_nopin = sl_elide;
 				/* DEAD-SLOT ZEROING (MONO_WASM_JIT_SLOTZERO, Phase 3a): a slotted single-bb vreg is
 				 * provably dead after its last use — zero its slot there so the dead object stops
-				 * pinning (a long-lived/JSPI-suspended frame otherwise pins it until frame pop).
+				 * pinning (a long-lived frame otherwise pins it until frame pop).
 				 * Emission happens at the ordinal AFTER the last use (a last use as a call arg must
 				 * stay pinned across that whole call), which is always still inside the bb because a
 				 * kill is only worth emitting when a GC point FOLLOWS the last use in the same bb

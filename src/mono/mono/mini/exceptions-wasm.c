@@ -195,7 +195,7 @@ mono_arch_unwind_frame (MonoJitTlsData *jit_tls,
 
 		/* The wasm top-LMF marker is an all-zero MonoLMF (MONO_ARCH_INIT_TOP_LMF_ENTRY is empty).
 		 * Normally it is recognized by pointer identity with jit_tls->first_lmf above. A cooperative
-		 * attach/detach or JSPI TLS handoff can, however, leave an older root allocation at the end of
+		 * attach/detach can, however, leave an older root allocation at the end of
 		 * the active LMF chain while jit_tls->first_lmf names the replacement. It is still a terminal
 		 * marker, not a managed frame: it has no predecessor, address, or method. Recognize that exact
 		 * structural sentinel so StackTrace stops cleanly instead of trying to compile method == NULL.

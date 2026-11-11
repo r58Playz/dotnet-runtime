@@ -846,7 +846,7 @@ mono_set_lmf_addr (MonoLMF **lmf_addr)
 	 * same address's previous_lmf changes under us (0 -> 0x4) -- i.e. it is recycled stack, not an LMF. The
 	 * remaining way that happens without anyone "writing an LMF" is for lmf_addr itself to be re-pointed:
 	 * every read of the head then comes from wherever this points. setup_jit_tls_data passes
-	 * &jit_tls->lmf (heap); anything else -- a coop attach/detach or a JSPI TLS handoff pointing it at a
+	 * &jit_tls->lmf (heap); anything else -- a coop attach/detach pointing it at a
 	 * stack slot or another jit_tls -- makes the head live in memory that can be reused underneath it.
 	 * Print the target and the value it currently holds so the two cases are distinguishable. */
 	{

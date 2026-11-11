@@ -5,7 +5,7 @@
  * interpreter segments, and the IL_STATE records of methods WITH clauses (llvm-only deopt, the wasm JIT's WjEhRec).
  * Every JIT or AOT frame without clauses was invisible -- and every consumer (CoreLib's StackFrame/StackTrace, IKVM's
  * getCallerClass/StackWalker/exception traces) assumes it sees every frame. V8 does see every wasm frame, including the
- * ones it inlined itself and across JSPI stack switches, so a walk asks it once (one EM_JS call) and merges the answer
+ * ones it inlined itself, so a walk asks it once (one EM_JS call) and merges the answer
  * with the LMF chain, which still owns the interpreter's frames: those are data, and appear to V8 only as
  * mono_interp_exec_method activations. Nothing on any hot path changes; a walk costs ~90-130 us in a 26.2 boot (~60-90
  * V8 frames each, `[wasm-jit stackwalk]` us/walks at the title, 2026-10-24), ~2% of boot (R516).

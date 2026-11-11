@@ -72,8 +72,8 @@ g_static_assert (WJC_MAX == 607);   /* + the EH-inline hot-size / new-root quart
  *
  * PROCESS-WIDE ATOMICS, not just thread-locals, and that is forced rather than preferred: the worker
  * isolates whose numbers we want are pthreads parked in synchronous wasm, so CDP Runtime.evaluate never
- * returns for them (33 of 34 worker targets read "unreachable"). The same blocking is why the unlanded
- * SHARE_MODULES postMessage relay cannot work without JSPI suspends. Aggregating in C and reading the
+ * returns for them (33 of 34 worker targets read "unreachable"). The same blocking is why a postMessage
+ * relay (the unlanded SHARE_MODULES) cannot work: those workers never return to their event loop. Aggregating in C and reading the
  * total from the page target is the only reliable channel. These live in the wasm heap, which pthreads
  * share, so any thread's increment is visible.
  *

@@ -3069,8 +3069,8 @@ wj_depset_new (const int *slots, const guint32 *sigs, MonoMethod *const *methods
  *      The exit now reads one plain word and does nothing at all in the steady state, because retires
  *      happen during compilation and dispatch is not compiling.
  *
- * WHAT IS STILL TRUE: one worker parked inside the bracket (a JS module compile, a GC-safe region, a JSPI
- * suspension) holds the count non-zero and defers reclamation of everything. That is a burst, not a leak,
+ * WHAT IS STILL TRUE: one worker parked inside the bracket (a JS module compile, a GC-safe region) holds the
+ * count non-zero and defers reclamation of everything. That is a burst, not a leak,
  * but it is unbounded in principle -- so the depth and its high-water mark are COUNTED. A guard whose
  * bound is asserted rather than read is not a bound.
  */
@@ -5867,8 +5867,7 @@ mono_wasm_jit_admit (int desc_id)
  * the exact mechanism AOT'd LLVM code relies on for refs in C locals. This replaced a custom
  * per-thread "ref shadow stack" arena (mono_gc_register_root + enter/leave + zero-on-pop + balance
  * guards): with real frames, a popped/unwound frame falls below the SP and is simply no longer
- * scanned, C++/wasm-EH landing pads restore the SP like every LLVM-compiled catch does, and
- * JSPI-suspended computations keep their frames inside the scanned [SP, stack-top] region — whatever
+ * scanned, and C++/wasm-EH landing pads restore the SP like every LLVM-compiled catch does — whatever
  * guarantee AOT frames have, JIT frames inherit by construction.
  *
  * Frame layout (stack grows DOWN; entry_sp is the SP at method entry):
@@ -5888,24 +5887,22 @@ mono_wasm_jit_admit (int desc_id)
  *   - MONO_WASM_JIT_SLOTLIVE (slot elision): only refs a GC can actually OBSERVE (live across a
  *     GC-capable instruction, or spanning bbs) get a slot at all; the rest stay in plain locals.
  *   - MONO_WASM_JIT_SLOTZERO (dead-slot zeroing): a single-bb slotted ref's slot is zeroed after
- *     its last use, so dead objects stop pinning inside long-lived (JSPI-suspended) frames.
+ *     its last use, so dead objects stop pinning inside long-lived frames.
  * The whole scheme rests on two invariants:
- *   (I1) a pinned object never MOVES — so a cached wasm-local copy (REF_WT) can't go stale, and a
- *        JSPI-suspended computation's frozen locals stay valid across a GC. The same invariant AOT
- *        code depends on for refs in registers.
+ *   (I1) a pinned object never MOVES — so a cached wasm-local copy (REF_WT) can't go stale. The same
+ *        invariant AOT code depends on for refs in registers.
  *   (I2) every slot is CURRENT at every GC point — the slot store is emitted adjacent to each def
  *        with no GC point in between, so a multithreaded STW at an OP_GC_SAFE_POINT poll always
  *        sees live values.
  * Rejected alternatives, for the record: precise/moving roots (incompatible with I1-dependent
- * local caching, JSPI-frozen locals, and wasm operand-stack transients across GC points) and a
+ * local caching and wasm operand-stack transients across GC points) and a
  * registered arena root (the pre-frame design this section replaced — loses the by-construction
- * EH/JSPI guarantees of real C-stack frames).
+ * EH guarantees of real C-stack frames).
  *
  * QUALIFY THE ARENA REJECTION (R191). It is sound for an arena whose bump pointer is a GLOBAL, which
  * is what the pre-frame design had (enter/leave + zero-on-pop + balance guards). It does NOT follow for
  * an arena whose pointer is THREADED as a call parameter: a parameter is per-frame and per-stack by
- * construction, so unwinding to a caller restores that caller's value with no explicit pop, and JSPI
- * saves it with the frame. CoreCLR's wasm backend threads exactly such a pointer
+ * construction, so unwinding to a caller restores that caller's value with no explicit pop. CoreCLR's wasm backend threads exactly such a pointer
  * (WellKnownArg::WasmShadowStackPointer, added to every managed call at morph.cpp:1803-1809) and
  * NativeAOT-wasm scans a separate TLS-bounded region conservatively on top of it
  * (nativeaot/Runtime/thread.cpp:419). Threading is not an alternative to a private region — it is what
@@ -6284,7 +6281,7 @@ wj_memsz (void)
 /* Overflow-safe "is `a` a plausible aligned pointer we may speculatively READ 8 bytes at?" for the
  * OBJGUARD/MISSEDREF diagnostic probes. The naive form `a + 8 > memsz` WRAPS for a near 2^32 —
  * e.g. probing a heap word that holds a small negative int like -8 (0xFFFFFFF8): a+8 == 0 passes,
- * and the diagnostic's own deref becomes the OOB trap that silently kills a JSPI-suspended thread
+ * and the diagnostic's own deref becomes an OOB trap that kills the worker
  * and stalls the GC (seen live: MISSEDREF ICONST probe trapping inside mono_wasm_emit_method). */
 static inline gboolean
 wj_probe_ok (gsize a, gsize memsz)
@@ -6452,8 +6449,8 @@ mono_wasm_jit_check_store (guint8 *addr, int kind)
 			 * field not yet assigned), so *base reads as 0. kind=2 cannot distinguish that benign shape from a
 			 * collected/zeroed object, and hard-trapping on it was the consistent MemoryMappingTree$Entry:.ctor
 			 * false positive that masked everything downstream. Rate-limited log only, so a genuinely suspicious
-			 * zeroed-object pattern stays visible without killing the thread (a wasm trap on a JSPI-suspended
-			 * stack silently kills it and stalls the GC). */
+			 * zeroed-object pattern stays visible without killing the thread (a wasm trap kills the worker and
+			 * stalls the GC). */
 			if (vt == 0) {
 				if (kind == 5) {
 					printf ("WASM_JIT_BAD_VCALL_THIS obj=%p — receiver has null vtable before virtual dispatch; method in the trap below:\n", (void *) addr);
