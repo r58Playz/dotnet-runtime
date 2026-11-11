@@ -243,6 +243,13 @@ async function onRuntimeInitializedAsync (userOnRuntimeInitialized: (module:Emsc
             runtimeHelpers.monoThreadInfo = monoThreadInfo;
             runtimeHelpers.isManagedRunningOnCurrentThread = false;
             update_thread_info();
+            // Every pthread reserves its jiterpreter tables in mono_wasm_pthread_on_pthread_created, the deputy
+            // included, and that runs before the deputy's start_runtime. The options size the tables, and every
+            // thread must reserve them at the same indices, so parse them here, once, for the whole process.
+            if (runtimeHelpers.config.runtimeOptions) {
+                mono_log_debug("runtime options parsed on main, before the deputy reserves its tables");
+                mono_wasm_set_runtime_options(runtimeHelpers.config.runtimeOptions);
+            }
             runtimeHelpers.managedThreadTID = tcwraps.mono_wasm_create_deputy_thread();
 
             // await mono started on deputy thread
@@ -446,7 +453,8 @@ export async function start_runtime () {
             else
                 throw new Error(`Expected environment variable '${k}' to be a string but it was ${typeof v}: '${v}'`);
         }
-        if (runtimeHelpers.config.runtimeOptions)
+        // with threads, main parsed them before creating this (the deputy) thread
+        if (!WasmEnableThreads && runtimeHelpers.config.runtimeOptions)
             mono_wasm_set_runtime_options(runtimeHelpers.config.runtimeOptions);
 
         if (runtimeHelpers.emscriptenBuildOptions.enableEventPipe) {
