@@ -449,6 +449,10 @@ async function createEmscriptenWorker (): Promise<EmscriptenModuleInternal> {
     await loaderHelpers.afterConfigLoaded.promise;
 
     prepareAssetsWorker();
+    // Before the modules: initializing them runs the native module's DOTNET.setup, which copies loaderHelpers.fetch_like
+    // into emscripten's module-scoped `fetch` (dotnet.es6.extpost.js shadows the global). Done after, every worker's
+    // emscripten `fetch` was undefined, and WasmFS's fetch backend failed each read with EBADF (2026-11-10).
+    await detect_features_and_polyfill(emscriptenModule);
     const promises = importModules();
     const es6Modules = await Promise.all(promises);
     (globalThis as any).name = "em-pthread";
@@ -461,8 +465,6 @@ async function createEmscriptenWorker (): Promise<EmscriptenModuleInternal> {
     if (ENVIRONMENT_IS_WEB && loaderHelpers.config.forwardConsole && typeof globalThis.WebSocket != "undefined") {
         setup_proxy_console("main", globalThis.console, globalThis.location.origin);
     }
-
-    await detect_features_and_polyfill(emscriptenModule);
 
     await mono_download_assets();
 

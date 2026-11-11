@@ -538,8 +538,6 @@ export interface PThreadWorker extends Worker {
     pthread_ptr: PThreadPtr;
     // emscripten's "loaded" reply, wrapped by replaceEmscriptenPThreadUI (info.isLoaded is set when it resolves)
     afterLoaded?: Promise<PThreadWorker>;
-    // resolved when main has posted the worker its config, which its instantiateWasmWorker waits for
-    afterConfigSent?: PromiseAndController<void>;
     // this info is updated via async messages from the worker, it could be stale
     info: PThreadInfo;
     thread?: Thread;

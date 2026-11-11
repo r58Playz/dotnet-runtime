@@ -99,7 +99,6 @@ function monoWorkerMessageHandler (worker: PThreadWorker, wasmModule: WebAssembl
                     wasmModule,
                     webcilModules: (globalThis as any).__monoWebcilModules,
                 });
-                worker.afterConfigSent?.promise_control.resolve();
             });
             break;
         }
@@ -286,36 +285,36 @@ function getNewWorker (modulePThread: PThreadLibrary): PThreadWorker {
         modulePThread.loadWasmModuleToWorker(worker);
     }
 
-    // The oldest worker that is ready, so the first pthread (the deputy) gets dotnet-worker-001 and a worker
+    // The oldest worker that has loaded, so the first pthread (the deputy) gets dotnet-worker-001 and a worker
     // allocated just above is taken last. This read emscripten's worker.loaded, which emscripten 6 no longer sets,
-    // so the scan never matched and pop() handed out the NEWEST worker -- the one allocated above, still loading.
-    // Ready is two things since emscripten 6: it posts "loaded" when the worker STARTS instantiating, and from then
-    // on runs whatever arrives, while our instantiateWasmWorker first waits for the config reply to its "preload"
-    // (sent only once every assembly is registered, R529). A "run" that overtakes that reply starts a pthread on a
-    // worker with no wasm instance, and the thread never runs (its creator waits forever).
+    // so the scan never matched and pop() handed out the NEWEST worker -- the one allocated above, not yet loaded.
+    // A worker that has not loaded DROPS what main posts to it: it loads itself (createEmscriptenWorker waits for
+    // its config, initializes the modules, which installs emscripten's message handler, then dispatches its own
+    // CMD_LOAD), and until that handler exists a message has no listener. Its "run" was lost that way, so the
+    // thread never started and its creator waited forever (PreInit's fetch-backend ProxyWorker, 2026-11-10).
     for (let i = 0; i < pool.length; i++) {
         const worker = pool[i];
-        if (worker.info.isLoaded && worker.afterConfigSent?.promise_control.isDone) {
+        if (worker.info.isLoaded) {
             pool.splice(i, 1);
             return worker;
         }
     }
 
-    // None is ready. Hand out the oldest, and hold what spawnThread posts to it (the "run") until it is: the
-    // config reply is then posted before the "run", the order a ready worker has by construction.
+    // None has loaded. Hand out the oldest, and hold what spawnThread posts to it (the "run") until its "loaded",
+    // which the worker posts once its handler is installed.
     const worker = pool.shift()!;
-    mono_log_debug(() => `No ready WebWorker; the thread starts once dotnet-worker-${worker.info.workerNumber} is ready. Increase pthreadPoolInitialSize to avoid the wait. Running threads ${Object.keys(modulePThread.pthreads).length}. Unused workers: ${pool.length}`);
-    holdMessagesUntilReady(worker);
+    mono_log_debug(() => `No loaded WebWorker; the thread starts once dotnet-worker-${worker.info.workerNumber} has loaded. Increase pthreadPoolInitialSize to avoid the wait. Running threads ${Object.keys(modulePThread.pthreads).length}. Unused workers: ${pool.length}`);
+    holdMessagesUntilLoaded(worker);
     return worker;
 }
 
-function holdMessagesUntilReady (worker: PThreadWorker): void {
-    if (!worker.afterLoaded || !worker.afterConfigSent) return;
+function holdMessagesUntilLoaded (worker: PThreadWorker): void {
+    if (!worker.afterLoaded) return;
     const held: [any, any][] = [];
     (worker as any).postMessage = (message: any, transfer?: any) => {
         held.push([message, transfer]);
     };
-    Promise.all([worker.afterLoaded, worker.afterConfigSent.promise]).then(() => {
+    worker.afterLoaded.then(() => {
         delete (worker as any).postMessage; // Worker.prototype's again
         for (const [message, transfer] of held)
             worker.postMessage(message, transfer);
@@ -334,7 +333,6 @@ function allocateUnusedWorker (): PThreadWorker {
         type: "module",
     }) as PThreadWorker;
     getUnusedWorkerPool().push(worker);
-    worker.afterConfigSent = createPromiseController<void>();
     worker.info = {
         workerNumber,
         pthreadId: PThreadPtrNull,
