@@ -130,6 +130,10 @@ mkdir -p "$BUILD_TMPDIR"
 	}
 
 cp -r "loader/bin/Release/$TFM/publish/wwwroot/_framework" frontend/public/
+# The JDK image (conf/, lib/, the libraries' placeholder files), as `make build` copies it: PreInit mounts it on a
+# fetch backend, and a checkout that never ran `make build` has none -- the dev server answers every path with
+# index.html, and Java fails at java.security (a fresh worktree did, 2026-11-10).
+cp -r statics/ikvm/image frontend/public/
 
 # THE MAKEFILE'S TWO POST-PUBLISH PATCHES (Makefile:63,65), WHICH THIS SCRIPT USED TO OMIT.
 #
