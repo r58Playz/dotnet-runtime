@@ -254,7 +254,16 @@ restarted=""
 # ONE unit name for the dev server, shared with drive/ensure-server.sh: $DEV_UNIT running $DEV_CMD (lib/paths.mjs). Two
 # names used to coexist (ikvmcraft-dev / pnpm here-and-there, ikvmcraft-vite / npm here), so this branch missed the live
 # unit and killed its process from the one below.
-if systemctl --user is-active --quiet "$DEV_UNIT.service" 2>/dev/null; then
+udir="$(systemctl --user show "$DEV_UNIT.service" -p WorkingDirectory --value 2>/dev/null)"
+if systemctl --user is-active --quiet "$DEV_UNIT.service" 2>/dev/null && [ "$udir" != "$APP/frontend" ]; then
+	# The unit serves ANOTHER checkout (IKVMCRAFT now names a different tree, e.g. a worktree). A restart keeps the
+	# transient unit's working directory, so it would go on serving the old tree; re-create it here instead.
+	systemctl --user stop "$DEV_UNIT.service" 2>/dev/null
+	for _i in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$VITE_PORT " || break; sleep 1; done
+	systemctl --user reset-failed "$DEV_UNIT" >/dev/null 2>&1
+	systemd-run --user --quiet --unit="$DEV_UNIT" --working-directory="$APP/frontend" -- bash -lc "exec $DEV_CMD </dev/null" 2>/dev/null \
+		&& restarted="systemd unit $DEV_UNIT, moved from $udir to $APP/frontend"
+elif systemctl --user is-active --quiet "$DEV_UNIT.service" 2>/dev/null; then
 	systemctl --user restart "$DEV_UNIT.service" 2>/dev/null
 	restarted="systemd unit $DEV_UNIT"
 else

@@ -11,6 +11,13 @@ set -u
 APP=$(need IKVMCRAFT "the dev server serves $IKVMCRAFT/frontend")
 U=$DEV_UNIT
 PORT=$(node -e 'const u=new URL(process.argv[1]); console.log(u.port || (u.protocol==="https:"?443:80))' "$SERVE_URL")
+# A 200 from a server rooted in ANOTHER checkout is not this app: IKVMCRAFT may name a different tree (a worktree)
+# than the one the running unit was started in. Stop it; the loop below re-creates it in $APP/frontend.
+udir=$(systemctl --user show "$U" -p WorkingDirectory --value 2>/dev/null)
+if systemctl --user is-active "$U" >/dev/null 2>&1 && [ -n "$udir" ] && [ "$udir" != "$APP/frontend" ]; then
+  echo "ensure-server: $U serves $udir, not $APP/frontend; re-creating it" >&2
+  systemctl --user stop "$U" >/dev/null 2>&1
+fi
 for _ in $(seq 1 40); do
   [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$SERVE_URL" 2>/dev/null)" = "200" ] && exit 0
   if ! systemctl --user is-active "$U" >/dev/null 2>&1; then
