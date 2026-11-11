@@ -21,14 +21,16 @@ file leaves out.
 |---|---|
 | the backend | `src/mono/mono/mini/mini-wasm.c` (knobs, registry, admission, GC shadow frame) + its `#include`d `.inc` files: `-emitter` IR -> wasm, `-ir` the relocatable body (`WjBody`) and `wj_assemble`, `-batching` co-location, `-publish` asynchronous republication, `-lazy` lazy f-slot pools, `-vslow`, `-diagnostics`; and `wasm-encoder.c` |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
-| the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft`, `frontend/src/dotnet/index.ts` |
-| IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm` |
+| this branch | `wasm-jit-11.0.0` (.NET 11.0.0, emscripten 6.0.3, no JSPI), worktree `~/fna-wasm/dotnet-runtime-jit`. Rounds before 2026-11-10 cite `wasm-jspi-jit-10.0.3` (frozen at de5ea57c395); `scratchpad/notes/REBASE-11.0.0-HASHMAP.txt` maps each of its commits to this branch's (`cherry picked from` lines too) |
+| the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft-net11` (branch `net11`), `frontend/src/dotnet/index.ts`; the 10.0.3 app is `~/Documents/ikvm-wasm/ikvmcraft` |
+| IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm`; its natives from ikvm-wasm-build `net11-sockets` |
 | the GL stack (mesa-wink) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/native-deps/mesa-wink`, its own repo (branch `wink`, origin `MercuryWorkshop/mesa-wink`; ikvm-wasm-build ignores it) -- see **The GL stack** |
 | measurement harness | `wjharness/` (tracked; `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/` -- see **The harness** |
 | **the findings log -- read before proposing anything** | `scratchpad/notes/MINECRAFT-FINDINGS.md` (untracked) |
 | chromium / V8 source | `~/Documents/chromium/src` (v8 at `src/v8`) |
-| split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
-| the canonical emsdk (3.1.56) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` -- see **Building** |
+| split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft-net11/loader/obj/dotnet.native.debug.wasm` |
+| the canonical emsdk (6.0.3) | `~/Documents/ikvm-wasm/ikvmcraft-net11/statics/emsdk` -- see **Building** |
+| FNA-WASM-Build (runtime build, emsdk patches) | `~/fna-wasm/FNA-WASM-Build-net11`, branch `net11` |
 
 The findings log is long. The alternative to reading the relevant part is re-running an experiment that already has an
 answer.
@@ -99,8 +101,26 @@ version). Line numbers drift: if something surprising turns up, re-check the tre
 * **A partial AOT profile is worse than none unless it is closed over direct calls** (R498): an AOT'd call to an
   out-of-profile method of the same image goes indirect and may enter the interpreter. No profile ships: the AOT
   whitelist is CoreLib, IKVM.Runtime, IKVM.ByteCode and System.Memory (ikvmcraft `loader/IkvmWasm.csproj`).
-* **emscripten 3.1.56 can deadlock main on its own proxying lock** (R479). FNA-WASM-Build's `emsdk.7.patch` backports
-  the fix (upstream 21a3a81daf); a deploy carries it if the served wasm's `do_proxy` is 136 B, not 84.
+* **R479's deadlock fix is upstream in emscripten 6** (21a3a81daf), as are emsdk.patch, .2 and .5; FNA-WASM-Build net11
+  carries .3 (a backport of upstream #27937's readwrite-unsafe OPFS handles), .4, .6, .8-.11 rebased, and .12.
+* **emscripten 6 picks the wasm EH encoding at COMPILE time** (default legacy) and V8 refuses a module that mixes the two
+  (`function-body-decoder-impl.h`, "module uses a mix of legacy and new exception handling instructions"). Every native
+  object with wasm EH or wasm setjmp is built `-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0`, and the JIT emits
+  `try_table` (exnref).
+* **Java's networking is the JDK's own libnet/libnio over WasmFS** (FNA-WASM-Build `emsdk.12.patch`: sockets, epoll,
+  eventfd, socketpair, a resolver handing out 240.67.x.y and giving the name back on connect) **and ikvmcraft's
+  `loader/wasmfs-wisp-transport.js`** (wisp-js on emsdk.12's network pthread). Wisp has no connect acknowledgement: a
+  refused connect succeeds and fails on first I/O. Java TLS is SunJSSE (the M6 note in the findings log).
+* **Five upstream .NET 11 browser behaviours this branch changes; keep them through any upstream merge** (findings
+  notes of 2026-11-10): runtime options parsed on main before the deputy reserves its jiterpreter tables (f0b54a52a56);
+  `getNewWorker` hands out the oldest LOADED worker and holds messages to one still loading, which would drop them
+  (806af7938c5); workers set `fetch_like` before the native module copies it (806af7938c5); worker print/printErr marked
+  `.proxy` so pthread stdout reaches the page (cc4a3d883e8); System.Native's libc `socket`/`connect`/`send` stubs only
+  for CoreCLR (7f3c9a18f69: in mono's static link they replaced libc's for every native).
+* **There is no JSPI.** The deputy runs the whole game inside the `Run` JSExport and never returns to its event loop;
+  GLFW's poll drains the thread's C proxy queue and its wait is a futex on the SAB input ring. JS work posted to the
+  deputy after `Run` is serviced only by that drain (WatchMemoryUsage's callback is); a JSExport call to it would not be.
+* **emscripten 6 no longer puts `wasmMemory` on `Module`**: from the page, use `getDotnetRuntime(0).localHeapViewU8()`.
 * **dlmalloc's memalign never reuses its own freed block for the same request** (R528): it mallocs request + alignment
   + 12 and returns the slack, so the freed chunk is exactly the request. Every sgen block came through it (LOS objects,
   major arenas, mono_valloc), and the holes ratcheted sbrk to ~1.1 GB over in-use under chunk loading: the 26.2 OOM.
@@ -266,6 +286,9 @@ The registry and the profile keep raw pointers while IKVM creates and frees dyna
 ## Where we stand against other JVMs
 
 ### Minecraft 26.2 with no mods (the target) against HotSpot 25
+
+These numbers were taken on wasm-jspi-jit-10.0.3. The .NET 11 / emscripten 6 move was a wash on both workloads
+(2026-11-10, interleaved n=3: -0.8% cycles, +1.7% instructions a tick on 262n; jbox2d 0.6019 ms/step on 11 against 0.6013 on 10.0.3).
 
 Server thread per tick, Q60 window (60 s, opening ~183 s after join), both sides pinned to the P-cores, 0 skipped ticks;
 native JDK 25.0.5 n=3, ours 2bc83b4fdce with default knobs n=3; mean (range). 2026-11-06, `runs/2026-11-06-262`,
@@ -488,7 +511,8 @@ number.
 Mesa's GL on the `gex_wgpu` Gallium driver over WebGPU. In the mesa-wink checkout, `bash wink/build.sh --variant=mt
 --emsdk=$HOME/emsdk --test` builds it and runs its smoke suite. It reaches the app through ikvm-wasm-build's GLFW port
 (`tools/native-deps`: `build-glfw.sh --wink-out=...`, `install-glfw.sh --dest=<ikvmcraft>`). GL runs on the browser's main thread
-(`?wj.WINK_GL_MAIN`, default 1): the render thread only records (Mesa's glthread), and wink executes on main. At Q60
+(`?wj.WINK_GL_MAIN`, default 1; `=0`, GL on a worker, needed JSPI and is refused since the .NET 11 move): the render
+thread only records (Mesa's glthread), and wink executes on main. At Q60
 on 1.16.1 with Minecraft's limiter lifted that is ~170-185 fps, and the render thread (63% JIT-tier Java) is the limiter
 (R479). The 26.2 target runs vanilla's renderer (no Sodium). Its census line reads 2.0 waits a frame on main (one FenceSync
 and one ClientWaitSync, the round trips below), 0 read live, 0 GPU readbacks and 0.00 MiB of persistent mappings a
@@ -517,7 +541,7 @@ submit (`runs/2026-11-06-262/ours/o2a`). Its frame rate and client-thread profil
 The runtime (this repo), ~9 min. A plain `./build.sh mono` is not this build:
 
 ```
-WASM_ENABLE_JSPI=true ../FNA-WASM-Build/build-dotnet.sh . true ./dotnet-jspi.zip
+../FNA-WASM-Build-net11/build-dotnet.sh . true ./dotnet-jit.zip
 ```
 
 Then **deploy**, ~12 min, which is not optional. The page loads `frontend/public/_framework/dotnet.native.<hash>.wasm`,
@@ -540,12 +564,17 @@ inlined away). Prove a revert both ways: the new marker present and the reverted
   believing a boot failure.
 * **IKVM.Runtime**: `wj ikvm-runtime --install` builds it the way ikvm-wasm-build does and stages it into ikvmcraft,
   keeping the replaced DLL in `state/arms/ikvm-runtime/`. Prove it is served by the DLL's sha256.
-* **The canonical emsdk** is ikvmcraft's `statics/emsdk`, frozen from FNA-WASM-Build's `emsdk*.patch` by
-  `freeze-emsdk.sh`. The app links against ITS cache (`IkvmWasm.csproj` `WasmCachePath`), so libc, pthread and wasmfs
-  questions are answered there, not in this repo's `src/mono/browser/emsdk`. Patching a system library means
-  `embuilder build --force <lib>` with `EM_FROZEN_CACHE=0`, then a redeploy. **embuilder clears the whole cache when
-  `cache/sanity.txt` names another toolchain path** (R502); rebuild with `freeze-emsdk.sh`'s list. Re-extracting
-  `statics/emsdk.zip` reverts patches 5-9.
+* **The canonical emsdk** is ikvmcraft's `statics/emsdk`: the emscripten .NET 11 provisions (6.0.3, 6ea9c28c38cd, in
+  `.dotnet/wasm-tools/emscripten/6.0.2-linux-x64` -- the directory name is stale) with FNA-WASM-Build's `emsdk*.patch`
+  applied and its cache rebuilt, by `freeze-emsdk.sh <that dir> <out.zip>`. The app links against ITS cache
+  (`IkvmWasm.csproj` `WasmCachePath`), so libc, pthread and wasmfs questions are answered there. Every native is built
+  with it too (one emsdk everywhere: the workload refuses an emcc that is not the pack's). Patching a system library
+  means `embuilder build --force <lib>` with `EM_FROZEN_CACHE` set EMPTY (.NET's `.emscripten` reads it with
+  `bool(os.getenv(..., 'True'))`), then a redeploy. **embuilder clears the whole cache when `cache/sanity.txt` names
+  another toolchain path** (R502), and the provisioned sanity.txt names .NET's CI path; the freeze script handles both.
+* **The deploy environment for this branch**: `IKVMCRAFT=~/Documents/ikvm-wasm/ikvmcraft-net11`,
+  `FNA_WASM_BUILD=~/fna-wasm/FNA-WASM-Build-net11` (or set them in `~/.config/wjharness/machine.env`); the harness
+  defaults to `dotnet-jit.zip`.
 * **Never edit a source file while a build of it is in flight.** The binary's contents become unknowable, and so does
   every number taken on it. Treat the build and deploy windows as read-only and queue the edits.
 
