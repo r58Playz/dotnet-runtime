@@ -99,6 +99,7 @@ function monoWorkerMessageHandler (worker: PThreadWorker, wasmModule: WebAssembl
                     wasmModule,
                     webcilModules: (globalThis as any).__monoWebcilModules,
                 });
+                worker.afterConfigSent?.promise_control.resolve();
             });
             break;
         }
@@ -220,6 +221,7 @@ export function replaceEmscriptenPThreadUI (modulePThread: PThreadLibrary): void
     modulePThread.loadWasmModuleToWorker = (worker: PThreadWorker): Promise<PThreadWorker> => {
 
         const afterLoaded = originalLoadWasmModuleToWorker(worker);
+        worker.afterLoaded = afterLoaded;
         afterLoaded.then(() => {
             worker.info.isLoaded = true;
         });
@@ -277,28 +279,47 @@ export function replaceEmscriptenPThreadUI (modulePThread: PThreadLibrary): void
 function getNewWorker (modulePThread: PThreadLibrary): PThreadWorker {
     if (!WasmEnableThreads) return null as any;
 
-    if (modulePThread.unusedWorkers.length == 0) {
-        mono_log_debug(() => `Failed to find unused WebWorker, this may deadlock. Please increase the pthreadPoolInitialSize. Running threads ${Object.keys(modulePThread.pthreads).length}. Loading workers: ${modulePThread.unusedWorkers.length}`);
-        const worker = allocateUnusedWorker();
-        modulePThread.loadWasmModuleToWorker(worker);
-        return worker;
-    }
-
+    const pool = modulePThread.unusedWorkers;
     // keep them pre-allocated all the time, not just during startup
-    if (modulePThread.unusedWorkers.length <= loaderHelpers.config.pthreadPoolUnusedSize!) {
+    if (pool.length <= loaderHelpers.config.pthreadPoolUnusedSize! || pool.length == 0) {
         const worker = allocateUnusedWorker();
         modulePThread.loadWasmModuleToWorker(worker);
     }
 
-    for (let i = 0; i < modulePThread.unusedWorkers.length; i++) {
-        const worker = modulePThread.unusedWorkers[i];
-        if (worker.loaded) {
-            modulePThread.unusedWorkers.splice(i, 1);
+    // The oldest worker that is ready, so the first pthread (the deputy) gets dotnet-worker-001 and a worker
+    // allocated just above is taken last. This read emscripten's worker.loaded, which emscripten 6 no longer sets,
+    // so the scan never matched and pop() handed out the NEWEST worker -- the one allocated above, still loading.
+    // Ready is two things since emscripten 6: it posts "loaded" when the worker STARTS instantiating, and from then
+    // on runs whatever arrives, while our instantiateWasmWorker first waits for the config reply to its "preload"
+    // (sent only once every assembly is registered, R529). A "run" that overtakes that reply starts a pthread on a
+    // worker with no wasm instance, and the thread never runs (its creator waits forever).
+    for (let i = 0; i < pool.length; i++) {
+        const worker = pool[i];
+        if (worker.info.isLoaded && worker.afterConfigSent?.promise_control.isDone) {
+            pool.splice(i, 1);
             return worker;
         }
     }
-    mono_log_debug(() => `Failed to find loaded WebWorker, this may deadlock. Please increase the pthreadPoolInitialSize. Running threads ${Object.keys(modulePThread.pthreads).length}. Loading workers: ${modulePThread.unusedWorkers.length}`);
-    return modulePThread.unusedWorkers.pop()!;
+
+    // None is ready. Hand out the oldest, and hold what spawnThread posts to it (the "run") until it is: the
+    // config reply is then posted before the "run", the order a ready worker has by construction.
+    const worker = pool.shift()!;
+    mono_log_debug(() => `No ready WebWorker; the thread starts once dotnet-worker-${worker.info.workerNumber} is ready. Increase pthreadPoolInitialSize to avoid the wait. Running threads ${Object.keys(modulePThread.pthreads).length}. Unused workers: ${pool.length}`);
+    holdMessagesUntilReady(worker);
+    return worker;
+}
+
+function holdMessagesUntilReady (worker: PThreadWorker): void {
+    if (!worker.afterLoaded || !worker.afterConfigSent) return;
+    const held: [any, any][] = [];
+    (worker as any).postMessage = (message: any, transfer?: any) => {
+        held.push([message, transfer]);
+    };
+    Promise.all([worker.afterLoaded, worker.afterConfigSent.promise]).then(() => {
+        delete (worker as any).postMessage; // Worker.prototype's again
+        for (const [message, transfer] of held)
+            worker.postMessage(message, transfer);
+    });
 }
 
 /// We replace Module["PThreads"].allocateUnusedWorker with this version that knows about assets
@@ -313,7 +334,7 @@ function allocateUnusedWorker (): PThreadWorker {
         type: "module",
     }) as PThreadWorker;
     getUnusedWorkerPool().push(worker);
-    worker.loaded = false;
+    worker.afterConfigSent = createPromiseController<void>();
     worker.info = {
         workerNumber,
         pthreadId: PThreadPtrNull,
