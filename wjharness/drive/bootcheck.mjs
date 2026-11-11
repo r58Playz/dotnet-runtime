@@ -148,7 +148,7 @@ try {
   if (verdict.startsWith("PASS")) {
     await sleep(2000);
     const r = await Promise.race([conn.send("Runtime.evaluate", { returnByValue: true, expression: `(() => { const M = globalThis.wasm?.Module; if (!M) return null;
-      return JSON.stringify({ wasm: M.wasmMemory.buffer.byteLength / 1048576, heap: M._ikvm_heap_top_mb?.(), native: M._ikvm_native_used_mb?.(), gc: M._ikvm_gc_heap_mb?.() }); })()` }, sid),
+      return JSON.stringify({ wasm: (M.wasmMemory?.buffer ?? globalThis.getDotnetRuntime(0).localHeapViewU8().buffer).byteLength / 1048576, heap: M._ikvm_heap_top_mb?.(), native: M._ikvm_native_used_mb?.(), gc: M._ikvm_gc_heap_mb?.() }); })()` }, sid),
       sleep(8000).then(() => null)]);
     const v = r?.result?.value;
     if (v) { const m = JSON.parse(v); console.log(`  memory at title (MB): wasm ${m.wasm.toFixed(0)} heap ${m.heap?.toFixed(0)} native ${m.native?.toFixed(0)} gc ${m.gc?.toFixed(0)}`); }

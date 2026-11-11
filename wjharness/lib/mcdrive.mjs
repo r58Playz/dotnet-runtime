@@ -1956,7 +1956,7 @@ const WINDOW_JS = (durationMs, walk, dumps, settleInfo = {}, warmMs = 0) => `(as
      * worker crash) and nothing was executing at all. */
     void: nf === 0 || nf == null || !!settle.serverDead, settle,
     fpsPerSecond: fps, registeredPer5s: reg, frameTime, deltas: d, countersAvailable, prof: profStat(), devirt: devirtStat(),
-    heapMb: g(() => Math.round(M.wasmMemory.buffer.byteLength / 1048576)),
+    heapMb: g(() => Math.round((M.wasmMemory?.buffer ?? globalThis.getDotnetRuntime(0).localHeapViewU8().buffer).byteLength / 1048576)),
     /* THE WASM FUNCTION TABLE IS PER-WORKER, so its length is multiplied by every retained isolate.
      * V8 stores each entry twice: a WasmDispatchTable slot (kEntrySize = 12 B under pointer
      * compression, wasm-objects.h:981) plus a tagged reference in WasmTableObject's
@@ -3440,7 +3440,7 @@ export async function probeCounters (conn, sid) {
       expression: `JSON.stringify({
         live: (globalThis.jitLiveness && globalThis.jitLiveness()) || null,
         frames: globalThis.wasm?.Module?._emscripten_glfw3_get_frame_count?.() ?? null,
-        heapMb: (globalThis.wasm?.Module?.wasmMemory?.buffer?.byteLength || 0) / 1048576,
+        heapMb: ((globalThis.wasm?.Module?.wasmMemory?.buffer ?? globalThis.getDotnetRuntime?.(0)?.localHeapViewU8?.().buffer)?.byteLength || 0) / 1048576,
       })`,
       returnByValue: true,
     }, sid);

@@ -10,7 +10,7 @@
  */
 (function loscensus(ADDR) {
   const t0 = performance.now();
-  const M = globalThis.wasm.Module, buf = M.wasmMemory.buffer;
+  const M = globalThis.wasm.Module, buf = (M.wasmMemory?.buffer ?? globalThis.getDotnetRuntime(0).localHeapViewU8().buffer);
   const u32 = new Uint32Array(buf), u8 = new Uint8Array(buf);
   const R = (a) => u32[a >>> 2], memEnd = buf.byteLength;
   const dec = new TextDecoder();
