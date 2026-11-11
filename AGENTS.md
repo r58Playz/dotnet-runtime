@@ -27,7 +27,7 @@ exists because a previous pass got it wrong at real cost.
 | **the running log — read before proposing anything** | `scratchpad/wj/MINECRAFT-FINDINGS.md` |
 | chromium/V8 source, for checking claims about V8 | `~/Documents/chromium/src` (v8 at `src/v8`) |
 | split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
-| **the canonical emsdk** (6.0.3, .NET 11's) | `~/Documents/ikvm-wasm/ikvmcraft-net11/statics/emsdk` — frozen from `~/fna-wasm/FNA-WASM-Build-net11` (`emsdk*.patch`, applied by `freeze-emsdk.sh`; see CLAUDE.md's **Building**). The app links `dotnet.native.wasm` against ITS cache (`IkvmWasm.csproj` `WasmCachePath`), so a libc/pthread/wasmfs question is answered there, not in this repo's `src/mono/browser/emsdk`. Patching a system-library source means rebuilding the archives that hold it (`embuilder build --force <lib>`, `EM_FROZEN_CACHE=0`) and redeploying |
+| **the canonical emsdk** (6.0.3, .NET 11's) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` — frozen from `~/fna-wasm/FNA-WASM-Build` (`emsdk*.patch`, applied by `freeze-emsdk.sh`; see CLAUDE.md's **Building**). The app links `dotnet.native.wasm` against ITS cache (`IkvmWasm.csproj` `WasmCachePath`), so a libc/pthread/wasmfs question is answered there, not in this repo's `src/mono/browser/emsdk`. Patching a system-library source means rebuilding the archives that hold it (`embuilder build --force <lib>`, `EM_FROZEN_CACHE=0`) and redeploying |
 
 `MINECRAFT-FINDINGS.md` is a long numbered log. The alternative to reading the relevant part is re-running an
 experiment that already has an answer; several entries exist only because an earlier one was not read.
@@ -731,7 +731,7 @@ with `knob=0`: `queued=889`, compiled 591, `republished=591` (R269)** -- so an A
 The **runtime** (this repo) is built and packed with
 
 ```
-../FNA-WASM-Build-net11/build-dotnet.sh . true ./dotnet-jit.zip     # ~9 min (no JSPI since the .NET 11 move)
+../FNA-WASM-Build/build-dotnet.sh . true ./dotnet-jit.zip     # ~9 min (no JSPI since the .NET 11 move)
 ```
 
 A plain `./build.sh mono` is NOT that build and its pack has to be hand-patched.

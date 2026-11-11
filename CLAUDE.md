@@ -30,7 +30,7 @@ file leaves out.
 | chromium / V8 source | `~/Documents/chromium/src` (v8 at `src/v8`) |
 | split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
 | the canonical emsdk (6.0.3) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` -- see **Building** |
-| FNA-WASM-Build (runtime build, emsdk patches) | `~/fna-wasm/FNA-WASM-Build-net11`, branch `net11` |
+| FNA-WASM-Build (runtime build, emsdk patches) | `~/fna-wasm/FNA-WASM-Build`, branch `net11`; the 10.0.3 one is its worktree `~/fna-wasm/FNA-WASM-Build-10.0.3` (branch `main`) |
 
 The findings log is long. The alternative to reading the relevant part is re-running an experiment that already has an
 answer.
@@ -541,7 +541,7 @@ submit (`runs/2026-11-06-262/ours/o2a`). Its frame rate and client-thread profil
 The runtime (this repo), ~9 min. A plain `./build.sh mono` is not this build:
 
 ```
-../FNA-WASM-Build-net11/build-dotnet.sh . true ./dotnet-jit.zip
+../FNA-WASM-Build/build-dotnet.sh . true ./dotnet-jit.zip
 ```
 
 Then **deploy**, ~12 min, which is not optional. The page loads `frontend/public/_framework/dotnet.native.<hash>.wasm`,
@@ -573,7 +573,7 @@ inlined away). Prove a revert both ways: the new marker present and the reverted
   `bool(os.getenv(..., 'True'))`), then a redeploy. **embuilder clears the whole cache when `cache/sanity.txt` names
   another toolchain path** (R502), and the provisioned sanity.txt names .NET's CI path; the freeze script handles both.
 * **The harness needs no environment for this branch**: `~/.config/wjharness/machine.env` names `IKVMCRAFT` (the
-  `net11` checkout) and `FNA_WASM_BUILD=~/fna-wasm/FNA-WASM-Build-net11`, `WJ_HOME` defaults to this checkout's
+  `net11` checkout) and `FNA_WASM_BUILD=~/fna-wasm/FNA-WASM-Build`, `WJ_HOME` defaults to this checkout's
   `scratchpad/`, and `DOTNET_ZIP` to `dotnet-jit.zip`. To measure the 10.0.3 app, set `IKVMCRAFT` to its worktree:
   `ensure-server` re-creates the dev server there.
 * **Never edit a source file while a build of it is in flight.** The binary's contents become unknowable, and so does
