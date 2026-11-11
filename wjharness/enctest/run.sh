@@ -19,6 +19,9 @@
 #       the tag its reloc carried, and nothing else (the managed stack walk maps V8 frame positions through it)
 #   t13 R516: call-site KEYS -- every key is the memory access an independent model of the rule picks (the last one
 #       before the call in its run, only when the run has one after it too; a guarded pair's guard load), no other
+#   t14 the exnref EH region an EH method's dispatch is framed in (wasm_eh_region_open/_catch, wasm_eh_throw_payload):
+#       validated and EXECUTED in node (t14.mjs) -- catch + re-dispatch (twice), an unclaimed x.e leaving with the same
+#       payload, a JS exception passing through
 #   t5  ONE body framed at two different ti_base values asks for the SAME functype -- the re-framing case
 #       re-emission creates, which t1-t4 structurally cannot reach (they frame each body once). Carries
 #       its own negative control: a deliberately off-by-one ti_base must be caught, or the gate is inert.
@@ -29,11 +32,12 @@ set -e
 d=$(cd "$(dirname "$0")" && pwd)
 m=$(cd "$d/../../src/mono/mono/mini" && pwd)
 o=${ENCTEST_OUT:-$(mktemp -d)}; mkdir -p "$o"
-for t in t t2 t3 t4 t5 t6 t7 t9 t10 t11 t12 t13; do
+for t in t t2 t3 t4 t5 t6 t7 t9 t10 t11 t12 t13 t14; do
 	gcc -g -O1 -Wall -I"$d" -I"$m" -o "$o/$t.bin" "$d/$t.c" "$d/legacy.c" "$m/wasm-encoder.c"
 	(cd "$o" && "./$t.bin")
 done
 (cd "$o" && node "$d/t7.mjs")
 (cd "$o" && node "$d/t10.mjs")
 (cd "$o" && node "$d/t11.mjs")
+(cd "$o" && node "$d/t14.mjs")
 [ -n "${ENCTEST_OUT:-}" ] || rm -rf "$o"

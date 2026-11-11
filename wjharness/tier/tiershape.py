@@ -56,9 +56,11 @@ for o in (0x0c, 0x0d): IMM[o] = "u"         # br, br_if
 IMM[0x0e] = "br"                            # br_table
 IMM[0x10] = "u"                             # call
 IMM[0x11] = "uu"                            # call_indirect
-IMM[0x06] = "b"; IMM[0x07] = "u"            # try, catch
-IMM[0x08] = "u"; IMM[0x09] = "u"            # throw, rethrow
-IMM[0x18] = "u"; IMM[0x19] = ""             # delegate, catch_all
+IMM[0x06] = "b"; IMM[0x07] = "u"            # legacy EH try, catch (dumps from before the exnref port)
+IMM[0x08] = "u"; IMM[0x09] = "u"            # throw, legacy rethrow
+IMM[0x18] = "u"; IMM[0x19] = ""             # legacy delegate, catch_all
+IMM[0x0a] = ""                              # throw_ref
+IMM[0x1f] = "tt"                            # try_table: blocktype, then a vec of catch clauses
 for o in (0x1a, 0x1b): IMM[o] = ""          # drop, select
 IMM[0x1c] = "vt"                            # select t
 for o in range(0x20, 0x25): IMM[o] = "u"    # local/global get/set/tee
@@ -116,6 +118,17 @@ def fingerprint_code(b, i, end, out):
                     v, i = read_uleb(b, i); out.append(str(v))
             elif k == "vt":
                 n, i = read_uleb(b, i); i += n; out.append(f"vt{n}")
+            elif k == "tt":
+                if b[i] == 0x40: out.append("void"); i += 1
+                elif b[i] in (0x7f, 0x7e, 0x7d, 0x7c, 0x70, 0x6f): out.append(f"vt{b[i]}"); i += 1
+                else:
+                    v, i = read_sleb(b, i); out.append(f"ty{v}")
+                n, i = read_uleb(b, i); out.append(f"c{n}")
+                for _ in range(n):
+                    kind = b[i]; i += 1; out.append(f"k{kind}")
+                    if kind in (0x00, 0x01):                  # catch / catch_ref carry a tag index
+                        v, i = read_uleb(b, i); out.append(str(v))
+                    v, i = read_uleb(b, i); out.append(str(v))  # label
     return i
 
 def shape(path):

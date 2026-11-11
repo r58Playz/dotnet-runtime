@@ -602,6 +602,34 @@ wasm_op_local (WasmBuf *b, WasmOpcode op, guint32 local_idx)
 }
 
 void
+wasm_eh_region_open (WasmBuf *b)
+{
+	wasm_op (b, WASM_OP_LOOP); wasm_u8 (b, WASM_VOID);        /* $outer: re-dispatch loop */
+	wasm_op (b, WASM_OP_BLOCK); wasm_u8 (b, WASM_I32);        /* $lp: a caught x.e lands here with its payload */
+	wasm_op (b, WASM_OP_TRY_TABLE); wasm_u8 (b, WASM_VOID);
+	wasm_uleb (b, 1);                                         /* one catch clause: */
+	wasm_u8 (b, WASM_CATCH); wasm_uleb (b, 0);                /*   catch tag 0 (payload only) */
+	wasm_uleb (b, 0);                                         /*   -> $lp: catch labels count from outside the try_table */
+}
+
+void
+wasm_eh_region_catch (WasmBuf *b)
+{
+	wasm_op (b, WASM_OP_END);           /* the try_table */
+	wasm_op (b, WASM_OP_UNREACHABLE);   /* nothing falls out of the region, so $lp's i32 is never owed here */
+	wasm_op (b, WASM_OP_END);           /* $lp: reached only by a catch */
+}
+
+/* A `throw` of the same payload is how C++ itself rethrows under wasm EH (libunwind's _Unwind_RaiseException is
+ * __builtin_wasm_throw (0, exception_object)); it needs no exnref local or multi-value block type. */
+void
+wasm_eh_throw_payload (WasmBuf *b, guint32 payload_local)
+{
+	wasm_op_local (b, WASM_OP_LOCAL_GET, payload_local);
+	wasm_op (b, WASM_OP_THROW); wasm_uleb (b, 0);
+}
+
+void
 wasm_i32_const (WasmBuf *b, gint32 v)
 {
 	wasm_u8 (b, WASM_OP_I32_CONST);

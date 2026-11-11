@@ -35,12 +35,15 @@ typedef enum {
 	WASM_OP_LOOP          = 0x03,
 	WASM_OP_IF            = 0x04,
 	WASM_OP_ELSE          = 0x05,
-	/* legacy exception-handling proposal (what mono + the jiterpreter use) */
-	WASM_OP_TRY           = 0x06,
-	WASM_OP_CATCH         = 0x07,
-	WASM_OP_THROW         = 0x08,
-	WASM_OP_RETHROW       = 0x09,
-	WASM_OP_CATCH_ALL     = 0x19,
+	/* exception handling: the standardized (exnref) proposal, which .NET 11 builds dotnet.native.wasm with
+	 * (-sWASM_LEGACY_EXCEPTIONS=0) and the jiterpreter emits. V8 rejects a module that mixes legacy and new EH
+	 * instructions (function-body-decoder-impl.h, "module uses a mix of legacy and new exception handling"), so
+	 * the legacy try/catch/rethrow/catch_all opcodes must not come back. try_table is followed by a blocktype,
+	 * then a vec of catch clauses (WasmCatchKind, a tag index for the two tag kinds, a label depth that is
+	 * resolved OUTSIDE the try_table). */
+	WASM_OP_THROW         = 0x08,   /* tagidx */
+	WASM_OP_THROW_REF     = 0x0a,   /* [exnref] -> unreachable */
+	WASM_OP_TRY_TABLE     = 0x1f,
 	WASM_OP_END           = 0x0b,
 	WASM_OP_BR            = 0x0c,
 	WASM_OP_BR_IF         = 0x0d,
@@ -213,6 +216,14 @@ typedef enum {
 	WASM_OP_I32_EXTEND16_S     = 0xc1,
 } WasmOpcode;
 
+/* try_table catch-clause kinds */
+typedef enum {
+	WASM_CATCH         = 0x00,   /* tagidx label: push the tag's params, branch */
+	WASM_CATCH_REF     = 0x01,   /* tagidx label: params + exnref */
+	WASM_CATCH_ALL     = 0x02,   /* label */
+	WASM_CATCH_ALL_REF = 0x03,   /* label: exnref */
+} WasmCatchKind;
+
 /*
  * Saturating float->int truncation ("non-trapping float-to-int conversions"), 0xFC-prefixed with a
  * ULEB sub-opcode -- emit via wasm_op_sat(), not wasm_op(), since these are two-byte forms.
@@ -354,6 +365,19 @@ void wasm_i64_const (WasmBuf *b, gint64 v);
 void wasm_f32_const (WasmBuf *b, float v);
 void wasm_f64_const (WasmBuf *b, double v);
 void wasm_memarg    (WasmBuf *b, guint32 align_log2, guint32 offset);
+
+/* An EH method's in-method exception region (exnref EH). mini-wasm-emitter.inc frames the dispatch of a method
+ * with clauses as
+ *     wasm_eh_region_open:   loop $outer ; block $lp (result i32) ; try_table (catch tag 0 -> $lp)
+ *     <dispatch, which never falls through>
+ *     wasm_eh_region_catch:  end ; unreachable ; end            -- the caught payload (i32) is now on the stack
+ *     <landing pad> ... br 0 ($outer) to re-dispatch, or wasm_eh_throw_payload to propagate
+ *     end ($outer) ; unreachable
+ * Tag 0 is the imported x.e (the C++ exception tag); its payload is the C++ exception pointer. Kept here so enctest
+ * (t14) frames and executes the same bytes the emitter writes. */
+void wasm_eh_region_open   (WasmBuf *b);
+void wasm_eh_region_catch  (WasmBuf *b);
+void wasm_eh_throw_payload (WasmBuf *b, guint32 payload_local);
 
 /*
  * RELOCATIONS -- why a body is not finished when it is emitted.

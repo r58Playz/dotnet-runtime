@@ -4296,11 +4296,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * br_table index i jumps just past block B_i, where bb_i's code lives. A branch
 	 * to bb T sets $blk=idx(T) and br's back to the loop to re-dispatch.
 	 *
-	 * In-method EH (eh_on): wrap the whole dispatch in `loop $outer { try { <dispatch> } catch <x.e> {
-	 * <clause-walk landing pad>; br $outer } }`. A C++/wasm-EH unwind out of any bb is caught here; the
-	 * landing pad maps the throwing bb ($blk) -> a handler bb (set $blk + br $outer to re-dispatch) or
-	 * rethrows. The inner dispatch + all GOTO depths are UNCHANGED — outer-loop/try sit ABOVE the inner
-	 * loop, so a GOTO's depth to the inner loop is unaffected. */
+	 * In-method EH (eh_on), in the standardized (exnref) EH proposal:
+	 *   loop $outer
+	 *     block $lp (result i32)
+	 *       try_table (catch $x.e -> $lp) <dispatch> end
+	 *       unreachable                                  ;; the dispatch never falls through
+	 *     end                                            ;; a caught x.e: its payload, the C++ exc ptr
+	 *     <clause-walk landing pad>; br $outer  |  throw $x.e
+	 *   end
+	 * A C++/wasm-EH unwind out of any bb is caught here; the landing pad maps the throwing bb ($blk) -> a
+	 * handler bb (set $blk + br $outer to re-dispatch) or throws the same exception object on. The inner
+	 * dispatch + all GOTO depths are UNCHANGED -- $outer/$lp/try_table sit ABOVE the inner loop, and nothing in
+	 * the dispatch branches past it, so a GOTO's depth to the inner loop is unaffected. */
 	{
 		/* ()->void for mono_wasm_jit_continue_unwind. Registered for every method, not just eh_on ones:
 		 * a non-EH JIT frame must ALSO continue the unwind rather than return, otherwise it is skipped
@@ -4369,8 +4376,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff6, (guint32) eh_type_idx);
 #endif
-		wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);   /* $outer: catch re-dispatch loop */
-		wasm_op (&body, WASM_OP_TRY); wasm_u8 (&body, 0x40);    /* in-method EH try region (catches x.e) */
+		wasm_eh_region_open (&body);   /* loop $outer ; block $lp (result i32) ; try_table (catch x.e -> $lp) */
 	}
 	wasm_origin_push (&body, WJO_DISPATCH);
 	/*
@@ -9021,11 +9027,11 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 
 	wasm_origin_push (&body, WJO_LANDING);
 	if (eh_on) {
-		/* In-method EH landing pad: `catch <x.e>` of the wrapping try. The C++ exc ptr (i32) is pushed.
-		 * h = eh_dispatch(table, $blk): the throwing bb's matching catch handler bbidx, or -1. h<0 ->
-		 * rethrow (propagate to an outer try / the interp boundary). h>=0 -> claim the C++ exc + set
+		/* In-method EH landing pad, reached by the try_table's `catch x.e -> $lp` with the C++ exc ptr (i32) on
+		 * the stack. h = eh_dispatch(table, $blk): the throwing bb's matching catch handler bbidx, or -1. h<0 ->
+		 * throw it on (propagate to an outer frame / the interp boundary). h>=0 -> claim the C++ exc + set
 		 * $blk=h + br $outer to re-dispatch into the handler bb. */
-		wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0);   /* tag 0 = x.e */
+		wasm_eh_region_catch (&body);   /* end try_table ; unreachable ; end $lp -- the C++ exc ptr is on the stack */
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
 #ifdef HOST_BROWSER
 		/* R353: this frame is the one resuming, so its record is the current island (dispatch and
@@ -9058,7 +9064,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 #else
 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff7, (guint32) eh_endcatch_ti);   /* leave_island ()->void */
 #endif
-		wasm_op (&body, WASM_OP_RETHROW); wasm_uleb (&body, 1); /* depth 1 = the enclosing try -> re-propagate */
+		wasm_eh_throw_payload (&body, (guint32) eh_exc_idx);   /* propagate the same C++ exception (wasm-encoder.c) */
 		wasm_op (&body, WASM_OP_END);                          /* end if */
 		/* matched: claim+release the C++ exception (balance the cxa handler count), then dispatch. */
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_exc_idx);
@@ -9111,8 +9117,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		}
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_h_idx);
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);   /* $blk = handler bbidx */
-		wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);     /* depth 1 = $outer loop -> re-dispatch */
-		wasm_op (&body, WASM_OP_END);          /* close try */
+		wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 0);     /* depth 0 = $outer loop -> re-dispatch */
 		wasm_op (&body, WASM_OP_END);          /* close $outer loop */
 		wasm_op (&body, WASM_OP_UNREACHABLE);  /* $outer loop never falls through */
 	}
