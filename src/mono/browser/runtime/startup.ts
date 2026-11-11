@@ -5,7 +5,7 @@ import WasmEnableThreads from "consts:wasmEnableThreads";
 import BuildConfiguration from "consts:configuration";
 
 import { DotnetModuleInternal, CharPtrNull, MainToWorkerMessageType } from "./types/internal";
-import { exportedRuntimeAPI, INTERNAL, loaderHelpers, Module, runtimeHelpers, mono_assert, browserVirtualAppBase } from "./globals";
+import { exportedRuntimeAPI, INTERNAL, loaderHelpers, Module, runtimeHelpers, mono_assert, browserVirtualAppBase, ENVIRONMENT_IS_WORKER } from "./globals";
 import cwraps, { init_c_exports, threads_c_functions as tcwraps } from "./cwraps";
 import { mono_wasm_raise_debug_event, mono_wasm_runtime_ready } from "./debug";
 import { toBase64StringImpl } from "./base64";
@@ -57,6 +57,15 @@ export async function configureRuntimeStartup (module: DotnetModuleInternal): Pr
     }
     loaderHelpers.out = module.print;
     loaderHelpers.err = module.printErr;
+    if (WasmEnableThreads && ENVIRONMENT_IS_WORKER) {
+        // A pthread's print/printErr: emscripten (runtime_pthread.js, CMD_LOAD) replaces them with a proxy to the main
+        // thread's handler only when the worker's own is missing or marked .proxy. The defaults above are neither, so
+        // since emscripten 6 a worker printed to its own console, which the page's console hooks never see (stdout of
+        // every managed thread, the deputy's included). Mark them replaceable; loaderHelpers keeps the local ones.
+        (module.print as any).proxy = true;
+        (module.printErr as any).proxy = true;
+        mono_log_debug("pthread stdout and stderr forward to the main thread's print handlers");
+    }
     await ensureUsedWasmFeatures();
 }
 
