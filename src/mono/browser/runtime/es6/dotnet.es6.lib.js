@@ -92,6 +92,11 @@ function injectDependencies() {
         `gitHash: "${gitHash}", ` +
         `});`;
 
+    // The wasm JIT's EM_ASM bodies (mini-wasm*.c / .inc) read wasmTable, and EM_ASM code creates no library
+    // dependencies. Since emscripten 4, $wasmTable is a library alias emitted only on demand; without this it is
+    // present only because addFunction happens to be exported.
+    DotnetSupportLib["$DOTNET__deps"] = ["$wasmTable"];
+
     autoAddDeps(DotnetSupportLib, "$DOTNET");
     mergeInto(LibraryManager.library, DotnetSupportLib);
 }

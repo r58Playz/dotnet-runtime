@@ -11,7 +11,8 @@ using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using Microsoft.Build.Framework;
-using WasmAppBuilder;
+
+namespace Microsoft.WebAssembly.Build.Tasks.Mono;
 
 // Interp-to-native cookies for every `calli` through an UNMANAGED function pointer in the scanned assemblies.
 //

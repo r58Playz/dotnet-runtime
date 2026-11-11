@@ -93,7 +93,7 @@ export async function instantiate_webcil_range_asset (asset: AssetEntry, url: st
     const virtualName: string = typeof (asset.virtualPath) === "string" ? asset.virtualPath : asset.name;
     let instance: WebAssembly.Instance;
     try {
-        instance = await WebAssembly.instantiate(module, { webcil: { memory: (Module as any).wasmMemory } });
+        instance = await WebAssembly.instantiate(module, { webcil: { memory: runtimeHelpers.getMemory() } });
     } catch (err: any) {
         mono_log_info(`webcil range: ${virtualName} not instantiable (${err}), loading it whole`);
         return false;
