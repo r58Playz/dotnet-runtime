@@ -7187,7 +7187,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						     * f-slot call plus the shared cold miss. With it off, only the terminal
 						     * vcall handoff site was offered to prediction at all. */
 						    TRUE) {
-							int pred_why = 0;
+							int pred_why = 0, pred_src = 0;   /* pred_src: MONO_WASM_JIT_SITE_COUNT, WjSiteRec.pred_src */
 							guint32 pred_samples = 0;
 							extern gboolean mono_wasm_jit_prof_predict_method (gpointer caller, MonoMethod *base,
 								MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
@@ -7199,7 +7199,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							if (!pred_ok && mono_wasm_jit_pred_mid && vc_mid_slot >= 0 && (pred_why == 3 || pred_why == 4) &&
 							    mono_wasm_jit_prof_predict_method (pred_im, call->method,
 							                                       &pred_vt, &pred_target, &pred_samples)) {
-								pred_ok = TRUE;
+								pred_ok = TRUE; pred_src = 2;
 								wj_count (WJC_MID_PRED_ARM);
 							}
 							/* R405: a COLD verdict whose record saw ONE receiver (interp.c mono_wasm_jit_prof_predict_cold). */
@@ -7208,7 +7208,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
 							  if (!pred_ok && pred_why == 2 && (mono_wasm_jit_t2_cold_pred & 2) && cfg->wasm_jit_tier >= 2 &&
 							      mono_wasm_jit_prof_predict_cold (pred_im, call->method, &pred_vt, &pred_target, &pred_samples)) {
-								pred_ok = TRUE;
+								pred_ok = TRUE; pred_src = 4;
 								wj_count (WJC_T2_COLD_PRED_ARM);
 							  } }
 							{ extern int mono_wasm_jit_s3;   /* plan2x S3: no prediction, but nothing overrides the base */
@@ -7216,12 +7216,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							  if (!pred_ok && (mono_wasm_jit_s3 & 2) && (!(mono_wasm_jit_s3 & 8) || cfg->wasm_jit_tier >= 2)) {
 								pred_cha = mono_wasm_jit_cha_final_word (call->method, &_cand);
 								if (pred_cha) {
-									pred_ok = TRUE; pred_vt = NULL; pred_target = call->method;
+									pred_ok = TRUE; pred_vt = NULL; pred_target = call->method; pred_src = 3;
 									wj_count (WJC_S3_ARM_PRED);
 								} else if (_cand) {
 									wj_count (WJC_S3_ARM_OVERRIDDEN);
 								}
 							  } }
+							if (G_UNLIKELY (wj_site_cur))
+								wj_site_note_pred (wj_site_cur, pred_im, call->method, pred_vt, pred_target, pred_ok && !pred_src ? 1 : pred_src);
 							if (pred_ok) {
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);

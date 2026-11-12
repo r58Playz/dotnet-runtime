@@ -1945,6 +1945,28 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 	return TRUE;
 }
 
+/* MONO_WASM_JIT_SITE_COUNT: the record a virtual site predicts from, and its receiver set as text
+ * ("total margin nids overflow id:target:count,..."; pointers are printed, never dereferenced). Racy by design:
+ * a census reads it. The record never moves (see WjVcallSite.prof). */
+gpointer
+mono_wasm_jit_prof_site_peek (gpointer caller_ptr, MonoMethod *base)
+{
+	return (caller_ptr && base) ? wj_prof_site ((InterpMethod *) caller_ptr, base, WJ_SITE_VIRTUAL, FALSE) : NULL;
+}
+
+int
+mono_wasm_jit_prof_site_format (gpointer site, char *buf, int len)
+{
+	WjProfSite *s = (WjProfSite *) site;
+	int o, k, n = s->nids;
+	if (n > WJ_PROF_WAYS)
+		n = WJ_PROF_WAYS;
+	o = g_snprintf (buf, len, "%u %u %d %d ", s->total, s->margin, n, (int) s->ids_overflow);
+	for (k = 0; k < n && o < len - 40; ++k)
+		o += g_snprintf (buf + o, len - o, "%s%p:%p:%u", k ? "," : "", s->ids [k], s->id_targets [k], (guint32) s->id_counts [k]);
+	return o;
+}
+
 /* R310 census predicates for the GI gate's refusal split (method-to-ir.c). Read-only and racy: they
  * classify a refusal that has already happened, and a torn read mis-files one site in a census. */
 

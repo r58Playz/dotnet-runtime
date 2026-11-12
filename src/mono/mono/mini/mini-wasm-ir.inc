@@ -1428,6 +1428,11 @@ typedef struct {
 	 * thread, then the selected thread (MONO_WASM_JIT_SITE_THREAD). The layout is the serializer's contract. */
 	gint32 form [2 * WASM_SF_N], form_last [2 * WASM_SF_N];
 	gint32 fslot;         /* the f-slot the instruction's last WASM_RELOC_CALL names (0: none) */
+	/* A virtual site's prediction: who predicted (0 none, 1 receiver profile, 2 one-method profile, 3 CHA, 4 cold
+	 * record), the predicted vtable and target (identities), the profile record, and its receiver set at emit time. */
+	guint8 pred_src;
+	gpointer pred_vt, pred_target, prof;
+	const char *prof0;
 } WjSiteRec;
 /* The record of the call instruction being lowered, so the lowering can file its arm outcome. Per thread: compiles
  * on different workers do not share it, and the emitter loop clears it for every instruction. */
@@ -1557,6 +1562,23 @@ wj_site_count_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins, const char *mnam
 	wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, addr);
 }
 
+#ifdef HOST_BROWSER
+/* File a virtual site's prediction in its census record (the dump prints it beside the record's state then). */
+static void
+wj_site_note_pred (WjSiteRec *r, gpointer prof_im, MonoMethod *base, gpointer pred_vt, gpointer pred_target, int src)
+{
+	extern gpointer mono_wasm_jit_prof_site_peek (gpointer caller_ptr, MonoMethod *base);
+	extern int mono_wasm_jit_prof_site_format (gpointer site, char *buf, int len);
+	char buf [512];
+	r->pred_src = (guint8) src; r->pred_vt = pred_vt; r->pred_target = pred_target;
+	r->prof = mono_wasm_jit_prof_site_peek (prof_im, base);
+	if (r->prof) {
+		mono_wasm_jit_prof_site_format (r->prof, buf, sizeof (buf));
+		r->prof0 = g_strdup (buf);   /* never freed, like the record */
+	}
+}
+#endif
+
 /* Does `mname` contain one of MONO_WASM_JIT_SITE_THREAD's comma-separated substrings? */
 static gboolean
 wj_site_thread_match (const char *mname)
@@ -1627,10 +1649,19 @@ mono_wasm_jit_dump_sites (void)
 		if (d < 0) d = 0;
 		total += d; lines++;
 		/* fields 13-15: the form counters of every thread, of the selected thread, and the callee f-slot */
-		printf ("WASM_JIT_SITE\t%d\t%d\t%u\t%c\t%d\t%p\t%p\t%s\t%s\t%s\t%c\t%d\t%d,%d,%d,%d,%d,%d\t%d,%d,%d,%d,%d,%d\t%d\n",
+		printf ("WASM_JIT_SITE\t%d\t%d\t%u\t%c\t%d\t%p\t%p\t%s\t%s\t%s\t%c\t%d\t%d,%d,%d,%d,%d,%d\t%d,%d,%d,%d,%d,%d\t%d\t%d\n",
 			seq, d, r->tier, r->kind, r->il,
 			r->caller_m, r->callee_m, r->caller, r->inl ? r->inl : "-", r->callee, r->gi ? r->gi : '-', r->arm,
-			fd [0], fd [1], fd [2], fd [3], fd [4], fd [5], fd [6], fd [7], fd [8], fd [9], fd [10], fd [11], r->fslot);
+			fd [0], fd [1], fd [2], fd [3], fd [4], fd [5], fd [6], fd [7], fd [8], fd [9], fd [10], fd [11], r->fslot, i);
+#ifdef HOST_BROWSER
+		if (r->prof) {   /* field 16 above is the record's index; this line is its prediction, then and now */
+			extern int mono_wasm_jit_prof_site_format (gpointer site, char *buf, int len);
+			char pb [512];
+			mono_wasm_jit_prof_site_format (r->prof, pb, sizeof (pb));
+			printf ("WASM_JIT_SITE\tP\t%d\t%d\t%d\t%p\t%p\t%s\t%s\n", seq, i, (int) r->pred_src, r->pred_vt, r->pred_target,
+				r->prof0 ? r->prof0 : "-", pb);
+		}
+#endif
 	}
 	printf ("[wasm-jit sites] dump=%d records=%d moved=%d calls=%lld fields=gi+arm+forms form_calls=%lld selected_thread=%lld "
 		"(SITE_COUNT=%d; forms local,superseded,call_solo,call_group,dynamic,fixed)\n", seq, n, lines, (long long) total,
