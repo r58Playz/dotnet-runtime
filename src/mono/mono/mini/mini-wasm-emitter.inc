@@ -1511,10 +1511,21 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int *addrslot = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg); /* address-taken local vreg -> byte offset in the addr frame, else -1 */
 	signed char *addr_ldkind = (signed char *) mono_mempool_alloc0 (cfg->mempool, sizeof (signed char) * nvreg); /* sub-word read-back kind (0=full), see WjCtx.addr_ldkind */
 	guint8 *arg_spill = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nargs + 1);   /* [nargs]: 1 = an address-taken scalar arg the prologue copies into its addr slot */
-	WasmValtype *param_types = (WasmValtype *) mono_mempool_alloc0 (cfg->mempool, sizeof (WasmValtype) * (nargs + 2)); /* +2: trailing hidden-vret param, then the trailing threaded frame base (MONO_WASM_JIT_THREAD_SP) */
+	WasmValtype *param_types = (WasmValtype *) mono_mempool_alloc0 (cfg->mempool, sizeof (WasmValtype) * (nargs + 2)); /* +2: trailing hidden-vret param, then the trailing frame base (MONO_WASM_JIT_SP_ARG) */
 	WasmValtype ret_vt;
 	WasmCallInfo self_ci;              /* the method's OWN callee ABI (self-sig); also the registered f_sig_id, so callers' baked dep_sig and our registration can never disagree */
-	int nwparams;                      /* wasm param count of func f = nargs + (hidden vret ? 1 : 0) + (threaded frame base ? 1 : 0). ALL local-index math is based on this, not nargs: wasm locals are numbered after the params */
+	int nwparams;                      /* wasm param count of func f = nargs + (hidden vret ? 1 : 0) + (frame base ? 1 : 0). ALL local-index math is based on this, not nargs: wasm locals are numbered after the params */
+	/* MONO_WASM_JIT_SP_ARG (mini-wasm.c states the modes); all -1 in mode 0.
+	 * sp_param_idx: the trailing frame-base parameter. spout_idx: a local for a LAZY frame's method, which has a frame
+	 * on some paths only -- it holds the parameter until ENSURE_REF_FRAME makes it refbase, and the parameter again
+	 * after RELEASE_LAZY_REF_FRAME. sp_out_idx: the local this body's JIT callees are handed and, in mode 2, s.p is
+	 * written from before a native call -- spout_idx for a lazy frame, refbase_idx for an eager frame or an EH method
+	 * (set by the prologue before anything can emit a call), the parameter itself for a method with no frame. */
+	int sp_param_idx = -1, spout_idx G_GNUC_UNUSED = -1, sp_out_idx = -1;
+	/* the per-body emission state (mini-wasm-ir.inc), put back at `done` */
+	int wj_sp_saved_local = wj_sp_out_local;
+	gboolean wj_sp_saved_sync = wj_sp_sync_on, wj_sp_saved_unset = wj_sp_unset;
+	guint32 wj_sp_saved_n = wj_sp_sync_n;
 	gboolean self_has_byaddr G_GNUC_UNUSED = FALSE;  /* stats: method takes >=1 by-addr vtype arg */
 	WasmBuf body, out;
 	WjBody *wj_stored_body = NULL;   /* the relocatable body, handed to the registry on successful registration */
@@ -1614,6 +1625,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean cfg_sorted = FALSE;   /* plan A5 v2: wj_cfg_sort reordered the blocks (fallthrough goes to out_bb [0]) */
 	WasmFuncType extra_types [WJ_EXTRA_TYPES_MAX]; /* callee functypes for call_indirect, after T0/T1 */
 	int nextra = 0;
+	guint32 wj_site_bytes = 0;         /* MONO_WASM_JIT_SITE_COUNT: bytes of form counters in this module (left out of the tier-2 cap) */
 	/* Where this method's extra callee types start WITHIN ITS OWN type block: T0 = the method, T1 = the
 	 * entry thunk, T2.. = the extras. So it is the constant 2, always, and every type index the body
 	 * carries is block-relative.
@@ -1652,6 +1664,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int wj_self_e_slot = 0, wj_self_f_slot = 0;
 #endif
 
+	wj_sp_out_local = -1;   /* MONO_WASM_JIT_SP_ARG: this body has not named its frame-base local yet */
+	wj_sp_sync_on = FALSE;
+	wj_sp_unset = FALSE;
+	wj_sp_sync_n = 0;
 	wasm_buf_init (&body);
 	wasm_buf_init_relocs (&body);   /* every call site and type index in it is a hole; see wasm-encoder.h */
 	wj_sw_tab = wj_sw_inl_freeze (cfg, &wj_sw_ranges, &wj_sw_n);   /* R516: inlining is done; tag call sites below */
@@ -1887,6 +1903,22 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		vt [vrd] = WASM_I32;
 		li [vrd] = nargs;
 		nwparams = nargs + 1;
+	}
+	/* MONO_WASM_JIT_SP_ARG: the frame base is the LAST parameter, after the hidden vret pointer, so no argument's
+	 * index moves (the prologue reads incoming argument i as `local.get i`). Added to self_ci.ftype, which is what
+	 * f_sig_id hashes, what callers' baked dep_sig is compared with, and what a pool slot's stub type is checked
+	 * against below -- every caller builds its site's type through the same wj_ftype_add_sp. A type with no room is a
+	 * permanent bail: the method runs in the interpreter. */
+	if (mono_wasm_jit_sp_arg) {
+		if (!wj_ftype_add_sp (&self_ci.ftype)) {
+			mono_atomic_inc_i32 (&mono_wasm_jit_sp_arg_refused);
+			fail = "self nargs+sp";
+			goto done;
+		}
+		param_types [nwparams] = WASM_I32;
+		sp_param_idx = nwparams;
+		nwparams += 1;
+		self_ci.f_sig_id = wj_functype_hash (&self_ci.ftype);
 	}
 	ret_vt = self_ci.ret.wtype;   /* WASM_VOID for void and hidden-vret returns, else the scalar ret valtype */
 
@@ -2469,14 +2501,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	/* one more i32 local: the C-stack SP captured at entry (every exit stackRestores to it) */
 	spentry_idx = nwparams + cnt [0];
 	cnt [0] += 1;
-	/* one more i32 local: the frame base handed to JIT callees. A dedicated local rather than an alias
-	 * of refbase_idx because a LAZY ref frame has no valid refbase until ENSURE_REF_FRAME runs, and a
-	 * frame-free/no-GC callee can be called before that point -- aliasing would hand it a garbage base.
-	 * GATED on the knob, unlike every other local here, so that knob-off output stays BYTE-IDENTICAL and
-	 * tiershape.py can gate this change as a pure refactor -- against a same-binary CONTROL pair, not an
-	 * absolute floor (R241: the same-binary floor is 0.69% on the current tier). An always-declared
-	 * local is free at run time (V8 lowers local ops to zero instructions) but it is not free in WIRE
-	 * SIZE, and wire size is what decides whether a body clears V8's 500-byte inlining cap. */
+	/* MONO_WASM_JIT_SP_ARG: one more i32 local, the frame base a LAZY frame's method hands to its JIT callees (see
+	 * sp_out_idx). A lazy ref frame has no valid refbase until ENSURE_REF_FRAME runs, and a frame-free/no-GC callee
+	 * can be called before that point, so refbase cannot serve there. Whether the frame is lazy is decided after
+	 * this, so the local is declared in every method (dead elsewhere) -- but only under the knob, unlike every other
+	 * local here, so that knob-off output stays BYTE-IDENTICAL: a declared local is free at run time (V8 lowers
+	 * local ops to zero instructions) and not in wire size. */
+	if (sp_param_idx >= 0) {
+		spout_idx = nwparams + cnt [0];
+		cnt [0] += 1;
+	}
 	/* three i32 locals for OP_WASM_JIT_ALLOC_FAST (TLS address/SgenThreadInfo, object, new tlab_next). Declared
 	 * ONLY in a method that allocates inline, so every other method's output is unchanged. */
 	{
@@ -3614,10 +3648,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		wasm_op (&body, wj_fcmp_op ((IS_F32), (KIND))); \
 		if (NEG) wasm_op (&body, WASM_OP_I32_EQZ); \
 	} while (0)
+/* MONO_WASM_JIT_SP_ARG: the frame-base argument of a JIT->JIT call whose table index is computed (an IC hit, a
+ * delegate recipe, a late f-slot). It is the LAST argument, so it goes after the callee's own and BEFORE the index;
+ * the site's functype went through wj_ftype_add_sp and its wj_emit_dynamic_call says WJ_DYN_F. Nothing in mode 0. */
+#define WJ_PUSH_SP() wj_emit_sp_push (&body)
 /* Pop this method's C-stack frame (restore __stack_pointer to the entry SP). Emit before EVERY
  * return: a popped frame falls below the SP and stops being GC-scanned — no zeroing needed. The
  * global.set consumes only entry_sp, so it leaves any return value on the stack. No-op for
- * frame-less methods. */
+ * frame-less methods, and under MONO_WASM_JIT_SP_ARG=2, where a JIT frame never wrote s.p for itself: the
+ * caller's next native call writes it from the caller's own frame base. */
 /* A residual/vcall/delegate callee reported threw==1: CONTINUE THE NATIVE UNWIND, never return.
  *
  * The boundary (mono_wasm_jit_invoke_caught) has already caught the C++ unwind and, for a handler in a
@@ -3743,7 +3782,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	} while (0)
 #define EMIT_REF_LEAVE() do { guint16 _wjo_rl = wasm_origin_push (&body, WJO_EXIT); \
 	if (ehrec_on) { guint16 _wjo_ep = wasm_origin_push (&body, WJO_EH_POP); EMIT_EHREC_POP (); wasm_origin_pop (&body, _wjo_ep); } \
-	if (framebytes > 0 && !lazy_cold_frame) { \
+	if (framebytes > 0 && !lazy_cold_frame && mono_wasm_jit_sp_arg < 2) { \
 		if (lazy_ref_frame) { \
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
 			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
@@ -3767,6 +3806,22 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define EMIT_REF_LEAVE() do { } while (0)
 #endif
 
+/* MONO_WASM_JIT_SP_ARG, the two places a frame is created (the eager prologue and ENSURE_REF_FRAME).
+ * WJ_EMIT_ENTRY_SP pushes the base the frame goes below: the frame-base parameter, else s.p.
+ * WJ_EMIT_FRAME_PUBLISH follows `local.set refbase`: s.p = refbase -- except in mode 2, where the write happens before
+ * each native call instead (wj_emit_sp_sync) -- and, in a lazy frame's method, refbase becomes what JIT callees are
+ * handed. An eager frame's method hands out refbase_idx itself, so it has nothing more to set. */
+#define WJ_EMIT_ENTRY_SP() do { \
+	if (sp_param_idx >= 0) wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) sp_param_idx); \
+	else { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0); } } while (0)
+#define WJ_EMIT_FRAME_PUBLISH() do { \
+	if (mono_wasm_jit_sp_arg < 2) { \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+		wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); } \
+	if (sp_out_idx >= 0 && sp_out_idx == spout_idx) { \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spout_idx); } } while (0)
+
 /* Materialize a lazy pure-ref frame immediately before the first instruction that can return after a
  * GC. The current SP is still this method's entry SP: everything executed before here is inline-pure or
  * a transitively no-GC/frame-free direct callee. Copy every write-through local only after reserving and
@@ -3777,14 +3832,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
 	wasm_op (&body, WASM_OP_I32_EQZ); \
 	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
-	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0); \
+	WJ_EMIT_ENTRY_SP (); \
 	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx); \
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
 	wasm_i32_const (&body, framebytes); wasm_op (&body, WASM_OP_I32_SUB); \
 	wasm_i32_const (&body, -16); wasm_op (&body, WASM_OP_I32_AND); \
 	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx); \
-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
-	wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); \
+	WJ_EMIT_FRAME_PUBLISH (); \
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
 	wasm_i32_const (&body, 0); wasm_i32_const (&body, framebytes); \
 	wasm_u8 (&body, 0xFC); wasm_uleb (&body, 11); wasm_u8 (&body, 0); \
@@ -3808,8 +3862,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define RELEASE_LAZY_REF_FRAME() do { if (lazy_ref_frame) { \
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
 	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
-	wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); \
+	if (mono_wasm_jit_sp_arg < 2) { \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+		wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); } \
+	if (sp_out_idx >= 0) {   /* MONO_WASM_JIT_SP_ARG: no frame again, so JIT callees go below the base this method was handed */ \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) sp_param_idx); \
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spout_idx); } \
 	wasm_i32_const (&body, 0); \
 	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx); \
 	wasm_op (&body, WASM_OP_END); \
@@ -4131,12 +4189,40 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	/* Prologue: $blk is needed only by the universal dispatcher/EH landing pad. Structured non-EH
 	 * layouts enter their first lexical block directly and never read it. */
 	wasm_origin_push (&body, WJO_DISPATCH);   /* origin regions of the prologue are sequential: no pops */
+	{ extern int mono_wasm_jit_site_count;
+	  /* MONO_WASM_JIT_SITE_COUNT: entering a method MONO_WASM_JIT_SITE_THREAD names selects this thread for the census */
+	  if (G_UNLIKELY (mono_wasm_jit_site_count) && mname && wj_site_thread_match (mname)) {
+		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);
+		wasm_i32_const (&body, 1);
+		wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, WJ_SCRATCH_SITESEL_SLOT);
+		printf ("[wasm-jit sites] thread select emitted in %s (tier %d)\n", mname, (int) cfg->wasm_jit_tier);
+	  } }
 	if (structured_cfg_kind == WJ_CFG_DISPATCH) {
 		wasm_i32_const (&body, 0);
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
 	}
 
 	wasm_origin_push (&body, WJO_FRAME);
+	/* MONO_WASM_JIT_SP_ARG: name the local this body's JIT callees are handed (sp_out_idx, see its declaration) before
+	 * anything can emit a call -- nothing above this point does. A lazy frame's method seeds its own local from the
+	 * parameter here. An eager frame's or an EH method's is refbase, which the prologue just below sets ahead of its
+	 * first call; the call forms are told about it there, once it holds a value, so a call emitted any earlier fails
+	 * the compile (wj_sp_unset) instead of handing out an unset local. From then to `done` wj_emit_method_call pushes
+	 * the local, and in mode 2 every native call form writes s.p from it first. */
+	if (sp_param_idx >= 0) {
+#ifdef HOST_BROWSER
+		if (lazy_ref_frame) {
+			sp_out_idx = spout_idx;
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) sp_param_idx);
+			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spout_idx);
+		} else if (framebytes > 0 || eh_on) {
+			sp_out_idx = refbase_idx;
+		} else
+#endif
+			sp_out_idx = sp_param_idx;   /* no frame (and none at all in the offline dump): the base it was handed */
+		wj_sp_out_local = sp_out_idx == refbase_idx ? -1 : sp_out_idx;
+		wj_sp_sync_on = mono_wasm_jit_sp_arg >= 2;
+	}
 #ifdef HOST_BROWSER
 	/* C-STACK FRAME PROLOGUE. Reserve this method's ref+addr slots as a real frame on the emscripten
 	 * C stack (see the layout doc at the top of this file): capture entry_sp, drop the SP by the
@@ -4145,11 +4231,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * (EMIT_REF_LEAVE); the EH landing pad stackRestores refbase (this frame stays live, unwound
 	 * callee frames fall below the SP and stop being scanned — no zeroing, no balance bookkeeping).
 	 * An EH method with an EMPTY frame still captures entry_sp (refbase = entry_sp) so its landing
-	 * pad can pop the frames of callees the C++ unwind tore through. */
+	 * pad can pop the frames of callees the C++ unwind tore through.
+	 * MONO_WASM_JIT_SP_ARG: entry_sp is the frame-base parameter, not a read of s.p, and in mode 2 neither the
+	 * prologue nor an exit writes s.p (the landing pad still does). */
 	if ((framebytes > 0 && !lazy_ref_frame) || eh_on) {
 		uses_calls = TRUE;
-		/* entry_sp = the caller's frame base, read from __stack_pointer (imported wasm global 0). */
-		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
+		/* entry_sp = the caller's frame base: __stack_pointer (imported wasm global 0), or the parameter. */
+		WJ_EMIT_ENTRY_SP ();
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) spentry_idx);
 		if (framebytes > 0 && !lazy_ref_frame) {
 			/* refbase (frame base) = (entry_sp - framebytes) & ~15; __stack_pointer = refbase */
@@ -4159,8 +4247,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wasm_i32_const (&body, -16);
 			wasm_op (&body, WASM_OP_I32_AND);
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx);
-			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
-			wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
+			WJ_EMIT_FRAME_PUBLISH ();
+			if (sp_out_idx == refbase_idx)
+				wj_sp_out_local = sp_out_idx;   /* MONO_WASM_JIT_SP_ARG: refbase holds the frame base from here on */
 			/* memory.fill (refbase, 0, framebytes): the frame is above the SP now, so the GC scans it —
 			 * it must hold no garbage/stale pointers; .NET local zero-init falls out of the same fill */
 			{
@@ -4236,6 +4325,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			/* eh_on with an empty frame: refbase = entry_sp is the landing pad's restore target */
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx);
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) refbase_idx);
+			if (sp_out_idx == refbase_idx)
+				wj_sp_out_local = sp_out_idx;   /* MONO_WASM_JIT_SP_ARG: ... and what this method's JIT callees are handed */
 		}
 	}
 	if (lazy_ref_frame)
@@ -5243,7 +5334,25 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				 * through to the plain immediate bake. */
 				if (ins->type == STACK_OBJ && ins->inst_p0) {
 #ifdef HOST_BROWSER
-					if (!ins->inst_p1) { fail = "managed pconst not interned"; goto done; }
+					if (!ins->inst_p1 && mono_wasm_jit_lit_rescue) {
+					/* a pass cloned the constant without its slot: this compile interned the same pointer value */
+					WjLitNote *_ln;
+					for (_ln = (WjLitNote *) cfg->wasm_jit_literals; _ln; _ln = _ln->next)
+						if (_ln->obj == ins->inst_p0) {
+							ins->inst_p1 = _ln->slot;
+							mono_atomic_inc_i32 (&mono_wasm_jit_lit_rescued);
+							break;
+						}
+				}
+				if (!ins->inst_p1) {
+					/* ~10-25 a run, so ungated: which constant, for finding its producer */
+					if (mono_atomic_inc_i32 (&mono_wasm_jit_lit_unslotted) <= 40)
+						printf ("[wasm-jit pconst] no literal slot: R%d il %d tier %d notes %s %s\n", ins->dreg,
+							(ins->cil_code && cfg->header && ins->cil_code >= cfg->header->code &&
+							 ins->cil_code < cfg->header->code + cfg->header->code_size) ? (int) (ins->cil_code - cfg->header->code) : -1,
+							(int) cfg->wasm_jit_tier, cfg->wasm_jit_literals ? "some" : "none", mname ? mname : "?");
+					fail = "managed pconst not interned"; goto done;
+				}
 					wasm_i32_const (&body, (gint32) (intptr_t) ins->inst_p1);
 #else
 					wasm_i32_const (&body, 0x7ff8); /* offline dump: placeholder slot addr for encoder validation */
@@ -6356,6 +6465,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					goto done;
 				}
 				ct = cci.ftype;
+				/* MONO_WASM_JIT_SP_ARG: from here `ct` is the callee's JIT `f` type -- the lazy pool's, the dependency
+				 * hash's, the direct call's and the self-healing call's. The inline AOT call builds its own from
+				 * cci.ftype, and the residual reads only ct's argument and return valtypes. A callee type with no room
+				 * for the parameter cannot be an `f`; the caller bails rather than carry a second type for it. */
+				if (!wj_ftype_add_sp (&ct)) {
+					mono_atomic_inc_i32 (&mono_wasm_jit_sp_arg_refused);
+					fail = "callee nargs+sp";
+					goto done;
+				}
 #ifdef HOST_BROWSER
 				if (call_method == cfg->method) {
 					extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
@@ -6486,15 +6604,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							if (call_method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL)
 								wj_count (WJC_ICALL_AOT_SITE);   /* J1a: only reachable with MONO_WASM_JIT_ICALL_AOT */
 							/* FROM cci.ftype, NOT ct. `ct` is the JIT-callee functype and carries the
-							 * trailing threaded frame base under MONO_WASM_JIT_THREAD_SP; an AOT body has
+							 * trailing frame base under MONO_WASM_JIT_SP_ARG; an AOT body has
 							 * no such parameter and this site never pushes one, so copying `ct` here
 							 * declares one param too many and the module fails to COMPILE with
 							 * "not enough arguments on the stack" -- which is a whole-module loss that
 							 * shows up as `registered` falling and WJC_INVALID rising, never as an error
-							 * at the call. Measured: 112 of 392 methods (jbox2d), 5.0x
-							 * slower, because this is the highest-volume call site in the emitter.
-							 * cci.ftype is the unmodified logical signature -- the old THREAD_SP path mutated
-							 * only the copy. */
+							 * at the call. Measured on that knob's predecessor, MONO_WASM_JIT_THREAD_SP:
+							 * 112 of 392 methods (jbox2d), 5.0x slower, because this is the highest-volume
+							 * call site in the emitter. cci.ftype is the unmodified logical signature --
+							 * wj_ftype_add_sp mutates only the copy. */
 							WasmFuncType nt = cci.ftype;   /* native functype = (this?, args by value) [+ i32 rgctx if aot_has_extra] -> ret */
 							int nti = -1;
 							/* Append the trailing extra (rgctx/dummy) arg ONLY when the body actually has it. Exempt
@@ -6678,8 +6796,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								for (ai = 0; ai < cci.nargs; ++ai)
 									if (!wj_emit_one_call_arg (&body, &lc, &cci, csig, call, ai)) { fail = "late call arg ld"; goto done; }
 								if (cci.vret_byaddr && !wasm_ld (&body, &lc, wj_arg_vreg (call, cci.nargs))) { fail = "late call vret ld"; goto done; }
+								WJ_PUSH_SP ();
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-								wj_emit_dynamic_call (&body, (guint32) type_idx);
+								wj_emit_dynamic_call (&body, (guint32) type_idx, WJ_DYN_F);
 								if (ct.ret != WASM_VOID) {
 									if (cci.ret.kind == WJ_ARG_VTYPE_SCALAR) {
 										if (!wj_store_scalar_vtype_result (&body, &lc, ct.ret, wj_arg_vreg (call, cci.nargs))) { fail = "late scalar-vtype ret"; goto done; }
@@ -6972,8 +7091,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
 						if (vtdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = vtd; vtdi = ti_base + nextra++; }
 						memset (&ftd, 0, sizeof (ftd)); for (vk = 0; vk < npp; ++vk) ftd.params [vk] = pp [vk]; ftd.nparams = (guint32) npp; ftd.ret = rv;
 						/* `ftd` is a JIT `f`; `at`/`at_ne` below are AOT bodies built from the same pp[] and
-						 * must NOT get the extra param. Adding it here rather than inside
-						 * mono_wasm_get_call_info is what keeps those two apart. */
+						 * must NOT get the extra param (MONO_WASM_JIT_SP_ARG's frame base). Adding it here rather
+						 * than inside mono_wasm_get_call_info is what keeps those two apart. */
+						if (!wj_ftype_add_sp (&ftd)) {
+							mono_atomic_inc_i32 (&mono_wasm_jit_sp_arg_refused);
+							fail = "callee nargs+sp";
+							goto done;
+						}
 						for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &ftd)) { ftdi = ti_base + vk; break; }
 						if (ftdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ftd; ftdi = ti_base + nextra++; }
 						/* Adaptive speculative devirtualization. A perfectly-monomorphic interpreter profile
@@ -7106,6 +7230,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 								MonoMethodSignature *pred_sig = mono_method_signature_internal (pred_target);
 								WasmCallInfo pred_ci;
 								mono_wasm_get_call_info (pred_sig, &pred_ci);
+								/* compared with `ftd` below, a JIT `f` type: the candidate's fresh one must be too */
+								if (pred_ci.valid && !wj_ftype_add_sp (&pred_ci.ftype))
+									pred_ci.valid = FALSE;
 								if (m_class_is_valuetype (pred_target->klass)) {
 									/* R376: the profile records a boxed receiver's VALUETYPE override (MINT_CALLVIRT_FAST
 									 * records, then unboxes), and an arm would call it with the boxed `this`, so its
@@ -7173,6 +7300,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 							memset (&dftd, 0, sizeof (dftd));
 							for (vk = 1; vk < npp; ++vk) dftd.params [vk - 1] = pp [vk];
 							dftd.nparams = (guint32) (npp - 1); dftd.ret = rv;
+							wj_ftype_add_sp (&dftd);   /* a JIT `f` like ftd, and one param shorter, so it fits where ftd did */
 							for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &dftd)) { dftdi = ti_base + vk; break; }
 							if (dftdi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = dftd; dftdi = ti_base + nextra++; }
 						}
@@ -7501,6 +7629,8 @@ vcall_nullchk_done:
 											MonoMethodSignature *s2 = mono_method_signature_internal (a2t);
 											WasmCallInfo ci2;
 											mono_wasm_get_call_info (s2, &ci2);
+											if (ci2.valid && !wj_ftype_add_sp (&ci2.ftype))
+												ci2.valid = FALSE;
 											if (ci2.valid && !ci2.vret_byaddr && functype_eq (&ci2.ftype, &ftd)) {
 												pred2_vt = a2vt; pred2_target = a2t; pred2_fslot = f2;
 												wj_count (WJC_DEVIRT_ARM2_EMITTED);
@@ -7663,7 +7793,7 @@ vcall_nullchk_done:
 							 * objguard builds; a site whose stub cannot be made keeps the full form. */
 							{ extern int mono_wasm_jit_vsite_compact;
 							  if (mono_wasm_jit_vsite_compact && !is_delegate_invoke && !vc_vret && !lc.objguard && npp == n2 &&
-							      n2 >= 1 && n2 + 1 <= WASM_FUNCTYPE_MAX_PARAMS) {
+							      n2 >= 1 && n2 + 1 + (mono_wasm_jit_sp_arg ? 1 : 0) <= WASM_FUNCTYPE_MAX_PARAMS) {
 								int retnorm = 0, vs_slot, vs_ti = -1;
 								WasmFuncType vst;
 								if (rv == WASM_I32 && !m_type_is_byref (csig->ret)) {
@@ -7677,8 +7807,10 @@ vcall_nullchk_done:
 								}
 								memset (&vst, 0, sizeof (vst));
 								for (vk = 0; vk < n2; ++vk) vst.params [vk] = pp [vk];
-								vst.params [n2] = WASM_I64;   /* the descriptor: an i64 can never match the placeholder's type */
-								vst.nparams = (guint32) (n2 + 1); vst.ret = rv;
+								vst.nparams = (guint32) n2;
+								wj_ftype_add_sp (&vst);       /* MONO_WASM_JIT_SP_ARG: the stub is handed the frame base too, to pass on to a JIT f (room tested above) */
+								vst.params [vst.nparams++] = WASM_I64;   /* the descriptor: an i64 can never match the placeholder's type */
+								vst.ret = rv;
 								for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &vst)) { vs_ti = ti_base + vk; break; }
 								if (vs_ti < 0 && nextra < WJ_EXTRA_TYPES_MAX) { extra_types [nextra] = vst; vs_ti = ti_base + nextra++; }
 								vs_slot = vs_ti >= 0 ? wj_vslow_slot (&ftd, retnorm) : 0;
@@ -7762,16 +7894,18 @@ vcall_nullchk_done:
 									wj_emit_fast_count (&body, WJC_FAST_VIC);
 									for (ai = 0; ai < n2; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vslow hit arg ld"; goto done; }
+									WJ_PUSH_SP ();
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-									wj_emit_dynamic_call (&body, (guint32) ftdi);
+									wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
 									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vslow hit dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> end $after */
 									wasm_op (&body, WASM_OP_END);                            /* $cslow */
 									wj_emit_fast_count (&body, WJC_FAST_VMISS);
 									for (ai = 0; ai < n2; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vslow arg ld"; goto done; }
+									WJ_PUSH_SP ();
 									wasm_i64_const (&body, (gint64) (gsize) vsd);
-									wj_emit_helper_call (&body, (gpointer) (intptr_t) vs_slot, (guint32) vs_ti);
+									wj_emit_stub_call (&body, (gpointer) (intptr_t) vs_slot, (guint32) vs_ti);
 									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vslow dreg"; goto done; }
 									goto vcall_compact_done;
 								}
@@ -7821,8 +7955,9 @@ vcall_nullchk_done:
 									}
 									for (ai = 0; ai < n2c; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "slim pic arg ld"; goto done; }
+									WJ_PUSH_SP ();
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-									wj_emit_dynamic_call (&body, (guint32) ftdi);
+									wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
 									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "slim pic dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $slim_pic_miss */
@@ -7994,13 +8129,15 @@ vcall_nullchk_done:
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_target_off);
 										for (ai = 1; ai < n2; ++ai)
 											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate obj closed arg ld"; goto done; }
+										WJ_PUSH_SP ();
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wj_emit_dynamic_call (&body, (guint32) ftdi);
+										wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
 									wasm_op (&body, WASM_OP_ELSE);
 										for (ai = 1; ai < n2; ++ai)
 											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate obj open arg ld"; goto done; }
+										WJ_PUSH_SP ();
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wj_emit_dynamic_call (&body, (guint32) dftdi);
+										wj_emit_dynamic_call (&body, (guint32) dftdi, WJ_DYN_F);
 									wasm_op (&body, WASM_OP_END);
 									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "delegate obj dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> $after */
@@ -8174,13 +8311,15 @@ vcall_nullchk_done:
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) delegate_target_off);
 										for (ai = 1; ai < n2; ++ai)
 											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate ic closed arg ld"; goto done; }
+										WJ_PUSH_SP ();
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wj_emit_dynamic_call (&body, (guint32) ftdi);
+										wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
 									wasm_op (&body, WASM_OP_ELSE);
 										for (ai = 1; ai < n2; ++ai)
 											if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "delegate ic open arg ld"; goto done; }
+										WJ_PUSH_SP ();
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wj_emit_dynamic_call (&body, (guint32) dftdi);
+										wj_emit_dynamic_call (&body, (guint32) dftdi, WJ_DYN_F);
 									wasm_op (&body, WASM_OP_END);
 									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "delegate ic dreg"; goto done; }
 									/* One level deeper in the local-PIC arm: the ways sit inside the shared
@@ -8429,8 +8568,9 @@ vcall_nullchk_done:
 							}
 							for (ai = 0; ai < n2c; ++ai)
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "ic fast arg ld"; goto done; }
+							WJ_PUSH_SP ();
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-							wj_emit_dynamic_call (&body, (guint32) ftdi);
+							wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
 							if (rv != WASM_VOID) { if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "ic fast dreg"; goto done; } }
 							wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> $after (skip the C-helper slow path) */
 							wasm_op (&body, WASM_OP_END);                            /* end $slow */
@@ -8497,11 +8637,11 @@ vcall_nullchk_done:
 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND);   /* kind2bit selector */
 								wasm_op (&body, WASM_OP_IF); wj_emit_blocktype (&body, (guint32) aic_ati_ne);   /* typed block in: (this,args) out: rv */
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);   /* ti */
-									wj_emit_dynamic_call (&body, (guint32) aic_ati_ne);
+									wj_emit_dynamic_call (&body, (guint32) aic_ati_ne, WJ_DYN_NATIVE);
 								wasm_op (&body, WASM_OP_ELSE);
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_rgctx_idx);
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_ti_idx); wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);
-									wj_emit_dynamic_call (&body, (guint32) aic_ati);
+									wj_emit_dynamic_call (&body, (guint32) aic_ati, WJ_DYN_NATIVE);
 								wasm_op (&body, WASM_OP_END);   /* end kind if/else */
 								if (rv != WASM_VOID) { if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret); if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "aot ic dreg"; goto done; } }
 								wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* hit -> $after */
@@ -8566,9 +8706,10 @@ vcall_cold_miss_emit:
 							 * not spill, so no GC-invisible window), then the f-slot table index, call_indirect(ftd). */
 							for (ai = 0; ai < n2c; ++ai)
 								if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vcall fast arg ld"; goto done; }
+							WJ_PUSH_SP ();
 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 208);            /* f-slot = table index */
-							wj_emit_dynamic_call (&body, (guint32) ftdi);
+							wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
 							if (rv != WASM_VOID) { if (!wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vcall fast dreg"; goto done; } }
 						wasm_op (&body, WASM_OP_ELSE);
 							/* Fast AOT-vcall (MONO_WASM_JIT_VCALL_AOT, gated, default off): if the resolved override
@@ -8627,14 +8768,14 @@ vcall_cold_miss_emit:
 										/* no-extra-arg variant: AOT addr@212; call_indirect (this,args)->rv */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
-										wj_emit_dynamic_call (&body, (guint32) ati_ne);
+										wj_emit_dynamic_call (&body, (guint32) ati_ne, WJ_DYN_NATIVE);
 									wasm_op (&body, WASM_OP_ELSE);
 										/* with-rgctx variant: rgctx@216, AOT addr@212; call_indirect (this,args,rgctx)->rv */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 216);   /* rgctx (ftndesc.arg) */
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
-										wj_emit_dynamic_call (&body, (guint32) ati);
+										wj_emit_dynamic_call (&body, (guint32) ati, WJ_DYN_NATIVE);
 									wasm_op (&body, WASM_OP_END);   /* end variant if/else */
 									if (rv != WASM_VOID) {
 										if (rv == WASM_I32) wasm_emit_subword_ret_norm (&body, csig->ret);   /* raw AOT body: dirty upper bits */
@@ -8715,8 +8856,9 @@ vcall_cold_miss_emit:
 											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 											wasm_op (&body, lop); wasm_memarg (&body, al2, (guint32) (ai * 8));
 										}
+										WJ_PUSH_SP ();
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wj_emit_dynamic_call (&body, (guint32) ftdi);
+										wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
 										if (rv != WASM_VOID) {
 											WasmOpcode sop; guint32 al2;
 											switch (rv) {
@@ -8748,8 +8890,9 @@ vcall_cold_miss_emit:
 											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
 											wasm_op (&body, lop); wasm_memarg (&body, al2, (guint32) (ai * 8));
 										}
+										WJ_PUSH_SP ();
 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
-										wj_emit_dynamic_call (&body, (guint32) dftdi);
+										wj_emit_dynamic_call (&body, (guint32) dftdi, WJ_DYN_F);
 										if (rv != WASM_VOID) {
 											WasmOpcode sop; guint32 al2;
 											switch (rv) {
@@ -8795,7 +8938,7 @@ vcall_cold_miss_emit:
 								wasm_i32_const (&body, 0x7ffc);
 #endif
 							wasm_op (&body, WASM_OP_END);
-							wj_emit_dynamic_call (&body, (guint32) vtdi);
+							wj_emit_dynamic_call (&body, (guint32) vtdi, WJ_DYN_NATIVE);   /* call_delegate / call_interp: C helpers */
 							/* call_interp returns 1 if the vcall fallback threw. Continue the native unwind
 							 * instead of reading the stale scratch result; mirrors the direct residual path. */
 							WJ_HINT (0);   /* R339 */
@@ -8886,7 +9029,10 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				if (call->wasm_native_calli && !wj_emit_native_transition (&body, extra_types, &nextra, WJ_EXTRA_TYPES_MAX, ti_base, TRUE)) { fail = "too many callee types"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "creg target ld"; goto done; }
 					if (is_membase) { wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) ins->inst_offset); } /* target = *(base + offset) */
-				wj_emit_dynamic_call (&body, (guint32) type_idx);
+				/* WJ_DYN_NATIVE: the target is a native function pointer (MONO_WASM_JIT_NATIVE_CALLI) or, in a compile that is
+				 * not auto-JIT, an ftndesc's address, and `ct` above is the signature as written: no frame base, so it is
+				 * called as native code. An f-slot is not handed out as a function pointer by anything read for this. */
+				wj_emit_dynamic_call (&body, (guint32) type_idx, WJ_DYN_NATIVE);
 				if (call->wasm_native_calli) {
 					if (!wj_emit_native_transition (&body, extra_types, &nextra, WJ_EXTRA_TYPES_MAX, ti_base, FALSE)) { fail = "too many callee types"; goto done; }
 					wj_native_ret_norm (&body, &ct, csig);
@@ -9031,6 +9177,13 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		 * the stack. h = eh_dispatch(table, $blk): the throwing bb's matching catch handler bbidx, or -1. h<0 ->
 		 * throw it on (propagate to an outer frame / the interp boundary). h>=0 -> claim the C++ exc + set
 		 * $blk=h + br $outer to re-dispatch into the handler bb. */
+		/* MONO_WASM_JIT_SP_ARG=2: the pad's helpers (dispatch, the record pop or leave_island, begin/end catch) are
+		 * NOT preceded by a write of s.p. They run on the value the unwind left, as in modes 0 and 1 -- at or below
+		 * the s.p of the native call that threw, which is below this frame and every frame the unwind tore through --
+		 * and REF-SP-1 below is the write, after them. Writing refbase first would let those helpers allocate over
+		 * the torn frames while the exception is still being dispatched; nothing here shows that to be safe. */
+		gboolean wj_sp_pad_sync = wj_sp_sync_on;
+		wj_sp_sync_on = FALSE;
 		wasm_eh_region_catch (&body);   /* end try_table ; unreachable ; end $lp -- the C++ exc ptr is on the stack */
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
 #ifdef HOST_BROWSER
@@ -9120,7 +9273,12 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 0);     /* depth 0 = $outer loop -> re-dispatch */
 		wasm_op (&body, WASM_OP_END);          /* close $outer loop */
 		wasm_op (&body, WASM_OP_UNREACHABLE);  /* $outer loop never falls through */
+		wj_sp_sync_on = wj_sp_pad_sync;
 	}
+	/* MONO_WASM_JIT_SP_ARG: a call form asked for the frame-base local before this body had named it. Not reachable
+	 * as the emitter stands (the local is named ahead of the first instruction that can call); a bail rather than
+	 * a body with an argument or a write of s.p missing. */
+	if (G_UNLIKELY (wj_sp_unset)) { fail = "sp out local unset"; goto done; }
 
 #ifdef HOST_BROWSER
 	if (G_UNLIKELY (wj_oc != NULL))
@@ -9185,14 +9343,29 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		 * batch_finish to patch; it is now simply a hole the assembler fills, which is the same trick with
 		 * none of the bookkeeping. `tpool` 1 is the thunk's own signature, unused for a SELF reloc but
 		 * kept well-formed. */
-		/* THE BOUNDARY. `e` is the one place an interp->JIT transition enters the tier, so it is where
-		 * the frame base comes from -- one `global.get` per transition instead of one per method entry.
-		 * That ratio is the whole point of threading: 2.4M transitions against 974M dispatches in a 45 s
-		 * window, i.e. ~409x fewer reads of the imported mutable global. It is also where the reserved
-		 * CHUNK will be taken once the two `global.set`s go, at which point this read disappears too.
-		 * The 8 `s.*` globals are imported unconditionally (wasm-encoder.c:404-411), so this needs no
-		 * uses_calls flag to keep global 0 declared. */
+		/* THE BOUNDARY. `e` is the one place an interp->JIT transition enters the tier, so under MONO_WASM_JIT_SP_ARG
+		 * it is where the frame base comes from: s.p as the interpreter's C frames left it, pushed as the trailing
+		 * argument. In mode 2 `e` also puts that value back once `f` has returned. No JIT frame restores s.p there,
+		 * so without this the C frames above would go on allocating below wherever the last native call left it,
+		 * and the drift would grow with every transition. The value is kept in local 0 (args_ptr), which is dead
+		 * once the last argument is loaded. An unwind through `e` skips the restore; the C frame that catches it
+		 * resyncs from its own snapshot (mono_wasm_jit_invoke_caught). The s.* globals are imported whatever
+		 * uses_calls says (emit_import_section), so global 0 is always declared. */
+		if (mono_wasm_jit_sp_arg) {
+			wasm_op (&ethunk, WASM_OP_GLOBAL_GET); wasm_uleb (&ethunk, 0);
+			if (mono_wasm_jit_sp_arg >= 2)
+				wasm_op_local (&ethunk, WASM_OP_LOCAL_TEE, 0);
+		}
 		wasm_reloc (&ethunk, WASM_RELOC_SELF, 1, 0, NULL);
+		if (mono_wasm_jit_sp_arg >= 2) {
+			wasm_op_local (&ethunk, WASM_OP_LOCAL_GET, 0);
+			wasm_op (&ethunk, WASM_OP_GLOBAL_SET); wasm_uleb (&ethunk, 0);
+			mono_atomic_inc_i32 (&mono_wasm_jit_sp_arg_restores);
+		}
+		if (sp_param_idx >= 0) {   /* `[wasm-jit sp-arg]`: this body, and the writes of s.p it carries */
+			mono_atomic_inc_i32 (&mono_wasm_jit_sp_arg_bodies);
+			mono_atomic_add_i32 (&mono_wasm_jit_sp_arg_syncs, (gint32) wj_sp_sync_n);
+		}
 		if (has_ret) {
 			WasmOpcode st; guint32 al;
 			switch (ret_vt) {
@@ -9290,7 +9463,9 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				WjAsmDeps sdeps;
 				int di;
 				memset (&sdeps, 0, sizeof (sdeps));
+				wj_site_bytes = wasm_count_bytes;
 				wj_assemble (am, 1, 1, &pol, &out, NULL, &sdeps, wj_sw_sites);
+				wj_site_bytes = wasm_count_bytes - wj_site_bytes;   /* compiles are serialized: the delta is this module's */
 				for (di = 0; di < sdeps.n; ++di) {
 					int before = cfg->wasm_jit_result.ndirect_deps;
 					wj_result_add_direct_dep (&cfg->wasm_jit_result, sdeps.slot [di],
@@ -9333,8 +9508,10 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 	 * was <= ~101 KB spiked. A permanent (non-retriable) fail: a re-emit leaves the method's tier-1 body live, and
 	 * mono_wasm_force_compile's downgrade retries once at the ordinary policy when lifted call inlining was used. */
 	{ extern int mono_wasm_jit_t2_max_body;
-	  /* R460: the module V8 compiles -- not the ORIGIN diagnostic riding in it (0 bytes in a normal run) */
+	  /* R460: the module V8 compiles -- not the ORIGIN diagnostic riding in it (0 bytes in a normal run), nor the
+	   * census's counters (MONO_WASM_JIT_SITE_COUNT): a census must not downgrade what an uncounted run promotes */
 	  guint32 cap_len = out.len - MIN (out.len, wasm_last_origin_section_len);
+	  cap_len -= MIN (cap_len, wj_site_bytes);
 #ifdef HOST_BROWSER
 	  if (G_UNLIKELY (wj_oc != NULL) && !fail)
 		wj_oc_method (wj_oc, cap_len, mono_wasm_jit_t2_max_body, cfg->wasm_jit_tier >= 2 && mono_wasm_jit_t2_max_body > 0 &&
@@ -9512,6 +9689,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 						WjBody *old_body = sre->body;
 						sre->body = wj_stored_body;
 						sre->body_nparams_p1 = wj_stored_body ? (gint16) (wj_stored_body->nparams + 1) : sre->body_nparams_p1;
+						sre->body_tier = (guint8) (0x80 | (cfg->wasm_jit_tier & 0xf) | (cfg->wasm_jit_t1_down ? 0x10 : 0));
 						wj_stored_body = NULL;
 						{
 							extern void mono_wasm_jit_edge_note_name (int desc, const char *name);
@@ -9586,6 +9764,10 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 
 done:
 	wj_edge_on = FALSE;
+	wj_sp_out_local = wj_sp_saved_local;
+	wj_sp_sync_on = wj_sp_saved_sync;
+	wj_sp_unset = wj_sp_saved_unset;
+	wj_sp_sync_n = wj_sp_saved_n;
 	wj_body_free (wj_stored_body);   /* NULL once the registry has taken it */
 	wj_stored_body = NULL;
 	wasm_buf_free (&body);

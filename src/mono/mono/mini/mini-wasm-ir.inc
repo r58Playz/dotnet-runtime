@@ -1424,6 +1424,10 @@ typedef struct {
 	gint8 arm;            /* W3: the emitter's devirt arm outcome for a virtual site (ic_tag), -1 = not a virtual site */
 	gpointer caller_m, callee_m;   /* identities only, NEVER dereferenced after record time */
 	const char *caller, *inl, *callee;
+	/* How the calls lowered from this instruction ran, counted where each is written (wasm-encoder.h WASM_SF_*): every
+	 * thread, then the selected thread (MONO_WASM_JIT_SITE_THREAD). The layout is the serializer's contract. */
+	gint32 form [2 * WASM_SF_N], form_last [2 * WASM_SF_N];
+	gint32 fslot;         /* the f-slot the instruction's last WASM_RELOC_CALL names (0: none) */
 } WjSiteRec;
 /* The record of the call instruction being lowered, so the lowering can file its arm outcome. Per thread: compiles
  * on different workers do not share it, and the emitter loop clears it for every instruction. */
@@ -1540,6 +1544,10 @@ wj_site_count_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins, const char *mnam
 	r->ready = 1;
 	wj_site_cur = r;
 
+	{ extern int mono_wasm_jit_site_count;
+	  if (mono_wasm_jit_site_count >= 2)
+		return;   /* form counters only: the stored body is byte-identical to an uncounted one (holes are zero bytes) */
+	}
 	addr = (guint32) (gsize) &r->count;
 	wasm_i32_const (b, 0);
 	wasm_i32_const (b, 0);
@@ -1549,6 +1557,41 @@ wj_site_count_ins (WasmBuf *b, MonoCompile *cfg, MonoInst *ins, const char *mnam
 	wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, addr);
 }
 
+/* Does `mname` contain one of MONO_WASM_JIT_SITE_THREAD's comma-separated substrings? */
+static gboolean
+wj_site_thread_match (const char *mname)
+{
+	extern const char *mono_wasm_jit_site_thread;
+	const char *p = mono_wasm_jit_site_thread;
+	while (p && *p) {
+		const char *e = strchr (p, ',');
+		gsize n = e ? (gsize) (e - p) : strlen (p);
+		char buf [200];
+		if (n > 0 && n < sizeof (buf)) {
+			memcpy (buf, p, n); buf [n] = 0;
+			if (strstr (mname, buf))
+				return TRUE;
+		}
+		p = e ? e + 1 : NULL;
+	}
+	return FALSE;
+}
+
+/* The reloc just recorded belongs to the call instruction being lowered: the serializer counts it by form. */
+static void
+wj_site_link_reloc (WasmBuf *b, int fslot)
+{
+	WjSiteRec *r = wj_site_cur;
+	if (G_LIKELY (!r) || !b->relocs || !b->relocs->n)
+		return;
+	b->relocs->r [b->relocs->n - 1].site_rec = (guint32) (gsize) &r->form [0];
+	if (fslot > 0)
+		r->fslot = fslot;
+}
+
+#ifdef HOST_BROWSER
+static void wj_site_dump_registry (int seq);   /* below the registry's accessors */
+#endif
 /* Print every site whose count moved since the previous dump. With --dumps the harness dumps at both edges of the
  * in-game window, so the second dump's lines are the window's call graph. Also the deploy marker. */
 void mono_wasm_jit_dump_sites (void);
@@ -1557,7 +1600,7 @@ mono_wasm_jit_dump_sites (void)
 {
 	extern int mono_wasm_jit_site_count;
 	gint32 n = wj_site_n, i, lines = 0, seq;
-	gint64 total = 0;
+	gint64 total = 0, ftotal = 0, stotal = 0;
 	if (!mono_wasm_jit_site_count)
 		return;
 	seq = ++wj_site_dumps;
@@ -1572,14 +1615,29 @@ mono_wasm_jit_dump_sites (void)
 		r = &c [i % WJ_SITE_CHUNK];
 		if (!r->ready)
 			continue;
+		gint32 fd [2 * WASM_SF_N], k, moved = 0;
 		now = r->count; d = now - r->last; r->last = now;
-		if (d <= 0)
+		for (k = 0; k < 2 * WASM_SF_N; ++k) {
+			gint32 fnow = r->form [k];
+			fd [k] = fnow - r->form_last [k]; r->form_last [k] = fnow;
+			if (fd [k] > 0) { moved = 1; if (k < WASM_SF_N) ftotal += fd [k]; else stotal += fd [k]; }
+		}
+		if (d <= 0 && !moved)
 			continue;
+		if (d < 0) d = 0;
 		total += d; lines++;
-		printf ("WASM_JIT_SITE\t%d\t%d\t%u\t%c\t%d\t%p\t%p\t%s\t%s\t%s\t%c\t%d\n", seq, d, r->tier, r->kind, r->il,
-			r->caller_m, r->callee_m, r->caller, r->inl ? r->inl : "-", r->callee, r->gi ? r->gi : '-', r->arm);
+		/* fields 13-15: the form counters of every thread, of the selected thread, and the callee f-slot */
+		printf ("WASM_JIT_SITE\t%d\t%d\t%u\t%c\t%d\t%p\t%p\t%s\t%s\t%s\t%c\t%d\t%d,%d,%d,%d,%d,%d\t%d,%d,%d,%d,%d,%d\t%d\n",
+			seq, d, r->tier, r->kind, r->il,
+			r->caller_m, r->callee_m, r->caller, r->inl ? r->inl : "-", r->callee, r->gi ? r->gi : '-', r->arm,
+			fd [0], fd [1], fd [2], fd [3], fd [4], fd [5], fd [6], fd [7], fd [8], fd [9], fd [10], fd [11], r->fslot);
 	}
-	printf ("[wasm-jit sites] dump=%d records=%d moved=%d calls=%lld fields=gi+arm\n", seq, n, lines, (long long) total);
+	printf ("[wasm-jit sites] dump=%d records=%d moved=%d calls=%lld fields=gi+arm+forms form_calls=%lld selected_thread=%lld "
+		"(SITE_COUNT=%d; forms local,superseded,call_solo,call_group,dynamic,fixed)\n", seq, n, lines, (long long) total,
+		(long long) ftotal, (long long) stotal, mono_wasm_jit_site_count);
+#ifdef HOST_BROWSER
+	wj_site_dump_registry (seq);
+#endif
 	fflush (stdout);
 }
 
@@ -1980,12 +2038,69 @@ mono_wasm_jit_s2_site_freq (MonoCompile *cfg)
 
 
 
+/* --- MONO_WASM_JIT_SP_ARG (mini-wasm.c states the modes) -------------------------------------------
+ *
+ * The body being lowered on this thread: the local its JIT callees' frame-base argument is read from (-1: mode 0, or
+ * no body), whether a call that leaves JIT-emitted code must be preceded by a write of s.p from that local (mode 2,
+ * outside a landing pad), how many such writes the body got, and whether a call wanted the local before the body had
+ * named it (the compile fails). mono_wasm_emit_method sets them for the span of one body and restores them. */
+static __thread int wj_sp_out_local = -1;
+static __thread gboolean wj_sp_sync_on;
+static __thread guint32 wj_sp_sync_n;
+static __thread gboolean wj_sp_unset;
+
+/* Give a JIT `f` functype its trailing frame-base parameter. For every type that names an `f` -- a method's own, a
+ * direct call's, a devirt arm's or a delegate target's, a pool's -- BEFORE it is interned, hashed or compared, and for
+ * nothing else: mono_wasm_get_call_info's ftype is also what the AOT body types are built from, and an AOT body has no
+ * such parameter. FALSE: it does not fit WASM_FUNCTYPE_MAX_PARAMS, so no `f` of this type can exist. */
+static gboolean
+wj_ftype_add_sp (WasmFuncType *ft)
+{
+	if (!mono_wasm_jit_sp_arg)
+		return TRUE;
+	if (ft->nparams + 1 > WASM_FUNCTYPE_MAX_PARAMS)
+		return FALSE;
+	ft->params [ft->nparams++] = WASM_I32;
+	return TRUE;
+}
+
+/* The frame-base argument of a JIT->JIT call: the last one. A site that computes its table index pushes this BEFORE
+ * the index. */
+static void
+wj_emit_sp_push (WasmBuf *b)
+{
+	if (!mono_wasm_jit_sp_arg)
+		return;
+	if (wj_sp_out_local < 0) {
+		wj_sp_unset = TRUE;
+		return;
+	}
+	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) wj_sp_out_local);
+}
+
+/* Mode 2: s.p = this body's frame base, immediately before a call that leaves JIT-emitted code. Stack-neutral, so it
+ * goes between the call's last operand and the call. */
+static void
+wj_emit_sp_sync (WasmBuf *b)
+{
+	if (!wj_sp_sync_on)
+		return;
+	if (wj_sp_out_local < 0) {
+		wj_sp_unset = TRUE;
+		return;
+	}
+	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) wj_sp_out_local);
+	wasm_op (b, WASM_OP_GLOBAL_SET); wasm_uleb (b, 0);
+	wj_sp_sync_n++;
+}
+
 /* --- the four call forms the emitter can leave behind --------------------------------------------
  *
  * None of these writes a call. Each records a zero-length HOLE (see wasm-encoder.h) saying what is being
  * called and with what signature; the form -- `call_indirect` through the table, `call` to an import, or
  * `call` to a module-local function -- is chosen when the member is framed, and re-chosen every time it is
- * re-framed. That is what makes retargeting free, and it is why nothing here consults a knob.
+ * re-framed. That is what makes retargeting free, and it is why no FORM here consults a knob.
+ * (MONO_WASM_JIT_SP_ARG's frame-base argument and its write of s.p are bytes emitted ahead of the hole, not a form.)
  *
  * `type_idx` is an index into THIS member's type block (0 = the method's own signature, 1 = its entry
  * thunk's, 2.. = the callee types interned during emission), not a module type index. */
@@ -1997,7 +2112,21 @@ static void
 wj_emit_helper_call (WasmBuf *b, gpointer addr, guint32 type_idx)
 {
 	guint16 _o = wasm_origin_push (b, WJO_HELPER_CALL);
+	wj_emit_sp_sync (b);
 	wasm_reloc (b, WASM_RELOC_HELPER, type_idx, (guint32) (intptr_t) addr, NULL);
+	wj_site_link_reloc (b, 0);
+	wasm_origin_pop (b, _o);
+}
+
+/* A shared virtual slow-path stub (mini-wasm-vslow.inc), at its fixed table index like a helper. It is JIT-emitted
+ * code, not native: under MONO_WASM_JIT_SP_ARG it takes the frame base as an argument and writes s.p itself, so the
+ * site does not. */
+static void
+wj_emit_stub_call (WasmBuf *b, gpointer addr, guint32 type_idx)
+{
+	guint16 _o = wasm_origin_push (b, WJO_HELPER_CALL);
+	wasm_reloc (b, WASM_RELOC_HELPER, type_idx, (guint32) (intptr_t) addr, NULL);
+	wj_site_link_reloc (b, 0);
 	wasm_origin_pop (b, _o);
 }
 
@@ -2013,6 +2142,8 @@ static __thread gboolean wj_edge_on;
 static __thread gint32 *wj_edge_wptr;   /* the S2 counter of the call instruction being lowered (NULL: none) */
 static __thread guint32 wj_edge_est;
 
+static gint32 *wj_word_alloc (void);
+extern int mono_wasm_jit_b4_exact;
 /* Another wasm-JITted method, named by identity as well as by f-slot: the identity is what lets the
  * assembler notice the callee is co-located (making this a one-instruction `call <funcidx>` that V8 can
  * inline through) and what it checks the callee's registered ABI against before daring to import it. */
@@ -2020,21 +2151,42 @@ static void
 wj_emit_method_call (WasmBuf *b, MonoMethod *callee, int fslot, guint32 type_idx)
 {
 	guint16 _o = wasm_origin_push (b, WJO_METHOD_CALL);
+	wj_emit_sp_push (b);   /* MONO_WASM_JIT_SP_ARG: the last argument; the assembler adds a table index after it if it needs one */
 	wasm_reloc (b, WASM_RELOC_CALL, type_idx, (guint32) fslot, callee);
+	wj_site_link_reloc (b, fslot);
 	wasm_origin_pop (b, _o);
-	if (G_UNLIKELY (wj_edge_on) && fslot > 0 && wj_edge_wptr) {
+	if (G_UNLIKELY (wj_edge_on) && fslot > 0 && (wj_edge_wptr || mono_wasm_jit_b4_exact)) {
 		WjEdge e = { callee, fslot, wj_edge_wptr, wj_edge_est };
-		g_array_append_val (wj_edge_buf, e);
+		if (mono_wasm_jit_b4_exact) {
+			/* The edge weighs what THIS call ran: its own word, bumped by the serializer while the body is framed
+			 * alone (WasmReloc.edge_cnt), in place of a tier-1 site count that stopped at promotion or the root's
+			 * entry count. Never freed: its address is in modules that outlive the body. */
+			gint32 *cnt = wj_word_alloc ();
+			if (cnt && b->relocs && b->relocs->n) {
+				b->relocs->r [b->relocs->n - 1].edge_cnt = (guint32) (gsize) cnt;
+				e.wptr = cnt; e.est = 0;
+			}
+		}
+		if (e.wptr)
+			g_array_append_val (wj_edge_buf, e);
 	}
 }
 
 /* A call whose target index is computed at run time -- a virtual dispatch, an IC hit, a calli. This one
- * can never become a direct call; only its functype is relocated. */
+ * can never become a direct call; only its functype is relocated.
+ *
+ * `target` says what the index names, which MONO_WASM_JIT_SP_ARG has to know at every site: WJ_DYN_F, a JIT `f` -- its
+ * functype went through wj_ftype_add_sp and the site pushed wj_emit_sp_push before the index; WJ_DYN_NATIVE, anything
+ * else (an AOT body, a C helper, a native function pointer) -- no such argument, and in mode 2 s.p is written here. */
+enum { WJ_DYN_F, WJ_DYN_NATIVE };
 static void
-wj_emit_dynamic_call (WasmBuf *b, guint32 type_idx)
+wj_emit_dynamic_call (WasmBuf *b, guint32 type_idx, int target)
 {
 	guint16 _o = wasm_origin_push (b, WJO_DYN_CALL);
+	if (target == WJ_DYN_NATIVE)
+		wj_emit_sp_sync (b);
 	wasm_reloc (b, WASM_RELOC_INDIRECT, type_idx, 0, NULL);
+	wj_site_link_reloc (b, 0);
 	wasm_origin_pop (b, _o);
 }
 
@@ -2055,7 +2207,9 @@ static void
 wj_emit_helper_call_ci (WasmBuf *b, gpointer addr, guint32 type_idx)
 {
 	guint16 _o = wasm_origin_push (b, WJO_HELPER_CALL);
+	wj_emit_sp_sync (b);
 	wasm_reloc (b, WASM_RELOC_HELPER_CI, type_idx, (guint32) (intptr_t) addr, NULL);
+	wj_site_link_reloc (b, 0);
 	wasm_origin_pop (b, _o);
 }
 
@@ -2065,7 +2219,9 @@ wj_emit_helper_call_ci (WasmBuf *b, gpointer addr, guint32 type_idx)
 static void
 wj_emit_aot_call (WasmBuf *b, gpointer addr, guint32 type_idx)
 {
+	wj_emit_sp_sync (b);
 	wasm_reloc (b, WASM_RELOC_AOT, type_idx, (guint32) (intptr_t) addr, NULL);
+	wj_site_link_reloc (b, 0);
 }
 
 /* INLINE f-SLOT LIVENESS PROBE. Pushes i32 1 if THIS worker installed a function at `fslot_idx`, else 0.
@@ -3109,6 +3265,7 @@ mono_wasm_jit_entry_sig (MonoMethod *method, guint8 *kinds, guint8 *vtypes, int 
 
 	if (!method || !kinds || !vtypes)
 		return -1;
+	mono_wasm_jit_auto_init ();   /* the knob below must have been read: the trampoline bakes this answer */
 	sig = mono_method_signature_internal (method);
 	if (!sig)
 		return -1;
@@ -3161,7 +3318,22 @@ mono_wasm_jit_entry_sig (MonoMethod *method, guint8 *kinds, guint8 *vtypes, int 
 			return -1;
 	}
 	vtypes [nargs] = (guint8) ci.ret.wtype;   /* WASM_VOID for void */
+	/* MONO_WASM_JIT_SP_ARG: `f` takes a trailing frame base. The trampoline passes s.p, which is exact there -- it is
+	 * entered from native code -- through the global its builder imports (mono_wasm_jit_sp_arg_mode tells it to).
+	 * Counted: the direct forwards that carry one. */
+	if (mono_wasm_jit_sp_arg)
+		mono_atomic_inc_i32 (&mono_wasm_jit_sp_arg_entry_sig);
 	return nargs;
+}
+
+/* MONO_WASM_JIT_SP_ARG, for jiterpreter-interp-entry.ts: non-zero = the `f` type its direct forward call_indirects
+ * ends in an i32 frame base, for which it passes the imported s.p; 2 = and it puts s.p back after `f` returns, as the
+ * entry thunk `e` does (a JIT body leaves the global wherever its last native call put it). */
+EMSCRIPTEN_KEEPALIVE int
+mono_wasm_jit_sp_arg_mode (void)
+{
+	mono_wasm_jit_auto_init ();
+	return mono_wasm_jit_sp_arg;
 }
 #endif
 
@@ -3635,6 +3807,43 @@ wj_body_bytes (struct _WjBody *b)
 	return (int) MIN (n, (gsize) G_MAXINT32);
 }
 
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_SITE_COUNT: the live registry beside the sites, so a reader can say why a counted call was not
+ * module-local. `D`: one line per descriptor that owns its f-slot -- descriptor, f-slot, body_tier, its group (the
+ * WjBatchDesc as an identity, and its member count), body bytes, B4 edge count, body/logical method identities, name.
+ * `E`: one per recorded B4 edge -- caller descriptor, callee f-slot, its weight now, entry-estimated or not. Reads
+ * what the planner's dry run reads, under the same bracket. Each line has fewer than 13 tab fields, so sitewhy.py,
+ * which takes site lines by that count, skips them. */
+static void
+wj_site_dump_registry (int seq)
+{
+	int n, i, k, nd = 0, ne = 0;
+	wj_reg_read_enter ();
+	n = wj_reg_n;
+	for (i = 0; i < n; ++i) {
+		WjRegEntry *re = wj_reg_at (i);
+		WjBody *rb;
+		WjBatchDesc *bt;
+		if (!re || re->e <= 0 || re->f <= 0 || wj_desc_for_fslot (re->f) != i + 1)
+			continue;
+		rb = wj_entry_body (re);
+		bt = re->batch;
+		printf ("WASM_JIT_SITE\tD\t%d\t%d\t%d\t%d\t%p\t%d\t%d\t%d\t%p/%p\t%s\n", seq, i + 1, re->f, (int) re->body_tier,
+			(void *) bt, bt ? bt->n : 0, rb ? (int) rb->f_body.len : -1, rb ? (int) rb->nedges : -1,
+			(void *) re->body_method, (void *) re->logical_method, (rb && rb->name) ? rb->name : "?");
+		nd++;
+		for (k = 0; rb && k < (int) rb->nedges; ++k) {
+			WjEdge *ed = &rb->edges [k];
+			printf ("WASM_JIT_SITE\tE\t%d\t%d\t%d\t%u\t%d\n", seq, i + 1, ed->fslot,
+				ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0u, ed->est ? 1 : 0);
+			ne++;
+		}
+	}
+	wj_reg_read_leave ();
+	printf ("[wasm-jit sites] registry dump=%d descriptors=%d edges=%d\n", seq, nd, ne);
+}
+#endif
+
 static void
 wj_body_free (WjBody *b)
 {
@@ -3969,7 +4178,8 @@ wj_arm_abi_ok (MonoMethod *target, const WasmFuncType *want)
 		wj_count (WJC_ARM_ABI_BYADDR);
 		return FALSE;
 	}
-	if (!functype_eq (&ci.ftype, want)) {
+	/* `want` is a JIT `f` type, so the candidate's fresh one must be too (MONO_WASM_JIT_SP_ARG) */
+	if (!wj_ftype_add_sp (&ci.ftype) || !functype_eq (&ci.ftype, want)) {
 		wj_count (WJC_ARM_ABI_SHAPE);
 		return FALSE;
 	}
@@ -4080,6 +4290,8 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 		fix [k].form = WASM_FORM_INDIRECT;
 		fix [k].idx = 0;
 		fix [k].guard = fix [k].guard_count = 0;
+		fix [k].in_group = n > 1;   /* MONO_WASM_JIT_SITE_COUNT: an indirect call from a group module counts apart */
+		fix [k].count_edge = n == 1;   /* MONO_WASM_JIT_B4_EXACT: edge counters only while the method is framed alone */
 		switch ((WasmRelocKind) r->kind) {
 		case WASM_RELOC_TYPE_U:
 		case WASM_RELOC_TYPE_S:

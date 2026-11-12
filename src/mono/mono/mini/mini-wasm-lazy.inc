@@ -356,7 +356,8 @@ wj_lazy_refusal (MonoMethod *m, MonoMethodSignature *csig, gboolean rgctx, const
 	if (!m->signature)
 		return "sig unresolved";
 	mono_wasm_get_call_info (m->signature, &cci);
-	if (!cci.valid || !functype_eq (&cci.ftype, ct))
+	/* `ct` is a JIT `f` type (MONO_WASM_JIT_SP_ARG: with its frame base), so the callee's own must be built the same way */
+	if (!cci.valid || !wj_ftype_add_sp (&cci.ftype) || !functype_eq (&cci.ftype, ct))
 		return "sig";
 	return NULL;
 }
@@ -513,7 +514,7 @@ mono_wasm_jit_hook_route_locked (int desc_id, MonoMethod *m, gpointer imethod)
 	if (!sig)
 		goto fail;
 	mono_wasm_get_call_info (sig, &cci);
-	if (!cci.valid || wj_functype_hash (&cci.ftype) != re->f_sig_id)
+	if (!cci.valid || !wj_ftype_add_sp (&cci.ftype) || wj_functype_hash (&cci.ftype) != re->f_sig_id)   /* the `f` type, as registered */
 		goto fail;
 	if (!wj_lazy_hook_bank (re, m, imethod, &cci.ftype))
 		goto fail;
@@ -683,8 +684,9 @@ mono_wasm_jit_lazy_bind (int slot)
 /*
  * The stub's interpreter leg. The stub stored its wasm params at buf + 8*j, which is the residual's layout for
  * the call arguments (cci.nargs of them); what it cannot know from a functype is the managed shape, so the two
- * places that differ are fixed here from the signature: a hidden vret pointer (the LAST wasm param) moves to
- * WJ_SCRATCH_VRET_OFF, and a sub-word return is widened the way the residual's emitted code widens it.
+ * places that differ are fixed here from the signature: a hidden vret pointer (the LAST wasm param, or the last
+ * before MONO_WASM_JIT_SP_ARG's frame base, which the stub does not store) moves to WJ_SCRATCH_VRET_OFF, and a
+ * sub-word return is widened the way the residual's emitted code widens it.
  */
 WJ_KEEPALIVE int
 mono_wasm_jit_lazy_interp (int slot, guint8 *buf)
@@ -705,7 +707,7 @@ mono_wasm_jit_lazy_interp (int slot, guint8 *buf)
 	mono_wasm_get_call_info (sig, &cci);
 	/* The scratch holds the arguments laid out for the bank's functype; marshalling them by another is corruption.
 	 * Only a method reallocated at a freed owner's address could differ here. */
-	if (G_UNLIKELY (!cci.valid || !functype_eq (&cci.ftype, &wj_lazy_banks [ls->bank - 1]->ft))) {
+	if (G_UNLIKELY (!cci.valid || !wj_ftype_add_sp (&cci.ftype) || !functype_eq (&cci.ftype, &wj_lazy_banks [ls->bank - 1]->ft))) {
 		mono_wasm_jit_counters [WJC_LAZY_DEAD]++;
 		g_error ("wasm-jit lazy: f-slot %d's owner no longer has the stub's functype", slot);
 	}

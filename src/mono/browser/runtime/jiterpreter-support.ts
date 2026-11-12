@@ -115,6 +115,9 @@ export class WasmBuilder {
     // Set when this module's import section declares the indirect function table (`f`.`f`), so
     // getWasmImports knows to supply it. Only modules that emit call_indirect need it.
     importsFunctionTable = false;
+    // MONO_WASM_JIT_SP_ARG: the module imports emscripten's mutable `__stack_pointer` as global 0 ("s"."p", the name
+    // the wasm-JIT's own modules import it under). Set by the caller before the import section is generated.
+    importsStackPointer = false;
 
     constructor () {
         this.stack = [new BlobBuilder()];
@@ -131,6 +134,7 @@ export class WasmBuilder {
         this.inSection = false;
         this.inFunction = false;
         this.lockImports = false;
+        this.importsStackPointer = false;
         this.locals.clear();
 
         this.functionTypeCount = this.permanentFunctionTypeCount;
@@ -214,6 +218,8 @@ export class WasmBuilder {
             result.f = { f: getWasmFunctionTable() };
         if (exceptionTag)
             result.x = { e: exceptionTag };
+        if (this.importsStackPointer)
+            result.s = { p: (<any>Module)["wasmExports"]["__stack_pointer"] };
 
         const importsToEmit = this.getImportsToEmit();
 
@@ -497,7 +503,8 @@ export class WasmBuilder {
             1 + // memory
             (enableWasmFinalEh ? 1 : 0) + // c++ exception tag
             importsToEmit.length +
-            ((includeFunctionTable !== false) ? 1 : 0)
+            ((includeFunctionTable !== false) ? 1 : 0) +
+            (this.importsStackPointer ? 1 : 0)
         );
 
         // mono_log_info(`referenced ${importsToEmit.length} import(s)`);
@@ -551,6 +558,14 @@ export class WasmBuilder {
             // limits = { min=0x01, max=infinity }
             this.appendU8(0x00);
             this.appendULeb(0x01);
+        }
+
+        if (this.importsStackPointer) {
+            this.appendName("s");
+            this.appendName("p");
+            this.appendU8(0x03); // global
+            this.appendU8(WasmValtype.i32);
+            this.appendU8(0x01); // mutable
         }
     }
 

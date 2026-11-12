@@ -28,6 +28,9 @@ const norm = (rn, v) => [v, v & 0xff, (v << 24) >> 24, v & 0xffff, (v << 16) >> 
 const mem = new WebAssembly.Memory({ initial: 256, maximum: 65535, shared: true });
 const dv = () => new DataView(mem.buffer);
 const SP0 = 1 << 20, SCRATCH = 8192, THIS = 4096, VT = 0x7700, DESC = 4608, AIC = 4864;
+// MONO_WASM_JIT_SP_ARG stubs (t11sp-manifest.txt): the frame base the stub is handed, and where s.p stands on entry --
+// equal to the base in mode 1 (that convention keeps them equal), stale and lower in mode 2.
+const BASE = SP0 - 8192, STALE = SP0 - 65536;
 const T_SITE = 40, T_AT = 41, T_JIT = 42;   // table slots: at_ne / the JIT f (site functype), at (+ rgctx)
 const B_SITE = 16384, B_AT = 17408, B_JIT = 18432;
 let fails = 0, runs = 0;
@@ -36,18 +39,23 @@ const argv = (p, j) => j === 0 ? THIS : ({ 0x7f: 1000 + j * 37, 0x7e: BigInt(-(2
 const rd = (p, a) => ({ 0x7f: () => dv().getInt32(a, true), 0x7e: () => dv().getBigInt64(a, true), 0x7d: () => dv().getFloat32(a, true), 0x7c: () => dv().getFloat64(a, true) }[p])();
 const wr = (p, a, v) => ({ 0x7f: () => dv().setInt32(a, v, true), 0x7e: () => dv().setBigInt64(a, v, true), 0x7d: () => dv().setFloat32(a, v, true), 0x7c: () => dv().setFloat64(a, v, true) }[p])();
 const ROUTES = ['aic-ne', 'aic-rg', 'resolve', 'aot-ne', 'aot-rg', 'interp', 'throw', 'noaic-resolve'];
-for (const line of fs.readFileSync('t11-manifest.txt', 'utf8').trim().split('\n')) {
-  const [fn, rns, rets, ...ps] = line.split(' ');
-  const rn = +rns, ret = +rets, params = ps.map(Number);
+const lines = fs.readFileSync('t11-manifest.txt', 'utf8').trim().split('\n').map((l) => '0 ' + l)
+  .concat(fs.readFileSync('t11sp-manifest.txt', 'utf8').trim().split('\n').map((l) => { const [fn, m, ...r] = l.split(' '); return [m, fn, ...r].join(' '); }));
+for (const line of lines) {
+  const [ms, fn, rns, rets, ...ps] = line.split(' ');
+  const spm = +ms, rn = +rns, ret = +rets, params = ps.map(Number);
+  const site = spm ? params.slice(0, -1) : params;   // the site's arguments: a trailing frame base is not one
+  const base = spm ? BASE : SP0, sp0 = spm === 2 ? STALE : base;
   try { execFileSync('wasm-validate', ['--enable-all', fn]); } catch (e) { bad(`${fn}: wasm-validate: ${e.stdout || e.message}`); continue; }
   const table = new WebAssembly.Table({ initial: 64, element: 'anyfunc' });
-  const sp = new WebAssembly.Global({ value: 'i32', mutable: true }, SP0);
+  const sp = new WebAssembly.Global({ value: 'i32', mutable: true }, sp0);
   const g = (v) => new WebAssembly.Global({ value: 'i32', mutable: false }, v);
-  const i32idx = params.map((p, j) => [p, j]).filter(([p]) => p === 0x7f).map(([, j]) => j);
+  const i32idx = site.map((p, j) => [p, j]).filter(([p]) => p === 0x7f).map(([, j]) => j);
+  const frame = (i32idx.length * 4 + 15) & ~15;
   let route = '', curArgs = null, pinOK = true, resolveArgs = null, interpArgs = null, unwound = false, aotArgs = null;
   const pinCheck = () => {
     const s = sp.value;
-    if (!(s < SP0) || (s & 15)) { pinOK = false; return; }
+    if (!(s < base) || (s & 15) || (spm && s !== base - frame)) { pinOK = false; return; }
     i32idx.forEach((j, kth) => { if (dv().getInt32(s + 4 * kth, true) !== curArgs[j]) pinOK = false; });
   };
   const h = {
@@ -57,7 +65,8 @@ for (const line of fs.readFileSync('t11-manifest.txt', 'utf8').trim().split('\n'
       if (route === 'aot-ne') { dv().setInt32(scr + 212, T_SITE, true); return 2; }
       if (route === 'aot-rg') { dv().setInt32(scr + 212, T_AT, true); dv().setInt32(scr + 216, 0x5151, true); return 1; }
       dv().setInt32(scr + 200, 0xbeef, true); return 0; },
-    4: (tgt, buf) => { interpArgs = [tgt, buf, params.map((p, j) => rd(p, buf + 8 * j))]; pinCheck();
+    4: (tgt, buf) => { interpArgs = [tgt, buf, site.map((p, j) => rd(p, buf + 8 * j))]; pinCheck();
+      if (spm && dv().getInt32(buf + 8 * site.length, true) !== 0x5a5a5a5a) pinOK = false;   // the base is not spilled
       if (route === 'throw') return 1;
       if (ret !== 0x40) wr(ret, buf + 192, { 0x7f: 0x7abc0181, 0x7e: 99n, 0x7d: 0.75, 0x7c: 6.5 }[ret]);
       return 0; },
@@ -66,8 +75,8 @@ for (const line of fs.readFileSync('t11-manifest.txt', 'utf8').trim().split('\n'
   const s = { p: sp, l: g(0), c: g(0), v: g(0), n: g(0), d: g(0), m: g(0), b: g(0), i: g(0), g: g(0) };
   let stub;
   try {
-    table.set(T_SITE, new WebAssembly.Instance(new WebAssembly.Module(target(params, ret, B_SITE)), { m: { h: mem } }).exports.t);
-    table.set(T_AT, new WebAssembly.Instance(new WebAssembly.Module(target([...params, 0x7f], ret, B_AT)), { m: { h: mem } }).exports.t);
+    table.set(T_SITE, new WebAssembly.Instance(new WebAssembly.Module(target(site, ret, B_SITE)), { m: { h: mem } }).exports.t);
+    table.set(T_AT, new WebAssembly.Instance(new WebAssembly.Module(target([...site, 0x7f], ret, B_AT)), { m: { h: mem } }).exports.t);
     table.set(T_JIT, new WebAssembly.Instance(new WebAssembly.Module(target(params, ret, B_JIT)), { m: { h: mem } }).exports.t);
     new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(fn)), { m: { h: mem }, f: { f: table }, s, h });
     stub = table.get(16);
@@ -78,8 +87,11 @@ for (const line of fs.readFileSync('t11-manifest.txt', 'utf8').trim().split('\n'
   for (route of ROUTES) {
     runs++;
     curArgs = params.map(argv);
+    if (spm) curArgs[site.length] = base;
     pinOK = true; resolveArgs = interpArgs = aotArgs = null; unwound = false;
     new Uint8Array(mem.buffer, B_SITE, 3072).fill(0);
+    new Uint8Array(mem.buffer, SCRATCH, 192).fill(0x5a);
+    sp.value = sp0;
     dv().setInt32(THIS, VT, true);
     const aic = route === 'noaic-resolve' ? 0 : AIC;
     dv().setInt32(DESC + 4, aic, true);
@@ -90,11 +102,13 @@ for (const line of fs.readFileSync('t11-manifest.txt', 'utf8').trim().split('\n'
     dv().setInt32(AIC + 12, 0x6262, true);
     let r, threw = false;
     try { r = stub(...curArgs, BigInt(DESC)); } catch (e) { threw = true; }
-    if (route !== 'throw' && sp.value !== SP0) bad(`${fn} ${route}: s.p not restored (${sp.value})`);
-    if (!pinOK) bad(`${fn} ${route}: i32 params not pinned below s.p in a helper`);
-    const expectArgs = (base, extra) => {
-      params.forEach((p, j) => { if (rd(p, base + 8 * j) !== curArgs[j]) bad(`${fn} ${route}: arg ${j} ${rd(p, base + 8 * j)} != ${curArgs[j]}`); });
-      if (extra !== undefined && dv().getInt32(base + 8 * params.length, true) !== extra) bad(`${fn} ${route}: rgctx ${dv().getInt32(base + 8 * params.length, true)} != ${extra}`);
+    if (route !== 'throw' && sp.value !== base) bad(`${fn} ${route}: s.p not restored (${sp.value})`);
+    if (!pinOK) bad(`${fn} ${route}: i32 params not pinned below ${spm ? 'the frame base' : 's.p'} in a helper`);
+    // what a callee stored: a JIT f (B_JIT) gets every param, the frame base last; an AOT body the site's alone (+ rgctx)
+    const expectArgs = (at, extra) => {
+      const ps = at === B_JIT ? params : site;
+      ps.forEach((p, j) => { if (rd(p, at + 8 * j) !== curArgs[j]) bad(`${fn} ${route}: arg ${j} ${rd(p, at + 8 * j)} != ${curArgs[j]}`); });
+      if (extra !== undefined && dv().getInt32(at + 8 * ps.length, true) !== extra) bad(`${fn} ${route}: rgctx ${dv().getInt32(at + 8 * ps.length, true)} != ${extra}`);
     };
     const want = (normed) => ({ 0x7f: normed ? norm(rn, 0x12345681) : 0x12345681, 0x7e: -7777n, 0x7d: 2.5, 0x7c: -3.25, 0x40: undefined }[ret]);
     if (threw && route !== 'throw') { bad(`${fn} ${route}: threw`); continue; }
@@ -114,7 +128,7 @@ for (const line of fs.readFileSync('t11-manifest.txt', 'utf8').trim().split('\n'
       break; }
     case 'throw': if (!unwound || !threw) bad(`${fn} ${route}: throw did not reach continue_unwind`); break;
     }
-    sp.value = SP0;
+    sp.value = sp0;
   }
 }
 console.log(`t11: ${runs} stub calls, ${fails} failures`);

@@ -538,6 +538,16 @@ wj_inline_call_allowed (MonoCompile *cfg, MonoMethod *cmethod)
 	return TRUE;
 }
 
+#ifdef HOST_BROWSER
+/* Remember an interned managed-object constant by the pointer value it was interned at (WjLitNote, mini-wasm.h). */
+#define WJ_LIT_NOTE(cfg, ins) do { \
+		if ((ins)->inst_p1) { \
+			WjLitNote *_ln = (WjLitNote *) mono_mempool_alloc0 ((cfg)->mempool, sizeof (WjLitNote)); \
+			_ln->obj = (ins)->inst_p0; _ln->slot = (ins)->inst_p1; \
+			_ln->next = (WjLitNote *) (cfg)->wasm_jit_literals; (cfg)->wasm_jit_literals = _ln; \
+		} \
+	} while (0)
+#endif
 /* MONO_WASM_JIT_INLINE_COLD_CALL (2026-11-05): is the call at `ip` inside an IL basic block that ends in a `throw`? The
  * get_basic_blocks pre-pass marks such a block out_of_line before import. A call there runs at most once, on the way
  * to the throw -- exception-message construction, mostly -- so the importer neither inlines it nor charges it the
@@ -11869,6 +11879,7 @@ calli_end:
 				if (cfg->compile_wasm && ins->inst_p0) {
 					extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
 					ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+					WJ_LIT_NOTE (cfg, ins);
 				}
 #endif
 				*sp = ins;
@@ -11924,6 +11935,7 @@ calli_end:
 						if (cfg->compile_wasm && ins->inst_p0) {
 							extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
 							ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+							WJ_LIT_NOTE (cfg, ins);
 						}
 #endif
 
@@ -12386,6 +12398,7 @@ calli_end:
 							if (cfg->compile_wasm && ins->inst_p0) {
 								extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
 								ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+								WJ_LIT_NOTE (cfg, ins);
 							}
 #endif
 						}
@@ -13692,6 +13705,7 @@ field_access_end:
 						if (cfg->compile_wasm && ins->inst_p0) {
 							extern gpointer mono_wasm_jit_intern_literal (MonoObject *o);
 							ins->inst_p1 = mono_wasm_jit_intern_literal ((MonoObject *) ins->inst_p0);
+							WJ_LIT_NOTE (cfg, ins);
 						}
 #endif
 					}

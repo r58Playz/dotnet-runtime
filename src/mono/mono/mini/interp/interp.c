@@ -6693,11 +6693,13 @@ mono_wasm_jit_vcall_i4 (MonoObject *this_obj, MonoMethod *base_method)
 
 	/* Fast path: resolved override is wasm-JITted — call its scalar f directly ((this)->i4 table
 	 * index), a ~ns call_indirect with no interpreter re-entry. This is the win: JITted caller →
-	 * JITted callee, devirtualized at runtime. (On wasm a function pointer IS a table index.) */
-	if (G_LIKELY (fs > 0)) {
+	 * JITted callee, devirtualized at runtime. (On wasm a function pointer IS a table index.)
+	 * Not under MONO_WASM_JIT_SP_ARG, where an `f` takes a frame base C cannot pass through this type. */
+	{ extern int mono_wasm_jit_sp_arg;
+	  if (G_LIKELY (fs > 0) && !mono_wasm_jit_sp_arg) {
 		gint32 (*f) (gpointer) = (gint32 (*) (gpointer)) (intptr_t) fs;
 		return f (this_obj);
-	}
+	  } }
 
 	/* Slow path: un-JITted override — re-enter the interpreter via interp_entry. */
 	{
@@ -6828,14 +6830,15 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
 	InterpMethod *imethod = mono_interp_get_imethod (target);
 	gint32 fs = imethod->wasm_jit_fslot;
 
-	if (fs > 0) {
+	{ extern int mono_wasm_jit_sp_arg;   /* an `f` takes a frame base under MONO_WASM_JIT_SP_ARG: no direct call from C */
+	  if (fs > 0 && !mono_wasm_jit_sp_arg) {
 		guint32 *icp = (guint32 *) ic;
 		icp [1] = (guint32) fs;                                        /* f-slot */
 		mono_memory_barrier ();
 		icp [0] = (guint32) (gsize) this_obj->vtable;                  /* publish vtable last */
 		gint32 (*f) (gpointer) = (gint32 (*) (gpointer)) (intptr_t) fs;
 		return f (this_obj);
-	}
+	  } }
 
 	{
 		ERROR_DECL (error);
@@ -6869,9 +6872,10 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
  *  - the result slot is written then read in strict nested (LIFO) order across reentrancy.
  * Per-thread => MT-safe. The address can't be baked into the emitted module (a __thread address
  * differs per thread), so the JITted code fetches it via mono_wasm_jit_scratch() at each call site. */
-static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 32] __attribute__ ((aligned (8)));   /* + the TLAB, thread, LMF-address and finally-depth slots */
-g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 32);
-g_static_assert (WJ_SCRATCH_FINSP_SLOT + 8 <= WJ_SCRATCH_SIZE + 32);
+static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 40] __attribute__ ((aligned (8)));   /* + the TLAB, thread, LMF-address, finally-depth and census-select slots */
+g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 40);
+g_static_assert (WJ_SCRATCH_FINSP_SLOT + 8 <= WJ_SCRATCH_SIZE + 40);
+g_static_assert (WJ_SCRATCH_SITESEL_SLOT + 8 <= WJ_SCRATCH_SIZE + 40);
 /* The 8 bytes past the marshalling area are NOT scratch: they hold the address of this thread's
  * mono_wasm_sgen_tls_info (sgen-mono.c), for OP_WASM_JIT_ALLOC_FAST's inline TLAB bump (R305). The emitter reads
  * it at WJ_SCRATCH_TLAB_SLOT; this pins the two together. */

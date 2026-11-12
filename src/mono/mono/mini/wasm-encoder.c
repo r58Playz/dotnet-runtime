@@ -259,6 +259,8 @@ wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, 
 	e->site_il = b->site_il;
 	e->site_inl = b->site_inl;
 	e->site_kd = 0;
+	e->site_rec = 0;
+	e->edge_cnt = 0;
 	if (kind != WASM_RELOC_TYPE_U && kind != WASM_RELOC_TYPE_S) {
 		/* a call: it ends the previous call's run, and its key is the last memory access of its own */
 		wasm_site_key_open (b);
@@ -270,6 +272,46 @@ wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, 
 	/* See the header: a zero-length hole would otherwise leave the local.tee peephole armed ACROSS it. */
 	b->tee_end = 0;
 }
+
+int wasm_count_on;
+guint32 wasm_count_sel_off;
+guint32 wasm_count_bytes;
+
+int wasm_sp_arg;
+
+guint32
+wasm_emit_count (WasmBuf *b, guint32 addr, guint32 sel_addr)
+{
+	guint32 at = b->len, last;
+	wasm_i32_const (b, 0);
+	wasm_i32_const (b, 0);
+	wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, addr);
+	wasm_i32_const (b, 1);
+	wasm_op (b, WASM_OP_I32_ADD);
+	last = b->len;
+	wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, addr);
+	if (sel_addr) {
+		wasm_i32_const (b, 0);
+		wasm_i32_const (b, 0);
+		wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, sel_addr);
+		wasm_op (b, WASM_OP_GLOBAL_GET); wasm_uleb (b, 7);
+		wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, wasm_count_sel_off);
+		wasm_op (b, WASM_OP_I32_ADD);
+		last = b->len;
+		wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, sel_addr);
+	}
+	wasm_count_bytes += b->len - at;
+	return last;
+}
+
+/* The counter of form F for reloc `r`, written before its call. Its last store becomes the site's key: it is now
+ * the last memory access before the call (see WasmSites). */
+#define WASM_COUNT_SITE(F) do { \
+		if (wasm_count_on && r->site_rec) { \
+			guint32 _ko = wasm_emit_count (out, r->site_rec + 4 * (guint32) (F), r->site_rec + 4 * (guint32) (WASM_SF_N + (F))); \
+			key = closed ? (gint64) (_ko - base) : -1; \
+		} \
+	} while (0)
 
 /* One resolved call site. `ti` is the module type index; `fix` says which of the three forms to use; `key` is
  * the site's key in output terms (WasmSites.kd), or -1. */
@@ -369,6 +411,7 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 			wasm_sleb (out, (gint64) ti);
 			break;
 		case WASM_RELOC_INDIRECT:
+			WASM_COUNT_SITE (WASM_SF_DYNAMIC);
 			wasm_site_note (out, base, r, key);
 			wasm_op (out, WASM_OP_CALL_INDIRECT);
 			wasm_uleb (out, ti);
@@ -388,6 +431,8 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 				 * this group generation was superseded -- is the rare one, hinted so. */
 				/* The guard load is the key: the hot `else` call follows it directly in V8's code (the taken arm
 				 * is hinted cold), and both calls carry the one tag, so it is given to the first. */
+				if (wasm_count_on && r->site_rec)   /* before the guard load, which stays the key */
+					wasm_emit_count (out, r->site_rec + 4 * WASM_SF_LOCAL, r->site_rec + 4 * (WASM_SF_N + WASM_SF_LOCAL));
 				wasm_i32_const (out, 0);
 				key = closed ? (gint64) (out->len - base) : -1;
 				wasm_op (out, WASM_OP_I32_LOAD); wasm_memarg (out, 2, fix [k].guard);
@@ -403,6 +448,8 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 						wasm_op (out, WASM_OP_I32_ADD);
 						wasm_op (out, WASM_OP_I32_STORE); wasm_memarg (out, 2, fix [k].guard_count);
 					}
+					if (wasm_count_on && r->site_rec)
+						wasm_emit_count (out, r->site_rec + 4 * WASM_SF_SUPERSEDED, r->site_rec + 4 * (WASM_SF_N + WASM_SF_SUPERSEDED));
 					wasm_i32_const (out, (gint32) r->table_index);
 					wasm_site_note (out, base, r, key);
 					wasm_op (out, WASM_OP_CALL_INDIRECT); wasm_uleb (out, ti); wasm_uleb (out, 0);
@@ -411,6 +458,16 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 					wasm_op (out, WASM_OP_CALL); wasm_uleb (out, fix [k].idx);
 				wasm_op (out, WASM_OP_END);
 			} else {
+				if (r->edge_cnt && fix [k].count_edge) {
+					/* MONO_WASM_JIT_B4_EXACT: a named call counts itself while its body is framed alone */
+					guint32 _ko = wasm_emit_count (out, r->edge_cnt, 0);
+					key = closed ? (gint64) (_ko - base) : -1;
+				}
+				if ((WasmRelocKind) r->kind == WASM_RELOC_CALL)
+					WASM_COUNT_SITE (fix [k].form == WASM_FORM_LOCAL ? WASM_SF_LOCAL :
+					                 fix [k].in_group ? WASM_SF_CALL_GROUP : WASM_SF_CALL_SOLO);
+				else
+					WASM_COUNT_SITE (WASM_SF_FIXED);
 				emit_call_site (out, base, r, &fix [k], ti, key);
 			}
 			break;
@@ -1072,6 +1129,11 @@ emit_stub_names (WasmBuf *out, const char *module_name, guint32 first, guint32 k
  *   r = bind (N); if r { pop; return_call_indirect ft (params..., r) }
  *   r = scratch (); params -> r + 8*j; if interp (N, r) { continue_unwind; unreachable }
  *   [ret = load r + 192]; pop
+ * MONO_WASM_JIT_SP_ARG (wasm_sp_arg != 0): ft's LAST param is the caller's frame base, not an argument. The stub's
+ * frame goes below that base rather than below s.p; the base is neither pinned nor spilled for the interpreter; and
+ * the tail call passes it on (the stub's own frame is popped by then). The stub writes s.p where it did before, which
+ * in mode 2 is what puts s.p below the caller's frames for bind, scratch and interp; a stub with no frame makes that
+ * one write (s.p = the base) on its own.
  */
 void
 wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, const guint32 *helper_idx, WasmBuf *out)
@@ -1083,8 +1145,10 @@ wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, co
 	WasmBuf sec;
 	guint32 i, j, n = ft->nparams, ni32 = 0, frame;
 	guint32 l_old = n, l_sp = n + 1, l_r = n + 2;
+	guint32 na = wasm_sp_arg ? n - 1 : n;   /* the callee's arguments: all of ft's params but a trailing frame base */
 
-	for (j = 0; j < n; ++j)
+	g_assert (!wasm_sp_arg || (n >= 1 && ft->params [n - 1] == WASM_I32));
+	for (j = 0; j < na; ++j)
 		if (ft->params [j] == WASM_I32)
 			ni32++;
 	frame = (ni32 * 4 + 15) & ~15u;
@@ -1134,19 +1198,27 @@ wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, co
 		guint32 kth = 0;
 		wasm_buf_init (&body);
 		if (frame) {
-			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
+			if (wasm_sp_arg) {
+				wasm_op_local (&body, WASM_OP_LOCAL_GET, na);
+			} else {
+				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
+			}
 			wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_old);
 			wasm_i32_const (&body, (gint32) frame);
 			wasm_op (&body, WASM_OP_I32_SUB);
 			wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_sp);
 			wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
-			for (j = 0; j < n; ++j) {
+			for (j = 0; j < na; ++j) {
 				if (ft->params [j] != WASM_I32)
 					continue;
 				wasm_op_local (&body, WASM_OP_LOCAL_GET, l_sp);
 				wasm_op_local (&body, WASM_OP_LOCAL_GET, j);
 				wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 4 * kth++);
 			}
+		} else if (wasm_sp_arg >= 2) {
+			/* no frame to write s.p for, and what follows is native */
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, na);
+			wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
 		}
 		wasm_i32_const (&body, f_slots [i]);
 		wasm_op (&body, WASM_OP_CALL); wasm_uleb (&body, 0);
@@ -1165,7 +1237,7 @@ wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, co
 		wasm_op (&body, WASM_OP_END);
 		wasm_op (&body, WASM_OP_CALL); wasm_uleb (&body, 1);
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, l_r);
-		for (j = 0; j < n; ++j) {
+		for (j = 0; j < na; ++j) {
 			WasmOpcode sop;
 			guint32 al;
 			switch (ft->params [j]) {

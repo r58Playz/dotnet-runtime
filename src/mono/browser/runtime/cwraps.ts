@@ -119,6 +119,7 @@ const fn_signatures: SigLine[] = [
     [true, "mono_jiterp_get_simd_opcode", "number", ["number", "number"]],
     [true, "mono_jiterp_get_arg_offset", "number", ["number", "number", "number"]],
     [true, "mono_wasm_jit_entry_sig", "number", ["number", "number", "number", "number"]],
+    [true, "mono_wasm_jit_sp_arg_mode", "number", []],
     [true, "mono_wasm_jit_slot_live", "number", ["number"]],
     [true, "mono_wasm_jit_method_known_dead", "number", ["number", "number"]],
     [true, "mono_wasm_jit_worker_reuse", "number", ["number", "number", "number"]],
@@ -261,6 +262,7 @@ export interface t_Cwraps {
     // wasm-JIT interp-entry fast path: describes a JITted method's `f` signature (per-arg load kind +
     // wasm valtypes, with the return valtype last). Returns the arg count, or -1 if ineligible.
     mono_wasm_jit_entry_sig(method: MonoMethod, kinds: number, vtypes: number, max: number): number;
+    mono_wasm_jit_sp_arg_mode(): number;
     mono_wasm_jit_slot_live(slot: number): number;
     // Pointer-value lookup in the wasm JIT's freed-method set; never dereferences `method`.
     mono_wasm_jit_method_known_dead(method: MonoMethod, site: number): number;

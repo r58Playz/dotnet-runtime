@@ -695,6 +695,17 @@ mono_wasm_jit_dump_stats (void)
 		"instead of calling the interpreted managed-to-native wrapper; routed by method-to-ir, emitted by the emitter\n",
 		mono_wasm_jit_native_calli, mono_atomic_load_i32 (&mono_wasm_jit_native_calli_routed),
 		mono_atomic_load_i32 (&mono_wasm_jit_native_calli_emitted)); }
+	/* Ungated, and the knob as the EMITTER read it: an arm whose line reads mode=0 measured the default convention.
+	 * The tag is also this change's deploy marker. */
+	printf ("[wasm-jit pconst] rescued=%d unslotted=%d (lit_rescue=%d) -- managed-object constants that reached the emitter "
+		"without a literal slot: given the slot the compile interned for the same pointer, or the compile failed\n",
+		(int) mono_wasm_jit_lit_rescued, (int) mono_wasm_jit_lit_unslotted, mono_wasm_jit_lit_rescue);
+	printf ("[wasm-jit sp-arg] mode=%d bodies=%d syncs=%d restores=%d refused=%d entry_fwd=%d -- MONO_WASM_JIT_SP_ARG: "
+		"f bodies emitted with the frame-base parameter, s.p writes they carry before a native call (mode 2), entry thunks "
+		"that restore s.p (mode 2), compiles refused for the parameter limit, interp-entry signatures handed out with the frame base (the trampoline passes s.p)\n",
+		mono_wasm_jit_sp_arg, mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_bodies), mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_syncs),
+		mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_restores), mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_refused),
+		mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_entry_sig));
 	{ extern int mono_wasm_jit_b4; extern void mono_wasm_jit_b4_plan (void);   /* plan B4: the dry-run partition */
 	  if (mono_wasm_jit_b4)
 		mono_wasm_jit_b4_plan (); }

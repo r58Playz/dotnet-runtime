@@ -1012,8 +1012,16 @@ mono_wasm_jit_auto_init (void)
 	  if (og && *og) mono_wasm_jit_origin = *og != '0';
 	  if (cp && *cp) mono_wasm_jit_capture = *cp != '0';
 	  { extern int mono_wasm_jit_site_count; const char *sc = g_getenv ("MONO_WASM_JIT_SITE_COUNT");
-	    if (sc && *sc) mono_wasm_jit_site_count = *sc != '0';
-	    if (mono_wasm_jit_site_count) { extern void mono_wasm_jit_site_init (void); mono_wasm_jit_site_init (); } }
+	    if (sc && *sc) mono_wasm_jit_site_count = atoi (sc);
+	    if (mono_wasm_jit_site_count) {
+		extern void mono_wasm_jit_site_init (void);
+		extern const char *mono_wasm_jit_site_thread;
+		const char *st = g_getenv ("MONO_WASM_JIT_SITE_THREAD");
+		if (st && *st) mono_wasm_jit_site_thread = g_strdup (st);
+		mono_wasm_jit_site_init ();
+		wasm_count_sel_off = WJ_SCRATCH_SITESEL_SLOT;
+		wasm_count_on = 1;
+	    } }
 	{ extern int mono_wasm_jit_f4; const char *f4 = g_getenv ("MONO_WASM_JIT_F4"); if (f4 && *f4) mono_wasm_jit_f4 = atoi (f4); }
 	{ extern int mono_wasm_jit_f9; const char *f9 = g_getenv ("MONO_WASM_JIT_F9"); if (f9 && *f9) mono_wasm_jit_f9 = atoi (f9); }
 	{ extern int mono_wasm_jit_s1; const char *s1 = g_getenv ("MONO_WASM_JIT_S1"); if (s1 && *s1) mono_wasm_jit_s1 = atoi (s1); }
@@ -1035,6 +1043,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_stelem_obj; const char *so = g_getenv ("MONO_WASM_JIT_STELEM_OBJ"); if (so && *so) mono_wasm_jit_stelem_obj = atoi (so); }
 	{ extern int mono_wasm_jit_s4_sel_lo, mono_wasm_jit_s4_sel_hi; const char *ss = g_getenv ("MONO_WASM_JIT_S4_SEL");
 	  if (ss && *ss) { int lo = -1, hi = -1; if (sscanf (ss, "%d-%d", &lo, &hi) == 2 && lo >= 0 && hi >= lo) { mono_wasm_jit_s4_sel_lo = lo; mono_wasm_jit_s4_sel_hi = hi; } } }
+	{ extern int mono_wasm_jit_lit_rescue; const char *lr = g_getenv ("MONO_WASM_JIT_LIT_RESCUE"); if (lr && *lr) mono_wasm_jit_lit_rescue = *lr != '0'; }
+	{ extern int mono_wasm_jit_b4_exact, mono_wasm_jit_b4_delay; const char *bx = g_getenv ("MONO_WASM_JIT_B4_EXACT");
+	  if (bx && *bx) mono_wasm_jit_b4_exact = *bx != '0';
+	  bx = g_getenv ("MONO_WASM_JIT_B4_DELAY"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_delay = v; } }
 	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes; const char *b4 = g_getenv ("MONO_WASM_JIT_B4");
 	  if (b4 && *b4) mono_wasm_jit_b4 = atoi (b4);
 	  b4 = g_getenv ("MONO_WASM_JIT_B4_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v >= 2 && v <= 512) mono_wasm_jit_b4_max = v; }
@@ -1064,6 +1076,9 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
 	{ extern int mono_wasm_jit_frame_zero; const char *fz = g_getenv ("MONO_WASM_JIT_FRAME_ZERO"); if (fz && *fz) mono_wasm_jit_frame_zero = *fz != '0'; }
 	{ extern int mono_wasm_jit_inline_alloc; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_ALLOC"); if (ia && *ia) mono_wasm_jit_inline_alloc = *ia != '0'; }
+	{ extern int mono_wasm_jit_sp_arg; const char *sa = g_getenv ("MONO_WASM_JIT_SP_ARG");
+	  if (sa && *sa) { int v = atoi (sa); mono_wasm_jit_sp_arg = v < 0 ? 0 : v > 2 ? 2 : v; }
+	  wasm_sp_arg = mono_wasm_jit_sp_arg; }   /* the stub framers' copy (wasm-encoder.c) */
 	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = the ENTRY half of the per-worker census (mono_wasm_jit_liveness fields 6/9); adds a load+test to the interp->JIT boundary, so off while timing. The INSTANTIATION half (fields 5/7/8/10/13) is unconditional and needs no knob. */
 	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
@@ -1274,6 +1289,13 @@ int mono_wasm_jit_capture = 0;
  * edges of the in-game window, the second dump is the window's exact call graph. Names the callee at emit time, so it
  * is a diagnostic: never on in a timing arm. */
 int mono_wasm_jit_site_count = 0;
+/* MONO_WASM_JIT_SITE_COUNT also counts each call it lowers by the FORM the assembler gave it (module-local, through the
+ * f-slot, a computed index, a helper or AOT body: wasm-encoder.h WASM_SF_*), where the call is written, and prints the
+ * live registry (group membership, tier, B4 edges) beside the sites. 2 = those counters only: nothing is added to the
+ * stored body, so body sizes -- and B4's byte bound -- are an uncounted run's; the tier-2 cap leaves the counters out.
+ * MONO_WASM_JIT_SITE_THREAD: comma-separated substrings of method full names. A thread that enters a matching method is
+ * the SELECTED thread from then on, and every form counter has a twin that counts it alone. */
+const char *mono_wasm_jit_site_thread = "MinecraftServer:tickServer,MinecraftServer:tickChildren";
 /* MONO_WASM_JIT_S2 (plan2x S2), a bit mask:
  *   1  tier-1 bodies count their entries and every managed call site, into process-wide records keyed by identities
  *      (mini-wasm-ir.inc, WjS2Rec). One load/add/store per site and per entry, in tier-1 code only;
@@ -1332,6 +1354,20 @@ int mono_wasm_jit_b4_groups = 256;
 int mono_wasm_jit_b4_merge = 0;
 /* MONO_WASM_JIT_B4_PER_PLAN: groups framed per plan, hottest first (R446); MONO_WASM_JIT_B4_PLAN_SAMPLES: tier-2-body
  * safepoint samples between plans, beside the growth trigger -- so plans keep coming once the tier stops growing. */
+/* MONO_WASM_JIT_LIT_RESCUE: 1 = a managed-object constant that reaches the emitter without its literal-table slot
+ * (inst_p1) takes the slot this compile interned for the same pointer value (WjLitNote, mini-wasm.h) instead of failing
+ * the compile at "managed pconst not interned". 2026-11-11, 26.2: that bail keeps ServerChunkCache.getChunk (25.6 k
+ * calls a tick from its tier-1 body), Level.getEntities, ServerLevel.tickNonPassenger and Minecraft.runTick at tier 1. */
+int mono_wasm_jit_lit_rescue = 0;
+gint32 mono_wasm_jit_lit_rescued, mono_wasm_jit_lit_unslotted;
+/* MONO_WASM_JIT_B4_EXACT: 1 = a tier-2 body's named call sites count themselves while the body is framed alone (the
+ * serializer writes the counter; a group module carries none), and the planner weighs an edge by that count, one edge
+ * a caller-callee pair. MONO_WASM_JIT_B4_DELAY: seconds after the JIT came up before B4 plans or frames anything, so
+ * the first groups are formed from counts taken in the world rather than at boot (a framed member never moves, R445).
+ * 2026-11-11 census, 26.2 server thread: the shipped weights hold 26% of the named calls in one group where exact
+ * counts allow 76% at the same caps (findings log). */
+int mono_wasm_jit_b4_exact = 0;
+int mono_wasm_jit_b4_delay = 0;
 int mono_wasm_jit_b4_per_plan = 16;
 int mono_wasm_jit_b4_plan_samples = 5000;
 /* MONO_WASM_JIT_B4_T1: tier-1 bodies record edges too (R447: 52% of the tick's entries into ungrouped callees come
@@ -1576,6 +1612,34 @@ int mono_wasm_jit_frame_zero = 0;
  * with its own generated call_indirect and has no way to read a wasm global, so it must either be given
  * an imported global or be refused the direct-forward path -- which is a confound to name, not a free
  * change. */
+/* MONO_WASM_JIT_SP_ARG: how a JIT `f` learns where its C-stack frame goes. Every `f` functype depends on it, so it is
+ * read once at startup and the whole process agrees. Unmeasured: an experiment's arm.
+ *   0  `f` reads the imported mutable `__stack_pointer` (s.p) and writes it when it creates its frame and at every exit.
+ *   1  every `f` takes the caller's frame base as a TRAILING i32 parameter (after the hidden vret pointer, see the note
+ *      above) and reads that wherever mode 0 reads s.p: the prologue, a lazy frame's creation, an EH method's capture.
+ *      Every write of s.p stays. A method hands its JIT callees its own frame base once it has a frame, else the base
+ *      it was handed.
+ *   2  as 1, and JIT code writes s.p only (a) immediately before a call that leaves JIT-emitted code -- a C helper, an
+ *      icall, an AOT body, the interpreter fallback, a native calli -- and (b) in an EH landing pad, as before. Not in
+ *      a prologue, at a lazy frame's creation or release, or at an exit.
+ *      THE INVARIANT MODE 2 RELIES ON: s.p is meaningful only while native code runs. JIT code re-establishes it, at or
+ *      below every live JIT frame of the thread, before every native call (wj_emit_sp_sync, mini-wasm-ir.inc); a landing
+ *      pad's helpers run on the value the unwind left, which is below the frames it tore through; and the entry thunk
+ *      `e` restores the value it found, so the interpreter's C frames never see the drift. A native call emitted
+ *      without the sync lets its callee allocate over live JIT frames.
+ * In 1 and 2 everything that sits in an f-slot or calls through one handles the parameter: lazy pool and hook stubs and
+ * the shared virtual slow-path stubs take it and pass it on (wasm-encoder.c reads wasm_sp_arg; in mode 2 they write s.p
+ * from it ahead of their own native calls), `e` supplies it from s.p, and every call site whose functype is a JIT `f`
+ * pushes it. AOT body types, icalls, the interpreter fallback and calli have no such argument. The jiterpreter's
+ * interp-entry trampoline cannot produce it, so mono_wasm_jit_entry_sig refuses the direct forward and those entries
+ * go through `e`: a confound to name when reading an arm (counted, `[wasm-jit sp-arg]`). Defined out here like the
+ * knobs above: the emitter reads it in both builds. */
+int mono_wasm_jit_sp_arg = 0;
+/* `[wasm-jit sp-arg]`, ungated: bodies framed with the parameter; s.p writes those bodies carry before a native call
+ * (mode 2); entry thunks framed with the save and restore (mode 2); compiles refused because the parameter did not fit
+ * WASM_FUNCTYPE_MAX_PARAMS (the method's own type, or a callee's at a site); mono_wasm_jit_entry_sig refusals. */
+gint32 mono_wasm_jit_sp_arg_bodies, mono_wasm_jit_sp_arg_syncs, mono_wasm_jit_sp_arg_restores,
+	mono_wasm_jit_sp_arg_refused, mono_wasm_jit_sp_arg_entry_sig;
 /* MONO_WASM_JIT_ENTRYCENSUS=1; the census state and reader live in the HOST_BROWSER section below, but
  * this flag must be defined OUT here: mono_wasm_jit_auto_init reads it and mini-wasm.c is linked into
  * mono-aot-cross as well as the runtime, so a browser-only definition is an undefined symbol at the
@@ -3495,6 +3559,7 @@ typedef struct {
 	gint32 hook_bank;        /* lazy bank index + 1, framed over `f` alone; made at the first hook, reused by every one */
 	guint32 hook_payload;    /* W1 C0 id of the stub at `f` for the hook in force */
 	gint16 body_nparams_p1;  /* R531: the stored body's nparams + 1 (0: never had one); admission reads it after the body is retired */
+	guint8 body_tier;        /* the census's registry dump: 0x80 | the stored body's tier | 0x10 for a downgrade recompile */
 } WjRegEntry;
 
 /* R531: bodies retired because nothing can frame them again (an orphaned descriptor, a hooked one's stale IL) */

@@ -1315,6 +1315,13 @@ wj_b4_cmp (gconstpointer x, gconstpointer y)
 	return a < b ? 1 : a > b ? -1 : 0;
 }
 
+static int
+wj_b4_paircmp (gconstpointer x, gconstpointer y)
+{
+	const WjB4Edge *p = (const WjB4Edge *) x, *q = (const WjB4Edge *) y;
+	return p->a != q->a ? (p->a < q->a ? -1 : 1) : p->b != q->b ? (p->b < q->b ? -1 : 1) : 0;
+}
+
 static gint32
 wj_b4_find (gint32 *par, gint32 x)
 {
@@ -1336,6 +1343,14 @@ static gint32 *volatile wj_b4_snap;   /* WJ_B4_SNAP_MAX entries, allocated once 
                                        * thread's dry run reads it while the drainer writes it */
 static WjB4Group *wj_b4_pend;   /* the current plan's groups, framed one per visit; drainer-owned */
 static int wj_b4_npend, wj_b4_ipend;
+/* MONO_WASM_JIT_B4_DELAY: nothing is planned or framed until that many seconds after the JIT came up. */
+static gboolean
+wj_b4_delayed (void)
+{
+	extern int mono_wasm_jit_b4_delay;
+	extern gint64 mono_wasm_jit_start_ms;
+	return mono_wasm_jit_b4_delay > 0 && mono_msec_ticks () - mono_wasm_jit_start_ms < (gint64) mono_wasm_jit_b4_delay * 1000;
+}
 /* Read without synchronisation on every drainer early-out: is there planning or framing to do? */
 gint32 mono_wasm_jit_b4_due (void);
 static gboolean
@@ -1345,6 +1360,8 @@ wj_b4_grown (void)
 	gint32 grow = MAX (32, wj_b4_planned_at / 4);   /* re-plan once the edge-carrying tier grew by 32 or 25% */
 	extern int mono_wasm_jit_b4_plan_samples;
 	if (mono_wasm_jit_counters [WJC_B4_FRAMED] >= mono_wasm_jit_b4_groups)
+		return FALSE;
+	if (wj_b4_delayed ())
 		return FALSE;
 	return mono_wasm_jit_b4_bodies - wj_b4_planned_at >= grow ||
 		(mono_wasm_jit_b4_plan_samples > 0 && mono_wasm_jit_b4_samples - wj_b4_samples_at >= mono_wasm_jit_b4_plan_samples);
@@ -1442,6 +1459,22 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 			total += e.w;
 			nest += e.est;
 		}
+	}
+	if (mono_wasm_jit_b4_exact && edges->len > 1) {
+		/* one edge a pair: a caller's several sites on one callee merge at their summed count, so the pair is ranked
+		 * by what it ran rather than by its heaviest site */
+		guint j = 0, q;
+		qsort (edges->data, edges->len, sizeof (WjB4Edge), wj_b4_paircmp);
+		for (q = 1; q < edges->len; ++q) {
+			WjB4Edge *pe = &g_array_index (edges, WjB4Edge, j), *ce = &g_array_index (edges, WjB4Edge, q);
+			if (pe->a == ce->a && pe->b == ce->b) {
+				guint64 sum = (guint64) pe->w + ce->w;
+				pe->w = sum > 0xffffffffu ? 0xffffffffu : (guint32) sum;
+			} else {
+				g_array_index (edges, WjB4Edge, ++j) = *ce;
+			}
+		}
+		g_array_set_size (edges, j + 1);
 	}
 	qsort (edges->data, edges->len, sizeof (WjB4Edge), wj_b4_cmp);
 	par = g_new (gint32, n + 1); sz = g_new (gint32, n + 1); by = g_new (gint32, n + 1); gw = g_new0 (guint64, n + 1);
@@ -1568,7 +1601,7 @@ void
 mono_wasm_jit_b4_plan (void)
 {
 	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_groups, mono_wasm_jit_b4_merge;
-	extern int mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor;
+	extern int mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor, mono_wasm_jit_b4_delay;
 	WjB4Group *g;
 	int ng, nd, ne, nest, k, m, nmem = 0;
 	guint64 total, inside, *hot = NULL;
@@ -1579,11 +1612,12 @@ mono_wasm_jit_b4_plan (void)
 		nmem += g [k].n;
 	printf ("[wasm-jit b4] plan (dry run): bodies with edges=%d edges=%d (entry-estimated %d) weight=%llu | groups=%d "
 		"members=%d internal=%.1f%% (cap %d members / %d body bytes) | framed=%lld/%d (group budget) refused=%lld published=%lld "
-		"plans=%lld merge=%d (heat-ranked, tier-1 edges %d, anchor %d)\n", nd, ne, nest,
+		"plans=%lld merge=%d (heat-ranked, tier-1 edges %d, anchor %d, exact %d, delay %d s)\n", nd, ne, nest,
 		(unsigned long long) total, ng, nmem, total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max,
 		mono_wasm_jit_b4_bytes, (long long) mono_wasm_jit_counters [WJC_B4_FRAMED], mono_wasm_jit_b4_groups,
 		(long long) mono_wasm_jit_counters [WJC_B4_REFUSED], (long long) mono_wasm_jit_counters [WJC_B4_PUBLISHED],
-		(long long) mono_wasm_jit_counters [WJC_B4_PLANS], mono_wasm_jit_b4_merge, mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor);
+		(long long) mono_wasm_jit_counters [WJC_B4_PLANS], mono_wasm_jit_b4_merge, mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor,
+		mono_wasm_jit_b4_exact, mono_wasm_jit_b4_delay);
 	{
 		double t = total ? (double) total : 1.0;
 		printf ("[wasm-jit b4] dup census: weight from a grouped caller into a callee outside its group: <=500 B %.1f%% "
@@ -1876,6 +1910,8 @@ mono_wasm_jit_b4_step (void)
 		wj_b4_ipend = wj_b4_npend;   /* the budget is spent: drop the rest of the plan */
 		return 0;
 	}
+	if (wj_b4_delayed ())
+		return 0;
 	if (wj_b4_ipend >= wj_b4_npend) {
 		int nd, ne, nest;
 		guint64 total, inside;

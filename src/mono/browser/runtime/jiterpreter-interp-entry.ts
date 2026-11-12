@@ -194,6 +194,35 @@ class TrampolineInfo {
     }
 }
 
+// MONO_WASM_JIT_SP_ARG, read once: 0 = the JITted `f` takes its logical arguments; 1, 2 = it takes a trailing frame
+// base, for which the direct forward passes `__stack_pointer` (exact here: a trampoline is entered from native code);
+// 2 = and puts the global back after `f` returns, because a body no longer restores it itself.
+let wjSpArgMode = -1;
+function wj_sp_arg (): number {
+    if (wjSpArgMode < 0)
+        wjSpArgMode = cwraps.mono_wasm_jit_sp_arg_mode();
+    return wjSpArgMode;
+}
+
+// The frame-base argument of a direct forward, after the logical arguments and before the table index.
+function wj_push_sp (builder: WasmBuilder) {
+    if (wj_sp_arg() <= 0)
+        return;
+    builder.appendU8(WasmOpcode.get_global);
+    builder.appendULeb(0);
+    if (wj_sp_arg() >= 2)
+        builder.local("wj_sp", WasmOpcode.tee_local);
+}
+
+// After the forward returned (mode 2): `__stack_pointer` as the trampoline found it.
+function wj_restore_sp (builder: WasmBuilder) {
+    if (wj_sp_arg() < 2)
+        return;
+    builder.local("wj_sp");
+    builder.appendU8(WasmOpcode.set_global);
+    builder.appendULeb(0);
+}
+
 let mostRecentOptions: JiterpreterOptions | undefined = undefined;
 
 function has_live_pthread () {
@@ -686,6 +715,8 @@ function flush_wasm_entry_trampoline_jit_queue () {
                 const tsig: any = {};
                 for (let a = 0; a < info.wjNargs; a++)
                     tsig[`p${a}`] = info.wjVtypes[a];
+                if (wj_sp_arg() > 0)
+                    tsig["sp"] = WasmValtype.i32;
                 builder.defineType(
                     info.getTraceName() + "_wj", tsig, info.wjVtypes[info.wjNargs], false
                 );
@@ -709,7 +740,8 @@ function flush_wasm_entry_trampoline_jit_queue () {
             builder.markImportAsUsed(trampImports[i][0]);
 
         // Import the indirect function table: the wasm-JIT direct-forward path call_indirects a
-        // JITted method's f-slot in it.
+        // JITted method's f-slot in it. Under MONO_WASM_JIT_SP_ARG it also passes `__stack_pointer` (global 0).
+        builder.importsStackPointer = wj_sp_arg() > 0;
         builder._generateImportSection(true);
 
         const directQueue = jitQueue.filter((info) => info.wjNargs >= 0);
@@ -760,6 +792,7 @@ function flush_wasm_entry_trampoline_jit_queue () {
                 "need_unbox": WasmValtype.i32,
                 // wasm-JIT direct-forward scratch (unused, hence free, when the fast path is not emitted)
                 "wj_fslot": WasmValtype.i32,
+                "wj_sp": WasmValtype.i32,
                 // "void" is not a legal local type, and a void-returning target has nothing to stash
                 "wj_ret": (info.wjNargs >= 0 && info.hasReturnValue) ? info.wjVtypes[info.wjNargs] : WasmValtype.i32,
             });
@@ -776,6 +809,7 @@ function flush_wasm_entry_trampoline_jit_queue () {
             const traceName = info.getTraceName();
             builder.beginFunction(traceName, {
                 "wj_fslot": WasmValtype.i32,
+                "wj_sp": WasmValtype.i32,
                 "wj_ret": info.hasReturnValue ? info.wjVtypes[info.wjNargs] : WasmValtype.i32,
             });
 
@@ -1004,8 +1038,10 @@ function generate_wasm_jit_direct_body (builder: WasmBuilder, info: TrampolineIn
         }
     }
 
+    wj_push_sp(builder);
     builder.local("wj_fslot");
     builder.call_indirect(info.getTraceName() + "_wj", 0);
+    wj_restore_sp(builder);
 
     if (info.hasReturnValue) {
         const rv = info.wjVtypes[info.wjNargs];
@@ -1150,8 +1186,10 @@ function generate_wasm_body (
             }
         }
 
+        wj_push_sp(builder);
         builder.local("wj_fslot");
         builder.call_indirect(info.getTraceName() + "_wj", 0);
+        wj_restore_sp(builder);
 
         // store the result where the caller expects it, then we are done
         if (info.hasReturnValue) {

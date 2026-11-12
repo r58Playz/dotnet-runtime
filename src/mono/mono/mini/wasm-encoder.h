@@ -426,6 +426,10 @@ typedef struct {
 	gint32   site_il;      /* the emitter's site tag when the hole was recorded (WasmBuf.site_il / site_inl) */
 	guint16  site_inl;
 	guint16  site_kd;      /* a call's key (WasmSites.kd): off - key in the low 15 bits (0: none), WASM_SITE_KD_CLOSED */
+	guint32  edge_cnt;     /* MONO_WASM_JIT_B4_EXACT: linear-memory address of this named call's own execution counter
+	                        * (a never-freed word, also the weight of its B4 edge); 0 = none */
+	guint32  site_rec;     /* MONO_WASM_JIT_SITE_COUNT: linear-memory address of the call site's form counters
+	                        * (gint32 [2 * WASM_SF_N]: every thread, then the selected thread); 0 = not counted */
 } WasmReloc;
 
 #define WASM_SITE_KD_CLOSED 0x8000   /* a memory access followed the call in its run: the key may be used */
@@ -441,7 +445,25 @@ typedef struct _WasmRelocs {
  * which case the call goes through the table at the reloc's f-slot (and bumps the i32 at `guard_count` if non-zero).
  * `guard`/`guard_count` are ignored by every other form. */
 typedef enum { WASM_FORM_INDIRECT, WASM_FORM_IMPORT, WASM_FORM_LOCAL, WASM_FORM_LOCAL_GUARDED } WasmRelocForm;
-typedef struct { guint8 form; guint32 idx; guint32 guard, guard_count; } WasmRelocFix;
+/* `in_group` is read only under wasm_count_on: the module being framed holds more than one method. */
+/* `count_edge` is read only for a reloc that carries `edge_cnt`: write its counter (the module holds one method). */
+typedef struct { guint8 form; guint32 idx; guint32 guard, guard_count; guint8 in_group; guint8 count_edge; } WasmRelocFix;
+
+/* MONO_WASM_JIT_SITE_COUNT: which way a counted call ran, decided where the call is WRITTEN (wasm_body_serialize), so a
+ * body framed again -- alone, then in a group -- counts under the form each framing gave it.
+ *   LOCAL       a JITted callee, module-local `call` (for the guarded form: every execution, SUPERSEDED included)
+ *   SUPERSEDED  a guarded module-local call whose group generation was superseded: it went through the table
+ *   CALL_SOLO   a JITted callee through its f-slot, from a module holding one method
+ *   CALL_GROUP  a JITted callee through its f-slot, from a group module the callee is not a member of
+ *   DYNAMIC     a computed table index: an IC hit, vtable / IMT dispatch, a delegate, calli
+ *   FIXED       a fixed table index: a C helper or an AOT body */
+enum { WASM_SF_LOCAL, WASM_SF_SUPERSEDED, WASM_SF_CALL_SOLO, WASM_SF_CALL_GROUP, WASM_SF_DYNAMIC, WASM_SF_FIXED, WASM_SF_N };
+extern int wasm_count_on;            /* set once at startup; without it the serializer writes no counter */
+extern guint32 wasm_count_sel_off;   /* offset of the thread-select word from the imported s.b (global 7) */
+extern guint32 wasm_count_bytes;     /* bytes of counter code written so far (the tier-2 body cap leaves them out) */
+/* A stack-neutral `*(i32 *) addr += 1`, then `*(i32 *) sel_addr += <this thread's select word>`. Returns the offset
+ * in `b` of its last memory access (a call-site key candidate, see WasmSites). */
+guint32 wasm_emit_count (WasmBuf *b, guint32 addr, guint32 sel_addr);
 
 /* Attach a reloc list to a body buffer. Must be called before any wasm_reloc on it. */
 void wasm_buf_init_relocs (WasmBuf *b);
@@ -580,6 +602,11 @@ typedef struct {
  * Nothing is patched afterwards and nothing is asserted about what the caller baked, because the caller
  * bakes nothing: every index a body needs arrived as a relocation.
  */
+/* MONO_WASM_JIT_SP_ARG as the runtime read it (mini-wasm.c says what each mode means), for the two stub framers below.
+ * Set once at startup, before any stub is framed. Non-zero: the functype handed to a framer ends in the frame-base
+ * parameter. */
+extern int wasm_sp_arg;
+
 /* A lazy stub bank (MONO_WASM_JIT_LAZY_T1): k stubs of functype ft at table slots f_slots[], see wasm-encoder.c.
  * helper_idx = table indices of bind, scratch, interp, continue_unwind. */
 void wasm_module_lazy_bank (const WasmFuncType *ft, const int *f_slots, guint32 k, const guint32 *helper_idx, WasmBuf *out);

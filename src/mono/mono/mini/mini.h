@@ -1461,6 +1461,7 @@ typedef struct {
 	guint8           wasm_inline_allow_calls;
 	guint8           wasm_inline_used_calls;
 	guint8           wasm_jit_tier;          /* R316: 2 = tier-2 compile (policy below; no T2 sampling emitted) */
+	gpointer         wasm_jit_literals;      /* WjLitNote list (mini-wasm.h): the managed-object constants this compile interned */
 	int              wasm_gi_size;           /* R316: guarded-inline size cap when > 0 (else the global knob) */
 	gpointer         wasm_cur_inline_im;     /* R316b: the inlinee being IR'd, for MonoCallInst.wasm_prof_im */
 	/* R407: the methods inline_method is inside, outermost first (the root is not on it); entries past 16 are dropped. */

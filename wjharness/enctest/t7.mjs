@@ -27,33 +27,42 @@ function target (params, ret) {
 const mem = new WebAssembly.Memory({ initial: 256, maximum: 65535, shared: true });
 const dv = () => new DataView(mem.buffer);
 const SP0 = 1 << 20, SCRATCH = 8192, TARGET = 60;
+// MONO_WASM_JIT_SP_ARG banks (t7sp-manifest.txt): the frame base the stub is handed, and where s.p stands on entry --
+// equal to the base in mode 1 (that convention keeps them equal), stale and lower in mode 2.
+const BASE = SP0 - 8192, STALE = SP0 - 65536;
 let fails = 0, runs = 0;
 const bad = (m) => { if (fails++ < 20) console.log('t7 FAIL: ' + m); };
 const argv = (p, j) => ({ 0x7f: 1000 + j * 37, 0x7e: BigInt(-(2 ** 40) + j), 0x7d: Math.fround(j + 0.5), 0x7c: j * 1.25 - 9 }[p]);
 const rd = (p, a) => ({ 0x7f: () => dv().getInt32(a, true), 0x7e: () => dv().getBigInt64(a, true), 0x7d: () => dv().getFloat32(a, true), 0x7c: () => dv().getFloat64(a, true) }[p])();
 const wr = (p, a, v) => ({ 0x7f: () => dv().setInt32(a, v, true), 0x7e: () => dv().setBigInt64(a, v, true), 0x7d: () => dv().setFloat32(a, v, true), 0x7c: () => dv().setFloat64(a, v, true) }[p])();
-for (const line of fs.readFileSync('t7-manifest.txt', 'utf8').trim().split('\n')) {
-  const [fn, ks, rets, ...ps] = line.split(' ');
-  const k = +ks, ret = +rets, params = ps.map(Number);
+const lines = fs.readFileSync('t7-manifest.txt', 'utf8').trim().split('\n').map((l) => '0 ' + l)
+  .concat(fs.readFileSync('t7sp-manifest.txt', 'utf8').trim().split('\n').map((l) => { const [fn, m, ...r] = l.split(' '); return [m, fn, ...r].join(' '); }));
+for (const line of lines) {
+  const [ms, fn, ks, rets, ...ps] = line.split(' ');
+  const spm = +ms, k = +ks, ret = +rets, params = ps.map(Number);
+  const na = spm ? params.length - 1 : params.length;   // the callee's arguments: a trailing frame base is not one
+  const base = spm ? BASE : SP0, sp0 = spm === 2 ? STALE : base;
   try { execFileSync('wasm-validate', ['--enable-all', fn]); } catch (e) { bad(`${fn}: wasm-validate: ${e.stdout || e.message}`); continue; }
   const table = new WebAssembly.Table({ initial: 64, element: 'anyfunc' });
-  const sp = new WebAssembly.Global({ value: 'i32', mutable: true }, SP0);
+  const sp = new WebAssembly.Global({ value: 'i32', mutable: true }, sp0);
   const g = (v) => new WebAssembly.Global({ value: 'i32', mutable: false }, v);
   let mode = 0, bindSlot = -1, interpArgs = null, unwound = false, pinOK = true;
-  const i32idx = params.map((p, j) => [p, j]).filter(([p]) => p === 0x7f).map(([, j]) => j);
+  const i32idx = params.slice(0, na).map((p, j) => [p, j]).filter(([p]) => p === 0x7f).map(([, j]) => j);
+  const frame = (i32idx.length * 4 + 15) & ~15;
   let curArgs = null;
   const h = {
     1: (slot) => {   // bind: check the pin frame while "the GC could run"
       bindSlot = slot;
       if (i32idx.length) {
         const s = sp.value;
-        if (!(s < SP0) || (s & 15)) pinOK = false;
+        if (!(s < base) || (s & 15) || (spm && s !== base - frame)) pinOK = false;
         i32idx.forEach((j, kth) => { if (dv().getInt32(s + 4 * kth, true) !== curArgs[j]) pinOK = false; });
-      } else if (sp.value !== SP0) pinOK = false;
+      } else if (sp.value !== base) pinOK = false;
       return mode === 0 ? TARGET : 0;
     },
     2: () => SCRATCH,
-    3: (slot, buf) => { interpArgs = [slot, buf, params.map((p, j) => rd(p, buf + 8 * j))];
+    3: (slot, buf) => { interpArgs = [slot, buf, params.slice(0, na).map((p, j) => rd(p, buf + 8 * j))];
+      if (spm && (sp.value !== base - frame || dv().getInt32(buf + 8 * na, true) !== 0x5a5a5a5a)) pinOK = false;   // native code below the base; the base not spilled
       if (mode === 2) return 1;
       if (ret !== 0x40) wr(ret, buf + 192, { 0x7f: 4242, 0x7e: 99n, 0x7d: 0.75, 0x7c: 6.5 }[ret]);
       return 0; },
@@ -69,14 +78,17 @@ for (const line of fs.readFileSync('t7-manifest.txt', 'utf8').trim().split('\n')
     const slot = 16 + 2 * i, stub = table.get(slot);
     if (!stub) { bad(`${fn}: slot ${slot} empty`); continue; }
     curArgs = params.map(argv);
+    if (spm) curArgs[na] = base;
     for (mode = 0; mode < 3; ++mode) {
       runs++; bindSlot = -1; interpArgs = null; unwound = false; pinOK = true;
       new Uint8Array(mem.buffer, 1024, 256).fill(0);
+      new Uint8Array(mem.buffer, SCRATCH, 192).fill(0x5a);
+      sp.value = sp0;
       let r, threw = false;
       try { r = stub(...curArgs); } catch (e) { threw = true; }
       if (bindSlot !== slot) bad(`${fn} stub ${i} mode ${mode}: bind got ${bindSlot}`);
-      if (!pinOK) bad(`${fn} stub ${i} mode ${mode}: i32 params not pinned below s.p`);
-      if (mode !== 2 && sp.value !== SP0) bad(`${fn} stub ${i} mode ${mode}: s.p not restored (${sp.value})`);
+      if (!pinOK) bad(`${fn} stub ${i} mode ${mode}: i32 params not pinned below ${spm ? 'the frame base' : 's.p'}`);
+      if (mode !== 2 && sp.value !== base) bad(`${fn} stub ${i} mode ${mode}: s.p not restored (${sp.value})`);
       if (mode === 0) {
         if (threw) { bad(`${fn} stub ${i}: tail call threw`); continue; }
         params.forEach((p, j) => { if (rd(p, 1024 + 8 * j) !== curArgs[j]) bad(`${fn} stub ${i}: target arg ${j} ${rd(p, 1024 + 8 * j)} != ${curArgs[j]}`); });
@@ -90,7 +102,7 @@ for (const line of fs.readFileSync('t7-manifest.txt', 'utf8').trim().split('\n')
           if (threw || r !== want) bad(`${fn} stub ${i}: interp ret ${r} != ${want} (threw ${threw})`);
         } else if (!unwound || !threw) bad(`${fn} stub ${i}: throw did not reach continue_unwind`);
       }
-      sp.value = SP0;   // a throw leaves s.p to the catching frame's landing pad, as a JIT frame without one does
+      sp.value = sp0;   // a throw leaves s.p to the catching frame's landing pad, as a JIT frame without one does
 
     }
   }

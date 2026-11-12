@@ -38,6 +38,12 @@
  *     [ret = load scratch + 192; normalise]; pop
  * retnorm: 0 none, 1 u8 (bool/byte), 2 s8, 3 u16 (char/ushort), 4 s16 -- applied to AOT and interpreter returns only,
  * as the inline cold path did (wasm_emit_subword_ret_norm and the residual's switch).
+ *
+ * MONO_WASM_JIT_SP_ARG (wasm_sp_arg != 0): ft is the JIT f's type and its LAST param is the caller's frame base, so the
+ * stub is (site params..., base, i64 desc). The base is passed on to a JIT f and to nothing else: an AOT body takes the
+ * site params alone (a type of its own here, 7) or with the rgctx, the pin frame and the interpreter's spill leave it
+ * out, and the frame goes below it rather than below s.p. In mode 2 s.p may be anywhere on entry and the inline AOT IC
+ * calls native code before any frame exists, so the stub first writes s.p from the base.
  */
 static void
 vslow_norm (WasmBuf *b, int retnorm)
@@ -67,33 +73,39 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 	WasmLocalGroup lg [2] = { { WASM_I32, 9 }, { WASM_I64, 2 } };
 	WasmBuf sec, body;
 	guint32 i, j, n = ft->nparams, ni32 = 0, frame, kth;
+	guint32 na = wasm_sp_arg ? n - 1 : n;   /* the site's arguments: all of ft's params but a trailing frame base */
+	guint32 t_ne = wasm_sp_arg ? 7 : 1;     /* the type of an AOT body without the extra arg */
 	/* locals after the n site params and the i64 descriptor (param n) */
 	guint32 l_desc = n + 1, l_vt = n + 2, l_aic = n + 3, l_ti = n + 4, l_rg = n + 5, l_r = n + 6, l_fs = n + 7;
 	guint32 l_old = n + 8, l_sp = n + 9, l_w0 = n + 10, l_w1 = n + 11;
 
 	g_assert (n >= 1 && n + 1 <= WASM_FUNCTYPE_MAX_PARAMS);   /* `this` is param 0; the caller checked the room */
+	g_assert (!wasm_sp_arg || (n >= 2 && ft->params [n - 1] == WASM_I32));
 	for (j = 0; j < n; ++j) {
 		stub_p [j] = ft->params [j];
 		at_p [j] = ft->params [j];
-		if (ft->params [j] == WASM_I32)
+		if (j < na && ft->params [j] == WASM_I32)
 			ni32++;
 	}
 	stub_p [n] = WASM_I64;
-	at_p [n] = WASM_I32;
+	at_p [na] = WASM_I32;
 	frame = (ni32 * 4 + 15) & ~15u;
 
 	wasm_bytes (out, header, 8);
 	/* types: 0 stub, 1 the site's own (f-slot call, AOT body without the extra arg), 2 AOT body with rgctx,
-	 * 3 (i32,i32,i32)->i32 resolve/aot, 4 ()->i32 scratch, 5 (i32,i32)->i32 interp, 6 ()->void continue_unwind */
+	 * 3 (i32,i32,i32)->i32 resolve/aot, 4 ()->i32 scratch, 5 (i32,i32)->i32 interp, 6 ()->void continue_unwind;
+	 * with a frame base in ft, 1 is the f-slot call only and 7 the AOT body without the extra arg */
 	wasm_buf_init (&sec);
-	wasm_uleb (&sec, 7);
+	wasm_uleb (&sec, wasm_sp_arg ? 8 : 7);
 	emit_functype (&sec, stub_p, n + 1, ft->ret);
 	emit_functype (&sec, ft->params, n, ft->ret);
-	emit_functype (&sec, at_p, n + 1, ft->ret);
+	emit_functype (&sec, at_p, na + 1, ft->ret);
 	emit_functype (&sec, p3, 3, WASM_I32);
 	emit_functype (&sec, NULL, 0, WASM_I32);
 	emit_functype (&sec, p2, 2, WASM_I32);
 	emit_functype (&sec, NULL, 0, WASM_VOID);
+	if (wasm_sp_arg)
+		emit_functype (&sec, ft->params, na, ft->ret);
 	emit_section (out, 1, &sec);
 	wasm_buf_free (&sec);
 
@@ -123,10 +135,16 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 	emit_section (out, 9, &sec);
 	wasm_buf_free (&sec);
 
-#define VS_PARAMS() do { for (j = 0; j < n; ++j) wasm_op_local (&body, WASM_OP_LOCAL_GET, j); } while (0)
+/* VS_PARAMS: the site's arguments, for an AOT body. VS_F_PARAMS: those and the frame base, for a JIT f. */
+#define VS_PARAMS() do { for (j = 0; j < na; ++j) wasm_op_local (&body, WASM_OP_LOCAL_GET, j); } while (0)
+#define VS_F_PARAMS() do { for (j = 0; j < n; ++j) wasm_op_local (&body, WASM_OP_LOCAL_GET, j); } while (0)
 #define VS_POP() do { if (frame) { wasm_op_local (&body, WASM_OP_LOCAL_GET, l_old); \
 		wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0); } } while (0)
 	wasm_buf_init (&body);
+	if (wasm_sp_arg >= 2) {
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, na);
+		wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
+	}
 	wasm_op_local (&body, WASM_OP_LOCAL_GET, n);
 	wasm_op (&body, WASM_OP_I32_WRAP_I64);
 	wasm_op_local (&body, WASM_OP_LOCAL_SET, l_desc);
@@ -166,7 +184,7 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 				VS_PARAMS ();
 				wasm_op_local (&body, WASM_OP_LOCAL_GET, l_ti);
 				wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SHR_U);
-				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, 1); wasm_uleb (&body, 0);
+				wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, t_ne); wasm_uleb (&body, 0);
 			wasm_op (&body, WASM_OP_ELSE);
 				VS_PARAMS ();
 				wasm_op_local (&body, WASM_OP_LOCAL_GET, l_rg);
@@ -182,14 +200,18 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 
 	/* frame for the helpers */
 	if (frame) {
-		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
+		if (wasm_sp_arg) {
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, na);
+		} else {
+			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
+		}
 		wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_old);
 		wasm_i32_const (&body, (gint32) frame);
 		wasm_op (&body, WASM_OP_I32_SUB);
 		wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_sp);
 		wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
 		kth = 0;
-		for (j = 0; j < n; ++j) {
+		for (j = 0; j < na; ++j) {
 			if (ft->params [j] != WASM_I32)
 				continue;
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, l_sp);
@@ -208,7 +230,7 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 	wasm_op_local (&body, WASM_OP_LOCAL_TEE, l_fs);
 	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 		VS_POP ();
-		VS_PARAMS ();
+		VS_F_PARAMS ();
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, l_fs);
 		wasm_u8 (&body, 0x13);                                      /* return_call_indirect */
 		wasm_uleb (&body, 1);
@@ -230,7 +252,7 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 			VS_PARAMS ();
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, l_r);
 			wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 212);   /* AOT body table index */
-			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, 1); wasm_uleb (&body, 0);
+			wasm_op (&body, WASM_OP_CALL_INDIRECT); wasm_uleb (&body, t_ne); wasm_uleb (&body, 0);
 		wasm_op (&body, WASM_OP_ELSE);
 			VS_PARAMS ();
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, l_r);
@@ -245,7 +267,7 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 	wasm_op (&body, WASM_OP_END);
 
 	/* residual: the interpreter, through the arguments spilled to scratch */
-	for (j = 0; j < n; ++j) {
+	for (j = 0; j < na; ++j) {
 		WasmOpcode sop;
 		guint32 al;
 		switch (ft->params [j]) {
@@ -282,6 +304,7 @@ wasm_module_vslow (const WasmFuncType *ft, int retnorm, int f_slot, const guint3
 	}
 	VS_POP ();
 #undef VS_PARAMS
+#undef VS_F_PARAMS
 #undef VS_POP
 
 	(void) l_rg;

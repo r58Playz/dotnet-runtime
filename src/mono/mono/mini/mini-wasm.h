@@ -1513,6 +1513,14 @@ void mono_wasm_jit_census_note_entry (int eslot);
  * finally-save depth (interp.c). */
 #define WJ_SCRATCH_LMFADDR_SLOT (WJ_SCRATCH_THREAD_SLOT + 8)
 #define WJ_SCRATCH_FINSP_SLOT (WJ_SCRATCH_LMFADDR_SLOT + 8)
+/* Every managed-object constant a wasm compile interned (method-to-ir.c, at its resolve site), keyed by the pointer value
+ * it had THEN -- an identity, never dereferenced -- with its literal-table slot. A pass that clones such a constant
+ * copies inst_c0 (= inst_p0) and may not copy inst_p1; the emitter then finds the slot here (MONO_WASM_JIT_LIT_RESCUE)
+ * instead of failing the compile. Mempool-allocated: it dies with the compile. */
+typedef struct _WjLitNote { gpointer obj, slot; struct _WjLitNote *next; } WjLitNote;
+/* MONO_WASM_JIT_SITE_COUNT: this thread's select word. 1 once the thread entered a method MONO_WASM_JIT_SITE_THREAD
+ * names; the census's second counter set adds it, so it counts that thread alone. */
+#define WJ_SCRATCH_SITESEL_SLOT (WJ_SCRATCH_FINSP_SLOT + 8)
 
 /* Byte offsets of interp.c's WjEhRec (R353), for the emitter, which cannot see MonoLMFExt from here. */
 typedef struct {
