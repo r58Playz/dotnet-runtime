@@ -33,7 +33,15 @@ if not tids:
 # class_3218, LevelTicks = Lithium's/vanilla's tick scheduler, LevelRenderer = class_761 (WorldRenderer).
 SERVER = re.compile(r"ServerTickScheduler|net\.minecraft\.class_3218|selectTicks|class_1937:method_8398"
                     r"|net\.minecraft\.server\.level\.ServerLevel:|net\.minecraft\.world\.ticks\.LevelTicks:|ServerChunkCache:")
-CLIENT = re.compile(r"wink_present|gex_wgpu|class_761|WorldRenderer|net\.minecraft\.client\.renderer\.LevelRenderer:")
+# The CLIENT is the Java render thread. Since GL moved to the browser's main thread (WINK_GL_MAIN, R477) that thread
+# only RECORDS GL, so no wink / gex_wgpu symbol runs on it any more (they are on `chromium`, tid == pid, which is not a
+# candidate here), and perfraw cuts a name at 130 characters, which hides the class behind a long modopt return type
+# (`object modopt(__<Unloadable>13/...) net.minecraft.client.renderer.LevelRe`): on 262n no worker matched and
+# `hwcensus --client` refused every capture (2026-11-11). So the client is named by what only it executes in Java: the
+# client packages and blaze3d on 26.x, the client classes' intermediary names and Sodium on 1.16.1. The GL names stay
+# for captures taken with GL on a worker.
+CLIENT = re.compile(r"wink_present|gex_wgpu|class_761|WorldRenderer|net\.minecraft\.client\.|com\.mojang\.blaze3d\."
+                    r"|net\.minecraft\.class_310:|net\.minecraft\.class_757:|me\.jellysquid\.mods\.sodium\.|net\.caffeinemc\.mods\.sodium\.")
 
 best = None
 for t in tids:

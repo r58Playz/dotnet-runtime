@@ -16,7 +16,8 @@ rows = sorted(jitdump_ranges(jit)); st = [r[0] for r in rows]
 SERVER = re.compile(r"ServerTickScheduler|net\.minecraft\.class_3218|selectTicks|class_1937:method_8398"
                     r"|net\.minecraft\.server\.level\.ServerLevel:|net\.minecraft\.world\.ticks\.LevelTicks:|ServerChunkCache:")
 CLIENT = re.compile(r"realize_glenv|gl4es|wink_present|gex_wgpu|class_761|WorldRenderer"
-                    r"|net\.minecraft\.client\.renderer\.LevelRenderer:")
+                    r"|net\.minecraft\.client\.|com\.mojang\.blaze3d\."   # the render thread's own Java: see native/servertid.py
+                    r"|net\.minecraft\.class_310:|net\.minecraft\.class_757:|me\.jellysquid\.mods\.sodium\.|net\.caffeinemc\.mods\.sodium\.")
 at = perfread.attrs(os.path.join(d, 'perf.data'))
 ia = {i for i, x in enumerate(at) if 'instructions' in x['name']}
 cnt = collections.Counter(); sc = collections.Counter(); cc = collections.Counter()
