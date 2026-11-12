@@ -286,6 +286,10 @@ typedef struct {
 	gint32 key_pending;
 	/* Local-op log (WasmLocalLog), or NULL. Changes no bytes. */
 	struct _WasmLocalLog *llog;
+	/* MONO_WASM_JIT_SP_ARG mode 2 (wj_emit_sp_sync): `ctl_depth` is the block nesting wasm_op has written, and
+	 * `sp_synced` is 1 + the nesting at which this buffer last wrote s.p, while that write still dominates what is
+	 * appended (0: none). An `end` or `else` of a block that was open at the write clears it. */
+	gint32 ctl_depth, sp_synced;
 } WasmBuf;
 
 /* Every wasm_op_local call on a buffer whose `llog` is set, in call order, as idx << 2 | WASM_LLOG_*. Logged as CALLED:

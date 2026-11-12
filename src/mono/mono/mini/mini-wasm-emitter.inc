@@ -1525,7 +1525,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	/* the per-body emission state (mini-wasm-ir.inc), put back at `done` */
 	int wj_sp_saved_local = wj_sp_out_local;
 	gboolean wj_sp_saved_sync = wj_sp_sync_on, wj_sp_saved_unset = wj_sp_unset;
-	guint32 wj_sp_saved_n = wj_sp_sync_n;
+	guint32 wj_sp_saved_n = wj_sp_sync_n, wj_sp_saved_elided = wj_sp_elided_n;
+	gboolean wj_sp_saved_elide = wj_sp_elide_ok;
 	gboolean self_has_byaddr G_GNUC_UNUSED = FALSE;  /* stats: method takes >=1 by-addr vtype arg */
 	WasmBuf body, out;
 	WjBody *wj_stored_body = NULL;   /* the relocatable body, handed to the registry on successful registration */
@@ -1668,6 +1669,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	wj_sp_sync_on = FALSE;
 	wj_sp_unset = FALSE;
 	wj_sp_sync_n = 0;
+	wj_sp_elided_n = 0;
+	wj_sp_elide_ok = FALSE;
 	wasm_buf_init (&body);
 	wasm_buf_init_relocs (&body);   /* every call site and type index in it is a hole; see wasm-encoder.h */
 	wj_sw_tab = wj_sw_inl_freeze (cfg, &wj_sw_ranges, &wj_sw_n);   /* R516: inlining is done; tag call sites below */
@@ -4222,6 +4225,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			sp_out_idx = sp_param_idx;   /* no frame (and none at all in the offline dump): the base it was handed */
 		wj_sp_out_local = sp_out_idx == refbase_idx ? -1 : sp_out_idx;
 		wj_sp_sync_on = mono_wasm_jit_sp_arg >= 2;
+		{ extern int mono_wasm_jit_sp_elide;
+		  wj_sp_elide_ok = mono_wasm_jit_sp_elide && (sp_out_idx == refbase_idx || sp_out_idx == sp_param_idx); }
 	}
 #ifdef HOST_BROWSER
 	/* C-STACK FRAME PROLOGUE. Reserve this method's ref+addr slots as a real frame on the emscripten
@@ -9367,6 +9372,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		if (sp_param_idx >= 0) {   /* `[wasm-jit sp-arg]`: this body, and the writes of s.p it carries */
 			mono_atomic_inc_i32 (&mono_wasm_jit_sp_arg_bodies);
 			mono_atomic_add_i32 (&mono_wasm_jit_sp_arg_syncs, (gint32) wj_sp_sync_n);
+			mono_atomic_add_i32 (&mono_wasm_jit_sp_arg_elided, (gint32) wj_sp_elided_n);
 		}
 		if (has_ret) {
 			WasmOpcode st; guint32 al;
@@ -9770,6 +9776,8 @@ done:
 	wj_sp_sync_on = wj_sp_saved_sync;
 	wj_sp_unset = wj_sp_saved_unset;
 	wj_sp_sync_n = wj_sp_saved_n;
+	wj_sp_elided_n = wj_sp_saved_elided;
+	wj_sp_elide_ok = wj_sp_saved_elide;
 	wj_body_free (wj_stored_body);   /* NULL once the registry has taken it */
 	wj_stored_body = NULL;
 	wasm_buf_free (&body);

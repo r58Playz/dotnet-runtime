@@ -700,11 +700,11 @@ mono_wasm_jit_dump_stats (void)
 	printf ("[wasm-jit pconst] rescued=%d unslotted=%d (lit_rescue=%d) -- managed-object constants that reached the emitter "
 		"without a literal slot: given the slot the compile interned for the same pointer, or the compile failed\n",
 		(int) mono_wasm_jit_lit_rescued, (int) mono_wasm_jit_lit_unslotted, mono_wasm_jit_lit_rescue);
-	printf ("[wasm-jit sp-arg] mode=%d bodies=%d syncs=%d restores=%d refused=%d entry_fwd=%d -- MONO_WASM_JIT_SP_ARG: "
-		"f bodies emitted with the frame-base parameter, s.p writes they carry before a native call (mode 2), entry thunks "
+	printf ("[wasm-jit sp-arg] mode=%d bodies=%d syncs=%d elided=%d restores=%d refused=%d entry_fwd=%d -- MONO_WASM_JIT_SP_ARG: "
+		"f bodies emitted with the frame-base parameter, s.p writes they carry before a native call (mode 2), writes dropped behind a dominating one (SP_ELIDE), entry thunks "
 		"that restore s.p (mode 2), compiles refused for the parameter limit, interp-entry signatures handed out with the frame base (the trampoline passes s.p)\n",
 		mono_wasm_jit_sp_arg, mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_bodies), mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_syncs),
-		mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_restores), mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_refused),
+		mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_elided), mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_restores), mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_refused),
 		mono_atomic_load_i32 (&mono_wasm_jit_sp_arg_entry_sig));
 	{ extern int mono_wasm_jit_b4; extern void mono_wasm_jit_b4_plan (void);   /* plan B4: the dry-run partition */
 	  if (mono_wasm_jit_b4)

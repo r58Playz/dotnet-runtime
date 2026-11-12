@@ -1046,7 +1046,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_lit_rescue; const char *lr = g_getenv ("MONO_WASM_JIT_LIT_RESCUE"); if (lr && *lr) mono_wasm_jit_lit_rescue = *lr != '0'; }
 	{ extern int mono_wasm_jit_b4_exact, mono_wasm_jit_b4_delay; const char *bx = g_getenv ("MONO_WASM_JIT_B4_EXACT");
 	  if (bx && *bx) mono_wasm_jit_b4_exact = *bx != '0';
-	  bx = g_getenv ("MONO_WASM_JIT_B4_DELAY"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_delay = v; } }
+	  bx = g_getenv ("MONO_WASM_JIT_B4_DELAY"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_delay = v; }
+	  { extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win;
+	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_quiet = v; }
+	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET_WIN"); if (bx && *bx) { int v = atoi (bx); if (v >= 100) mono_wasm_jit_b4_quiet_win = v; } } }
 	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes; const char *b4 = g_getenv ("MONO_WASM_JIT_B4");
 	  if (b4 && *b4) mono_wasm_jit_b4 = atoi (b4);
 	  b4 = g_getenv ("MONO_WASM_JIT_B4_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v >= 2 && v <= 512) mono_wasm_jit_b4_max = v; }
@@ -1076,9 +1079,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_inline_zero; const char *iz = g_getenv ("MONO_WASM_JIT_INLINE_ZERO"); mono_wasm_jit_inline_zero = (iz && *iz) ? atoi (iz) : 64; }
 	{ extern int mono_wasm_jit_frame_zero; const char *fz = g_getenv ("MONO_WASM_JIT_FRAME_ZERO"); if (fz && *fz) mono_wasm_jit_frame_zero = *fz != '0'; }
 	{ extern int mono_wasm_jit_inline_alloc; const char *ia = g_getenv ("MONO_WASM_JIT_INLINE_ALLOC"); if (ia && *ia) mono_wasm_jit_inline_alloc = *ia != '0'; }
-	{ extern int mono_wasm_jit_sp_arg; const char *sa = g_getenv ("MONO_WASM_JIT_SP_ARG");
+	{ extern int mono_wasm_jit_sp_arg, mono_wasm_jit_sp_elide; const char *sa = g_getenv ("MONO_WASM_JIT_SP_ARG");
 	  if (sa && *sa) { int v = atoi (sa); mono_wasm_jit_sp_arg = v < 0 ? 0 : v > 2 ? 2 : v; }
-	  wasm_sp_arg = mono_wasm_jit_sp_arg; }   /* the stub framers' copy (wasm-encoder.c) */
+	  wasm_sp_arg = mono_wasm_jit_sp_arg;   /* the stub framers' copy (wasm-encoder.c) */
+	  sa = g_getenv ("MONO_WASM_JIT_SP_ELIDE"); if (sa && *sa) mono_wasm_jit_sp_elide = *sa != '0'; }
 	{ const char *ec = g_getenv ("MONO_WASM_JIT_ENTRYCENSUS"); mono_wasm_jit_entry_census = (ec && *ec && *ec != '0') ? 1 : 0; } /* 1 = the ENTRY half of the per-worker census (mono_wasm_jit_liveness fields 6/9); adds a load+test to the interp->JIT boundary, so off while timing. The INSTANTIATION half (fields 5/7/8/10/13) is unconditional and needs no knob. */
 	{ extern int mono_wasm_jit_elidediag; const char *ed = g_getenv ("MONO_WASM_JIT_ELIDEDIAG"); mono_wasm_jit_elidediag = (ed && *ed && *ed != '0') ? 1 : 0; }
 	{ extern int mono_wasm_jit_lmf_publish_diag; const char *lp = g_getenv ("MONO_WASM_JIT_LMF_PUBLISH_DIAG"); mono_wasm_jit_lmf_publish_diag = (lp && *lp && *lp != '0') ? 1 : 0; } /* 1 = mono_set_lmf reports publishing an LMF head whose lmf_addr is 0 (an incomplete push); diagnostic only */ /* 1 = print per-method per-arm ref-slot elision attribution; diagnostic only */
@@ -1368,6 +1372,12 @@ gint32 mono_wasm_jit_lit_rescued, mono_wasm_jit_lit_unslotted;
  * counts allow 76% at the same caps (findings log). */
 int mono_wasm_jit_b4_exact = 0;
 int mono_wasm_jit_b4_delay = 0;
+/* MONO_WASM_JIT_B4_QUIET=<pct> (0 = off): B4 plans and frames only while the edge-carrying tier is QUIET -- over the
+ * last window of planner samples (tier-2-body safepoint samples: executed work, not wall time) it grew by at most
+ * <pct> percent. A window is as long as all the samples before it, from 1000 up to MONO_WASM_JIT_B4_QUIET_WIN. The delay's purpose without its clock: a workload that is still compiling its hot set
+ * has not shown its call counts yet. Unmeasured. */
+int mono_wasm_jit_b4_quiet = 0;
+int mono_wasm_jit_b4_quiet_win = 15000;
 int mono_wasm_jit_b4_per_plan = 16;
 int mono_wasm_jit_b4_plan_samples = 5000;
 /* MONO_WASM_JIT_B4_T1: tier-1 bodies record edges too (R447: 52% of the tick's entries into ungrouped callees come
@@ -1639,7 +1649,10 @@ int mono_wasm_jit_sp_arg = 0;
  * (mode 2); entry thunks framed with the save and restore (mode 2); compiles refused because the parameter did not fit
  * WASM_FUNCTYPE_MAX_PARAMS (the method's own type, or a callee's at a site); mono_wasm_jit_entry_sig refusals. */
 gint32 mono_wasm_jit_sp_arg_bodies, mono_wasm_jit_sp_arg_syncs, mono_wasm_jit_sp_arg_restores,
-	mono_wasm_jit_sp_arg_refused, mono_wasm_jit_sp_arg_entry_sig;
+	mono_wasm_jit_sp_arg_refused, mono_wasm_jit_sp_arg_entry_sig, mono_wasm_jit_sp_arg_elided;
+/* MONO_WASM_JIT_SP_ELIDE (mode 2 only): a body with an eager frame or none drops a write of s.p before a native call
+ * when an earlier write of its own dominates it (WasmBuf.sp_synced; wj_emit_sp_sync has the argument). Unmeasured. */
+int mono_wasm_jit_sp_elide = 0;
 /* MONO_WASM_JIT_ENTRYCENSUS=1; the census state and reader live in the HOST_BROWSER section below, but
  * this flag must be defined OUT here: mono_wasm_jit_auto_init reads it and mini-wasm.c is linked into
  * mono-aot-cross as well as the runtime, so a browser-only definition is an undefined symbol at the

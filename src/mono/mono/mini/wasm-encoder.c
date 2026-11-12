@@ -16,6 +16,7 @@ wasm_buf_init (WasmBuf *b)
 {
 	b->cap = WASM_BUF_MIN_CAP;
 	b->len = 0;
+	b->ctl_depth = 0; b->sp_synced = 0;
 	b->data = (guint8 *) g_malloc (b->cap);
 	/* Disarm the local.tee peephole. Buffers are stack-allocated at several call sites and are NOT zeroed,
 	 * so leaving these as garbage could make a local.get rewrite a byte that is not a local.set. */
@@ -604,6 +605,20 @@ wasm_op (WasmBuf *b, WasmOpcode op)
 	if (((guint8) op <= 0x19 && (guint8) op != 0x01) || (guint8) op == 0x1f) {
 		wasm_site_key_open (b);
 		b->key_src = -1;
+	}
+	switch ((guint8) op) {   /* WasmBuf.ctl_depth / sp_synced */
+	case 0x02: case 0x03: case 0x04: case 0x06: case 0x1f:
+		b->ctl_depth++;
+		break;
+	case 0x05:
+		if (b->sp_synced > b->ctl_depth) b->sp_synced = 0;
+		break;
+	case 0x0b:
+		if (b->sp_synced > b->ctl_depth) b->sp_synced = 0;
+		b->ctl_depth--;
+		break;
+	default:
+		break;
 	}
 	wasm_u8 (b, (guint8) op);
 }

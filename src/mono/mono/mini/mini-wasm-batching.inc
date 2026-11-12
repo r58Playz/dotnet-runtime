@@ -1343,13 +1343,40 @@ static gint32 *volatile wj_b4_snap;   /* WJ_B4_SNAP_MAX entries, allocated once 
                                        * thread's dry run reads it while the drainer writes it */
 static WjB4Group *wj_b4_pend;   /* the current plan's groups, framed one per visit; drainer-owned */
 static int wj_b4_npend, wj_b4_ipend;
-/* MONO_WASM_JIT_B4_DELAY: nothing is planned or framed until that many seconds after the JIT came up. */
+/* MONO_WASM_JIT_B4_QUIET's window: the planner clock and the tier's size at its start, and the last verdict (TRUE
+ * until the first window closes: nothing is known yet). */
+static gint32 wj_b4_q_samples, wj_b4_q_bodies, wj_b4_q_windows;
+static gboolean wj_b4_noisy = TRUE;
+/* MONO_WASM_JIT_B4_DELAY: nothing is planned or framed until that many seconds after the JIT came up.
+ * MONO_WASM_JIT_B4_QUIET: nor while the tier is still growing. */
 static gboolean
 wj_b4_delayed (void)
 {
 	extern int mono_wasm_jit_b4_delay;
 	extern gint64 mono_wasm_jit_start_ms;
-	return mono_wasm_jit_b4_delay > 0 && mono_msec_ticks () - mono_wasm_jit_start_ms < (gint64) mono_wasm_jit_b4_delay * 1000;
+	extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win;
+	extern int mono_wasm_jit_stats;
+	if (mono_wasm_jit_b4_delay > 0 && mono_msec_ticks () - mono_wasm_jit_start_ms < (gint64) mono_wasm_jit_b4_delay * 1000)
+		return TRUE;
+	if (mono_wasm_jit_b4_quiet > 0) {
+		/* MONO_WASM_JIT_B4_QUIET. Drainer-only state; the dump thread's read of wj_b4_noisy is a census's. One
+		 * verdict a window: the tier's growth over the window against its size at the window's start. */
+		gint32 s = mono_wasm_jit_b4_samples, bd = mono_wasm_jit_b4_bodies;
+		/* The window is as long as everything before it, between 1000 samples and QUIET_WIN: early on the verdict
+		 * is "the work done so far doubled and the tier barely grew", which a 20 s kernel reaches and a boot does not;
+		 * later it is a rate. */
+		gint32 win = MIN (mono_wasm_jit_b4_quiet_win, MAX (1000, wj_b4_q_samples));
+		if (s - wj_b4_q_samples >= win) {
+			gboolean noisy = (gint64) (bd - wj_b4_q_bodies) * 100 > (gint64) mono_wasm_jit_b4_quiet * MAX (wj_b4_q_bodies, 1);
+			if (G_UNLIKELY (mono_wasm_jit_stats) && (noisy != wj_b4_noisy || wj_b4_q_windows < 4 || (wj_b4_q_windows & 7) == 0))
+				printf ("[wasm-jit b4 quiet] +%.1fs window %d: bodies %d -> %d over %d samples (window of %d): %s (framed %lld)\n",
+					(double) (mono_msec_ticks () - mono_wasm_jit_start_ms) / 1000.0, wj_b4_q_windows, wj_b4_q_bodies, bd,
+					s - wj_b4_q_samples, win, noisy ? "GROWING, B4 holds" : "quiet", (long long) mono_wasm_jit_counters [WJC_B4_FRAMED]);
+			wj_b4_noisy = noisy; wj_b4_q_samples = s; wj_b4_q_bodies = bd; wj_b4_q_windows++;
+		}
+		return wj_b4_noisy;
+	}
+	return FALSE;
 }
 /* Read without synchronisation on every drainer early-out: is there planning or framing to do? */
 gint32 mono_wasm_jit_b4_due (void);

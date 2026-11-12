@@ -2079,6 +2079,12 @@ static __thread int wj_sp_out_local = -1;
 static __thread gboolean wj_sp_sync_on;
 static __thread guint32 wj_sp_sync_n;
 static __thread gboolean wj_sp_unset;
+/* MONO_WASM_JIT_SP_ELIDE: may this body drop a write of s.p that an earlier one dominates? Only where the local the
+ * writes read never changes value after its first use: an eager frame's refbase or a frameless method's parameter.
+ * A lazy frame's method re-bases mid-body, and a loop can carry a write made before the frame existed to a native
+ * call made after it. */
+static __thread gboolean wj_sp_elide_ok;
+static __thread guint32 wj_sp_elided_n;
 
 /* Give a JIT `f` functype its trailing frame-base parameter. For every type that names an `f` -- a method's own, a
  * direct call's, a devirt arm's or a delegate target's, a pool's -- BEFORE it is interned, hashed or compared, and for
@@ -2120,9 +2126,17 @@ wj_emit_sp_sync (WasmBuf *b)
 		wj_sp_unset = TRUE;
 		return;
 	}
+	/* A write this buffer made earlier, in a block still open, dominates this point, and nothing since can have
+	 * RAISED s.p: a native callee returns it as it found it, a JIT callee writes only values below this frame, and
+	 * `e` and the interp-entry trampoline restore what they found. So s.p is at or below this frame already. */
+	if (wj_sp_elide_ok && b->sp_synced > 0) {
+		wj_sp_elided_n++;
+		return;
+	}
 	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) wj_sp_out_local);
 	wasm_op (b, WASM_OP_GLOBAL_SET); wasm_uleb (b, 0);
 	wj_sp_sync_n++;
+	b->sp_synced = b->ctl_depth + 1;
 }
 
 /* --- the four call forms the emitter can leave behind --------------------------------------------
