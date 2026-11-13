@@ -866,6 +866,21 @@ int mono_wasm_jit_t2_max_body = 106496;
  * of Liftoff zone and 995 MiB of TurboFan's, SnbtGrammar.createParser (200,040 B) 463 and 333, and PartitionAlloc
  * never returns that address space (findings note "why the FO pack holds ~10 GiB"). Unmeasured as a knob. */
 int mono_wasm_jit_t1_max_body = 0;
+/* MONO_WASM_JIT_SPARSE_DISPATCH: 1 = a body in the dispatcher form (every method with clauses, and whatever the
+ * structured planner refuses) lists in its br_table only the blocks something dispatches to (the note at the table in
+ * mono_wasm_emit_method). d8 on captured bodies with the table's other entries pointed away (2026-11-12,
+ * runs/2026-11-12-fomem/d8, an upper bound: the rewrite also cut the handlers off): GlCommandEncoder.trySetup 21 of
+ * 1,009 labels dispatched to, TurboFan x86 223,600 -> 160,284 B, stores to frame slots 3,569 -> 688, loads 5,511 ->
+ * 2,589, compile 1,280 -> 462 ms, zone 200 -> 146 MB; Minecraft.runTick 4 of 469, 174,560 -> 143,272 B;
+ * ExpressionParser.expression 5 of 2,145, 403,308 -> 278,884 B, zone 1,043 -> 512 MB.
+ * In the game (2026-11-13, build 10, with MONO_WASM_JIT_COALESCE_BIG=5; findings note of 00:30 and the one after):
+ * 26.2 server tick, Q60, n=3 an arm interleaved, against the defaults: -3.7% cycles (93.03-93.37 against 95.06-98.88 M
+ * a tick), -6.7% instructions, -18.2% stores, all three ranges disjoint; COALESCE_BIG=5 alone -0.9% / 0.0% / -4.0%,
+ * overlapping. 262n: 1,051 dispatcher bodies, 5,505 of 79,495 labels in their tables, miss 0. V8 on the FO pack:
+ * TurboFan compiles of 64 MiB and more 19 -> 2, total TurboFan time 46 -> 30 s. Peak VmData with both: 262n 6,990 /
+ * 7,132 MiB (defaults 7,910), 262u with MONO_WASM_JIT_T1_MAX_BODY=180000 7,982 / 7,923 (9,964). jbox2d checksum holds
+ * (34 bodies, 143 of 1,552 labels). */
+int mono_wasm_jit_sparse_dispatch = 0;
 /* MONO_WASM_JIT_MAX_COMPILE_MB: a body whose compile V8 is estimated to need more than this many MiB for
  * (wj_compile_mem_estimate, fitted to V8's own figures) fails permanently, at either tier: a tier-2 body keeps its
  * tier-1 one, a tier-1 body is left to the interpreter. 0 = no such cap. It is the cap MONO_WASM_JIT_T2_MAX_BODY and
@@ -1191,6 +1206,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t1_max_body, "MONO_WASM_JIT_T1_MAX_BODY", 0, 64 * 1024 * 1024)
 	WJ_T2_KNOB (mono_wasm_jit_coalesce_big, "MONO_WASM_JIT_COALESCE_BIG", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_max_compile_mb, "MONO_WASM_JIT_MAX_COMPILE_MB", 0, 65536)
+	WJ_T2_KNOB (mono_wasm_jit_sparse_dispatch, "MONO_WASM_JIT_SPARSE_DISPATCH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_exc_pin, "MONO_WASM_JIT_EXC_PIN", 0, 1)

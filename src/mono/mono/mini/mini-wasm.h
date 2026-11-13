@@ -1487,6 +1487,10 @@ enum {
 	WJC_COALESCE_BIG_VERIFY_FAIL, /* ... and differed (must read 0) */
 	WJC_COMPILE_MEM_CAPPED,    /* bodies refused for exceeding MONO_WASM_JIT_MAX_COMPILE_MB by wj_compile_mem_estimate (ungated) */
 	WJC_COALESCE_BIG_EH,       /* MONO_WASM_JIT_COALESCE_BIG bit 4: methods with clauses that shared their block-local vregs' locals */
+	WJC_SPARSE_DISPATCH,         /* MONO_WASM_JIT_SPARSE_DISPATCH: dispatcher bodies emitted with the sparse table */
+	WJC_SPARSE_DISPATCH_LABELS,  /* ... their blocks */
+	WJC_SPARSE_DISPATCH_TARGETS, /* ... the blocks their tables hold */
+	WJC_SPARSE_DISPATCH_MISS,    /* ... compiles failed because a site dispatched to a block outside the table (must read 0) */
 	WJC_MAX
 };
 

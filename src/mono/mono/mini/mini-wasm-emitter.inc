@@ -1794,6 +1794,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int i, cnt [4] = { 0, 0, 0, 0 }, base [4], run [4] = { 0, 0, 0, 0 };
 	WasmLocalGroup groups [4];
 	int dispatch_idx = 0, N = 0;
+	int *disp_id = NULL, disp_n = 0;   /* MONO_WASM_JIT_SPARSE_DISPATCH: a block's index in the dispatcher's table, or -1 */
 	int scratch_idx G_GNUC_UNUSED = 0; /* i32 local holding the per-thread interp-residual scratch ptr */
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int spentry_idx = 0;               /* i32 local: C-stack SP at entry (exit/landing-pad restore target) */
@@ -4842,15 +4843,81 @@ co_ranges_done:
 	/* Outermost first, so the last one emitted (throw[0]) is innermost and depth N-i+t holds. */
 	for (i = nthrow - 1; i >= 0; --i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
 
+	/* MONO_WASM_JIT_SPARSE_DISPATCH: the dispatcher's br_table names only the blocks something dispatches to, and $blk
+	 * holds such a block's index IN THE TABLE (disp_id [bb], -1 for a block outside it) when it is written to dispatch.
+	 * A br_table edge makes its target a merge of the dispatcher's state with the fall-through, and V8 builds a Phi
+	 * there for every local assigned since (wasm/turboshaft-graph-interface.cc SetupControlFlowEdge / MaybePhi): with
+	 * every label in the table that is locals x labels phis, which keep those locals in frame slots and cost a move
+	 * at each merge. What dispatches: the entry; a GOTO to a block at or before the branching one; the landing pad
+	 * (to a clause's handler, whose table index goes into the EH table); OP_ENDFINALLY (to an OP_CALL_HANDLER's
+	 * continuation). The per-bb write of the block's own index in an EH method is not a dispatch: the landing pad
+	 * reads it, and every branch to the dispatcher writes $blk first. A value outside the table traps. */
+	{ extern int mono_wasm_jit_sparse_dispatch;
+	  if (mono_wasm_jit_sparse_dispatch && !skip_dispatch && N > 1) {
+		MonoBasicBlock *_b; MonoInst *_in; int _i = 0, _k;
+#define WJ_DISP_IDX(BB) (((BB) && (BB)->block_num >= 0 && (BB)->block_num <= (int) cfg->max_block_num) ? bbidx [(BB)->block_num] : -1)
+		disp_id = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * N);
+		for (_k = 0; _k < N; ++_k) disp_id [_k] = -1;
+		disp_id [0] = 0;
+		if (eh_table)
+			for (_k = 0; _k < eh_table->nclauses; ++_k) {
+				int _h = eh_table->clauses [_k].handler_bbidx;
+				if (_h >= 0 && _h < N) disp_id [_h] = 0;
+			}
+		for (_b = cfg->bb_entry; _b; _b = _b->next_bb, ++_i) {
+			for (_k = 0; _k < _b->out_count; ++_k) {
+				int _j = WJ_DISP_IDX (_b->out_bb [_k]);
+				if (_j >= 0 && _j <= _i) disp_id [_j] = 0;
+			}
+			MONO_BB_FOR_EACH_INS (_b, _in) {
+				int _j;
+				if (_in->opcode == OP_CALL_HANDLER) {
+					MonoInst *_nx = _in->next;
+					while (_nx && (_nx->opcode == OP_NOP || _nx->opcode == OP_IL_SEQ_POINT || _nx->opcode == OP_SEQ_POINT)) _nx = _nx->next;
+					if (_nx && _nx->opcode == OP_BR && (_j = WJ_DISP_IDX (_nx->inst_target_bb)) >= 0) disp_id [_j] = 0;
+					if ((_j = WJ_DISP_IDX (_in->inst_target_bb)) >= 0 && _j <= _i) disp_id [_j] = 0;
+				} else if (_in->opcode == OP_BR) {
+					if ((_j = WJ_DISP_IDX (_in->inst_target_bb)) >= 0 && _j <= _i) disp_id [_j] = 0;
+				} else if (MONO_IS_COND_BRANCH_OP (_in)) {
+					if ((_j = WJ_DISP_IDX (_in->inst_true_bb)) >= 0 && _j <= _i) disp_id [_j] = 0;
+					if ((_j = WJ_DISP_IDX (_in->inst_false_bb)) >= 0 && _j <= _i) disp_id [_j] = 0;
+				}
+			}
+		}
+#undef WJ_DISP_IDX
+		for (_k = 0; _k < N; ++_k)
+			if (disp_id [_k] == 0) disp_id [_k] = disp_n++;
+		if (eh_table)
+			for (_k = 0; _k < eh_table->nclauses; ++_k) {
+				int _h = eh_table->clauses [_k].handler_bbidx;
+				if (_h >= 0 && _h < N) eh_table->clauses [_k].handler_bbidx = disp_id [_h];
+			}
+		mono_wasm_jit_count (WJC_SPARSE_DISPATCH);
+		mono_wasm_jit_counters [WJC_SPARSE_DISPATCH_LABELS] += N;
+		mono_wasm_jit_counters [WJC_SPARSE_DISPATCH_TARGETS] += disp_n;
+	  } }
 	if (!skip_dispatch) {
 		wasm_op (&body, WASM_OP_LOOP); wasm_u8 (&body, 0x40);
 		for (i = 0; i < N; ++i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
-		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);
-		wasm_op (&body, WASM_OP_BR_TABLE);
-		wasm_uleb (&body, (guint32) N);
-		for (i = 0; i < N; ++i)
-			wasm_uleb (&body, (guint32) i);
-		wasm_uleb (&body, 0); /* default -> block 0 */
+		if (disp_id) {
+			/* one more block, innermost: the label of a $blk outside the table. Inside it block i is at depth i + 1. */
+			wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);
+			wasm_op (&body, WASM_OP_BR_TABLE);
+			wasm_uleb (&body, (guint32) disp_n);
+			for (i = 0; i < N; ++i)
+				if (disp_id [i] >= 0) wasm_uleb (&body, (guint32) (i + 1));
+			wasm_uleb (&body, 0);
+			wasm_op (&body, WASM_OP_END);
+			wasm_op (&body, WASM_OP_UNREACHABLE);
+		} else {
+			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);
+			wasm_op (&body, WASM_OP_BR_TABLE);
+			wasm_uleb (&body, (guint32) N);
+			for (i = 0; i < N; ++i)
+				wasm_uleb (&body, (guint32) i);
+			wasm_uleb (&body, 0); /* default -> block 0 */
+		}
 	} else if (structured_cfg_kind == WJ_CFG_FORWARD) {
 		/* One lexical label per bb. Closing the first label enters bb0; the remaining labels are
 		 * precisely the direct targets of forward edges. A one-bb leaf needs no label at all. */
@@ -4908,10 +4975,20 @@ co_ranges_done:
 			/* depth 0 at bb top level is the fallthrough edge: emitting nothing gets there. */ \
 			if (_d != 0) { wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) _d); } \
 		} else { \
-			wasm_i32_const (&body, _ti); \
+			int _tv = _ti; \
+			if (disp_id && (_tv = disp_id [_ti]) < 0) { WJ_DISP_MISS ("back edge"); } \
+			wasm_i32_const (&body, _tv); \
 			wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx); \
 			wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) (N - 1 - i + (EXTRA))); \
 		} \
+	} while (0)
+/* MONO_WASM_JIT_SPARSE_DISPATCH: a site is about to dispatch to a block the table does not hold. The compile fails
+ * (the body would trap there); the count must read 0. */
+#define WJ_DISP_MISS(WHAT) do { \
+		if (mono_wasm_jit_counters [WJC_SPARSE_DISPATCH_MISS] < 8) \
+			printf ("[wasm-jit sparse-dispatch] MISS (%s) bb %d of %d in %s\n", (WHAT), i, N, mname ? mname : "?"); \
+		mono_wasm_jit_count (WJC_SPARSE_DISPATCH_MISS); \
+		fail = "sparse dispatch: a target outside the table"; goto done; \
 	} while (0)
 
 /* Branch to the shared raise site for EXC_ID, consuming a "should throw" i32 already on the stack.
@@ -5259,6 +5336,7 @@ co_ranges_done:
 				if (!_nx || _nx->opcode != OP_BR || !_nx->inst_target_bb) { fail = "finally: complex call_handler continuation"; goto done; }
 				_cont = bbidx [_nx->inst_target_bb->block_num];
 				if (_cont < 0) { fail = "finally: bad continuation"; goto done; }
+				if (disp_id && (_cont = disp_id [_cont]) < 0) { WJ_DISP_MISS ("finally continuation"); }
 				wasm_i32_const (&body, _cont);
 				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) finally_ind_idx);
 				GOTO (ins->inst_target_bb, 0);
