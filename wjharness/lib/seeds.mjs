@@ -8,8 +8,9 @@
 //
 // Pick one with `--seed NAME` on a driver or `MC_SEED=NAME` (a name below, or a profile directory). The
 // default is `262n`, the performance target (2026-11-08; it was `mcsr` until then, so a run directory from before
-// that date without `--seed` measured 1.16.1). 26.2 has ONE seed: the modded packs (262u, 262b, 262p) and the
-// registry-race diagnostic (262d) were retired on 2026-11-08 to $WJ_STATE/retired/2026-11-08 (findings log).
+// that date without `--seed` measured 1.16.1). The modded packs (262u, 262b, 262p) and the registry-race diagnostic
+// (262d) were retired on 2026-11-08 to $WJ_STATE/retired/2026-11-08 (findings log); 262u (Fabulously Optimized) came
+// back on 2026-11-11 as a correctness workload, not a performance one.
 //
 // Per entry:
 //   dir         profile directory under $WJ_HOME/state/seeds
@@ -87,6 +88,23 @@ export const SEEDS = {
     dir: "seed-262n", version: "26.2", fabric: "0.19.5",
     what: "26.2 + Fabric 0.19.5, NO mods, the save set to peaceful, RD 12 (2026-11-06): the performance target",
     titleRx: /Created: \d+x\d+x\d+ minecraft:textures\/atlas\/shulker_boxes\.png-atlas/,
+    joinRx: /joined the game/,
+    genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
+    menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),
+    quitTabs: null,
+    benignRx: BENIGN_262,
+  },
+  /* A CORRECTNESS workload, not a performance one (2026-11-11): the user's own 26.2 OPFS export with Fabulously
+   * Optimized's 149 mods (Sodium 0.9.2, Iris with shaders off, Lithium, ModernFix, Ixeris, EMF/ETF, ImmediatelyFast,
+   * dynamic_fps, Kotlin, Controlify...), render distance 2, a survival save. Built 2026-10-19 by seedbuild for R509-R513
+   * (Sodium's 32 MB persistent staging buffer), retired 2026-11-08, restored 2026-11-11 to reproduce a gc-corrupt
+   * abort the user hit on this pack (findings log). Mixins on almost every class, Kotlin, Mixin's own ASM work and 149
+   * mods' class loading make it the widest IKVM / relink / GC surface the harness has. Fabulously Optimized turns
+   * ModernFix's measure_time off; RRLS logs "Overlay is removed!" when the loading overlay leaves. */
+  "262u": {
+    dir: "seed-262u", version: "26.2", fabric: "0.19.5",
+    what: "26.2 + Fabric, Fabulously Optimized (149 mods), RD 2, survival (2026-10-19 export): correctness, not perf",
+    titleRx: /Game took [\d.]+ seconds to start|Overlay is removed!/,
     joinRx: /joined the game/,
     genRx: /Preparing start region for dimension|Preparing spawn area: \d+%/,
     menu: keys("Tab Enter Tab Tab Enter", { Enter: 3500 }),

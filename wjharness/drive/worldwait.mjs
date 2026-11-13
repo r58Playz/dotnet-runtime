@@ -419,7 +419,9 @@ for (let i = 1; i <= RUNS; i++) {
        * when its duration expires and LOST if the browser is SIGKILLed first, so the run has to outlast
        * the trace. Run length otherwise varies with the server-settle wait (20-120 s), which makes a
        * fixed trace duration a coin flip. */
-      url, profile, logPath, benchMs: num("bench-ms", 5000), warmMs: num("warm-ms", 0), walk: false, saveQuit: false,   // --warm-ms was accepted and ignored before 2026-10-01
+      /* --walk (sprint + strafe through the window, mcdrive's WINDOW_JS) was accepted and ignored before 2026-11-11 */
+      url, profile, logPath, benchMs: num("bench-ms", 5000), warmMs: num("warm-ms", 0),
+      walk: args.includes("--walk") && !args.includes("--no-walk"), saveQuit: false,   // --warm-ms was accepted and ignored before 2026-10-01
       workerProbeCount: WORKER_PROBE,
       dumps: DUMPS,
       /* --expose-gc on BOTH arms: the page decides whether to call gc(), so the browser configuration is

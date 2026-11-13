@@ -109,13 +109,16 @@ wj deploy '<a string your change added>'                      # after build-dotn
 
 `--seed NAME` on any driver, or `MC_SEED`. **The default is `262n`, the performance target** (26.2 on Fabric Loader, no
 mods, peaceful; see CLAUDE.md). It became the default on 2026-11-08: a run before then without `--seed` measured `mcsr`.
-26.2 has one seed. The modded packs `262u`, `262b` and `262p` and the registry-race diagnostic `262d` were retired that
-day to `state/retired/2026-11-08/` (with the native stages `sa262d` and `fo262`); move one back into `state/seeds/` and
-restore its `lib/seeds.mjs` entry from git to use it. Profiles under `state/seeds/`:
+The modded packs `262u`, `262b` and `262p` and the registry-race diagnostic `262d` were retired that day to
+`state/retired/2026-11-08/` (with the native stages `sa262d` and `fo262`); `262u` (Fabulously Optimized) came back on
+2026-11-11 as a correctness workload. To use another, move it back into `state/seeds/` and restore its `lib/seeds.mjs`
+entry from git. Profiles under `state/seeds/`:
 
 | seed | profile | version | what |
 |---|---|---|---|
 | **`262n`** (default, target) | `seed-262n` | 26.2 + Fabric 0.19.5 | **no mods**; the user's 2026-10-21 "New World" save set to **peaceful** (it spawns at night), vanilla resource pack, vsync off, RD 12, OpenGL backend; built from `state/seeds/ikvmcraft-262n.tar`, and so is the native stage `sa262n` |
+| `262u` | `seed-262u` | 26.2 + Fabric 0.19.5 | **correctness, not performance**: Fabulously Optimized's 149 mods (Sodium, Iris, Lithium, ModernFix, EMF/ETF, ...), RD 2, survival; the user's 2026-10-19 export. The widest IKVM / relink / GC surface the harness has |
+| `262c` | `seed-262c` | 26.2 + Fabric 0.19.5 | no mods, creative; a datapack teleports along +X: continuous chunk loading (memory census) |
 | `mcsr` | `seed` | 1.16.1 + Fabric 0.19.3 | MCSR Ranked, "New World" pre-generated to the 83% knee: the 1.16.1 regression workload |
 | `165` | `seed-165` | 1.16.5 + 0.19.5 | 10 mods incl. Iris + BSL, RD 12 |
 

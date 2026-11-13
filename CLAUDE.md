@@ -6,10 +6,11 @@ workload is Minecraft under IKVM, and the goal is frame rate.
 
 **The performance target is Minecraft 26.2 with no mods, still launched through Fabric Loader (0.19.5)** (2026-11-07):
 seed `262n` on our side, stage `sa262n` for native HotSpot, both the same save set to peaceful. Both are the harness
-defaults (since 2026-11-08; a run before then without `--seed` measured 1.16.1). Optimize for it and quote it. 26.2
-has this one seed: the modded 26.2 packs were retired (`state/retired/2026-11-08`). 1.16.1 + Fabric + Sodium/Lithium
-(`--seed mcsr`) remains a correctness and regression workload, but a result on it does not transfer: 26.2's gap to
-HotSpot is wider on every counter (**Where we stand**), and its hot code is vanilla's, not Sodium's or Lithium's.
+defaults (since 2026-11-08; a run before then without `--seed` measured 1.16.1). Optimize for it and quote it. The
+correctness and regression workloads are 26.2 + Fabulously Optimized's 149 mods (`--seed 262u`, RD 2; restored
+2026-11-11 from `state/retired/2026-11-08`, where the other modded 26.2 packs stay) and 1.16.1 + Fabric +
+Sodium/Lithium (`--seed mcsr`). A performance result on either does not transfer: 26.2's gap to HotSpot is wider on
+every counter (**Where we stand**), and its hot code is vanilla's, not Sodium's or Lithium's.
 
 Read this before editing the backend or proposing a performance change. Most of it exists because a previous pass got
 it wrong at real cost. Round numbers (`R258`) point into the findings log, which holds the evidence and the history this
