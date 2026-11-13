@@ -879,15 +879,18 @@ int mono_wasm_jit_t1_max_body = 0;
  * overlapping. 262n: 1,051 dispatcher bodies, 5,505 of 79,495 labels in their tables, miss 0. V8 on the FO pack:
  * TurboFan compiles of 64 MiB and more 19 -> 2, total TurboFan time 46 -> 30 s. Peak VmData with both: 262n 6,990 /
  * 7,132 MiB (defaults 7,910), 262u with MONO_WASM_JIT_T1_MAX_BODY=180000 7,982 / 7,923 (9,964). jbox2d checksum holds
- * (34 bodies, 143 of 1,552 labels). */
-int mono_wasm_jit_sparse_dispatch = 0;
+ * (34 bodies, 143 of 1,552 labels). 1 since 2026-11-13, with MONO_WASM_JIT_COALESCE_BIG=5: 14 runs with both on
+ * (262n, 262u, mcsr) without a fault, mcsr's peak 6,534 / 6,536 MiB against 7,490. */
+int mono_wasm_jit_sparse_dispatch = 1;
 /* MONO_WASM_JIT_MAX_COMPILE_MB: a body whose compile V8 is estimated to need more than this many MiB for
  * (wj_compile_mem_estimate, fitted to V8's own figures) fails permanently, at either tier: a tier-2 body keeps its
  * tier-1 one, a tier-1 body is left to the interpreter. 0 = no such cap. It is the cap MONO_WASM_JIT_T2_MAX_BODY and
  * MONO_WASM_JIT_T1_MAX_BODY approximate by bytes. FO pack (262u, 2026-11-12, one run an arm): 256 refused
  * ExpressionParser.expression and LayerDefinitions.createRoots, peak VmData 10,061 -> 9,422 MiB and the boot marks
  * did not move; with MONO_WASM_JIT_COALESCE_BIG=1 8,622. The estimate's limits are at wj_compile_mem_estimate: under
- * COALESCE_BIG bit 4 it refuses nothing at 256 and is not a reason to raise the tier-2 byte cap. */
+ * COALESCE_BIG bit 4 it refuses nothing at 256 and is not a reason to raise the tier-2 byte cap. With the defaults of
+ * 2026-11-13 (COALESCE_BIG=5, SPARSE_DISPATCH) neither this nor MONO_WASM_JIT_T1_MAX_BODY buys the FO pack anything:
+ * 7,998 / 7,925 MiB without a cap, 7,982 / 7,923 / 8,177 with T1_MAX_BODY=180000. */
 int mono_wasm_jit_max_compile_mb = 0;
 /* MONO_WASM_JIT_COALESCE_BIG, bits. 1: the local coalescer also runs on a method past its dataflow bound (nbb x nvreg /
  * 32 > 65,536 words), through wj_coalesce_ranges_big, and its slot allocator reuses slots past its 256-slot scan.
@@ -899,8 +902,12 @@ int mono_wasm_jit_max_compile_mb = 0;
  * FO pack (262u, 2026-11-12, one run an arm, all verdict ok): peak VmData 10,061 MiB at 0, 8,971 / 8,979 / 9,143 at
  * 7 / 5 / 5; Liftoff compiles of 64 MiB and more 31 -> 0 (largest 445 -> 62 MiB), TurboFan's 25 -> 19 (it does not
  * follow the locals in a body with clauses). Bit 2 over that run: 34,845 methods compared, 0 differing; 31 methods
- * took the big path, 1,433 the clause path. jbox2d checksum holds at 7. Not measured: the tick, a fault rate. */
-int mono_wasm_jit_coalesce_big = 0;
+ * took the big path, 1,433 the clause path. jbox2d checksum holds at 7. Alone it does not move the tick, and in a
+ * dispatcher body shared locals make TurboFan's code BIGGER (every one differs at every label: trySetup 223,600 ->
+ * 281,916 B), so bit 4 goes with MONO_WASM_JIT_SPARSE_DISPATCH, where the numbers for the pair are. 5 since
+ * 2026-11-13. Bit 4 has no reference to be checked against the way bit 2 checks bit 1: what stands behind it is the
+ * `pin` argument and the runs. */
+int mono_wasm_jit_coalesce_big = 5;
 /* MONO_WASM_JIT_EH_REC (R353): an EH method keeps its IL_STATE LMFExt in a record inside its OWN C-stack frame and
  * links/unlinks it inline, instead of calling mono_wasm_jit_enter_island / leave_island (interp.c, WjEhRec). p75, b t t b
  * on the Minecraft server tick: the island helpers 2.98 -> 0.08 M instr/tick, all instructions -3.6%, calls -9.6%;
