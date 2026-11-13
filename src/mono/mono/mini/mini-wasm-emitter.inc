@@ -1518,6 +1518,213 @@ wj_compile_mem_estimate (guint32 bytes, guint32 locals, guint32 ctl, guint32 loo
 	return liftoff > turbofan ? liftoff : turbofan;
 }
 
+/* Is `op`'s dreg the BASE of a store -- an address it reads -- rather than a value it writes? */
+static inline gboolean
+wj_op_dreg_is_base (int op)
+{
+	switch (op) {
+	case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
+	case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG:
+	case OP_STORER8_MEMBASE_REG:
+	case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM:
+	case OP_STOREI2_MEMBASE_IMM:
+	case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:
+	case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+	case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:
+	case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+/* The bound of wj_nce_flow's two bitsets, in words each (4 MiB). */
+#define WJ_NCE_MAX_WORDS 1048576
+
+/* MONO_WASM_JIT_NCE_FLOW bit 2: which vregs are proven non-null at the ENTRY of each block.
+ *
+ * A forward must-analysis over the emitter's own facts: a vreg is non-null after OP_NOT_NULL, OP_CHECK_THIS or the
+ * null-check pair (OP_COMPARE_IMM 0 + OP_COND_EXC_EQ "NullReferenceException"), an OP_MOVE carries its source's fact,
+ * and any other write of the vreg forgets it -- the rules the emitter applies inside one block, replayed here.
+ * in [b] is what EVERY predecessor ends with. It starts from "everything" and only loses facts, so a loop keeps what
+ * its body does not write.
+ * A block that can be entered by anything the CFG does not show starts with nothing (`reset`): the entry, a clause's
+ * handler, an OP_CALL_HANDLER continuation (the finally ran in between), a block with no predecessor, and a block no
+ * reset block reaches. That is what makes this sound with clauses, which the deleted dominator mode was not.
+ * It must never claim more than the emitter establishes: instructions after a block's terminator generate nothing
+ * here (the emitter skips them), and the receiver check of a virtual call and a frame-slot address are left out.
+ * Only vregs a check can ask about are carried (dense index `cv`), with what an OP_MOVE copies into them.
+ * Returns the in-sets, N x *out_cwords words, or NULL (nothing to carry, past WJ_NCE_MAX_WORDS, or no fixpoint). */
+static guint32 *
+wj_nce_flow (MonoCompile *cfg, const int *bbidx, int N, int nvreg, const int *addrslot, guint8 *reset,
+	gboolean keep_base, int **out_cv, int *out_nc, int *out_cwords)
+{
+	guint8 *cand = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
+	int *cidx, *cv;
+	guint32 *in, *out, *st;
+	int nc = 0, cw, i, k, w, iter, changed = 1;
+	MonoBasicBlock *bb; MonoInst *ins;
+
+#define WJ_NCE_OK(V) ((V) >= 0 && (V) < nvreg && !(addrslot && addrslot [(V)] != -1))
+#define WJ_NCE_IDX(BB) (((BB) && (BB)->block_num >= 0 && (BB)->block_num <= (int) cfg->max_block_num) ? bbidx [(BB)->block_num] : -1)
+	/* what a check can ask about */
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+		MONO_BB_FOR_EACH_INS (bb, ins) {
+			switch (ins->opcode) {
+			case OP_NOT_NULL: case OP_CHECK_THIS:
+				if (WJ_NCE_OK (ins->sreg1)) cand [ins->sreg1] = 1;
+				break;
+			case OP_COMPARE_IMM: case OP_ICOMPARE_IMM:
+				if ((gint32) ins->inst_imm == 0 && WJ_NCE_OK (ins->sreg1)) cand [ins->sreg1] = 1;
+				break;
+			default:
+				if (MONO_IS_CALL (ins)) {
+					MonoCallInst *cl = (MonoCallInst *) ins;
+					if (cl->call_info) {
+						int a = wj_arg_vreg (cl, 0);
+						if (WJ_NCE_OK (a)) cand [a] = 1;
+					}
+				}
+				break;
+			}
+		}
+	}
+	/* ... and what an OP_MOVE copies into those (a chain longer than the passes below just loses its fact) */
+	for (iter = 0; iter < 8 && changed; ++iter) {
+		changed = 0;
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+			MONO_BB_FOR_EACH_INS (bb, ins) {
+				if (ins->opcode == OP_MOVE && WJ_NCE_OK (ins->dreg) && cand [ins->dreg] &&
+				    WJ_NCE_OK (ins->sreg1) && !cand [ins->sreg1]) {
+					cand [ins->sreg1] = 1;
+					changed = 1;
+				}
+			}
+		}
+	}
+	cidx = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+	for (i = 0; i < nvreg; ++i)
+		cidx [i] = cand [i] ? nc++ : -1;
+	if (nc == 0)
+		return NULL;
+	cw = (nc + 31) / 32;
+	if ((gsize) N * cw > WJ_NCE_MAX_WORDS) {
+		mono_wasm_jit_count (WJC_NCE_FLOW_SKIPPED);
+		return NULL;
+	}
+	cv = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nc);
+	for (i = 0; i < nvreg; ++i)
+		if (cidx [i] >= 0) cv [cidx [i]] = i;
+
+	/* a block nothing marked reaches is entered by something this does not see, or by nothing: it starts empty too */
+	{
+		guint8 *reach = (guint8 *) mono_mempool_alloc0 (cfg->mempool, N);
+		int again = 1;
+		for (i = 0; i < N; ++i) reach [i] = reset [i];
+		while (again) {
+			again = 0; i = 0;
+			for (bb = cfg->bb_entry; bb && i < N; bb = bb->next_bb, ++i) {
+				if (!reach [i]) continue;
+				for (k = 0; k < bb->out_count; ++k) {
+					int j = WJ_NCE_IDX (bb->out_bb [k]);
+					if (j >= 0 && j < N && !reach [j]) { reach [j] = 1; if (j < i) again = 1; }
+				}
+			}
+		}
+		for (i = 0; i < N; ++i)
+			if (!reach [i]) reset [i] = 1;
+	}
+
+	in  = (guint32 *) mono_mempool_alloc (cfg->mempool, sizeof (guint32) * (gsize) N * cw);
+	out = (guint32 *) mono_mempool_alloc (cfg->mempool, sizeof (guint32) * (gsize) N * cw);
+	st  = (guint32 *) mono_mempool_alloc (cfg->mempool, sizeof (guint32) * cw);
+	memset (out, 0xff, sizeof (guint32) * (gsize) N * cw);
+	memset (in, 0, sizeof (guint32) * (gsize) N * cw);
+#define WJ_NCE_BIT(V) (cidx [(V)])
+#define WJ_NCE_GET(V) ((st [WJ_NCE_BIT (V) >> 5] >> (WJ_NCE_BIT (V) & 31)) & 1u)
+#define WJ_NCE_SET(V) do { st [WJ_NCE_BIT (V) >> 5] |= 1u << (WJ_NCE_BIT (V) & 31); } while (0)
+#define WJ_NCE_CLR(V) do { st [WJ_NCE_BIT (V) >> 5] &= ~(1u << (WJ_NCE_BIT (V) & 31)); } while (0)
+#define WJ_NCE_TRK(V) ((V) >= 0 && (V) < nvreg && cidx [(V)] >= 0)
+	changed = 1;
+	for (iter = 0; changed && iter < N + 8; ++iter) {
+		changed = 0; i = 0;
+		for (bb = cfg->bb_entry; bb && i < N; bb = bb->next_bb, ++i) {
+			guint32 *bo = out + (gsize) i * cw;
+			gboolean term = FALSE, cmp_null = FALSE;
+			int cmp_a = -1;
+			/* meet */
+			if (reset [i] || bb->in_count == 0) {
+				memset (st, 0, sizeof (guint32) * cw);
+			} else {
+				memset (st, 0xff, sizeof (guint32) * cw);
+				for (k = 0; k < bb->in_count; ++k) {
+					int pi = WJ_NCE_IDX (bb->in_bb [k]);
+					if (pi < 0 || pi >= N) { memset (st, 0, sizeof (guint32) * cw); break; }
+					for (w = 0; w < cw; ++w) st [w] &= out [(gsize) pi * cw + w];
+				}
+			}
+			memcpy (in + (gsize) i * cw, st, sizeof (guint32) * cw);
+			/* transfer: the emitter's kill point, then its generators, in its order */
+			MONO_BB_FOR_EACH_INS (bb, ins) {
+				int d = ins->dreg, s1 = ins->sreg1;
+				gboolean mv = ins->opcode == OP_MOVE && WJ_NCE_TRK (s1) && WJ_NCE_GET (s1);
+				if (!(keep_base && wj_op_dreg_is_base (ins->opcode))) {
+					if (WJ_NCE_TRK (d)) WJ_NCE_CLR (d);
+					if (d >= 0 && d == cmp_a) cmp_null = FALSE;
+				}
+				if (mv && WJ_NCE_TRK (d)) WJ_NCE_SET (d);
+				switch (ins->opcode) {
+				case OP_COMPARE_IMM: case OP_ICOMPARE_IMM:
+					cmp_a = s1; cmp_null = (gint32) ins->inst_imm == 0;
+					break;
+				case OP_COMPARE: case OP_ICOMPARE: case OP_LCOMPARE: case OP_LCOMPARE_IMM:
+				case OP_FCOMPARE: case OP_RCOMPARE:
+					cmp_a = -1; cmp_null = FALSE;
+					break;
+				case OP_NOT_NULL: case OP_CHECK_THIS:
+					if (!term && WJ_NCE_TRK (s1)) WJ_NCE_SET (s1);
+					break;
+				case OP_COND_EXC_EQ: case OP_COND_EXC_IEQ:
+					if (!term && cmp_null && WJ_NCE_TRK (cmp_a) && wj_exc_id_for_name ((const char *) ins->inst_p1) == 4)
+						WJ_NCE_SET (cmp_a);
+					break;
+				case OP_SETRET:
+					if (cfg->ret && s1 != cfg->ret->dreg) {
+						int r = cfg->ret->dreg;
+						if (WJ_NCE_TRK (r)) WJ_NCE_CLR (r);
+						if (r == cmp_a) cmp_null = FALSE;
+					}
+					break;
+				case OP_BR: case OP_SWITCH: case OP_CALL_HANDLER: case OP_ENDFINALLY: case OP_ENDFILTER:
+				case OP_THROW: case OP_RETHROW: case OP_NOT_REACHED:
+					term = TRUE;
+					break;
+				default:
+					if (MONO_IS_COND_BRANCH_OP (ins)) term = TRUE;
+					break;
+				}
+			}
+			if (memcmp (bo, st, sizeof (guint32) * cw)) {
+				memcpy (bo, st, sizeof (guint32) * cw);
+				changed = 1;
+			}
+		}
+	}
+#undef WJ_NCE_BIT
+#undef WJ_NCE_GET
+#undef WJ_NCE_SET
+#undef WJ_NCE_CLR
+#undef WJ_NCE_TRK
+#undef WJ_NCE_OK
+#undef WJ_NCE_IDX
+	if (changed) {
+		mono_wasm_jit_count (WJC_NCE_FLOW_SKIPPED);
+		return NULL;
+	}
+	*out_cv = cv; *out_nc = nc; *out_cwords = cw;
+	return in;
+}
+
 /* MONO_WASM_JIT_COALESCE_BIG: the heap the slot allocator falls back on past its 256-slot scan. It holds the slots
  * from 256 up, the one whose occupant ends first (key []) on top. */
 static void
@@ -1795,6 +2002,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	WasmLocalGroup groups [4];
 	int dispatch_idx = 0, N = 0;
 	int *disp_id = NULL, disp_n = 0;   /* MONO_WASM_JIT_SPARSE_DISPATCH: a block's index in the dispatcher's table, or -1 */
+	guint32 *nce_in = NULL; int *nce_cv = NULL, nce_nc = 0, nce_cw = 0;   /* MONO_WASM_JIT_NCE_FLOW: wj_nce_flow's in-sets */
 	int scratch_idx G_GNUC_UNUSED = 0; /* i32 local holding the per-thread interp-residual scratch ptr */
 	int refbase_idx = 0, rtmp_idx = 0; /* i32 locals: ref-frame base addr + scratch for ref stores */
 	int spentry_idx = 0;               /* i32 local: C-stack SP at entry (exit/landing-pad restore target) */
@@ -4193,6 +4401,29 @@ co_ranges_done:
 #define NN_GET(VR)  (NN_OK (VR) && nn [(VR)])
 #define NN_SET(VR)  do { if (NN_OK (VR)) nn [(VR)] = 1; } while (0)
 #define NN_KILL(VR) do { if ((nn) && (VR) >= 0 && (VR) < nvreg) nn [(VR)] = 0; } while (0)
+/* The census of null checks, by site: emitted, dropped on a fact of the same block, dropped on one that came in
+ * (MONO_WASM_JIT_NCE_FLOW bit 2); tier 2's apart. Bit 4 (the gate for bit 2): a check dropped on a fact that came in is
+ * replaced by a test that reports a null there -- `[wasm-jit nce] VIOLATION`, which must never print. */
+#define WJ_NCE_CHECK() do { mono_wasm_jit_count (WJC_NCE_CHECKS); if (cfg->wasm_jit_tier >= 2) mono_wasm_jit_count (WJC_NCE_T2_CHECKS); } while (0)
+#define WJ_NCE_ELIDE(VR) do { \
+		gboolean _fl = nn [(VR)] == 2; \
+		mono_wasm_jit_count (_fl ? WJC_NCE_ELIDED_FLOW : WJC_NCE_ELIDED_LOCAL); \
+		if (cfg->wasm_jit_tier >= 2) mono_wasm_jit_count (_fl ? WJC_NCE_T2_ELIDED_FLOW : WJC_NCE_T2_ELIDED_LOCAL); \
+		if (_fl && G_UNLIKELY (mono_wasm_jit_nce_flow & 4)) { \
+			WasmFuncType _vt; int _vti = -1, _vk; \
+			extern void mono_wasm_jit_nce_violation (const char *where); \
+			memset (&_vt, 0, sizeof _vt); _vt.nparams = 1; _vt.params [0] = WASM_I32; _vt.ret = WASM_VOID; \
+			for (_vk = 0; _vk < nextra; ++_vk) if (functype_eq (&extra_types [_vk], &_vt)) { _vti = ti_base + _vk; break; } \
+			if (_vti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _vt; _vti = ti_base + nextra++; } \
+			uses_calls = TRUE; \
+			if (!wasm_ld (&body, &lc, (VR))) { fail = "nce verify"; goto done; } \
+			wasm_op (&body, WASM_OP_I32_EQZ); \
+			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+			wasm_i32_const (&body, (gint32) (intptr_t) g_strdup_printf ("%s vreg %d bb %d", mname ? mname : "?", (int) (VR), i)); \
+			wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_nce_violation, (guint32) _vti); \
+			wasm_op (&body, WASM_OP_END); \
+		} \
+	} while (0)
 
 	/* dense bb indexing for the dispatch table */
 	bbidx = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * ((int) cfg->max_block_num + 1));
@@ -4843,6 +5074,34 @@ co_ranges_done:
 	/* Outermost first, so the last one emitted (throw[0]) is innermost and depth N-i+t holds. */
 	for (i = nthrow - 1; i >= 0; --i) { wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); }
 
+	/* MONO_WASM_JIT_NCE_FLOW bit 2: the non-null facts each block starts with (wj_nce_flow). Here because the EH table is
+	 * complete and its handler_bbidx still are block indices (the sparse dispatcher renumbers them below). */
+	if ((mono_wasm_jit_nce_flow & 2) && nn && N > 1) {
+		guint8 *nce_reset = (guint8 *) mono_mempool_alloc0 (cfg->mempool, N);
+		MonoBasicBlock *_b; MonoInst *_in; int _i = 0, _k;
+		nce_reset [0] = 1;
+		if (eh_table)
+			for (_k = 0; _k < eh_table->nclauses; ++_k) {
+				int _h = eh_table->clauses [_k].handler_bbidx;
+				if (_h >= 0 && _h < N) nce_reset [_h] = 1;
+			}
+		for (_b = cfg->bb_entry; _b && _i < N; _b = _b->next_bb, ++_i) {
+			if (_b->flags & BB_EXCEPTION_HANDLER) nce_reset [_i] = 1;
+			MONO_BB_FOR_EACH_INS (_b, _in) {
+				if (_in->opcode == OP_CALL_HANDLER) {
+					MonoInst *_nx = _in->next; int _j;
+					while (_nx && (_nx->opcode == OP_NOP || _nx->opcode == OP_IL_SEQ_POINT || _nx->opcode == OP_SEQ_POINT)) _nx = _nx->next;
+					if (_nx && _nx->opcode == OP_BR && _nx->inst_target_bb && _nx->inst_target_bb->block_num >= 0 &&
+					    _nx->inst_target_bb->block_num <= (int) cfg->max_block_num &&
+					    (_j = bbidx [_nx->inst_target_bb->block_num]) >= 0 && _j < N)
+						nce_reset [_j] = 1;
+				}
+			}
+		}
+		nce_in = wj_nce_flow (cfg, bbidx, N, nvreg, lc.addrslot, nce_reset, (mono_wasm_jit_nce_flow & 1) != 0,
+			&nce_cv, &nce_nc, &nce_cw);
+		if (nce_in) mono_wasm_jit_count (WJC_NCE_FLOW_BODIES);
+	}
 	/* MONO_WASM_JIT_SPARSE_DISPATCH: the dispatcher's br_table names only the blocks something dispatches to, and $blk
 	 * holds such a block's index IN THE TABLE (disp_id [bb], -1 for a block outside it) when it is written to dispatch.
 	 * A br_table edge makes its target a merge of the dispatcher's state with the fall-through, and V8 builds a Phi
@@ -5132,6 +5391,18 @@ co_ranges_done:
 		if (nn) {
 			if (nn_in && i < N && nn_in [i]) memcpy (nn, nn_in [i], (gsize) nvreg);
 			else memset (nn, 0, (gsize) nvreg);
+			/* MONO_WASM_JIT_NCE_FLOW bit 2: what every predecessor proved (2 = a fact that came in, for the census) */
+			if (nce_in && i < N) {
+				const guint32 *_ni = nce_in + (gsize) i * nce_cw; int _w;
+				for (_w = 0; _w < nce_cw; ++_w) {
+					guint32 _bits = _ni [_w];
+					while (_bits) {
+						int _c = _w * 32 + __builtin_ctz (_bits);
+						_bits &= _bits - 1;
+						if (_c < nce_nc) nn [nce_cv [_c]] = 2;
+					}
+				}
+			}
 		}
 
 		/* LCSE: inherit the load table only across a single-predecessor edge from an already-emitted
@@ -5257,9 +5528,12 @@ co_ranges_done:
 			 * An OP_MOVE carries the fact across, which is what keeps a receiver proven after the
 			 * copies mini's call-arg setup inserts -- captured before the kill so dreg == sreg1 is safe. */
 			if (G_UNLIKELY (nn != NULL)) {
-				gboolean nn_move = (ins->opcode == OP_MOVE) && NN_GET (ins->sreg1);
-				NN_KILL (ins->dreg);
-				if (nn_move) NN_SET (ins->dreg);
+				guint8 nn_move = (ins->opcode == OP_MOVE && NN_OK (ins->sreg1)) ? nn [ins->sreg1] : 0;
+				/* MONO_WASM_JIT_NCE_FLOW bit 1: a store through a base does not write the base. Without it every
+				 * field store forgot its object, and the next access to the same object checked it again. */
+				if (!((mono_wasm_jit_nce_flow & 1) && wj_op_dreg_is_base (ins->opcode)))
+					NN_KILL (ins->dreg);
+				if (nn_move && NN_OK (ins->dreg)) nn [ins->dreg] = nn_move;
 			}
 			/* LCSE kill point, same placement and for the same reason as NCE's: the instruction's own
 			 * sources must still resolve against the pre-def state. A copy additionally carries the
@@ -6166,8 +6440,9 @@ co_ranges_done:
 				 * corrupts low memory; and EH methods now compile, so a null this/deref inside
 				 * a try must reach managed EH/finally rather than `unreachable`. Hot path = ld + eqz + not-taken
 				 * branch; cold path raises NRE (exc_id 4) then C++-unwinds (cppeh) or bails to interp resume-state. */
-				if (NN_GET (ins->sreg1)) break;   /* NCE: already proven non-null earlier in this bb */
+				if (NN_GET (ins->sreg1)) { WJ_NCE_ELIDE (ins->sreg1); break; }   /* NCE: already proven non-null */
 				NN_SET (ins->sreg1);              /* past this point it cannot be null */
+				WJ_NCE_CHECK ();
 				if (!WJ_HAS_THROW (4)) { fail = "no shared throw block for NRE"; goto done; }
 				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "nullchk sreg"; goto done; }
 				wasm_op (&body, WASM_OP_I32_EQZ);
@@ -6570,8 +6845,9 @@ co_ranges_done:
 				 * about those conditions. */
 				if (exc_id == 4 && cmp_imm_mode && !cmp_i64 && cmp_imm == 0 &&
 				    (ins->opcode == OP_COND_EXC_EQ || ins->opcode == OP_COND_EXC_IEQ)) {
-					if (NN_GET (cmp_a)) break;
+					if (NN_GET (cmp_a)) { WJ_NCE_ELIDE (cmp_a); break; }
 					NN_SET (cmp_a);
+					WJ_NCE_CHECK ();
 				}
 				if (!WJ_HAS_THROW (exc_id)) { fail = "no shared throw block for exc"; goto done; }
 				if (!wasm_ld (&body, &lc, cmp_a)) { fail = "cond_exc a"; goto done; }
@@ -7737,8 +8013,9 @@ co_ranges_done:
 						 * nearly every callvirt, so this block is usually a pure duplicate of a test
 						 * that ran a few instructions ago. Skip it when the receiver is already proven;
 						 * otherwise emit it and record the proof for the rest of the bb. */
-						if (NN_GET (this_vr)) goto vcall_nullchk_done;
+						if (NN_GET (this_vr)) { WJ_NCE_ELIDE (this_vr); goto vcall_nullchk_done; }
 						NN_SET (this_vr);
+						WJ_NCE_CHECK ();
 						{
 							if (!WJ_HAS_THROW (4)) { fail = "no shared throw block for NRE"; goto done; }
 							if (!wasm_ld (&body, &lc, this_vr)) { fail = "vcall nullchk this"; goto done; }
@@ -9674,6 +9951,8 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 #undef NN_GET
 #undef NN_SET
 #undef NN_KILL
+#undef WJ_NCE_CHECK
+#undef WJ_NCE_ELIDE
 #undef BIN
 #undef BINI32
 #undef BINI64

@@ -1491,6 +1491,14 @@ enum {
 	WJC_SPARSE_DISPATCH_LABELS,  /* ... their blocks */
 	WJC_SPARSE_DISPATCH_TARGETS, /* ... the blocks their tables hold */
 	WJC_SPARSE_DISPATCH_MISS,    /* ... compiles failed because a site dispatched to a block outside the table (must read 0) */
+	WJC_NCE_CHECKS,              /* null-check sites emitted (the three kinds NCE knows), all tiers */
+	WJC_NCE_ELIDED_LOCAL,        /* ... dropped on a fact established earlier in the same block */
+	WJC_NCE_ELIDED_FLOW,         /* ... dropped on a fact every predecessor proved (MONO_WASM_JIT_NCE_FLOW bit 2) */
+	WJC_NCE_T2_CHECKS,           /* the same three, tier-2 bodies only */
+	WJC_NCE_T2_ELIDED_LOCAL,
+	WJC_NCE_T2_ELIDED_FLOW,
+	WJC_NCE_FLOW_BODIES,         /* bodies wj_nce_flow gave in-sets */
+	WJC_NCE_FLOW_SKIPPED,        /* ... it gave up on (its bitsets past WJ_NCE_MAX_WORDS, or no fixpoint) */
 	WJC_MAX
 };
 

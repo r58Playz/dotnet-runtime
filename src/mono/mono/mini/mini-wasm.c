@@ -866,6 +866,27 @@ int mono_wasm_jit_t2_max_body = 106496;
  * of Liftoff zone and 995 MiB of TurboFan's, SnbtGrammar.createParser (200,040 B) 463 and 333, and PartitionAlloc
  * never returns that address space (findings note "why the FO pack holds ~10 GiB"). Unmeasured as a knob. */
 int mono_wasm_jit_t1_max_body = 0;
+/* MONO_WASM_JIT_NCE_FLOW, bits (null-check elimination past what MONO_WASM_JIT_NCE does inside one block). 1: a store
+ * through a base no longer forgets that the base is non-null. 2: each block starts with the facts every predecessor
+ * ends with (wj_nce_flow, a forward must-analysis; blocks entered by something the CFG does not show start empty, so
+ * it holds in methods with clauses). 4: the gate for 2 -- a check dropped on an incoming fact is replaced by a test
+ * that reports a null (`[wasm-jit nce] VIOLATION`, must never print). The deleted dominator mode carried only
+ * never-written vregs in clause-free methods and was measured on jbox2d alone.
+ * 26.2 (2026-11-13, build 12): at 3, 32% of tier 2's null-check sites are dropped on an incoming fact (16,434 of
+ * 52,005; 17% more on a same-block one), bit 4 reports no null over jbox2d, 262n, 262u and mcsr -- and the server tick
+ * does not move: Q60, n=3 an arm interleaved, cycles -0.3%, instructions -0.2%, overlapping. V8 already folds a branch
+ * whose condition a dominating branch tested (compiler/turboshaft/wasm-optimize-phase.cc: BranchEliminationReducer
+ * with ValueNumberingReducer), so a repeated `v == 0` on the same value costs wire bytes, not instructions. Stays 0:
+ * an instrument (the census) and a byte saver, not a speed lever. */
+int mono_wasm_jit_nce_flow = 0;
+gint32 mono_wasm_jit_nce_violations;
+void mono_wasm_jit_nce_violation (const char *where);
+void
+mono_wasm_jit_nce_violation (const char *where)
+{
+	if (mono_atomic_inc_i32 (&mono_wasm_jit_nce_violations) <= 16)
+		printf ("[wasm-jit nce] VIOLATION: null where every predecessor proved non-null: %s\n", where ? where : "?");
+}
 /* MONO_WASM_JIT_SPARSE_DISPATCH: 1 = a body in the dispatcher form (every method with clauses, and whatever the
  * structured planner refuses) lists in its br_table only the blocks something dispatches to (the note at the table in
  * mono_wasm_emit_method). d8 on captured bodies with the table's other entries pointed away (2026-11-12,
@@ -1214,6 +1235,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_coalesce_big, "MONO_WASM_JIT_COALESCE_BIG", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_max_compile_mb, "MONO_WASM_JIT_MAX_COMPILE_MB", 0, 65536)
 	WJ_T2_KNOB (mono_wasm_jit_sparse_dispatch, "MONO_WASM_JIT_SPARSE_DISPATCH", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_nce_flow, "MONO_WASM_JIT_NCE_FLOW", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_exc_pin, "MONO_WASM_JIT_EXC_PIN", 0, 1)
