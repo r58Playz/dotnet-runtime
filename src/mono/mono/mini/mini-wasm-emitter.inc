@@ -1490,6 +1490,256 @@ wj_t2u_census (MonoMethod *root, WjBody *b)
 }
 #endif
 
+/* What V8 will allocate to compile one function, in bytes: the larger of its two tiers' zones, ESTIMATED. Liftoff keeps
+ * a CacheState per Control and per landing pad with a slot per local (wasm/baseline/liftoff-compiler.cc), so its zone
+ * follows locals x structure. Coefficients are a non-negative least-squares fit of V8's own figures
+ * (--trace-wasm-compilation-times, Chromium 156) against the bodies of one FO-pack run with one local per vreg
+ * (2026-11-12, runs/2026-11-12-fomem u8c, zonefit.py): Liftoff 5,133 compiles, R^2 0.978, the compiles of 16 MiB and
+ * more predicted within 0.82-1.27x (10th-90th percentile); TurboFan 3,003 compiles, R^2 0.902, 0.62-1.27x.
+ * WHAT IT DOES NOT HOLD (same date, findings note "build 9"):
+ *  - the TurboFan terms were fitted where locals and size moved together. With MONO_WASM_JIT_COALESCE_BIG the locals
+ *    fall 5-50x and TurboFan's zone for a body in a try barely moves (ExpressionParser.expression 995 -> 775 MiB at
+ *    4,820 -> 892 locals; the 85-92 KB bodies still 180-265 MiB), so there this reads ~10x low. Do not raise
+ *    MONO_WASM_JIT_T2_MAX_BODY on its word: 256 KB with nothing refused cost the FO pack +970 MiB.
+ *  - `ctl` and `calls` are counted in the relocatable body. The serializer writes a virtual site's blocks, and every
+ *    call, while it frames the function in a buffer of its own, so about half of a big body's control structures and
+ *    all of its calls are missing (the `out` counts added at the cap site read 0).
+ *   bytes   the module V8 compiles;  locals  declared locals;  ctl / loops / calls  WasmBuf.n_ctl / n_loop / n_call;
+ *   eh  the body sits in a try_table. */
+static guint64
+wj_compile_mem_estimate (guint32 bytes, guint32 locals, guint32 ctl, guint32 loops, guint32 calls, gboolean eh,
+	guint64 *out_liftoff, guint64 *out_turbofan)
+{
+	guint64 lc = (guint64) locals * ctl, ln = eh ? (guint64) locals * calls : 0, ll = (guint64) locals * loops;
+	guint64 liftoff = 19 * (guint64) bytes + (97 * lc + 105 * ln) / 10;
+	guint64 turbofan = 205 * (guint64) bytes + (37 * lc) / 10 + 124 * ln + 59 * ll;
+	if (out_liftoff) *out_liftoff = liftoff;
+	if (out_turbofan) *out_turbofan = turbofan;
+	return liftoff > turbofan ? liftoff : turbofan;
+}
+
+/* MONO_WASM_JIT_COALESCE_BIG: the heap the slot allocator falls back on past its 256-slot scan. It holds the slots
+ * from 256 up, the one whose occupant ends first (key []) on top. */
+static void
+wj_co_heap_push (int *heap, int *n, const int *key, int slot)
+{
+	int i = (*n)++;
+	while (i > 0) {
+		int p = (i - 1) / 2;
+		if (key [heap [p]] <= key [slot])
+			break;
+		heap [i] = heap [p];
+		i = p;
+	}
+	heap [i] = slot;
+}
+
+static int
+wj_co_heap_pop (int *heap, int *n, const int *key)
+{
+	int top = heap [0], last = heap [--(*n)], i = 0;
+	for (;;) {
+		int c = 2 * i + 1;
+		if (c >= *n)
+			break;
+		if (c + 1 < *n && key [heap [c + 1]] < key [heap [c]])
+			c++;
+		if (key [last] <= key [heap [c]])
+			break;
+		heap [i] = heap [c];
+		i = c;
+	}
+	if (*n > 0)
+		heap [i] = last;
+	return top;
+}
+
+/* The dataflow bound of wj_coalesce_ranges_big, in words per bitset (4 bitsets of 4 MiB at most). */
+#define WJ_COB_MAX_WORDS 1048576
+
+/* MONO_WASM_JIT_COALESCE_BIG: live ranges for a method whose dataflow bitsets pass the coalescer's bound (nbb x
+ * nvreg / 32 words). The same analysis, its bitsets indexed by the vregs that can be live at a block boundary at
+ * all: one mentioned in more than one block, or read in its only block before that block writes it. Any other vreg
+ * is written before it is read inside one block, so no live_in or live_out set can hold it and its range is its
+ * mentions -- which is what the bounded walk gives it too. When even those bitsets pass WJ_COB_MAX_WORDS, a boundary
+ * vreg keeps the whole method (its local is shared with nothing).
+ * `pin` (a method with clauses, MONO_WASM_JIT_COALESCE_BIG bit 4) skips the dataflow and gives every boundary vreg the
+ * whole method: mono threads no exception edge through out_bb, so no liveness computed from it holds for a value that
+ * crosses blocks. What is left to share is the vreg written before it is read inside one block, and that is sound
+ * with clauses because a block is only ever entered at its start -- a handler at its first block, a finally's
+ * continuation at the leave's target (OP_CALL_HANDLER ends its block), and nothing resumes after a throw -- so its
+ * value is dead once control has left the block, by any edge.
+ * Mentions are enumerated exactly as the walk in mono_wasm_emit_method does: keep the two in lockstep.
+ * Fills bb_lo / bb_hi / vlo / vhi (vlo and vhi enter as -1) and returns the instruction count. */
+static int
+wj_coalesce_ranges_big (MonoCompile *cfg, int nvreg, int nbb2, int *bb_lo, int *bb_hi, int *vlo, int *vhi, gboolean pin)
+{
+	int *vfirst = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);   /* block of the first mention */
+	guint8 *vglob = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);          /* can be live at a block boundary */
+	int *gidx, *gv;
+	guint32 *bs_use, *bs_def, *bs_in, *bs_out;
+	MonoBasicBlock **bbarr;
+	int *bbnum2idx;
+	int ng = 0, gwords, ordn = 0, bbn, i, iter, changed = 1;
+	MonoBasicBlock *bbl; MonoInst *insl;
+
+	for (i = 0; i < nvreg; ++i)
+		vfirst [i] = -1;
+
+#define WJ_COB_MENTIONS(INS, USE, DEF) do { \
+	int _srcs [MONO_MAX_SRC_REGS]; \
+	int _nsrc = mono_inst_get_src_registers ((INS), _srcs), _u; \
+	gboolean _base = FALSE; \
+	switch ((INS)->opcode) { \
+	case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG: \
+	case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: \
+	case OP_STORER8_MEMBASE_REG: \
+	case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: \
+	case OP_STOREI2_MEMBASE_IMM: \
+	case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1: \
+	case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4: \
+	case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8: \
+	case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8: \
+		_base = TRUE; break; \
+	default: break; \
+	} \
+	for (_u = 0; _u < _nsrc; ++_u) \
+		USE (_srcs [_u]); \
+	if (_base) \
+		USE ((INS)->dreg); \
+	if (MONO_IS_CALL (INS)) { \
+		MonoCallInst *_cl = (MonoCallInst *) (INS); \
+		WjCallArgs *_cw = (WjCallArgs *) _cl->call_info; \
+		if (_cw) { \
+			for (_u = 0; _u <= _cw->nargs; ++_u) \
+				USE (wj_arg_vreg (_cl, _u)); \
+		} \
+	} \
+	if (!_base) \
+		DEF ((INS)->dreg); \
+} while (0)
+
+	/* pass 1: each vreg's range by mention, and whether it can cross a block boundary */
+#define WJ_COB_SEEN(V, ISUSE) do { int _v = (V); \
+	if (_v >= 0 && _v < nvreg) { \
+		if (vfirst [_v] < 0) { vfirst [_v] = bbn; if (ISUSE) vglob [_v] = 1; } \
+		else if (vfirst [_v] != bbn) vglob [_v] = 1; \
+		if (vlo [_v] < 0 || ordn < vlo [_v]) vlo [_v] = ordn; \
+		if (ordn > vhi [_v]) vhi [_v] = ordn; \
+	} } while (0)
+#define WJ_COB_USE1(V) WJ_COB_SEEN (V, 1)
+#define WJ_COB_DEF1(V) WJ_COB_SEEN (V, 0)
+	bbn = 0;
+	for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
+		bb_lo [bbn] = ordn;
+		MONO_BB_FOR_EACH_INS (bbl, insl) {
+			WJ_COB_MENTIONS (insl, WJ_COB_USE1, WJ_COB_DEF1);
+			ordn++;
+		}
+		bb_hi [bbn] = ordn - 1;   /* < bb_lo for an empty bb, as in the bounded walk */
+	}
+#undef WJ_COB_USE1
+#undef WJ_COB_DEF1
+#undef WJ_COB_SEEN
+
+	gidx = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+	for (i = 0; i < nvreg; ++i)
+		gidx [i] = vglob [i] ? ng++ : -1;
+	if (ng == 0)
+		return ordn;
+	gwords = (ng + 31) / 32;
+	if (pin || (gsize) nbb2 * gwords > WJ_COB_MAX_WORDS) {
+		if (!pin)
+			mono_wasm_jit_count (WJC_COALESCE_BIG_PINNED);
+		for (i = 0; i < nvreg; ++i)
+			if (vglob [i]) { vlo [i] = 0; vhi [i] = ordn; }
+		return ordn;
+	}
+	gv = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * ng);
+	for (i = 0; i < nvreg; ++i)
+		if (gidx [i] >= 0) gv [gidx [i]] = i;
+	bs_use = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * gwords);
+	bs_def = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * gwords);
+	bs_in  = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * gwords);
+	bs_out = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * gwords);
+
+#define WJ_COB_BS(BASE, BB) ((BASE) + (gsize) (BB) * gwords)
+#define WJ_COB_GET(BASE, BB, G) ((WJ_COB_BS (BASE, BB) [(G) >> 5] >> ((G) & 31)) & 1u)
+#define WJ_COB_SET(BASE, BB, G) do { WJ_COB_BS (BASE, BB) [(G) >> 5] |= 1u << ((G) & 31); } while (0)
+
+	/* pass 2: per-bb upward-exposed uses and defs of the boundary vregs */
+#define WJ_COB_USE2(V) do { int _v = (V); \
+	if (_v >= 0 && _v < nvreg && gidx [_v] >= 0) { \
+		int _g = gidx [_v]; \
+		if (!WJ_COB_GET (bs_def, bbn, _g)) WJ_COB_SET (bs_use, bbn, _g); \
+	} } while (0)
+#define WJ_COB_DEF2(V) do { int _v = (V); \
+	if (_v >= 0 && _v < nvreg && gidx [_v] >= 0) \
+		WJ_COB_SET (bs_def, bbn, gidx [_v]); \
+	} while (0)
+	bbn = 0;
+	for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
+		MONO_BB_FOR_EACH_INS (bbl, insl) {
+			WJ_COB_MENTIONS (insl, WJ_COB_USE2, WJ_COB_DEF2);
+		}
+	}
+#undef WJ_COB_USE2
+#undef WJ_COB_DEF2
+#undef WJ_COB_MENTIONS
+
+	/* live_out[b] = U live_in[succ];  live_in[b] = use[b] U (live_out[b] - def[b]) */
+	bbarr = (MonoBasicBlock **) mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock *) * nbb2);
+	bbnum2idx = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * ((int) cfg->max_block_num + 1));
+	for (i = 0; i <= (int) cfg->max_block_num; ++i)
+		bbnum2idx [i] = -1;
+	bbn = 0;
+	for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb, ++bbn) {
+		bbarr [bbn] = bbl;
+		if (bbl->block_num >= 0 && bbl->block_num <= (int) cfg->max_block_num)
+			bbnum2idx [bbl->block_num] = bbn;
+	}
+	for (iter = 0; changed && iter < nbb2 + 4; ++iter) {
+		changed = 0;
+		for (bbn = nbb2 - 1; bbn >= 0; --bbn) {
+			MonoBasicBlock *b = bbarr [bbn];
+			int k, w;
+			for (k = 0; k < b->out_count; ++k) {
+				MonoBasicBlock *o = b->out_bb [k];
+				int oi = (o && o->block_num >= 0 && o->block_num <= (int) cfg->max_block_num)
+					? bbnum2idx [o->block_num] : -1;
+				if (oi < 0) continue;
+				for (w = 0; w < gwords; ++w) {
+					guint32 nv = WJ_COB_BS (bs_out, bbn) [w] | WJ_COB_BS (bs_in, oi) [w];
+					if (nv != WJ_COB_BS (bs_out, bbn) [w]) { WJ_COB_BS (bs_out, bbn) [w] = nv; changed = 1; }
+				}
+			}
+			for (w = 0; w < gwords; ++w) {
+				guint32 nv = WJ_COB_BS (bs_use, bbn) [w] | (WJ_COB_BS (bs_out, bbn) [w] & ~WJ_COB_BS (bs_def, bbn) [w]);
+				if (nv != WJ_COB_BS (bs_in, bbn) [w]) { WJ_COB_BS (bs_in, bbn) [w] = nv; changed = 1; }
+			}
+		}
+	}
+
+	/* A vreg live at a block boundary is live across that whole block, back edges included. */
+	for (bbn = 0; bbn < nbb2; ++bbn) {
+		int hi = bb_hi [bbn] < bb_lo [bbn] ? bb_lo [bbn] : bb_hi [bbn];
+		int w;
+		for (w = 0; w < gwords; ++w) {
+			guint32 bits = WJ_COB_BS (bs_in, bbn) [w] | WJ_COB_BS (bs_out, bbn) [w];
+			while (bits) {
+				int v = gv [w * 32 + __builtin_ctz (bits)];
+				bits &= bits - 1;
+				if (vlo [v] < 0 || bb_lo [bbn] < vlo [v]) vlo [v] = bb_lo [bbn];
+				if (hi > vhi [v]) vhi [v] = hi;
+			}
+		}
+	}
+#undef WJ_COB_BS
+#undef WJ_COB_GET
+#undef WJ_COB_SET
+	return ordn;
+}
+
 void
 mono_wasm_emit_method (MonoCompile *cfg)
 {
@@ -2290,7 +2540,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				printf ("WASM_JIT_S4_APPLIED\t%d\t%d\t%d\t%s\ts4-pre-coalesce\n", cfg->wasm_jit_tier, s4n, s4h, mname ? mname : "?");
 		}
 	  } }
-	if (nvreg > 0 && cfg->header->num_clauses == 0) {
+	if (nvreg > 0 && (cfg->header->num_clauses == 0 || (mono_wasm_jit_coalesce_big & 4))) {
+		gboolean co_eh = cfg->header->num_clauses != 0;   /* block-local sharing only (wj_coalesce_ranges_big, `pin`) */
 		int words = (nvreg + 31) / 32;
 		int nbb2 = 0, ordn = 0, bbn;
 		MonoBasicBlock *bbl; MonoInst *insl;
@@ -2298,16 +2549,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		for (bbl = cfg->bb_entry; bbl; bbl = bbl->next_bb)
 			nbb2++;
 		/* Bound the dataflow: 4 bitsets of nbb2*words words. Past this a method keeps the old
-		 * one-local-per-vreg assignment rather than paying unbounded compile time/memory. */
-		if (nbb2 > 0 && (gsize) nbb2 * words <= 65536) {
+		 * one-local-per-vreg assignment rather than paying unbounded compile time/memory, unless
+		 * MONO_WASM_JIT_COALESCE_BIG sends it through wj_coalesce_ranges_big. */
+		gboolean co_fits = !co_eh && (gsize) nbb2 * words <= 65536;
+		if (nbb2 > 0 && (co_fits || co_eh || (mono_wasm_jit_coalesce_big & 3))) {
 			int *bb_lo = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nbb2);
 			int *bb_hi = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nbb2);
 			int *vlo = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
 			int *vhi = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
-			guint32 *bs_use = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
-			guint32 *bs_def = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
-			guint32 *bs_in  = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
-			guint32 *bs_out = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * (gsize) nbb2 * words);
+			gsize co_bs = co_fits ? sizeof (guint32) * (gsize) nbb2 * words : sizeof (guint32);
+			guint32 *bs_use = (guint32 *) mono_mempool_alloc0 (cfg->mempool, co_bs);
+			guint32 *bs_def = (guint32 *) mono_mempool_alloc0 (cfg->mempool, co_bs);
+			guint32 *bs_in  = (guint32 *) mono_mempool_alloc0 (cfg->mempool, co_bs);
+			guint32 *bs_out = (guint32 *) mono_mempool_alloc0 (cfg->mempool, co_bs);
 			int iter, changed = 1;
 
 #define WJ_BS(BASE, BB) ((BASE) + (gsize) (BB) * words)
@@ -2315,6 +2569,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
 #define WJ_BS_SET(BASE, BB, V) do { WJ_BS (BASE, BB) [(V) >> 5] |= 1u << ((V) & 31); } while (0)
 
 			for (i = 0; i < nvreg; ++i) { vlo [i] = -1; vhi [i] = -1; }
+
+			if (!co_fits) {
+				mono_wasm_jit_count (co_eh ? WJC_COALESCE_BIG_EH : WJC_COALESCE_BIG);
+				ordn = wj_coalesce_ranges_big (cfg, nvreg, nbb2, bb_lo, bb_hi, vlo, vhi, co_eh);
+				goto co_ranges_done;
+			}
 
 			/* per-bb upward-exposed uses + defs, and the ordinal range of each bb */
 			bbn = 0;
@@ -2417,6 +2677,28 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				}
 			}
 
+			/* MONO_WASM_JIT_COALESCE_BIG bit 2: the gate for wj_coalesce_ranges_big. On a method the bounded walk can
+			 * do, both must give every vreg the same range. */
+			if (G_UNLIKELY (mono_wasm_jit_coalesce_big & 2)) {
+				int *vlo2 = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+				int *vhi2 = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+				int *bl2 = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nbb2);
+				int *bh2 = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nbb2);
+				int o2, bad = -1;
+				for (i = 0; i < nvreg; ++i) { vlo2 [i] = -1; vhi2 [i] = -1; }
+				o2 = wj_coalesce_ranges_big (cfg, nvreg, nbb2, bl2, bh2, vlo2, vhi2, FALSE);
+				for (i = 0; i < nvreg && bad < 0; ++i)
+					if (vlo2 [i] != vlo [i] || vhi2 [i] != vhi [i]) bad = i;
+				mono_wasm_jit_count (WJC_COALESCE_BIG_VERIFIED);
+				if (o2 != ordn || bad >= 0) {
+					if (mono_wasm_jit_counters [WJC_COALESCE_BIG_VERIFY_FAIL] < 8)
+						printf ("[wasm-jit coalesce-big] VERIFY FAIL: ordinals %d / %d, vreg %d bounded [%d, %d] big [%d, %d] %s\n",
+							ordn, o2, bad, bad >= 0 ? vlo [bad] : 0, bad >= 0 ? vhi [bad] : 0,
+							bad >= 0 ? vlo2 [bad] : 0, bad >= 0 ? vhi2 [bad] : 0, mname ? mname : "?");
+					mono_wasm_jit_count (WJC_COALESCE_BIG_VERIFY_FAIL);
+				}
+			}
+co_ranges_done:
 			/* The epilogue reads cfg->ret->dreg after the last instruction; no IR walk can see that. */
 			if (cfg->ret && cfg->ret->dreg >= 0 && cfg->ret->dreg < nvreg) {
 				int rv = cfg->ret->dreg;
@@ -2437,12 +2719,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 				int *order = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
 				int *slot_end [4] = { NULL, NULL, NULL, NULL };
 				int nslot [4] = { 0, 0, 0, 0 };
+				int *co_heap [4] = { NULL, NULL, NULL, NULL };   /* MONO_WASM_JIT_COALESCE_BIG: the slots from 256 up */
+				int co_nheap [4] = { 0, 0, 0, 0 };
 				int pos = 0, gi;
 
 				lslot = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
 				for (i = 0; i < nvreg; ++i) lslot [i] = -1;
-				for (gi = 0; gi < 4; ++gi)
+				for (gi = 0; gi < 4; ++gi) {
 					slot_end [gi] = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+					if (mono_wasm_jit_coalesce_big)
+						co_heap [gi] = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+				}
 
 				for (i = 0; i < nvreg; ++i) cntb [vlo [i] < nord ? vlo [i] : nord - 1]++;
 				for (i = 1; i < nord; ++i) cntb [i] += cntb [i - 1];
@@ -2460,8 +2747,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
 					/* Scanning is capped: past 256 slots the search cost stops being worth the reuse. */
 					for (s = 0; s < nslot [g] && s < 256; ++s)
 						if (slot_end [g] [s] < vlo [v]) { chosen = s; break; }
+					/* Past the scan a slot was never reused: in a method with 256 long ranges every later
+					 * vreg got a new local. The heap hands back the slot from 256 up that ended first. */
+					if (chosen < 0 && co_heap [g] && co_nheap [g] > 0 && slot_end [g] [co_heap [g] [0]] < vlo [v])
+						chosen = wj_co_heap_pop (co_heap [g], &co_nheap [g], slot_end [g]);
 					if (chosen < 0) chosen = nslot [g]++;
 					slot_end [g] [chosen] = vhi [v];
+					if (co_heap [g] && chosen >= 256)
+						wj_co_heap_push (co_heap [g], &co_nheap [g], slot_end [g], chosen);
 					lslot [v] = chosen;
 				}
 			}
@@ -9539,7 +9832,42 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		fail = "tier-2 body over MONO_WASM_JIT_T2_MAX_BODY";
 		wasm_buf_free (&out);   /* freed before `done:` on the normal path (below), so free it here */
 		goto done;
-	  } }
+	  }
+	  { extern int mono_wasm_jit_t1_max_body;
+	    if (!fail && cfg->wasm_jit_tier < 2 && mono_wasm_jit_t1_max_body > 0 && cap_len > (guint32) mono_wasm_jit_t1_max_body) {
+		mono_wasm_jit_count (WJC_T1_BODY_CAPPED);
+		/* a handful per run, so ungated */
+		printf ("[wasm-jit t1-cap] refused %u B (cap %d%s) %s\n", cap_len, mono_wasm_jit_t1_max_body,
+			cfg->wasm_jit_t1_down ? ", downgrade" : "", mname ? mname : "?");
+		fail = "body over MONO_WASM_JIT_T1_MAX_BODY";
+		wasm_buf_free (&out);
+		goto done;
+	    } }
+	  /* MONO_WASM_JIT_MAX_COMPILE_MB: the cap by what V8 will allocate rather than by bytes, either tier. */
+	  { extern int mono_wasm_jit_max_compile_mb;
+	    if (!fail && (mono_wasm_jit_max_compile_mb > 0 || G_UNLIKELY (mono_wasm_jit_stats))) {
+		/* wj_body_take moved the body into the stored one and zeroed the emitter's. `out`'s counts read 0: the
+		 * serializer frames the function in its own buffer (the note at wj_compile_mem_estimate). */
+		const WasmBuf *sh_b = wj_stored_body ? &wj_stored_body->f_body : &body;
+		guint32 sh_loc = (guint32) (nwparams + cnt [0] + cnt [1] + cnt [2] + cnt [3]);
+		guint32 sh_ctl = sh_b->n_ctl + out.n_ctl, sh_loops = sh_b->n_loop + out.n_loop, sh_calls = sh_b->n_call + out.n_call;
+		guint64 sh_lo = 0, sh_tf = 0;
+		guint64 sh_est = wj_compile_mem_estimate (cap_len, sh_loc, sh_ctl, sh_loops, sh_calls, uses_eh_tag, &sh_lo, &sh_tf);
+		gboolean sh_over = mono_wasm_jit_max_compile_mb > 0 && sh_est > ((guint64) mono_wasm_jit_max_compile_mb << 20);
+		/* the line a V8 compile trace is joined to (by bytes) to check the estimate: under stats every body
+		 * estimated at 16 MiB or more; a refusal always (a handful per run) */
+		if (sh_over || (G_UNLIKELY (mono_wasm_jit_stats) && sh_est >= (16u << 20)))
+			printf ("[wasm-jit mem-cap] %s %u MiB (Liftoff %u, TurboFan %u): %u B, %u locals, %u control, %u loops, %u calls%s, tier %d%s (budget %d) %s\n",
+				sh_over ? "refused" : "estimate", (guint32) (sh_est >> 20), (guint32) (sh_lo >> 20), (guint32) (sh_tf >> 20),
+				cap_len, sh_loc, sh_ctl, sh_loops, sh_calls, uses_eh_tag ? " in a try" : "", cfg->wasm_jit_tier,
+				cfg->wasm_jit_t1_down ? " downgrade" : "", mono_wasm_jit_max_compile_mb, mname ? mname : "?");
+		if (sh_over) {
+			mono_wasm_jit_count (WJC_COMPILE_MEM_CAPPED);
+			fail = "estimated V8 compile memory over MONO_WASM_JIT_MAX_COMPILE_MB";
+			wasm_buf_free (&out);
+			goto done;
+		}
+	    } } }
 #ifdef HOST_BROWSER
 	{ extern int mono_wasm_jit_t2_unit;
 	  if (G_UNLIKELY (mono_wasm_jit_t2_unit == 2) && !fail && cfg->wasm_jit_tier >= 2 && wj_stored_body)

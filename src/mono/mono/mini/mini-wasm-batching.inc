@@ -1347,6 +1347,7 @@ static int wj_b4_npend, wj_b4_ipend;
  * until the first window closes: nothing is known yet). */
 static gint32 wj_b4_q_samples, wj_b4_q_bodies, wj_b4_q_windows;
 static gboolean wj_b4_noisy = TRUE;
+#define WJ_B4_QUIET_FLOOR 8
 /* MONO_WASM_JIT_B4_DELAY: nothing is planned or framed until that many seconds after the JIT came up.
  * MONO_WASM_JIT_B4_QUIET: nor while the tier is still growing. */
 static gboolean
@@ -1367,7 +1368,11 @@ wj_b4_delayed (void)
 		 * later it is a rate. */
 		gint32 win = MIN (mono_wasm_jit_b4_quiet_win, MAX (1000, wj_b4_q_samples));
 		if (s - wj_b4_q_samples >= win) {
-			gboolean noisy = (gint64) (bd - wj_b4_q_bodies) * 100 > (gint64) mono_wasm_jit_b4_quiet * MAX (wj_b4_q_bodies, 1);
+			/* A window that added at most WJ_B4_QUIET_FLOOR bodies is quiet whatever the percentage: on a small
+			 * tier one late compile is several percent (jbox2d: 52 -> 55 bodies read GROWING, the run ended before
+			 * the next window and nothing was framed; a 26.2 boot's early windows add 19 and more). */
+			gboolean noisy = bd - wj_b4_q_bodies > WJ_B4_QUIET_FLOOR &&
+				(gint64) (bd - wj_b4_q_bodies) * 100 > (gint64) mono_wasm_jit_b4_quiet * MAX (wj_b4_q_bodies, 1);
 			if (G_UNLIKELY (mono_wasm_jit_stats) && (noisy != wj_b4_noisy || wj_b4_q_windows < 4 || (wj_b4_q_windows & 7) == 0))
 				printf ("[wasm-jit b4 quiet] +%.1fs window %d: bodies %d -> %d over %d samples (window of %d): %s (framed %lld)\n",
 					(double) (mono_msec_ticks () - mono_wasm_jit_start_ms) / 1000.0, wj_b4_q_windows, wj_b4_q_bodies, bd,

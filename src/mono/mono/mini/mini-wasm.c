@@ -855,8 +855,37 @@ int mono_wasm_jit_aggr_inline_blocks = 3000;
 /* MONO_WASM_JIT_T2_MAX_BODY (R349): largest tier-2 module, in bytes, the emitter will hand to V8; a bigger one fails
  * permanently and the method keeps its tier-1 body (or takes the tier-1-policy downgrade). 0 = no cap. 104 KB takes
  * ServerWorld.tick's strict body (100.6 KB) once VSITE_COMPACT shrinks virtual sites: all five server giants then reach
- * tier 2 at no measured memory cost (R464). 160 KB costs +551 MiB of TurboFan zones (R450, R460). */
+ * tier 2 at no measured memory cost (R464). 160 KB costs +551 MiB of TurboFan zones (R450, R460); 256 KB with
+ * MONO_WASM_JIT_COALESCE_BIG=5 still costs the FO pack +970 MiB (2026-11-12, one run): the bodies in a try. */
 int mono_wasm_jit_t2_max_body = 106496;
+/* MONO_WASM_JIT_T1_MAX_BODY: the same cap for a body compiled at the ordinary policy (tier 1 and the tier-2
+ * downgrade); a bigger one fails permanently and the interpreter runs the method. 0 = no cap. Both V8 tiers keep
+ * per-control-structure state sized by the function's locals (wasm/baseline/liftoff-compiler.cc `Control.label_state`,
+ * wasm/turboshaft-graph-interface.cc block phis), and an EH method declares one local per vreg, so compile memory grows
+ * faster than the body: on the FO pack (262u, 2026-11-12, one run) ExpressionParser.expression (179,630 B) took 445 MiB
+ * of Liftoff zone and 995 MiB of TurboFan's, SnbtGrammar.createParser (200,040 B) 463 and 333, and PartitionAlloc
+ * never returns that address space (findings note "why the FO pack holds ~10 GiB"). Unmeasured as a knob. */
+int mono_wasm_jit_t1_max_body = 0;
+/* MONO_WASM_JIT_MAX_COMPILE_MB: a body whose compile V8 is estimated to need more than this many MiB for
+ * (wj_compile_mem_estimate, fitted to V8's own figures) fails permanently, at either tier: a tier-2 body keeps its
+ * tier-1 one, a tier-1 body is left to the interpreter. 0 = no such cap. It is the cap MONO_WASM_JIT_T2_MAX_BODY and
+ * MONO_WASM_JIT_T1_MAX_BODY approximate by bytes. FO pack (262u, 2026-11-12, one run an arm): 256 refused
+ * ExpressionParser.expression and LayerDefinitions.createRoots, peak VmData 10,061 -> 9,422 MiB and the boot marks
+ * did not move; with MONO_WASM_JIT_COALESCE_BIG=1 8,622. The estimate's limits are at wj_compile_mem_estimate: under
+ * COALESCE_BIG bit 4 it refuses nothing at 256 and is not a reason to raise the tier-2 byte cap. */
+int mono_wasm_jit_max_compile_mb = 0;
+/* MONO_WASM_JIT_COALESCE_BIG, bits. 1: the local coalescer also runs on a method past its dataflow bound (nbb x nvreg /
+ * 32 > 65,536 words), through wj_coalesce_ranges_big, and its slot allocator reuses slots past its 256-slot scan.
+ * Without it a big method declares one wasm local per vreg -- SnbtGrammar.createParser 6,309 locals over 7,785 control
+ * structures -- and V8's compile memory follows locals x structure (wj_compile_mem_estimate). 2: bit 1, and the
+ * ranges are computed both ways on every method inside the bound, counting the methods where they differ
+ * (`[wasm-jit coalesce-big] verify_fail`, which must read 0). 4: a method with clauses shares the locals of the vregs
+ * that never leave one block (the `pin` note at wj_coalesce_ranges_big); without it such a method shares nothing.
+ * FO pack (262u, 2026-11-12, one run an arm, all verdict ok): peak VmData 10,061 MiB at 0, 8,971 / 8,979 / 9,143 at
+ * 7 / 5 / 5; Liftoff compiles of 64 MiB and more 31 -> 0 (largest 445 -> 62 MiB), TurboFan's 25 -> 19 (it does not
+ * follow the locals in a body with clauses). Bit 2 over that run: 34,845 methods compared, 0 differing; 31 methods
+ * took the big path, 1,433 the clause path. jbox2d checksum holds at 7. Not measured: the tick, a fault rate. */
+int mono_wasm_jit_coalesce_big = 0;
 /* MONO_WASM_JIT_EH_REC (R353): an EH method keeps its IL_STATE LMFExt in a record inside its OWN C-stack frame and
  * links/unlinks it inline, instead of calling mono_wasm_jit_enter_island / leave_island (interp.c, WjEhRec). p75, b t t b
  * on the Minecraft server tick: the island helpers 2.98 -> 0.08 M instr/tick, all instructions -3.6%, calls -9.6%;
@@ -1159,6 +1188,9 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_trace_compile, "MONO_WASM_JIT_TRACE_COMPILE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aggr_inline_blocks, "MONO_WASM_JIT_AGGR_INLINE_BLOCKS", 0, 10000000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max_body, "MONO_WASM_JIT_T2_MAX_BODY", 0, 64 * 1024 * 1024)
+	WJ_T2_KNOB (mono_wasm_jit_t1_max_body, "MONO_WASM_JIT_T1_MAX_BODY", 0, 64 * 1024 * 1024)
+	WJ_T2_KNOB (mono_wasm_jit_coalesce_big, "MONO_WASM_JIT_COALESCE_BIG", 0, 7)
+	WJ_T2_KNOB (mono_wasm_jit_max_compile_mb, "MONO_WASM_JIT_MAX_COMPILE_MB", 0, 65536)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_exc_pin, "MONO_WASM_JIT_EXC_PIN", 0, 1)
@@ -1368,15 +1400,24 @@ gint32 mono_wasm_jit_lit_rescued, mono_wasm_jit_lit_unslotted;
  * serializer writes the counter; a group module carries none), and the planner weighs an edge by that count, one edge
  * a caller-callee pair. MONO_WASM_JIT_B4_DELAY: seconds after the JIT came up before B4 plans or frames anything, so
  * the first groups are formed from counts taken in the world rather than at boot (a framed member never moves, R445).
- * 2026-11-11 census, 26.2 server thread: the shipped weights hold 26% of the named calls in one group where exact
- * counts allow 76% at the same caps (findings log). */
-int mono_wasm_jit_b4_exact = 0;
+ * 2026-11-11 census, 26.2 server thread: the old weights hold 26% of the named calls in one group where exact
+ * counts allow 76% at the same caps (findings log). B4_EXACT is 1 since 2026-11-12 with MONO_WASM_JIT_B4_QUIET (the
+ * set and its numbers are at MONO_WASM_JIT_SP_ARG); B4_DELAY stays 0, the quiet gate does its job without a clock.
+ * jbox2d pays the counters and frames nothing: its ~7 s measured run is shorter than the gate (0.610 against 0.602-0.613
+ * ms a step, two runs an arm). */
+int mono_wasm_jit_b4_exact = 1;
 int mono_wasm_jit_b4_delay = 0;
 /* MONO_WASM_JIT_B4_QUIET=<pct> (0 = off): B4 plans and frames only while the edge-carrying tier is QUIET -- over the
  * last window of planner samples (tier-2-body safepoint samples: executed work, not wall time) it grew by at most
- * <pct> percent. A window is as long as all the samples before it, from 1000 up to MONO_WASM_JIT_B4_QUIET_WIN. The delay's purpose without its clock: a workload that is still compiling its hot set
- * has not shown its call counts yet. Unmeasured. */
-int mono_wasm_jit_b4_quiet = 0;
+ * <pct> percent. A window is as long as all the samples before it, from 1000 up to MONO_WASM_JIT_B4_QUIET_WIN. The
+ * delay's purpose without its clock: a workload that is still compiling its hot set has not shown its call counts
+ * yet. On 26.2 the gate opens ~125 s after the world is joined (one census). 5 since 2026-11-12, measured as part of
+ * the set at MONO_WASM_JIT_SP_ARG.
+ * MONO_WASM_JIT_B4_PER_PLAN stays 16 under the gate: at 64 the ~155 groups are framed in three plans, the server tick
+ * reads -10.6% (n=4) against -8.8% (overlapping), and partition_alloc steps +115 to +644 MiB in one sample in 7 of 7
+ * runs -- 4 of them end over the 8 GiB a sandboxed renderer gets; at 16 the largest step was +9 / +50 / +158 and none
+ * did (2026-11-12, findings notes "the fault and memory gate" and "F's memory step"). */
+int mono_wasm_jit_b4_quiet = 5;
 int mono_wasm_jit_b4_quiet_win = 15000;
 int mono_wasm_jit_b4_per_plan = 16;
 int mono_wasm_jit_b4_plan_samples = 5000;
@@ -1623,7 +1664,12 @@ int mono_wasm_jit_frame_zero = 0;
  * an imported global or be refused the direct-forward path -- which is a confound to name, not a free
  * change. */
 /* MONO_WASM_JIT_SP_ARG: how a JIT `f` learns where its C-stack frame goes. Every `f` functype depends on it, so it is
- * read once at startup and the whole process agrees. Unmeasured: an experiment's arm.
+ * read once at startup and the whole process agrees. Default 2 since 2026-11-12, with SP_ELIDE, B4_EXACT and B4_QUIET
+ * (one set, findings notes of that date): 26.2 server tick -8.8% cycles and -5.8% instructions against the old defaults
+ * (Q60, n=3 against n=5, cycle ranges disjoint, 97.37-103.22 against 107.21-111.49 M a tick), peak VmData no higher
+ * (7,792-7,989 against 7,767-8,185 MiB, n=3 / 4), 6 of 6 runs without a fault. The two SP knobs on top of exact-count
+ * co-location at 64 groups a plan: -6.5% cycles (n=3 each, disjoint). jbox2d, the two SP knobs against the old
+ * defaults: 0.599 / 0.599 against 0.602 / 0.613 ms a step (window means, two runs an arm), neutral.
  *   0  `f` reads the imported mutable `__stack_pointer` (s.p) and writes it when it creates its frame and at every exit.
  *   1  every `f` takes the caller's frame base as a TRAILING i32 parameter (after the hidden vret pointer, see the note
  *      above) and reads that wherever mode 0 reads s.p: the prologue, a lazy frame's creation, an EH method's capture.
@@ -1641,18 +1687,20 @@ int mono_wasm_jit_frame_zero = 0;
  * the shared virtual slow-path stubs take it and pass it on (wasm-encoder.c reads wasm_sp_arg; in mode 2 they write s.p
  * from it ahead of their own native calls), `e` supplies it from s.p, and every call site whose functype is a JIT `f`
  * pushes it. AOT body types, icalls, the interpreter fallback and calli have no such argument. The jiterpreter's
- * interp-entry trampoline cannot produce it, so mono_wasm_jit_entry_sig refuses the direct forward and those entries
- * go through `e`: a confound to name when reading an arm (counted, `[wasm-jit sp-arg]`). Defined out here like the
- * knobs above: the emitter reads it in both builds. */
-int mono_wasm_jit_sp_arg = 0;
+ * interp-entry trampoline pushes it too: it asks mono_wasm_jit_sp_arg_mode once, reads s.p for the argument and, in
+ * mode 2, puts s.p back after `f` returns (browser/runtime jiterpreter-interp-entry.ts), so the direct forward
+ * stays. Defined out here like the knobs above: the emitter reads it in both builds. */
+int mono_wasm_jit_sp_arg = 2;
 /* `[wasm-jit sp-arg]`, ungated: bodies framed with the parameter; s.p writes those bodies carry before a native call
  * (mode 2); entry thunks framed with the save and restore (mode 2); compiles refused because the parameter did not fit
- * WASM_FUNCTYPE_MAX_PARAMS (the method's own type, or a callee's at a site); mono_wasm_jit_entry_sig refusals. */
+ * WASM_FUNCTYPE_MAX_PARAMS (the method's own type, or a callee's at a site); entry signatures answered for the
+ * trampoline's direct forward (`entry_fwd`). */
 gint32 mono_wasm_jit_sp_arg_bodies, mono_wasm_jit_sp_arg_syncs, mono_wasm_jit_sp_arg_restores,
 	mono_wasm_jit_sp_arg_refused, mono_wasm_jit_sp_arg_entry_sig, mono_wasm_jit_sp_arg_elided;
 /* MONO_WASM_JIT_SP_ELIDE (mode 2 only): a body with an eager frame or none drops a write of s.p before a native call
- * when an earlier write of its own dominates it (WasmBuf.sp_synced; wj_emit_sp_sync has the argument). Unmeasured. */
-int mono_wasm_jit_sp_elide = 0;
+ * when an earlier write of its own dominates it (WasmBuf.sp_synced; wj_emit_sp_sync has the argument). 26.2, one
+ * census (2026-11-12): 31,374 of 156,483 writes dropped (17%); measured only inside the set at MONO_WASM_JIT_SP_ARG. */
+int mono_wasm_jit_sp_elide = 1;
 /* MONO_WASM_JIT_ENTRYCENSUS=1; the census state and reader live in the HOST_BROWSER section below, but
  * this flag must be defined OUT here: mono_wasm_jit_auto_init reads it and mini-wasm.c is linked into
  * mono-aot-cross as well as the runtime, so a browser-only definition is an undefined symbol at the

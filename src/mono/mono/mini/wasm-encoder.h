@@ -290,6 +290,10 @@ typedef struct {
 	 * `sp_synced` is 1 + the nesting at which this buffer last wrote s.p, while that write still dominates what is
 	 * appended (0: none). An `end` or `else` of a block that was open at the write clears it. */
 	gint32 ctl_depth, sp_synced;
+	/* The shape V8's compile memory follows (wj_compile_mem_estimate): control structures (block / loop / if /
+	 * try_table), loops and calls wasm_op has written to this buffer. A relocatable body holds only what the
+	 * emitter wrote; the serializer writes every call, and a virtual site's blocks, into the module it frames. */
+	guint32 n_ctl, n_loop, n_call;
 } WasmBuf;
 
 /* Every wasm_op_local call on a buffer whose `llog` is set, in call order, as idx << 2 | WASM_LLOG_*. Logged as CALLED:

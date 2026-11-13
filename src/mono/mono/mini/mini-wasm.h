@@ -1480,6 +1480,13 @@ enum {
 	WJC_EHINL_ROOT_HOT,          /* EH_INLINE bit 256: a root without clauses allowed its first instance (site frequency) */
 	WJC_EHINL_ROOT_COLD,         /* ... refused it (site below EH_INLINE_ROOT_PCT, or no profile) */
 	WJC_EHINL_FREQ_RAISED,       /* EH_INLINE bit 128: an EH callee given the S2 hot-site limit by the EH frequency (S2 had none) */
+	WJC_T1_BODY_CAPPED,        /* tier-1 bodies refused for exceeding MONO_WASM_JIT_T1_MAX_BODY (ungated) */
+	WJC_COALESCE_BIG,          /* MONO_WASM_JIT_COALESCE_BIG: methods past the coalescer's bound that took wj_coalesce_ranges_big */
+	WJC_COALESCE_BIG_PINNED,   /* ... whose boundary vregs passed WJ_COB_MAX_WORDS too and kept the whole method */
+	WJC_COALESCE_BIG_VERIFIED, /* MONO_WASM_JIT_COALESCE_BIG=2: methods inside the bound whose ranges were computed both ways */
+	WJC_COALESCE_BIG_VERIFY_FAIL, /* ... and differed (must read 0) */
+	WJC_COMPILE_MEM_CAPPED,    /* bodies refused for exceeding MONO_WASM_JIT_MAX_COMPILE_MB by wj_compile_mem_estimate (ungated) */
+	WJC_COALESCE_BIG_EH,       /* MONO_WASM_JIT_COALESCE_BIG bit 4: methods with clauses that shared their block-local vregs' locals */
 	WJC_MAX
 };
 
