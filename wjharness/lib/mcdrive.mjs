@@ -52,7 +52,7 @@
 import { spawn, execSync, spawnSync } from "child_process";
 import { mkdirSync, rmSync, existsSync, openSync, readSync, writeSync, closeSync, statSync, writeFileSync, appendFileSync, readFileSync, readdirSync } from "fs";
 import { join, resolve } from "path";
-import { connect, attachPage } from "./browser.mjs";
+import { connect, attachPage, blockedHostArgs } from "./browser.mjs";
 import { readPartitionStats } from "./partition-alloc.mjs";
 import { SEEDS, resolveSeed, seedFromArgs } from "./seeds.mjs";
 import { serveUrl } from "./paths.mjs";
@@ -1271,6 +1271,7 @@ export function launchGame ({ url, profile, logPath, jsFlags = null, extraArgs =
      * renderer; it only takes effect without the per-isolate prefix (logging/log.cc:2333). Inert when
      * nothing turns --log on. The perf map is a separate listener and is unaffected. */
     `--js-flags=--stack-trace-limit=64 --no-logfile-per-isolate --logfile=+${jsFlags ? " " + jsFlags : ""}`,
+    ...blockedHostArgs(),
     ...extraArgs,
     url,
   ];
@@ -1414,7 +1415,27 @@ export async function driveLauncher (conn, sid, seed, { log = console.log, timeo
       return document.querySelector("canvas#canvas") ? "autostart" : "none";
     })()`).catch(() => "loading");
     if (st === "launcher" || st === "autostart") break;
-    if (Date.now() - t0 > timeoutMs) throw new Error(`launcher never became usable (last state: ${st})`);
+    if (Date.now() - t0 > timeoutMs) {
+      /* Say what the page is waiting for before giving up: this failure comes in clusters (2026-11-12: nine launches)
+       * and leaves nothing in the log after `[vite] connected.`. A module that is still pending 3 s after being
+       * imported again is waiting on a top-level await or on one of its own imports; the ones whose imports all
+       * resolved are where it is stuck. */
+      const diag = await conn.send("Runtime.evaluate", { awaitPromise: true, returnByValue: true, expression: `(async () => {
+        const res = performance.getEntriesByType("resource");
+        const mods = res.map((e) => e.name).filter((n) => /\\/src\\/|\\/node_modules\\/|@vite/.test(n) && !/\\.(wasm|css|svg|png|json)(\\?|$)/.test(n));
+        const state = await Promise.all(mods.map((u) => Promise.race([
+          import(u).then(() => null, (e) => "FAILED " + u + ": " + String(e).slice(0, 120)),
+          new Promise((r) => setTimeout(() => r("PENDING " + u), 3000))])));
+        const text = (document.getElementById("app") || document.body).innerText;
+        return JSON.stringify({ app: text.slice(0, 80) + " ... " + text.slice(-240),
+          buttons: [...document.querySelectorAll("button")].map((b) => b.textContent.trim().slice(0, 24) + (b.disabled ? " (disabled)" : "")),
+          resources: res.length, slow: res.filter((e) => e.duration > 2000).map((e) => e.name.slice(0, 100) + " " + Math.round(e.duration) + "ms"),
+          failed: res.filter((e) => e.responseStatus === 0 || e.responseStatus >= 400).map((e) => e.name.slice(0, 100) + " " + e.responseStatus),
+          modules: state.filter(Boolean).map((x) => x.replace(location.origin, "")) });
+      })()` }, sid).then((r) => r?.result?.value ?? JSON.stringify(r?.exceptionDetails || r).slice(0, 400), (e) => `diagnosis failed: ${e.message}`);
+      log(`  launcher: never became usable; the page: ${diag}`);
+      throw new Error(`launcher never became usable (last state: ${st})`);
+    }
     await sleep(300);
   }
   if (st === "autostart") { log(`  launcher: none on this page (app starts on load)`); return { mode: "autostart" }; }

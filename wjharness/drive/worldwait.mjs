@@ -461,6 +461,9 @@ for (let i = 1; i <= RUNS; i++) {
            * window where the phase closes. */
           if (name === "spawn83") { console.log("  [worldwait] generate segment opened — sampling threads"); startSampling(); }
           if (name === "spawnDone") { acctAtSpawnDone = stopSampling(); console.log("  [worldwait] generate segment closed — sampling stopped"); }
+          /* The pid is otherwise resolved only at spawn83, which a seed with an existing world never emits. */
+          if ((name === "benchStart" || name === "benchEnd") && (VMLEDGER || MAPS_SNAPSHOT) && !pid) pid = findRenderer(profile);
+          if ((name === "benchStart" || name === "benchEnd") && VMLEDGER && !pid) console.log(`  [worldwait] vmledger ${name}: renderer pid not found`);
           if ((name === "benchStart" || name === "benchEnd") && VMLEDGER && pid) {
             try { vmLedgerSnap(OUT, `run-${i}-${name}`, pid); if (VMPEEK) vmPeek(OUT, `run-${i}-${name}`, pid); }
             catch (e) { console.log(`  [worldwait] vmledger ${name} failed: ${e.message}`); }

@@ -20,6 +20,16 @@ import { tmpdir } from "os";
 import { join } from "path";
 import "./paths.mjs";   // exports the resolved configuration (CHROME_BIN, ...) into process.env
 
+/* WJ_BLOCK_HOSTS=<host>[,<host>...]: hosts the browser must fail to resolve at once. The app's page loads an external
+ * script with `defer`, which is ahead of the app's module in the document's execute-after-parsing list: when that
+ * host stalls, the page logs `[vite] connected.` and nothing else, and the run dies as "launcher never became usable
+ * (last state: none)" (2026-11-12: six launches, positive control in runs/2026-11-11-colo/fin/probe). A name that
+ * does not resolve fails fast and the app boots. Opt-in: a run that should exercise that script leaves it unset. */
+export function blockedHostArgs () {
+  const hosts = (process.env.WJ_BLOCK_HOSTS || "").split(",").map((h) => h.trim()).filter(Boolean);
+  return hosts.length ? [`--host-resolver-rules=${hosts.map((h) => `MAP ${h} ~NOTFOUND`).join(", ")}`] : [];
+}
+
 export function launchChrome({ extraArgs = [], headless = true, gl = true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "wj-"));
   const args = [
@@ -46,6 +56,7 @@ export function launchChrome({ extraArgs = [], headless = true, gl = true } = {}
       ? ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
       : ["--use-gl=angle", `--use-angle=${process.env.MC_ANGLE || "gl"}`]) : []),
     "--js-flags=--stack-trace-limit=64",
+    ...blockedHostArgs(),
     ...extraArgs,
     "about:blank",
   ];
