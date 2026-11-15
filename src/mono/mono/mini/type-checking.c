@@ -613,6 +613,56 @@ handle_isinst (MonoCompile *cfg, MonoClass *klass, MonoInst *src, int context_us
 	return ins;
 }
 
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_CAST_DIAG (mini-wasm.c): mark every InvalidCastException check the castclass decomposed into with a
+ * tagged OP_DUMMY_USE of the object, placed ahead of the check's compare so that only the compare (no dreg) lies
+ * between the mark and the OP_COND_EXC. The wasm emitter reads the mark from the OP_COND_EXC and raises with the
+ * object and KLASS. The mark is a real use: the passes that run after this one keep the object's vreg live to it. */
+extern int mono_wasm_jit_cast_diag;
+extern const char mono_wasm_jit_cast_note_tag [];
+
+static void
+wj_cast_note_checks (MonoCompile *cfg, MonoBasicBlock *first_bb, MonoBasicBlock *last_bb, int obj_reg, MonoClass *klass)
+{
+	MonoBasicBlock *b;
+	MonoInst *c, *note, *at;
+
+	for (b = first_bb; b; b = b->next_bb) {
+		for (c = b->code; c; c = c->next) {
+			if (!MONO_IS_COND_EXC (c) || !c->inst_p1 || strcmp ((const char *) c->inst_p1, "InvalidCastException"))
+				continue;
+			at = c;
+			if (c->prev && (c->prev->opcode == OP_COMPARE || c->prev->opcode == OP_COMPARE_IMM ||
+			                c->prev->opcode == OP_ICOMPARE || c->prev->opcode == OP_ICOMPARE_IMM))
+				at = c->prev;
+			MONO_INST_NEW (cfg, note, OP_DUMMY_USE);
+			note->sreg1 = obj_reg;
+			note->klass = klass;
+			note->inst_p1 = (gpointer) mono_wasm_jit_cast_note_tag;
+			mono_bblock_insert_before_ins (b, at, note);
+		}
+		if (b == last_bb)
+			break;
+	}
+}
+
+/* MONO_WASM_JIT_CAST_UNFINISHED (mini-wasm.c): is KLASS -- or the element class an array of it is checked against, or
+ * its generic definition -- a TypeBuilder's class that CreateType has not completed? Its parent, and so the depth the
+ * inline check would bake, is not final until then; wastypebuilder is set under the loader lock after both are. */
+extern int mono_wasm_jit_cast_unfinished;
+void mono_wasm_jit_note_cast_unfinished (MonoMethod *method, int tier, MonoClass *klass, gboolean isinst, gboolean checked_at_run_time);
+
+static gboolean
+wj_cast_target_unfinished (MonoClass *klass)
+{
+	while (klass && m_class_get_rank (klass))
+		klass = m_class_get_element_class (klass);
+	if (klass && mono_class_is_ginst (klass))
+		klass = mono_class_get_generic_class (klass)->container_class;
+	return klass && image_is_dynamic (m_class_get_image (klass)) && !m_class_was_typebuilder (klass);
+}
+#endif
+
 static void
 mono_decompose_typecheck (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins)
 {
@@ -630,7 +680,14 @@ mono_decompose_typecheck (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins)
 	NEW_BBLOCK (cfg, first_bb);
 	cfg->cbb = first_bb;
 
-	if (mini_class_has_reference_variant_generic_argument (cfg, klass, context_used)) {
+	gboolean with_cache = mini_class_has_reference_variant_generic_argument (cfg, klass, context_used);
+#ifdef HOST_BROWSER
+	if (!with_cache && !context_used && COMPILE_WASM (cfg) && wj_cast_target_unfinished (klass)) {
+		with_cache = mono_wasm_jit_cast_unfinished != 0;
+		mono_wasm_jit_note_cast_unfinished (cfg->method, cfg->wasm_jit_tier, klass, is_isinst, with_cache);
+	}
+#endif
+	if (with_cache) {
 		if (is_isinst)
 			ret = emit_isinst_with_cache (cfg, source, klass, context_used);
 		else
@@ -641,6 +698,10 @@ mono_decompose_typecheck (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins)
 			ret = handle_isinst (cfg, klass, source, context_used);
 		else
 			ret = handle_castclass (cfg, klass, source, context_used);
+#ifdef HOST_BROWSER
+		if (!is_isinst && !context_used && COMPILE_WASM (cfg) && mono_wasm_jit_cast_diag)
+			wj_cast_note_checks (cfg, first_bb, cfg->cbb, source->dreg, klass);
+#endif
 	}
 	EMIT_NEW_UNALU (cfg, move, OP_MOVE, ins->dreg, ret->dreg);
 

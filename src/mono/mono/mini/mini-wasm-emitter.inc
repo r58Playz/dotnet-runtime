@@ -802,6 +802,10 @@ wj_call_prof_im (MonoCompile *cfg, MonoCallInst *call)
 	extern gboolean mono_wasm_jit_prof_has_site (gpointer caller, MonoMethod *base);
 	if (!mono_wasm_jit_prof_origin || !call->wasm_prof_im || call->wasm_prof_im == cfg->wasm_jit_caller_imethod)
 		return cfg->wasm_jit_caller_imethod;
+	{ extern int mono_wasm_jit_prof_sample;   /* tier-1 sampling made the compiled method's own record the better witness */
+	  extern gboolean mono_wasm_jit_prof_site_warm (gpointer caller_ptr, MonoMethod *base);
+	  if (mono_wasm_jit_prof_sample > 0 && mono_wasm_jit_prof_site_warm (cfg->wasm_jit_caller_imethod, call->method))
+		return cfg->wasm_jit_caller_imethod; }
 	if (mono_wasm_jit_prof_has_site (call->wasm_prof_im, call->method)) {
 		wj_count (WJC_PROF_ORIGIN_USED);
 		return call->wasm_prof_im;
@@ -2056,6 +2060,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean eh_on = FALSE;            /* TRUE: emit the in-method try/catch wrapper for this method */
 	gboolean ehrec_on G_GNUC_UNUSED = FALSE;   /* eh_on + MONO_WASM_JIT_EH_REC: inline frame record instead of the island calls (R353) */
 	int ehrec_off G_GNUC_UNUSED = 0;           /* the record's byte offset in the frame, from refbase */
+	gboolean ehslim G_GNUC_UNUSED = FALSE;     /* ehrec_on + MONO_WASM_JIT_EH_SLIM: the slim push / pop and the pad's record argument */
 	int ehlmf_idx G_GNUC_UNUSED = 0;           /* i32 local: this thread's LMF address, re-derived at each push/pop */
 	int eh_dispatch_ti = -1, eh_endcatch_ti = -1;  /* functype indices: (i32,i32)->i32 dispatch + ()->void end_catch */
 	int resid_void_ti = -1;            /* ()->void: mono_wasm_jit_continue_unwind. Registered UNCONDITIONALLY --
@@ -3077,8 +3082,9 @@ co_ranges_done:
 	cnt [0] += 1;
 #ifdef HOST_BROWSER
 	{
-		extern int mono_wasm_jit_eh_rec;
+		extern int mono_wasm_jit_eh_rec, mono_wasm_jit_eh_slim;
 		ehrec_on = eh_on && mono_wasm_jit_eh_rec;
+		ehslim = ehrec_on && mono_wasm_jit_eh_slim;
 		if (ehrec_on) {
 			ehlmf_idx = nwparams + cnt [0];
 			cnt [0] += 1;
@@ -4285,8 +4291,63 @@ co_ranges_done:
 	wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_finally_trim_to, (guint32) eh_type_idx); \
 	wasm_op (&body, WASM_OP_END); \
 	} while (0)
+/* MONO_WASM_JIT_EH_SLIM (knob comment in mini-wasm.c, record in interp.c). The head is at s.b + WJ_SCRATCH_LMFHEAD_SLOT,
+ * re-derived at each use like the mirror was. The push writes seven record words and the head; `prev`, the two
+ * plain-LMF words and the finally-save depth stay unwritten (the frame scan is conservative, so a stale word there is at
+ * most a pin), and the IL offset written is the entry block's, whose own store is skipped (the block loop tests the same
+ * condition). ehlmf_idx is free in this mode and holds the pop's link. */
+#define EHSLIM_HEAD_LOAD() do { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_LMFHEAD_SLOT); } while (0)
+#define EMIT_EHSLIM_PUSH() do { const WjEhRecLayout *_L = mono_wasm_jit_ehrec_layout (); \
+	/* previous_lmf = head | 2 (the ext tag); bit 0 clear = no finally dispatched in this activation */ \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	EHSLIM_HEAD_LOAD (); \
+	wasm_i32_const (&body, 2); wasm_op (&body, WASM_OP_I32_OR); \
+	EHREC_I32_STORE (_L->previous_lmf); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, _L->kind_il_state); EHREC_I32_STORE (_L->kind); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); EHREC_I32_STORE (_L->il_state); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); \
+	wasm_i32_const (&body, (gint32) _L->magic_key); wasm_op (&body, WASM_OP_I32_XOR); EHREC_I32_STORE (_L->magic); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, (gint32) (intptr_t) cfg->method); EHREC_I32_STORE (_L->il_method); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, (gint32) (intptr_t) eh_table); EHREC_I32_STORE (_L->desc); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+	wasm_i32_const (&body, WJ_EHSLIM_ENTRY_FOLD (0, cfg->bb_entry) ? eh_table->il_offsets [0] : -1); EHREC_I32_STORE (_L->il_offset); \
+	/* publish the chain head = &rec.ext, last */ \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); EHREC_ADDR (0); \
+	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, WJ_SCRATCH_LMFHEAD_SLOT); \
+	} while (0)
+/* TRUE for the block whose IL-offset store the slim push absorbs: the entry block, at dense index 0, which nothing
+ * branches to, so it runs once, straight after the push (an EH body starts at dispatcher label 0 and there is no call
+ * between the push and it). */
+#define WJ_EHSLIM_ENTRY_FOLD(dense, blk) (ehslim && (dense) == 0 && N > 0 && (blk) == cfg->bb_entry && (blk)->in_count == 0 && \
+	bbidx [cfg->bb_entry->block_num] == 0)
+/* The link is loaded once: it restores the head, and its bit 0 says a finally / fault dispatch marked this record
+ * (interp.c wj_eh_dispatch), in which case the save stack may hold what an escaped finally body left (cold). */
+#define EMIT_EHSLIM_POP() do { const WjEhRecLayout *_L = mono_wasm_jit_ehrec_layout (); \
+	extern void mono_wasm_jit_ehrec_trim (gpointer rec); \
+	extern void mono_wasm_jit_ehrec_unlink (gpointer rec); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->previous_lmf); \
+	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) ehlmf_idx); \
+	EHSLIM_HEAD_LOAD (); \
+	EHREC_ADDR (0); wasm_op (&body, WASM_OP_I32_EQ); \
+	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+	wasm_i32_const (&body, -4); wasm_op (&body, WASM_OP_I32_AND); \
+	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, WJ_SCRATCH_LMFHEAD_SLOT); \
+	wasm_op (&body, WASM_OP_ELSE); \
+	EHREC_ADDR (0); \
+	wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_ehrec_unlink, (guint32) eh_type_idx); \
+	wasm_op (&body, WASM_OP_END); \
+	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+	wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_AND); \
+	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+	EHREC_ADDR (0); \
+	wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_ehrec_trim, (guint32) eh_type_idx); \
+	wasm_op (&body, WASM_OP_END); \
+	} while (0)
 #define EMIT_REF_LEAVE() do { guint16 _wjo_rl = wasm_origin_push (&body, WJO_EXIT); \
-	if (ehrec_on) { guint16 _wjo_ep = wasm_origin_push (&body, WJO_EH_POP); EMIT_EHREC_POP (); wasm_origin_pop (&body, _wjo_ep); } \
+	if (ehrec_on) { guint16 _wjo_ep = wasm_origin_push (&body, WJO_EH_POP); if (ehslim) EMIT_EHSLIM_POP (); else EMIT_EHREC_POP (); wasm_origin_pop (&body, _wjo_ep); } \
 	if (framebytes > 0 && !lazy_cold_frame && mono_wasm_jit_sp_arg < 2) { \
 		if (lazy_ref_frame) { \
 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
@@ -4963,7 +5024,11 @@ co_ranges_done:
 		 * Popped at every exit by EMIT_REF_LEAVE + the rethrow paths. In record mode (R353) the push is inline and
 		 * the island call is not emitted at all. */
 #ifdef HOST_BROWSER
-		if (ehrec_on) {
+		if (ehslim) {
+			EMIT_EHSLIM_PUSH ();
+			mono_wasm_jit_count (WJC_EHREC_EMITTED);
+			mono_wasm_jit_count (WJC_EHSLIM_EMITTED);
+		} else if (ehrec_on) {
 			EMIT_EHREC_PUSH ();
 			mono_wasm_jit_count (WJC_EHREC_EMITTED);
 		} else {
@@ -5475,7 +5540,9 @@ co_ranges_done:
 				 * It works where INLINE_ILOFS failed, for a specific reason: it `global.get`s the il_state
 				 * pointer at each store site instead of caching it in a method-long local, so it leaves
 				 * NOTHING live across the method's calls. */
-				if (ehrec_on) {
+				if (WJ_EHSLIM_ENTRY_FOLD (i, bb)) {
+					/* the slim push wrote this block's offset */
+				} else if (ehrec_on) {
 					/* R353: straight into this frame's own record through refbase, which is live for the
 					 * landing pad anyway -- no load of the current island at all */
 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
@@ -6849,6 +6916,43 @@ co_ranges_done:
 					NN_SET (cmp_a);
 					WJ_NCE_CHECK ();
 				}
+#ifdef HOST_BROWSER
+				/* MONO_WASM_JIT_CAST_DIAG: a castclass check that mono_decompose_typecheck marked (a tagged
+				 * OP_DUMMY_USE of the object ahead of this check's compare) raises from its own taken arm with
+				 * the object and the class, instead of branching to the shared block, which has neither. The
+				 * arm is the shared block's sequence -- frame, raise, unreachable -- with two operands. */
+				if (exc_id == 3) {
+					extern int mono_wasm_jit_cast_diag;
+					extern gint32 mono_wasm_jit_cast_diag_sites;
+					extern const char mono_wasm_jit_cast_note_tag [];
+					extern void mono_wasm_jit_raise_cast (MonoObject *obj, MonoClass *klass);
+					MonoInst *cn = mono_wasm_jit_cast_diag ? ins->prev : NULL;
+					if (cn && (cn->opcode == OP_COMPARE || cn->opcode == OP_COMPARE_IMM ||
+					           cn->opcode == OP_ICOMPARE || cn->opcode == OP_ICOMPARE_IMM))
+						cn = cn->prev;
+					if (cn && cn->opcode == OP_DUMMY_USE && cn->inst_p1 == (gpointer) mono_wasm_jit_cast_note_tag && cn->klass) {
+						WasmFuncType ct; int cti = -1, ck;
+						memset (&ct, 0, sizeof (ct)); ct.params [0] = WASM_I32; ct.params [1] = WASM_I32; ct.nparams = 2; ct.ret = WASM_VOID;
+						for (ck = 0; ck < nextra; ++ck) if (functype_eq (&extra_types [ck], &ct)) { cti = ti_base + ck; break; }
+						if (cti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = ct; cti = ti_base + nextra++; }
+						uses_calls = TRUE;
+						if (!wasm_ld (&body, &lc, cmp_a)) { fail = "cond_exc a"; goto done; }
+						if (cmp_imm_mode) { if (cmp_i64) wasm_i64_const (&body, cmp_imm64); else wasm_i32_const (&body, cmp_imm); }
+						else if (!wasm_ld (&body, &lc, cmp_b)) { fail = "cond_exc b"; goto done; }
+						wasm_op (&body, cmp_wop);
+						WJ_HINT (0);
+						wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+						RAISE_ENSURE_REF_FRAME ();
+						if (!wasm_ld (&body, &lc, cn->sreg1)) { fail = "cast diag obj"; goto done; }
+						wasm_i32_const (&body, (gint32) (gsize) cn->klass);
+						wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_raise_cast, (guint32) cti);
+						wasm_op (&body, WASM_OP_UNREACHABLE);   /* raises; never returns */
+						wasm_op (&body, WASM_OP_END);
+						mono_atomic_inc_i32 (&mono_wasm_jit_cast_diag_sites);
+						break;
+					}
+				}
+#endif
 				if (!WJ_HAS_THROW (exc_id)) { fail = "no shared throw block for exc"; goto done; }
 				if (!wasm_ld (&body, &lc, cmp_a)) { fail = "cond_exc a"; goto done; }
 				if (cmp_imm_mode) { if (cmp_i64) wasm_i64_const (&body, cmp_imm64); else wasm_i32_const (&body, cmp_imm); }
@@ -7651,6 +7755,7 @@ co_ranges_done:
 						gboolean vc_vret = FALSE; int n2c;
 						MonoVTable *pred_vt = NULL;
 						gint32 *pred_cha = NULL;   /* plan2x S3: a CHA arm's guard word (pred_vt stays NULL) */
+						int pred_sslot = -1;       /* MONO_WASM_JIT_RECV_CLASS: >= 0 = a static-class arm, guarded on this vtable slot (pred_vt stays NULL) */
 						MonoMethod *pred_target = NULL;
 						int pred_fslot = 0;
 						MonoMethod *ddevirt_target = NULL;   /* R215 delegate devirt */
@@ -7843,6 +7948,8 @@ co_ranges_done:
 							guint32 pred_samples = 0;
 							extern gboolean mono_wasm_jit_prof_predict_method (gpointer caller, MonoMethod *base,
 								MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples);
+							extern int mono_wasm_jit_recv_class;
+							extern gboolean mono_wasm_jit_recv_compatible (MonoClass *k, MonoMethod *target);
 							gpointer pred_im = wj_call_prof_im (cfg, call);
 							gboolean pred_ok = mono_wasm_jit_prof_predict (pred_im,
 							    call->method, &pred_vt, &pred_target, &pred_samples, &pred_why);
@@ -7874,6 +7981,34 @@ co_ranges_done:
 									wj_count (WJC_S3_ARM_OVERRIDDEN);
 								}
 							  } }
+							/* MONO_WASM_JIT_RECV_CLASS & 4: a profile target whose class is neither the receiver's known class,
+							 * above it nor below it is one this site cannot dispatch to -- an inlined site's record is every
+							 * caller's. No arm rather than a dead one (12 in the site census; the polymorphic arms below test
+							 * the same thing per candidate). */
+							if (pred_ok && pred_target && call->wasm_recv_class && (mono_wasm_jit_recv_class & 4) &&
+							    !mono_wasm_jit_recv_compatible (call->wasm_recv_class, pred_target)) {
+								pred_ok = FALSE; pred_vt = NULL; pred_target = NULL; pred_cha = NULL; pred_src = 0; pred_why = 12;
+								wj_count (WJC_RECV_FILTERED);
+							}
+							/* MONO_WASM_JIT_RECV_CLASS & 2: the gate's rule (method-to-ir.c) for a site it did not inline. The
+							 * receiver's class holds wasm_static_target in wasm_static_slot and nothing loaded overrides it: that
+							 * is the arm, guarded on the slot's method identity (pred_sslot), behind the profiled vtable when
+							 * the record agrees on the target. S3's own CHA arm is already exact and stays. */
+							if (call->wasm_recv_class && call->wasm_static_target && (mono_wasm_jit_recv_class & 2) && !(pred_ok && pred_cha)) {
+								gboolean _stc = FALSE;
+								if (!mono_wasm_jit_cha_final_word (call->wasm_static_target, &_stc)) {
+									wj_count (WJC_RECV_OVERRIDDEN);
+								} else if (pred_ok && pred_vt && pred_target == call->wasm_static_target) {
+									if (vc_mid_slot < 0) {
+										pred_sslot = call->wasm_static_slot;
+										wj_count (WJC_RECV_WIDENED);
+									}
+								} else {
+									pred_ok = TRUE; pred_vt = NULL; pred_cha = NULL; pred_target = call->wasm_static_target;
+									pred_sslot = call->wasm_static_slot; pred_src = 5;
+									wj_count (WJC_RECV_ARM_PRED);
+								}
+							}
 							if (G_UNLIKELY (wj_site_cur))
 								wj_site_note_pred (wj_site_cur, pred_im, call->method, pred_vt, pred_target, pred_ok && !pred_src ? 1 : pred_src);
 							if (pred_ok) {
@@ -8174,6 +8309,8 @@ vcall_nullchk_done:
 									MonoVTable *skip, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_pct);
 								extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
 								extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
+								extern int mono_wasm_jit_recv_class;
+								extern gboolean mono_wasm_jit_recv_compatible (MonoClass *k, MonoMethod *target);
 								gpointer im = wj_call_prof_im (cfg, call);
 								MonoVTable *v1 = NULL, *v2 = NULL;
 								MonoMethod *t1 = NULL, *t2 = NULL;
@@ -8186,6 +8323,7 @@ vcall_nullchk_done:
 								#define WJ_ARM_OK(vt, t, pct, fs) ( \
 									(vt) && (t) && (int) (pct) >= mono_wasm_jit_devirt_arm2_pct && \
 									(t) != cfg->method && !mono_wasm_jit_callee_perm_unjittable (t) && \
+									(!call->wasm_recv_class || !(mono_wasm_jit_recv_class & 4) || mono_wasm_jit_recv_compatible (call->wasm_recv_class, (t))) && \
 									((fs) = wj_lazy_arm_fslot ((t), cfg->method, &ftd)) > 0 && \
 									wj_arm_abi_ok ((t), &ftd))
 								/* NOTE the f-slot test above is not merely "is it compiled": it is what makes the
@@ -8299,6 +8437,43 @@ vcall_nullchk_done:
 								}
 							}
 							if (!is_delegate_invoke) wj_emit_fast_count (&body, WJC_FAST_VSITE);   /* C1 route mix: denominator */
+#ifdef HOST_BROWSER
+							/* MONO_WASM_JIT_PROF_SAMPLE (tier 1): every dispatch of this site counts a process-wide word down,
+							 * and the one that reaches zero hands the receiver's vtable to the site's profile record. Ahead of
+							 * the arm, so it sees arm hits and IC hits alike. The receiver is non-null here (the site's
+							 * receiver null check is emitted above). */
+							{ extern int mono_wasm_jit_prof_sample;
+							  extern void mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt);
+							  if (mono_wasm_jit_prof_sample > 0 && cfg->wasm_jit_tier < 2 && !is_delegate_invoke && vic) {
+								gpointer _psite = vic;   /* the site's IC cell: its miss path's record is the one sampled into */
+								gint32 *_pw = wj_word_alloc ();
+								if (_pw) {
+									guint32 _pa = (guint32) (gsize) _pw;
+									WasmFuncType _pt; int _pti = -1, _pk;
+									memset (&_pt, 0, sizeof (_pt)); _pt.ret = WASM_VOID; _pt.nparams = 2; _pt.params [0] = WASM_I32; _pt.params [1] = WASM_I32;
+									for (_pk = 0; _pk < nextra; ++_pk) if (functype_eq (&extra_types [_pk], &_pt)) { _pti = ti_base + _pk; break; }
+									if (_pti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _pt; _pti = ti_base + nextra++; }
+									wj_count (WJC_PROF_SAMPLE_SITES);
+									wasm_i32_const (&body, 0);
+									wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _pa);
+									wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SUB);
+									wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) aic_vtab_idx);
+									wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _pa);
+									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+									wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_LT_S);
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+										wasm_i32_const (&body, 0); wasm_i32_const (&body, mono_wasm_jit_prof_sample);
+										wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _pa);
+										ENSURE_REF_FRAME ();
+										wasm_i32_const (&body, (gint32) (intptr_t) _psite);
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "prof sample this ld"; goto done; }
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+										wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_prof_sample_site, (guint32) _pti);
+										RELEASE_LAZY_REF_FRAME ();
+									wasm_op (&body, WASM_OP_END);
+								}
+							  } }
+#endif
 							wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $after (void) */
 							/* Strict monomorphic guard. A hit bypasses the worker PIC completely. The prediction
 							 * is deliberately speculative: interpreter warmup can see one receiver before the
@@ -8306,7 +8481,7 @@ vcall_nullchk_done:
 							 * worker-local alternate way below. It costs one bounds check + one i64 guard on a
 							 * prediction miss, but turns the second and later calls of the common alternate into
 							 * direct f-slot dispatch instead of repeatedly entering the shared resolver. */
-							if (pred_fslot > 0 && (pred_vt || (pred_cha && pred_target == call->method)) && pred_target && !is_delegate_invoke) {
+							if (pred_fslot > 0 && (pred_vt || (pred_cha && pred_target == call->method) || pred_sslot >= 0) && pred_target && !is_delegate_invoke) {
 								wj_count (WJC_DEVIRT_EMITTED); WJ_REEMIT_SCOPED (WJC_REEMIT_EMITTED);
 								ic_tag = 7;   /* R205: any IC hit below this guard is the ALTERNATE receiver */
 								wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_miss */
@@ -8360,7 +8535,49 @@ vcall_nullchk_done:
 										if (!wasm_ld (&body, &lc, this_vr)) { fail = "devirt this ld"; goto done; }
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 									  } }
-									if (mono_wasm_jit_pred_mid && vc_mid_slot >= 0) {
+									if (pred_sslot >= 0) {
+										/* MONO_WASM_JIT_RECV_CLASS: the slot-identity guard. The receiver is an instance of a class
+										 * whose vtable holds pred_target at pred_sslot, so its own class's vtable has that slot and
+										 * the method there is where this receiver dispatches the call. A profiled vtable that
+										 * resolved to the same target is tried first (one compare for the common receiver). */
+										wj_count (WJC_RECV_ARM_EMITTED);
+										wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
+										if (pred_vt) {
+											wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40); /* $pred_hit */
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+											wasm_i32_const (&body, (gint32) (intptr_t) pred_vt);
+											wasm_op (&body, WASM_OP_I32_EQ);
+											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* -> $pred_hit */
+										}
+										wj_emit_class_slot_method (&body, aic_vtab_idx, vc_class_vtable_off, pred_sslot);
+										wasm_i32_const (&body, (gint32) (intptr_t) pred_target);
+										wasm_op (&body, WASM_OP_I32_NE);
+										WJ_HINT2 (0, WJC_BRANCH_HINT_IC);
+										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, pred_vt ? 1 : 0);   /* -> $pred_miss */
+#ifdef HOST_BROWSER
+										{ extern int mono_wasm_jit_recv_class;
+										  extern int mono_wasm_jit_recv_verify (MonoVTable *vt, MonoClass *k);
+										  if (mono_wasm_jit_recv_class & 8) {
+											/* the verify mode (method-to-ir.c WJ_RECV_VERIFY): the slot guard passed, so the
+											 * receiver's class must be wasm_recv_class or below it; a failure is counted and misses */
+											WasmFuncType _vt; int _vti = -1, _vk2;
+											memset (&_vt, 0, sizeof (_vt)); _vt.ret = WASM_I32; _vt.nparams = 2; _vt.params [0] = WASM_I32; _vt.params [1] = WASM_I32;
+											for (_vk2 = 0; _vk2 < nextra; ++_vk2) if (functype_eq (&extra_types [_vk2], &_vt)) { _vti = ti_base + _vk2; break; }
+											if (_vti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _vt; _vti = ti_base + nextra++; }
+											ENSURE_REF_FRAME ();
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+											wasm_i32_const (&body, (gint32) (intptr_t) ((mono_wasm_jit_recv_class & 16) ? mono_defaults.exception_class : call->wasm_recv_class));   /* 16: the negative control */
+											wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_recv_verify, (guint32) _vti);
+											wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
+											RELEASE_LAZY_REF_FRAME ();
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+											wasm_op (&body, WASM_OP_I32_EQZ);
+											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, pred_vt ? 1 : 0);   /* -> $pred_miss */
+										  } }
+#endif
+										if (pred_vt)
+											wasm_op (&body, WASM_OP_END); /* $pred_hit */
+									} else if (mono_wasm_jit_pred_mid && vc_mid_slot >= 0) {
 										/* R311 METHOD-IDENTITY ARM GUARD. The predicted receiver pays the one
 										 * compare it always did; any other receiver whose class holds pred_target
 										 * in this vtable slot (inherits it) takes the arm instead of the IC. */
@@ -9843,19 +10060,26 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
 #ifdef HOST_BROWSER
 		/* R353: this frame is the one resuming, so its record is the current island (dispatch and
-		 * wj_eh_restore_lmf read cur_island_il_state in record mode; WJC_EHREC_DISPATCH_NOREC checks it). */
+		 * wj_eh_restore_lmf read cur_island_il_state in record mode; WJC_EHREC_DISPATCH_NOREC checks it).
+		 * A slim record is not published there: the pad passes the record itself, whose desc is the table. */
+		if (ehslim) {
+			EHREC_ADDR (0);
+		} else {
 		if (ehrec_on) {
 			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8);
 			EHREC_ADDR (mono_wasm_jit_ehrec_layout ()->il);
 			wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0);
 		}
 		wasm_i32_const (&body, (gint32) (intptr_t) eh_table);
+		}
 #else
 		wasm_i32_const (&body, 0x7ff0);   /* offline: placeholder EH-table addr */
 #endif
 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);   /* $blk = the throwing bb */
 #ifdef HOST_BROWSER
-		{ extern int mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk); wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_eh_dispatch, eh_dispatch_ti); }
+		{ extern int mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk);
+		  extern int mono_wasm_jit_eh_dispatch_rec (gpointer rec, int blk);
+		  wj_emit_helper_call (&body, ehslim ? (gpointer) mono_wasm_jit_eh_dispatch_rec : (gpointer) mono_wasm_jit_eh_dispatch, eh_dispatch_ti); }
 #else
 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff1, (guint32) eh_dispatch_ti);
 #endif
@@ -9865,7 +10089,9 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 		wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);     /* h < 0: no local handler */
 		/* the method escapes via rethrow -> pop its il_state island first */
 #ifdef HOST_BROWSER
-		if (ehrec_on)
+		if (ehslim)
+			EMIT_EHSLIM_POP ();
+		else if (ehrec_on)
 			EMIT_EHREC_POP ();
 		else
 		{ extern void mono_wasm_jit_leave_island (void); wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_leave_island, eh_endcatch_ti); }

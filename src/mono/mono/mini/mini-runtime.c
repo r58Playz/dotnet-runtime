@@ -763,13 +763,38 @@ register_opcode_emulation (int opcode, MonoJitICallInfo *jit_icall_info, const c
 #define register_dyn_icall(func, name, sig, save) \
 	(mono_register_jit_icall_info (&mono_get_jit_icall_info ()->name, (gconstpointer)func, #name, (sig), (save), NULL))
 
+#if defined (TARGET_WASM) && defined (HOST_BROWSER)
+/* R353: this thread's LMF address as a real __thread, so emitted code can reach the LMF chain head without a
+ * pthread-key call: interp.c puts &mono_wasm_lmf_addr_mirror in the per-thread scratch (WJ_SCRATCH_LMFADDR_SLOT),
+ * exactly as R317 does for the current thread object. Kept in step with the pthread key at its only setter,
+ * mono_set_lmf_addr, on the owning thread. It is NULL before the first attach and keeps its value after a detach
+ * (mini_thread_cleanup's reset sits behind a mono_get_lmf () that reads NULL once jit_tls is gone).
+ *
+ * The address it holds is the thread's WJ_SCRATCH_LMFHEAD_SLOT, not &jit_tls->lmf (setup_jit_tls_data): the head lives
+ * in the JIT scratch and jit_tls->lmf is unused in the browser. Read the head through mono_get_lmf (), the pthread
+ * key or TLS_KEY_LMF_ADDR. */
+__thread MonoLMF **mono_wasm_lmf_addr_mirror;
+
+gpointer mono_wasm_lmf_addr_mirror_addr (void);
+gpointer
+mono_wasm_lmf_addr_mirror_addr (void)
+{
+	return &mono_wasm_lmf_addr_mirror;
+}
+#endif
+
 MonoLMF *
 mono_get_lmf (void)
 {
+#if defined (TARGET_WASM) && defined (HOST_BROWSER)
+	if (mono_tls_get_jit_tls ())
+		return mono_wasm_lmf_addr_mirror ? *mono_wasm_lmf_addr_mirror : NULL;
+#else
 	MonoJitTlsData *jit_tls;
 
 	if ((jit_tls = mono_tls_get_jit_tls ()))
 		return jit_tls->lmf;
+#endif
 	/*
 	 * We do not assert here because this function can be called from
 	 * mini-gc.c on a thread that has not executed any managed code, yet
@@ -819,21 +844,6 @@ mono_set_jit_tls (MonoJitTlsData *jit_tls)
 		mono_thread_info_tls_set (info, TLS_KEY_JIT_TLS, jit_tls);
 }
 
-#if defined (TARGET_WASM) && defined (HOST_BROWSER)
-/* R353: this thread's LMF address as a real __thread, so emitted code can reach the LMF chain head without a
- * pthread-key call: interp.c puts &mono_wasm_lmf_addr_mirror in the per-thread scratch (WJ_SCRATCH_LMFADDR_SLOT),
- * exactly as R317 does for the current thread object. Kept in step with the pthread key at its only setter,
- * below, on the owning thread; NULL while detached. */
-__thread MonoLMF **mono_wasm_lmf_addr_mirror;
-
-gpointer mono_wasm_lmf_addr_mirror_addr (void);
-gpointer
-mono_wasm_lmf_addr_mirror_addr (void)
-{
-	return &mono_wasm_lmf_addr_mirror;
-}
-#endif
-
 static void
 mono_set_lmf_addr (MonoLMF **lmf_addr)
 {
@@ -846,20 +856,22 @@ mono_set_lmf_addr (MonoLMF **lmf_addr)
 	 * same address's previous_lmf changes under us (0 -> 0x4) -- i.e. it is recycled stack, not an LMF. The
 	 * remaining way that happens without anyone "writing an LMF" is for lmf_addr itself to be re-pointed:
 	 * every read of the head then comes from wherever this points. setup_jit_tls_data passes
-	 * &jit_tls->lmf (heap); anything else -- a coop attach/detach pointing it at a
-	 * stack slot or another jit_tls -- makes the head live in memory that can be reused underneath it.
+	 * the thread's scratch slot (TLS); anything else -- a coop attach/detach pointing it at a
+	 * stack slot or a jit_tls -- makes the head live in memory that can be reused underneath it.
 	 * Print the target and the value it currently holds so the two cases are distinguishable. */
 	{
 		extern int mono_wasm_jit_lmf_publish_diag;
+		extern gpointer mono_wasm_jit_lmf_head_addr (void);
 		if (G_UNLIKELY (mono_wasm_jit_lmf_publish_diag)) {
 			static int n;
 			MonoJitTlsData *cur = mono_tls_get_jit_tls ();
-			gboolean expected = cur && lmf_addr == &cur->lmf;
+			gpointer slot = mono_wasm_jit_lmf_head_addr ();
+			gboolean expected = cur && (gpointer) lmf_addr == slot;
 			if (!expected && n++ < 20)
-				printf ("WASM_JIT_LMF_ADDR_SET: lmf_addr=%p (jit_tls=%p, &jit_tls->lmf=%p) holds=%p %s\n",
-					(void *) lmf_addr, (void *) cur, cur ? (void *) &cur->lmf : NULL,
+				printf ("WASM_JIT_LMF_ADDR_SET: lmf_addr=%p (jit_tls=%p, the scratch slot=%p) holds=%p %s\n",
+					(void *) lmf_addr, (void *) cur, (void *) slot,
 					lmf_addr ? (void *) *lmf_addr : NULL,
-					cur ? "NOT &jit_tls->lmf" : "no jit_tls yet");
+					cur ? "NOT the scratch slot" : "no jit_tls yet");
 		}
 	}
 	mono_wasm_lmf_addr_mirror = lmf_addr;
@@ -1004,9 +1016,22 @@ setup_jit_tls_data (gpointer stack_start, MonoAbortFunction abort_func)
 
 	jit_tls->first_lmf = lmf;
 
+#if defined (TARGET_WASM) && defined (HOST_BROWSER)
+	/* The chain head lives in this thread's JIT scratch (interp.c, WJ_SCRATCH_LMFHEAD_SLOT), a __thread array: emitted
+	 * code reaches it as s.b + a constant (MONO_WASM_JIT_EH_SLIM), and the address stays this pthread's across a
+	 * detach and re-attach, where &jit_tls->lmf would be a new allocation that live module instances could not
+	 * follow. jit_tls->lmf stays NULL. */
+	{
+		extern gpointer mono_wasm_jit_lmf_head_addr (void);
+		MonoLMF **head = (MonoLMF **) mono_wasm_jit_lmf_head_addr ();
+		mono_set_lmf_addr (head);
+		*head = lmf;
+	}
+#else
 	mono_set_lmf_addr (&jit_tls->lmf);
 
 	jit_tls->lmf = lmf;
+#endif
 
 #if defined (TARGET_WASM) && defined (HOST_BROWSER)
 	/* Record every root LMF handed out, so a later stale head can be matched against a PREVIOUS thread's
@@ -1018,8 +1043,8 @@ setup_jit_tls_data (gpointer stack_start, MonoAbortFunction abort_func)
 		if (G_UNLIKELY (mono_wasm_jit_lmf_publish_diag)) {
 			static int n;
 			if (n++ < 20)
-				printf ("WASM_JIT_LMF_ROOT: thread attached jit_tls=%p first_lmf=%p (&jit_tls->lmf=%p)\n",
-					(void *) jit_tls, (void *) lmf, (void *) &jit_tls->lmf);
+				printf ("WASM_JIT_LMF_ROOT: thread attached jit_tls=%p first_lmf=%p (lmf_addr=%p)\n",
+					(void *) jit_tls, (void *) lmf, (void *) mono_get_lmf_addr ());
 		}
 	}
 #endif

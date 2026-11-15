@@ -1557,6 +1557,8 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
  * disagree about the front-runner; the result is only ever a worse *prediction*, and the emitted code
  * guards on the identity regardless. Taking a lock here would cost more than the profile is worth.
  */
+static guint32 wj_prof_decays;   /* MONO_WASM_JIT_PROF_DECAY: halvings (racy, a census) */
+
 static void
 wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod *target,
                    gboolean from_jit)
@@ -1580,8 +1582,23 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
 		 * ago, and with the record memoised at the call site this early-out is the whole cost of the
 		 * profile -- two loads and a compare, no barrier and no scan. */
 		guint32 seen = (kind == WJ_SITE_DELEGATE || !target) ? s->total : s->margin;
-		if (seen >= WJ_PROF_SATURATE)
+		extern int mono_wasm_jit_prof_decay;
+		/* MONO_WASM_JIT_PROF_DECAY (knob comment in mini-wasm.c): a resolved observation from JIT code -- an IC miss, or
+		 * a tier-1 site's sample -- is never refused, and the counts are halved when the total reaches the knob, so the
+		 * record follows what the site dispatches to now. The interpreter's own observations still stop at saturation:
+		 * that early-out is its whole cost. Counts only: an identity keeps its slot and its target, so no reader can pair
+		 * one receiver with another's target. */
+		gboolean live = from_jit && target && kind == WJ_SITE_VIRTUAL && mono_wasm_jit_prof_decay > 0;
+		if (seen >= WJ_PROF_SATURATE && !live)
 			return;                       /* decided; stop paying for this site */
+		if (live && s->total >= (guint32) mono_wasm_jit_prof_decay) {
+			guint32 dk;
+			for (dk = 0; dk < s->nids && dk < WJ_PROF_WAYS; ++dk)
+				s->id_counts [dk] >>= 1;
+			s->margin >>= 1;
+			s->total >>= 1;
+			wj_prof_decays++;
+		}
 		wj_prof_samples++;
 		if (from_jit)
 			wj_prof_jit_samples++;
@@ -2946,6 +2963,79 @@ mono_wasm_jit_hook_publish (int desc_id, MonoMethod *m, InterpMethod *im)
 	ep = mono_wasm_jit_rendezvous_epoch (&desc_id, 1);
 	if (ep > 0)
 		mono_wasm_jit_hook_wait (ep);
+}
+
+/* MONO_WASM_JIT_PROF_SAMPLE: one sampled dispatch of a tier-1 virtual site, (i32 the site's IC cell, i32 the
+ * receiver's vtable)->void, called from emitted code once every `period` dispatches of the site -- arm hits and IC hits
+ * alike, which no other observer sees. It records into the record the site's IC miss does (wj_vcall_pic_publish: the
+ * compiled method's own, memoised in WjVcallSite.prof), so the two observers of a site agree on where its evidence
+ * lives. The target is read off the receiver's class the way get_virtual_method does for the plain cases (a
+ * class-virtual slot, or the class's offset for a non-generic interface); anything else is recorded unresolved. No
+ * allocation beyond the record's own, no managed code, no lock. */
+static guint32 wj_prof_sampled, wj_prof_sampled_unresolved;
+void mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt);
+void
+mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt)
+{
+	WjVcallSite *site;
+	WjProfSite *s;
+	MonoMethod *base, *t = NULL;
+	MonoClass *k;
+	if (!ic || !vt || !(k = vt->klass))
+		return;
+	site = wj_vcall_site (ic);
+	if (!site->caller_im || !(base = site->base))
+		return;
+	s = site->prof;
+	if (G_UNLIKELY (!s)) {
+		s = wj_prof_site (site->caller_im, base, WJ_SITE_VIRTUAL, TRUE);
+		if (!s)
+			return;
+		site->prof = s;
+	}
+	if (!base->is_inflated && !base->is_generic && base->slot >= 0 && base->klass && m_class_get_vtable (k) &&
+	    !mono_class_is_ginst (k) && !m_class_get_rank (k)) {
+		int slot = -1;
+		if (mono_class_is_interface (base->klass)) {
+			if (!mono_class_is_ginst (base->klass) && !mono_class_is_gtd (base->klass)) {
+				int io = mono_class_interface_offset (k, base->klass);
+				if (io >= 0)
+					slot = io + base->slot;
+			}
+		} else if (m_class_get_supertypes (k) && m_class_get_supertypes (base->klass) && m_class_get_idepth (base->klass) > 0 &&
+		           mono_class_has_parent_fast (k, base->klass)) {
+			slot = base->slot;
+		}
+		if (slot >= 0 && slot < m_class_get_vtable_size (k)) {
+			t = m_class_get_vtable (k) [slot];
+			if (t && (t->is_inflated || t->is_generic || (t->flags & METHOD_ATTRIBUTE_ABSTRACT) || !t->klass || mono_class_is_interface (t->klass)))
+				t = NULL;
+		}
+	}
+	wj_prof_sampled++;
+	if (!t)
+		wj_prof_sampled_unresolved++;
+	wj_prof_record_at (s, WJ_SITE_VIRTUAL, vt, t, TRUE);
+}
+
+void mono_wasm_jit_prof_sample_stats (guint32 *sampled, guint32 *unresolved, guint32 *decays);
+void
+mono_wasm_jit_prof_sample_stats (guint32 *sampled, guint32 *unresolved, guint32 *decays)
+{
+	*sampled = wj_prof_sampled;
+	*unresolved = wj_prof_sampled_unresolved;
+	*decays = wj_prof_decays;
+}
+
+/* MONO_WASM_JIT_PROF_SAMPLE: does the compiled method's own record hold a warm site for `base` (>= 8 observations)?
+ * Tier-1 sampling fills that record with what this method's sites dispatched to, which the emitter's arm then prefers
+ * to an inlinee's every-caller record (mini-wasm-emitter.inc wj_call_prof_im). */
+gboolean mono_wasm_jit_prof_site_warm (gpointer caller_ptr, MonoMethod *base);
+gboolean
+mono_wasm_jit_prof_site_warm (gpointer caller_ptr, MonoMethod *base)
+{
+	WjProfSite *s = wj_prof_site ((InterpMethod *) caller_ptr, base, WJ_SITE_VIRTUAL, FALSE);
+	return s && s->total >= 8;
 }
 
 static void
@@ -6894,10 +6984,19 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
  *  - the result slot is written then read in strict nested (LIFO) order across reentrancy.
  * Per-thread => MT-safe. The address can't be baked into the emitted module (a __thread address
  * differs per thread), so the JITted code fetches it via mono_wasm_jit_scratch() at each call site. */
-static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 40] __attribute__ ((aligned (8)));   /* + the TLAB, thread, LMF-address, finally-depth and census-select slots */
-g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 40);
-g_static_assert (WJ_SCRATCH_FINSP_SLOT + 8 <= WJ_SCRATCH_SIZE + 40);
-g_static_assert (WJ_SCRATCH_SITESEL_SLOT + 8 <= WJ_SCRATCH_SIZE + 40);
+static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 48] __attribute__ ((aligned (8)));   /* + the TLAB, thread, LMF-address, finally-depth, census-select and LMF-head slots */
+g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
+g_static_assert (WJ_SCRATCH_FINSP_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
+g_static_assert (WJ_SCRATCH_SITESEL_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
+g_static_assert (WJ_SCRATCH_LMFHEAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
+
+/* Where this thread's LMF chain head is stored: mini-runtime.c's setup_jit_tls_data points lmf_addr here. */
+gpointer mono_wasm_jit_lmf_head_addr (void);
+gpointer
+mono_wasm_jit_lmf_head_addr (void)
+{
+	return wj_scratch + WJ_SCRATCH_LMFHEAD_SLOT;
+}
 /* The 8 bytes past the marshalling area are NOT scratch: they hold the address of this thread's
  * mono_wasm_sgen_tls_info (sgen-mono.c), for OP_WASM_JIT_ALLOC_FAST's inline TLAB bump (R305). The emitter reads
  * it at WJ_SCRATCH_TLAB_SLOT; this pins the two together. */
@@ -9050,8 +9149,8 @@ wasm_jit_cpp_unwind (MonoObject *exc, MonoGCHandle pin)
  * the exception by a C++/wasm-EH native unwind (wasm_jit_cpp_unwind) to the nearest landing pad — an
  * in-method wasm catch or the interp e-thunk boundary. Never returns.
  */
-void
-mono_wasm_jit_raise_corlib (int exc_id)
+static void
+wj_raise_corlib (int exc_id, gboolean cast_noted)
 {
 	MonoException *ex;
 	MonoContext ctx;
@@ -9059,7 +9158,7 @@ mono_wasm_jit_raise_corlib (int exc_id)
 	case 0:  ex = mono_get_exception_overflow (); break;
 	case 1:  ex = mono_get_exception_divide_by_zero (); break;
 	case 2:  ex = mono_get_exception_index_out_of_range (); break;
-	case 3:  ex = mono_get_exception_invalid_cast (); WJ_NOTE_CAST ("jit-raise", NULL, NULL, NULL); break;
+	case 3:  ex = mono_get_exception_invalid_cast (); if (!cast_noted) WJ_NOTE_CAST ("jit-raise", NULL, NULL, NULL); break;
 	case 4:  ex = mono_get_exception_null_reference (); break;
 	case 5:  ex = mono_get_exception_arithmetic (); break;
 	case 6:  ex = mono_get_exception_array_type_mismatch (); break;
@@ -9083,6 +9182,23 @@ mono_wasm_jit_raise_corlib (int exc_id)
 	 * whose OWN wasm landing pad catches the cpp unwind (e.g. a checked-op corlib exception caught by the
 	 * SAME JITted method). Either way it is delivered by the native unwind below, which never returns. */
 	wasm_jit_cpp_unwind ((MonoObject *) ex, pin);   /* C++-unwind to the nearest landing pad; never returns */
+}
+
+void
+mono_wasm_jit_raise_corlib (int exc_id)
+{
+	wj_raise_corlib (exc_id, FALSE);
+}
+
+/* MONO_WASM_JIT_CAST_DIAG: the InvalidCastException of one inline castclass check, raised from the check's own taken
+ * arm with the object it tested and the class it tested against ((i32,i32)->void). The note reads both before
+ * anything allocates; OBJ is not used after it. Never returns. */
+void mono_wasm_jit_raise_cast (MonoObject *obj, MonoClass *klass);
+void
+mono_wasm_jit_raise_cast (MonoObject *obj, MonoClass *klass)
+{
+	WJ_NOTE_CAST ("jit-cast", obj, klass, NULL);
+	wj_raise_corlib (3, TRUE);
 }
 
 /*
@@ -9469,12 +9585,19 @@ wj_finally_trim (int baseline)
  *   - the interp->JIT boundary: pops records of DEAD frames (below its saved C SP) off the head of the chain,
  *     and puts cur_island_il_state and the finally-save depth back to their entry values.
  * The record has no il_state data[]: nothing reads it for an island, because pass 1 stops at every island
- * clause (mini-exceptions.c) and filter clauses bail at the emitter gate. */
+ * clause (mini-exceptions.c) and filter clauses bail at the emitter gate.
+ *
+ * A slim record (MONO_WASM_JIT_EH_SLIM) is the same struct with less of it written. ext.lmf.lmf_addr, ext.lmf.method
+ * and `prev` hold stack residue: no reader of an IL_STATE ext looks at the first two (the unwinders and the V8 walk
+ * branch on the tag bit and the kind first), and nothing publishes cur_island_il_state, because the pad passes the
+ * record itself to mono_wasm_jit_eh_dispatch_rec. `finally_sp` is valid only once bit 0 of ext.lmf.previous_lmf is
+ * set, which the first finally / fault dispatch in the activation does; every walker of the chain masks the low two
+ * bits off a link (~3, or ~7), so the mark is invisible to them. */
 typedef struct {
 	MonoLMFExt ext;
 	guint32 magic;                  /* WJ_EHREC_MAGIC ^ (guint32) &il */
-	MonoMethodILState *prev;        /* the cur_island_il_state this record shadows */
-	gint32 finally_sp;              /* wj_finally_exc_sp at entry */
+	MonoMethodILState *prev;        /* the cur_island_il_state this record shadows (unwritten in a slim record) */
+	gint32 finally_sp;              /* wj_finally_exc_sp at entry (slim: at the first finally / fault dispatch, see above) */
 	/* This compiled body's EH table (a compile-time constant; never freed). desc->body is the InterpMethod the body was
 	 * compiled against: exception handling for this frame resolves its clauses through it, not through the method's
 	 * CURRENT InterpMethod -- after a body swap those are compilations of different IL, and the frame is still running
@@ -9864,6 +9987,16 @@ mono_wasm_jit_finally_trim_to (int baseline)
 	wj_finally_trim (baseline);
 }
 
+/* MONO_WASM_JIT_EH_SLIM: the exit of a record a finally / fault dispatch marked (bit 0 of its previous_lmf), whether
+ * or not a finally body left anything behind. (i32)->void. */
+void mono_wasm_jit_ehrec_trim (gpointer rec);
+void
+mono_wasm_jit_ehrec_trim (gpointer rec)
+{
+	mono_wasm_jit_count (WJC_EHREC_TRIM);
+	wj_finally_trim (((WjEhRec *) rec)->finally_sp);
+}
+
 static void
 wj_ehrec_boundary_save (MonoMethodILState **cur, int *finally_sp)
 {
@@ -10132,10 +10265,16 @@ wj_island_for_method (MonoMethod *method)
  * chain state that method should run under -- the same thing mono installs for a handler frame.
  */
 static void
-wj_eh_restore_lmf (MonoMethod *method)
+wj_eh_restore_lmf (MonoMethod *method, WjEhRec *rec)
 {
 	WjIsland *is;
 
+	if (rec) {
+		/* MONO_WASM_JIT_EH_SLIM: the landing pad handed over its own record */
+		if (mono_get_lmf () != &rec->ext.lmf)
+			mono_set_lmf (&rec->ext.lmf);
+		return;
+	}
 	{
 		extern int mono_wasm_jit_eh_rec;
 		if (mono_wasm_jit_eh_rec) {
@@ -10262,9 +10401,11 @@ __thread int mono_wasm_jit_eh_caught_flag = 0;
  * this method's try region(s) caught it. Walk the clauses enclosing the throwing bb (innermost-out); on
  * the first CATCH whose type matches, stash the exception for OP_GET_EX_OBJ, consume the in-flight
  * exception (clear thrown_exc + any resume-state pass-1 picked for an OUTER handler — we handle nearer),
- * and return the handler's dense bbidx. No match -> -1 (the landing pad rethrows to propagate). */
-int
-mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
+ * and return the handler's dense bbidx. No match -> -1 (the landing pad rethrows to propagate).
+ * `rec` is the pad's own record when the pad passed it (mono_wasm_jit_eh_dispatch_rec), else NULL and the frame is
+ * found through cur_island_il_state or the island stack. */
+static int
+wj_eh_dispatch (WasmEhTable *t, int blk, WjEhRec *rec)
 {
 	ERROR_DECL (error);
 	MonoJitTlsData *jit_tls = mono_get_jit_tls ();
@@ -10282,7 +10423,9 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 	blk_il = (blk >= 0 && blk < t->nbbs) ? t->il_offsets [blk] : -1;
 	{
 		extern int mono_wasm_jit_eh_rec;
-		if (mono_wasm_jit_eh_rec) {
+		if (rec) {
+			island_il = rec->il.il_offset;
+		} else if (mono_wasm_jit_eh_rec) {
 			MonoMethodILState *cur = mono_wasm_jit_cur_island_il_state;
 			if (G_LIKELY (cur && cur->method == t->method)) {
 				island_il = cur->il_offset;
@@ -10325,7 +10468,7 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 				ctx->handler_frame = NULL;
 				if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
 				jit_tls->resume_state.il_state = NULL;
-				wj_eh_restore_lmf (t->method);
+				wj_eh_restore_lmf (t->method, rec);
 				return c->handler_bbidx;
 			}
 			mono_error_cleanup (error);
@@ -10350,17 +10493,45 @@ mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
 			ctx->handler_frame = NULL;
 			if (jit_tls->resume_state.ex_gchandle) { mono_gchandle_free_internal (jit_tls->resume_state.ex_gchandle); jit_tls->resume_state.ex_gchandle = 0; }
 			jit_tls->resume_state.il_state = NULL;
+			/* A slim record did not sample the save depth at entry. This is the activation's first push if the
+			 * record is unmarked, and callees trimmed to their own baselines on the way out, so the depth here is
+			 * the entry depth: record it and mark the record, which sends its exits to mono_wasm_jit_ehrec_trim. */
+			if (rec && !(((gsize) rec->ext.lmf.previous_lmf) & 1)) {
+				rec->finally_sp = wj_finally_exc_sp;
+				rec->ext.lmf.previous_lmf = (gpointer) (((gsize) rec->ext.lmf.previous_lmf) | 1);
+				mono_wasm_jit_count (WJC_EHSLIM_FIN_MARK);
+			}
 			wj_finally_push (jit_tls->thrown_exc);   /* take ownership of the gchandle for OP_ENDFINALLY's re-raise */
 			jit_tls->thrown_exc = 0;                 /* clear so a nested throw inside the finally body can't free it */
 			/* Tag the FINALLY/FAULT dispatch so the landing pad sets finally_ind = -1 ONLY for it (see
 			 * WJ_EH_DISPATCH_FINALLY_BIT in mini.h): a CATCH dispatch must NOT clobber a normal-leave
 			 * continuation an in-flight OP_CALL_HANDLER stored there. */
-			wj_eh_restore_lmf (t->method);
+			wj_eh_restore_lmf (t->method, rec);
 			return c->handler_bbidx | WJ_EH_DISPATCH_FINALLY_BIT;
 		}
 		/* FILTER clauses still bail at the emitter gate; FAULT is handled above (like FINALLY). */
 	}
 	return -1;   /* no matching handler in this method -> rethrow to propagate */
+}
+
+int
+mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk)
+{
+	return wj_eh_dispatch (t, blk, NULL);
+}
+
+/* MONO_WASM_JIT_EH_SLIM's landing pad: the same dispatch, given the pad's own record (refbase + its frame offset)
+ * instead of the table, which is the record's desc. (i32,i32)->i32, as mono_wasm_jit_eh_dispatch. */
+int mono_wasm_jit_eh_dispatch_rec (gpointer rec, int blk);
+int
+mono_wasm_jit_eh_dispatch_rec (gpointer rec, int blk)
+{
+	WjEhRec *r = (WjEhRec *) rec;
+	if (G_UNLIKELY (!r || ((gsize) r & 3) || !wj_ehrec_is_record_il (&r->il) || !r->desc)) {
+		mono_wasm_jit_count (WJC_EHREC_DISPATCH_NOREC);   /* must read 0 */
+		return -1;
+	}
+	return wj_eh_dispatch (r->desc, blk, r);
 }
 
 /* OP_ENDFINALLY rethrow path (finally_ind == -1, i.e. the finally ran on the EXCEPTION path, not a normal
@@ -17847,7 +18018,9 @@ metadata_update_prepare_to_invalidate (void)
 		if (!info || !info->jit_data)
 			continue;
 
-		MonoLMF *lmf = info->jit_data->lmf;
+		/* through the thread's lmf_addr, as interp_mark_stack reads it: in the browser the head is not in jit_tls->lmf */
+		MonoLMF **lmf_addr = (MonoLMF **) info->tls [TLS_KEY_LMF_ADDR];
+		MonoLMF *lmf = lmf_addr ? *lmf_addr : NULL;
 		while (lmf) {
 			if (((gsize) lmf->previous_lmf) & 2) {
 				MonoLMFExt *ext = (MonoLMFExt *) lmf;

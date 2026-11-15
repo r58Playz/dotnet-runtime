@@ -536,6 +536,13 @@ mini_emit_method_call_full (MonoCompile *cfg, MonoMethod *method, MonoMethodSign
 
 	call = mini_emit_call_args (cfg, sig, args, FALSE, virtual_, tailcall, rgctx_arg ? TRUE : FALSE, need_unbox_trampoline, method);
 	call->method = method;
+	/* wasm JIT (MONO_WASM_JIT_RECV_CLASS): the site method-to-ir.c is lowering hands its receiver's class to its call */
+	if (virtual_ && cfg->wasm_site_base == method) {
+		call->wasm_recv_class = cfg->wasm_site_class;
+		call->wasm_static_target = cfg->wasm_site_target;
+		call->wasm_static_slot = cfg->wasm_site_slot;
+		cfg->wasm_site_base = NULL;
+	}
 #ifdef HOST_BROWSER
 	/* R407: the emitter's devirt arm reads call->wasm_prof_im's record (wj_call_prof_im); when neither it nor the root's
 	 * has a site for this callee, point it at the enclosing inlinee that does (mono_wasm_jit_prof_ancestor). */

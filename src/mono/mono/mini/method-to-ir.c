@@ -103,6 +103,148 @@ gpointer mono_wasm_jit_prof_ancestor (MonoCompile *cfg, MonoMethod *base);   /* 
  * branches. GI_ADMITTED == GI_EMITTED + GI_REFUSED_LATE is the identity to assert. */
 #define wj_gi_count(C) do { if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (C); } while (0)
 
+/* --- MONO_WASM_JIT_RECV_CLASS (knob comment in mini-wasm.c): the class a virtual call's receiver is known to be an
+ * instance of. The knowledge is per frame and per ARGUMENT (cfg->wasm_arg_class, parallel to cfg->args), and holds only
+ * for a frame whose IL never writes an argument, so a load of the argument anywhere in the frame reads the value the
+ * frame was entered with. Nothing here trusts MonoInst.klass: a stack merge types its temporary from the first branch. */
+extern int mono_wasm_jit_recv_class;
+extern gboolean mono_wasm_jit_recv_compatible (MonoClass *k, MonoMethod *target);
+
+/* TRUE if the IL can write an argument or take its address (starg, ldarga), or leaves by tail. / jmp (which store the
+ * outgoing arguments into the argument variables). Pure IL decoding, as wj_il_is_call_free below; undecodable IL
+ * answers TRUE. */
+static gboolean
+wj_il_writes_args (const unsigned char *code, guint32 size)
+{
+	const unsigned char *ip = code, *end = code + size;
+	while (ip < end) {
+		MonoOpcodeEnum op;
+		const unsigned char *p = ip;
+		int n = mono_opcode_value_and_size (&p, end, &op);
+		if (n <= 0)
+			return TRUE;
+		switch (op) {
+		case MONO_CEE_STARG: case MONO_CEE_STARG_S: case MONO_CEE_LDARGA: case MONO_CEE_LDARGA_S:
+		case MONO_CEE_TAIL_: case MONO_CEE_JMP:
+			return TRUE;
+		default:
+			break;
+		}
+		ip += n;
+	}
+	return FALSE;
+}
+
+/* A class a site can resolve against: a plain class whose vtable is built (so its interface offsets are too). */
+static gboolean
+wj_recv_class_ok (MonoClass *k)
+{
+	return k && !mono_class_is_interface (k) && !mono_class_is_ginst (k) && !mono_class_is_gtd (k) &&
+		!m_class_is_valuetype (k) && !m_class_get_rank (k) && m_class_get_vtable (k) && m_class_get_supertypes (k) &&
+		m_class_get_idepth (k) > 0;
+}
+
+/* The class the value `ins` is known to be an instance of, or NULL. `ins` must be a plain load of one of the current
+ * frame's argument variables (NEW_ARGLOAD: OP_MOVE from the variable's vreg) that the frame carries a class for. */
+static MonoClass *
+wj_recv_arg_class (MonoCompile *cfg, MonoInst *ins)
+{
+	if (!cfg->wasm_arg_class || !cfg->args || !ins || ins->opcode != OP_MOVE)
+		return NULL;
+	for (int k = 0; k < cfg->wasm_arg_class_n; ++k)
+		if (cfg->wasm_arg_class [k] && cfg->args [k] && ins->sreg1 == cfg->args [k]->dreg)
+			return cfg->wasm_arg_class [k];
+	return NULL;
+}
+
+/* The method class `k` holds for a virtual call of `base`, and the slot of k's vtable it sits in. A class-virtual base
+ * keeps its own slot; an interface base's is k's offset for the interface plus the method's index in it, an offset every
+ * subclass of k shares (class-setup-vtable.c: "Force the sharing of interface offsets between parent and subtypes").
+ * So for a receiver that IS a k, `receiver->vtable->klass->vtable [slot] == the method returned` says exactly that this
+ * receiver dispatches the call there. NULL when there is nothing to predict: k does not have the base, the slot holds an
+ * abstract, generic or wrapper method, or the target's signature was never resolved (resolving one here could load a
+ * class from inside a compile). Reads only what a built vtable holds. */
+static MonoMethod *
+wj_recv_static_target (MonoClass *k, MonoMethod *base, int *out_slot)
+{
+	MonoMethod *m;
+	int slot;
+	if (!wj_recv_class_ok (k) || !base || !base->klass || base->is_inflated || base->is_generic || base->slot < 0)
+		return NULL;
+	if (mono_class_is_interface (base->klass)) {
+		int io;
+		if (mono_class_is_ginst (base->klass) || mono_class_is_gtd (base->klass))
+			return NULL;
+		io = mono_class_interface_offset (k, base->klass);
+		if (io < 0)
+			return NULL;
+		slot = io + base->slot;
+	} else {
+		if (!m_class_get_supertypes (base->klass) || m_class_get_idepth (base->klass) <= 0 || !mono_class_has_parent_fast (k, base->klass))
+			return NULL;
+		slot = base->slot;
+	}
+	if (slot < 0 || slot >= m_class_get_vtable_size (k))
+		return NULL;
+	m = m_class_get_vtable (k) [slot];
+	if (!m || !m->klass || !m->signature || m->is_inflated || m->is_generic || m->wrapper_type != MONO_WRAPPER_NONE ||
+	    (m->flags & (METHOD_ATTRIBUTE_ABSTRACT | METHOD_ATTRIBUTE_PINVOKE_IMPL)) ||
+	    (m->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME)) ||
+	    mono_class_is_interface (m->klass) || m_class_is_valuetype (m->klass))
+		return NULL;
+	*out_slot = slot;
+	return m;
+}
+
+/* The root frame (tier 2): `this` of an instance method of a plain class is an instance of that class. */
+static void
+wj_recv_root_args (MonoCompile *cfg, MonoMethod *method, MonoMethodSignature *sig, MonoMethodHeader *header)
+{
+	cfg->wasm_arg_class = NULL;
+	cfg->wasm_arg_class_n = 0;
+	if (!mono_wasm_jit_recv_class || !COMPILE_WASM (cfg) || cfg->wasm_jit_tier < 2 || cfg->gshared || !sig || !sig->hasthis ||
+	    method->wrapper_type != MONO_WRAPPER_NONE || !wj_recv_class_ok (method->klass) || !header ||
+	    wj_il_writes_args (header->code, header->code_size))
+		return;
+	cfg->wasm_arg_class_n = sig->param_count + 1;
+	cfg->wasm_arg_class = (MonoClass **) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoClass *) * cfg->wasm_arg_class_n);
+	cfg->wasm_arg_class [0] = method->klass;
+}
+
+/* An inlinee's frame, computed in the CALLER's frame from the call's arguments `sp`. Its `this` is an instance of the
+ * inlinee's class -- what a guarded inline's guard established (a receiver vtable, a method identity or a CHA word each
+ * imply it) or what a non-virtual call's own typing does -- narrowed to the caller's class for the value when that is
+ * the more specific; any other argument keeps what the caller knows of the value passed. NULL (*out_n 0) when nothing
+ * is known or the inlinee's IL writes its arguments. */
+static MonoClass **
+wj_recv_inline_args (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig, MonoInst **sp, MonoMethodHeader *cheader, int *out_n)
+{
+	int n = fsig ? (int) fsig->param_count + (fsig->hasthis ? 1 : 0) : 0, found = 0;
+	MonoClass **res;
+	*out_n = 0;
+	if (!mono_wasm_jit_recv_class || !COMPILE_WASM (cfg) || cfg->wasm_jit_tier < 2 || cfg->gshared || n <= 0 || !sp || !cheader ||
+	    cmethod->wrapper_type != MONO_WRAPPER_NONE || wj_il_writes_args (cheader->code, cheader->code_size))
+		return NULL;
+	res = (MonoClass **) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoClass *) * n);
+	for (int i = 0; i < n; ++i) {
+		MonoClass *k = wj_recv_arg_class (cfg, sp [i]);
+		if (i == 0 && fsig->hasthis) {
+			MonoClass *tk = wj_recv_class_ok (cmethod->klass) ? cmethod->klass : NULL;
+			if (!k || (tk && !mono_class_has_parent_fast (k, tk)))
+				k = tk;
+		}
+		if (k && wj_recv_class_ok (k)) {
+			res [i] = k;
+			found++;
+		}
+	}
+	if (!found)
+		return NULL;
+	wj_gi_count (WJC_RECV_FRAMES);
+	*out_n = n;
+	return res;
+}
+
 /* R310: WHY the profile refused a GI site, and whether the answer existed somewhere the key did not look.
  * Called only for a `prof` refusal and only under stats. `why` is mono_wasm_jit_prof_predict's out_why:
  * 1 no_rec, 2 cold, 3 poly, 4 poly >= 90%, 5 torn (the WJ_PRED_* codes, interp.c). `method` is the method
@@ -6555,6 +6697,10 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	MonoGenericContext *prev_generic_context;
 	gboolean ret_var_set, prev_ret_var_set, prev_disable_inline, virtual_ = FALSE;
 	gpointer prev_wasm_inline_im;
+#ifdef HOST_BROWSER
+	MonoClass **prev_arg_class, **inl_arg_class;   /* MONO_WASM_JIT_RECV_CLASS */
+	int prev_arg_class_n, inl_arg_class_n = 0;
+#endif
 	double prev_s2_ctx, prev_eh_ctx;
 	gboolean s2_hot;
 	gint32 s2_charge = 0;
@@ -6703,7 +6849,20 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 		cfg->wasm_eh_base = -1;   /* no clauses of its own, unless wj_eh_inst_begin makes it an instance */
 		cfg->wasm_eh_want = eh_want;
 	}
+#ifdef HOST_BROWSER
+	/* MONO_WASM_JIT_RECV_CLASS: the inlinee's argument classes, read off the caller's frame (cfg->args is still the
+	 * caller's here; mono_method_to_ir replaces it) and in force for exactly the inlinee's IR */
+	prev_arg_class = cfg->wasm_arg_class;
+	prev_arg_class_n = cfg->wasm_arg_class_n;
+	inl_arg_class = wj_recv_inline_args (cfg, cmethod, fsig, sp, cheader, &inl_arg_class_n);
+	cfg->wasm_arg_class = inl_arg_class;
+	cfg->wasm_arg_class_n = inl_arg_class_n;
+#endif
 	costs = mono_method_to_ir (cfg, cmethod, sbblock, ebblock, rvar, sp, real_offset, virtual_);
+#ifdef HOST_BROWSER
+	cfg->wasm_arg_class = prev_arg_class;
+	cfg->wasm_arg_class_n = prev_arg_class_n;
+#endif
 	cfg->wasm_eh_want = FALSE;
 	eh_self = cfg->wasm_eh_inline && cfg->wasm_eh_base > 0 ? cfg->wasm_eh_cur : 0;   /* before the restore below */
 	cfg->wasm_eh_base = prev_eh_base;
@@ -8556,6 +8715,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 	cfg->arg_types = param_types;
 
 	cfg->dont_inline = g_list_prepend (cfg->dont_inline, method);
+#ifdef HOST_BROWSER
+	if (cfg->method == method)
+		wj_recv_root_args (cfg, method, sig, header);   /* MONO_WASM_JIT_RECV_CLASS; an inlinee's come from inline_method */
+#endif
 	if (cfg->method == method) {
 		/* ENTRY BLOCK */
 		NEW_BBLOCK (cfg, start_bblock);
@@ -10256,9 +10419,32 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				/* R311: the vtable slot a method-identity guard tests, or < 0 for "vtable guard only". */
 				int gi_mid_slot = mono_wasm_jit_pred_mid ? mono_wasm_jit_mid_slot (cmethod) : -1;
 
+				/* MONO_WASM_JIT_RECV_CLASS: the receiver's known class, the method it holds for this call, and its slot */
+				MonoClass *gi_rk = NULL;
+				MonoMethod *gi_st = NULL;
+				int gi_st_slot = -1;
+				gboolean gi_recv = FALSE;   /* this site's prediction is the static one */
+				gboolean gi_widened = FALSE;   /* ... or the profile's, with the static slot guard behind its vtable */
+				cfg->wasm_site_base = NULL;
+				if (mono_wasm_jit_recv_class && cfg->wasm_jit_tier >= 2 && (gi_rk = wj_recv_arg_class (cfg, sp [0]))) {
+					wj_gi_count (WJC_RECV_SITE);
+					gi_st = wj_recv_static_target (gi_rk, cmethod, &gi_st_slot);
+					if (!gi_st)
+						wj_gi_count (WJC_RECV_UNRESOLVED);
+				}
+
 				wj_gi_count (WJC_GI_SITE);
 				gboolean gi_pred = wj_gi_predict (cfg, method, cmethod, gi_mid_slot,
 				                                  &gi_vt, &gi_target, &gi_samples, &gi_why);
+				if (gi_pred && gi_rk && (mono_wasm_jit_recv_class & 4) && gi_target &&
+				    !mono_wasm_jit_recv_compatible (gi_rk, gi_target)) {
+					/* the record names a receiver this site cannot have (an inlinee's record is every caller's) */
+					gi_pred = FALSE;
+					gi_why = 3;
+					wj_gi_static = FALSE;
+					wj_gi_pred_im = NULL;
+					wj_gi_count (WJC_RECV_FILTERED);
+				}
 				/* R411: copied now -- arm 1's inline_method runs nested predictions that overwrite the TLS */
 				gpointer gi_pred_im = wj_gi_pred_im;
 				gint32 *gi_cha = NULL;   /* plan2x S3: a CHA target's guard word */
@@ -10281,6 +10467,39 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					if (gi_cha) {
 						gi_vt = NULL; gi_mid_slot = -1;
 						wj_gi_count (WJC_S3_GI_STATIC);
+					}
+				  }
+				  /* MONO_WASM_JIT_RECV_CLASS & 1. The receiver's class holds gi_st for this call, and (as HotSpot's CHA step
+				   * asks) nothing loaded overrides it, so a receiver of that class dispatches there: that beats any record
+				   * naming another target, which an inlinee's shared record does. A class-virtual site then needs only the
+				   * CHA word (S3's guard, on the class's method instead of the base); an interface site gets the
+				   * slot-identity guard, behind the profiled vtable when the record agrees on the target. An overridden
+				   * gi_st is left to the profile. Not after S3's own CHA prediction, which is already exact. */
+				  if (gi_st && (mono_wasm_jit_recv_class & 1) && !gi_cha) {
+					gboolean st_cand = FALSE;
+					gint32 *st_word = mono_wasm_jit_cha_final_word (gi_st, &st_cand);
+					if (!st_word) {
+						wj_gi_count (WJC_RECV_OVERRIDDEN);
+					} else if (gi_pred && gi_vt && gi_target == gi_st) {
+						if (gi_mid_slot < 0) {
+							gi_mid_slot = gi_st_slot;
+							gi_widened = TRUE;
+							wj_gi_count (WJC_RECV_WIDENED);
+						}
+					} else {
+						gi_pred = gi_recv = TRUE;
+						gi_target = gi_st;
+						gi_vt = NULL;
+						gi_pred_im = NULL;
+						wj_gi_pred_im = NULL;
+						wj_gi_static = FALSE;
+						if (!mono_class_is_interface (cmethod->klass) && (mono_wasm_jit_s3 & 1) && s3_tier_ok) {
+							gi_cha = st_word;
+							gi_mid_slot = -1;
+						} else {
+							gi_mid_slot = gi_st_slot;
+						}
+						wj_gi_count (WJC_RECV_GI_PRED);
 					}
 				  } }
 				if (!gi_pred) {
@@ -10403,6 +10622,44 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					/* COMPARE_IMM against the baked vtable, the same form the non-AOT array-store check
 					 * uses -- one fewer register than materialising a PCONST, and this is a runtime JIT
 					 * so compile_aot is never set on this path. */
+					/* MONO_WASM_JIT_RECV_CLASS & 8, the verify mode: on the path a static-class guard has just let
+					 * through, check what the guard assumed -- the receiver's class IS gi_rk or below it, and (with_slot:
+					 * a CHA guard tested no receiver at all) its vtable holds gi_target in the slot. A failure counts
+					 * into mono_wasm_jit_recv_wrong, which must read 0, and takes the fallback, so a verify run stays
+					 * correct whatever it finds. Costs seven loads a guarded dispatch: an instrument, never a default. */
+#define WJ_RECV_VERIFY(with_slot) do { \
+						extern gint32 mono_wasm_jit_recv_wrong; \
+						extern int mono_wasm_jit_class_vtable_off (void); \
+						MonoBasicBlock *_wbb, *_okbb; \
+						/* bit 16, the verify's negative control: test against a class no receiver here is (tests only) */ \
+						MonoClass *_vkc = (mono_wasm_jit_recv_class & 16) ? mono_defaults.exception_class : gi_rk; \
+						int _vk = alloc_preg (cfg), _vd = alloc_ireg (cfg), _vs = alloc_preg (cfg), _ve = alloc_preg (cfg); \
+						int _va = alloc_preg (cfg), _vc = alloc_ireg (cfg); \
+						NEW_BBLOCK (cfg, _wbb); NEW_BBLOCK (cfg, _okbb); \
+						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, _vk, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass)); \
+						MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADU2_MEMBASE, _vd, _vk, GINTPTR_TO_TMREG (m_class_offsetof_idepth ())); \
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, _vd, m_class_get_idepth (_vkc)); \
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBLT_UN, _wbb); \
+						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, _vs, _vk, GINTPTR_TO_TMREG (m_class_offsetof_supertypes ())); \
+						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, _ve, _vs, (m_class_get_idepth (_vkc) - 1) * TARGET_SIZEOF_VOID_P); \
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, _ve, (gssize) _vkc); \
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, _wbb); \
+						if (with_slot) { \
+							int _vmv = alloc_preg (cfg), _vm = alloc_preg (cfg); \
+							MONO_EMIT_NEW_LOAD_MEMBASE (cfg, _vmv, _vk, mono_wasm_jit_class_vtable_off ()); \
+							MONO_EMIT_NEW_LOAD_MEMBASE (cfg, _vm, _vmv, gi_st_slot * TARGET_SIZEOF_VOID_P); \
+							MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, _vm, (gssize) gi_target); \
+							MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, _wbb); \
+						} \
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, _okbb); \
+						MONO_START_BB (cfg, _wbb); \
+						MONO_EMIT_NEW_PCONST (cfg, _va, &mono_wasm_jit_recv_wrong); \
+						MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, _vc, _va, 0); \
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_IADD_IMM, _vc, _vc, 1); \
+						MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STOREI4_MEMBASE_REG, _va, 0, _vc); \
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_fallback_bb); \
+						MONO_START_BB (cfg, _okbb); \
+					} while (0)
 					if (gi_cha) {
 						/* plan2x S3: CHA GUARD -- one load of the base's word; the vtable load above stays as the
 						 * null check. */
@@ -10411,6 +10668,8 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, gi_wreg, gi_areg, 0);
 						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, gi_wreg, 0);
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, gi_fallback_bb);
+						if (gi_recv && (mono_wasm_jit_recv_class & 8))
+							WJ_RECV_VERIFY (TRUE);
 					} else if (gi_mid_slot >= 0) {
 						/* R311 METHOD-IDENTITY GUARD. The predicted receiver still pays one compare; any
 						 * other receiver whose class holds gi_target in the same vtable slot -- i.e.
@@ -10431,6 +10690,8 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mreg, gi_mvreg, gi_mid_slot * TARGET_SIZEOF_VOID_P);
 						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_mreg, (gssize) gi_target);
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi_fallback_bb);
+						if ((gi_recv || gi_widened) && (mono_wasm_jit_recv_class & 8))
+							WJ_RECV_VERIFY (FALSE);   /* the slot guard passed; the profiled vtable's own path skips this */
 						MONO_START_BB (cfg, gi_hot_bb);
 						wj_gi_count (WJC_MID_GI);
 					} else {
@@ -10494,6 +10755,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						gi_active = TRUE;
 						wj_site_gi_note (cfg, ip, 'I');
 						wj_gi_count (WJC_GI_EMITTED);
+						if (gi_recv) {
+							wj_gi_count (WJC_RECV_GI_EMITTED);
+							gi_st = NULL;   /* the fallback's call is what the guard missed: no arm for the same target */
+						}
 						if (gi_cha)
 							wj_gi_count (WJC_S3_GI_EMITTED);
 						if (cfg->wasm_jit_tier >= 2) {
@@ -10569,6 +10834,15 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 							}
 						}
 					}
+				}
+				/* MONO_WASM_JIT_RECV_CLASS: what the emitter's arm needs at this site's call -- the receiver's class (to
+				 * refuse a profile target it cannot have) and, unless the gate inlined it, the static target and its slot.
+				 * mini_emit_method_call_full takes them off cfg when it builds the call for this base. */
+				if (gi_rk && (mono_wasm_jit_recv_class & 6)) {
+					cfg->wasm_site_base = cmethod;
+					cfg->wasm_site_class = gi_rk;
+					cfg->wasm_site_target = gi_st;
+					cfg->wasm_site_slot = gi_st_slot;
 				}
 			}
 #endif /* HOST_BROWSER */
@@ -11118,6 +11392,7 @@ call_end:
 			if (common_call) // FIXME goto call_end && !common_call often skips tailcall processing.
 				ins = mini_emit_method_call_full (cfg, cmethod, fsig, tailcall, sp, virtual_ ? sp [0] : NULL,
 												  imt_arg, vtable_arg);
+			cfg->wasm_site_base = NULL;   /* MONO_WASM_JIT_RECV_CLASS: the site is lowered, whichever way it went */
 
 #ifdef HOST_BROWSER
 			/* CLOSE THE GUARDED-INLINE DIAMOND. Everything since MONO_START_BB (gi_fallback_bb) above

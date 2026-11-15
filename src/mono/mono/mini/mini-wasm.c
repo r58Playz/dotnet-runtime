@@ -789,6 +789,74 @@ int mono_wasm_jit_t2_loop_count = 65536;
 /* MONO_WASM_JIT_T2_GI_BIMORPHIC (R411): a tier-2 site's SECOND guarded inline, when its second target holds at least this
  * % of the site's observations; 0 = off. */
 int mono_wasm_jit_t2_gi_bimorphic = 0;
+/* MONO_WASM_JIT_RECV_CLASS: predict a tier-2 virtual call from the class its receiver is KNOWN to be an instance of,
+ * before any profile. Known means the receiver is an argument the frame never writes: the root's `this` (an instance of
+ * the method's class), an inlinee's `this` (of the inlinee's class, which its guard or the call established), and any
+ * argument an inliner passed such a value to (method-to-ir.c wj_recv_*). The target is what that class's vtable holds
+ * for the call -- for an interface call, at the class's offset for the interface, which subclasses share -- and the guard
+ * is the method-identity guard on that slot, so a receiver whose own class overrides it falls to the IC as before.
+ * 1 = at the guarded-inline gate, 2 = at the emitter's devirt arm (sites the gate did not inline), 4 = refuse a profile
+ * prediction whose target's class cannot be the receiver's, 8 = verify: every dispatch a static-class guard lets
+ * through re-checks that the receiver's class is the known class or below it and holds the target in the slot;
+ * mono_wasm_jit_recv_wrong counts the failures and must read 0 (`[wasm-jit recv] wrong=`), 16 = the verify's negative
+ * control (tests only): it checks against System.Exception, so every verified dispatch must count. Why: an inlined site reads
+ * the INLINEE's shared record, which names whatever receivers its first callers passed (findings notes 2026-11-12
+ * midday, 2026-11-13). 0 = off.
+ * 7 on Minecraft 26.2 (262n Q60, server thread, 2026-11-13, n=3 a side, d R R d R d): calls 0.576 -> 0.515 M a tick
+ * (-10.6%) and indirect branches -13.1%, both disjoint; instructions 78.11 (76.70-79.83) -> 75.77 (75.26-76.35), -3.0%,
+ * disjoint by 0.36 M; cycles 96.02 -> 91.67 with overlapping ranges. Site census: calls under a dead arm predicted from a
+ * frozen record 58.0 k -> 9.3 k a tick. jbox2d has no site it acts on. Verify (15): wrong=0 over four world runs (262n
+ * x2, 262u, mcsr) and nine boots; the control (31) counts 366,792 in one boot. One Arg_InvalidCastException in 29
+ * boots with the knob on (the long-logged intermittent, in a tier-1 body), none in ~20 without: not attributable either
+ * way, which is why this is still 0. */
+int mono_wasm_jit_recv_class = 0;
+gint32 mono_wasm_jit_recv_wrong;
+
+/* MONO_WASM_JIT_RECV_CLASS & 8, the emitter arm's verify: is the receiver's class `k` or below it? (i32,i32)->i32.
+ * A failure counts and the first eight print the two classes (field reads; both are live). */
+int mono_wasm_jit_recv_verify (MonoVTable *vt, MonoClass *k);
+int
+mono_wasm_jit_recv_verify (MonoVTable *vt, MonoClass *k)
+{
+	MonoClass *c = vt ? vt->klass : NULL;
+	if (c && k && m_class_get_supertypes (c) && m_class_get_idepth (c) >= m_class_get_idepth (k) &&
+	    m_class_get_supertypes (c) [m_class_get_idepth (k) - 1] == k)
+		return 1;
+	if (mono_atomic_inc_i32 (&mono_wasm_jit_recv_wrong) <= 8)
+		printf ("[wasm-jit recv] WRONG receiver %s.%s where %s.%s was known\n",
+			c ? m_class_get_name_space (c) : "?", c ? m_class_get_name (c) : "?",
+			k ? m_class_get_name_space (k) : "?", k ? m_class_get_name (k) : "?");
+	return 0;
+}
+
+/* MONO_WASM_JIT_PROF_SAMPLE: a tier-1 body's virtual sites hand every Nth dispatch (N = the knob; the receiver's vtable)
+ * to the call profile (interp.c mono_wasm_jit_prof_sample_site). Tier 1 is the instrumented tier, as RyuJIT's tier 0 is:
+ * without this JIT code reports a receiver only when an inline cache MISSES, so an arm that hits, an arm that never
+ * hits and a cache that settled all look alike to the record tier 2 reads. Costs a countdown word per site in tier-1
+ * code only. 0 = off.
+ * MONO_WASM_JIT_PROF_DECAY: with it > 0, an observation from JIT code is recorded past WJ_PROF_SATURATE, and a
+ * record's counts are halved when its total reaches the knob -- the record follows the site instead of freezing on
+ * its first 64 receivers. Both need a share bar to act on (MONO_WASM_JIT_PRED_PCT; `margin == total` rejects a site
+ * for one foreign receiver). 0 = the freeze. Findings notes 2026-11-12 midday, 2026-11-13.
+ * 64 / 128 with PRED_PCT=90 on top of RECV_CLASS=7 (262n Q60, 2026-11-13, n=3 a side, R S3 S3 R S3 R): instructions
+ * 75.99 -> 75.91, cycles 93.85 (92.68-95.09) -> 95.34 (95.00-95.97), every range overlapping -- more guarded inlines
+ * (virtual-site calls 431 k -> 366 k a tick in the census) and no gain on the tick. Instruments; the decayed record
+ * still cannot recycle a megamorphic site's first 8 identities. */
+int mono_wasm_jit_prof_sample = 0;
+int mono_wasm_jit_prof_decay = 0;
+
+/* For MONO_WASM_JIT_RECV_CLASS: can a receiver that is an instance of `k` dispatch a call to `target`? Only when the
+ * target's class is k, above it or below it. TRUE (cannot tell) for an interface's method or a class without supertypes. */
+gboolean mono_wasm_jit_recv_compatible (MonoClass *k, MonoMethod *target);
+gboolean
+mono_wasm_jit_recv_compatible (MonoClass *k, MonoMethod *target)
+{
+	MonoClass *tk = target ? target->klass : NULL;
+	if (!k || !tk || mono_class_is_interface (tk) || mono_class_is_interface (k) ||
+	    !m_class_get_supertypes (k) || !m_class_get_supertypes (tk) || m_class_get_idepth (k) <= 0 || m_class_get_idepth (tk) <= 0)
+		return TRUE;
+	return mono_class_has_parent_fast (k, tk) || mono_class_has_parent_fast (tk, k);
+}
 /* MONO_WASM_JIT_GI_LATE_RETRY (plan swirling-moore S2): a guarded inline refused AFTER its guard was emitted because the
  * inlinee plus ITS inlines went over the cost cap is retried once with nesting off -- the outer body inlines, its inner
  * calls stay calls -- instead of leaving the guard in front of the full fallback call. 1 = tier-2 compiles, 2 = every
@@ -880,6 +948,44 @@ int mono_wasm_jit_t1_max_body = 0;
  * an instrument (the census) and a byte saver, not a speed lever. */
 int mono_wasm_jit_nce_flow = 0;
 gint32 mono_wasm_jit_nce_violations;
+
+/* MONO_WASM_JIT_CAST_DIAG: a castclass the JIT checks inline raises through mono_wasm_jit_raise_cast (object, class)
+ * from its own taken arm instead of branching to the method's shared InvalidCastException block, so
+ * `[wasm-jit castfail]` reads site=jit-cast with both classes, the state the check read and the isinst recheck. The
+ * shared block's site=jit-raise has neither operand, and R302's diagnostic only ever named the interpreter's and the
+ * icalls' casts. mono_decompose_typecheck marks each check of a castclass with a tagged OP_DUMMY_USE of the object
+ * ahead of the check's compare (type-checking.c); nothing with a dreg sits between the two, so the object's local is
+ * intact at the raise. Left alone: casts in shared-generic code (the class is not a constant), unbox, and the
+ * castclass-with-cache wrapper. 0 = off: with it off the IR and the emitted bytes are what they were. */
+int mono_wasm_jit_cast_diag = 0;
+gint32 mono_wasm_jit_cast_diag_sites;
+const char mono_wasm_jit_cast_note_tag [] = "wj-cast-note";
+
+/* MONO_WASM_JIT_CAST_UNFINISHED: a castclass or isinst whose class is a TypeBuilder's that CreateType has not completed
+ * is checked at run time, through the castclass / isinst with-cache wrappers, instead of inline. The inline check of
+ * a non-final class compares the object's supertypes [idepth - 1] with the class and bakes that index when the method
+ * is compiled (type-checking.c mini_emit_castclass_inst, mini_emit_isninst_cast_inst). IKVM defines a dynamic type with
+ * no parent and sets it only when the class is finished (RuntimeByteCodeJavaType: DefineType, then SetParent in
+ * FinishImpl), so until then the class's shell sits directly under System.Object and its depth is 2 whatever it will
+ * be. Resolving the type token normally finishes the class first; but when that finish fails -- IKVM refuses one made
+ * from its relink drain (RelinkDrainRefusal) and one re-entered on the thread already finishing the class's parent
+ * ("Recursive finish attempt") -- mono_reflection_resolve_object drops the error and hands back the shell (sre.c: "we
+ * still have a valid shell klass that's usable for type identity"). A body compiled then fails the cast of every real
+ * instance for as long as it lives, and answers isinst with false. The run-time check reads the class as it is when
+ * the cast executes. Every such site is counted and the first 32 named at either knob value
+ * (`[wasm-jit cast-unfinished]`, `unfinished_sites=` on the castfail stats line). 0 = the inline check for every class.
+ * Evidence (findings notes of 2026-11-13 23:10 and 2026-11-14, runs/2026-11-13-castdiag): the `site=jit-raise`
+ * InvalidCastException of 2026-11-12/13 in ChunkMap.getVisibleChunkIfPresent -- in both faulting capture runs the body
+ * that raised reads supertypes [1] for ChunkHolder and 19 other bodies read supertypes [3]; no class is read at two
+ * depths in four clean capture runs (depthscan.py). tests/unfinished-sig.jar (a cast compiled while only nulls flow,
+ * then the first instance; HotSpot -5997673904696311073), 2026-11-14, build 20: with the state forced by a resolver
+ * switch that is not in the tree (scratchpad/state/patches/cast-unfinished-control.patch) knob 0 fails 2 of 2
+ * (1,200,000 failed casts each, `recheck: isinst NOW SUCCEEDS`) and knob 1 passes 2 of 2; with nothing forced and
+ * MONO_WASM_JIT_T2=0, 25 interleaved rounds, the state arose in 5 knob-0 runs and all 5 failed, and in 4 knob-1 runs
+ * and none did. With tier 2 on it arose in 3 of 20 knob-0 runs and none failed: a tier-2 body compiled after the
+ * finish took the calls. Not measured: the tick. */
+int mono_wasm_jit_cast_unfinished = 1;
+gint32 mono_wasm_jit_cast_unfinished_sites;
 void mono_wasm_jit_nce_violation (const char *where);
 void
 mono_wasm_jit_nce_violation (const char *where)
@@ -934,6 +1040,19 @@ int mono_wasm_jit_coalesce_big = 5;
  * on the Minecraft server tick: the island helpers 2.98 -> 0.08 M instr/tick, all instructions -3.6%, calls -9.6%;
  * cycles unresolved on that instrument (the helpers were ~1 M cycles/tick). 0 = the island calls. */
 int mono_wasm_jit_eh_rec = 1;
+/* MONO_WASM_JIT_EH_SLIM: the record's push and pop without the parts nothing reads (emitter EMIT_EHREC_PUSH / _POP,
+ * interp.c WjEhRec). With 1:
+ *  - the push leaves the ext's unused plain-LMF words (lmf_addr, method) unwritten, and writes the entry block's IL
+ *    offset where it wrote -1, so the entry block's own store goes;
+ *  - nothing publishes mono_wasm_jit_cur_island_il_state: the landing pad hands its record to
+ *    mono_wasm_jit_eh_dispatch_rec, so the record's `prev` and the exit's restore go;
+ *  - the finally-save depth is not sampled at entry: a finally / fault dispatch records it in the record and sets bit 0
+ *    of the record's previous_lmf, which the exit already loads, and only a marked record's exit calls the trim;
+ *  - the LMF head is read and written at s.b + WJ_SCRATCH_LMFHEAD_SLOT, one load, where the mirror took three.
+ * Needs MONO_WASM_JIT_EH_REC. 0 = R353's push and pop. Sound on every gate and not shown to pay: 262n Q60 n=3 a side
+ * overlaps on every counter, and the store drop the emitter implies was not seen in getBlockState (findings note
+ * 2026-11-13 14:10, unexplained). */
+int mono_wasm_jit_eh_slim = 0;
 /* MONO_WASM_JIT_EH_JTAB (plan zany-beacon E0): where exception pass 1/2 read a JIT EH frame's clauses. 0 = the
  * interpreter's jinfo for the method, found through the record (today's path); bit 1 = the JIT's own clause table for the
  * compiled body (interp.c mono_wasm_jit_ehjt_frame), the foundation for inlining methods with clauses, whose clauses the
@@ -1236,7 +1355,13 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_max_compile_mb, "MONO_WASM_JIT_MAX_COMPILE_MB", 0, 65536)
 	WJ_T2_KNOB (mono_wasm_jit_sparse_dispatch, "MONO_WASM_JIT_SPARSE_DISPATCH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_nce_flow, "MONO_WASM_JIT_NCE_FLOW", 0, 7)
+	WJ_T2_KNOB (mono_wasm_jit_cast_diag, "MONO_WASM_JIT_CAST_DIAG", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_recv_class, "MONO_WASM_JIT_RECV_CLASS", 0, 31)
+	WJ_T2_KNOB (mono_wasm_jit_prof_sample, "MONO_WASM_JIT_PROF_SAMPLE", 0, 65536)
+	WJ_T2_KNOB (mono_wasm_jit_prof_decay, "MONO_WASM_JIT_PROF_DECAY", 0, 60000)
 	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_exc_pin, "MONO_WASM_JIT_EXC_PIN", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_inline, "MONO_WASM_JIT_EH_INLINE", 0, 0x1ff)

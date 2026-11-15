@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
  * because the stats dump below prints it. */
 #define WJ_ADMIT_DEPTH_WARN 64
 
-g_static_assert (WJC_MAX == 626);   /* + the null-check census (8), + the sparse-dispatch quartet, + the EH coalesce count, + the compile-memory cap, + the big-coalesce quartet, + the tier-1 body cap, + the EH-inline hot-size / new-root quartet, + the EH-inlining census (15, MONO_WASM_JIT_EH_INLINE), + the exception-pin trio (MONO_WASM_JIT_EXC_PIN), + the EH-table sextet (MONO_WASM_JIT_EH_JTAB), + the cold-call trio (MONO_WASM_JIT_INLINE_COLD_CALL), + the R493 promote-once skip, + the R489 desc-grow/reach-oob pair, + the R476 B4 dead skip, + the S2 late-retry pair, + the R475 thread-overlap pair, + the R470 retire-guard pair and B4 section skip, + the R459 vslow repair, + the typed-spindle C1 vslow quintet, + the typed-spindle C1 route-mix quintet, + the B4 quintet (R443), + the R411 bimorphic-GI quartet + retry pair, + the R410 undefined-local count, + the R409 loop-count site, + the R407 ancestor trio, + the R405 cold-prediction trio, + the H4-H6 hook census (12, R403), + the W1 C0 tripwire, + the H3 epoch/no-GC/broker census (7, R401), + the R399 adoption pair, + the plan2x S2 GI quartet, + the plan2x S0b pair, + the plan2x S4 pair, + the plan2x S3 census (8), + the plan2x S2 census (13), + the plan2x S0 count quartet, + the plan2x S1 quartet, + the plan2x F9 pair, + the plan2x F4 quartet, + the R377 ldaddr-arg count, + the J1a icall site count, + the J1e value-type vcall pair, + the R376 aggressive-inline cap, + the R376 valuetype-target refusal, + the J1c 64-bit atomic count, + the R371 cold-block census (8), + the Phase 5 lazy-slot census (32), + the R360 atomic lowering count, + the R358 tier-2 unit census (14), + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
+g_static_assert (WJC_MAX == 639);   /* + the tier-1 sample sites, + the receiver-class ten, + the slim EH-record pair, + the null-check census (8), + the sparse-dispatch quartet, + the EH coalesce count, + the compile-memory cap, + the big-coalesce quartet, + the tier-1 body cap, + the EH-inline hot-size / new-root quartet, + the EH-inlining census (15, MONO_WASM_JIT_EH_INLINE), + the exception-pin trio (MONO_WASM_JIT_EXC_PIN), + the EH-table sextet (MONO_WASM_JIT_EH_JTAB), + the cold-call trio (MONO_WASM_JIT_INLINE_COLD_CALL), + the R493 promote-once skip, + the R489 desc-grow/reach-oob pair, + the R476 B4 dead skip, + the S2 late-retry pair, + the R475 thread-overlap pair, + the R470 retire-guard pair and B4 section skip, + the R459 vslow repair, + the typed-spindle C1 vslow quintet, + the typed-spindle C1 route-mix quintet, + the B4 quintet (R443), + the R411 bimorphic-GI quartet + retry pair, + the R410 undefined-local count, + the R409 loop-count site, + the R407 ancestor trio, + the R405 cold-prediction trio, + the H4-H6 hook census (12, R403), + the W1 C0 tripwire, + the H3 epoch/no-GC/broker census (7, R401), + the R399 adoption pair, + the plan2x S2 GI quartet, + the plan2x S0b pair, + the plan2x S4 pair, + the plan2x S3 census (8), + the plan2x S2 census (13), + the plan2x S0 count quartet, + the plan2x S1 quartet, + the plan2x F9 pair, + the plan2x F4 quartet, + the R377 ldaddr-arg count, + the J1a icall site count, + the J1e value-type vcall pair, + the R376 aggressive-inline cap, + the R376 valuetype-target refusal, + the J1c 64-bit atomic count, + the R371 cold-block census (8), + the Phase 5 lazy-slot census (32), + the R360 atomic lowering count, + the R358 tier-2 unit census (14), + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
 
 /* Census counters — see the long note above mono_wasm_jit_liveness.
  *
@@ -184,6 +184,25 @@ mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *k
 		total, site, obj, vt, fbuf, tbuf, mname ? mname : "(see stack)");
 	g_free (mname);
 	EM_ASM ({ var l = Error.stackTraceLimit; Error.stackTraceLimit = 40; var s = (new Error ()).stack; Error.stackTraceLimit = l; console.log (UTF8ToString ($0) + " " + s); }, line);
+	/* MONO_WASM_JIT_CAST_DIAG: what an inline check of `to` reads, as it stands NOW. The emitted check compares
+	 * from.supertypes [to.idepth - 1] with `to` (a sealed class: from itself), or tests bit to.iid of the vtable's
+	 * interface bitmap under max_iid, with `to`, its idepth and its iid baked in when the method was compiled. A check
+	 * that these values pass and that still raised was run on other values. Field reads only. */
+	if (vt && from && klass && wj_castfail_in_heap (from) && wj_castfail_in_heap (klass)) {
+		char sbuf [256];
+		int td = m_class_get_idepth (klass), fd = m_class_get_idepth (from);
+		MonoClass **fs = m_class_get_supertypes (from);
+		MonoClass *at = (fs && wj_castfail_in_heap (fs) && td >= 1 && (td <= fd || td <= MONO_DEFAULT_SUPERTABLE_SIZE)) ? fs [td - 1] : NULL;
+		guint32 iid = m_class_get_interface_id (klass);
+		wj_castfail_class_name (at, sbuf, sizeof (sbuf));
+		g_snprintf (line, sizeof (line), "[wasm-jit castfail] #%d state: site=%s from=%s to=%s | to idepth=%d iid=%u iface=%d sealed=%d rank=%d inited=%d | "
+			"from idepth=%d supertypes[to.idepth-1]=%s vt.max_iid=%u bit=%d",
+			total, site, fbuf, tbuf, td, iid, mono_class_is_interface (klass) ? 1 : 0, mono_class_is_sealed (klass) ? 1 : 0,
+			(int) m_class_get_rank (klass), m_class_is_inited (klass) ? 1 : 0, fd, sbuf, (guint32) vt->max_interface_id,
+			(mono_class_is_interface (klass) && wj_castfail_in_heap (vt->interface_bitmap)) ? (MONO_VTABLE_IMPLEMENTS_INTERFACE (vt, iid) ? 1 : 0) : -1);
+		/* printf, not console.log: a harness that taps only the page's console (j2d/run) still gets the two classes */
+		printf ("%s\n", line);
+	}
 	/* AFTER the line is out: isinst walks the object's class hierarchy, and if the object is stale that walk
 	 * can trap -- which must not take the line above with it. */
 	if (from && klass && wj_castfail_in_heap (from) && wj_castfail_in_heap (klass)) {
@@ -191,8 +210,35 @@ mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *k
 		recheck = mono_object_isinst_checked (obj, klass, error) ? "isinst NOW SUCCEEDS -- the failed check was wrong" : "isinst fails -- the object is not a `to`: either a wrong object, or the cast names the wrong class (compare `to` with the method)";
 		mono_error_cleanup (error);
 		g_snprintf (line, sizeof (line), "[wasm-jit castfail] #%d recheck: %s", total, recheck);
-		EM_ASM ({ console.log (UTF8ToString ($0)); }, line);
+		printf ("%s\n", line);
 	}
+}
+
+/* MONO_WASM_JIT_CAST_UNFINISHED: a castclass or isinst is being compiled whose class is a TypeBuilder's that CreateType
+ * has not completed (type-checking.c wj_cast_target_unfinished). Counted at either knob value, and the first 32 print:
+ * with the knob off these are the sites whose inline check bakes a depth that the class's finish will change. Called
+ * inside a compile section: field reads only, no name resolution. */
+void mono_wasm_jit_note_cast_unfinished (MonoMethod *method, int tier, MonoClass *klass, gboolean isinst, gboolean checked_at_run_time);
+void
+mono_wasm_jit_note_cast_unfinished (MonoMethod *method, int tier, MonoClass *klass, gboolean isinst, gboolean checked_at_run_time)
+{
+	extern gint32 mono_wasm_jit_cast_unfinished_sites;
+	char kbuf [256], pbuf [256], mbuf [256];
+	MonoClass *k = klass;
+	int n = mono_atomic_inc_i32 (&mono_wasm_jit_cast_unfinished_sites);
+
+	if (n > 32)
+		return;
+	while (k && m_class_get_rank (k))
+		k = m_class_get_element_class (k);
+	wj_castfail_class_name (k, kbuf, sizeof (kbuf));
+	wj_castfail_class_name (k ? m_class_get_parent (k) : NULL, pbuf, sizeof (pbuf));
+	wj_castfail_class_name (method ? method->klass : NULL, mbuf, sizeof (mbuf));
+	printf ("[wasm-jit cast-unfinished] #%d %s of %s (rank %d) in %s:%s tier %d -- the class is an unfinished TypeBuilder: "
+		"parent now %s, depth now %d, sealed=%d iface=%d; %s\n", n, isinst ? "isinst" : "castclass", kbuf,
+		klass ? (int) m_class_get_rank (klass) : 0, mbuf, (method && wj_castfail_in_heap (method->name)) ? method->name : "?", tier,
+		pbuf, k ? (int) m_class_get_idepth (k) : -1, (k && mono_class_is_sealed (k)) ? 1 : 0, (k && mono_class_is_interface (k)) ? 1 : 0,
+		checked_at_run_time ? "checked at run time" : "INLINE check (MONO_WASM_JIT_CAST_UNFINISHED=0)");
 }
 
 /* One successful module instantiation on this thread, `ms` being the WebAssembly.Module+Instance time
@@ -716,10 +762,15 @@ mono_wasm_jit_dump_stats (void)
 			"inline TLAB bump, emit-time count (R305)\n", mono_atomic_load_i32 (&mono_wasm_jit_inline_alloc_sites),
 			mono_wasm_jit_inline_alloc);
 	}
-	printf ("[wasm-jit castfail] total=%d signatures=%d bare=%d -- native InvalidCastException raises (R302); each "
-		"new (site, from, to) and the first 16 operand-less JIT/AOT raises print once with a JS stack\n",
+	{ extern int mono_wasm_jit_cast_diag; extern gint32 mono_wasm_jit_cast_diag_sites;
+	  extern int mono_wasm_jit_cast_unfinished; extern gint32 mono_wasm_jit_cast_unfinished_sites;
+	printf ("[wasm-jit castfail] total=%d signatures=%d bare=%d diag_sites=%d (cast_diag=%d) unfinished_sites=%d (cast_unfinished=%d) -- "
+		"native InvalidCastException raises (R302); each new (site, from, to) and the first 16 operand-less JIT/AOT raises "
+		"print once with a JS stack; diag_sites = inline cast checks emitted with their operands (site=jit-cast); "
+		"unfinished_sites = casts and isinsts compiled while their class was an unfinished TypeBuilder, checked at run time\n",
 		mono_atomic_load_i32 (&wj_castfail_total), mono_atomic_load_i32 (&wj_castfail_sigs_used),
-		mono_atomic_load_i32 (&wj_castfail_bare_printed));
+		mono_atomic_load_i32 (&wj_castfail_bare_printed), mono_atomic_load_i32 (&mono_wasm_jit_cast_diag_sites),
+		mono_wasm_jit_cast_diag, mono_atomic_load_i32 (&mono_wasm_jit_cast_unfinished_sites), mono_wasm_jit_cast_unfinished); }
 	{
 		extern int mono_wasm_jit_frame_zero;
 		printf ("[wasm-jit framezero] skipped_bytes=%lld (MONO_WASM_JIT_FRAME_ZERO=%d) -- write-through ref-region bytes "
@@ -1116,6 +1167,21 @@ mono_wasm_jit_dump_stats (void)
 				  printf ("[wasm-jit ehrec] emitted=%lld trim=%lld boundary_pop=%lld dispatch_norec=%lld unlink_inner=%lld unlink_outer=%lld (eh_rec=%d)\n",
 					WJC_(WJC_EHREC_EMITTED), WJC_(WJC_EHREC_TRIM), WJC_(WJC_EHREC_BOUNDARY_POP), WJC_(WJC_EHREC_DISPATCH_NOREC),
 					WJC_(WJC_EHREC_UNLINK_INNER), WJC_(WJC_EHREC_UNLINK_OUTER), mono_wasm_jit_eh_rec); }
+				{ extern int mono_wasm_jit_eh_slim;
+				  printf ("[wasm-jit ehslim] emitted=%lld finally_marked=%lld (eh_slim=%d) -- slim records share ehrec's trim, dispatch_norec and unlink counts\n",
+					WJC_(WJC_EHSLIM_EMITTED), WJC_(WJC_EHSLIM_FIN_MARK), mono_wasm_jit_eh_slim); }
+				{ extern int mono_wasm_jit_recv_class;
+				  extern gint32 mono_wasm_jit_recv_wrong;
+				  printf ("[wasm-jit recv] frames=%lld sites=%lld unresolved=%lld overridden=%lld gi_pred=%lld gi_emitted=%lld arm_pred=%lld arm_emitted=%lld widened=%lld filtered=%lld (recv_class=%d) verify wrong=%d -- wrong MUST be 0 unless recv_class has 16\n",
+					WJC_(WJC_RECV_FRAMES), WJC_(WJC_RECV_SITE), WJC_(WJC_RECV_UNRESOLVED), WJC_(WJC_RECV_OVERRIDDEN), WJC_(WJC_RECV_GI_PRED),
+					WJC_(WJC_RECV_GI_EMITTED), WJC_(WJC_RECV_ARM_PRED), WJC_(WJC_RECV_ARM_EMITTED), WJC_(WJC_RECV_WIDENED), WJC_(WJC_RECV_FILTERED),
+					mono_wasm_jit_recv_class, (int) mono_wasm_jit_recv_wrong); }
+				{ extern int mono_wasm_jit_prof_sample, mono_wasm_jit_prof_decay, mono_wasm_jit_pred_pct;
+				  extern void mono_wasm_jit_prof_sample_stats (guint32 *sampled, guint32 *unresolved, guint32 *decays);
+				  guint32 _ps = 0, _pu = 0, _pd = 0;
+				  mono_wasm_jit_prof_sample_stats (&_ps, &_pu, &_pd);
+				  printf ("[wasm-jit profsample] sites=%lld sampled=%u unresolved=%u decays=%u (prof_sample=%d prof_decay=%d pred_pct=%d)\n",
+					WJC_(WJC_PROF_SAMPLE_SITES), _ps, _pu, _pd, mono_wasm_jit_prof_sample, mono_wasm_jit_prof_decay, mono_wasm_jit_pred_pct); }
 				{ extern int mono_wasm_jit_eh_jtab;
 				  printf ("[wasm-jit ehjt] frames=%lld built=%lld nodesc=%lld disagree=%lld disagree_unreach=%lld unnested=%lld (eh_jtab=%d) -- nodesc and disagree MUST be 0\n",
 					WJC_(WJC_EHJT_FRAMES), WJC_(WJC_EHJT_BUILT), WJC_(WJC_EHJT_NODESC), WJC_(WJC_EHJT_DISAGREE),

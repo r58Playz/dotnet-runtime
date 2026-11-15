@@ -1267,9 +1267,9 @@ enum {
 	WJC_MATH_INTRINS_LOWERED,  /* R346: System.Math/MathF Sqrt/Floor/Ceiling call sites lowered to a wasm opcode */
 	WJC_T2_BODY_CAPPED,        /* R349: tier-2 bodies refused for exceeding MONO_WASM_JIT_T2_MAX_BODY (ungated) */
 	WJC_EHREC_EMITTED,         /* R353: EH methods emitted with an inline frame record (MONO_WASM_JIT_EH_REC) */
-	WJC_EHREC_TRIM,            /* R353: record exits that found the finally-save depth moved and called the trim */
+	WJC_EHREC_TRIM,            /* R353: record exits that found the finally-save depth moved and called the trim (EH_SLIM: exits of a marked record) */
 	WJC_EHREC_BOUNDARY_POP,    /* R353: dead-frame records the interp->JIT boundary popped off the LMF head */
-	WJC_EHREC_DISPATCH_NOREC,  /* R353: landing-pad dispatches whose cur_island was not the method's record; must be 0 */
+	WJC_EHREC_DISPATCH_NOREC,  /* R353: landing-pad dispatches whose cur_island was not the method's record (EH_SLIM: whose record argument failed the magic test); must be 0 */
 	WJC_EHREC_UNLINK_INNER,    /* R353: record exits that unlinked through a stale inner LMF left at the head */
 	WJC_EHREC_UNLINK_OUTER,    /* R353: record exits that found the head rewound past them (pass 1) and left it */
 	WJC_T2_LOOP_OWED,          /* R355: entry-poll samples that owed the next back-edge a second one (ungated) */
@@ -1499,6 +1499,19 @@ enum {
 	WJC_NCE_T2_ELIDED_FLOW,
 	WJC_NCE_FLOW_BODIES,         /* bodies wj_nce_flow gave in-sets */
 	WJC_NCE_FLOW_SKIPPED,        /* ... it gave up on (its bitsets past WJ_NCE_MAX_WORDS, or no fixpoint) */
+	WJC_EHSLIM_EMITTED,          /* MONO_WASM_JIT_EH_SLIM: EH methods emitted with the slim record push / pop */
+	WJC_EHSLIM_FIN_MARK,         /* ... records a finally / fault dispatch marked (bit 0 of previous_lmf): their exits trim */
+	WJC_RECV_FRAMES,             /* MONO_WASM_JIT_RECV_CLASS: inline frames that carried a class for at least one argument */
+	WJC_RECV_SITE,               /* ... tier-2 virtual sites at the GI gate whose receiver has a known class */
+	WJC_RECV_UNRESOLVED,         /* ... of them, where that class has nothing to predict (abstract slot, base not in it, unresolved signature) */
+	WJC_RECV_GI_PRED,            /* ... predicted from the class at the GI gate */
+	WJC_RECV_GI_EMITTED,         /* ... and inlined behind the slot-identity guard */
+	WJC_RECV_ARM_PRED,           /* ... the emitter's arm predicted from the class (the site was not guard-inlined) */
+	WJC_RECV_ARM_EMITTED,        /* ... and emitted */
+	WJC_RECV_FILTERED,           /* profile predictions refused because the target's class cannot be the receiver's (GI gate + emitter) */
+	WJC_RECV_OVERRIDDEN,         /* ... sites whose class's method something loaded overrides: left to the profile (GI gate + emitter) */
+	WJC_RECV_WIDENED,            /* ... interface sites whose record agreed on the target: the slot guard added behind the profiled vtable */
+	WJC_PROF_SAMPLE_SITES,       /* MONO_WASM_JIT_PROF_SAMPLE: tier-1 virtual sites emitted with the sampling countdown */
 	WJC_MAX
 };
 
@@ -1540,6 +1553,11 @@ typedef struct _WjLitNote { gpointer obj, slot; struct _WjLitNote *next; } WjLit
 /* MONO_WASM_JIT_SITE_COUNT: this thread's select word. 1 once the thread entered a method MONO_WASM_JIT_SITE_THREAD
  * names; the census's second counter set adds it, so it counts that thread alone. */
 #define WJ_SCRATCH_SITESEL_SLOT (WJ_SCRATCH_FINSP_SLOT + 8)
+/* The thread's LMF chain HEAD itself (not its address): mini-runtime.c's setup_jit_tls_data points the thread's
+ * lmf_addr here instead of at jit_tls->lmf, so emitted code reads and writes the head as `s.b + this` in one load or
+ * store (MONO_WASM_JIT_EH_SLIM). The scratch is a __thread array, so the address outlives a detach and re-attach of the
+ * pthread, which &jit_tls->lmf does not. */
+#define WJ_SCRATCH_LMFHEAD_SLOT (WJ_SCRATCH_SITESEL_SLOT + 8)
 
 /* Byte offsets of interp.c's WjEhRec (R353), for the emitter, which cannot see MonoLMFExt from here. */
 typedef struct {

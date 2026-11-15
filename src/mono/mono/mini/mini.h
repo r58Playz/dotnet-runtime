@@ -829,6 +829,12 @@ struct MonoCallInst {
 	/* wasm JIT (R316b): the InterpMethod whose call profile describes this site when it was IR'd inside an inlinee
 	 * under the per-compile policy, else NULL (= the compiled method's own record). */
 	gpointer wasm_prof_im;
+	/* wasm JIT (MONO_WASM_JIT_RECV_CLASS): a class this virtual call's receiver is known to be an instance of (its site
+	 * read an argument the frame never writes: method-to-ir.c wj_recv_arg_class), else NULL; and, when the site was not
+	 * guard-inlined on it, the method that class holds for the call and the slot of the class's vtable it sits in. */
+	MonoClass *wasm_recv_class;
+	MonoMethod *wasm_static_target;
+	gint32 wasm_static_slot;
 #ifdef ENABLE_LLVM
 	LLVMCallInfo *cinfo;
 	int rgctx_arg_reg, imt_arg_reg;
@@ -1467,6 +1473,16 @@ typedef struct {
 	/* R407: the methods inline_method is inside, outermost first (the root is not on it); entries past 16 are dropped. */
 	MonoMethod      *wasm_inl_stack [16];
 	int              wasm_inl_sp;
+	/* MONO_WASM_JIT_RECV_CLASS: per argument of the frame being IR'd (the root, or the innermost inlinee), a class the
+	 * argument is an instance of for the whole frame, or NULL (method-to-ir.c wj_recv_root_args / wj_recv_inline_args). */
+	MonoClass      **wasm_arg_class;
+	int              wasm_arg_class_n;
+	/* ... and the virtual site being lowered: its base method, the receiver's class, and the static target with its
+	 * slot when the emitter should arm it. mini_emit_method_call_full (calls.c) moves them onto the site's call. */
+	MonoMethod      *wasm_site_base;
+	MonoClass       *wasm_site_class;
+	MonoMethod      *wasm_site_target;
+	int              wasm_site_slot;
 	gint32          *wasm_t2_loop_word;      /* R409: this tier-1 body's loop back-edge counter (MONO_WASM_JIT_T2_LOOP_COUNT) */
 	gint32           wasm_gi2_n;             /* R411: bimorphic-GI arms this compile took (a poly site's arm 1, or an arm 2) */
 	guint8           wasm_no_gi2;            /* R411: the retry without them (a body over T2_MAX_BODY) */
