@@ -1993,6 +1993,108 @@ mono_gc_wasm_inline_alloc_size (MonoClass *klass)
 	return 0;
 #endif
 }
+
+/* A word read out of nursery memory, named if it is a class's own vtable. Every load is bounds-tested first: the word
+ * can be anything. */
+static const char *
+wasm_dirty_word_class (gsize w, const char **ns)
+{
+	gsize memsz = (gsize) __builtin_wasm_memory_size (0) << 16;
+	MonoVTable *vt = (MonoVTable *) w;
+	MonoClass *k;
+	*ns = "";
+	if (w < 65536 || (w & 3) || w + sizeof (MonoVTable) > memsz)
+		return NULL;
+	k = vt->klass;
+	if ((gsize) k < 65536 || ((gsize) k & 3) || (gsize) k + sizeof (MonoClass) > memsz || m_class_get_runtime_vtable (k) != vt)
+		return NULL;
+	*ns = m_class_get_name_space (k);
+	return m_class_get_name (k);
+}
+
+/* An allocation by a thread whose coop state says it is in a GC-safe region (sgen-alloc.c). The first 8 print with the
+ * JS stack, which names the native frame that entered the region and the managed code running inside it. */
+static gint32 wasm_alloc_state_reports;
+void
+mono_gc_wasm_alloc_state_report (int raw_state)
+{
+	int n = mono_atomic_inc_i32 (&wasm_alloc_state_reports);
+	g_static_assert (STATE_BLOCKING == 6);
+	if (n > 8 && (n & (n - 1)))
+		return;   /* then at powers of two, so the line also says how often */
+	printf ("[sgen alloc-in-gc-safe] #%d thread %p allocates with coop state 0x%x (state %d, suspend count %d): a collection would not wait for it\n",
+		n, (gpointer) (gsize) mono_native_thread_id_get (), (guint32) raw_state, raw_state & 0x7f, (raw_state >> 8) & 0xff);
+	if (n <= 8)
+		EM_ASM ({ var l = Error.stackTraceLimit; Error.stackTraceLimit = 48; console.log ("[sgen alloc-in-gc-safe] stack " + (new Error ()).stack); Error.stackTraceLimit = l; });
+}
+
+/*
+ * What sgen_try_alloc_obj_nolock found when the word it is about to hand out was not zero (its `*p == NULL` assert
+ * follows and aborts). Fresh nursery memory is zeroed when its TLAB is made (CLEAR_AT_TLAB_CREATION), so a non-zero
+ * word means one of: (a) this TLAB outlived a nursery collection -- `born at collection` is older than `now`, i.e. the
+ * collection's sgen_clear_tlabs did not reach this thread or the thread stored tlab_next back afterwards (it was
+ * running during the pause); (b) someone else allocated here -- the words read as whole objects, vtable first;
+ * (c) a store through a stale or wild pointer -- isolated words, the rest still zero. The dump says which.
+ */
+void
+mono_gc_wasm_dirty_alloc_report (void **p, size_t size, int path, char *tlab_start, char *tlab_next, char *tlab_temp_end,
+	char *tlab_real_end, int born_gc, char *born_start)
+{
+	static gint32 reports;
+	char *nstart = sgen_get_nursery_start (), *nend = sgen_get_nursery_end ();
+	char *lim = (char *) p + 4096, *q;
+	const char *ns, *nm;
+	int i, dirty = 0, first = -1, last = -1, objs = 0;
+	SgenThreadInfo *ti = mono_thread_info_current_unchecked ();
+
+	if (mono_atomic_inc_i32 (&reports) > 4)
+		return;
+	if ((path == 2 || path >= 12) && tlab_real_end > (char *) p && tlab_real_end < lim)
+		lim = tlab_real_end;
+	if (lim > nend)
+		lim = nend;
+	for (q = (char *) p, i = 0; q + sizeof (gpointer) <= lim; q += sizeof (gpointer), ++i) {
+		gsize w = *(gsize *) q;
+		if (!w)
+			continue;
+		dirty++;
+		if (first < 0)
+			first = i;
+		last = i;
+		if (wasm_dirty_word_class (w, &ns))
+			objs++;
+	}
+	nm = wasm_dirty_word_class ((gsize) *p, &ns);
+	printf ("[sgen dirty-alloc] thread %p (coop state 0x%x) p=%p *p=%p%s%s%s%s size=%d path=%d (try: 1 over-TLAB 2 in-TLAB 3 beside-TLAB 4 new-TLAB; 5 locked in-TLAB; MONO_WASM_TLAB_VERIFY: 11 object extent, 12 / 13 rest of the TLAB, 14 the self-test) | "
+		"tlab start=%p next=%p temp_end=%p real_end=%p, born at collection %d (start %p%s), now %d, majors %d | "
+		"nursery %p-%p (p %s) | world stopped=%d, collecting generation %d | "
+		"next %d words: %d non-zero (word %d..%d), %d of them a class's vtable\n",
+		(gpointer) (gsize) mono_native_thread_id_get (), ti ? (guint32) mono_atomic_load_i32 (&ti->client_info.info.thread_state.raw) : 0u,
+		(gpointer) p, *p, nm ? " = vtable of " : "", nm ? ns : "", nm ? "." : "", nm ? nm : "",
+		(int) size, path, (gpointer) tlab_start, (gpointer) tlab_next, (gpointer) tlab_temp_end, (gpointer) tlab_real_end,
+		born_gc, (gpointer) born_start, born_start == tlab_start ? "" : ", NOT this TLAB's start",
+		sgen_gc_collection_count (GENERATION_NURSERY), sgen_gc_collection_count (GENERATION_OLD),
+		(gpointer) nstart, (gpointer) nend, ((char *) p >= nstart && (char *) p < nend) ? "inside" : "OUTSIDE",
+		sgen_is_world_stopped () ? 1 : 0, sgen_get_current_collection_generation (),
+		(int) (((char *) lim - (char *) p) / sizeof (gpointer)), dirty, first, last, objs);
+	/* 8 words before p (the previous allocation's tail) and 40 from p, one line, with the vtables named. */
+	q = (char *) p - 8 * sizeof (gpointer);
+	if (q < nstart)
+		q = nstart;
+	printf ("[sgen dirty-alloc] words from %p:", (gpointer) q);
+	for (i = 0; i < 48 && q + sizeof (gpointer) <= nend; ++i, q += sizeof (gpointer)) {
+		gsize w = *(gsize *) q;
+		nm = w ? wasm_dirty_word_class (w, &ns) : NULL;
+		if (q == (char *) p)
+			printf (" [p]");
+		if (nm)
+			printf (" %x<%s.%s>", (guint32) w, ns, nm);
+		else
+			printf (" %x", (guint32) w);
+	}
+	printf ("\n");
+	fflush (stdout);
+}
 #endif
 
 void

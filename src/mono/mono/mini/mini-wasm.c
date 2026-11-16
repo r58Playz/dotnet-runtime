@@ -370,6 +370,18 @@ int mono_wasm_jit_guarded_inline_size = 60;
 int mono_wasm_jit_delegate_devirt = 15;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.16.1 + Fabric + Sodium/Lithium under IKVM, 2026-08/09, plateau protocol. A number without a workload is not a result -- this one has one, and it is not necessarily right for anything else. */
 /* minimum %% of a delegate site's observations its dominant target must hold before it gets a guarded direct arm. MEASURED: -6.6%% of client-thread instructions/frame at n=2 with a flat negative control (__<>MHC stubs -12.8%%, InstanceCheck -22.7%%). thin=35 of 7,556 sites, so delegate sites are overwhelmingly SINGLE-TARGET and the bar is not worth sweeping. */
 int mono_wasm_jit_pred_pct = 0;
+/* MONO_WASM_JIT_PRED_VERIFY: every (receiver vtable, target method) pair a call-profile predictor returns is checked
+ * against the receiver class's own vtable before the emitter may bake a guarded call or a guarded inline from it
+ * (interp.c wj_pred_verify, which says why the record cannot be trusted for the pairing). 1 = a pair the class
+ * contradicts is refused -- no arm, the site keeps its IC -- and named (`[wasm-jit predverify] #n MISMATCH|FOREIGN`,
+ * the first 64); 2 = named and KEPT (the reproduction arm: tests only); 0 = no check. Counts on the
+ * `[wasm-jit predverify]` line, printed with the bounds. */
+int mono_wasm_jit_pred_verify = 1;
+/* MONO_WASM_JIT_PROF_SERIAL: the call profile's three creating writes -- a site slot, a site's first observation, a new
+ * (identity, target) entry -- run one at a time (interp.c, THE APPEND SECTION), and a monomorphic prediction takes its
+ * target from the identity set instead of the front-runner's second word. 0 = the unserialized recorder (tests only:
+ * with MONO_WASM_JIT_PRED_VERIFY=2 it is the reproduction arm). Counts on the `[wasm-jit profappend]` line. */
+int mono_wasm_jit_prof_serial = 1;
 /* Minimum share of a site's observations the runner-up must hold, in percent. Default is the measured
  * co-located break-even; raise toward 50 if arm-2 targets are not co-locating. */
 int mono_wasm_jit_devirt_arm2_pct = 15;
@@ -1360,6 +1372,8 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_recv_class, "MONO_WASM_JIT_RECV_CLASS", 0, 31)
+	WJ_T2_KNOB (mono_wasm_jit_pred_verify, "MONO_WASM_JIT_PRED_VERIFY", 0, 2)
+	WJ_T2_KNOB (mono_wasm_jit_prof_serial, "MONO_WASM_JIT_PROF_SERIAL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_sample, "MONO_WASM_JIT_PROF_SAMPLE", 0, 65536)
 	WJ_T2_KNOB (mono_wasm_jit_prof_decay, "MONO_WASM_JIT_PROF_DECAY", 0, 60000)
 	WJ_T2_KNOB (mono_wasm_jit_eh_jtab, "MONO_WASM_JIT_EH_JTAB", 0, 7)

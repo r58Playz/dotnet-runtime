@@ -184,6 +184,22 @@ mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *k
 		total, site, obj, vt, fbuf, tbuf, mname ? mname : "(see stack)");
 	g_free (mname);
 	EM_ASM ({ var l = Error.stackTraceLimit; Error.stackTraceLimit = 40; var s = (new Error ()).stack; Error.stackTraceLimit = l; console.log (UTF8ToString ($0) + " " + s); }, line);
+	/* Where the object is and what its first words are: a reference that outlived a nursery collection points at
+	 * whatever the nursery holds there now (a filler, another object, zeroes), and a value that was never a reference
+	 * (a boolean returned by the wrong callee) is not in the heap at all. */
+	if (obj) {
+		int nshift = 0;
+		size_t nsize = 0;
+		uintptr_t nstart = (uintptr_t) mono_gc_get_nursery (&nshift, &nsize), o = (uintptr_t) obj;
+		guint32 w [4] = { 0, 0, 0, 0 };
+		gboolean readable = wj_castfail_in_heap (obj) && !(o & 3) && wj_castfail_in_heap ((guint8 *) obj + 16);
+		if (readable)
+			memcpy (w, obj, sizeof (w));
+		printf ("[wasm-jit castfail] #%d object: %p %s, nursery %p +%u MiB (%s), words %x %x %x %x, collections minor %d major %d\n",
+			total, obj, readable ? "readable" : "NOT a heap address", (void *) nstart, (guint32) (nsize >> 20),
+			(o >= nstart && o < nstart + nsize) ? "INSIDE" : "outside", w [0], w [1], w [2], w [3],
+			mono_gc_collection_count (0), mono_gc_collection_count (1));
+	}
 	/* MONO_WASM_JIT_CAST_DIAG: what an inline check of `to` reads, as it stands NOW. The emitted check compares
 	 * from.supertypes [to.idepth - 1] with `to` (a sealed class: from itself), or tests bit to.iid of the vtable's
 	 * interface bitmap under max_iid, with `to`, its idepth and its iid baked in when the method was compiled. A check
@@ -638,6 +654,29 @@ mono_wasm_jit_dump_stats (void)
 		 * first -- non-zero and small is normal (1-4 a run); before R489 each one stored a generation past the
 		 * arrays' end. reach_oob = wj_asm_reaches walks that met a descriptor registered past their stamp array. */
 		WJC_(WJC_DESC_GROW), WJC_(WJC_REACH_OOB));
+	{
+		/* MONO_WASM_JIT_PRED_VERIFY (interp.c wj_pred_verify): mismatch + foreign = predictions the receiver's class
+		 * contradicted; each would have been a guarded call to the wrong method. */
+		extern void mono_wasm_jit_pred_verify_stats (guint32 *out);
+		extern int mono_wasm_jit_pred_verify;
+		guint32 pv [6];
+		mono_wasm_jit_pred_verify_stats (pv);
+		printf ("[wasm-jit predverify] checked=%u ok=%u unknown=%u mismatch=%u foreign=%u refused=%u (pred_verify=%d)\n",
+			pv [0], pv [1], pv [2], pv [3], pv [4], pv [5], mono_wasm_jit_pred_verify);
+		{
+			/* MONO_WASM_JIT_PROF_SERIAL: raced_* = appends whose second look, inside the section, found what another
+			 * thread had just made -- each one a pair that would have been written by two threads at once. busy must
+			 * read 0: an observation dropped because the section was never free. */
+			extern void mono_wasm_jit_prof_append_stats (gint32 *out);
+			extern int mono_wasm_jit_prof_serial;
+			gint32 pa [7];
+			mono_wasm_jit_prof_append_stats (pa);
+			/* other_* = the second look found a DIFFERENT entry appended since the first: the appends the unserialized
+			 * recorder could have torn into a mismatched pair. */
+			printf ("[wasm-jit profappend] raced_site=%d raced_id=%d raced_first=%d busy=%d | other_site=%d other_id=%d other_first=%d (prof_serial=%d)\n",
+				pa [0], pa [1], pa [2], pa [3], pa [4], pa [5], pa [6], mono_wasm_jit_prof_serial);
+		}
+	}
 	/* R516: the V8-assisted stack walk (exceptions-wasm-stackwalk.inc). Ungated, like the bounds above. */
 	mono_wasm_stackwalk_print_stats ();
 	/*

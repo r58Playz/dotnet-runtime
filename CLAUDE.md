@@ -438,7 +438,11 @@ number.
   front end was 1.6-2.5x worse (icache, iTLB, BTB), and that tax follows CODE VOLUME, not placement: C1's byte cut took
   6-10% off it (R459), while packing the hot set into 28 modules took nothing (R463). The levers are fewer executed
   instructions and smaller hot functions, not cheaper instructions. On 26.2, entity code runs at a lower IPC than
-  HotSpot's (1.04 vs 1.30); its front end has not been measured.
+  HotSpot's (1.04 vs 1.30), and the server thread is 34% front-end bound on the P-cores against HotSpot's 20-22%
+  (2026-11-15, `runs/2026-11-15-fe`, ours n=3, HotSpot n=2; the FO pack 50%, n=1): 0.42 against 0.29 cycles of
+  front-end loss an instruction, so density at today's instruction count is worth at most ~10% of the tick. L1i misses
+  per instruction already equal HotSpot's; iTLB walks and BTB misses are 3x. Layout inside hot functions is the part
+  that has paid: `MONO_WASM_JIT_BRANCH_HINTS=0` costs 12.9% of the tick's cycles at equal instructions (n=3 a side).
 * **The kernel no longer explains the game**: jbox2d is ~2x HotSpot while the 26.2 tick is ~6x. Minecraft adds machinery a
   kernel does not exercise: IKVM's unresolved-member dispatch (the lazy-link fallback for unloadable types -- NOT
   `java.lang.invoke`, which is small), our dispatch, IC and boundary helpers, Java type checks, `Unsafe` emulation (no
@@ -529,8 +533,16 @@ submit (`runs/2026-11-06-262/ours/o2a`). Its frame rate and client-thread profil
 * **A write-mapped persistent buffer is re-sent at every submit** unless it is FLUSH_EXPLICIT and non-coherent (GL leaves
   its unflushed writes undefined, and `glFlushMappedBufferRange` already uploaded the rest); other mappings send a diff.
   26.2's Sodium maps a 32 MB staging buffer that way, and sending it whole was 16 fps against 108 (R509; unconditional
-  since mesa-wink 51eb6bdb). Read `gex-wgpu: persistent mappings sent X MiB a submit`. 26.2's per-frame
-  `glClientWaitSync` is two round trips through main, unfixed.
+  since mesa-wink 51eb6bdb). Read `gex-wgpu: persistent mappings sent X MiB a submit`.
+* **26.2's per-frame `glFenceSync` + `glClientWaitSync` serialize the render thread and main** (unfixed). They come from
+  `GlCommandEncoder.submit` (pacing its staging memory) and their answers are constants here (the driver has no
+  fences), but each makes the render thread wait for main to execute what is queued: on 262n the two threads take turns,
+  ~3.2 ms of a 14 ms frame (2026-11-15, one capture; a bound of ~+27% fps, not an A/B).
+* **Half of main's GL time is wink's own per-draw work, and 26.2's present is a row-by-row copy** (2026-11-15,
+  `runs/2026-11-15-wink`, findings note): the driver keeps no dirty state (39% of main in the draw path), the present
+  blit's y flip is one `copyTextureToTexture` per row of window height (428 of the FO pack's 675 WebGPU calls a frame),
+  8 of ~13.5 passes a frame are clears with no draw, and copies break the frame into 9-10 submits (1.16.1: 2). wink's
+  Vulkan driver (wvk) is linked in, but in this threading mode it wraps every Vulkan call in a synchronous hop to main.
 * The ~62 fps ceiling exists only in the headless harness (compare GL configurations with `MC_UNCAPPED=1`). Past it, the
   seed's `maxFps:120` holds (`?wj.IKVM_GAME_OPTIONS=maxFps:260` lifts it). Below the limiter, read cycles a frame, not fps.
 * Traps: an edit to the `emscripten-glfw` checkout needs `emscripten-glfw.patch` regenerated, or `build-glfw.sh`

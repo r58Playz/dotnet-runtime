@@ -1370,14 +1370,77 @@ mono_wasm_jit_prof_stat (int field)
 	}
 }
 
+/*
+ * THE APPEND SECTION (MONO_WASM_JIT_PROF_SERIAL, knob comment in mini-wasm.c; findings note 2026-11-15).
+ *
+ * The record is written by every thread that runs the caller, and three of its writes CREATE something a reader later
+ * trusts as a pair: a site slot (callee, kind), a site's first observation, and a new (identity, target) entry of its
+ * identity set. Unserialized, two threads doing one of those at once leave a pair made of one thread's half and the
+ * other's -- a slot labelled `List.contains` holding the receivers and targets of `List.isEmpty`, or ArrayList$Itr
+ * beside UnmodifiableCollection$1.next -- and the pair is stable from then on, so the predictors' double read sees
+ * nothing wrong and the emitter bakes `if (this->vtable == A) call B's method`. Reproduced on a jar (tests/
+ * foreach-race.jar: one method's for-each raised ConcurrentModificationException 583 times off such an arm).
+ *
+ * So those three writes run one at a time, process-wide, and re-read what they are about to create once inside. They
+ * are rare by construction -- once per site, and at most WJ_PROF_WAYS times per site for identities -- so one flag for
+ * the whole process is enough, and the hot paths (the lookup, a known identity's count, the majority vote) take
+ * nothing. The section makes no call and reaches no safepoint. The spin is test-and-test-and-set and BOUNDED
+ * (mono_thread_info_yield is a no-op here): an appender that cannot get in drops its observation and counts it.
+ */
+static volatile gint32 wj_prof_append_flag;
+static gint32 wj_prof_append_busy;        /* observations dropped: the section stayed held for the whole spin */
+static gint32 wj_prof_append_raced_site;  /* the re-read found the site another appender had just made */
+static gint32 wj_prof_append_raced_id;    /* ... the identity ... */
+static gint32 wj_prof_append_raced_first; /* ... the first observation */
+/* The appends the unserialized recorder could tear: the second look found a DIFFERENT entry made since the first --
+ * another callee's site, another receiver's identity, a first observation by another receiver. Each is two threads
+ * creating two different pairs in one place at one time. */
+static gint32 wj_prof_append_other_site, wj_prof_append_other_id, wj_prof_append_other_first;
+
+static inline gboolean
+wj_prof_append_enter (void)
+{
+	extern int mono_wasm_jit_prof_serial;
+	int spins;
+	if (!mono_wasm_jit_prof_serial)
+		return TRUE;
+	for (spins = 0; spins < 100000; ++spins)
+		if (mono_atomic_load_i32 (&wj_prof_append_flag) == 0 && mono_atomic_cas_i32 (&wj_prof_append_flag, 1, 0) == 0)
+			return TRUE;
+	wj_prof_append_busy++;
+	return FALSE;
+}
+
+static inline void
+wj_prof_append_leave (void)
+{
+	extern int mono_wasm_jit_prof_serial;
+	if (mono_wasm_jit_prof_serial)
+		mono_atomic_store_i32 (&wj_prof_append_flag, 0);
+}
+
+void mono_wasm_jit_prof_append_stats (gint32 *out);
+void
+mono_wasm_jit_prof_append_stats (gint32 *out)
+{
+	out [0] = wj_prof_append_raced_site; out [1] = wj_prof_append_raced_id;
+	out [2] = wj_prof_append_raced_first; out [3] = wj_prof_append_busy;
+	out [4] = wj_prof_append_other_site; out [5] = wj_prof_append_other_id; out [6] = wj_prof_append_other_first;
+}
+
 /* Add `identity` to the site's distinct-identity set. Saturating: past WJ_PROF_WAYS it only sets the
  * overflow flag, so the cost stays bounded no matter how polymorphic the site is. */
 static void
 wj_prof_note_identity (WjProfSite *s, gpointer identity, MonoMethod *target)
 {
-	guint32 k;
+	guint32 k, n, n_first = 0;
+	gboolean again = FALSE;
 
-	for (k = 0; k < s->nids; ++k)
+rescan:
+	n = s->nids;
+	if (!again)
+		n_first = n;
+	for (k = 0; k < n && k < WJ_PROF_WAYS; ++k)
 		if (s->ids [k] == identity) {
 			/* Saturating: a count that wrapped would invert the ranking, which is worse than one that
 			 * stops growing -- once an identity is this dominant its rank cannot change. */
@@ -1386,15 +1449,34 @@ wj_prof_note_identity (WjProfSite *s, gpointer identity, MonoMethod *target)
 			/* A sizing-only observation arrives with target == NULL; do not clobber a resolved one. */
 			if (target && !s->id_targets [k])
 				s->id_targets [k] = target;
+			if (again) {
+				wj_prof_append_raced_id++;
+				wj_prof_append_leave ();
+			}
 			return;
 		}
-	if (s->nids >= WJ_PROF_WAYS) {
+	if (n >= WJ_PROF_WAYS) {
 		s->ids_overflow = 1;
+		if (again)
+			wj_prof_append_leave ();
 		return;
 	}
-	s->id_targets [s->nids] = target;
-	s->id_counts [s->nids] = 1;
-	s->ids [s->nids++] = identity;
+	if (!again) {
+		/* A new identity: enter the append section and read the set again, as it stands with no appender in it. */
+		if (!wj_prof_append_enter ())
+			return;
+		again = TRUE;
+		goto rescan;
+	}
+	if (n != n_first)
+		wj_prof_append_other_id++;
+	/* The entry is whole before the count that publishes it: readers stop at nids. */
+	s->id_targets [n] = target;
+	s->id_counts [n] = 1;
+	s->ids [n] = identity;
+	mono_memory_barrier ();
+	s->nids = (guint8) (n + 1);
+	wj_prof_append_leave ();
 }
 
 /* R484: the site capacity of the next block of a chain whose blocks already hold `used_cap` slots; 0 when the
@@ -1483,14 +1565,19 @@ static WjProfSite *
 wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean create)
 {
 	extern int mono_wasm_jit_prof_blocks;
-	WjCallProfile *head, *p, *last = NULL;
-	guint32 i, n, used_cap = 0;
+	WjCallProfile *head, *p, *last;
+	guint32 i, n, used_cap, seen, seen_first = 0;
+	gboolean in_section = FALSE;
 
 	if (!caller || !base)
 		return NULL;
 	head = create ? wj_prof_block (caller) : (WjCallProfile *) caller->wasm_jit_profile;
 	if (!head)
 		return NULL;
+rescan:
+	last = NULL;
+	used_cap = 0;
+	seen = 0;
 	/* R311: blocks CHAIN rather than grow. The JIT miss path memoises a WjProfSite * (WjVcallSite.prof), so a
 	 * site must never move; a published block is never moved or freed. R310 measured the old single 12-site
 	 * block dropping the callees of the hottest entity methods for the whole process. */
@@ -1502,10 +1589,16 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
 		if (n > p->cap)
 			n = p->cap;
 		for (i = 0; i < n; ++i)
-			if (p->sites [i].base == base && p->sites [i].kind == (guint8) kind)
+			if (p->sites [i].base == base && p->sites [i].kind == (guint8) kind) {
+				if (in_section) {
+					wj_prof_append_raced_site++;
+					wj_prof_append_leave ();
+				}
 				return &p->sites [i];
+			}
 		last = p;
 		used_cap += p->cap;
+		seen += n;
 	}
 	if (!create)
 		return NULL;
@@ -1513,6 +1606,11 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
 	if (p->n >= p->cap) {
 		WjCallProfile *nb;
 		guint32 cap = wj_prof_next_cap (used_cap);
+		/* A block is allocated OUTSIDE the append section: the mempool's lock can block. */
+		if (in_section) {
+			wj_prof_append_leave ();
+			in_section = FALSE;
+		}
 		if (!cap) {
 			wj_prof_evicted++;                /* every block full: ignore further callees rather than thrash */
 			wj_prof_note_capped (caller, head, base);
@@ -1522,14 +1620,22 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
 		nb = wj_prof_alloc_block (caller, cap);
 		if (!nb)
 			return NULL;
-		if (mono_atomic_cas_ptr ((gpointer *) &p->next, nb, NULL) != NULL)
-			nb = p->next;
-		else if (G_UNLIKELY (mono_wasm_jit_stats))
+		if (mono_atomic_cas_ptr ((gpointer *) &p->next, nb, NULL) == NULL && G_UNLIKELY (mono_wasm_jit_stats))
 			mono_wasm_jit_count (WJC_PROF_BLOCK_GROW);
-		p = nb;
-		if (p->n >= p->cap)
-			return NULL;                      /* a racing appender filled it first; a later observation walks on */
+		goto rescan;                          /* the chain has a block with room now: look, then append there */
 	}
+	if (!in_section) {
+		/* Two threads appending two callees at once took the same slot: both then recorded into a record that bears
+		 * one callee's name. Claim the slot inside the append section, after reading the table again as it stands
+		 * with no appender in it. */
+		if (!wj_prof_append_enter ())
+			return NULL;
+		in_section = TRUE;
+		seen_first = seen;
+		goto rescan;
+	}
+	if (seen != seen_first)
+		wj_prof_append_other_site++;
 	i = p->n;
 	wj_prof_sites++;
 	p->sites [i].base = base;
@@ -1541,6 +1647,7 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
 	 * identity and prof_arity rejects nids == 0. */
 	mono_memory_barrier ();
 	p->n = i + 1;
+	wj_prof_append_leave ();
 	return &p->sites [i];
 }
 
@@ -1553,9 +1660,13 @@ wj_prof_site (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gboolean 
  * Called from the interpreter's virtual and delegate dispatch AND from the JITted code's IC-miss publish,
  * so it must stay cheap: a linear scan over <=12 pointers, no allocation after the first call, no locking.
  *
- * Racy by design on threaded builds. Concurrent recorders can interleave and lose a sample or briefly
- * disagree about the front-runner; the result is only ever a worse *prediction*, and the emitted code
- * guards on the identity regardless. Taking a lock here would cost more than the profile is worth.
+ * The COUNTS are racy by design on threaded builds: concurrent recorders can lose a sample or disagree about the
+ * majority, and that only ever costs a prediction. The PAIRS are not allowed to be: the emitted guard proves the
+ * receiver's vtable and then calls the recorded target with no further test, so a vtable recorded beside another
+ * receiver's (or another callee's) target is a call into the wrong method's body, not a missed prediction. This
+ * comment used to say the guard made every race harmless; it was reproduced otherwise on 2026-11-15 (THE APPEND
+ * SECTION above, MONO_WASM_JIT_PROF_SERIAL). So the writes that CREATE a pair take the section, and the two words the
+ * majority vote adopts without it (`identity`, `target`) are never read as a pair (mono_wasm_jit_prof_predict).
  */
 static guint32 wj_prof_decays;   /* MONO_WASM_JIT_PROF_DECAY: halvings (racy, a census) */
 
@@ -1574,7 +1685,42 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
 	 * leaves the margin at zero, so that a site which has ever been polymorphic can never again claim
 	 * margin == total), and the site could then never be predicted however monomorphic it turned out to
 	 * be. Keyed on `total`, the invariant is the same one the pre-unification recorder had. */
-	if (s->total != 0) {
+	if (s->total == 0) {
+		/* Two threads making a site's first observation at once, with different receivers, left one's identity
+		 * beside the other's target -- in the front-runner and in ids [0]. One first observation, made inside the
+		 * append section; `total` goes non-zero LAST, so nothing on the update path reads a half-made record. */
+		gboolean first = FALSE;
+		if (!wj_prof_append_enter ())
+			return;
+		if (s->total == 0) {
+			first = TRUE;
+			wj_prof_samples++;
+			if (from_jit)
+				wj_prof_jit_samples++;
+			s->identity = target ? identity : NULL;
+			s->target = target;
+			s->margin = target ? 1 : 0;
+			/* The identity set's first entry gets its target and count here too: the set path
+			 * (wj_prof_note_identity) is not taken for a first observation, and a record left at ONE observation
+			 * -- a hot monomorphic IC site -- had ids [0] with no target and a count of 0 until R405. */
+			s->id_targets [0] = target;
+			s->id_counts [0] = 1;
+			s->ids [0] = identity;
+			s->nids = 1;
+			s->ids_overflow = 0;
+			mono_memory_barrier ();
+			s->total = 1;
+		} else {
+			wj_prof_append_raced_first++;
+			if (s->ids [0] != identity)
+				wj_prof_append_other_first++;
+		}
+		wj_prof_append_leave ();
+		if (first)
+			return;
+		/* another thread's first observation landed first: this one is an update */
+	}
+	{
 		/* A delegate site never accumulates a majority margin (see WjProfSite.margin), so it must
 		 * saturate on `total` instead or it would record forever.
 		 *
@@ -1617,21 +1763,6 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
 		}
 		return;
 	}
-	wj_prof_samples++;
-	if (from_jit)
-		wj_prof_jit_samples++;
-	s->identity = target ? identity : NULL;
-	s->target = target;
-	s->margin = target ? 1 : 0;
-	s->total = 1;
-	/* The identity set's first entry gets its target and count here too: the set path (wj_prof_note_identity) is
-	 * not taken for a first observation, and a record left at ONE observation -- a hot monomorphic IC site -- had
-	 * ids [0] with no target and a count of 0 until R405. */
-	s->id_targets [0] = target;
-	s->id_counts [0] = 1;
-	s->ids [0] = identity;
-	s->nids = 1;
-	s->ids_overflow = 0;
 }
 
 /* Resolve this caller's record for (base, kind) and record into it. The observation points that hold a
@@ -1729,6 +1860,172 @@ mono_wasm_jit_prof_site_id (gpointer caller_ptr, MonoMethod *base, int kind, vol
 }
 
 /*
+ * MONO_WASM_JIT_PRED_VERIFY (knob comment in mini-wasm.c): is `target` what a receiver whose vtable is `vt` runs for a
+ * virtual call of `base`?
+ *
+ * Every predictor below hands the emitter a (receiver vtable, target method) pair read from a WjProfSite, and the
+ * emitter bakes `if (this->vtable == vt) call target` with no further test: its guard proves the RECEIVER, never the
+ * pairing. The pairing is only as good as the record, and the record is written without a lock by every thread that
+ * runs the caller: wj_prof_site appends a slot with a plain `i = p->n; ...; p->n = i + 1` (two threads appending two
+ * different callees take the same slot, and both then record into it), and wj_prof_record_at / wj_prof_note_identity
+ * store an identity and its target as separate words. The predictors' double read catches a replacement IN FLIGHT; a
+ * pair left mismatched by two recorders is stable and reads clean. A mismatched arm calls another method's body with
+ * this receiver (or the right class's wrong method): type confusion, not a missed prediction.
+ *
+ * Answered from the receiver class's own tables, the way mono_wasm_jit_prof_sample_site resolves a target: a
+ * class-virtual slot, or a non-generic interface's offset. No class init, no lock, no allocation, so it is safe in a
+ * compile section. Returns 1 = consistent, 0 = cannot tell (a generic / inflated / wrapper-backed dispatch, or a vtable
+ * that is not its class's), -1 = the class dispatches `base` to another method (*out_expected), -2 = a receiver of
+ * this class cannot reach `base` or cannot be `target`'s `this` at all.
+ */
+static guint32 wj_pv_checked, wj_pv_ok, wj_pv_unknown, wj_pv_mismatch, wj_pv_foreign, wj_pv_refused;
+
+static int
+wj_pred_pair_check (MonoMethod *base, MonoVTable *vt, MonoMethod *target, MonoMethod **out_expected)
+{
+#if HOST_BROWSER
+	extern int mono_wasm_jit_ptr_plausible (gpointer p);
+	MonoClass *k, *bk, *tk;
+	MonoMethod *t;
+	int slot = -1;
+
+	*out_expected = NULL;
+	if (!base || !target || !mono_wasm_jit_ptr_plausible (vt))
+		return 0;
+	k = vt->klass;
+	/* A profile identity is a raw pointer: only trust a vtable that is still its class's own. */
+	if (!mono_wasm_jit_ptr_plausible (k) || m_class_get_runtime_vtable (k) != vt)
+		return 0;
+	bk = base->klass;
+	tk = target->klass;
+	if (!bk || !tk || !m_class_get_vtable (k) || !m_class_get_supertypes (k) || m_class_get_rank (k))
+		return 0;
+	/* `this` for the target: the receiver's class must be the target's class or below it (an interface-declared
+	 * target -- a default method -- is left to the slot test). Holds whatever shape the dispatch has. */
+	if (!mono_class_is_interface (tk) && !m_class_is_valuetype (tk) && !mono_class_is_ginst (tk) && !mono_class_is_gtd (tk) &&
+	    !mono_class_is_ginst (k) && m_class_get_supertypes (tk) && m_class_get_idepth (tk) > 0 &&
+	    !mono_class_has_parent_fast (k, tk))
+		return -2;
+	if (base->is_inflated || base->is_generic || base->slot < 0 || mono_class_is_ginst (k) ||
+	    !(base->flags & METHOD_ATTRIBUTE_VIRTUAL))
+		return 0;
+	if (mono_class_is_interface (bk)) {
+		int io;
+		if (mono_class_is_ginst (bk) || mono_class_is_gtd (bk))
+			return 0;
+		io = mono_class_interface_offset (k, bk);
+		if (io < 0)
+			return -2;   /* the interpreter's own resolve asserts on this (get_virtual_method) */
+		slot = io + base->slot;
+	} else {
+		if (!m_class_get_supertypes (bk) || m_class_get_idepth (bk) <= 0)
+			return 0;
+		if (!mono_class_has_parent_fast (k, bk))
+			return -2;
+		if (base->flags & METHOD_ATTRIBUTE_FINAL) {
+			/* get_virtual_method returns a final base itself (or its synchronized wrapper) */
+			if (base->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)
+				return 0;
+			*out_expected = base;
+			return target == base ? 1 : -1;
+		}
+		slot = base->slot;
+	}
+	if (slot < 0 || slot >= m_class_get_vtable_size (k))
+		return 0;
+	t = m_class_get_vtable (k) [slot];
+	/* What get_virtual_method would wrap or inflate, it records as something other than the slot's method. */
+	if (!t || t->is_inflated || t->is_generic || !t->klass || mono_class_is_interface (t->klass) ||
+	    (t->flags & METHOD_ATTRIBUTE_ABSTRACT) ||
+	    (t->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)) ||
+	    (t->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL))
+		return 0;
+	*out_expected = t;
+	return t == target ? 1 : -1;
+#else
+	(void) base; (void) vt; (void) target;
+	*out_expected = NULL;
+	return 0;
+#endif
+}
+
+/* TRUE = the prediction may be used. `src` names the predictor (1 predict/margin, 2 predict/pct, 3 alt, 4 method,
+ * 5 second, 6 cold). Names come from raw metadata fields, as wj_prof_note_capped's do. */
+static gboolean
+wj_pred_verify (InterpMethod *caller, MonoMethod *base, MonoVTable *vt, MonoMethod *target, int src)
+{
+	extern int mono_wasm_jit_pred_verify;
+	MonoMethod *expected = NULL;
+	int r;
+
+	if (!mono_wasm_jit_pred_verify)
+		return TRUE;
+	r = wj_pred_pair_check (base, vt, target, &expected);
+	wj_pv_checked++;
+	/* A boot-only run ends before any counter dump: say where the counts stand every 4,096 predictions (a boot makes
+	 * a few tens of thousands). */
+	if (G_UNLIKELY ((wj_pv_checked & 4095) == 0))
+		printf ("[wasm-jit predverify] checked=%u ok=%u unknown=%u mismatch=%u foreign=%u refused=%u | profappend raced_site=%d raced_id=%d raced_first=%d busy=%d | other_site=%d other_id=%d other_first=%d\n",
+			wj_pv_checked, wj_pv_ok, wj_pv_unknown, wj_pv_mismatch, wj_pv_foreign, wj_pv_refused,
+			wj_prof_append_raced_site, wj_prof_append_raced_id, wj_prof_append_raced_first, wj_prof_append_busy,
+			wj_prof_append_other_site, wj_prof_append_other_id, wj_prof_append_other_first);
+	if (r == 1) { wj_pv_ok++; return TRUE; }
+	if (r == 0) { wj_pv_unknown++; return TRUE; }
+	if (r == -1) wj_pv_mismatch++; else wj_pv_foreign++;
+	if (wj_pv_mismatch + wj_pv_foreign <= 64) {
+		MonoMethod *cm = caller ? caller->method : NULL;
+		MonoClass *k = vt->klass;
+		printf ("[wasm-jit predverify] #%u %s src=%d in %s.%s:%s -- base %s.%s:%s, receiver %s.%s (vt %p), profile target %s.%s:%s (%p)",
+			wj_pv_mismatch + wj_pv_foreign, r == -1 ? "MISMATCH" : "FOREIGN", src,
+			cm ? m_class_get_name_space (cm->klass) : "?", cm ? m_class_get_name (cm->klass) : "?", cm ? cm->name : "?",
+			m_class_get_name_space (base->klass), m_class_get_name (base->klass), base->name,
+			m_class_get_name_space (k), m_class_get_name (k), (void *) vt,
+			m_class_get_name_space (target->klass), m_class_get_name (target->klass), target->name, (void *) target);
+		if (expected)
+			printf (", the class dispatches to %s.%s:%s (%p)", m_class_get_name_space (expected->klass),
+				m_class_get_name (expected->klass), expected->name, (void *) expected);
+		printf (" -- %s\n", mono_wasm_jit_pred_verify == 1 ? "prediction refused" : "KEPT (MONO_WASM_JIT_PRED_VERIFY=2)");
+		/* The record the pair came from, and every site of the caller's profile beside it: a callee recorded at two
+		 * indices, or one whose receivers belong to another callee, is what two appenders in one slot leave behind. */
+		if (caller) {
+			WjCallProfile *pb;
+			guint32 si = 0, k2;
+			for (pb = (WjCallProfile *) caller->wasm_jit_profile; pb && si < 24; pb = pb->next) {
+				guint32 n = pb->n > pb->cap ? pb->cap : pb->n, i2;
+				for (i2 = 0; i2 < n && si < 24; ++i2, ++si) {
+					WjProfSite *ps = &pb->sites [i2];
+					MonoMethod *b2 = ps->base;
+					if (b2 && !wj_method_usable_profile (b2)) {
+						printf ("[wasm-jit predverify]   site %u kind %d base %p (freed) total %u\n", si, (int) ps->kind, (void *) b2, ps->total);
+						continue;
+					}
+					printf ("[wasm-jit predverify]   site %u%s kind %d base %s.%s:%s (%p) total %u margin %u front %p -> %p, ids",
+						si, b2 == base ? " <<" : "", (int) ps->kind,
+						b2 ? m_class_get_name_space (b2->klass) : "?", b2 ? m_class_get_name (b2->klass) : "?", b2 ? b2->name : "?",
+						(void *) b2, ps->total, ps->margin, ps->identity, (void *) ps->target);
+					for (k2 = 0; k2 < ps->nids && k2 < WJ_PROF_WAYS; ++k2)
+						printf (" %p->%p x%u", ps->ids [k2], (void *) ps->id_targets [k2], (guint32) ps->id_counts [k2]);
+					printf ("%s\n", ps->ids_overflow ? " (overflow)" : "");
+				}
+			}
+		}
+	}
+	if (mono_wasm_jit_pred_verify == 1) {
+		wj_pv_refused++;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+void mono_wasm_jit_pred_verify_stats (guint32 *out);
+void
+mono_wasm_jit_pred_verify_stats (guint32 *out)
+{
+	out [0] = wj_pv_checked; out [1] = wj_pv_ok; out [2] = wj_pv_unknown;
+	out [3] = wj_pv_mismatch; out [4] = wj_pv_foreign; out [5] = wj_pv_refused;
+}
+
+/*
  * R206: the RUNNER-UP receiver at a site, for a second guarded arm.
  *
  * Why this is a separate entry point and not a flag on mono_wasm_jit_prof_predict: that function answers
@@ -1786,6 +2083,8 @@ mono_wasm_jit_prof_predict_alt (gpointer caller_ptr, MonoMethod *base, MonoVTabl
 	/* nids only grows and total only grows; a change means the set moved under us. Refusing is free --
 	 * the site keeps its IC and the next emission sees a settled record. */
 	if (nids1 != nids2 || total1 != total2 || !best_id || !best_t || !total1)
+		return FALSE;
+	if (!wj_pred_verify (caller, base, (MonoVTable *) best_id, best_t, 3))
 		return FALSE;
 
 	*out_vt = (MonoVTable *) best_id;
@@ -1860,9 +2159,10 @@ mono_wasm_jit_prof_predict_delegate (gpointer caller_ptr, MonoMethod *base,
  *
  * `margin` is a Boyer-Moore margin rather than an occurrence counter, so equality with total is the
  * one useful exact statement it can make: every observation had the same receiver.  The generated
- * code still guards on that vtable, making a stale/racy prediction a performance miss rather than a
- * correctness assumption.  Read the tuple twice because the recorder is deliberately lock-free; a
- * replacement in progress must not pair one receiver's vtable with another receiver's target.
+ * code guards on that vtable -- which makes a STALE prediction a performance miss, and does nothing for a pair
+ * whose two halves came from two recorders: the target is taken from the identity set for that reason (below),
+ * and every pair returned is checked against the receiver's class (wj_pred_verify).  Read the tuple twice
+ * because the majority vote is lock-free; a replacement in progress must not be read half-way.
  */
 gboolean
 mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **out_vt,
@@ -1931,11 +2231,33 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 				if (out_why) *out_why = WJ_PRED_POLY;
 				return FALSE;
 			}
+			if (!wj_pred_verify (caller, base, (MonoVTable *) best_id, best_t, 2)) {
+				if (out_why) *out_why = WJ_PRED_TORN;
+				return FALSE;
+			}
 			*out_vt = (MonoVTable *) best_id;
 			*out_target = best_t;
 			if (out_samples) *out_samples = total1;
 			if (out_why) *out_why = WJ_PRED_OK;
 			return TRUE;
+		}
+	}
+	{
+		/* `identity` and `target` are two words adopted by two stores on a path that takes no section (the majority
+		 * vote, every observation of a polymorphic site), so two recorders can leave one's identity beside the other's
+		 * target and the double read above cannot tell. An identity-set entry is made whole inside the append section
+		 * and never changes: take the front-runner's target from there. An identity the set does not hold (more
+		 * than WJ_PROF_WAYS receivers) is not a monomorphic site. */
+		extern int mono_wasm_jit_prof_serial;
+		if (mono_wasm_jit_prof_serial && id1) {
+			guint32 k, nids = s->nids;
+			MonoMethod *t = NULL;
+			for (k = 0; k < nids && k < WJ_PROF_WAYS; ++k)
+				if (s->ids [k] == id1) {
+					t = s->id_targets [k];
+					break;
+				}
+			target1 = t;
 		}
 	}
 	if (!id1 || !target1) {
@@ -1951,6 +2273,10 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 		 * since each further observation adds 1 to total and at most 1 to margin. */
 		if (out_why)
 			*out_why = (hits1 * 5 >= total1 * 4) ? WJ_PRED_POLY_90 : WJ_PRED_POLY;
+		return FALSE;
+	}
+	if (!wj_pred_verify (caller, base, (MonoVTable *) id1, target1, 1)) {
+		if (out_why) *out_why = WJ_PRED_TORN;   /* no arm, and not a verdict the POLY rescues below act on */
 		return FALSE;
 	}
 	if (out_why)
@@ -2060,6 +2386,8 @@ mono_wasm_jit_prof_predict_method (gpointer caller_ptr, MonoMethod *base, MonoVT
 	n2 = s->nids; total2 = s->total;
 	if (n1 != n2 || total1 != total2 || s->ids_overflow || !t0 || !best_id)
 		return FALSE;
+	if (!wj_pred_verify ((InterpMethod *) caller_ptr, base, (MonoVTable *) best_id, t0, 4))
+		return FALSE;
 	*out_vt = (MonoVTable *) best_id;
 	*out_target = t0;
 	if (out_samples)
@@ -2109,6 +2437,8 @@ mono_wasm_jit_prof_predict_second (gpointer caller_ptr, MonoMethod *base, MonoMe
 	n2 = s->nids; total2 = s->total;
 	if (n1 != n2 || total1 != total2 || s->ids_overflow || !best_t || !best_vt || !best_vc)
 		return FALSE;
+	if (!wj_pred_verify ((InterpMethod *) caller_ptr, base, (MonoVTable *) best_vt, best_t, 5))
+		return FALSE;
 	*out_vt = (MonoVTable *) best_vt;
 	*out_target = best_t;
 	*out_pct = (guint32) MIN (100, (guint64) best_sum * 100 / total1);
@@ -2141,6 +2471,8 @@ mono_wasm_jit_prof_predict_cold (gpointer caller_ptr, MonoMethod *base, MonoVTab
 	mono_memory_barrier ();
 	n2 = s->nids; total2 = s->total;
 	if (n1 != n2 || total1 != total2 || s->ids_overflow || s->ids [0] != id || s->id_targets [0] != t)
+		return FALSE;
+	if (!wj_pred_verify ((InterpMethod *) caller_ptr, base, (MonoVTable *) id, t, 6))
 		return FALSE;
 	*out_vt = (MonoVTable *) id;
 	*out_target = t;

@@ -70,6 +70,76 @@ static guint64 bytes_allocated_detached = 0;
 #define TLAB_TEMP_END	(__thread_info__->tlab_temp_end)
 #define TLAB_REAL_END	(__thread_info__->tlab_real_end)
 
+#ifdef HOST_BROWSER
+/* The `*p == NULL` assert in sgen_try_alloc_obj_nolock has fired three times here with nothing to read (2026-11-10,
+ * 2026-11-14). sgen_wasm_tlab_born records, per thread, the nursery-collection count at which its current TLAB was
+ * made; mono_gc_wasm_dirty_alloc_report (sgen-mono.c) prints what the allocation found before the assert aborts. */
+static __thread int sgen_wasm_tlab_born_gc = -1;
+static __thread char *sgen_wasm_tlab_born_start;
+#define SGEN_WASM_TLAB_BORN(start) do { sgen_wasm_tlab_born_gc = sgen_gc_collection_count (GENERATION_NURSERY); sgen_wasm_tlab_born_start = (char *) (start); } while (0)
+extern void mono_gc_wasm_alloc_state_report (int raw_state);
+#define SGEN_WASM_STATE_BLOCKING 6   /* mono-threads.h STATE_BLOCKING; the states after it are its suspended forms */
+extern void mono_gc_wasm_dirty_alloc_report (void **p, size_t size, int path, char *tlab_start, char *tlab_next,
+	char *tlab_temp_end, char *tlab_real_end, int born_gc, char *born_start);
+
+/* MONO_WASM_TLAB_VERIFY=1 (a diagnostic; off unless the variable is set to something other than 0): the asserts below test ONE word, the first of
+ * an object the C path hands out, so a stray store into TLAB memory is seen only when an object happens to start on it
+ * and the JIT's inline bump (OP_WASM_JIT_ALLOC_FAST) never tests anything. With this on, every object the C path hands
+ * out is checked over its whole extent (check 11), and the unallocated rest of the thread's TLAB is scanned each time an
+ * allocation crosses a scan-start granule or takes the locked path (12, 13) -- which every thread does at least once
+ * per SGEN_SCAN_START_SIZE bytes, inline allocations included. The first non-zero word is reported
+ * (mono_gc_wasm_dirty_alloc_report) and the run aborted there. */
+static int sgen_wasm_tlab_verify = -1;
+static void
+sgen_wasm_verify_zero (char *from, char *to, int path, char *tlab_start, char *tlab_next, char *tlab_temp_end, char *tlab_real_end)
+{
+	char *q;
+	for (q = from; q + sizeof (gpointer) <= to; q += sizeof (gpointer))
+		if (G_UNLIKELY (*(gsize *) q)) {
+			mono_gc_wasm_dirty_alloc_report ((void **) q, (size_t) (to - from), path, tlab_start, tlab_next, tlab_temp_end,
+				tlab_real_end, sgen_wasm_tlab_born_gc, sgen_wasm_tlab_born_start);
+			g_error ("MONO_WASM_TLAB_VERIFY: a non-zero word at %p in nursery memory that was never handed out (check %d)", q, path);
+		}
+}
+/* MONO_WASM_TLAB_VERIFY=2 is the scan's positive control (tests only): the 20,000th object the C path hands out in the
+ * process gets a marker word stored 64 bytes past its end, inside the unallocated rest of its TLAB -- a stray store by
+ * construction -- and the rest of the TLAB is scanned on the spot (check 14): the run must end there with that word in the report. */
+static gint32 sgen_wasm_tlab_verify_n;
+#define SGEN_WASM_VERIFY_INIT() do { \
+		if (sgen_wasm_tlab_verify < 0) { \
+			char *sgen_wasm_v = g_getenv ("MONO_WASM_TLAB_VERIFY"); \
+			sgen_wasm_tlab_verify = (sgen_wasm_v && *sgen_wasm_v && *sgen_wasm_v != '0') ? (*sgen_wasm_v == '2' ? 2 : 1) : 0; \
+			g_free (sgen_wasm_v); \
+		} \
+	} while (0)
+#define SGEN_WASM_VERIFY(from, to, path) do { \
+		if (G_UNLIKELY (sgen_wasm_tlab_verify)) { \
+			SGEN_WASM_VERIFY_INIT (); \
+			if (sgen_wasm_tlab_verify && (from) && (char *) (from) < (char *) (to)) \
+				sgen_wasm_verify_zero ((char *) (from), (char *) (to), (path), TLAB_START, TLAB_NEXT, TLAB_TEMP_END, TLAB_REAL_END); \
+		} \
+	} while (0)
+#define SGEN_WASM_VERIFY_SELFTEST(p, size) do { \
+		if (G_UNLIKELY (sgen_wasm_tlab_verify == 2) && mono_atomic_inc_i32 (&sgen_wasm_tlab_verify_n) == 20000 && \
+		    TLAB_NEXT && (char *) (p) + (size) + 64 + sizeof (gpointer) <= TLAB_REAL_END && (char *) (p) + (size) >= TLAB_NEXT) { \
+			*(gsize *) ((char *) (p) + (size) + 64) = 0x5e1f7e57; \
+			printf ("[sgen dirty-alloc] MONO_WASM_TLAB_VERIFY=2: stored the marker 5e1f7e57 at %p, 64 bytes past a new object, in the rest of this thread's TLAB\n", (void *) ((char *) (p) + (size) + 64)); \
+			/* scanned at once: the JIT's inline bump could hand the marked word out as a field before the next check */ \
+			sgen_wasm_verify_zero ((char *) (p) + (size), TLAB_REAL_END, 14, TLAB_START, TLAB_NEXT, TLAB_TEMP_END, TLAB_REAL_END); \
+		} \
+	} while (0)
+#define SGEN_WASM_DIRTY(p, size, path) do { \
+		if (G_UNLIKELY (*(p) != NULL)) \
+			mono_gc_wasm_dirty_alloc_report ((p), (size), (path), TLAB_START, TLAB_NEXT, TLAB_TEMP_END, TLAB_REAL_END, \
+				sgen_wasm_tlab_born_gc, sgen_wasm_tlab_born_start); \
+	} while (0)
+#else
+#define SGEN_WASM_TLAB_BORN(start) do { } while (0)
+#define SGEN_WASM_VERIFY(from, to, path) do { } while (0)
+#define SGEN_WASM_DIRTY(p, size, path) do { } while (0)
+#define SGEN_WASM_VERIFY_SELFTEST(p, size) do { } while (0)
+#endif
+
 static void
 increment_thread_allocation_counter (size_t byte_size)
 {
@@ -188,6 +258,7 @@ sgen_alloc_obj_nolock (GCVTable vtable, size_t size)
 	} else {
 		/* tlab_next and tlab_temp_end are TLS vars so accessing them might be expensive */
 
+		SGEN_WASM_VERIFY (TLAB_NEXT, TLAB_REAL_END, 13);
 		p = (void**)TLAB_NEXT;
 		/* FIXME: handle overflow */
 		new_next = (char*)p + size;
@@ -199,6 +270,7 @@ sgen_alloc_obj_nolock (GCVTable vtable, size_t size)
 			CANARIFY_ALLOC(p,real_size);
 			SGEN_LOG (6, "Allocated object %p, vtable: %p (%s), size: %" G_GSIZE_FORMAT "d", p, vtable, sgen_client_vtable_get_name (vtable), size);
 			sgen_binary_protocol_alloc (p , vtable, size, sgen_client_get_provenance ());
+			SGEN_WASM_DIRTY (p, size, 5);
 			g_assert (*p == NULL);
 			mono_atomic_store_seq (p, vtable);
 
@@ -290,6 +362,7 @@ sgen_alloc_obj_nolock (GCVTable vtable, size_t size)
 				TLAB_NEXT = TLAB_START;
 				TLAB_REAL_END = TLAB_START + alloc_size;
 				TLAB_TEMP_END = TLAB_START + MIN (SGEN_SCAN_START_SIZE, alloc_size);
+				SGEN_WASM_TLAB_BORN (TLAB_START);
 
 				zero_tlab_if_necessary (TLAB_START, alloc_size);
 
@@ -325,7 +398,15 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
 	void **p;
 	char *new_next;
 	size_t real_size = size;
+	int wasm_path G_GNUC_UNUSED = 0;   /* HOST_BROWSER: 1 over-TLAB-size, 2 inside the TLAB, 3 beside it, 4 a new TLAB */
 	TLAB_ACCESS_INIT;
+#ifdef HOST_BROWSER
+	/* A thread the suspend machinery counts as stopped (BLOCKING and beyond: it entered a GC-safe region and has not
+	 * left it) must not be here: a collection does not wait for it, so its TLAB can be cleared and its nursery moved
+	 * under this very allocation. Counted and named (mono_gc_wasm_alloc_state_report), never fatal. */
+	if (G_UNLIKELY (__thread_info__->client_info.info.thread_state.state >= SGEN_WASM_STATE_BLOCKING))
+		mono_gc_wasm_alloc_state_report (__thread_info__->client_info.info.thread_state.raw);
+#endif
 
 	CANARIFY_SIZE(size);
 
@@ -349,6 +430,7 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
 
 		/*FIXME we should use weak memory ops here. Should help specially on x86. */
 		zero_tlab_if_necessary (p, size);
+		wasm_path = 1;
 	} else {
 		int available_in_tlab;
 		char *real_end;
@@ -363,9 +445,11 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
 
 		if (G_LIKELY (new_next < real_end)) {
 			TLAB_NEXT = new_next;
+			wasm_path = 2;
 
 			/* Second case, we overflowed temp end */
 			if (G_UNLIKELY (new_next >= TLAB_TEMP_END)) {
+				SGEN_WASM_VERIFY (p, TLAB_REAL_END, 12);
 				sgen_set_nursery_scan_start (new_next);
 				/* we just bump tlab_temp_end as well */
 				TLAB_TEMP_END = MIN (TLAB_REAL_END, TLAB_NEXT + SGEN_SCAN_START_SIZE);
@@ -379,6 +463,7 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
 
 			increment_thread_allocation_counter (size);
 			zero_tlab_if_necessary (p, size);
+			wasm_path = 3;
 		} else {
 			size_t alloc_size = 0;
 
@@ -395,8 +480,10 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
 			TLAB_REAL_END = new_next + alloc_size;
 			TLAB_TEMP_END = new_next + MIN (SGEN_SCAN_START_SIZE, alloc_size);
 			sgen_set_nursery_scan_start ((char*)p);
+			SGEN_WASM_TLAB_BORN (new_next);
 
 			zero_tlab_if_necessary (new_next, alloc_size);
+			wasm_path = 4;
 		}
 	}
 
@@ -406,6 +493,9 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
 	CANARIFY_ALLOC(p,real_size);
 	SGEN_LOG (6, "Allocated object %p, vtable: %p (%s), size: %" G_GSIZE_FORMAT "d", p, vtable, sgen_client_vtable_get_name (vtable), size);
 	sgen_binary_protocol_alloc (p, vtable, size, sgen_client_get_provenance ());
+	SGEN_WASM_VERIFY (p, (char *) p + size, 11);
+	SGEN_WASM_DIRTY (p, size, wasm_path);
+	SGEN_WASM_VERIFY_SELFTEST (p, size);
 	g_assert (*p == NULL); /* FIXME disable this in non debug builds */
 
 	mono_atomic_store_seq (p, vtable);
