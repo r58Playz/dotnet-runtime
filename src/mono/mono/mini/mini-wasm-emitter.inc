@@ -2365,7 +2365,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 		 * assert really was the first thing to go wrong, unlike the mark_bb_in_region case where the
 		 * array was indexed before the assert could fire.
 		 */
-		if (nargs + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "self nargs+vret"; goto done; }
+		if (nargs + 1 > mono_wasm_jit_max_params) { fail = "self nargs+vret"; goto done; }
 		param_types [nargs] = WASM_I32;
 		vt [vrd] = WASM_I32;
 		li [vrd] = nargs;
@@ -4785,6 +4785,26 @@ co_ranges_done:
 		wasm_i32_const (&body, 1);
 		wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, WJ_SCRATCH_SITESEL_SLOT);
 		printf ("[wasm-jit sites] thread select emitted in %s (tier %d)\n", mname, (int) cfg->wasm_jit_tier);
+	  }
+	  /* MONO_WASM_JIT_ROLES: entering a method the spec names tags this thread with its role. Server and render (1, 2)
+	   * overwrite; a worldgen worker (3) only tags an untagged thread, so the server thread, which may generate spawn
+	   * chunks before its first tick, ends as 1. */
+	  if (G_UNLIKELY (mono_wasm_jit_roles_on) && mname) {
+		int role = mono_wasm_jit_role_match (mname);
+		if (role >= 3) {
+			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);
+			wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_ROLE_OFF);
+			wasm_op (&body, WASM_OP_I32_EQZ);
+			wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+		}
+		if (role > 0) {
+			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);
+			wasm_i32_const (&body, role);
+			wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, WJ_SCRATCH_ROLE_OFF);
+			printf ("[wasm-jit roles] role %d tag emitted in %s (tier %d)\n", role, mname, (int) cfg->wasm_jit_tier);
+		}
+		if (role >= 3)
+			wasm_op (&body, WASM_OP_END);
 	  } }
 	if (structured_cfg_kind == WJ_CFG_DISPATCH) {
 		wasm_i32_const (&body, 0);
@@ -5561,6 +5581,7 @@ co_ranges_done:
 		}
 #endif
 
+		wj_vol_atomic = NULL;   /* MONO_WASM_JIT_VOLATILE_LOAD: a barrier's mark never crosses a block (or a compile) */
 		MONO_BB_FOR_EACH_INS (bb, ins) {
 			int my_ord = sl_ord++;   /* bump for EVERY ins (incl. terminated-skipped) to stay aligned with the SLOTLIVE walk */
 			if (terminated) continue;   /* skip instrs after a bb terminator (e.g. the OP_BR following OP_CALL_HANDLER) */
@@ -5777,11 +5798,20 @@ co_ranges_done:
 				 * needs StoreLoad, and so do .NET patterns that expect a physical full barrier. These
 				 * modules never pass through wasm-opt, so this atomic.fence survives to V8's mfence. */
 				if (ins->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_SEQ) {
-					wasm_u8 (&body, 0xfe);  /* atomic prefix */
-					wasm_u8 (&body, 0x03);  /* atomic.fence */
-					wasm_u8 (&body, 0x00);  /* memory order: sequentially consistent */
+					extern int mono_wasm_jit_volatile_load;
+					/* MONO_WASM_JIT_VOLATILE_LOAD: the barrier IKVM puts in front of a volatile read becomes the read's own
+					 * seq-cst atomic load (LOADM below); every volatile store keeps its trailing fence. */
+					if (mono_wasm_jit_volatile_load && (wj_vol_atomic = wj_volatile_load_after (bb, ins))) {
+						if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_VOLATILE_ATOMIC]);
+					} else {
+						wasm_u8 (&body, 0xfe);  /* atomic prefix */
+						wasm_u8 (&body, 0x03);  /* atomic.fence */
+						wasm_u8 (&body, 0x00);  /* memory order: sequentially consistent */
+						if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_FENCE]);
+					}
 				}
 #endif
+				if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_GAP_BARRIER]);
 				break;
 			case OP_AOTCONST: {
 				/* On wasm (need_got_var=0, compile_aot=0) NEW_AOTCONST lowers to OP_PCONST, so the
@@ -5986,6 +6016,13 @@ co_ranges_done:
 						RELEASE_LAZY_REF_FRAME ();
 						wasm_op (&body, WASM_OP_END);
 						wj_count (WJC_T2_LOOP_SITES);
+					  } }
+					{ extern int mono_wasm_jit_entry_poll;
+					  /* MONO_WASM_JIT_ENTRY_POLL=0: the entry poll keeps its tier-1 counter (above) and drops the
+					   * action-word check (mini-wasm.c has the argument). Loop polls are not bb_entry. */
+					  if (!mono_wasm_jit_entry_poll && bb == cfg->bb_entry) {
+						if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_ENTRY_POLL_DROPPED]);
+						break;
 					  } }
 					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = this worker's action word */
 					{
@@ -6348,8 +6385,10 @@ co_ranges_done:
 				break;
 			case OP_RCONV_TO_R8: UN (WASM_OP_F64_PROMOTE_F32); break;     /* f32 -> f64 */
 			case OP_FCONV_TO_R4: UN (WASM_OP_F32_DEMOTE_F64); break;      /* f64 -> f32 */
-			case OP_ICONV_TO_I8: UN (WASM_OP_I64_EXTEND_I32_S); break;    /* i32 -> i64 (sign) */
-			case OP_ICONV_TO_U8: UN (WASM_OP_I64_EXTEND_I32_U); break;    /* i32 -> i64 (zero) */
+			case OP_ICONV_TO_I8: if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_GAP_I2L]);
+				UN (WASM_OP_I64_EXTEND_I32_S); break;    /* i32 -> i64 (sign) */
+			case OP_ICONV_TO_U8: if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_GAP_I2L]);
+				UN (WASM_OP_I64_EXTEND_I32_U); break;    /* i32 -> i64 (zero) */
 			case OP_ICONV_TO_I1: UN (WASM_OP_I32_EXTEND8_S); break;       /* (sbyte) */
 			case OP_ICONV_TO_I2: UN (WASM_OP_I32_EXTEND16_S); break;      /* (short) */
 			case OP_ICONV_TO_U1: MASK (0xFF); break;                     /* (byte) */
@@ -6549,6 +6588,19 @@ co_ranges_done:
  * pass exists for are the float and int field reads in jbox2d's inner loops, none of which are refs. */
 #define WJ_LCSE_UNPINNED(v)  (lcse_nopin && (v) >= 0 && (v) < nvreg && lcse_nopin [(v)])
 #define LOADM(WOP, AL) do { \
+		if (G_UNLIKELY (wj_vol_atomic == ins)) {   /* MONO_WASM_JIT_VOLATILE_LOAD: the guarded volatile read */ \
+			wj_vol_atomic = NULL; \
+			if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; } \
+			if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } \
+			wasm_op (&body, WASM_OP_ATOMIC_PREFIX); \
+			wasm_u8 (&body, (AL) == 0 ? 0x12 : (AL) == 1 ? 0x13 : 0x10);   /* i32.atomic.load8_u / load16_u / load */ \
+			wasm_memarg (&body, (AL), (guint32) ins->inst_offset); \
+			if ((WOP) == WASM_OP_I32_LOAD8_S) wasm_u8 (&body, 0xC0);        /* i32.extend8_s */ \
+			else if ((WOP) == WASM_OP_I32_LOAD16_S) wasm_u8 (&body, 0xC1);  /* i32.extend16_s */ \
+			else if ((WOP) == WASM_OP_F32_LOAD) wasm_u8 (&body, 0xBE);      /* f32.reinterpret_i32 */ \
+			if (!wasm_st (&body, &lc, ins->dreg)) { fail = "load dreg"; goto done; } \
+			break; \
+		} \
 		int _cb = G_UNLIKELY (lcse != NULL) ? wj_lcse_canon (lcse, ins->sreg1) : -1; \
 		int _hit = (_cb >= 0) ? wj_lcse_find (lcse, (WOP), (AL), _cb, (gint32) ins->inst_offset) : -1; \
 		if (G_UNLIKELY (lcse != NULL)) wj_count (WJC_LCSE_LOADS_SEEN); \
@@ -7086,6 +7138,7 @@ co_ranges_done:
 				 * final one is at bb top level (nesting 0), matching OP_BR. */
 				guint nsw = GPOINTER_TO_UINT (ins->klass), si;
 				if (nsw == 0) { fail = "switch no targets"; goto done; }
+				if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_GAP_SWITCH]);
 				for (si = 0; si + 1 < nsw; ++si) {
 					if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "switch idx"; goto done; }
 					wasm_i32_const (&body, (gint32) si);
@@ -7172,7 +7225,7 @@ co_ranges_done:
 					if (!csig) { fail = "icall null sig"; goto done; }
 					if (ifptr == 0) { fail = "icall no fptr"; goto done; }
 					memset (&ct, 0, sizeof (ct));
-					if (csig->hasthis) { if (ct.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "icall nargs"; goto done; } ct.params [ct.nparams++] = WASM_I32; }
+					if (csig->hasthis) { if (ct.nparams >= mono_wasm_jit_max_params) { fail = "icall nargs"; goto done; } ct.params [ct.nparams++] = WASM_I32; }
 					for (ai = 0; ai < (int) csig->param_count; ++ai) {
 						WasmValtype pv = wasm_valtype_of_type (csig->params [ai]);
 						if (pv == 0 || pv == WASM_VOID) {
@@ -7180,7 +7233,7 @@ co_ranges_done:
 							fail_sig_site = "icall"; fail_sig_callee = call_method; fail_sig = csig; fail_sig_arg = ai;
 							goto done;
 						}
-						if (ct.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "icall nargs"; goto done; }
+						if (ct.nparams >= mono_wasm_jit_max_params) { fail = "icall nargs"; goto done; }
 						ct.params [ct.nparams++] = pv;
 					}
 					if (csig->ret->type == MONO_TYPE_VOID) ct.ret = WASM_VOID;
@@ -7375,7 +7428,7 @@ co_ranges_done:
 							 * wrapper kinds (alloc/castclass/icall/etc.) have a bare (this,args)->ret body — appending
 							 * would declare one param too many -> call_indirect signature-mismatch trap. */
 							if (aot_has_extra) {
-								if (nt.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "aot inline nparams"; goto done; }
+								if (nt.nparams >= mono_wasm_jit_max_params) { fail = "aot inline nparams"; goto done; }
 								nt.params [nt.nparams++] = WASM_I32;
 							}
 							for (k = 0; k < nextra; ++k) if (functype_eq (&extra_types [k], &nt)) { nti = ti_base + k; break; }
@@ -8118,7 +8171,7 @@ co_ranges_done:
 						if (aic) {
 							/* register AOT-body functypes up front for the inline AOT-IC: at (this,args,rgctx)->rv, at_ne (this,args)->rv */
 							WasmFuncType at, at_ne;
-							if (n2 + 1 <= WASM_FUNCTYPE_MAX_PARAMS) {
+							if (n2 + 1 <= mono_wasm_jit_max_params) {
 								memset (&at, 0, sizeof (at)); for (vk = 0; vk < n2; ++vk) at.params [vk] = pp [vk]; at.params [n2] = WASM_I32; at.nparams = (guint32) (n2 + 1); at.ret = rv;
 								for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &at)) { aic_ati = ti_base + vk; break; }
 								if (aic_ati < 0 && nextra < WJ_EXTRA_TYPES_MAX) { extra_types [nextra] = at; aic_ati = ti_base + nextra++; }
@@ -8665,7 +8718,7 @@ vcall_nullchk_done:
 							 * objguard builds; a site whose stub cannot be made keeps the full form. */
 							{ extern int mono_wasm_jit_vsite_compact;
 							  if (mono_wasm_jit_vsite_compact && !is_delegate_invoke && !vc_vret && !lc.objguard && npp == n2 &&
-							      n2 >= 1 && n2 + 1 + (mono_wasm_jit_sp_arg ? 1 : 0) <= WASM_FUNCTYPE_MAX_PARAMS) {
+							      n2 >= 1 && n2 + 1 + (mono_wasm_jit_sp_arg ? 1 : 0) <= mono_wasm_jit_max_params) {
 								int retnorm = 0, vs_slot, vs_ti = -1;
 								WasmFuncType vst;
 								if (rv == WASM_I32 && !m_type_is_byref (csig->ret)) {
@@ -9088,6 +9141,29 @@ vcall_nullchk_done:
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dic_base_idx);
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) (vpic_site * mono_wasm_jit_vcall_ways * dpic_stride + way * dpic_stride + dpic_shape_off));
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
+#ifdef HOST_BROWSER   /* mono_wasm_jit_dyn_epoch_addr is interp.c's, browser-only: mono-aot-cross links this file too */
+									{ extern int mono_wasm_jit_delegate_dyn_pic; extern gpointer mono_wasm_jit_dyn_epoch_addr (void);
+									  /* MONO_WASM_JIT_DELEGATE_DYN_PIC: the shape word carries the publish-time dynamic-method epoch
+									   * above bit 3 (interp.c WJ_DPIC_EPOCH_*); 0 = a non-dynamic source. Accept the way only while
+									   * that epoch is current, then strip it. The epoch is one process-wide word. */
+									  if (mono_wasm_jit_delegate_dyn_pic) {
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_op (&body, WASM_OP_I32_EQZ);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+										wasm_i32_const (&body, 3); wasm_op (&body, WASM_OP_I32_SHR_U);
+										wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_dyn_epoch_addr ());
+										wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x10); wasm_memarg (&body, 2, 0);
+										wasm_i32_const (&body, 0x1FFFFFFF); wasm_op (&body, WASM_OP_I32_AND);
+										wasm_op (&body, WASM_OP_I32_EQ);
+										wasm_op (&body, WASM_OP_I32_OR);
+										wasm_op (&body, WASM_OP_I32_EQZ);
+										wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 0);   /* -> $delegate_way_fail */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
+										wasm_i32_const (&body, 7); wasm_op (&body, WASM_OP_I32_AND);
+										wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
+									  } }
+#endif
 									/* fslot = high half of the pair already loaded and validated above. It is
 									 * nonzero, ABI-EXPRESSIBLE and live on THIS worker by construction, not by
 									 * inspection: wj_delegate_pic_publish stores only an admitted fslot whose
@@ -9595,7 +9671,7 @@ vcall_cold_miss_emit:
 								if (!vc_vret) {
 									extern int mono_wasm_jit_vcall_aot_target (guint8 *scratch, MonoObject *this_obj, gpointer aic);
 									WasmFuncType at, at_ne, aott; int ati = -1, ati_ne = -1, aotti = -1;
-									if (n2 + 1 > WASM_FUNCTYPE_MAX_PARAMS) { fail = "vcall aot nparams"; goto done; }
+									if (n2 + 1 > mono_wasm_jit_max_params) { fail = "vcall aot nparams"; goto done; }
 									/* aott (i32,i32,i32)->i32 = the resolve helper (scratch, receiver, AOT IC), returning
 									 * 0=residual / 1=AOT+rgctx / 2=AOT,no-extra-arg.
 									 * at (this,params,i32 rgctx)->rv = AOT body WITH the trailing extra (rgctx/dummy) arg; at_ne
@@ -9874,7 +9950,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				/* rgctx (ftndesc.arg) is folded into csig as a trailing param + call->args, so it's
 				 * handled like any other arg — no separate rgctx_arg_reg (that field is LLVM-only). */
 				memset (&ct, 0, sizeof (ct));
-				if (csig->hasthis) { if (ct.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "creg nargs"; goto done; } ct.params [ct.nparams++] = WASM_I32; }
+				if (csig->hasthis) { if (ct.nparams >= mono_wasm_jit_max_params) { fail = "creg nargs"; goto done; } ct.params [ct.nparams++] = WASM_I32; }
 				for (ai = 0; ai < (int) csig->param_count; ++ai) {
 					WasmValtype pv = wasm_valtype_of_type (csig->params [ai]);
 					if (pv == 0 || pv == WASM_VOID) {
@@ -9882,7 +9958,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 						fail_sig_site = "callreg"; fail_sig_callee = call->method; fail_sig = csig; fail_sig_arg = ai;
 						goto done;
 					}
-					if (ct.nparams >= WASM_FUNCTYPE_MAX_PARAMS) { fail = "creg nargs"; goto done; }
+					if (ct.nparams >= mono_wasm_jit_max_params) { fail = "creg nargs"; goto done; }
 					ct.params [ct.nparams++] = pv;
 				}
 				if (csig->ret->type == MONO_TYPE_VOID) ct.ret = WASM_VOID;
@@ -10606,6 +10682,9 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 						 * being the only compiler buys nothing against it. Freeing here is a cross-thread
 						 * use-after-free on a body some other worker is reading. */
 						WjBody *old_body = sre->body;
+						{ extern int mono_wasm_jit_b4_seed;
+						  if ((mono_wasm_jit_b4_seed & 2) && old_body && wj_stored_body && old_body != wj_stored_body)
+							wj_edge_inherit (wj_stored_body, old_body); }
 						sre->body = wj_stored_body;
 						sre->body_nparams_p1 = wj_stored_body ? (gint16) (wj_stored_body->nparams + 1) : sre->body_nparams_p1;
 						sre->body_tier = (guint8) (0x80 | (cfg->wasm_jit_tier & 0xf) | (cfg->wasm_jit_t1_down ? 0x10 : 0));

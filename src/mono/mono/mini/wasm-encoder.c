@@ -278,6 +278,8 @@ wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, 
 int wasm_count_on;
 guint32 wasm_count_sel_off;
 guint32 wasm_count_bytes;
+int wasm_count_roles;
+guint32 wasm_count_role_off;
 
 int wasm_sp_arg;
 
@@ -301,6 +303,22 @@ wasm_emit_count (WasmBuf *b, guint32 addr, guint32 sel_addr)
 		wasm_op (b, WASM_OP_I32_ADD);
 		last = b->len;
 		wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, sel_addr);
+		if (wasm_count_roles) {
+			/* role set: address = role * stride (dynamic) + the set's static base (memarg offset) */
+			guint32 rbase = sel_addr + 4 * (guint32) WASM_SF_N;
+			int k;
+			for (k = 0; k < 2; ++k) {
+				wasm_op (b, WASM_OP_GLOBAL_GET); wasm_uleb (b, 7);
+				wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, wasm_count_role_off);
+				wasm_i32_const (b, 4 * (gint32) WASM_SF_N);
+				wasm_op (b, WASM_OP_I32_MUL);
+			}
+			wasm_op (b, WASM_OP_I32_LOAD); wasm_memarg (b, 2, rbase);
+			wasm_i32_const (b, 1);
+			wasm_op (b, WASM_OP_I32_ADD);
+			last = b->len;
+			wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, rbase);
+		}
 	}
 	wasm_count_bytes += b->len - at;
 	return last;

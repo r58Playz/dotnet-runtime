@@ -2748,6 +2748,23 @@ wj_vcall_site (gpointer ic)
  * PIC, so every f-slot in it was admitted on this thread (it is written only by the publish, after admission). */
 #define WJ_MCACHE_N 512
 typedef struct { MonoVTable *vt; MonoMethod *base; gint32 fslot; guint32 pad; } WjMcacheEntry;
+#if HOST_BROWSER
+/* MONO_WASM_JIT_ROLES (defined beside wj_scratch, below; the counter families are described there) */
+enum {
+	WJR_DOOR_AOT, WJR_DOOR_INTERP, WJR_DOOR_COLD, WJR_DOOR_RETRY, WJR_DOOR_JITTED, WJR_DOOR_EH, WJR_DOOR_NARGS,
+	WJR_DOOR_SHAPE, WJR_DOOR_SIG, WJR_DOOR_PERM_OTHER, WJR_DOOR_PARKED,
+	WJR_LAZY_BIND, WJR_LAZY_INTERP,
+	WJR_VS_ENTRY, WJR_VS_WAY, WJR_VS_MID,
+	WJR_RS_ENTRY, WJR_RS_FROM_VS, WJR_RS_DELEGATE, WJR_RS_MEMO, WJR_RS_ICHIT, WJR_RS_MISS, WJR_RS_FSLOT, WJR_RS_NOFSLOT,
+	WJR_MC_PROBE, WJR_MC_INELIG, WJR_MC_REAL, WJR_SH_512, WJR_SH_2K, WJR_SH_8K, WJR_SH_32K, WJR_SH_INF,
+	WJR_DG_PREP, WJR_DG_READHIT, WJR_DG_WRITE, WJR_DG_WRITE_FWD, WJR_DG_WRITE_BUSY, WJR_DG_PUBLISH, WJR_DG_PUB_DYNREF,
+	WJR_DYN_FREE,
+	WJR_N
+};
+static void wj_role_sh_fill (MonoVTable *vt, MonoMethod *base);
+static void wj_role_sh_probe (MonoVTable *vt, MonoMethod *base);
+static void wj_role_bump (int idx);
+#endif
 int mono_wasm_jit_mcache_prefix (void);
 int
 mono_wasm_jit_mcache_prefix (void)
@@ -2772,6 +2789,9 @@ wj_mcache_put (MonoVTable *vt, MonoMethod *base, gint32 fslot)
 	e->vt = vt;
 	if (G_UNLIKELY (mono_wasm_jit_stats))
 		mono_wasm_jit_count (WJC_F9_MCACHE_FILLS);
+#if HOST_BROWSER
+	wj_role_sh_fill (vt, base);
+#endif
 }
 
 static WjLocalVcallPicEntry *
@@ -3596,6 +3616,11 @@ typedef struct {
 	guint32 receiver_vt;
 	guint32 shape;
 } WjLocalDelegatePicEntry;
+/* MONO_WASM_JIT_DELEGATE_DYN_PIC: the `shape` word holds the delegate shape in its low 3 bits and, for a dynamic source,
+ * the low 29 bits of wj_dyn_method_epoch above them (0 = not a dynamic source: no epoch to check). The emitter mirrors
+ * both constants. */
+#define WJ_DPIC_EPOCH_SHIFT 3
+#define WJ_DPIC_EPOCH_MASK 0x1FFFFFFFu
 
 g_static_assert (sizeof (WjLocalDelegatePicEntry) == 16);
 
@@ -3644,19 +3669,34 @@ wj_delegate_pic_for_site (gpointer ic, gboolean grow)
 static int wj_dyn_delegate_epoch_on (void);
 
 static void
-wj_delegate_pic_publish (gpointer ic, MonoMethod *source, MonoVTable *receiver_vt, gint32 fslot, gint32 shape)
+wj_delegate_pic_publish (gpointer ic, MonoMethod *source, MonoVTable *receiver_vt, gint32 fslot, gint32 shape, gint32 epoch)
 {
-	extern int mono_wasm_jit_vcall_ways;
+	extern int mono_wasm_jit_vcall_ways, mono_wasm_jit_delegate_dyn_pic;
 	WjLocalDelegatePicEntry *p;
 	guint64 pair;
 	int k, victim = -1;
 
 	if (fslot <= 0 || !source)
 		return;   /* nothing cacheable: a hit must imply an admitted scalar target */
-	/* R507: a DynamicMethod's address is reused after it is collected, and the emitted hit compares only the pointer
-	 * (no epoch), so a dynamic source is never cached here; it takes the C prepare, whose cache checks the epoch. */
-	if (source->dynamic && wj_dyn_delegate_epoch_on ())
-		return;
+	/* R507: a DynamicMethod's address is reused after it is collected. Without MONO_WASM_JIT_DELEGATE_DYN_PIC the emitted
+	 * hit compares only the pointer, so a dynamic source is never cached here and takes the C prepare, whose cache checks
+	 * the epoch. With it, the entry carries the epoch the recipe was resolved under (WJ_DPIC_EPOCH_SHIFT, packed above the
+	 * shape) and the emitted hit accepts the entry only while wj_dyn_method_epoch still has that value -- interp_free_method
+	 * bumps it before the method's memory goes, so an entry can never match a method reborn at the same address. A
+	 * non-dynamic source stores epoch 0, which the hit accepts unconditionally. */
+	if (source->dynamic && wj_dyn_delegate_epoch_on ()) {
+		guint32 ep = (guint32) epoch & WJ_DPIC_EPOCH_MASK;
+		if (!mono_wasm_jit_delegate_dyn_pic || !ep) {
+#if HOST_BROWSER
+			wj_role_bump (WJR_DG_PUB_DYNREF);
+#endif
+			return;
+		}
+		shape = (gint32) (((guint32) shape & 7u) | (ep << WJ_DPIC_EPOCH_SHIFT));
+	}
+#if HOST_BROWSER
+	wj_role_bump (WJR_DG_PUBLISH);
+#endif
 	p = wj_delegate_pic_for_site (ic, TRUE);
 	if (G_UNLIKELY (!p))
 		return;   /* publishing is a pure optimisation */
@@ -6691,6 +6731,7 @@ typedef struct {
 
 #if HOST_BROWSER
 #define WJ_SCRATCH_ARG_SLOTS 16
+#define WJ_SCRATCH_MAX_ARGS 24   /* = WASM_FUNCTYPE_MAX_PARAMS (wasm-encoder.h): the most MONO_WASM_JIT_MAX_PARAMS allows */
 #define WJ_SCRATCH_RET_OFF 192   /* result slot; past the max args (WASM_FUNCTYPE_MAX_PARAMS*8 = 128) */
 #define WJ_SCRATCH_VRET_OFF 232  /* hidden-vret: the CALLER's return-buffer address; the VT result is
                                   * memcpy'd through it (never via the 8-byte ret slot at 192, which a
@@ -7321,6 +7362,308 @@ g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
 g_static_assert (WJ_SCRATCH_FINSP_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
 g_static_assert (WJ_SCRATCH_SITESEL_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
 g_static_assert (WJ_SCRATCH_LMFHEAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
+g_static_assert (WJ_SCRATCH_ROLE_OFF + 4 <= WJ_SCRATCH_LMFHEAD_SLOT);
+
+/* --- MONO_WASM_JIT_ROLES: per-role counters for the lever census (a counting instrument; never in a timing arm) ---
+ *
+ * The role is the word the prologue of a method MONO_WASM_JIT_ROLES names wrote into this thread's scratch (1 server,
+ * 2 render, 3 worldgen worker, 0 untagged). Every counter here is a process-wide gint64 per role, bumped atomically on
+ * a path that is already a C slow path, and printed as the DELTA since the previous stats dump, so with --dumps the
+ * second dump reads the in-game window. What each family sizes:
+ *   door_*     JIT -> interpreter / AOT crossings in wj_call_interp_inner, by why the callee is not a JIT f-slot
+ *              (the arity limit, EH, AOT-backed, a cold or retrying callee)
+ *   lazy_*     the lazy pool stub's bind and interpreter legs
+ *   vs_* rs_*  the megamorphic slow paths: a compact site's stub (mono_wasm_jit_vslow_resolve) and the full resolver
+ *   mc_* sh_*  per-thread SHADOW megamorphic caches (512 = today's size with every slow-path answer filled, which is
+ *              "fill on identity hit"; then 2 k, 8 k, 32 k and unbounded), probed at each slow-path entry for a base
+ *              the emitted probe covers: a hit is a stub call that cache would have answered inline
+ *   dg_*       the delegate slow path (wasm_jit_prepare_delegate_call) and its cache writes */
+static const char *const wj_role_names [WJR_N] = {
+	"door_aot", "door_interp", "door_cold", "door_retry", "door_jitted", "door_eh", "door_nargs",
+	"door_shape", "door_sig", "door_perm_other", "door_parked",
+	"lazy_bind", "lazy_interp",
+	"vs_entry", "vs_way", "vs_mid",
+	"rs_entry", "rs_from_vs", "rs_delegate", "rs_memo", "rs_ichit", "rs_miss", "rs_fslot", "rs_nofslot",
+	"mc_probe", "mc_inelig", "mc_real", "sh_512", "sh_2k", "sh_8k", "sh_32k", "sh_inf",
+	"dg_prep", "dg_readhit", "dg_write", "dg_write_fwd", "dg_write_busy", "dg_publish", "dg_pub_dynref",
+	"dyn_free",
+};
+static gint64 wj_role_ctr [WJ_ROLES][WJR_N], wj_role_last [WJ_ROLES][WJR_N];
+
+static inline int
+wj_role_cur (void)
+{
+	guint32 r = *(guint32 *) (wj_scratch + WJ_SCRATCH_ROLE_OFF);
+	return r < WJ_ROLES ? (int) r : 0;
+}
+
+static void
+wj_role_bump (int idx)
+{
+	if (G_UNLIKELY (mono_wasm_jit_roles_on))
+		mono_atomic_inc_i64 (&wj_role_ctr [wj_role_cur ()][idx]);
+}
+
+/* Named top tables: an identity (InterpMethod, cache or base method) per role and kind, with a name taken by the thread
+ * that first met it, while the method is in use. Approximate (a full table or a long probe drops the sample), like
+ * wj_vperm_tab. TRAP: nothing is ever evicted, so boot's untagged and render rows fill it before the server thread is
+ * tagged -- on 262n (2026-11-15, runs/2026-11-15-levers2) it held no server or worldgen rows by the window. The
+ * per-role COUNTERS are unaffected; for names read the process-wide `[wasm-jit iroute top]` / `vperm top` tables. */
+enum { WJT_DOOR_INTERP, WJT_DOOR_AOT, WJT_DG_WRITE, WJT_MC_MISS, WJT_N };
+static const char *const wj_rtop_kind [WJT_N] = { "door_interp", "door_aot", "dg_write", "mc_miss_inf" };
+#define WJ_RTOP_SLOTS 16384
+typedef struct { gpointer key; gint32 role, kind; gint64 n, last; char *name; volatile gint32 state; } WjRoleTop;
+static WjRoleTop wj_rtop [WJ_RTOP_SLOTS];
+
+static void
+wj_role_top (int kind, gpointer key, MonoMethod *m, const char *tag)
+{
+	int role = wj_role_cur (), i;
+	gsize h;
+	if (!key)
+		return;
+	h = (((gsize) key >> 3) * 2654435761u + (gsize) (role * 4 + kind) * 40503u) & (WJ_RTOP_SLOTS - 1);
+	for (i = 0; i < 64; ++i) {
+		WjRoleTop *e = &wj_rtop [(h + i) & (WJ_RTOP_SLOTS - 1)];
+		if (e->state == 2 && e->key == key && e->role == role && e->kind == kind) {
+			mono_atomic_inc_i64 (&e->n);
+			return;
+		}
+		if (e->state == 0 && mono_atomic_cas_i32 (&e->state, 1, 0) == 0) {
+			char *nm = m ? mono_method_get_full_name (m) : NULL;
+			e->key = key; e->role = role; e->kind = kind; e->n = 1; e->last = 0;
+			e->name = tag ? g_strdup_printf ("%s %s", tag, nm ? nm : "?") : (nm ? nm : g_strdup ("?"));
+			if (tag)
+				g_free (nm);
+			mono_atomic_xchg_i32 (&e->state, 2);   /* publish occupied last */
+			return;
+		}
+		if (e->state == 1)
+			return;
+	}
+}
+
+/* The interpreter door, classified by why the callee is not a live JIT f-slot here. */
+static void
+wj_role_door (InterpMethod *im, gboolean aot)
+{
+	int k;
+	if (G_LIKELY (!mono_wasm_jit_roles_on) || !im)
+		return;
+	if (aot) {
+		wj_role_bump (WJR_DOOR_AOT);
+		wj_role_top (WJT_DOOR_AOT, im, im->method, NULL);
+		return;
+	}
+	wj_role_bump (WJR_DOOR_INTERP);
+	if (im->wasm_jit_slot == -1) {
+		switch (im->wasm_jit_bail) {
+		case -2: case -10: k = WJR_DOOR_EH; break;
+		case -3: k = WJR_DOOR_SIG; break;
+		case -4: k = (im->wasm_jit_fail && strstr (im->wasm_jit_fail, "nargs")) ? WJR_DOOR_NARGS : WJR_DOOR_SHAPE; break;
+		default: k = WJR_DOOR_PERM_OTHER; break;
+		}
+	} else if (im->wasm_jit_slot == 0) {
+		k = WJR_DOOR_COLD;
+	} else if (im->wasm_jit_slot == -3) {
+		k = WJR_DOOR_RETRY;
+	} else if (im->wasm_jit_slot == -2) {
+		k = WJR_DOOR_PARKED;
+	} else {
+		k = WJR_DOOR_JITTED;   /* compiled, but not a live f-slot on this worker / not reached through one */
+	}
+	wj_role_bump (k);
+	{
+		static const char *const why [WJR_N] = { [WJR_DOOR_EH] = "[eh]", [WJR_DOOR_SIG] = "[sig]", [WJR_DOOR_NARGS] = "[nargs]",
+			[WJR_DOOR_SHAPE] = "[shape]", [WJR_DOOR_PERM_OTHER] = "[perm]", [WJR_DOOR_COLD] = "[cold]", [WJR_DOOR_RETRY] = "[retry]",
+			[WJR_DOOR_PARKED] = "[parked]", [WJR_DOOR_JITTED] = "[jitted]" };
+		wj_role_top (WJT_DOOR_INTERP, im, im->method, why [k]);
+	}
+}
+
+/* The lazy pool stub's legs (mini-wasm-lazy.inc): bind = an attempt to bind the real callee, interp = the call ran in
+ * the interpreter through the stub. */
+void mono_wasm_jit_role_lazy (int interp_leg);
+void
+mono_wasm_jit_role_lazy (int interp_leg)
+{
+	wj_role_bump (interp_leg ? WJR_LAZY_INTERP : WJR_LAZY_BIND);
+}
+
+/* Shadow megamorphic caches, per thread like the real one (wj_mcache_put's index, more bits of the same hash). */
+#define WJ_SH_SIZES 4
+static const guint32 wj_sh_size [WJ_SH_SIZES] = { 512, 2048, 8192, 32768 };
+static __thread guint64 *wj_sh_tab [WJ_SH_SIZES];
+static __thread guint64 *wj_sh_inf;
+static __thread guint32 wj_sh_inf_cap, wj_sh_inf_n;
+
+static inline guint32
+wj_sh_hash (MonoVTable *vt, MonoMethod *base)
+{
+	guint32 v = (guint32) (gsize) vt, b = (guint32) (gsize) base;
+	return (v >> 3) ^ (v >> 11) ^ ((b >> 3) ^ (b >> 13));
+}
+
+/* The emitted probe's condition (mini-wasm-emitter.inc, F9 at a compact or full virtual site). */
+static gboolean
+wj_sh_eligible (MonoMethod *base)
+{
+	return base && !base->is_inflated && !base->is_generic && base->klass &&
+		!mono_class_is_ginst (base->klass) && !mono_class_is_gtd (base->klass);
+}
+
+static gboolean
+wj_sh_inf_has (guint64 key, gboolean insert)
+{
+	guint32 i, h;
+	if (!wj_sh_inf) {
+		if (!insert)
+			return FALSE;
+		wj_sh_inf_cap = 4096;
+		wj_sh_inf = g_new0 (guint64, wj_sh_inf_cap);
+	}
+	h = (guint32) ((key * 0x9E3779B97F4A7C15ull) >> 40);
+	for (i = 0; i < wj_sh_inf_cap; ++i) {
+		guint64 *e = &wj_sh_inf [(h + i) & (wj_sh_inf_cap - 1)];
+		if (*e == key)
+			return TRUE;
+		if (!*e) {
+			if (!insert)
+				return FALSE;
+			*e = key;
+			if (++wj_sh_inf_n * 2 > wj_sh_inf_cap) {   /* grow: rehash into twice the size */
+				guint64 *old = wj_sh_inf;
+				guint32 oc = wj_sh_inf_cap, j;
+				wj_sh_inf_cap *= 2; wj_sh_inf_n = 0;
+				wj_sh_inf = g_new0 (guint64, wj_sh_inf_cap);
+				for (j = 0; j < oc; ++j)
+					if (old [j])
+						wj_sh_inf_has (old [j], TRUE);
+				g_free (old);
+			}
+			return FALSE;
+		}
+	}
+	return FALSE;
+}
+
+static void
+wj_role_sh_fill (MonoVTable *vt, MonoMethod *base)
+{
+	guint64 key;
+	guint32 h;
+	int s;
+	if (G_LIKELY (!mono_wasm_jit_roles_on) || !vt || !wj_sh_eligible (base))
+		return;
+	key = ((guint64) (guint32) (gsize) vt << 32) | (guint32) (gsize) base;
+	h = wj_sh_hash (vt, base);
+	for (s = 0; s < WJ_SH_SIZES; ++s) {
+		if (!wj_sh_tab [s])
+			wj_sh_tab [s] = g_new0 (guint64, wj_sh_size [s]);
+		wj_sh_tab [s][h & (wj_sh_size [s] - 1)] = key;
+	}
+	wj_sh_inf_has (key, TRUE);
+}
+
+/* A slow-path entry for (vt, base): would the real cache, a filled 512 or a bigger one have answered it inline? */
+static void
+wj_role_sh_probe (MonoVTable *vt, MonoMethod *base)
+{
+	extern int mono_wasm_jit_mcache_prefix (void);
+	guint64 key;
+	guint32 h;
+	int s;
+	if (G_LIKELY (!mono_wasm_jit_roles_on) || !vt)
+		return;
+	if (!wj_sh_eligible (base)) {
+		wj_role_bump (WJR_MC_INELIG);
+		return;
+	}
+	wj_role_bump (WJR_MC_PROBE);
+	key = ((guint64) (guint32) (gsize) vt << 32) | (guint32) (gsize) base;
+	h = wj_sh_hash (vt, base);
+	{
+		int pre = mono_wasm_jit_mcache_prefix ();
+		if (pre > 0 && wj_vcall_pic) {
+			guint32 *re = (guint32 *) ((guint8 *) wj_vcall_pic - pre) + (gsize) (h & 511) * 4;   /* WjMcacheEntry: vt, base, fslot, pad */
+			if (re [0] == (guint32) (gsize) vt && re [1] == (guint32) (gsize) base)
+				wj_role_bump (WJR_MC_REAL);
+		}
+	}
+	for (s = 0; s < WJ_SH_SIZES; ++s)
+		if (wj_sh_tab [s] && wj_sh_tab [s][h & (wj_sh_size [s] - 1)] == key)
+			wj_role_bump (WJR_SH_512 + s);
+	if (wj_sh_inf_has (key, FALSE))
+		wj_role_bump (WJR_SH_INF);
+	else
+		wj_role_top (WJT_MC_MISS, base, base, NULL);   /* first sight of this (vt, base) on this thread: by base */
+}
+
+/* Printed at every stats dump (mini-wasm-diagnostics.inc), as deltas. */
+void mono_wasm_jit_roles_dump (void);
+void
+mono_wasm_jit_roles_dump (void)
+{
+	extern gint64 wj_lev_static [];
+	extern const char *const wj_lev_static_names [];
+	extern const int wj_lev_static_n;
+	static gint64 lev_last [16];
+	static gint64 t_last;
+	static int seq;
+	gint64 now = mono_msec_ticks () * 1000;
+	int i, r, k;
+	if (!mono_wasm_jit_roles_on)
+		return;
+	++seq;
+	printf ("[wasm-jit role] dump=%d ms=%lld roles=untagged,server,render,worldgen\n", seq,
+		(long long) (t_last ? (now - t_last) / 1000 : 0));
+	t_last = now;
+	for (i = 0; i < WJR_N; ++i) {
+		gint64 d [WJ_ROLES];
+		for (r = 0; r < WJ_ROLES; ++r) {
+			gint64 v = mono_atomic_load_i64 (&wj_role_ctr [r][i]);
+			d [r] = v - wj_role_last [r][i];
+			wj_role_last [r][i] = v;
+		}
+		printf ("[wasm-jit role] %-16s %lld %lld %lld %lld\n", wj_role_names [i], (long long) d [0], (long long) d [1],
+			(long long) d [2], (long long) d [3]);
+	}
+	printf ("[wasm-jit role] static");
+	for (i = 0; i < wj_lev_static_n && i < 16; ++i) {   /* WJL_N in mini-wasm-ir.inc */
+		gint64 v = mono_atomic_load_i64 (&wj_lev_static [i]);
+		printf (" %s=%lld(+%lld)", wj_lev_static_names [i], (long long) v, (long long) (v - lev_last [i]));
+		lev_last [i] = v;
+	}
+	printf ("\n");
+	/* top tables: the 20 largest deltas per (kind, role) */
+	for (k = 0; k < WJT_N; ++k) {
+		for (r = 0; r < WJ_ROLES; ++r) {
+			int top [20], nt = 0, j;
+			gint64 topd [20];
+			for (i = 0; i < WJ_RTOP_SLOTS; ++i) {
+				WjRoleTop *e = &wj_rtop [i];
+				gint64 dd;
+				if (e->state != 2 || e->kind != k || e->role != r)
+					continue;
+				dd = e->n - e->last;
+				if (dd <= 0)
+					continue;
+				if (nt == 20 && dd <= topd [19])
+					continue;
+				j = nt < 20 ? nt++ : 19;   /* full: the smallest is dropped */
+				for (; j > 0 && topd [j - 1] < dd; --j) { top [j] = top [j - 1]; topd [j] = topd [j - 1]; }
+				top [j] = i; topd [j] = dd;
+			}
+			for (j = 0; j < nt; ++j)
+				printf ("[wasm-jit role-top] %s r%d %lld %s\n", wj_rtop_kind [k], r, (long long) topd [j],
+					wj_rtop [top [j]].name ? wj_rtop [top [j]].name : "?");
+		}
+	}
+	for (i = 0; i < WJ_RTOP_SLOTS; ++i)
+		if (wj_rtop [i].state == 2)
+			wj_rtop [i].last = wj_rtop [i].n;
+	fflush (stdout);
+}
 
 /* Where this thread's LMF chain head is stored: mini-runtime.c's setup_jit_tls_data points lmf_addr here. */
 gpointer mono_wasm_jit_lmf_head_addr (void);
@@ -7987,9 +8330,15 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 				wj_aroute_note (imethod);
 				if (!mono_wasm_jit_ring_frozen) { mono_wasm_jit_ring [mono_wasm_jit_ring_count & 127] = method; mono_wasm_jit_ring_count++; }
 			}
+#if HOST_BROWSER
+			wj_role_door (imethod, TRUE);
+#endif
 			return wasm_jit_aot_call_lean (imethod, sig, buf);
 		}
 		if (G_UNLIKELY (mono_wasm_jit_stats)) { mono_wasm_jit_count (WJC_INTERP_ROUTED); wj_iroute_note (imethod); }
+#if HOST_BROWSER
+		wj_role_door (imethod, FALSE);
+#endif
 		/* DIRECT E-SLOT ENTRY: the callee has no AOT code but DOES have its own JITted wasm, and
 		 * interp_entry would discover that and run it anyway (the e-slot fast path further down this file).
 		 * Everything in between — this function's arg marshalling into InterpEntryData, interp_entry's
@@ -8052,7 +8401,12 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 		data.this_arg = *(gpointer *) (buf + 0);
 		idx = 1;
 	}
-	for (i = 0; i < (int) sig->param_count; ++i) {
+	/* MONO_WASM_JIT_MAX_PARAMS above 16: interp_entry reads many_args instead of the 16-entry args array. */
+	gpointer wj_many_args [WJ_SCRATCH_MAX_ARGS];
+	gpointer *wj_args = (int) sig->param_count > (int) G_N_ELEMENTS (data.args) ? wj_many_args : data.args;
+	if (wj_args == wj_many_args)
+		data.many_args = wj_many_args;
+	for (i = 0; i < (int) sig->param_count && i < WJ_SCRATCH_MAX_ARGS; ++i) {
 		guint8 *slot = buf + (idx + i) * 8;
 		/* interp_entry's arg convention: for a BYREF param, data.args[i] IS the pointer (the byref
 		 * value); for a by-value param it's a POINTER TO the value. The emitter spilled the scalar arg
@@ -8064,7 +8418,7 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
 		 * interp_entry's stackval_from_data wants a pointer to the VALUE, which that copy is.
 		 * Both cases are wj_arg_slot_holds_pointer, shared with wasm_jit_aot_call_lean -- read here out
 		 * of the per-method shape cache rather than re-derived per crossing. */
-		data.args [i] = wj_argshape_ptr (shape, ptrmask, sig, i) ? *(gpointer *) slot : slot;
+		wj_args [i] = wj_argshape_ptr (shape, ptrmask, sig, i) ? *(gpointer *) slot : slot;
 	}
 	data.res = buf + WJ_SCRATCH_RET_OFF;
 	/* hidden-vret destination: capture ONCE, now — a nested residual inside the callee reuses this
@@ -8282,6 +8636,14 @@ enum {
  * source from before the free stops matching. MONO_WASM_JIT_DYN_DELEGATE_EPOCH=0 turns the check (and the per-thread
  * PIC's refusal of dynamic sources) off, for the A/B. */
 static volatile gint32 wj_dyn_method_epoch = 1;
+/* MONO_WASM_JIT_DELEGATE_DYN_PIC: emitted delegate hits read the epoch from here (a process-wide address, the same on
+ * every worker). */
+gpointer mono_wasm_jit_dyn_epoch_addr (void);
+gpointer
+mono_wasm_jit_dyn_epoch_addr (void)
+{
+	return (gpointer) &wj_dyn_method_epoch;
+}
 
 static int
 wj_dyn_delegate_epoch_on (void)
@@ -8356,10 +8718,18 @@ wj_delegate_cache_write_way (WjDelegateIC *cache, MonoMethod *source, MonoVTable
 	gboolean abi_ok, gint32 epoch)
 {
 	gint32 before = mono_atomic_load_i32 (&cache->seq);
-	if (before & 1)
+	if (before & 1) {
+#if HOST_BROWSER
+		wj_role_bump (WJR_DG_WRITE_BUSY);
+#endif
 		return;
-	if (mono_atomic_cas_i32 (&cache->seq, before + 1, before) != before)
+	}
+	if (mono_atomic_cas_i32 (&cache->seq, before + 1, before) != before) {
+#if HOST_BROWSER
+		wj_role_bump (WJR_DG_WRITE_BUSY);
+#endif
 		return;
+	}
 	cache->source = source;
 	cache->receiver_vt = receiver_vt;
 	cache->target = target;
@@ -8396,6 +8766,12 @@ wj_delegate_cache_write (WjDelegateIC *cache, MonoMethod *source, MonoVTable *re
 	extern int mono_wasm_jit_vcall_ways;
 	int victim = -1;
 
+#if HOST_BROWSER
+	if (G_UNLIKELY (mono_wasm_jit_roles_on)) {
+		wj_role_bump (WJR_DG_WRITE);
+		wj_role_top (WJT_DG_WRITE, cache, source, NULL);
+	}
+#endif
 	/* Preserve an existing way for this key, otherwise fill an empty way before evicting. Concurrent
 	 * duplicate fills are harmless: both recipes are pure functions of the same immutable key. */
 	for (int i = 0; i < mono_wasm_jit_vcall_ways; ++i) {
@@ -8465,11 +8841,17 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	if (!del || !del->method || ((MonoMulticastDelegate *) del)->delegates)
 		return FALSE; /* multicast or not initialized */
 
+#if HOST_BROWSER
+	wj_role_bump (WJR_DG_PREP);
+#endif
 	source = del->method;
 	if (!m_method_is_static (source) && m_method_is_virtual (source) && del->target)
 		receiver_vt = del->target->vtable;
 	if (wj_delegate_cache_read (cache, source, receiver_vt, &target, &imethod, &shape, &slots, &scalar,
 	                            &slow_reason, &abi_ok)) {
+#if HOST_BROWSER
+		wj_role_bump (WJR_DG_READHIT);
+#endif
 		/* Tiering replaces, rather than mutates, an InterpMethod. Follow the forwarding link so a recipe
 		 * populated before tier-up does not permanently retain the unoptimized method. */
 		InterpMethod *cached_imethod = imethod;
@@ -8512,7 +8894,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 		 * evicted). Only an admitted scalar fslot is cacheable, which is what lets the generated hit
 		 * skip both the scalar test and the liveness probe. */
 		if (abi_ok)   /* see the note at the other publish site: ABI_OK, not `scalar` */
-			wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
+			wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape, epoch0);
 		*(MonoMethod **) (scratch + 200) = invoke;
 		*(MonoMethod **) (scratch + 204) = target;
 		*(gint32 *) (scratch + 228) = eslot;
@@ -8621,7 +9003,7 @@ wasm_jit_prepare_delegate_call (MonoDelegate *del, MonoMethod *invoke, guint8 *s
 	 * interp's stackval layout sent 100% of by-value-vtype delegate dispatches (9.35M per window) to the
 	 * C fallback for a constraint that applies to `e`, not to this path. */
 	if (abi_ok)
-		wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape);
+		wj_delegate_pic_publish (ic, source, receiver_vt, fslot, shape, epoch0);
 	/* R187's OBJECT-REACHABLE RECIPE published here: the same (fslot, shape) the per-site PIC above
 	 * writes, cached once on the (delegate class, target method) tramp info that interp_init_delegate
 	 * hangs on del->invoke_info, so generated code could reach it in two loads from `this` with no site
@@ -8866,11 +9248,16 @@ typedef struct {
 } WjVslowDescI;
 
 int mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method, guint8 *scratch, gpointer ic);
+static __thread int wj_rs_from_vs;   /* MONO_WASM_JIT_ROLES: the resolver was entered from a compact site's stub */
 
 int
 mono_wasm_jit_vslow_resolve (MonoObject *this_obj, gpointer desc, guint8 *scratch)
 {
 	WjVslowDescI *d = (WjVslowDescI *) desc;
+	if (G_UNLIKELY (mono_wasm_jit_roles_on) && this_obj) {
+		wj_role_bump (WJR_VS_ENTRY);
+		wj_role_sh_probe (this_obj->vtable, d->base);
+	}
 	if (G_LIKELY (this_obj) && d->site >= 0 && d->site < wj_vcall_pic_cap && d->ways > 0) {
 		extern int mono_wasm_jit_ic_mid;
 		MonoVTable *vt = this_obj->vtable;
@@ -8879,15 +9266,26 @@ mono_wasm_jit_vslow_resolve (MonoObject *this_obj, gpointer desc, guint8 *scratc
 		int k;
 		for (k = 0; k < d->ways; ++k) {
 			guint64 c = e [k].key_fslot;
-			if ((guint32) c == (guint32) (gsize) vt && (guint32) (c >> 32))
+			if ((guint32) c == (guint32) (gsize) vt && (guint32) (c >> 32)) {
+				if (G_UNLIKELY (mono_wasm_jit_roles_on)) { wj_role_bump (WJR_VS_WAY); wj_role_sh_fill (vt, d->base); }
 				return (int) (guint32) (c >> 32);
+			}
 		}
 		/* R311 method identity: another class holding way 0's method in this slot is the same method, and way 0's
 		 * f-slot is already admitted here. A zero f-slot (an empty entry) falls through to the resolver. */
 		f0 = (guint32) (e [0].key_fslot >> 32);
 		if (d->mid_slot >= 0 && mono_wasm_jit_ic_mid && f0 && e [0].target &&
-		    m_class_get_vtable (vt->klass) [d->mid_slot] == e [0].target)
+		    m_class_get_vtable (vt->klass) [d->mid_slot] == e [0].target) {
+			if (G_UNLIKELY (mono_wasm_jit_roles_on)) { wj_role_bump (WJR_VS_MID); wj_role_sh_fill (vt, d->base); }
 			return (int) f0;
+		}
+	}
+	if (G_UNLIKELY (mono_wasm_jit_roles_on)) {
+		int r;
+		wj_rs_from_vs = 1;
+		r = mono_wasm_jit_vcall_resolve_fslot (this_obj, d->base, scratch, d->vic);
+		wj_rs_from_vs = 0;
+		return r;
 	}
 	return mono_wasm_jit_vcall_resolve_fslot (this_obj, d->base, scratch, d->vic);
 }
@@ -8932,6 +9330,19 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 	}
 #endif
 	vt = this_obj->vtable;
+#if HOST_BROWSER
+	if (G_UNLIKELY (mono_wasm_jit_roles_on)) {
+		if (delegate_site) {
+			wj_role_bump (WJR_RS_DELEGATE);
+		} else {
+			wj_role_bump (WJR_RS_ENTRY);
+			if (wj_rs_from_vs)
+				wj_role_bump (WJR_RS_FROM_VS);
+			else
+				wj_role_sh_probe (vt, base_method);   /* a full-form site's miss; a stub's was probed at its entry */
+		}
+	}
+#endif
 	if (G_UNLIKELY (mono_wasm_jit_arity)) wj_arity_record (ic, vt, delegate_site);   /* receiver-diversity histogram (MONO_WASM_JIT_ARITY=1) */
 	{
 		extern int mono_wasm_jit_stats;
@@ -8955,6 +9366,9 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 						mono_wasm_jit_count (WJC_FASTVCALL);
 						mono_wasm_jit_count (WJC_VFAST_HAD);
 					}
+#if HOST_BROWSER
+					if (G_UNLIKELY (mono_wasm_jit_roles_on)) { wj_role_bump (WJR_RS_MEMO); wj_role_bump (WJR_RS_FSLOT); }
+#endif
 					return mm->fslot;
 				}
 				/* Forwarded by tier-up, re-slotted, or not admissible here right now: take the full path,
@@ -8990,6 +9404,10 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			}
 		}
 	}
+#if HOST_BROWSER
+	if (G_UNLIKELY (mono_wasm_jit_roles_on) && !delegate_site)
+		wj_role_bump (ic_hit ? WJR_RS_ICHIT : WJR_RS_MISS);
+#endif
 	if (ic_hit) {
 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_VIC_HIT);
 		/* FOLLOW TIERING BEFORE READING THE F-SLOT. Tiering REPLACES an InterpMethod rather than mutating
@@ -9204,6 +9622,9 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 				if (vfwd)
 					mono_wasm_jit_count (WJC_RETIRED_FWD_LIVE);
 			}
+#if HOST_BROWSER
+			if (G_UNLIKELY (mono_wasm_jit_roles_on) && !delegate_site) wj_role_bump (WJR_RS_FSLOT);
+#endif
 			return imethod->wasm_jit_fslot;
 		}
 	}
@@ -9262,6 +9683,9 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
 			}
 		}
 	}
+#if HOST_BROWSER
+	if (G_UNLIKELY (mono_wasm_jit_roles_on) && !delegate_site) wj_role_bump (WJR_RS_NOFSLOT);
+#endif
 	return 0;
 }
 
@@ -12699,6 +13123,7 @@ interp_free_method (MonoMethod *method)
 #if HOST_BROWSER
 	/* R507: first, so every cached delegate recipe keyed by this method's address is stale before it can be reused */
 	mono_atomic_inc_i32 (&wj_dyn_method_epoch);
+	wj_role_bump (WJR_DYN_FREE);   /* MONO_WASM_JIT_ROLES: how often the epoch moves (each move empties DYN_PIC's entries) */
 	/* Before anything is released: the wasm JIT retains raw MonoMethod * and must learn this one is dead
 	 * (mono_wasm_jit_note_method_freed, R290). Guarded -- this file also links into mono-aot-cross. */
 	{

@@ -770,6 +770,15 @@ mono_wasm_jit_dump_stats (void)
 			mono_wasm_jit_prof_inlinee, mono_wasm_jit_prof_blocks, mono_wasm_jit_s4, mono_wasm_jit_t2_loop_count,
 			mono_wasm_jit_rrem_inline, mono_wasm_jit_b4, mono_wasm_jit_b4_groups);
 	}
+	{
+		extern int mono_wasm_jit_recv_class, mono_wasm_jit_icall_aot, mono_wasm_jit_delegate_dyn_pic, mono_wasm_jit_entry_poll,
+			mono_wasm_jit_b4_seed, mono_wasm_jit_volatile_load, mono_wasm_jit_max_params;
+		/* the 2026-11-16 levers as this run had them (five became defaults that day; findings note "levers3") */
+		printf ("[wasm-jit levers3] recv_class=%d icall_aot=%d delegate_dyn_pic=%d entry_poll=%d b4_seed=%d | volatile_load=%d "
+			"max_params=%d -- the 2026-11-16 levers IN EFFECT\n", mono_wasm_jit_recv_class, mono_wasm_jit_icall_aot,
+			mono_wasm_jit_delegate_dyn_pic, mono_wasm_jit_entry_poll, mono_wasm_jit_b4_seed, mono_wasm_jit_volatile_load,
+			mono_wasm_jit_max_params);
+	}
 	{ extern int mono_wasm_jit_aot_deny_n;
 	  extern gint32 mono_wasm_jit_aot_denied_n;
 	  printf ("[wasm-jit aotdeny] deny=%d denied=%d -- MONO_WASM_JIT_AOT_DENY entries and the jit_call_supported answers "
@@ -1299,6 +1308,7 @@ mono_wasm_jit_dump_stats (void)
 	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2 (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2 (4096); }   /* R331: every row -- a low-sample hot method sat below the old top 120 */
 	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2_refusals (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2_refusals (60); }
 	{ extern void mono_wasm_jit_dump_sites (void); mono_wasm_jit_dump_sites (); }   /* MONO_WASM_JIT_SITE_COUNT */
+	{ extern void mono_wasm_jit_roles_dump (void); mono_wasm_jit_roles_dump (); }   /* MONO_WASM_JIT_ROLES */
 #endif
 	{ extern int mono_wasm_jit_f4;
 	  printf ("[wasm-jit f4] vt_nonref=%lld vt_reuse=%lld ic_memo=%lld arm_memo=%lld (f4=%d)\n",

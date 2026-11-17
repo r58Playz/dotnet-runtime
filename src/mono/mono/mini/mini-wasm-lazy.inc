@@ -596,6 +596,7 @@ mono_wasm_jit_lazy_bind (int slot)
 	WjLazySlot *ls = wj_lazy_slot (slot);
 	int f;
 	mono_wasm_jit_counters [WJC_LAZY_BIND]++;
+	if (G_UNLIKELY (mono_wasm_jit_roles_on)) { extern void mono_wasm_jit_role_lazy (int interp_leg); mono_wasm_jit_role_lazy (0); }
 	if (G_UNLIKELY (!ls || !ls->imethod)) {
 		mono_wasm_jit_counters [WJC_LAZY_ORPHAN]++;
 		return 0;
@@ -697,6 +698,7 @@ mono_wasm_jit_lazy_interp (int slot, guint8 *buf)
 	WasmCallInfo cci;
 	int threw;
 	mono_wasm_jit_counters [WJC_LAZY_INTERP]++;
+	if (G_UNLIKELY (mono_wasm_jit_roles_on)) { extern void mono_wasm_jit_role_lazy (int interp_leg); mono_wasm_jit_role_lazy (1); }
 	if (G_UNLIKELY (!ls || !ls->method))
 		g_error ("wasm-jit lazy: interp leg for f-slot %d has no owner", slot);
 	if (G_UNLIKELY (mono_wasm_jit_method_known_dead (ls->method, -1))) {

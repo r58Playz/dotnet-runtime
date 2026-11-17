@@ -399,6 +399,15 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	 * Finding 18 for the measurement record. */
 	if (raise_exempt && wj_ins_is_raise (ins))
 		return FALSE;
+	{ extern int mono_wasm_jit_gcp_pure;
+	  if (G_UNLIKELY (mono_wasm_jit_gcp_pure)) {
+		switch (ins->opcode) {
+		case OP_ICONV_TO_I8: case OP_ICONV_TO_U8: case OP_MEMORY_BARRIER: case OP_SWITCH:
+			return FALSE;
+		default:
+			break;
+		}
+	  } }
 
 	switch (ins->opcode) {
 	/* constants + moves (incl. STACK_OBJ ICONST: a pure literal-table i32.load) */
@@ -685,6 +694,10 @@ wj_ins_clobbers_mem (MonoInst *ins)
 	 * between a load and its reload, so getting this wrong costs the entire optimisation. */
 	if (MONO_IS_COND_EXC (ins) || ins->opcode == OP_THROW || ins->opcode == OP_RETHROW)
 		return FALSE;
+	/* A barrier orders accesses: a load cached before it must not satisfy one after it. Answered here so that
+	 * MONO_WASM_JIT_GCP_PURE, which takes it out of the GC-point set, does not also take it out of this one. */
+	if (ins->opcode == OP_MEMORY_BARRIER)
+		return TRUE;
 	/* Otherwise reuse the GC-point classifier's inverted whitelist: its FALSE set is exactly the
 	 * constants/moves/arithmetic/conversion/compare/branch/load family. Anything it does not recognise —
 	 * every call included — clears the table, i.e. an unknown opcode costs optimisation, never
@@ -766,7 +779,7 @@ typedef struct {
 #define WJO_TAG_LIST(X) \
 	X(UNKNOWN) X(PROLOGUE) X(FRAME) X(IC_PROLOGUE) X(EH_PUSH) X(DISPATCH) X(BB_ILOFS) X(SLOTZERO) \
 	X(ENSURE_FRAME) X(PIN) X(ADDR_ST) X(ADDR_LD) X(REF_LD) X(EXIT) X(EH_POP) X(THROW_SITES) X(LANDING) \
-	X(EPILOGUE) X(RETURN) X(BB_FALL) X(VCALL_PIC) X(AOT_IC) X(HELPER_CALL) X(DYN_CALL) X(METHOD_CALL)
+	X(EPILOGUE) X(RETURN) X(BB_FALL) X(VCALL_PIC) X(AOT_IC) X(HELPER_CALL) X(DYN_CALL) X(METHOD_CALL) X(SP_SYNC)
 enum {
 #define WJO_X(n) WJO_##n,
 	WJO_TAG_LIST (WJO_X)
@@ -1426,7 +1439,7 @@ typedef struct {
 	const char *caller, *inl, *callee;
 	/* How the calls lowered from this instruction ran, counted where each is written (wasm-encoder.h WASM_SF_*): every
 	 * thread, then the selected thread (MONO_WASM_JIT_SITE_THREAD). The layout is the serializer's contract. */
-	gint32 form [2 * WASM_SF_N], form_last [2 * WASM_SF_N];
+	gint32 form [(2 + WJ_ROLES) * WASM_SF_N], form_last [(2 + WJ_ROLES) * WASM_SF_N];   /* + MONO_WASM_JIT_ROLES' sets */
 	gint32 fslot;         /* the f-slot the instruction's last WASM_RELOC_CALL names (0: none) */
 	/* A virtual site's prediction: who predicted (0 none, 1 receiver profile, 2 one-method profile, 3 CHA, 4 cold
 	 * record), the predicted vtable and target (identities), the profile record, and its receiver set at emit time. */
@@ -1579,6 +1592,94 @@ wj_site_note_pred (WjSiteRec *r, gpointer prof_im, MonoMethod *base, gpointer pr
 }
 #endif
 
+/* MONO_WASM_JIT_ROLES: static (emit-time) counters for the lever census, printed by mono_wasm_jit_levers_dump. */
+enum { WJL_PIN_STORES, WJL_GAP_I2L, WJL_GAP_BARRIER, WJL_GAP_SWITCH, WJL_FENCE, WJL_ENTRY_POLL_DROPPED, WJL_VOLATILE_ATOMIC,
+	WJL_N };
+gint64 wj_lev_static [WJL_N];
+const int wj_lev_static_n = WJL_N;
+const char *const wj_lev_static_names [WJL_N] = { "pin_stores", "gap_i2l", "gap_barrier", "gap_switch", "fence",
+	"entry_poll_dropped", "volatile_atomic" };
+
+/* MONO_WASM_JIT_VOLATILE_LOAD: the load a SEQ barrier stands in front of, if it is a volatile one this backend can emit
+ * as a wasm atomic load (1, 2 or 4 bytes at a naturally aligned offset: an unaligned atomic traps), else NULL. Looks
+ * past what IKVM's `Thread.MemoryBarrier (); volatile. ldfld` puts between them -- sequence points, null checks and
+ * their compares, constants and moves -- and stops at anything else. Set by the barrier, consumed by LOADM. */
+static __thread MonoInst *wj_vol_atomic;
+
+/* MONO_WASM_JIT_VOLATILE_LOAD: can a store reach `bar` (in `bb`) with no SEQ fence, atomic read-modify-write or call
+ * between them? Then the fence must stay whatever follows it. IKVM's CodeEmitter.RemoveRedundantMemoryBarriers merges a
+ * volatile store's trailing barrier into the next barrier of the same straight-line IL, so `volatile store A; volatile
+ * load B` arrives with ONE fence, in front of the load, and that fence is the store's StoreLoad (2026-11-16: dropping it
+ * stopped 262c's memwalk datapack from ever stepping; findings note "levers3"). A call ends the scan because its callee
+ * fences its own volatile stores (IKVM resets the merge at every call; its Unsafe emulation must fence too). A method's
+ * entry ends it for the same reason. Conservative: a block with predecessors is followed into each of them, and running
+ * out of the budget answers TRUE. */
+static gboolean
+wj_vol_store_reaches (MonoBasicBlock *bb, MonoInst *from, int *budget)
+{
+	MonoInst *n;
+	int i;
+	if (--*budget < 0)
+		return TRUE;
+	for (n = from; n; n = n->prev) {
+		if (MONO_IS_CALL (n))
+			return FALSE;
+		switch (n->opcode) {
+		case OP_MEMORY_BARRIER:
+			if (n->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_SEQ)
+				return FALSE;
+			break;
+		case OP_ATOMIC_CAS_I4: case OP_ATOMIC_CAS_I8: case OP_ATOMIC_EXCHANGE_I4: case OP_ATOMIC_EXCHANGE_I8:
+		case OP_ATOMIC_ADD_I4: case OP_ATOMIC_ADD_I8:
+			return FALSE;   /* a seq-cst read-modify-write: a locked instruction on x64 */
+		case OP_STORE_MEMINDEX: case OP_STOREI1_MEMINDEX: case OP_STOREI2_MEMINDEX: case OP_STOREI4_MEMINDEX:
+		case OP_STOREI8_MEMINDEX: case OP_STORER4_MEMINDEX: case OP_STORER8_MEMINDEX:
+		case OP_MEMCPY: case OP_MEMSET:
+			return TRUE;
+		default:
+			if (MONO_IS_STORE_MEMBASE (n))
+				return TRUE;
+			break;
+		}
+	}
+	if (bb->in_count == 0)
+		return FALSE;   /* the method's entry */
+	for (i = 0; i < bb->in_count; ++i) {
+		MonoBasicBlock *p = bb->in_bb [i];
+		if (p == bb || wj_vol_store_reaches (p, p->last_ins, budget))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static MonoInst *
+wj_volatile_load_after (MonoBasicBlock *bb, MonoInst *bar)
+{
+	MonoInst *n;
+	int budget = 16;
+	if (wj_vol_store_reaches (bb, bar->prev, &budget))
+		return NULL;
+	for (n = bar->next; n; n = n->next) {
+		switch (n->opcode) {
+		case OP_IL_SEQ_POINT: case OP_SEQ_POINT: case OP_NOP: case OP_NOT_NULL: case OP_DUMMY_USE:
+		case OP_GC_LIVENESS_DEF: case OP_GC_LIVENESS_USE: case OP_ICONST: case OP_MOVE:
+		case OP_COMPARE_IMM: case OP_ICOMPARE_IMM: case OP_CHECK_THIS:
+			continue;
+		case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE: case OP_LOADR4_MEMBASE:
+			return ((n->flags & MONO_INST_VOLATILE) && (n->inst_offset & 3) == 0) ? n : NULL;
+		case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE:
+			return ((n->flags & MONO_INST_VOLATILE) && (n->inst_offset & 1) == 0) ? n : NULL;
+		case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE:
+			return (n->flags & MONO_INST_VOLATILE) ? n : NULL;
+		default:
+			if (MONO_IS_COND_EXC (n))
+				continue;
+			return NULL;
+		}
+	}
+	return NULL;
+}
+
 /* Does `mname` contain one of MONO_WASM_JIT_SITE_THREAD's comma-separated substrings? */
 static gboolean
 wj_site_thread_match (const char *mname)
@@ -1597,6 +1698,42 @@ wj_site_thread_match (const char *mname)
 		p = e ? e + 1 : NULL;
 	}
 	return FALSE;
+}
+
+/* MONO_WASM_JIT_ROLES: which role, if any, a method's prologue tags its thread with. The spec is
+ * `<role>=<substring>,<substring>;<role>=...` (roles 1..3), matched against the method's full name like
+ * MONO_WASM_JIT_SITE_THREAD. 0 = none. */
+int
+mono_wasm_jit_role_match (const char *mname)
+{
+	extern const char *mono_wasm_jit_roles;
+	const char *p = mono_wasm_jit_roles;
+	if (!mono_wasm_jit_roles_on || !p || !mname)
+		return 0;
+	while (*p) {
+		int role = 0;
+		const char *end = strchr (p, ';');
+		gsize len = end ? (gsize) (end - p) : strlen (p);
+		if (len >= 2 && p [0] >= '1' && p [0] <= '3' && p [1] == '=') {
+			const char *q = p + 2, *qe = p + len;
+			role = p [0] - '0';
+			while (q < qe) {
+				const char *c = memchr (q, ',', (gsize) (qe - q));
+				gsize n = c ? (gsize) (c - q) : (gsize) (qe - q);
+				char buf [200];
+				if (n > 0 && n < sizeof (buf)) {
+					memcpy (buf, q, n); buf [n] = 0;
+					if (strstr (mname, buf))
+						return role;
+				}
+				q = c ? c + 1 : qe;
+			}
+		}
+		if (!end)
+			break;
+		p = end + 1;
+	}
+	return 0;
 }
 
 /* The reloc just recorded belongs to the call instruction being lowered: the serializer counts it by form. */
@@ -1637,22 +1774,32 @@ mono_wasm_jit_dump_sites (void)
 		r = &c [i % WJ_SITE_CHUNK];
 		if (!r->ready)
 			continue;
-		gint32 fd [2 * WASM_SF_N], k, moved = 0;
+		gint32 fd [(2 + WJ_ROLES) * WASM_SF_N], k, moved = 0;
 		now = r->count; d = now - r->last; r->last = now;
-		for (k = 0; k < 2 * WASM_SF_N; ++k) {
+		for (k = 0; k < (2 + WJ_ROLES) * WASM_SF_N; ++k) {
 			gint32 fnow = r->form [k];
 			fd [k] = fnow - r->form_last [k]; r->form_last [k] = fnow;
-			if (fd [k] > 0) { moved = 1; if (k < WASM_SF_N) ftotal += fd [k]; else stotal += fd [k]; }
+			if (fd [k] > 0 && k < 2 * WASM_SF_N) { moved = 1; if (k < WASM_SF_N) ftotal += fd [k]; else stotal += fd [k]; }
 		}
 		if (d <= 0 && !moved)
 			continue;
 		if (d < 0) d = 0;
 		total += d; lines++;
 		/* fields 13-15: the form counters of every thread, of the selected thread, and the callee f-slot */
-		printf ("WASM_JIT_SITE\t%d\t%d\t%u\t%c\t%d\t%p\t%p\t%s\t%s\t%s\t%c\t%d\t%d,%d,%d,%d,%d,%d\t%d,%d,%d,%d,%d,%d\t%d\t%d\n",
-			seq, d, r->tier, r->kind, r->il,
-			r->caller_m, r->callee_m, r->caller, r->inl ? r->inl : "-", r->callee, r->gi ? r->gi : '-', r->arm,
-			fd [0], fd [1], fd [2], fd [3], fd [4], fd [5], fd [6], fd [7], fd [8], fd [9], fd [10], fd [11], r->fslot, i);
+		/* field 17 (MONO_WASM_JIT_ROLES only): the form counters of roles 0..3 (untagged, server, render, worldgen
+		 * worker), WASM_SF_N each, comma-separated */
+		{
+			char rb [WJ_ROLES * WASM_SF_N * 12 + 4];
+			int o = 0;
+			rb [0] = 0;
+			if (wasm_count_roles)
+				for (k = 0; k < WJ_ROLES * WASM_SF_N && o < (int) sizeof (rb) - 16; ++k)
+					o += snprintf (rb + o, sizeof (rb) - o, k ? ",%d" : "\t%d", fd [2 * WASM_SF_N + k]);
+			printf ("WASM_JIT_SITE\t%d\t%d\t%u\t%c\t%d\t%p\t%p\t%s\t%s\t%s\t%c\t%d\t%d,%d,%d,%d,%d,%d\t%d,%d,%d,%d,%d,%d\t%d\t%d%s\n",
+				seq, d, r->tier, r->kind, r->il,
+				r->caller_m, r->callee_m, r->caller, r->inl ? r->inl : "-", r->callee, r->gi ? r->gi : '-', r->arm,
+				fd [0], fd [1], fd [2], fd [3], fd [4], fd [5], fd [6], fd [7], fd [8], fd [9], fd [10], fd [11], r->fslot, i, rb);
+		}
 #ifdef HOST_BROWSER
 		if (r->prof) {   /* field 16 above is the record's index; this line is its prediction, then and now */
 			extern int mono_wasm_jit_prof_site_format (gpointer site, char *buf, int len);
@@ -2095,7 +2242,7 @@ wj_ftype_add_sp (WasmFuncType *ft)
 {
 	if (!mono_wasm_jit_sp_arg)
 		return TRUE;
-	if (ft->nparams + 1 > WASM_FUNCTYPE_MAX_PARAMS)
+	if (ft->nparams + 1 > mono_wasm_jit_max_params)
 		return FALSE;
 	ft->params [ft->nparams++] = WASM_I32;
 	return TRUE;
@@ -2133,8 +2280,10 @@ wj_emit_sp_sync (WasmBuf *b)
 		wj_sp_elided_n++;
 		return;
 	}
-	wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) wj_sp_out_local);
-	wasm_op (b, WASM_OP_GLOBAL_SET); wasm_uleb (b, 0);
+	{ guint16 _o = wasm_origin_push (b, WJO_SP_SYNC);   /* the ledger's row for the writes cross-block elision could drop */
+	  wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) wj_sp_out_local);
+	  wasm_op (b, WASM_OP_GLOBAL_SET); wasm_uleb (b, 0);
+	  wasm_origin_pop (b, _o); }
 	wj_sp_sync_n++;
 	b->sp_synced = b->ctl_depth + 1;
 }
@@ -2181,7 +2330,15 @@ wj_emit_stub_call (WasmBuf *b, gpointer addr, guint32 type_idx)
 /* R448: an edge holds a POINTER to its S2 counter, read when the planner runs: a tier-1 body's own call sites keep
  * counting, so its edges weigh what runs NOW; a tier-2 body's point at the tier-1-era record of the same site. est = the
  * site had no record and the counter is the root's entry count. */
-typedef struct { gpointer callee; gint32 fslot; gint32 *wptr; guint32 est; } WjEdge;
+/* `base`: MONO_WASM_JIT_B4_SEED bit 2 -- what the same (caller, callee) pair had counted in the body this one replaced,
+ * when the replacement registered; 0 otherwise. Read every weight through wj_edge_weight. */
+typedef struct { gpointer callee; gint32 fslot; gint32 *wptr; guint32 est; guint32 base; } WjEdge;
+static inline guint32
+wj_edge_weight (const WjEdge *ed)
+{
+	guint64 w = (guint64) (ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0u) + ed->base;
+	return w > 0x7fffffffu ? 0x7fffffffu : (guint32) w;
+}
 static __thread GArray *wj_edge_buf;
 static __thread gboolean wj_edge_on;
 static __thread gint32 *wj_edge_wptr;   /* the S2 counter of the call instruction being lowered (NULL: none) */
@@ -2581,6 +2738,8 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) stash);
 		wasm_op (b, WASM_OP_I32_STORE); wasm_memarg (b, 2, (guint32) (c->refslot [vreg] * 4));
+		if (G_UNLIKELY (mono_wasm_jit_roles_on))
+			mono_atomic_inc_i64 (&wj_lev_static [WJL_PIN_STORES]);   /* GC_PURE's sizing: pin stores emitted */
 		if (c->lazy_frame)
 			wasm_op (b, WASM_OP_END);
 		wasm_origin_pop (b, _o);
@@ -3195,7 +3354,7 @@ mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
 	ci->valid = TRUE;
 	ci->hasthis = sig->hasthis ? 1 : 0;
 	ci->nargs = sig->hasthis + sig->param_count;
-	if (ci->nargs > WASM_FUNCTYPE_MAX_PARAMS) { ci->valid = FALSE; ci->fail_reason = "call nargs"; return; }
+	if (ci->nargs > mono_wasm_jit_max_params) { ci->valid = FALSE; ci->fail_reason = "call nargs"; return; }
 
 	if (sig->hasthis) {
 		ci->args [0].kind = WJ_ARG_SCALAR;
@@ -3258,7 +3417,7 @@ mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
 						? "call ret gsharedvt" : "call ret type";
 					return;
 				}
-				if (ci->ftype.nparams + 1 > WASM_FUNCTYPE_MAX_PARAMS) { ci->valid = FALSE; ci->fail_reason = "call nargs"; return; }
+				if (ci->ftype.nparams + 1 > mono_wasm_jit_max_params) { ci->valid = FALSE; ci->fail_reason = "call nargs"; return; }
 				ci->ret.kind = WJ_ARG_VTYPE_BYADDR;
 				ci->ret.wtype = WASM_VOID;
 				ci->ftype.params [ci->ftype.nparams++] = WASM_I32;
@@ -3852,6 +4011,33 @@ wj_body_bytes (struct _WjBody *b)
 	return (int) MIN (n, (gsize) G_MAXINT32);
 }
 
+/* MONO_WASM_JIT_B4_SEED bit 2: `nb` replaces `ob` on one descriptor (a re-emission, an IKVM relink, a tier change). A
+ * replacement's own counters start at 0, and one framed into a group never counts (WasmRelocFix.count_edge), so its
+ * edges would weigh nothing: give the first edge of each callee the old body's summed weight for that callee (the
+ * planner sums a pair's edges under B4_EXACT). Called before `nb` is published, on the compiling thread. */
+static gint64 wj_b4_inherited_edges;
+static inline void
+wj_edge_inherit (WjBody *nb, const WjBody *ob)
+{
+	guint32 i, j;
+	if (!nb || !ob || !nb->edges || !ob->edges || (guint64) nb->nedges * (nb->nedges + ob->nedges) > (1u << 22))
+		return;
+	for (i = 0; i < nb->nedges; ++i) {
+		guint64 w = 0;
+		for (j = 0; j < i && nb->edges [j].fslot != nb->edges [i].fslot; ++j)
+			;
+		if (j < i)
+			continue;
+		for (j = 0; j < ob->nedges; ++j)
+			if (ob->edges [j].fslot == nb->edges [i].fslot)
+				w += wj_edge_weight (&ob->edges [j]);
+		if (w) {
+			nb->edges [i].base = w > 0x7fffffffu ? 0x7fffffffu : (guint32) w;
+			wj_b4_inherited_edges++;
+		}
+	}
+}
+
 #ifdef HOST_BROWSER
 /* MONO_WASM_JIT_SITE_COUNT: the live registry beside the sites, so a reader can say why a counted call was not
  * module-local. `D`: one line per descriptor that owns its f-slot -- descriptor, f-slot, body_tier, its group (the
@@ -3880,7 +4066,7 @@ wj_site_dump_registry (int seq)
 		for (k = 0; rb && k < (int) rb->nedges; ++k) {
 			WjEdge *ed = &rb->edges [k];
 			printf ("WASM_JIT_SITE\tE\t%d\t%d\t%d\t%u\t%d\n", seq, i + 1, ed->fslot,
-				ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0u, ed->est ? 1 : 0);
+				wj_edge_weight (ed), ed->est ? 1 : 0);
 			ne++;
 		}
 	}

@@ -45,7 +45,7 @@ int main (void) {
 		guint32 nexport = 1 + rnd (n);          /* the whole point: often < n */
 		guint32 off = 8, nfunc_sec = 0, ncode_sec = 0, nexp_seen = 0, seen_f = 0, seen_e = 0;
 
-		for (i = 0; i < nfimp; ++i) { fimp [i].table_index = 40000 + rnd (9999); fimp [i].type_idx = 0; }
+		for (i = 0; i < nfimp; ++i) { fimp [i].table_index = 40000 + rnd (9999); fimp [i].type_idx = 0; fimp [i].method = 0; }
 		for (i = 0; i < n; ++i) {
 			guint32 np = rnd (5), ne = rnd (8);
 			for (j = 0; j < np; ++j) params [i][j] = vt ();

@@ -18,6 +18,13 @@ SRC=$(need IKVM_SRC "the IKVM fork checkout")
 JAVA=0; INSTALL=0
 for a in "$@"; do case "$a" in --java) JAVA=1 ;; --install) INSTALL=1 ;; *) echo "usage: wj ikvm-runtime [--java] [--install]" >&2; exit 2 ;; esac; done
 cd "$SRC"
+# IKVM's global.json pins a 10.0.x SDK; a dotnet first in PATH that has none (a user-local .NET 11 install) fails every
+# step with rc 155 "A compatible .NET SDK was not found". Fall back to a distro install that resolves it.
+if ! dotnet --version > /dev/null 2>&1; then
+  for d in /usr/share/dotnet /usr/lib/dotnet /usr/lib64/dotnet; do
+    if [ -x "$d/dotnet" ] && "$d/dotnet" --version > /dev/null 2>&1; then export PATH="$d:$PATH"; echo "ikvm-runtime: SDK from $d ($(dotnet --version))"; break; fi
+  done
+fi
 # ikvm-wasm-build's build-ikvm-local.sh is the reference (its dcf29b2 moved the cache to the user's default). The fork
 # builds into artifacts/jdk25; src/IKVM.Runtime/bin is a STALE pre-jdk25 output and must not be picked up.
 export NUGET_PACKAGES=${NUGET_PACKAGES:-$HOME/.nuget/packages}

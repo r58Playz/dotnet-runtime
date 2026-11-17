@@ -325,6 +325,13 @@ def kind_of(x):
         return 'ins_lbr' if x['bstype'] & CALL_STACK else 'ins'
     if 'cycles' in n and x['precise'] >= 2:
         return 'cyc'
+    # Stall-cycle events (2026-11-16): counted in cycles, NOT PEBS, so a sample skids past the stalled instruction -- read
+    # them by tag or method, not by instruction. Matched before the miss loop: `cycle_activity.stalls_l3_miss` contains
+    # `l3_miss`. Their capture carries none of the miss events (four general-purpose counters a thread with SMT on).
+    for st, lab in (('stalls_total', 'st_tot'), ('stalls_l1d_miss', 'st_l1d'), ('stalls_l2_miss', 'st_l2'),
+                    ('stalls_l3_miss', 'st_l3'), ('dtlb_load_misses.walk_active', 'dtlb_walk')):
+        if st in n:
+            return lab
     for lv in ('l1_miss', 'l2_miss', 'l3_miss'):
         if lv in n and 'frontend' not in n:
             return lv
@@ -396,12 +403,23 @@ def classify(ip, t, chain, lbr=None, use_lbr=False):
     c = caller_of(chain, t, lbr, use_lbr)
     return ('nonjit', nonjit_name(r)) + ((c[0], c[1]) if c else (None, None))
 
-for ai, ip, t, stid, chain, lbr in perfread.samples(os.path.join(rundir, 'perf.data'), tid=tid, t0=t0, t1=t1):
+# --addr-out FILE (a capture taken with `perf record -d`, MCPERF_EXTRA=-d): one line per l1/l2/l3-miss load sample --
+# event kind, ip, data address, PERF_SAMPLE_DATA_SRC, then the sample's ledger key (the same tuple the tables count) --
+# for joining miss addresses to owners (runs/2026-11-15-levers2/miss).
+ADDR_OUT = opt('--addr-out')
+addr_f = open(ADDR_OUT, 'w') if ADDR_OUT else None
+for rec in perfread.samples(os.path.join(rundir, 'perf.data'), tid=tid, t0=t0, t1=t1, want_addr=bool(addr_f)):
+    ai, ip, t, stid, chain, lbr = rec[:6]
     k = akind.get(ai)
     if not k:
         continue
     nsamp[ai] += 1
-    cnt[k][classify(ip, t, chain, lbr, bool(at[ai]['bstype'] & CALL_STACK))] += 1
+    key = classify(ip, t, chain, lbr, bool(at[ai]['bstype'] & CALL_STACK))
+    cnt[k][key] += 1
+    if addr_f and k in ('l1_miss', 'l2_miss', 'l3_miss'):
+        addr_f.write(f'{k}\t{ip:x}\t{rec[6][0]:x}\t{rec[6][1]:x}\t' + '\t'.join('' if x is None else str(x) for x in key) + '\n')
+if addr_f:
+    addr_f.close()
 
 # ---------------------------------------------------------------- report
 def total(kind):
@@ -454,7 +472,7 @@ def val(kind, key):
 # Cycles and memory events use the LBR call stack when it is there; the fp instructions stream keeps the old caller
 # attribution so the two can be compared below.
 extra = [k for k in ('ins_lbr', 'l1_miss', 'l2_miss', 'l3_miss', 'fe_l1i', 'fe_l2', 'fe_itlb', 'fe_stlb', 'fe_unkbr',
-                     'fe_dsb', 'fe_lat') if k in cnt]
+                     'fe_dsb', 'fe_lat', 'st_tot', 'st_l1d', 'st_l2', 'st_l3', 'dtlb_walk') if k in cnt]
 # The M_instr column takes the LBR-attributed stream when there is one (exact callers for runtime code); the fp
 # stream stays as an extra column for the comparison.
 INSK = 'ins_lbr' if 'ins_lbr' in cnt else 'ins'

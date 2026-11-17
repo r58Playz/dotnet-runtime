@@ -131,7 +131,7 @@ wj_vslow_slot (const WasmFuncType *ft, int retnorm)
 	WjVslowStub *s;
 	WasmBuf out;
 	int slot, id;
-	if (ft->nparams < 1 || ft->nparams + 1 > WASM_FUNCTYPE_MAX_PARAMS)
+	if (ft->nparams < 1 || ft->nparams + 1 > mono_wasm_jit_max_params)
 		return 0;
 	/* The module about to name this stub is validated by instantiating it on THIS pthread (the emit-time check), so
 	 * this pthread must hold every published stub, including ones other compiling workers created. */

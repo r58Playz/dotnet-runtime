@@ -1553,6 +1553,13 @@ typedef struct _WjLitNote { gpointer obj, slot; struct _WjLitNote *next; } WjLit
 /* MONO_WASM_JIT_SITE_COUNT: this thread's select word. 1 once the thread entered a method MONO_WASM_JIT_SITE_THREAD
  * names; the census's second counter set adds it, so it counts that thread alone. */
 #define WJ_SCRATCH_SITESEL_SLOT (WJ_SCRATCH_FINSP_SLOT + 8)
+/* MONO_WASM_JIT_ROLES: the select slot's second word, this thread's ROLE (0 untagged, 1 server, 2 render, 3 worldgen
+ * worker). Written by the prologue of a method the knob names; read by the per-role counters (interp.c
+ * mono_wasm_jit_role_*) and by the census's per-role form counters. */
+#define WJ_SCRATCH_ROLE_OFF (WJ_SCRATCH_SITESEL_SLOT + 4)
+#define WJ_ROLES 4
+extern int mono_wasm_jit_roles_on;
+int mono_wasm_jit_role_match (const char *mname);
 /* The thread's LMF chain HEAD itself (not its address): mini-runtime.c's setup_jit_tls_data points the thread's
  * lmf_addr here instead of at jit_tls->lmf, so emitted code reads and writes the head as `s.b + this` in one load or
  * store (MONO_WASM_JIT_EH_SLIM). The scratch is a __thread array, so the address outlives a detach and re-attach of the

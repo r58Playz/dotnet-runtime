@@ -819,9 +819,11 @@ int mono_wasm_jit_t2_gi_bimorphic = 0;
  * disjoint by 0.36 M; cycles 96.02 -> 91.67 with overlapping ranges. Site census: calls under a dead arm predicted from a
  * frozen record 58.0 k -> 9.3 k a tick. jbox2d has no site it acts on. Verify (15): wrong=0 over four world runs (262n
  * x2, 262u, mcsr) and nine boots; the control (31) counts 366,792 in one boot. One Arg_InvalidCastException in 29
- * boots with the knob on (the long-logged intermittent, in a tier-1 body), none in ~20 without: not attributable either
- * way, which is why this is still 0. */
-int mono_wasm_jit_recv_class = 0;
+ * boots with the knob on (the long-logged intermittent, in a tier-1 body), none in ~20 without; then none in 22 runs
+ * with it on and 31 without (2026-11-16, levers3 / levers5).
+ * 7 since 2026-11-16 (262n Q60 hwrun, server thread, build 29, 2026-11-16, alone n=2 against defaults n=3 (97.80-97.92 M cycles), runs/2026-11-16-levers5): cycles 96.10
+ * (95.84-96.37) -1.8%, instructions -6.2%, near calls -17%; verify wrong=0 on the 262n and 262c censuses. */
+int mono_wasm_jit_recv_class = 7;
 gint32 mono_wasm_jit_recv_wrong;
 
 /* MONO_WASM_JIT_RECV_CLASS & 8, the emitter arm's verify: is the receiver's class `k` or below it? (i32,i32)->i32.
@@ -918,8 +920,10 @@ int mono_wasm_jit_vcall_vret = 1;
 int mono_wasm_jit_direct_deps = 512;
 /* MONO_WASM_JIT_ICALL_AOT (J1a, the no-AOT plan): a direct call to an InternalCall takes the inline-AOT route to the
  * icall's AOT-compiled managed-to-native wrapper (interp.c wj_icall_aot_target) instead of the residual, which enters
- * the interpreter to run that wrapper's IL. */
-int mono_wasm_jit_icall_aot = 0;
+ * the interpreter to run that wrapper's IL. 1 since 2026-11-16 (262n Q60 hwrun, server thread, build 29, 2026-11-16, alone n=2 against defaults n=3 (97.80-97.92 M cycles), runs/2026-11-16-levers5):
+ * cycles 96.20 (95.99-96.41) -1.7%, instructions -2.2%; the render thread's interpreter door for icalls 178 -> 4,128 a
+ * second through AOT instead (2026-11-16 role census). */
+int mono_wasm_jit_icall_aot = 1;
 /* MONO_WASM_JIT_LDADDR_ARG (R377): an address-taken scalar ARGUMENT (ldarga, e.g. Unsafe.As<TEnum,int>(ref value) in
  * Enum.IsDefined<TEnum>) is homed in an addr-frame slot the prologue fills, instead of failing the compile with "ldaddr
  * of arg local". Clause-free methods and ref-free scalars only. */
@@ -1225,6 +1229,25 @@ mono_wasm_jit_auto_init (void)
 		wasm_count_sel_off = WJ_SCRATCH_SITESEL_SLOT;
 		wasm_count_on = 1;
 	    } }
+	{ extern const char *mono_wasm_jit_roles; extern int mono_wasm_jit_site_count; const char *ro = g_getenv ("MONO_WASM_JIT_ROLES");
+	  if (ro && *ro && strcmp (ro, "0") != 0) {
+		/* "1" = the default spec below; anything else is the spec itself */
+		if (strcmp (ro, "1") != 0) mono_wasm_jit_roles = g_strdup (ro);
+		mono_wasm_jit_roles_on = 1;
+		wasm_count_role_off = WJ_SCRATCH_ROLE_OFF;
+		wasm_count_roles = mono_wasm_jit_site_count ? 1 : 0;
+		printf ("[wasm-jit roles] on: %s (census role sets %s)\n", mono_wasm_jit_roles, wasm_count_roles ? "on" : "off");
+	  } }
+	{ extern int mono_wasm_jit_gcp_pure; const char *gp = g_getenv ("MONO_WASM_JIT_GCP_PURE"); if (gp && *gp) mono_wasm_jit_gcp_pure = atoi (gp); }
+	{ extern int mono_wasm_jit_delegate_dyn_pic, mono_wasm_jit_entry_poll, mono_wasm_jit_volatile_load, mono_wasm_jit_max_params;
+	  const char *v;
+	  if ((v = g_getenv ("MONO_WASM_JIT_DELEGATE_DYN_PIC")) && *v) mono_wasm_jit_delegate_dyn_pic = atoi (v);
+	  if ((v = g_getenv ("MONO_WASM_JIT_ENTRY_POLL")) && *v) mono_wasm_jit_entry_poll = atoi (v);
+	  if ((v = g_getenv ("MONO_WASM_JIT_VOLATILE_LOAD")) && *v) mono_wasm_jit_volatile_load = atoi (v);
+	  if ((v = g_getenv ("MONO_WASM_JIT_MAX_PARAMS")) && *v) {
+		int n = atoi (v);
+		mono_wasm_jit_max_params = (n >= 16 && n <= WASM_FUNCTYPE_MAX_PARAMS) ? n : 16;
+	  } }
 	{ extern int mono_wasm_jit_f4; const char *f4 = g_getenv ("MONO_WASM_JIT_F4"); if (f4 && *f4) mono_wasm_jit_f4 = atoi (f4); }
 	{ extern int mono_wasm_jit_f9; const char *f9 = g_getenv ("MONO_WASM_JIT_F9"); if (f9 && *f9) mono_wasm_jit_f9 = atoi (f9); }
 	{ extern int mono_wasm_jit_s1; const char *s1 = g_getenv ("MONO_WASM_JIT_S1"); if (s1 && *s1) mono_wasm_jit_s1 = atoi (s1); }
@@ -1252,7 +1275,9 @@ mono_wasm_jit_auto_init (void)
 	  bx = g_getenv ("MONO_WASM_JIT_B4_DELAY"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_delay = v; }
 	  { extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win;
 	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_quiet = v; }
-	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET_WIN"); if (bx && *bx) { int v = atoi (bx); if (v >= 100) mono_wasm_jit_b4_quiet_win = v; } } }
+	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET_WIN"); if (bx && *bx) { int v = atoi (bx); if (v >= 100) mono_wasm_jit_b4_quiet_win = v; } }
+	  { extern int mono_wasm_jit_b4_seed;
+	    bx = g_getenv ("MONO_WASM_JIT_B4_SEED"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_seed = v & 3; } } }
 	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes; const char *b4 = g_getenv ("MONO_WASM_JIT_B4");
 	  if (b4 && *b4) mono_wasm_jit_b4 = atoi (b4);
 	  b4 = g_getenv ("MONO_WASM_JIT_B4_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v >= 2 && v <= 512) mono_wasm_jit_b4_max = v; }
@@ -1516,6 +1541,53 @@ int mono_wasm_jit_site_count = 0;
  * MONO_WASM_JIT_SITE_THREAD: comma-separated substrings of method full names. A thread that enters a matching method is
  * the SELECTED thread from then on, and every form counter has a twin that counts it alone. */
 const char *mono_wasm_jit_site_thread = "MinecraftServer:tickServer,MinecraftServer:tickChildren";
+/* MONO_WASM_JIT_ROLES: a counting instrument, never on in a timing arm. "1" (this spec) or a spec of the same shape
+ * (mono_wasm_jit_role_match): a thread entering a JITted method the spec names stores its role -- 1 server, 2 render,
+ * 3 worldgen worker -- in its scratch (WJ_SCRATCH_ROLE_OFF), and interp.c's per-role counters, the per-role call-site
+ * census (with MONO_WASM_JIT_SITE_COUNT) and the shadow megamorphic caches count by it. Printed as `[wasm-jit role]`
+ * lines at every stats dump, as deltas, so with --dumps the second dump is the in-game window. Adds a role store to
+ * the named methods' prologues, a role load to every counted call (census only) and C work on the slow paths it
+ * counts. */
+const char *mono_wasm_jit_roles = "1=MinecraftServer:tickServer,MinecraftServer:tickChildren;"
+	"2=net.minecraft.client.Minecraft:runTick,GameRenderer:render;"
+	"3=NoiseBasedChunkGenerator:doFill,NoiseBasedChunkGenerator:buildSurface,NoiseBasedChunkGenerator:applyCarvers";
+int mono_wasm_jit_roles_on = 0;
+/* MONO_WASM_JIT_GCP_PURE=1: OP_ICONV_TO_I8 / _U8, OP_MEMORY_BARRIER and OP_SWITCH are not GC points
+ * (wj_ins_is_gcpoint's inverted whitelist leaves them at its `default: TRUE`; each lowers to one wasm op or an if-chain
+ * with no call). Sizing arm for the whitelist gap; default 0. Static only (262n census, one run a side, 2026-11-15,
+ * runs/2026-11-15-levers2 c262n / cGCP): pin stores emitted -4.5%, slot-zeroing stores -16%; never timed. */
+int mono_wasm_jit_gcp_pure = 0;
+/* MONO_WASM_JIT_DELEGATE_DYN_PIC=1: a delegate whose target is a DynamicMethod (IKVM's method-handle delegates: IndyDirect,
+ * DynamicBinder, LambdaForms) may enter the worker-local delegate PIC, its entry tagged with the dynamic-method epoch the
+ * emitted hit re-checks (interp.c wj_delegate_pic_publish, R507). 0 keeps R507's refusal: every such call takes the C
+ * resolver. 1 since 2026-11-16 (262n Q60 hwrun, server thread, build 29, 2026-11-16, alone n=2 against defaults n=3 (97.80-97.92 M cycles), runs/2026-11-16-levers5): cycles 93.56
+ * (92.65-94.46) -4.4%, instructions -6.5%; the C resolver a second (262n role census) server 100.6 k -> 44, render
+ * 171 k -> 2; worldgen workers (262c) 1.44 M -> 1.00 M -- the rest is site thrash: the emitted PIC and the C cache are
+ * VCALL_WAYS (1) wide and shared LambdaForm invoker sites alternate sources (findings note "levers3"). */
+int mono_wasm_jit_delegate_dyn_pic = 1;
+/* MONO_WASM_JIT_ENTRY_POLL=0: the method-ENTRY safepoint emits only its tier-1 entry counter, not the action-word check.
+ * Loop back-edge polls stay, and so do the interpreter's and AOT code's safepoints and the boundary drain, so a thread
+ * still reaches a poll in bounded time (a loop-free call chain ends at the stack's depth). What it gives up: the
+ * sampler's entry credit (R355 mode 2) and adoption at entry -- publications are adopted at the next loop poll or
+ * interp->JIT re-entry instead. 1 = the entry poll as before. 0 since 2026-11-16 (262n Q60 hwrun, server thread, build 29, 2026-11-16, alone n=2 against defaults n=3 (97.80-97.92 M cycles), runs/2026-11-16-levers5):
+ * cycles 95.38 (94.38-96.37) -2.5%, instructions -4.8%; the ledger's safepoint polls 4.66 -> 1.35 M instructions a tick
+ * with the other levers on. */
+int mono_wasm_jit_entry_poll = 0;
+/* MONO_WASM_JIT_VOLATILE_LOAD=1: a SEQ barrier followed (past null checks and constants) by a load mono flagged
+ * MONO_INST_VOLATILE -- IKVM's Java volatile read, which it brackets as Thread.MemoryBarrier(); volatile. ldfld -- emits no
+ * fence, and the load becomes a seq-cst wasm atomic load (a plain mov on x64). Only 1-, 2- and 4-byte loads at a naturally
+ * aligned offset; others keep the fence. 0 (default) = the fence, as before.
+ * The read-side fence is also the StoreLoad fence of any Java volatile store before it that has none of its own, and two
+ * kinds do not: (a) IKVM merges a store's trailing barrier into the next barrier of the same straight-line IL
+ * (CodeEmitter.RemoveRedundantMemoryBarriers) -- wj_vol_store_reaches keeps every fence a store reaches without an
+ * intervening fence or call; (b) IKVM.Runtime's Unsafe emulation stores with Volatile.Write or a bare `volatile. stind`
+ * and no fence, which nothing here can see. The first build without (a) stopped 262c's memwalk datapack (2026-11-16,
+ * findings note "levers3"); with (b) unfixed the knob is NOT sound. */
+int mono_wasm_jit_volatile_load = 0;
+/* MONO_WASM_JIT_MAX_PARAMS: the largest wasm functype a JIT body or call site may use (this, args and the frame-base
+ * argument). 16 (default) is the old fixed limit; up to WASM_FUNCTYPE_MAX_PARAMS (24): args spill into the per-thread
+ * scratch at 8 bytes a slot below the result slot at 192, and the residual path passes > 16 through many_args. */
+int mono_wasm_jit_max_params = 16;
 /* MONO_WASM_JIT_S2 (plan2x S2), a bit mask:
  *   1  tier-1 bodies count their entries and every managed call site, into process-wide records keyed by identities
  *      (mini-wasm-ir.inc, WjS2Rec). One load/add/store per site and per entry, in tier-1 code only;
@@ -1603,6 +1675,19 @@ int mono_wasm_jit_b4_delay = 0;
  * did (2026-11-12, findings notes "the fault and memory gate" and "F's memory step"). */
 int mono_wasm_jit_b4_quiet = 5;
 int mono_wasm_jit_b4_quiet_win = 15000;
+/* MONO_WASM_JIT_B4_SEED, a bit mask (2026-11-16, lever 7 of the levers3 round):
+ *   1  the partition starts from the framed groups, each one set and frozen (wj_b4_partition), so a plan pairs fresh
+ *      members with each other instead of spending a fresh callee on a framed caller the framing step will leave out;
+ *      ignored under B4_MERGE;
+ *   2  a body that replaces another on the same descriptor starts each edge from what the old body's edges to the same
+ *      callee had counted (WjEdge.base), so a re-emission does not reset its weight to 0.
+ * Offline, on the 2026-11-15 c262n census's own counts (server thread, named JIT calls inside one group): as framed
+ * 54.5%; the planner's end-of-run edges partitioned around the framed groups 62.2%; with tier-1 callers' exact counts too
+ * 68.6% (runs/2026-11-16-levers3/colo/why.py). Online (262n censuses, one run an arm, 2026-11-16): module-local named
+ * calls server 58.8 -> 70.5%, render 64.2 -> 80.0%, groups framed 46 -> 218 of the 256 budget. Bit 2 alone is nearly
+ * inert (5 edges inherited a run without B4_T1). 3 since 2026-11-16 (262n Q60 hwrun, server thread, build 29, 2026-11-16, alone n=2 against defaults n=3 (97.80-97.92 M cycles), runs/2026-11-16-levers5):
+ * cycles 93.44 (91.47-95.40) -4.5% (the spread is plan timing); 262u peak VmData 7,990 MiB against 8,228 / 8,293. */
+int mono_wasm_jit_b4_seed = 3;
 int mono_wasm_jit_b4_per_plan = 16;
 int mono_wasm_jit_b4_plan_samples = 5000;
 /* MONO_WASM_JIT_B4_T1: tier-1 bodies record edges too (R447: 52% of the tick's entries into ungrouped callees come

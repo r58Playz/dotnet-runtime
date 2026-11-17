@@ -212,10 +212,18 @@ note "Server thread tid=$STID, Render thread tid=$RTID"
 if [ "$PERF" = 1 ]; then
   C="$WJ_PMU_CORE"; A="$WJ_PMU_ATOM"
   EV="${MCN_EVENTS:-instructions/period=2000003/u,cycles/period=2000003/u,$C/event=0xc4,umask=0x02,period=200003/up,$A/event=0xc4,umask=0xf9,period=200003/up,$C/event=0xc4,umask=0x02,period=400009/upp,$A/event=0xc4,umask=0xf9,period=400009/upp,$C/event=0xc4,umask=0x80,period=400009/u,$A/event=0xc4,umask=0xeb,period=400009/u,$C/event=0xd0,umask=0x81,period=2000003/u,$C/event=0xd0,umask=0x82,period=1000003/u,$C/event=0xc4,umask=0x11,period=2000003/u,$A/event=0xc4,umask=0x7e,period=2000003/u}"
-  perf record -q -k 1 -g -e "$EV" -p "$JPID" -o "$OUT/perf.data" > "$OUT/perfrec.log" 2>&1 &
+  # MCN_PERF_EXTRA: extra `perf record` args, space-separated (`-d` for the data-address census, as MCPERF_EXTRA).
+  # shellcheck disable=SC2086
+  perf record -q -k 1 -g ${MCN_PERF_EXTRA:-} -e "$EV" -p "$JPID" -o "$OUT/perf.data" > "$OUT/perfrec.log" 2>&1 &
   PRPID=$!
   sleep 3
   kill -0 "$PRPID" 2>/dev/null || void "perf record exited: $(head -3 "$OUT/perfrec.log")"
+  # MCN_SYSMAP=1 (HotSpot): the JVM's own annotated memory map (heap, metaspace, class space, code heap, stacks) and
+  # /proc maps at the window's start, for classifying `-d` data addresses (runs/2026-11-15-levers2/miss).
+  if [ "${MCN_SYSMAP:-0}" = 1 ] && [ -z "$IKVM" ] && [ -x "$JH/bin/jcmd" ]; then
+    cp "/proc/$JPID/maps" "$OUT/maps-start.txt" 2>/dev/null
+    "$JH/bin/jcmd" "$JPID" System.map > "$OUT/sysmap-start.txt" 2>&1 || note "WARNING: jcmd System.map failed"
+  fi
 fi
 T0=$(mono); echo "[mcw] START" >> "$LOG"
 sleep "$BENCH"

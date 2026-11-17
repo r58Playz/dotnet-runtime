@@ -469,8 +469,14 @@ enum { WASM_SF_LOCAL, WASM_SF_SUPERSEDED, WASM_SF_CALL_SOLO, WASM_SF_CALL_GROUP,
 extern int wasm_count_on;            /* set once at startup; without it the serializer writes no counter */
 extern guint32 wasm_count_sel_off;   /* offset of the thread-select word from the imported s.b (global 7) */
 extern guint32 wasm_count_bytes;     /* bytes of counter code written so far (the tier-2 body cap leaves them out) */
-/* A stack-neutral `*(i32 *) addr += 1`, then `*(i32 *) sel_addr += <this thread's select word>`. Returns the offset
- * in `b` of its last memory access (a call-site key candidate, see WasmSites). */
+/* MONO_WASM_JIT_ROLES under MONO_WASM_JIT_SITE_COUNT: a third counter set, one per thread role, laid out right after
+ * the selected-thread set (gint32 [WJ_ROLES][WASM_SF_N] at sel_addr + 4 * WASM_SF_N). The role word sits at
+ * wasm_count_role_off from s.b; a role outside 0..3 would index past the record, so the prologue writes only 1..3. */
+extern int wasm_count_roles;
+extern guint32 wasm_count_role_off;
+/* A stack-neutral `*(i32 *) addr += 1`, then `*(i32 *) sel_addr += <this thread's select word>` (and, with
+ * wasm_count_roles, `+= 1` into this thread's role set). Returns the offset in `b` of its last memory access (a
+ * call-site key candidate, see WasmSites). */
 guint32 wasm_emit_count (WasmBuf *b, guint32 addr, guint32 sel_addr);
 
 /* Attach a reloc list to a body buffer. Must be called before any wasm_reloc on it. */
@@ -511,7 +517,10 @@ typedef struct {
 } WasmLocalGroup;
 
 /* A function type (for callee signatures referenced by call_indirect). */
-#define WASM_FUNCTYPE_MAX_PARAMS 16
+/* Array capacity of a functype. The limit a compile enforces is mono_wasm_jit_max_params (MONO_WASM_JIT_MAX_PARAMS,
+ * default 16): 24 is the most the per-thread scratch holds (24 x 8-byte argument slots end at the result slot, 192). */
+#define WASM_FUNCTYPE_MAX_PARAMS 24
+extern int mono_wasm_jit_max_params;
 
 /* V8's hard cap on a single function's PARAMS + declared locals, enforced at validation and raised as
  * "local count too large": kV8MaxWasmFunctionLocals, v8/src/wasm/wasm-limits.h:50, checked in

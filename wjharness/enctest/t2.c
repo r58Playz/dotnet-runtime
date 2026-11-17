@@ -23,7 +23,7 @@ int main (void) {
 		gboolean tbl = rnd (2), tag = rnd (2);
 		guint32 ehti = 2;
 
-		for (i = 0; i < nfimp; ++i) { fimp [i].table_index = 40000 + rnd (9999); fimp [i].type_idx = 0; }
+		for (i = 0; i < nfimp; ++i) { fimp [i].table_index = 40000 + rnd (9999); fimp [i].type_idx = 0; fimp [i].method = 0; }
 		for (i = 0; i < n; ++i) {
 			guint32 np = rnd (WASM_FUNCTYPE_MAX_PARAMS + 1), ne = rnd (16);
 			for (j = 0; j < np; ++j) params [i][j] = vt ();

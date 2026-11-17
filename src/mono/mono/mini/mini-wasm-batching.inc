@@ -1461,7 +1461,9 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
                  gboolean take, guint64 **out_hot, WjB4Dup *dup)
 {
 	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_anchor, mono_wasm_jit_b4_hot;
+	extern int mono_wasm_jit_b4_seed, mono_wasm_jit_b4_merge;
 	GArray *edges;
+	guint8 *fz;
 	if (mono_wasm_jit_b4_hot > 0)
 		return wj_b4_hot_partition (out_ngroups, out_ndesc, out_nedges, out_nest, out_total, out_inside, take, out_hot, dup);
 	edges = g_array_new (FALSE, FALSE, sizeof (WjB4Edge));
@@ -1483,7 +1485,7 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 			int d = wj_desc_for_fslot (ed->fslot);
 			WjRegEntry *dre = (d > 0 && d <= n) ? wj_reg_at (d - 1) : NULL;
 			WjB4Edge e;
-			guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+			guint32 w = wj_edge_weight (ed);
 			if (!dre || !dre->body || d == i + 1 || w == 0 || dre->f != ed->fslot)
 				continue;
 			e.a = i + 1; e.b = d; e.w = w; e.est = ed->est ? 1 : 0;
@@ -1515,10 +1517,35 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 		WjRegEntry *re = i > 0 ? wj_reg_at (i - 1) : NULL;
 		par [i] = i; sz [i] = 1; by [i] = mx [i] = wj_b4_size (re);
 	}
+	/* MONO_WASM_JIT_B4_SEED bit 1: start from what is framed. Each framed group is one set, FROZEN, and nothing merges
+	 * into a frozen set -- the framing step would drop its framed members anyway (fresh groups only, R445), so a plan
+	 * that pairs a fresh callee with a framed caller spends that callee on a group that cannot form. With B4_MERGE a
+	 * frozen set could be absorbed, so the seed is off there. */
+	fz = g_new0 (guint8, n + 1);
+	if ((mono_wasm_jit_b4_seed & 1) && !mono_wasm_jit_b4_merge) {
+		for (i = 1; i <= n; ++i) {
+			WjRegEntry *re = wj_reg_at (i - 1);
+			WjBatchDesc *bt = re ? re->batch : NULL;
+			gint32 r0, ri, d0;
+			if (!bt || bt->n < 1)
+				continue;
+			d0 = bt->desc [0];
+			if (d0 < 1 || d0 > n)
+				continue;
+			r0 = wj_b4_find (par, d0); ri = wj_b4_find (par, i);
+			if (r0 != ri) {
+				par [ri] = r0; sz [r0] += sz [ri]; by [r0] += by [ri]; mx [r0] = MAX (mx [r0], mx [ri]);
+			}
+			fz [r0] = 1;
+		}
+		for (i = 1; i <= n; ++i)
+			if (fz [i] && par [i] != i)
+				fz [wj_b4_find (par, i)] = 1;
+	}
 	for (k = 0; k < (int) edges->len; ++k) {
 		WjB4Edge *e = &g_array_index (edges, WjB4Edge, k);
 		gint32 ra = wj_b4_find (par, e->a), rb = wj_b4_find (par, e->b), m;
-		if (ra == rb || sz [ra] + sz [rb] > cap)
+		if (ra == rb || sz [ra] + sz [rb] > cap || fz [ra] || fz [rb])
 			continue;
 		/* R448: the byte bound excludes the group's largest member, its ANCHOR, which is bounded on its own: a tick giant
 		 * (Entity.move and friends stay at tier 1) groups with its small hot callees */
@@ -1591,14 +1618,14 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 		slot = g_new (gint32, n + 1);
 		for (i = 0; i <= n; ++i) slot [i] = -1;
 		for (i = 1; i <= n; ++i)
-			if (par [i] == i && sz [i] >= 2 && gw [i] && heat [i])
+			if (par [i] == i && sz [i] >= 2 && gw [i] && heat [i] && !fz [i])
 				ngroups++;
 		groups = g_new0 (WjB4Group, ngroups ? ngroups : 1);
 		*out_hot = g_new0 (guint64, ngroups ? ngroups : 1);
 		for (k = 0; k < ngroups; ++k) {
 			gint32 best = -1;
 			for (i = 1; i <= n; ++i)
-				if (par [i] == i && sz [i] >= 2 && gw [i] && heat [i] && slot [i] < 0 &&
+				if (par [i] == i && sz [i] >= 2 && gw [i] && heat [i] && !fz [i] && slot [i] < 0 &&
 				    (best < 0 || heat [i] > heat [best] || (heat [i] == heat [best] && gw [i] > gw [best])))
 					best = i;
 			slot [best] = k;
@@ -1614,7 +1641,7 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 	}
 	*out_ngroups = ngroups; *out_ndesc = ndesc; *out_nedges = (int) edges->len; *out_nest = nest;
 	*out_total = total; *out_inside = inside;
-	g_free (par); g_free (sz); g_free (by); g_free (gw); g_free (slot); g_free (mx);
+	g_free (par); g_free (sz); g_free (by); g_free (gw); g_free (slot); g_free (mx); g_free (fz);
 	g_array_free (edges, TRUE);
 	return groups;
 }
@@ -1633,7 +1660,7 @@ void
 mono_wasm_jit_b4_plan (void)
 {
 	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_groups, mono_wasm_jit_b4_merge;
-	extern int mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor, mono_wasm_jit_b4_delay;
+	extern int mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor, mono_wasm_jit_b4_delay, mono_wasm_jit_b4_seed;
 	WjB4Group *g;
 	int ng, nd, ne, nest, k, m, nmem = 0;
 	guint64 total, inside, *hot = NULL;
@@ -1644,12 +1671,12 @@ mono_wasm_jit_b4_plan (void)
 		nmem += g [k].n;
 	printf ("[wasm-jit b4] plan (dry run): bodies with edges=%d edges=%d (entry-estimated %d) weight=%llu | groups=%d "
 		"members=%d internal=%.1f%% (cap %d members / %d body bytes) | framed=%lld/%d (group budget) refused=%lld published=%lld "
-		"plans=%lld merge=%d (heat-ranked, tier-1 edges %d, anchor %d, exact %d, delay %d s)\n", nd, ne, nest,
+		"plans=%lld merge=%d (heat-ranked, tier-1 edges %d, anchor %d, exact %d, delay %d s, seed %d, inherited %lld)\n", nd, ne, nest,
 		(unsigned long long) total, ng, nmem, total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max,
 		mono_wasm_jit_b4_bytes, (long long) mono_wasm_jit_counters [WJC_B4_FRAMED], mono_wasm_jit_b4_groups,
 		(long long) mono_wasm_jit_counters [WJC_B4_REFUSED], (long long) mono_wasm_jit_counters [WJC_B4_PUBLISHED],
 		(long long) mono_wasm_jit_counters [WJC_B4_PLANS], mono_wasm_jit_b4_merge, mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor,
-		mono_wasm_jit_b4_exact, mono_wasm_jit_b4_delay);
+		mono_wasm_jit_b4_exact, mono_wasm_jit_b4_delay, mono_wasm_jit_b4_seed, (long long) wj_b4_inherited_edges);
 	{
 		double t = total ? (double) total : 1.0;
 		printf ("[wasm-jit b4] dup census: weight from a grouped caller into a callee outside its group: <=500 B %.1f%% "
@@ -1791,7 +1818,7 @@ wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out
 			for (e2 = 0; rb && e2 < (int) rb->nedges; ++e2) {
 				WjEdge *ed = &rb->edges [e2];
 				int d = wj_desc_for_fslot (ed->fslot);
-				guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+				guint32 w = wj_edge_weight (ed);
 				WjB4Edge e;
 				if (d <= 0 || d > n || d == c [k].desc || !heat [d] || w == 0)
 					continue;
@@ -1870,7 +1897,7 @@ wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out
 			for (e2 = 0; ga >= 0 && rb && e2 < (int) rb->nedges; ++e2) {
 				WjEdge *ed = &rb->edges [e2];
 				int d = wj_desc_for_fslot (ed->fslot);
-				guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+				guint32 w = wj_edge_weight (ed);
 				if (d > 0 && d <= n && d != c [k].desc && heat [d] && w &&
 				    remap [ingrp [wj_b4_find (par, d)]] == ga)
 					inside += w;
@@ -2028,7 +2055,7 @@ mono_wasm_jit_b4_step (void)
 				for (k = 0; k < (int) re->body->nedges; ++k) {
 					WjEdge *ed = &re->body->edges [k];
 					int cd = wj_desc_for_fslot (ed->fslot), j;
-					guint32 w = ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0;
+					guint32 w = wj_edge_weight (ed);
 					WjRegEntry *cre;
 					if (cd <= 0 || w == 0)
 						continue;

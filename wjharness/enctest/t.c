@@ -33,7 +33,7 @@ int main (void) {
 			extra [i].ret = rnd (2) ? vt () : WASM_VOID;
 		}
 		for (i = 0; i < 4; ++i) { groups [i].type = vt (); groups [i].count = rnd (6); }
-		for (i = 0; i < nfimp; ++i) { fimp [i].table_index = 40000 + rnd (9999); fimp [i].type_idx = rnd (2 + nextra); }
+		for (i = 0; i < nfimp; ++i) { fimp [i].table_index = 40000 + rnd (9999); fimp [i].type_idx = rnd (2 + nextra); fimp [i].method = 0; }
 
 		wasm_buf_init (&fb); wasm_buf_init (&eb);
 		for (i = 0, j = rnd (60); i < j; ++i) { wasm_op (&fb, WASM_OP_NOP); }
