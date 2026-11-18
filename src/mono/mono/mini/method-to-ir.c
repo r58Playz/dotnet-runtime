@@ -108,6 +108,7 @@ gpointer mono_wasm_jit_prof_ancestor (MonoCompile *cfg, MonoMethod *base);   /* 
  * for a frame whose IL never writes an argument, so a load of the argument anywhere in the frame reads the value the
  * frame was entered with. Nothing here trusts MonoInst.klass: a stack merge types its temporary from the first branch. */
 extern int mono_wasm_jit_recv_class;
+extern int mono_wasm_jit_idhash;   /* MONO_WASM_JIT_IDHASH (knob comment in mini-wasm.c) */
 extern gboolean mono_wasm_jit_recv_compatible (MonoClass *k, MonoMethod *target);
 
 /* TRUE if the IL can write an argument or take its address (starg, ldarga), or leaves by tail. / jmp (which store the
@@ -10425,6 +10426,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				int gi_st_slot = -1;
 				gboolean gi_recv = FALSE;   /* this site's prediction is the static one */
 				gboolean gi_widened = FALSE;   /* ... or the profile's, with the static slot guard behind its vtable */
+				gboolean gi_idhash = FALSE;   /* ... or System.Object's own method (MONO_WASM_JIT_IDHASH) */
 				cfg->wasm_site_base = NULL;
 				if (mono_wasm_jit_recv_class && cfg->wasm_jit_tier >= 2 && (gi_rk = wj_recv_arg_class (cfg, sp [0]))) {
 					wj_gi_count (WJC_RECV_SITE);
@@ -10502,6 +10504,28 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						wj_gi_count (WJC_RECV_GI_PRED);
 					}
 				  } }
+				/* MONO_WASM_JIT_IDHASH (knob comment in mini-wasm.c): a site nothing above predicted that calls
+				 * System.Object's GetHashCode (bit 1) or Equals(object) (bit 2) inlines Object's own body behind the
+				 * method-identity guard on its slot; a receiver whose class overrides it fails the compare and takes
+				 * the callvirt below. */
+				if (!gi_pred && mono_wasm_jit_idhash && cfg->wasm_jit_tier >= 2 && cmethod->klass == mono_defaults.object_class &&
+				    !cmethod->is_inflated &&
+				    (((mono_wasm_jit_idhash & 1) && fsig->param_count == 0 && !strcmp (cmethod->name, "GetHashCode")) ||
+				     ((mono_wasm_jit_idhash & 2) && fsig->param_count == 1 && !strcmp (cmethod->name, "Equals")))) {
+					extern gint32 mono_wasm_jit_idhash_pred;
+					int id_slot = mono_wasm_jit_mid_slot (cmethod);
+					if (id_slot >= 0) {
+						gi_pred = gi_idhash = TRUE;
+						gi_target = cmethod;
+						gi_vt = NULL;
+						gi_mid_slot = id_slot;
+						gi_why = 0;
+						gi_pred_im = NULL;
+						wj_gi_pred_im = NULL;
+						wj_gi_static = FALSE;
+						mono_atomic_inc_i32 (&mono_wasm_jit_idhash_pred);
+					}
+				}
 				if (!gi_pred) {
 					/* R406: an inlinee site with an InterpMethod files the INLINEE record's verdict ('1' no record, '2' cold,
 					 * '3' poly); N/C/P are the root's, for root sites and inlinees without one. */
@@ -10570,6 +10594,14 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					 * Java is EH-dense and mono refuses to inline ANY method carrying a try/catch. SIZE
 					 * is the one a knob can move. OTHER is everything else, and it existing at all is
 					 * what stops the first two from quietly absorbing a cause nobody named. */
+					if (G_UNLIKELY (cfg->verbose_level > 2)) {
+						/* for MONO_VERBOSE_METHOD roots: the gate's own reason (WJ_T2R_WHY; NULL = the size test) */
+						MonoMethodHeaderSummary gi_vhs;
+						printf ("GI REFUSED %s -> %s: %s (IL %d, limit %d)\n", mono_method_full_name (cfg->method, TRUE),
+							mono_method_full_name (gi_target, TRUE), cfg->wasm_t2r_why ? cfg->wasm_t2r_why : "size",
+							mono_method_get_header_summary (gi_target, &gi_vhs) ? (int) gi_vhs.code_size : -1,
+							cfg->wasm_gi_size > 0 ? cfg->wasm_gi_size : mono_wasm_jit_guarded_inline_size);
+					}
 					{   /* W3 census: which check_inlining refusal (the header summary is the one it just read) */
 						extern int mono_wasm_jit_site_count;
 						if (G_UNLIKELY (mono_wasm_jit_site_count)) {
@@ -10755,6 +10787,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						gi_active = TRUE;
 						wj_site_gi_note (cfg, ip, 'I');
 						wj_gi_count (WJC_GI_EMITTED);
+						if (gi_idhash) {
+							extern gint32 mono_wasm_jit_idhash_emitted;
+							mono_atomic_inc_i32 (&mono_wasm_jit_idhash_emitted);
+						}
 						if (gi_recv) {
 							wj_gi_count (WJC_RECV_GI_EMITTED);
 							gi_st = NULL;   /* the fallback's call is what the guard missed: no arm for the same target */

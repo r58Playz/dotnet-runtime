@@ -30,6 +30,10 @@ mono_interp_replace_method_body (MonoMethod *target, MonoMethod *source);
 void
 mono_interp_mark_relink_pending (MonoMethod *method, int pending);
 
+/* IKVM: 1 once the type's static constructor has finished, 0 if not (or while it runs), -1 if unanswerable. */
+int
+mono_ikvm_type_initialized (MonoType *type);
+
 extern gint32 mono_interp_relink_replaced;
 extern gint32 mono_interp_relink_late;
 extern gint32 mono_interp_relink_untouched;

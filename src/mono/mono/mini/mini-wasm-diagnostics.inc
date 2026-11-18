@@ -779,6 +779,12 @@ mono_wasm_jit_dump_stats (void)
 			mono_wasm_jit_delegate_dyn_pic, mono_wasm_jit_entry_poll, mono_wasm_jit_b4_seed, mono_wasm_jit_volatile_load,
 			mono_wasm_jit_max_params);
 	}
+	{ extern int mono_wasm_jit_idhash;
+	  extern gint32 mono_wasm_jit_idhash_pred, mono_wasm_jit_idhash_emitted;
+	  printf ("[wasm-jit idhash] knob=%d pred=%d emitted=%d -- Object.GetHashCode / Equals sites given System.Object's own "
+		"body behind a slot guard (MONO_WASM_JIT_IDHASH), and the guarded inlines emitted for them\n",
+		mono_wasm_jit_idhash, mono_atomic_load_i32 (&mono_wasm_jit_idhash_pred),
+		mono_atomic_load_i32 (&mono_wasm_jit_idhash_emitted)); }
 	{ extern int mono_wasm_jit_aot_deny_n;
 	  extern gint32 mono_wasm_jit_aot_denied_n;
 	  printf ("[wasm-jit aotdeny] deny=%d denied=%d -- MONO_WASM_JIT_AOT_DENY entries and the jit_call_supported answers "

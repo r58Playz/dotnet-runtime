@@ -826,6 +826,19 @@ int mono_wasm_jit_t2_gi_bimorphic = 0;
 int mono_wasm_jit_recv_class = 7;
 gint32 mono_wasm_jit_recv_wrong;
 
+/* MONO_WASM_JIT_IDHASH, a bit mask (2026-11-17): a virtual call to System.Object::GetHashCode (1) or ::Equals(object) (2)
+ * that no profile or receiver class predicts gets System.Object's own method as its guarded-inline target, behind the
+ * method-identity guard on its vtable slot (method-to-ir.c, R311 / R329's static form). A receiver whose class does not
+ * override it -- an identity hash, ResourceKey under 26.2's TagKey.hashCode -- then runs the inlined
+ * RuntimeHelpers.GetHashCode (a lock-word read; C only for an object with no hash yet) or a reference compare, instead
+ * of the IC; an overriding receiver fails the slot compare and takes the IC as before. RECV_CLASS cannot reach these
+ * sites: its CHA word asks whether ANY loaded class overrides the method, and every record does. Tier 2 only.
+ * Why: Object.GetHashCode / Equals were 220 k + 216 k dynamic dispatches a second on the 262n server thread and 336 k +
+ * 44 k on the render thread (findings 2026-11-16, levers5 map). mono_wasm_jit_idhash_pred counts the sites given the
+ * prediction, mono_wasm_jit_idhash_emitted the guarded inlines emitted for them (`[wasm-jit idhash]`). 0 = off. */
+int mono_wasm_jit_idhash = 0;
+gint32 mono_wasm_jit_idhash_pred, mono_wasm_jit_idhash_emitted;
+
 /* MONO_WASM_JIT_RECV_CLASS & 8, the emitter arm's verify: is the receiver's class `k` or below it? (i32,i32)->i32.
  * A failure counts and the first eight print the two classes (field reads; both are live). */
 int mono_wasm_jit_recv_verify (MonoVTable *vt, MonoClass *k);
@@ -1397,6 +1410,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_recv_class, "MONO_WASM_JIT_RECV_CLASS", 0, 31)
+	WJ_T2_KNOB (mono_wasm_jit_idhash, "MONO_WASM_JIT_IDHASH", 0, 3)
 	WJ_T2_KNOB (mono_wasm_jit_pred_verify, "MONO_WASM_JIT_PRED_VERIFY", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_prof_serial, "MONO_WASM_JIT_PROF_SERIAL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_sample, "MONO_WASM_JIT_PROF_SAMPLE", 0, 65536)

@@ -593,6 +593,41 @@ mono_interp_replace_method_body (MonoMethod *target, MonoMethod *source)
 	return res;
 }
 
+/*
+ * P/Invoke entry point for IKVM (libikvm IKVM_type_initialized, reached with SuppressGCTransition): 1 once the type's
+ * static constructor has FINISHED -- vtable->initialized, which mono_runtime_class_init_full sets under the
+ * type-initialization lock after the cctor returns, and never if it threw -- 0 before that, or while it is running
+ * (RuntimeHelpers.RunClassConstructor returns early on the thread running it, so its return proves nothing), -1 for a
+ * type shape this does not answer. IKVM's Unsafe.shouldBeInitialized asks it, so java.lang.invoke's
+ * DirectMethodHandle.checkInitialized can drop the per-call class-init barrier once the class is initialized. Metadata
+ * reads only: no lock, no allocation, no GC state change.
+ */
+int
+mono_ikvm_type_initialized (MonoType *type)
+{
+	MonoClass *klass;
+	MonoVTable *vt;
+
+	if (!type || m_type_is_byref (type))
+		return -1;
+	switch (type->type) {
+	case MONO_TYPE_CLASS:
+	case MONO_TYPE_VALUETYPE:
+		klass = m_type_data_get_klass (type);
+		break;
+	default:
+		return -1;
+	}
+	if (!klass)
+		return -1;
+	vt = m_class_get_runtime_vtable (klass);
+	if (!vt || !vt->initialized)
+		return 0;
+	/* the caller goes on to use the class's statics: order those reads after this one */
+	mono_memory_read_barrier ();
+	return 1;
+}
+
 /* Under tiering_mutex. Optimized InterpMethods are keys too: upstream never registered them because nothing replaced
  * one, and a body swap does (patch_interp_data_items). */
 /* ---- the WasmDetour convention's entry points (liba, for MonoMod) ------------------------------------------------
