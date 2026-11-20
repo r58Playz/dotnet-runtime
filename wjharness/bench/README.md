@@ -62,7 +62,10 @@ memory word into a global, install split functions in table 0); `lbredges.py` re
 branch stack filtered to calls) into the edge and heat profiles `edges` / `classedges` / `hot` need.
 `--js-flags-extra=--no-wasm-inlining` on `tvfull` turns V8's inliner off.
 Run: `wj j2d/run ours|hs25|tvfull|tvsimple|tvsplit|clrrelink|clrclassic|clr <outdir> --bench mctick [--schedule W,S,N]` (default
-2000,100,20, window 10,20). The `clr*` arms are IKVM on native CoreCLR 10 with the same `cp-jvm.txt` (`$WJ_STATE/arms/
+6000,100,20, window 10,20; 2000,100,20 before 2026-11-20). `ours` gets `MONO_WASM_JIT_B4_QUIET=0` unless a `--knob` sets it:
+with B4's quiet gate a run this short never frames a co-location group, and the game's Q60 window measures the framed
+state (mctick, 2026-11-20, n=3: 13.06 -> 12.04 ms/tick, cycles -8.0%, both disjoint). Numbers for ours before that date
+are WITHOUT co-location. The `clr*` arms are IKVM on native CoreCLR 10 with the same `cp-jvm.txt` (`$WJ_STATE/arms/
 ikvm-clr10*`, see their READMEs): `clrrelink` is our IKVM configuration with a MonoMod relink backend, `clrclassic`
 eager linking, `clr` our switches with generation 1 kept; they boot in ~3.5 min (join), so budget the timeout.
 

@@ -5,7 +5,9 @@
 //           the same arms, windows and event sets over mctick's batches of ticks instead of jbox2d's steps. ours runs
 //           ?bench&jar=mctick.jar on a copy of the 262n seed (its OPFS holds 26.2 and the save), HotSpot runs
 //           $WJ_STATE/arms/mctick/cp-jvm.txt on the native stage's save, TeaVM serves $WJ_STATE/arms/mctick/teavm-full.
-//           --schedule W,S,N is warmup ticks, ticks per batch, batches (default 2000,100,20; window 10,20).
+//           --schedule W,S,N is warmup ticks, ticks per batch, batches (default 6000,100,20; window 10,20). ours runs with
+//           MONO_WASM_JIT_B4_QUIET=0 unless a --knob sets it: B4 (co-location) frames during the warm-up, the state the
+//           game's Q60 window measures; with the quiet gate a run this short never frames a group (2026-11-20: -8% cycles).
 //
 // Arms (all pinned to the P-core threads 0-7, as natrun and the Minecraft census are -- R369):
 //   ours    the ikvmcraft ?bench page (dev server :5021), the shipped runtime + MONO_WASM_JIT_ORIGIN/CAPTURE
@@ -90,7 +92,7 @@ const PERF = !args.includes("--no-perf");          // timing-only: the workload 
  * mid-window -- so a steady-state comparison runs 600,200,60 and reads batches 41..60. HotSpot gets the schedule as
  * the jar's positional args, ours as Java system properties bench.* (?jprop.*, read by IkvmBenchmarkStarter), TeaVM
  * by picking a build with that many batches (its schedule is compiled in). */
-const SCHED = (opt("schedule", MC ? "2000,100,20" : "600,200,12")).split(",").map(Number);
+const SCHED = (opt("schedule", MC ? "6000,100,20" : "600,200,12")).split(",").map(Number);
 const [WA, WB] = (opt("window-batches", MC ? "10,20" : "1,12")).split(",").map(Number);
 const STOP_AFTER = Number(opt("stop-after", WB));
 const DUMPS = args.includes("--dumps");             // ours: dumpWasmJit() at batch 1 and batch 12, so the LAST dump is the window
@@ -224,6 +226,7 @@ if (HS && MC) {
     // --base: another ikvmcraft dev server, e.g. rvcmp/jdk8's :5022 serving a saved IKVM flavor
     url = `${(opt("base") || serveUrl()).replace(/\/$/, "")}/?bench` + (ATTR ? "&wj.MONO_WASM_JIT_ORIGIN=1&wj.MONO_WASM_JIT_CAPTURE=1" : "")
       + args.flatMap((x, i) => x === "--knob" ? [`&wj.${args[i + 1]}`] : []).join("")   // --knob K=V (ours)
+      + (MC && !args.some((x, i) => x === "--knob" && /^MONO_WASM_JIT_B4_QUIET=/.test(args[i + 1] || "")) ? "&wj.MONO_WASM_JIT_B4_QUIET=0" : "")
       + (MC ? `&jar=mctick.jar&jprop.mctick.world=${encodeURIComponent("/libsdl/minecraft/saves/New World")}`
           + `&jprop.mctick.work=${encodeURIComponent("/tmp/mctick")}&jprop.mctick.noexit=true`
           + `&jprop.mctick.warmup=${SCHED[0]}&jprop.mctick.batchTicks=${SCHED[1]}&jprop.mctick.batches=${SCHED[2]}`

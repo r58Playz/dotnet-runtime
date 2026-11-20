@@ -445,7 +445,8 @@ findings note "mctick":
 | IKVM relink (our IKVM configuration) on CoreCLR 10 | 5.71 | 2.88x | 40.5 / 28.3 | 1.43 |
 | TeaVM FULL (linear-memory wasm) | 5.77 | 2.91x | 57.8 / 28.3 | 2.04 |
 | TeaVM SIMPLE | 10.03 | 5.06x | 102.6 / 48.7 | 2.10 |
-| **ours** | **13.72** | **6.92x** | 74.8 / 66.9 | 1.12 |
+| ours, no co-location (B4 never framed: the runs above) | 13.72 | 6.92x | 74.8 / 66.9 | 1.12 |
+| **ours, co-located, 2026-11-20 defaults** (6000-tick warm-up, n=3) | **12.04** | **6.08x** | 66.0 / 56.8 | 1.16 |
 
 * **Against TeaVM the gap is IPC, not work**: TeaVM FULL makes as many calls (0.52 vs 0.55 M a tick) and 1.29x fewer
   instructions; TeaVM SIMPLE executes 1.37x OUR instructions and is still 1.37x faster. Of our +38.7 M cycles, about half
@@ -466,9 +467,11 @@ findings note "mctick":
   metadata layout) and iTLB walks (70.6 vs 15.7 k: code volume; our hot functions are 4-7x TeaVM's wasm bytes).
 * Every arm does the same work only through `BenchServer.shouldRun` (every queued task due) and the TeaVM drain loop;
   without them HotSpot and ours loaded a fifth of the save's entities. Gate on the end state, not the checksum.
-* **Ours frames no B4 groups in a default mctick run** (`[wasm-jit b4] ... framed=0/256 plans=0`): `MONO_WASM_JIT_B4_QUIET`
-  holds framing while the tier grows, and every window of a run this short reads GROWING. The game's Q60 window comes
-  after B4 has framed. So the table above, and every mctick number for ours before 2026-11-20, is ours WITHOUT co-location.
+* **Before 2026-11-20 ours framed no B4 groups in mctick** (`[wasm-jit b4] ... framed=0/256 plans=0`): `MONO_WASM_JIT_B4_QUIET`
+  holds framing while the tier grows, and every window of a run that short reads GROWING, while the game's Q60 window
+  comes after B4 has framed. The 13.72 row and every earlier mctick number for ours are WITHOUT co-location. `j2d/run`
+  now passes `B4_QUIET=0` to ours and warms 6000 ticks: 167 groups framed; co-location is -8.0% cycles there, L1 load
+  misses -17.6%, calls -10.2% (n=3, disjoint). The TeaVM comparison's other rows were not re-taken.
 * **Ours' calls are bimodal across runs** (0.545 or ~0.50 M a tick on mctick): tier 2's guarded inlining of the
   block-state chain (`getBlockState` -> `SimpleBitStorage.get` / `valueFor`) lands one of two ways depending on the profile
   when it compiles. ~2-3% of instructions, more than most single levers: stratify an A/B by it, or run n >= 6.
