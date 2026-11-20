@@ -16,7 +16,7 @@ export WJ_HARNESS_DIR=$(dirname "$WJ_SELF")
 eval "$(node "$WJ_HARNESS_DIR/lib/paths.mjs" --sh)"
 # `wj` on PATH for everything it runs, so a launcher or a `wj bg` command can call it by name.
 case ":$PATH:" in *":$WJ_HARNESS:"*) ;; *) export PATH="$WJ_HARNESS:$PATH" ;; esac
-DIRS=(drive j2d read fe ledger tier native boot memaudit build live enctest lib)
+DIRS=(drive j2d bench read fe ledger tier native boot memaudit build live enctest lib)
 
 run_file () {   # run_file <path> args...
   local f=$1; shift

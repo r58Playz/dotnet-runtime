@@ -1,0 +1,26 @@
+ServiceLoader on the linear-memory wasm target corrupted the heap: ServiceLoadWasmRuntime.createServices allocated
+its result with Allocator.allocateArray(cls, n), where cls is the SERVICE class, not its array class. allocateArray
+takes the array class (it reads the component type through tag.itemType, null for a non-array class), so the result
+got the service interface's header and a wrong size, and storing the service objects wrote past it: the next
+object's header became the array length (1) and the GC's region walk later never ended. Found by walking the heap
+every allocation (mctick, java.nio.file.spi.FileSystemProvider.installedProviders from Minecraft's Util.<clinit>).
+Now the array class (cls.arrayType), as everywhere else.
+Codegen: this runtime method only.
+
+diff --git a/classlib/src/main/java/org/teavm/classlib/impl/ServiceLoadWasmRuntime.java b/classlib/src/main/java/org/teavm/classlib/impl/ServiceLoadWasmRuntime.java
+index fa2adbd3b..e487c19a0 100644
+--- a/classlib/src/main/java/org/teavm/classlib/impl/ServiceLoadWasmRuntime.java
++++ b/classlib/src/main/java/org/teavm/classlib/impl/ServiceLoadWasmRuntime.java
+@@ -37,7 +37,11 @@ final class ServiceLoadWasmRuntime {
+         entry = entry.add(Address.sizeOf()).getAddress();
+         var size = entry.getInt();
+         entry = entry.add(4);
+-        RuntimeArray result = Allocator.allocateArray(cls, size).toStructure();
++        // wjharness patch 0008: allocateArray takes the ARRAY class; cls is the service class. Object[] when the
++        // service's own array class was not generated (the caller treats the result as Object[] anyway).
++        RuntimeClass arrayClass = cls.arrayType != null ? cls.arrayType
++                : RuntimeClass.getClass(Address.ofObject(new Object[0]).toStructure());
++        RuntimeArray result = Allocator.allocateArray(arrayClass, size).toStructure();
+         var resultData = WasmRuntime.align(result.toAddress().add(Structure.sizeOf(RuntimeArray.class)),
+                 Address.sizeOf());
+         for (var i = 0; i < size; ++i) {

@@ -1,0 +1,13 @@
+diff --git a/classlib/src/main/java/org/teavm/classlib/impl/ReflectionDependencyListener.java b/classlib/src/main/java/org/teavm/classlib/impl/ReflectionDependencyListener.java
+index 8f965c4d4..bd9b35cee 100644
+--- a/classlib/src/main/java/org/teavm/classlib/impl/ReflectionDependencyListener.java
++++ b/classlib/src/main/java/org/teavm/classlib/impl/ReflectionDependencyListener.java
+@@ -431,7 +431,7 @@ public class ReflectionDependencyListener extends AbstractDependencyListener {
+ 
+     private void linkTypeParameterBounds(DependencyAgent agent, String className) {
+         var cls = agent.getClassSource().get(className);
+-        if (cls != null) {
++        if (cls == null) {
+             return;
+         }
+         var params = cls.getGenericParameters();

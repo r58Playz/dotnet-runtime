@@ -1,0 +1,37 @@
+JLS 12.4.2 on the linear-memory wasm target: a class's initializer ran its <clinit> without initializing its
+superclass first, so a subclass initialized before its superclass whenever the subclass was touched first (TeaVM's
+C target generates the same initializer shape). Minecraft numbers entity data fields per class in static
+initializers by walking superclasses (ClassTreeIdRegistry), so LivingEntity took ids from 0 before Entity had
+defined its own: "Duplicate id value for 0!" when the first player was created. The generated initializer now
+calls the nearest ancestor's initializer (the closest superclass with a <clinit>) after marking its class and
+before its own <clinit>.
+Codegen: one call in each class initializer that has an initializing ancestor; nothing on paths after initialization.
+
+diff --git a/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java b/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
+index 1f920b784..a3672ed7b 100644
+--- a/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
++++ b/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
+@@ -1058,6 +1058,23 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
+             block.getBody().add(new WasmStoreInt32(4, new WasmInt32Constant(index), initFlag,
+                     WasmInt32Subtype.INT32));
+ 
++            // wjharness patch 0010: the superclass first (JLS 12.4.2): the nearest ancestor with a <clinit>, whose own
++            // initializer does the same for its ancestors
++            for (var ancestorName = cls.getParent(); ancestorName != null;) {
++                if (classGenerator.isStructure(ancestorName)) {
++                    break;
++                }
++                var ancestor = classes.get(ancestorName);
++                if (ancestor == null) {
++                    break;
++                }
++                if (ancestor.getMethod(new MethodDescriptor("<clinit>", void.class)) != null) {
++                    block.getBody().add(new WasmCall(functions.forClassInitializer(ancestorName)));
++                    break;
++                }
++                ancestorName = ancestor.getParent();
++            }
++
+             block.getBody().add(new WasmCall(functions.forMethod(method)));
+ 
+             if (controller.wasCancelled()) {

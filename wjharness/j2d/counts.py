@@ -20,6 +20,8 @@ NAMES = {   # perf evlist names -> short keys
     'br_inst_retired.near_call': 'near_call', 'mem_inst_retired.all_loads': 'loads', 'mem_inst_retired.all_stores': 'stores',
     'dtlb_load_misses.walk_active': 'dtlb_walk_cycles', 'dtlb_load_misses.walk_completed': 'dtlb_walks',
     'br_inst_retired.indirect': 'indirect_br', 'icache_data.stalls': 'icache_stall_cycles',
+    'itlb_misses.walk_completed': 'itlb_walks', 'br_misp_retired.all_branches': 'br_misp',
+    'memory_activity.stalls_l1d_miss': 'l1d_miss_stall_cycles',
 }
 
 

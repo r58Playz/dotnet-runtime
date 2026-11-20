@@ -1,0 +1,96 @@
+The low-level GC on the linear-memory wasm target never traced object monitors (the C target got the same fix
+upstream in f30b56fea, after this backend was removed). There a monitor lives in the object header's second word,
+encoded (address >>> 1) | 0x80000000 (WasmGenerationVisitor.storeMonitor), and the GC's reference-field layouts
+exclude it, so a Monitor reachable only from a header was collected while in use; the next synchronized on that
+object wrote into freed memory, and the collector later walked a corrupted region forever (mctick: an endless
+GC.markFromRegion during block bootstrap). Now, on this target only (PlatformDetector.isWebAssembly):
+  - marking an object marks its header monitor; so does marking from classes (class objects live outside the heap,
+    and synchronized (X.class) gives them monitors too);
+  - updating pointers re-encodes the header word after the Monitor moves (from the relocation backup when the
+    object itself moves, as upstream's C fix does).
+String literals used as locks are not covered (outside the heap and not enumerated here).
+Codegen: the GC's own code on this target; nothing in user code.
+
+diff --git a/core/src/main/java/org/teavm/runtime/GC.java b/core/src/main/java/org/teavm/runtime/GC.java
+index 2c4ab0715..eb06695c6 100644
+--- a/core/src/main/java/org/teavm/runtime/GC.java
++++ b/core/src/main/java/org/teavm/runtime/GC.java
+@@ -308,6 +308,12 @@ public final class GC {
+     }
+ 
+     private static void markFromClass(RuntimeClass cls) {
++        if (PlatformDetector.isWebAssembly()) {
++            RuntimeObject monitor = headerMonitor(cls.toAddress());
++            if (monitor != null) {
++                mark(monitor);
++            }
++        }
+         if (cls.simpleNameCache != null) {
+             mark(cls.simpleNameCache);
+         }
+@@ -434,13 +440,40 @@ public final class GC {
+         }
+     }
+ 
++    // wjharness patch 0007: header-word monitors on the linear-memory wasm target
++    private static final int MONITOR_FLAG = 0x80000000;
++
++    private static RuntimeObject headerMonitor(Address header) {
++        int word = header.add(4).getInt();
++        return (word & MONITOR_FLAG) != 0 ? Address.fromInt(word << 1).toStructure() : null;
++    }
++
++    private static void updateHeaderMonitor(Address header) {
++        int word = header.add(4).getInt();
++        if ((word & MONITOR_FLAG) != 0) {
++            Address monitor = Address.fromInt(word << 1);
++            Address moved = updatePointer(monitor);
++            if (moved != monitor) {
++                header.add(4).putInt((moved.toInt() >>> 1) | MONITOR_FLAG);
++            }
++        }
++    }
++
+     private static boolean markObjectData(RuntimeObject object) {
++        boolean hasObjectsFromYoungGen = false;
++        if (PlatformDetector.isWebAssembly()) {
++            RuntimeObject monitor = headerMonitor(object.toAddress());
++            if (monitor != null) {
++                hasObjectsFromYoungGen = enqueueMark(monitor);
++            }
++        }
+         RuntimeClass cls = RuntimeClass.getClass(object);
+         if (cls.itemType == null) {
+-            return markObject(cls, object);
++            hasObjectsFromYoungGen |= markObject(cls, object);
+         } else {
+-            return markArray(cls, (RuntimeArray) object);
++            hasObjectsFromYoungGen |= markArray(cls, (RuntimeArray) object);
+         }
++        return hasObjectsFromYoungGen;
+     }
+ 
+     private static boolean markObject(RuntimeClass cls, RuntimeObject object) {
+@@ -1006,6 +1039,9 @@ public final class GC {
+             if (cls.nameCache != null) {
+                 cls.nameCache = updatePointer(cls.nameCache.toAddress()).toStructure();
+             }
++            if (PlatformDetector.isWebAssembly()) {
++                updateHeaderMonitor(cls.toAddress());
++            }
+             classPtr = classPtr.add(Address.sizeOf());
+         }
+     }
+@@ -1119,6 +1155,12 @@ public final class GC {
+     }
+ 
+     private static void updatePointers(RuntimeClass cls, RuntimeObject object) {
++        if (PlatformDetector.isWebAssembly()) {
++            // an object about to move keeps its original second header word in the relocation backup (sizeBackup,
++            // at the same offset as in an object header)
++            Relocation relocation = getRelocation(object.toAddress());
++            updateHeaderMonitor(relocation != null ? relocation.toAddress() : object.toAddress());
++        }
+         if (cls.itemType == null) {
+             updatePointersInObject(cls, object);
+         } else {

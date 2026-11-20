@@ -1,0 +1,1125 @@
+Methods the JDK has and TeaVM's classlib lacks at 9be5eca57, needed by Minecraft 26.2's server (mctick) and its libraries,
+and class-path resources for the low-level targets (served from the virtual file system under /res/: TeaVM's own
+resource support is JavaScript-only). UUID is replaced by the JDK's two-long layout (TeaVM's held a String: no
+(long, long) constructor and string-compare equality, which would have taxed every UUID-keyed map on the tick).
+New classes these methods return (FileChannel, FileStore, ...) are in wjharness/bench/teavm-classlib, which
+teavm-cli.sh compiles into the same classlib module.
+Codegen: adds methods and one class rewrite (UUID); a program that reaches none of them compiles as before.
+
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/io/TFile.java b/classlib/src/main/java/org/teavm/classlib/java/io/TFile.java
+index 5584925d1..14fbb83c3 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/io/TFile.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/io/TFile.java
+@@ -111,6 +111,11 @@ public class TFile implements Serializable, Comparable<TFile> {
+         return path.compareTo(o.path);
+     }
+ 
++    // wjharness patch 0003
++    public java.nio.file.Path toPath() {
++        return java.nio.file.Paths.get(getPath());
++    }
++
+     public String getPath() {
+         return path;
+     }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java b/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java
+index ab4b0a649..c2704bb70 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java
+@@ -496,4 +496,15 @@ public class TRandomAccessFile implements DataInput, DataOutput, Closeable {
+         }
+         return offset;
+     }
++
++    // wjharness patch 0003
++    private java.nio.channels.FileChannel channel;
++
++    public java.nio.channels.FileChannel getChannel() {
++        if (channel == null) {
++            channel = (java.nio.channels.FileChannel) (Object) org.teavm.classlib.java.nio.channels.TFileChannel
++                    .forRandomAccessFile((java.io.RandomAccessFile) (Object) this, !readOnly);
++        }
++        return channel;
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/io/TReader.java b/classlib/src/main/java/org/teavm/classlib/java/io/TReader.java
+index 2fe0e730a..0316bf4da 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/io/TReader.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/io/TReader.java
+@@ -96,4 +96,26 @@ public abstract class TReader implements TCloseable, TReadable {
+     public void reset() throws IOException {
+         throw new IOException();
+     }
++
++    // wjharness patch 0003
++    public String readAllAsString() throws IOException {
++        StringBuilder sb = new StringBuilder();
++        char[] buffer = new char[8192];
++        int read;
++        while ((read = read(buffer, 0, buffer.length)) >= 0) {
++            sb.append(buffer, 0, read);
++        }
++        return sb.toString();
++    }
++
++    public long transferTo(java.io.Writer out) throws IOException {
++        long transferred = 0;
++        char[] buffer = new char[8192];
++        int read;
++        while ((read = read(buffer, 0, buffer.length)) >= 0) {
++            out.write(buffer, 0, read);
++            transferred += read;
++        }
++        return transferred;
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TCharacter.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TCharacter.java
+index f66b0da1e..4ccef4587 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TCharacter.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TCharacter.java
+@@ -416,6 +416,15 @@ public class TCharacter extends TObject implements TComparable<TCharacter> {
+         }
+     }
+ 
++    // wjharness patch 0003
++    public static String toString(int codePoint) {
++        return new String(toChars(codePoint));
++    }
++
++    public static int codePointOf(String name) {
++        throw new IllegalArgumentException("Unrecognized character name: " + name);
++    }
++
+     public static char[] toChars(int codePoint) {
+         if (!isValidCodePoint(codePoint)) {
+             throw new IllegalArgumentException();
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
+index 69bd48339..b57e76769 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
+@@ -787,6 +787,46 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+         return TClassLoader.getSystemClassLoader();
+     }
+ 
++    // wjharness patch 0003
++    public Object[] getSigners() {
++        return null;
++    }
++
++    public boolean isAnonymousClass() {
++        return false;
++    }
++
++    public java.net.URL getResource(String name) {
++        return getClassLoader().getResource(resolveResourceName(name));
++    }
++
++    private String resolveResourceName(String name) {
++        if (name.startsWith("/")) {
++            return name.substring(1);
++        }
++        TClass<?> cls = this;
++        while (cls.isArray()) {
++            cls = cls.getComponentType();
++        }
++        String prefix = cls.getName().toString();
++        int index = prefix.lastIndexOf('.');
++        return index >= 0 ? prefix.substring(0, index + 1).replace('.', '/') + name : name;
++    }
++
++    /* No generic signatures in this metadata: the raw supertypes (Guava's TypeCapture checks and refuses). */
++    public java.lang.reflect.Type getGenericSuperclass() {
++        return (java.lang.reflect.Type) (Object) getSuperclass();
++    }
++
++    public java.lang.reflect.Type[] getGenericInterfaces() {
++        TClass<?>[] interfaces = getInterfaces();
++        java.lang.reflect.Type[] result = new java.lang.reflect.Type[interfaces.length];
++        for (int i = 0; i < interfaces.length; ++i) {
++            result[i] = (java.lang.reflect.Type) (Object) interfaces[i];
++        }
++        return result;
++    }
++
+     public static TClass<?> forName(TString name) throws TClassNotFoundException {
+         if (PlatformDetector.isJavaScript()) {
+             PlatformClass cls = Platform.lookupClass(name.toString());
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TClassLoader.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TClassLoader.java
+index c7e1acd72..75fc8d0d5 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TClassLoader.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TClassLoader.java
+@@ -18,6 +18,7 @@ package org.teavm.classlib.java.lang;
+ import java.io.ByteArrayInputStream;
+ import java.io.InputStream;
+ import org.teavm.backend.javascript.spi.InjectedBy;
++import org.teavm.classlib.PlatformDetector;
+ import org.teavm.classlib.impl.Base64Impl;
+ import org.teavm.interop.NoSideEffects;
+ import org.teavm.jso.JSBody;
+@@ -46,6 +47,9 @@ public abstract class TClassLoader extends TObject {
+     }
+ 
+     public InputStream getResourceAsStream(String name) {
++        if (PlatformDetector.isLowLevel()) {
++            return TVfsResources.open(name);
++        }
+         if (resources == null) {
+             resources = supplyResources();
+         }
+@@ -65,6 +69,28 @@ public abstract class TClassLoader extends TObject {
+         return getSystemClassLoader().getResourceAsStream(name);
+     }
+ 
++    // wjharness patch 0003: class-path resources on the low-level targets are files under TVfsResources.ROOT
++    public java.net.URL getResource(String name) {
++        return PlatformDetector.isLowLevel() ? TVfsResources.url(name) : null;
++    }
++
++    public java.util.Enumeration<java.net.URL> getResources(String name) {
++        java.net.URL url = getResource(name);
++        return java.util.Collections.enumeration(url != null ? java.util.List.of(url) : java.util.List.of());
++    }
++
++    public static java.net.URL getSystemResource(String name) {
++        return getSystemClassLoader().getResource(name);
++    }
++
++    public static java.util.Enumeration<java.net.URL> getSystemResources(String name) {
++        return getSystemClassLoader().getResources(name);
++    }
++
++    public TClass<?> loadClass(String name) throws TClassNotFoundException {
++        return TClass.forName(new TString(name.toCharArray()));
++    }
++
+     @JSBody(params = "resource", script = "return resource !== null && resource !== void 0 ? resource : null;")
+     private static native String resourceToString(JSObject resource);
+ 
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TInteger.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TInteger.java
+index f5c151832..c19166b35 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TInteger.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TInteger.java
+@@ -158,6 +158,22 @@ public class TInteger extends TNumber implements TComparable<TInteger> {
+         return negative ? -value : value;
+     }
+ 
++    // wjharness patch 0003
++    public static int parseUnsignedInt(String s, int radix) throws TNumberFormatException {
++        if (s == null || s.isEmpty() || s.charAt(0) == '-') {
++            throw new TNumberFormatException();
++        }
++        long v = TLong.parseLong(s.charAt(0) == '+' ? s.substring(1) : s, radix);
++        if ((v >>> 32) != 0) {
++            throw new TNumberFormatException();
++        }
++        return (int) v;
++    }
++
++    public static int parseUnsignedInt(String s) throws TNumberFormatException {
++        return parseUnsignedInt(s, 10);
++    }
++
+     public static int parseInt(String s) throws TNumberFormatException {
+         return parseInt(s, 10);
+     }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TLong.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TLong.java
+index d371cb827..ca3c41844 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TLong.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TLong.java
+@@ -101,6 +101,33 @@ public class TLong extends TNumber implements TComparable<TLong> {
+         return negative ? -value : value;
+     }
+ 
++    // wjharness patch 0003
++    public static long parseUnsignedLong(String s, int radix) throws TNumberFormatException {
++        if (s == null || s.isEmpty() || s.charAt(0) == '-') {
++            throw new TNumberFormatException();
++        }
++        if (s.charAt(0) == '+') {
++            s = s.substring(1);
++        }
++        if (s.length() <= 12) {
++            return parseLong(s, radix);
++        }
++        long hi = parseLong(s.substring(0, s.length() - 1), radix);
++        int digit = Character.digit(s.charAt(s.length() - 1), radix);
++        if (digit < 0) {
++            throw new TNumberFormatException();
++        }
++        long result = hi * radix + digit;
++        if (Long.compareUnsigned(result, hi) < 0 || Long.divideUnsigned(result, radix) != hi) {
++            throw new TNumberFormatException();
++        }
++        return result;
++    }
++
++    public static long parseUnsignedLong(String s) throws TNumberFormatException {
++        return parseUnsignedLong(s, 10);
++    }
++
+     public static long parseLong(String s) throws TNumberFormatException {
+         return parseLong(s, 10);
+     }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TMath.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TMath.java
+index 527071113..5adc6795a 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TMath.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TMath.java
+@@ -504,6 +504,15 @@ public final class TMath extends TObject {
+     @Import(name = "fabs")
+     private static native float absC(float d);
+ 
++    // wjharness patch 0003 (not fused: the double product of two floats is exact, the double sum rounds once more)
++    public static float fma(float a, float b, float c) {
++        return (float) ((double) a * (double) b + (double) c);
++    }
++
++    public static double fma(double a, double b, double c) {
++        return a * b + c;
++    }
++
+     public static float abs(float n) {
+         if (PlatformDetector.isJavaScript()) {
+             return absImpl(n);
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TRuntime.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TRuntime.java
+index e31cad18b..0ef411134 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TRuntime.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TRuntime.java
+@@ -89,11 +89,32 @@ public class TRuntime {
+         return GC.availableBytes();
+     }
+ 
+-    @SupportedOn({Platforms.JAVASCRIPT, Platforms.WEBASSEMBLY_GC})
++    // wjharness patch 0003: one processor on the low-level targets (they run one thread)
++    @DelegateTo("availableProcessorsLowLevel")
+     public int availableProcessors() {
+         return Navigator.hardwareConcurrency();
+     }
+ 
++    private int availableProcessorsLowLevel() {
++        return 1;
++    }
++
++    public long maxMemory() {
++        return Long.MAX_VALUE;
++    }
++
++    public java.lang.Process exec(String command) throws java.io.IOException {
++        throw new java.io.IOException("cannot run processes: " + command);
++    }
++
++    public java.lang.Process exec(String[] cmdarray) throws java.io.IOException {
++        throw new java.io.IOException("cannot run processes");
++    }
++
++    public java.lang.Process exec(String[] cmdarray, String[] envp) throws java.io.IOException {
++        throw new java.io.IOException("cannot run processes");
++    }
++
+     public static Version version() {
+         if (version == null) {
+             version = new Version();
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TSecurityManager.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TSecurityManager.java
+index 619b2a616..5bbcf6b60 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TSecurityManager.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TSecurityManager.java
+@@ -21,4 +21,9 @@ public class TSecurityManager {
+ 
+     public TSecurityManager() {
+     }
++
++    // wjharness patch 0003
++    protected Class<?>[] getClassContext() {
++        return new Class<?>[0];
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TSystem.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TSystem.java
+index f00181319..24609f195 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TSystem.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TSystem.java
+@@ -311,4 +311,21 @@ public final class TSystem extends TObject {
+     public static String getenv(String name) {
+         return null;
+     }
++
++    // wjharness patch 0003
++    public static java.util.Map<String, String> getenv() {
++        return java.util.Collections.emptyMap();
++    }
++
++    public static void load(String filename) {
++        throw new UnsatisfiedLinkError("no native libraries: " + filename);
++    }
++
++    public static void loadLibrary(String libname) {
++        throw new UnsatisfiedLinkError("no native libraries: " + libname);
++    }
++
++    public static String mapLibraryName(String libname) {
++        return "lib" + libname + ".so";
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TVfsResources.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TVfsResources.java
+new file mode 100644
+index 000000000..90ea3a2f3
+--- /dev/null
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TVfsResources.java
+@@ -0,0 +1,45 @@
++/*
++ *  wjharness patch 0003. Licensed under the Apache License, Version 2.0, as TeaVM.
++ */
++package org.teavm.classlib.java.lang;
++
++import java.io.FileInputStream;
++import java.io.FileNotFoundException;
++import java.io.InputStream;
++import java.net.MalformedURLException;
++import java.net.URL;
++
++/* Class-path resources on the low-level targets: files under ROOT in the virtual file system, put there by the program. */
++final class TVfsResources {
++    static final String ROOT = "/res/";
++
++    private TVfsResources() {
++    }
++
++    private static String path(String name) {
++        while (name.startsWith("/")) {
++            name = name.substring(1);
++        }
++        return ROOT + name;
++    }
++
++    static InputStream open(String name) {
++        try {
++            return new FileInputStream(path(name));
++        } catch (FileNotFoundException e) {
++            return null;
++        }
++    }
++
++    static URL url(String name) {
++        String p = path(name);
++        if (!new java.io.File(p).exists()) {
++            return null;
++        }
++        try {
++            return new URL("file", "", p);
++        } catch (MalformedURLException e) {
++            return null;
++        }
++    }
++}
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java b/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java
+index a3154f146..e506406ae 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java
+@@ -50,6 +50,26 @@ public final class TArray extends TObject {
+     }
+ 
+     @PluggableDependency(ArrayDependencyPlugin.class)
++    // wjharness patch 0003: multi-dimensional arrays, one level at a time
++    public static TObject newInstance(Class<?> componentType, int... dimensions) {
++        if (dimensions.length == 0) {
++            throw new IllegalArgumentException("no dimensions");
++        }
++        if (dimensions.length == 1) {
++            return newInstance(componentType, dimensions[0]);
++        }
++        int[] rest = java.util.Arrays.copyOfRange(dimensions, 1, dimensions.length);
++        Class<?> inner = componentType;
++        for (int i = 1; i < dimensions.length; ++i) {
++            inner = java.lang.reflect.Array.newInstance(inner, 0).getClass();
++        }
++        Object[] outer = (Object[]) (Object) newInstance(inner, dimensions[0]);
++        for (int i = 0; i < outer.length; ++i) {
++            outer[i] = newInstance(componentType, rest);
++        }
++        return (TObject) (Object) outer;
++    }
++
+     public static TObject newInstance(Class<?> componentType, int length) throws TNegativeArraySizeException {
+         if (componentType == null) {
+             throw new TNullPointerException();
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFileSystem.java b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFileSystem.java
+index a33c55752..a65369bff 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFileSystem.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFileSystem.java
+@@ -33,4 +33,78 @@ public abstract class TFileSystem implements Closeable {
+     public abstract Set<String> supportedFileAttributeViews();
+ 
+     public abstract TFileSystemProvider provider();
++
++    // wjharness patch 0003: "glob:" (*, **, ?, {a,b}, [..]) and "regex:" matchers on the path's string form
++    public java.nio.file.PathMatcher getPathMatcher(String syntaxAndPattern) {
++        int colon = syntaxAndPattern.indexOf(':');
++        if (colon <= 0) {
++            throw new IllegalArgumentException(syntaxAndPattern);
++        }
++        String syntax = syntaxAndPattern.substring(0, colon);
++        String pattern = syntaxAndPattern.substring(colon + 1);
++        String regex;
++        if (syntax.equalsIgnoreCase("regex")) {
++            regex = pattern;
++        } else if (syntax.equalsIgnoreCase("glob")) {
++            regex = globToRegex(pattern);
++        } else {
++            throw new UnsupportedOperationException("Syntax '" + syntax + "' not recognized");
++        }
++        java.util.regex.Pattern p = java.util.regex.Pattern.compile(regex);
++        return (java.nio.file.PathMatcher) (Object) (org.teavm.classlib.java.nio.file.TPathMatcher)
++                path -> p.matcher(path.toString()).matches();
++    }
++
++    private static String globToRegex(String glob) {
++        StringBuilder sb = new StringBuilder();
++        boolean inGroup = false;
++        for (int i = 0; i < glob.length(); ++i) {
++            char c = glob.charAt(i);
++            switch (c) {
++                case '*':
++                    if (i + 1 < glob.length() && glob.charAt(i + 1) == '*') {
++                        sb.append(".*");
++                        ++i;
++                    } else {
++                        sb.append("[^/]*");
++                    }
++                    break;
++                case '?':
++                    sb.append("[^/]");
++                    break;
++                case '{':
++                    sb.append("(?:");
++                    inGroup = true;
++                    break;
++                case '}':
++                    sb.append(')');
++                    inGroup = false;
++                    break;
++                case ',':
++                    sb.append(inGroup ? "|" : ",");
++                    break;
++                case '[':
++                    sb.append('[');
++                    if (i + 1 < glob.length() && glob.charAt(i + 1) == '!') {
++                        sb.append('^');
++                        ++i;
++                    }
++                    break;
++                case ']':
++                    sb.append(']');
++                    break;
++                case '\\':
++                    if (i + 1 < glob.length()) {
++                        sb.append(java.util.regex.Pattern.quote(String.valueOf(glob.charAt(++i))));
++                    }
++                    break;
++                default:
++                    if ("().+^$|".indexOf(c) >= 0) {
++                        sb.append('\\');
++                    }
++                    sb.append(c);
++            }
++        }
++        return sb.toString();
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java
+index ac702a588..14a1ed76a 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java
+@@ -571,4 +571,28 @@ public final class TFiles {
+     public static Stream<String> lines(TPath path) throws IOException {
+         return lines(path, StandardCharsets.UTF_8);
+     }
++
++    // wjharness patch 0003
++    public static java.nio.file.FileStore getFileStore(TPath path) throws IOException {
++        return (java.nio.file.FileStore) (Object) org.teavm.classlib.java.nio.file.TFileStore.memory();
++    }
++
++    public static <V extends java.nio.file.attribute.FileAttributeView> V getFileAttributeView(TPath path,
++            Class<V> type, TLinkOption... options) {
++        return null;
++    }
++
++    public static TPath createLink(TPath link, TPath existing) throws IOException {
++        throw new UnsupportedOperationException("hard links");
++    }
++
++    public static java.util.Set<java.nio.file.attribute.PosixFilePermission> getPosixFilePermissions(TPath path,
++            TLinkOption... options) throws IOException {
++        throw new UnsupportedOperationException("no POSIX file permissions on the in-memory file system");
++    }
++
++    public static TPath setPosixFilePermissions(TPath path,
++            java.util.Set<java.nio.file.attribute.PosixFilePermission> perms) throws IOException {
++        throw new UnsupportedOperationException("no POSIX file permissions on the in-memory file system");
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java
+index 662a7ecbb..07ed83e46 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java
+@@ -60,6 +60,15 @@ public interface TPath extends Comparable<TPath>, Iterable<TPath> {
+ 
+     TPath resolve(TPath other);
+ 
++    // wjharness patch 0003
++    default TPath resolve(String first, String... more) {
++        TPath result = resolve(first);
++        for (String s : more) {
++            result = result.resolve(s);
++        }
++        return result;
++    }
++
+     default TPath resolve(String other) {
+         return resolve(getFileSystem().getPath(other));
+     }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/TBase64.java b/classlib/src/main/java/org/teavm/classlib/java/util/TBase64.java
+index 397e374aa..9442c08dc 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/TBase64.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/TBase64.java
+@@ -56,6 +56,19 @@ public final class TBase64 {
+         }
+     }
+ 
++    // wjharness patch 0003: MIME coders without line breaks or separators (Minecraft's Crypt only formats PEM keys)
++    public static Encoder getMimeEncoder() {
++        return getEncoder();
++    }
++
++    public static Encoder getMimeEncoder(int lineLength, byte[] lineSeparator) {
++        return getEncoder();
++    }
++
++    public static Decoder getMimeDecoder() {
++        return getDecoder();
++    }
++
+     public static Decoder getDecoder() {
+         return new Decoder(Base64Impl.reverse);
+     }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/TDate.java b/classlib/src/main/java/org/teavm/classlib/java/util/TDate.java
+index 16e591725..c325fa50d 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/TDate.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/TDate.java
+@@ -379,6 +379,15 @@ public class TDate implements TComparable<TDate> {
+     @UnsupportedOn(Platforms.WEBASSEMBLY)
+     private static native int setSecondsLowLevel(long date, int seconds);
+ 
++    // wjharness patch 0003
++    public java.time.Instant toInstant() {
++        return java.time.Instant.ofEpochMilli(getTime());
++    }
++
++    public static TDate from(java.time.Instant instant) {
++        return new TDate(instant.toEpochMilli());
++    }
++
+     public long getTime() {
+         return value;
+     }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/TSpliterators.java b/classlib/src/main/java/org/teavm/classlib/java/util/TSpliterators.java
+index 0f3c3fc7e..3ecc545ef 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/TSpliterators.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/TSpliterators.java
+@@ -334,4 +334,152 @@ public class TSpliterators {
+             }
+         };
+     }
++
++    // wjharness patch 0003
++    public static <T> java.util.Iterator<T> iterator(java.util.Spliterator<? extends T> spliterator) {
++        java.util.ArrayList<T> items = new java.util.ArrayList<>();
++        spliterator.forEachRemaining(items::add);
++        return items.iterator();
++    }
++
++    public static java.util.PrimitiveIterator.OfInt iterator(java.util.Spliterator.OfInt spliterator) {
++        int[][] buf = { new int[16] };
++        int[] n = { 0 };
++        spliterator.forEachRemaining((int v) -> {
++            if (n[0] == buf[0].length) {
++                buf[0] = java.util.Arrays.copyOf(buf[0], n[0] * 2);
++            }
++            buf[0][n[0]++] = v;
++        });
++        return java.util.Arrays.stream(buf[0], 0, n[0]).iterator();
++    }
++
++    public static <T> TSpliterator<T> emptySpliterator() {
++        return spliterator(new Object[0], 0);
++    }
++
++    public static TSpliterator.OfInt emptyIntSpliterator() {
++        return spliterator(new int[0], 0);
++    }
++
++    public static TSpliterator.OfDouble spliterator(double[] array, int additionalCharacteristics) {
++        return spliterator(array, 0, array.length, additionalCharacteristics);
++    }
++
++    public static TSpliterator.OfDouble spliterator(double[] array, int from, int to,
++            int additionalCharacteristics) {
++        return (TSpliterator.OfDouble) (Object) new AbstractDoubleSpliterator(to - from, additionalCharacteristics | java.util.Spliterator.SIZED) {
++            private int index = from;
++
++            @Override
++            public boolean tryAdvance(java.util.function.DoubleConsumer action) {
++                if (index >= to) {
++                    return false;
++                }
++                action.accept(array[index++]);
++                return true;
++            }
++        };
++    }
++
++    public abstract static class AbstractSpliterator<T> implements java.util.Spliterator<T> {
++        private long est;
++        private final int characteristics;
++
++        protected AbstractSpliterator(long est, int additionalCharacteristics) {
++            this.est = est;
++            this.characteristics = (additionalCharacteristics & java.util.Spliterator.SIZED) != 0
++                    ? additionalCharacteristics | java.util.Spliterator.SUBSIZED : additionalCharacteristics;
++        }
++
++        @Override
++        public java.util.Spliterator<T> trySplit() {
++            return null;
++        }
++
++        @Override
++        public long estimateSize() {
++            return est;
++        }
++
++        @Override
++        public int characteristics() {
++            return characteristics;
++        }
++    }
++
++    public abstract static class AbstractIntSpliterator implements java.util.Spliterator.OfInt {
++        private final long est;
++        private final int characteristics;
++
++        protected AbstractIntSpliterator(long est, int additionalCharacteristics) {
++            this.est = est;
++            this.characteristics = additionalCharacteristics;
++        }
++
++        @Override
++        public java.util.Spliterator.OfInt trySplit() {
++            return null;
++        }
++
++        @Override
++        public long estimateSize() {
++            return est;
++        }
++
++        @Override
++        public int characteristics() {
++            return characteristics;
++        }
++    }
++
++    public abstract static class AbstractLongSpliterator implements java.util.Spliterator.OfLong {
++        private final long est;
++        private final int characteristics;
++
++        protected AbstractLongSpliterator(long est, int additionalCharacteristics) {
++            this.est = est;
++            this.characteristics = additionalCharacteristics;
++        }
++
++        @Override
++        public java.util.Spliterator.OfLong trySplit() {
++            return null;
++        }
++
++        @Override
++        public long estimateSize() {
++            return est;
++        }
++
++        @Override
++        public int characteristics() {
++            return characteristics;
++        }
++    }
++
++    public abstract static class AbstractDoubleSpliterator implements java.util.Spliterator.OfDouble {
++        private final long est;
++        private final int characteristics;
++
++        protected AbstractDoubleSpliterator(long est, int additionalCharacteristics) {
++            this.est = est;
++            this.characteristics = additionalCharacteristics;
++        }
++
++        @Override
++        public java.util.Spliterator.OfDouble trySplit() {
++            return null;
++        }
++
++        @Override
++        public long estimateSize() {
++            return est;
++        }
++
++        @Override
++        public int characteristics() {
++            return characteristics;
++        }
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/TUUID.java b/classlib/src/main/java/org/teavm/classlib/java/util/TUUID.java
+index ac80daf0b..907f3f9bc 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/TUUID.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/TUUID.java
+@@ -1,5 +1,5 @@
+ /*
+- *  Copyright 2015 Alexey Andreev.
++ *  Copyright 2020 Alexey Andreev.
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -15,50 +15,113 @@
+  */
+ package org.teavm.classlib.java.util;
+ 
+-import org.teavm.classlib.PlatformDetector;
+-import org.teavm.jso.crypto.Crypto;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
+ 
+-public class TUUID {
+-    private String value;
++/*
++ * wjharness patch 0003: the JDK's layout (two longs) and behaviour, in place of TeaVM's string-backed UUID, which had
++ * no (long, long) constructor, no bit accessors and string-compare equality.
++ */
++public final class TUUID implements Comparable<TUUID> {
++    private final long mostSigBits;
++    private final long leastSigBits;
+ 
+-    private TUUID(String value) {
+-        this.value = value;
++    public TUUID(long mostSigBits, long leastSigBits) {
++        this.mostSigBits = mostSigBits;
++        this.leastSigBits = leastSigBits;
+     }
+ 
+-    @Override
+-    public boolean equals(Object o) {
+-        if (o instanceof TUUID) {
+-            TUUID other = (TUUID) o;
+-            return value.equals(other.value);
+-        } else {
+-            return false;
++    public static TUUID randomUUID() {
++        long msb = (long) (Math.random() * 0x1p32) << 32 | (long) (Math.random() * 0x1p32);
++        long lsb = (long) (Math.random() * 0x1p32) << 32 | (long) (Math.random() * 0x1p32);
++        msb = (msb & ~0xF000L) | 0x4000L;
++        lsb = (lsb & 0x3FFFFFFFFFFFFFFFL) | 0x8000000000000000L;
++        return new TUUID(msb, lsb);
++    }
++
++    public static TUUID nameUUIDFromBytes(byte[] name) {
++        byte[] md5;
++        try {
++            md5 = MessageDigest.getInstance("MD5").digest(name);
++        } catch (NoSuchAlgorithmException e) {
++            throw new InternalError("MD5 not supported", e);
++        }
++        md5[6] &= 0x0f;
++        md5[6] |= 0x30;
++        md5[8] &= 0x3f;
++        md5[8] |= (byte) 0x80;
++        long msb = 0;
++        long lsb = 0;
++        for (int i = 0; i < 8; i++) {
++            msb = (msb << 8) | (md5[i] & 0xff);
+         }
++        for (int i = 8; i < 16; i++) {
++            lsb = (lsb << 8) | (md5[i] & 0xff);
++        }
++        return new TUUID(msb, lsb);
+     }
+ 
+-    @Override
+-    public int hashCode() {
+-        return value.hashCode();
++    public static TUUID fromString(String name) {
++        String[] parts = name.split("-");
++        if (parts.length != 5) {
++            throw new IllegalArgumentException("Invalid UUID string: " + name);
++        }
++        long msb = Long.parseLong(parts[0], 16);
++        msb <<= 16;
++        msb |= Long.parseLong(parts[1], 16);
++        msb <<= 16;
++        msb |= Long.parseLong(parts[2], 16);
++        long lsb = Long.parseLong(parts[3], 16);
++        lsb <<= 48;
++        lsb |= Long.parseLong(parts[4], 16);
++        return new TUUID(msb, lsb);
++    }
++
++    public long getLeastSignificantBits() {
++        return leastSigBits;
++    }
++
++    public long getMostSignificantBits() {
++        return mostSigBits;
++    }
++
++    public int version() {
++        return (int) ((mostSigBits >> 12) & 0x0f);
++    }
++
++    public int variant() {
++        return (int) ((leastSigBits >>> (64 - (leastSigBits >>> 62))) & (leastSigBits >> 63));
+     }
+ 
+     @Override
+     public String toString() {
+-        return value;
++        return digits(mostSigBits >> 32, 8) + "-" + digits(mostSigBits >> 16, 4) + "-" + digits(mostSigBits, 4) + "-"
++                + digits(leastSigBits >> 48, 4) + "-" + digits(leastSigBits, 12);
+     }
+ 
+-    public static TUUID randomUUID() {
+-        if (PlatformDetector.isJavaScript() && Crypto.isSupported()) {
+-            return new TUUID(Crypto.current().randomUUID());
+-        } else {
+-            String value = s4() + s4() + "-" + s4() + "-" + s4() + "-" + s4() + "-" + s4() + s4() + s4();
+-            return new TUUID(value);
+-        }
++    private static String digits(long val, int digits) {
++        long hi = 1L << (digits * 4);
++        return Long.toHexString(hi | (val & (hi - 1))).substring(1);
+     }
+ 
+-    private static String s4() {
+-        return Integer.toString((int) Math.floor((1 + Math.random()) * 65536), 16).substring(1);
++    @Override
++    public int hashCode() {
++        long hilo = mostSigBits ^ leastSigBits;
++        return ((int) (hilo >> 32)) ^ (int) hilo;
+     }
+ 
+-    public static TUUID fromString(String value) {
+-        return new TUUID(value);
++    @Override
++    public boolean equals(Object obj) {
++        if (!(obj instanceof TUUID)) {
++            return false;
++        }
++        TUUID id = (TUUID) obj;
++        return mostSigBits == id.mostSigBits && leastSigBits == id.leastSigBits;
++    }
++
++    @Override
++    public int compareTo(TUUID val) {
++        int mostSigBits = Long.compare(this.mostSigBits, val.mostSigBits);
++        return mostSigBits != 0 ? mostSigBits : Long.compare(this.leastSigBits, val.leastSigBits);
+     }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java b/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java
+index 62c00e8de..fe4061e45 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java
+@@ -804,4 +804,68 @@ public class TConcurrentHashMap<K, V> extends TAbstractMap<K, V>
+     private int computeIndex(int hash) {
+         return (hash & 0x7FFFFFFF) % elementData.length;
+     }
++
++    // wjharness patch 0003
++    public static <K> KeySetView<K, Boolean> newKeySet() {
++        return new KeySetView<>(new TConcurrentHashMap<>(), Boolean.TRUE);
++    }
++
++    public static <K> KeySetView<K, Boolean> newKeySet(int initialCapacity) {
++        return newKeySet();
++    }
++
++    public KeySetView<K, V> keySet(V mappedValue) {
++        return new KeySetView<>(this, mappedValue);
++    }
++
++    public static class KeySetView<K, V> extends TAbstractSet<K> implements TSerializable {
++        private final TConcurrentHashMap<K, V> map;
++        private final V value;
++
++        KeySetView(TConcurrentHashMap<K, V> map, V value) {
++            this.map = map;
++            this.value = value;
++        }
++
++        public TConcurrentHashMap<K, V> getMap() {
++            return map;
++        }
++
++        public V getMappedValue() {
++            return value;
++        }
++
++        @Override
++        public boolean add(K e) {
++            if (value == null) {
++                throw new UnsupportedOperationException();
++            }
++            return map.putIfAbsent(e, value) == null;
++        }
++
++        @Override
++        public boolean contains(Object o) {
++            return map.containsKey(o);
++        }
++
++        @Override
++        public boolean remove(Object o) {
++            return map.remove(o) != null;
++        }
++
++        @Override
++        public int size() {
++            return map.size();
++        }
++
++        @Override
++        public void clear() {
++            map.clear();
++        }
++
++        @Override
++        public TIterator<K> iterator() {
++            return map.keySet().iterator();
++        }
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/regex/TPattern.java b/classlib/src/main/java/org/teavm/classlib/java/util/regex/TPattern.java
+index 6250f39d7..490a80c5d 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/regex/TPattern.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/regex/TPattern.java
+@@ -1363,4 +1363,13 @@ public final class TPattern implements Serializable {
+      */
+     private TPattern() {
+     }
++
++    // wjharness patch 0003
++    public java.util.function.Predicate<String> asPredicate() {
++        return s -> matcher(s).find();
++    }
++
++    public java.util.function.Predicate<String> asMatchPredicate() {
++        return s -> matcher(s).matches();
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/stream/TStreamSupport.java b/classlib/src/main/java/org/teavm/classlib/java/util/stream/TStreamSupport.java
+index 8a33baef3..a3a295f9c 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/stream/TStreamSupport.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/stream/TStreamSupport.java
+@@ -32,4 +32,13 @@ public final class TStreamSupport {
+     public static <T> TStream<T> stream(Supplier<Spliterator<T>> spliterator, int characteristics, boolean parallel) {
+         return new TStreamOverSpliteratorSupplier<>(spliterator, characteristics);
+     }
++
++    // wjharness patch 0003
++    public static TIntStream intStream(Spliterator.OfInt spliterator, boolean parallel) {
++        return new org.teavm.classlib.java.util.stream.intimpl.TSpliteratorIntStreamImpl(spliterator);
++    }
++
++    public static TLongStream longStream(Spliterator.OfLong spliterator, boolean parallel) {
++        return new org.teavm.classlib.java.util.stream.longimpl.TSpliteratorLongStreamImpl(spliterator);
++    }
+ }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/stream/intimpl/TSpliteratorIntStreamImpl.java b/classlib/src/main/java/org/teavm/classlib/java/util/stream/intimpl/TSpliteratorIntStreamImpl.java
+new file mode 100644
+index 000000000..33a91174d
+--- /dev/null
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/stream/intimpl/TSpliteratorIntStreamImpl.java
+@@ -0,0 +1,36 @@
++/*
++ *  wjharness patch 0003: StreamSupport.intStream(Spliterator.OfInt, boolean).
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License"), as TeaVM.
++ */
++package org.teavm.classlib.java.util.stream.intimpl;
++
++import java.util.Spliterator;
++import java.util.function.IntConsumer;
++import java.util.function.IntPredicate;
++
++public class TSpliteratorIntStreamImpl extends TSimpleIntStreamImpl {
++    private final Spliterator.OfInt spliterator;
++    private boolean exhausted;
++
++    public TSpliteratorIntStreamImpl(Spliterator.OfInt spliterator) {
++        this.spliterator = spliterator;
++    }
++
++    @Override
++    public boolean next(IntPredicate consumer) {
++        boolean[] keep = new boolean[1];
++        IntConsumer push = v -> keep[0] = consumer.test(v);
++        while (!exhausted) {
++            keep[0] = true;
++            if (!spliterator.tryAdvance(push)) {
++                exhausted = true;
++                break;
++            }
++            if (!keep[0]) {
++                break;
++            }
++        }
++        return !exhausted;
++    }
++}
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/stream/longimpl/TSpliteratorLongStreamImpl.java b/classlib/src/main/java/org/teavm/classlib/java/util/stream/longimpl/TSpliteratorLongStreamImpl.java
+new file mode 100644
+index 000000000..71b6d16c7
+--- /dev/null
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/stream/longimpl/TSpliteratorLongStreamImpl.java
+@@ -0,0 +1,36 @@
++/*
++ *  wjharness patch 0003: StreamSupport.longStream(Spliterator.OfLong, boolean).
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License"), as TeaVM.
++ */
++package org.teavm.classlib.java.util.stream.longimpl;
++
++import java.util.Spliterator;
++import java.util.function.LongConsumer;
++import java.util.function.LongPredicate;
++
++public class TSpliteratorLongStreamImpl extends TSimpleLongStreamImpl {
++    private final Spliterator.OfLong spliterator;
++    private boolean exhausted;
++
++    public TSpliteratorLongStreamImpl(Spliterator.OfLong spliterator) {
++        this.spliterator = spliterator;
++    }
++
++    @Override
++    public boolean next(LongPredicate consumer) {
++        boolean[] keep = new boolean[1];
++        LongConsumer push = v -> keep[0] = consumer.test(v);
++        while (!exhausted) {
++            keep[0] = true;
++            if (!spliterator.tryAdvance(push)) {
++                exhausted = true;
++                break;
++            }
++            if (!keep[0]) {
++                break;
++            }
++        }
++        return !exhausted;
++    }
++}

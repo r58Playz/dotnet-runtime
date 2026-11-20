@@ -1,0 +1,52 @@
+ClassInitElimination took every invoked method's owner as initialized from then on, interface methods included. An
+instance call proves its owner initialized only when the owner is a class: an instance exists, so its class and (with
+patch 0010) its superclasses have been initialized. An interface is not initialized by the classes that implement it
+on this target, so a later InitClass of that interface was deleted and its static fields read before its <clinit>.
+mctick at FULL: HopperBlockEntity.suckInItems calls hopper.getLevelX() (Hopper), then inlines Hopper.getSuckAabb(),
+whose InitClass Hopper went, so Hopper.SUCK_AABB was null: NullPointerException in AABB.move on the first hopper tick.
+At ADVANCED getSuckAabb is not inlined (not used once), so its InitClass stayed in its own function. Instance calls
+whose owner is an interface (or unknown) no longer count; static calls still do (a static method initializes its
+class at entry).
+Codegen: InitClass checks of interfaces after an interface call in the same method are kept.
+
+diff --git a/core/src/main/java/org/teavm/model/optimization/ClassInitElimination.java b/core/src/main/java/org/teavm/model/optimization/ClassInitElimination.java
+index aa8642919..46814f87e 100644
+--- a/core/src/main/java/org/teavm/model/optimization/ClassInitElimination.java
++++ b/core/src/main/java/org/teavm/model/optimization/ClassInitElimination.java
+@@ -23,6 +23,9 @@ import org.teavm.common.DominatorTree;
+ import org.teavm.common.Graph;
+ import org.teavm.common.GraphUtils;
+ import org.teavm.model.BasicBlock;
++import org.teavm.model.ClassReader;
++import org.teavm.model.ClassReaderSource;
++import org.teavm.model.ElementModifier;
+ import org.teavm.model.Instruction;
+ import org.teavm.model.Program;
+ import org.teavm.model.instructions.InitClassInstruction;
+@@ -57,7 +60,13 @@ public class ClassInitElimination implements MethodOptimization {
+                 }
+                 if (insn instanceof InvokeInstruction) {
+                     InvokeInstruction invoke = (InvokeInstruction) insn;
+-                    step.initializedClasses.add(invoke.getMethod().getClassName());
++                    // a static call initializes its class at the callee's entry; an instance call proves its owner
++                    // initialized only for a class (an instance exists), never for an interface, which the classes
++                    // implementing it do not initialize here
++                    String owner = invoke.getMethod().getClassName();
++                    if (invoke.getInstance() == null || isClass(context.getClassSource(), owner)) {
++                        step.initializedClasses.add(owner);
++                    }
+                 }
+             }
+ 
+@@ -71,6 +80,11 @@ public class ClassInitElimination implements MethodOptimization {
+         return false;
+     }
+ 
++    private static boolean isClass(ClassReaderSource classSource, String name) {
++        ClassReader cls = classSource != null ? classSource.get(name) : null;
++        return cls != null && !cls.hasModifier(ElementModifier.INTERFACE);
++    }
++
+     static class Step {
+         int node;
+         Set<String> initializedClasses = new HashSet<>();

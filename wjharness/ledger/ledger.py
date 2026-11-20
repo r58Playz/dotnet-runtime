@@ -332,6 +332,11 @@ def kind_of(x):
                     ('stalls_l3_miss', 'st_l3'), ('dtlb_load_misses.walk_active', 'dtlb_walk')):
         if st in n:
             return lab
+    # Retired loads / stores that missed the STLB (2026-11-18): PEBS with a data address under `perf record -d`, so the
+    # dTLB walks can be split by data region (--addr-out). Not `frontend_retired.stlb_miss` (the instruction side, below).
+    for st, lab in (('mem_inst_retired.stlb_miss_loads', 'stlb_ld'), ('mem_inst_retired.stlb_miss_stores', 'stlb_st')):
+        if st in n:
+            return lab
     for lv in ('l1_miss', 'l2_miss', 'l3_miss'):
         if lv in n and 'frontend' not in n:
             return lv
@@ -403,7 +408,8 @@ def classify(ip, t, chain, lbr=None, use_lbr=False):
     c = caller_of(chain, t, lbr, use_lbr)
     return ('nonjit', nonjit_name(r)) + ((c[0], c[1]) if c else (None, None))
 
-# --addr-out FILE (a capture taken with `perf record -d`, MCPERF_EXTRA=-d): one line per l1/l2/l3-miss load sample --
+# --addr-out FILE (a capture taken with `perf record -d`, MCPERF_EXTRA=-d): one line per l1/l2/l3-miss load sample (and per
+# STLB-miss load / store sample, stlb_ld / stlb_st) --
 # event kind, ip, data address, PERF_SAMPLE_DATA_SRC, then the sample's ledger key (the same tuple the tables count) --
 # for joining miss addresses to owners (runs/2026-11-15-levers2/miss).
 ADDR_OUT = opt('--addr-out')
@@ -416,7 +422,7 @@ for rec in perfread.samples(os.path.join(rundir, 'perf.data'), tid=tid, t0=t0, t
     nsamp[ai] += 1
     key = classify(ip, t, chain, lbr, bool(at[ai]['bstype'] & CALL_STACK))
     cnt[k][key] += 1
-    if addr_f and k in ('l1_miss', 'l2_miss', 'l3_miss'):
+    if addr_f and k in ('l1_miss', 'l2_miss', 'l3_miss', 'stlb_ld', 'stlb_st'):
         addr_f.write(f'{k}\t{ip:x}\t{rec[6][0]:x}\t{rec[6][1]:x}\t' + '\t'.join('' if x is None else str(x) for x in key) + '\n')
 if addr_f:
     addr_f.close()
@@ -471,7 +477,7 @@ def val(kind, key):
     return c.get(key, 0) / s_ * per_tick[kind] / 1e6
 # Cycles and memory events use the LBR call stack when it is there; the fp instructions stream keeps the old caller
 # attribution so the two can be compared below.
-extra = [k for k in ('ins_lbr', 'l1_miss', 'l2_miss', 'l3_miss', 'fe_l1i', 'fe_l2', 'fe_itlb', 'fe_stlb', 'fe_unkbr',
+extra = [k for k in ('ins_lbr', 'l1_miss', 'l2_miss', 'l3_miss', 'stlb_ld', 'stlb_st', 'fe_l1i', 'fe_l2', 'fe_itlb', 'fe_stlb', 'fe_unkbr',
                      'fe_dsb', 'fe_lat', 'st_tot', 'st_l1d', 'st_l2', 'st_l3', 'dtlb_walk') if k in cnt]
 # The M_instr column takes the LBR-attributed stream when there is one (exact callers for runtime code); the fp
 # stream stays as an extra column for the comparison.

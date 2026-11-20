@@ -1,0 +1,93 @@
+Diagnostic only: with -Dwj.asyncReport (TeaVM reads build properties from the JVM's), the linear-memory wasm target
+prints every reachable suspending (@Async) method and a caller chain to the first method outside java.* and
+org.teavm.*. Any such method makes TeaVM coroutine-transform its transitive callers, which mctick's TeaVM arm must
+not have (bench/teavm-classlib/src/wjteavm/Background.java). Codegen: none.
+
+diff --git a/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java b/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
+index c8b7d0813..1f920b784 100644
+--- a/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
++++ b/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
+@@ -458,6 +458,9 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
+         asyncMethods = new HashSet<>(asyncFinder.getAsyncMethods());
+         asyncMethods.addAll(asyncFinder.getAsyncFamilyMethods());
+         hasThreads = asyncFinder.hasAsyncMethods();
++        if (controller.getProperties().getProperty("wj.asyncReport") != null) {
++            WjAsyncReport.print(controller.getDependencyInfo().getCallGraph(), classSource, asyncMethods, hasThreads);
++        }
+     }
+ 
+     @Override
+diff --git a/core/src/main/java/org/teavm/backend/wasm/WjAsyncReport.java b/core/src/main/java/org/teavm/backend/wasm/WjAsyncReport.java
+new file mode 100644
+index 000000000..5cb4db01e
+--- /dev/null
++++ b/core/src/main/java/org/teavm/backend/wasm/WjAsyncReport.java
+@@ -0,0 +1,68 @@
++/*
++ *  wjharness patch 0004 (diagnostic). Licensed under the Apache License, Version 2.0, as TeaVM.
++ */
++package org.teavm.backend.wasm;
++
++import java.util.ArrayDeque;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Set;
++import org.teavm.callgraph.CallGraph;
++import org.teavm.callgraph.CallGraphNode;
++import org.teavm.callgraph.CallSite;
++import org.teavm.interop.Async;
++import org.teavm.model.ClassReader;
++import org.teavm.model.ListableClassReaderSource;
++import org.teavm.model.MethodReader;
++import org.teavm.model.MethodReference;
++
++final class WjAsyncReport {
++    private WjAsyncReport() {
++    }
++
++    static void print(CallGraph callGraph, ListableClassReaderSource classes, Set<MethodReference> asyncMethods,
++            boolean hasThreads) {
++        System.out.println("[wj-async] " + asyncMethods.size() + " async methods, threads " + hasThreads);
++        for (MethodReference m : asyncMethods) {
++            ClassReader cls = classes.get(m.getClassName());
++            MethodReader method = cls != null ? cls.getMethod(m.getDescriptor()) : null;
++            if (method == null || method.getAnnotations().get(Async.class.getName()) == null) {
++                continue;
++            }
++            System.out.println("[wj-async] root " + m);
++            Map<MethodReference, MethodReference> next = new HashMap<>();
++            ArrayDeque<MethodReference> queue = new ArrayDeque<>();
++            queue.add(m);
++            next.put(m, null);
++            MethodReference user = null;
++            while (!queue.isEmpty() && user == null) {
++                MethodReference cur = queue.poll();
++                CallGraphNode node = callGraph.getNode(cur);
++                if (node == null) {
++                    continue;
++                }
++                for (CallSite site : node.getCallerCallSites()) {
++                    for (CallGraphNode caller : site.getCallers()) {
++                        MethodReference c = caller.getMethod();
++                        if (next.containsKey(c)) {
++                            continue;
++                        }
++                        next.put(c, cur);
++                        String n = c.getClassName();
++                        if (!n.startsWith("java.") && !n.startsWith("org.teavm.")) {
++                            user = c;
++                            break;
++                        }
++                        queue.add(c);
++                    }
++                    if (user != null) {
++                        break;
++                    }
++                }
++            }
++            for (MethodReference c = user; c != null; c = next.get(c)) {
++                System.out.println("[wj-async]     " + c);
++            }
++        }
++    }
++}

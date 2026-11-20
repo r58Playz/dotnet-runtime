@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- The jbox2d TeaVM arm (wj j2d/run tvfull|tvsimple), TeaVM's linear-memory wasm backend. ?args=W,S,N is the
+     schedule (warmup steps, steps per batch, batches), passed to main; output goes to the console. Built and copied
+     next to wasm/ by wjharness/bench/jbox2d/build.sh. -->
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+  <title>jbox2d fixed work, TeaVM linear-memory wasm</title>
+  <script type="text/javascript" charset="utf-8" src="wasm/benchmark.wasm-runtime.js"></script>
+</head>
+<script type="text/javascript">
+  function launch() {
+    const q = new URLSearchParams(location.search);
+    const args = (q.get("args") || "").split(",").filter(Boolean);
+    TeaVM.wasm.load("wasm/benchmark.wasm").then(function (teavm) {
+      teavm.main(args);
+    }).catch(function (e) {
+      console.log("[bench] LOAD FAILED: " + e);
+    });
+  }
+</script>
+<body onload="launch()">
+<pre id="bench-output"></pre>
+</body>
+</html>

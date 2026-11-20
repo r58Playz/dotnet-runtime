@@ -1,10 +1,7 @@
 // Minimal static file server with COOP/COEP headers.
 //
-// Exists for the teavm baseline row: the wasm-gc benchmark ships as build/libs/benchmark.war, and the
-// recorded 0.426 ms/step was taken by unzipping it (minus WEB-INF) and serving it this way on 8099.
-//
-//   cd $TEAVM_DIR/samples/benchmark && unzip -q -o build/libs/benchmark.war -x 'WEB-INF/*' -d /tmp/teavmweb
-//   wj serve-coep /tmp/teavmweb 8099
+// Serves the TeaVM arms (j2d/run tvfull, tvsimple, ...: $WJ_STATE/arms/j2d/teavm-*, built by wj bench/jbox2d/build)
+// and the mctick TeaVM arm. By hand: wj serve-coep <dir> 8099.
 //
 // <dir> may be several directories joined with ':' -- a path is served from the first that has it. j2d/run.mjs uses
 // that to serve the tracked j2d/cheerpj/index.html over the untracked jars in state/arms/cheerpj.

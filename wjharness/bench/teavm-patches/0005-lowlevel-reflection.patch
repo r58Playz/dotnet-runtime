@@ -1,0 +1,250 @@
+Reflection on the linear-memory ("low-level") wasm target, where TeaVM at 9be5eca57 left it as natives the backend
+never implements (Class.getDeclaredFields/Methods/Constructors, annotations, type parameters, forName's name map,
+Class.initialize, Array.get/set): the module links them as unresolved imports. That target never had reflection
+metadata, so these now answer as a class with no reflectable members does: empty arrays, no annotations, no type
+parameters; Class.forName throws ClassNotFoundException and forName(..., true, ...) initialises nothing. Array.get and
+Array.set are implemented for real (Gson's ArrayTypeAdapter uses them).
+Codegen: only on the low-level targets, and only in these methods.
+
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
+index b57e76769..fb62d4281 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
+@@ -351,6 +351,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     }
+ 
+     public TField[] getDeclaredFields() throws TSecurityException {
++        if (PlatformDetector.isLowLevel()) {
++            return new TField[0];   // wjharness patch 0005: no reflection metadata on the low-level targets
++        }
+         if (isPrimitive() || isArray()) {
+             return new TField[0];
+         }
+@@ -390,6 +393,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     private static native void createMetadata();
+ 
+     public TField[] getFields() throws TSecurityException {
++        if (PlatformDetector.isLowLevel()) {
++            return new TField[0];   // wjharness patch 0005
++        }
+         if (isPrimitive() || isArray()) {
+             return new TField[0];
+         }
+@@ -427,6 +433,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     }
+ 
+     public TField getField(String name) throws TNoSuchFieldException {
++        if (PlatformDetector.isLowLevel()) {
++            throw new TNoSuchFieldException(name);   // wjharness patch 0005
++        }
+         TField result = findField(name, new HashSet<>());
+         if (result == null) {
+             throw new TNoSuchFieldException();
+@@ -469,6 +478,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+ 
+     @SuppressWarnings({ "raw", "unchecked" })
+     public TConstructor<?>[] getDeclaredConstructors() throws TSecurityException {
++        if (PlatformDetector.isLowLevel()) {
++            return new TConstructor<?>[0];   // wjharness patch 0005
++        }
+         if (isPrimitive() || isArray()) {
+             return new TConstructor<?>[0];
+         }
+@@ -504,6 +516,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     }
+ 
+     public TConstructor<?>[] getConstructors() throws TSecurityException {
++        if (PlatformDetector.isLowLevel()) {
++            return new TConstructor<?>[0];   // wjharness patch 0005
++        }
+         TConstructor<?>[] declaredConstructors = getDeclaredConstructors();
+         TConstructor<?>[] constructors = new TConstructor<?>[declaredConstructors.length];
+ 
+@@ -535,6 +550,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     @SuppressWarnings({ "raw", "unchecked" })
+     public TConstructor<T> getConstructor(TClass<?>... parameterTypes)
+             throws TSecurityException, TNoSuchMethodException {
++        if (PlatformDetector.isLowLevel()) {
++            throw new TNoSuchMethodException();   // wjharness patch 0005
++        }
+         for (TConstructor<?> constructor : getDeclaredConstructors()) {
+             if (TModifier.isPublic(constructor.getModifiers())
+                     && Arrays.equals(constructor.getParameterTypes(), parameterTypes)) {
+@@ -559,6 +577,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     }
+ 
+     public TMethod[] getDeclaredMethods() {
++        if (PlatformDetector.isLowLevel()) {
++            return new TMethod[0];   // wjharness patch 0005
++        }
+         if (isPrimitive() || isArray()) {
+             return new TMethod[0];
+         }
+@@ -623,6 +644,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     }
+ 
+     public TMethod[] getMethods() throws TSecurityException {
++        if (PlatformDetector.isLowLevel()) {
++            return new TMethod[0];   // wjharness patch 0005
++        }
+         Map<MethodSignature, TMethod> methods = new HashMap<>();
+         findMethods(this, methods);
+         return methods.values().toArray(new TMethod[methods.size()]);
+@@ -630,6 +654,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+ 
+     public TMethod getMethod(String name, TClass<?>... parameterTypes) throws TNoSuchMethodException,
+             TSecurityException {
++        if (PlatformDetector.isLowLevel()) {
++            throw new TNoSuchMethodException(name);   // wjharness patch 0005
++        }
+         TMethod method = findMethod(this, null, name, parameterTypes);
+         if (method == null) {
+             throw new TNoSuchMethodException();
+@@ -739,6 +766,10 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     @SuppressWarnings("unchecked")
+     @PluggableDependency(ClassGenerator.class)
+     public TClass<? super T>[] getInterfaces() {
++        if (PlatformDetector.isLowLevel()) {
++            // wjharness patch 0005: the low-level class metadata has no supertype list (the intrinsic traps)
++            return (TClass<? super T>[]) new TClass<?>[0];
++        }
+         if (PlatformDetector.isWebAssemblyGC()) {
+             var result = getInterfacesImpl();
+             return result != null ? result.clone() : (TClass<? super T>[]) new TClass<?>[0];
+@@ -828,6 +859,10 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     }
+ 
+     public static TClass<?> forName(TString name) throws TClassNotFoundException {
++        if (PlatformDetector.isLowLevel()) {
++            // wjharness patch 0005: no class-name table on the low-level targets (fillNameMap's natives are not there)
++            throw new TClassNotFoundException((String) (Object) name);
++        }
+         if (PlatformDetector.isJavaScript()) {
+             PlatformClass cls = Platform.lookupClass(name.toString());
+             if (cls == null) {
+@@ -872,6 +907,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+ 
+     @PluggableDependency(ClassDependencyListener.class)
+     void initialize() {
++        if (PlatformDetector.isLowLevel()) {
++            return;   // wjharness patch 0005: only forName reaches this, and on the low-level targets it throws first
++        }
+         if (PlatformDetector.isJavaScript()) {
+             Platform.initClass(platformClass);
+         } else {
+@@ -931,6 +969,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+ 
+     @Override
+     public TAnnotation[] getAnnotations() {
++        if (PlatformDetector.isLowLevel()) {
++            return new TAnnotation[0];   // wjharness patch 0005
++        }
+         var state = getReflectionState();
+         if (state.annotationCache == null) {
+             TClass<?> cls = this;
+@@ -989,6 +1030,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+ 
+     @Override
+     public TAnnotation[] getDeclaredAnnotations() {
++        if (PlatformDetector.isLowLevel()) {
++            return new TAnnotation[0];   // wjharness patch 0005
++        }
+         var state = getReflectionState();
+         if (state.declaredAnnotationsCache == null) {
+             if (PlatformDetector.isWebAssemblyGC() || PlatformDetector.isC()) {
+@@ -1043,6 +1087,9 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+     @SuppressWarnings("unchecked")
+     @Override
+     public TTypeVariable<TClass<T>>[] getTypeParameters() {
++        if (PlatformDetector.isLowLevel()) {
++            return (TTypeVariable<TClass<T>>[]) new TTypeVariable<?>[0];   // wjharness patch 0005
++        }
+         initReflection();
+         var paramList = getTypeParametersImpl();
+         if (paramList == null) {
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java b/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java
+index e506406ae..9aee3dce0 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/reflect/TArray.java
+@@ -104,14 +104,81 @@ public final class TArray extends TObject {
+         if (index < 0 || index >= getLength(array)) {
+             throw new TArrayIndexOutOfBoundsException();
+         }
++        if (PlatformDetector.isLowLevel()) {
++            return getLowLevel(array, index);
++        }
+         return getImpl(array, index);
+     }
+ 
++    // wjharness patch 0005: Array.get / Array.set on the low-level targets, by array type
++    private static TObject getLowLevel(TObject array, int index) {
++        Object a = array;
++        Object v;
++        if (a instanceof Object[]) {
++            v = ((Object[]) a)[index];
++        } else if (a instanceof int[]) {
++            v = ((int[]) a)[index];
++        } else if (a instanceof long[]) {
++            v = ((long[]) a)[index];
++        } else if (a instanceof byte[]) {
++            v = ((byte[]) a)[index];
++        } else if (a instanceof short[]) {
++            v = ((short[]) a)[index];
++        } else if (a instanceof char[]) {
++            v = ((char[]) a)[index];
++        } else if (a instanceof float[]) {
++            v = ((float[]) a)[index];
++        } else if (a instanceof double[]) {
++            v = ((double[]) a)[index];
++        } else if (a instanceof boolean[]) {
++            v = ((boolean[]) a)[index];
++        } else {
++            throw new TIllegalArgumentException();
++        }
++        return (TObject) v;
++    }
++
++    private static void setLowLevel(TObject array, int index, TObject value) {
++        Object a = array;
++        Object v = value;
++        if (a instanceof Object[]) {
++            Object[] arr = (Object[]) a;
++            if (v != null && !arr.getClass().getComponentType().isInstance(v)) {
++                throw new TIllegalArgumentException();
++            }
++            arr[index] = v;
++        } else if (v == null) {
++            throw new TIllegalArgumentException();
++        } else if (a instanceof int[]) {
++            ((int[]) a)[index] = (Integer) v;
++        } else if (a instanceof long[]) {
++            ((long[]) a)[index] = (Long) v;
++        } else if (a instanceof byte[]) {
++            ((byte[]) a)[index] = (Byte) v;
++        } else if (a instanceof short[]) {
++            ((short[]) a)[index] = (Short) v;
++        } else if (a instanceof char[]) {
++            ((char[]) a)[index] = (Character) v;
++        } else if (a instanceof float[]) {
++            ((float[]) a)[index] = (Float) v;
++        } else if (a instanceof double[]) {
++            ((double[]) a)[index] = (Double) v;
++        } else if (a instanceof boolean[]) {
++            ((boolean[]) a)[index] = (Boolean) v;
++        } else {
++            throw new TIllegalArgumentException();
++        }
++    }
++
+     public static void set(TObject array, int index, TObject value) throws TIllegalArgumentException,
+             TArrayIndexOutOfBoundsException {
+         if (index < 0 || index >= getLength(array)) {
+             throw new TArrayIndexOutOfBoundsException();
+         }
++        if (PlatformDetector.isLowLevel()) {
++            setLowLevel(array, index, value);
++            return;
++        }
+         setImpl(array, index, value);
+     }
+ 

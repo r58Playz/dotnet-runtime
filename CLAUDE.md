@@ -27,6 +27,7 @@ file leaves out.
 | IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm`; its natives from ikvm-wasm-build `net11-sockets` |
 | the GL stack (mesa-wink) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/native-deps/mesa-wink`, its own repo (branch `wink`, origin `MercuryWorkshop/mesa-wink`; ikvm-wasm-build ignores it) -- see **The GL stack** |
 | measurement harness | `wjharness/` (tracked; `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/` -- see **The harness** |
+| the benchmarks and the TeaVM arms | `wjharness/bench/` (`README.md` there): jbox2d and mctick (26.2's server tick) sources and builds, and the pinned TeaVM (9be5eca57, the last commit with its linear-memory wasm backend, plus `bench/teavm-patches/`). The TeaVM checkout (`$TEAVM_DIR`) is only the source of that pin |
 | **the findings log -- read before proposing anything** | `scratchpad/notes/MINECRAFT-FINDINGS.md` (untracked) |
 | chromium / V8 source | `~/Documents/chromium/src` (v8 at `src/v8`) |
 | split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
@@ -427,6 +428,43 @@ jbox2d fixed-work, one jar, every run checksum-gated, R440 protocol, Chromium 15
 40,60`. It pins to `WJ_PCPUS` and reads batches 41-60 of 60, because tier-2 compiles still land in a 12-batch window
 (R416). **Before quoting any jbox2d or Minecraft timing, read the `[IKVM lazybody] stuck #N` lines**: a hot method named
 there runs IKVM's generation-1 dispatch, and the number measures that, not the tier (R523).
+
+### mctick (26.2's server tick as a fixed-work bench)
+
+The 262n save's server, its player joined, ticks back to back (`wjharness/bench/README.md`; `wj j2d/run <arm> <dir> --bench
+mctick --no-perf --no-attr`, default schedule 2000,100,20, window batches 11-20). n=3 a row, both orders, 2026-11-19,
+findings note "mctick":
+
+| | ms/tick | vs HotSpot | M instructions / cycles a tick | IPC |
+|---|---|---|---|---|
+| HotSpot 25 | 1.98 | 1.00x | 14.3 / 10.0 | 1.43 |
+| IKVM classic on CoreCLR 10 | 4.33 | 2.18x | 27.0 / 21.2 | 1.28 |
+| IKVM relink (our IKVM configuration) on CoreCLR 10 | 5.71 | 2.88x | 40.5 / 28.3 | 1.43 |
+| TeaVM FULL (linear-memory wasm) | 5.77 | 2.91x | 57.8 / 28.3 | 2.04 |
+| TeaVM SIMPLE | 10.03 | 5.06x | 102.6 / 48.7 | 2.10 |
+| **ours** | **13.72** | **6.92x** | 74.8 / 66.9 | 1.12 |
+
+* **Against TeaVM the gap is IPC, not work**: TeaVM FULL makes as many calls (0.52 vs 0.55 M a tick) and 1.29x fewer
+  instructions; TeaVM SIMPLE executes 1.37x OUR instructions and is still 1.37x faster. Of our +38.7 M cycles, about half
+  is L1D-miss stall (25.3 vs 6.0 M a tick), ~7 M icache stall (with 14x the iTLB walks: a code space per module), ~8.5 M
+  the extra instructions. TeaVM runs in the same V8 at 0.76 M dTLB-walk cycles a tick against our 7.7: the stalls are
+  not wasm.
+* **TeaVM's code in our call layout** (`bench/mctick/split-teavm.py --inline-runtime --sp-global`: every executed function
+  in its own module, calls `call_indirect` / imports, its allocStack and type checks inlined, its stack pointer an
+  imported mutable global like `s.p`; n=3, 2026-11-19, findings note "mctick" addendum 4): 6.58 ms/tick as one module
+  -> 11.02 one module per function (+67%). The imported mutable stack pointer is 1.15 ms of that (10.5% of the tick).
+  **Co-location along the hottest call edges recovers 72%** (7.89; 7.26 with the stack pointer in memory), the hottest
+  98% in 2 modules 61%, by class 21%; the group cap does not matter down to 64 KB. The win is calls staying in one
+  instance (L1 misses 902 -> 327 k a tick, iTLB walks 14.4 -> 4.4 k) plus V8 inlining inside groups (calls 1.03 ->
+  0.72 M). An earlier raw split (15.42, "slower than ours") double-called every virtual call through wasm-split's
+  trampolines: superseded. Our own machinery is still ~76 instructions a call (2026-11-07 ledger) against the ~20 this
+  layout's boundary costs.
+  What the call model does not explain: our dTLB walks (8.6 vs 1.8 M cycles at about the same module count: runtime
+  metadata layout) and iTLB walks (70.6 vs 15.7 k: code volume; our hot functions are 4-7x TeaVM's wasm bytes).
+* Every arm does the same work only through `BenchServer.shouldRun` (every queued task due) and the TeaVM drain loop;
+  without them HotSpot and ours loaded a fifth of the save's entities. Gate on the end state, not the checksum.
+* The TeaVM arm is the pin plus `bench/teavm-patches` 0001-0012 (two FULL miscompiles of 26.2 among them); at FULL the
+  build prints `wj: methods declared without a program: N` -- 1 is OptionalLong.isPresent, unreferenced.
 
 ### What the gap is made of
 

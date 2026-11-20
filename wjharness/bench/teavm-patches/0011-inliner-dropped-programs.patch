@@ -1,0 +1,111 @@
+At optimization FULL the inliner drops the program of a method whose SPECIAL-call count reaches 0
+(TeaVM.java, inlining loop: "if (!inlining.hasUsages(...)) method.setProgram(null)"). Two defects made that
+count wrong and its result invalid:
+
+* Inlining.devirtualize() turns VIRTUAL calls into SPECIAL ones without counting them, while execPlanEntry()
+  decrements the count for every SPECIAL call it inlines. A method could reach 0 while callers remained.
+  Devirtualized calls are now counted as execPlanEntry counts the calls an inlined body brings in.
+* The wasm backend still declares a function for such a method and then skips its body, leaving an empty body.
+  For a method with a result that is invalid wasm (mctick at -O3: BlockBehaviour$BlockStateBase.isAir and
+  OptionalLong.isPresent, "expected 1 elements on the stack for fallthru, found 0"); for a void method it
+  validates and a remaining call would silently do nothing. Such a body is now `unreachable`, and the build
+  logs how many there were (wj: "methods declared without a program").
+
+Codegen: methods whose programs were dropped wrongly are now emitted; empty bodies become `unreachable`.
+diff --git a/core/src/main/java/org/teavm/backend/wasm/WasmFunctionRepository.java b/core/src/main/java/org/teavm/backend/wasm/WasmFunctionRepository.java
+index 683816507..d586651a6 100644
+--- a/core/src/main/java/org/teavm/backend/wasm/WasmFunctionRepository.java
++++ b/core/src/main/java/org/teavm/backend/wasm/WasmFunctionRepository.java
+@@ -50,6 +50,11 @@ public class WasmFunctionRepository implements BaseWasmFunctionRepository {
+         return isStatic ? forStaticMethod(reference) : forInstanceMethod(reference);
+     }
+ 
++    /* The function already declared for a method, or null; never declares one. */
++    public WasmFunction findMethod(MethodReader method) {
++        return (method.hasModifier(ElementModifier.STATIC) ? staticMethods : instanceMethods).get(method.getReference());
++    }
++
+     @Override
+     public WasmFunction forStaticMethod(MethodReference reference) {
+         return staticMethods.computeIfAbsent(reference, key -> {
+diff --git a/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java b/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
+index a3672ed7b..f95cfc910 100644
+--- a/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
++++ b/core/src/main/java/org/teavm/backend/wasm/WasmTarget.java
+@@ -594,6 +594,7 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
+ 
+         new UnusedFunctionElimination(module).apply();
+         new UnusedTypeElimination(module).apply();
++        fillMethodsWithoutProgram(module, functions);
+ 
+         if (Boolean.parseBoolean(System.getProperty("wasm.memoryTrace", "false"))) {
+             new MemoryAccessTraceTransformation(module, functionTypes).apply();
+@@ -817,6 +818,8 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
+         }
+     }
+ 
++    private final List<MethodHolder> methodsWithoutProgram = new ArrayList<>();
++
+     private void generateMethods(ListableClassHolderSource classes, WasmGenerationContext context,
+             WasmGenerator generator, WasmClassGenerator classGenerator, BinaryWriter binaryWriter, WasmModule module,
+             DwarfClassGenerator dwarfClassGen) {
+@@ -873,6 +876,7 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
+                 continue;
+             }
+             if (implementor.getProgram() == null || implementor.getProgram().basicBlockCount() == 0) {
++                methodsWithoutProgram.add(method);
+                 continue;
+             }
+             if (method == implementor) {
+@@ -892,6 +896,34 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
+         }
+     }
+ 
++    /*
++     * A method whose program the inliner dropped (no SPECIAL callers left) can still have a declared function, which
++     * generateMethods skipped: an empty body, invalid wasm when the method has a result, and a silent no-op when it
++     * is void. Make it trap, and say how many there were.
++     */
++    private void fillMethodsWithoutProgram(WasmModule module, WasmFunctionRepository functions) {
++        var candidates = new java.util.HashMap<WasmFunction, MethodHolder>();
++        for (var method : methodsWithoutProgram) {
++            var function = functions.findMethod(method);
++            if (function != null) {
++                candidates.put(function, method);
++            }
++        }
++        int filled = 0;
++        var names = new StringBuilder();
++        for (var function : module.functions) {
++            var method = candidates.get(function);
++            if (method != null && function.getImportName() == null && function.getBody().isEmpty()) {
++                function.getBody().add(new org.teavm.backend.wasm.model.expression.WasmUnreachable());
++                if (filled++ < 20) {
++                    names.append(filled == 1 ? "" : ", ").append(method.getReference());
++                }
++            }
++        }
++        System.out.println("wj: methods declared without a program: " + filled + (filled > 0 ? " (" + names
++                + (filled > 20 ? ", ..." : "") + ")" : ""));
++    }
++
+     private boolean isShadowStackMethod(MethodReference method) {
+         if (!method.getClassName().equals(ShadowStack.class.getName())) {
+             return false;
+diff --git a/core/src/main/java/org/teavm/model/optimization/Inlining.java b/core/src/main/java/org/teavm/model/optimization/Inlining.java
+index e1d82c936..807cc8ecf 100644
+--- a/core/src/main/java/org/teavm/model/optimization/Inlining.java
++++ b/core/src/main/java/org/teavm/model/optimization/Inlining.java
+@@ -466,6 +466,12 @@ public class Inlining {
+                     if (implementationMethod != null && !implementationMethod.hasModifier(ElementModifier.ABSTRACT)) {
+                         invoke.setType(InvocationType.SPECIAL);
+                         invoke.setMethod(implementation);
++                        // a new SPECIAL call: count it, as execPlanEntry counts the calls an inlined body brings in,
++                        // or inlining it later decrements a count that never included it
++                        int usageCount = usageCounter.methodUsageCount.getOrDefault(implementation, -1);
++                        if (usageCount >= 0) {
++                            usageCounter.methodUsageCount.put(implementation, usageCount + 1);
++                        }
+ 
+                         if (!implementation.getName().equals(invoke.getMethod().getClassName())) {
+                             var cast = new CastInstruction();

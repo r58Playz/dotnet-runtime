@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!-- The mctick TeaVM arm (wj j2d/run tvfull <outdir> --bench mctick): Minecraft 26.2's server tick compiled by TeaVM's
+     linear-memory wasm backend. Fetches mctick-data.zip (the class-path resources and the save), hands it to the module
+     through the mctick.blobLength / mctick.blobRead imports (wjbench.mctick.Platform unpacks it into TeaVM's in-memory
+     file system) and runs main with ?args=W,S,N (warmup ticks, ticks per batch, batches). Output: the console. -->
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+  <title>mctick, TeaVM linear-memory wasm</title>
+  <script type="text/javascript" charset="utf-8" src="wasm/mctick.wasm-runtime.js"></script>
+</head>
+<script type="text/javascript">
+  async function launch() {
+    const q = new URLSearchParams(location.search);
+    const args = (q.get("args") || "").split(",").filter(Boolean);
+    try {
+      const res = await fetch("mctick-data.zip");
+      if (!res.ok) throw new Error("mctick-data.zip: " + res.status);
+      const blob = new Uint8Array(await res.arrayBuffer());
+      console.log("[mctick] page: data " + blob.length + " bytes");
+      const teavm = await TeaVM.wasm.load("wasm/mctick.wasm", {
+        installImports(o, controller) {
+          o.mctick = {
+            blobLength: () => blob.length,
+            blobRead: (offset, ptr, length) =>
+              new Uint8Array(controller.instance.exports.memory.buffer).set(blob.subarray(offset, offset + length), ptr),
+          };
+        },
+      });
+      await teavm.main(args);
+      console.log("[mctick] page: main returned");
+    } catch (e) {
+      console.log("[bench] LOAD FAILED: " + e + (e && e.stack ? "\n" + e.stack : ""));
+    }
+  }
+</script>
+<body onload="launch()">
+<pre id="bench-output"></pre>
+</body>
+</html>

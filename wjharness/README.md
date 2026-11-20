@@ -10,7 +10,9 @@ wjharness/                tracked; `wj ls` lists every tool
   wj                      entry point
   lib/                    paths (the one resolver), mcdrive (the Minecraft driver), browser, seeds, verdict, preflight, ...
   drive/                  run a workload: worldwait bootcheck mcperf mcab mcbench hwrun abboot arm fit seedbuild nbtedit wgen262 vcmp
-  j2d/                    jbox2d: run (the timing tool), counts, the wasm / HotSpot / CheerpJ ledgers, cheerpj/, jvmti/
+  j2d/                    jbox2d: run (the timing tool, also for mctick: --bench mctick), counts, the ledgers, cheerpj/, jvmti/
+  bench/                  the benchmarks' sources and builds (jbox2d, mctick = 26.2's server tick) and the pinned TeaVM
+                          (teavm-cli, teavm, teavm-patches/, teavm-classlib/): bench/README.md
   read/                   capture readers: perfraw hotinsn hwcensus callinfra memclass stabslice armcmp gc* faultcensus
   fe/                     front-end (i-cache / iTLB / BTB) readers and event set (R525)
   ledger/                 the per-function gap ledger (ours vs HotSpot): capture d8x86 ledger hsledger gap refresh
@@ -92,7 +94,9 @@ wj deploy '<a string your change added>'                      # after build-dotn
 | `abboot` | Interleaved (ABBA) bootcheck arms -> `boots.tsv` (first frame, title, heap at title) |
 | `arm` | One arm of a boot-crash A/B: N bootchecks under one knob set, crashes/valid with the crash text |
 | `fit` | Block until ensure-server, killdaemons and preflight all pass |
-| `j2d/run` | **The jbox2d timing tool**: `ours`, TeaVM (`teavm tvfull tvsimple tvfull60 tvsimple60`), HotSpot (`hs8 hs21 hs25`), CheerpJ (`cj<V> cjgc<V>`), pinned to `$WJ_PCPUS`. `--schedule` + `--window-batches` for the steady-state protocol, `--no-perf` for timing, `--events A|B|C` for the ledger sets |
+| `j2d/run` | **The jbox2d timing tool**: `ours`, TeaVM (`tvfull tvsimple`, built by `bench/jbox2d/build`; the older `tvfull60 tvsimple60 teavm`), HotSpot (`hs8 hs21 hs25`), CheerpJ (`cj<V> cjgc<V>`), pinned to `$WJ_PCPUS`. `--schedule` + `--window-batches` for the steady-state protocol, `--no-perf` for timing, `--events A|B|C` for the ledger sets, `D` for stall sources (dTLB / iTLB walks, icache and L1D-miss stall cycles, mispredicts; with a jitdump), `L` for call edges (LBR filtered to calls; `bench/mctick/lbredges.py`). `--tv-dir DIR` serves another TeaVM build (`bench/mctick/split-teavm.py`'s layouts). `--bench mctick` runs the Minecraft 26.2 server-tick bench on `ours`, `hs<N>`, `tvfull`, `tvsimple`, `tvsplit` (one module per executed function) and IKVM on native CoreCLR (`clr`, `clrrelink`, `clrclassic`: the `$WJ_STATE/arms/ikvm-clr10*` configurations `native/mcnative --ikvm` runs) (bench/README.md) |
+| `bench/jbox2d/build`, `bench/mctick/build` | build the benchmarks' arms into `$WJ_STATE/arms/{j2d,mctick}` (`--install` stages the jar ours runs) |
+| `bench/teavm-cli`, `bench/teavm` | build / run the pinned TeaVM (9be5eca57 + `bench/teavm-patches/`); `bench/teavm-patch-edit begin` / `save` edits the newest patch |
 | `benchstats` | jbox2d counters (`[wasm-jit ...]` stat lines). Its `mean` is the 12-batch mean and it pins only with `MC_TASKSET`: counters, not timing |
 | `seedbuild` | Build a seed from an OPFS export: `--dest $WJ_STATE/seeds/seed-X --tar /X.tar` (tar copied into the dev server's `frontend/public`, deleted after), then register it in `lib/seeds.mjs` |
 | `nbtedit` | `<level.dat in> <out>`: an NBT round trip that sets a 26.2 save's difficulty to peaceful and changes nothing else (seeds 262p, 262n) |
@@ -165,10 +169,11 @@ measured from the launcher's Play.
 
 ## Reference arms: how each is built
 
-* **TeaVM** (`state/arms/teavm-{full,simple}{,60}`): `$TEAVM_DIR/samples/benchmark` built with the R180 settings
-  (FULL = wasm optimization AGGRESSIVE, SIMPLE = `-Pteavm.wasm.optimization=NONE`; `60` = BATCHES 60). Served by
-  `drive/serve-coep.mjs`. `cap-*` are their module captures for `j2d/prep`.
-* **HotSpot**: `$JAVA_HOME_<N>` running `$TEAVM_DIR/samples/benchmark/ikvm-bench/target/ikvm-bench-*-jar-with-dependencies.jar`,
+* **TeaVM** (`state/arms/j2d/teavm-{full,simple}`, `state/arms/mctick/teavm-full`): `wj bench/jbox2d/build`,
+  `wj bench/mctick/build`, with the pinned TeaVM from `wj bench/teavm-cli` (FULL = optimization level 3, SIMPLE = 1, the
+  R180 arms A / B). Served by `drive/serve-coep.mjs`. The older gradle-sample builds `state/arms/teavm-{full,simple}{,60}`
+  and the 2026-07-27 `state/arms/teavm-baseline` stay for comparison; `cap-*` are module captures for `j2d/prep`.
+* **HotSpot**: `$JAVA_HOME_<N>` running `state/arms/j2d/bench.jar` (jbox2d) or `state/arms/mctick/cp-jvm.txt` (mctick),
   with `state/arms/jvmti/libj2dagent.so` for the ledger: `bash j2d/jvmti/build.sh`.
 * **CheerpJ**: `j2d/cheerpj/index.html` (tracked) over `state/arms/cheerpj/{bench.jar,gcprobe.jar}`; the loader comes from
   Leaning Technologies' CDN.

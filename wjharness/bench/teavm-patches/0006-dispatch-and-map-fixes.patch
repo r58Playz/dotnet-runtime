@@ -1,0 +1,133 @@
+Correctness fixes Minecraft 26.2's server needs, wrong at 9be5eca57 (the first is still wrong on TeaVM master):
+  VirtualTableBuilder.copyEntries took the first implementor any ancestor table offered, so a class inheriting an
+  interface default through its superclass (AbstractMap -> Map.computeIfAbsent) kept it even when it implements a
+  more specific interface that overrides it (ConcurrentMap.computeIfAbsent): Guava's MapMakerInternalMap then ran
+  Map's default, which calls put, which dispatched to AbstractMap.put and threw (ResourceKey.create, at bootstrap).
+  An interface default now yields to a default of a more specific interface; a class method is never displaced.
+  TConcurrentMap.computeIfAbsent returned putIfAbsent's result (the previous value: null on insertion) instead of
+  the value now mapped.
+  Upstream 7883fc417 (ConcurrentHashMap.computeIfAbsent/computeIfPresent on null results), backported.
+  DecimalFormat refused a negative subpattern without digits (JOML's " 0.000E0;-"); the JDK accepts a prefix alone.
+  The linear-memory target flagged WeakReference / ReferenceQueue with the GC's reference types without reshaping them
+  into its layout (only the C target does), so the first collection over a WeakReference trapped. No VM type there
+  now: references are strong, as that target's classlib already implemented them.
+Codegen: changes which method a virtual call reaches where the old table was wrong; nothing else.
+
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/text/TDecimalFormatParser.java b/classlib/src/main/java/org/teavm/classlib/java/text/TDecimalFormatParser.java
+index eeba1487b..42376c7fd 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/text/TDecimalFormatParser.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/text/TDecimalFormatParser.java
+@@ -59,8 +59,14 @@ class TDecimalFormatParser {
+                 throw new IllegalArgumentException("Expected ';' at " + index + " in " + string);
+             }
+             negativePrefix = parseText(false, true);
+-            parseNumber(false);
+-            negativeSuffix = parseText(true, true);
++            if (index < string.length()) {
++                parseNumber(false);
++                negativeSuffix = parseText(true, true);
++            } else {
++                // wjharness patch 0006: a negative subpattern may be a prefix alone ("0.00;-"); the JDK takes its
++                // digits from the positive pattern
++                negativeSuffix = new FormatField[0];
++            }
+         }
+     }
+ 
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java b/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java
+index fe4061e45..92109420b 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentHashMap.java
+@@ -464,6 +464,9 @@ public class TConcurrentHashMap<K, V> extends TAbstractMap<K, V>
+         }
+ 
+         var newValue = mappingFunction.apply(key);
++        if (newValue == null) {
++            return null;
++        }
+         entry = getEntry(key, hash);
+         if (entry != null) {
+             return entry.getValue();
+@@ -495,6 +498,10 @@ public class TConcurrentHashMap<K, V> extends TAbstractMap<K, V>
+             if (entry == null) {
+                 return null;
+             } else if (entry.getValue() == oldValue) {
++                if (newValue == null) {
++                    removeEntry(entry);
++                    return null;
++                }
+                 entry.setValue(newValue);
+                 return newValue;
+             }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentMap.java b/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentMap.java
+index 41e44c249..50dbf175d 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentMap.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/util/concurrent/TConcurrentMap.java
+@@ -87,7 +87,11 @@ public interface TConcurrentMap<K, V> extends TMap<K, V> {
+         V oldValue = get(key);
+         if (oldValue == null) {
+             V newValue = mappingFunction.apply(key);
+-            return newValue != null ? putIfAbsent(key, newValue) : null;
++            if (newValue == null) {
++                return null;
++            }
++            V previous = putIfAbsent(key, newValue);   // wjharness patch 0006: was returned as the result
++            return previous != null ? previous : newValue;
+         } else {
+             return oldValue;
+         }
+diff --git a/core/src/main/java/org/teavm/backend/wasm/generate/WasmClassGenerator.java b/core/src/main/java/org/teavm/backend/wasm/generate/WasmClassGenerator.java
+index b27dd05b5..665c4932f 100644
+--- a/core/src/main/java/org/teavm/backend/wasm/generate/WasmClassGenerator.java
++++ b/core/src/main/java/org/teavm/backend/wasm/generate/WasmClassGenerator.java
+@@ -353,7 +353,11 @@ public class WasmClassGenerator {
+             }
+         }
+ 
+-        flags = ClassGeneratorUtil.contributeToFlags(cls, flags);
++        // wjharness patch 0006: no VM reference type on this target. The C target reshapes WeakReference and
++        // ReferenceQueue into the GC's RuntimeReference layout (WeakReferenceTransformation + its C generator); this
++        // one keeps the classlib's plain fields (TWeakReference holds its referent strongly), so a GC that read them
++        // as RuntimeReference.queue/object/next followed garbage and trapped (memory access out of bounds in
++        // GC.isMarked from markWeakReference). Weakly reachable objects stay alive here, as the classlib already had it.
+         if (binaryData.bufferObjectFieldOffset >= 0) {
+             header.setAddress(CLASS_ENUM_VALUES, binaryData.bufferObjectFieldOffset);
+         }
+diff --git a/core/src/main/java/org/teavm/model/classes/VirtualTableBuilder.java b/core/src/main/java/org/teavm/model/classes/VirtualTableBuilder.java
+index 00523a84b..3e9b9d41b 100644
+--- a/core/src/main/java/org/teavm/model/classes/VirtualTableBuilder.java
++++ b/core/src/main/java/org/teavm/model/classes/VirtualTableBuilder.java
+@@ -162,12 +162,31 @@ public class VirtualTableBuilder {
+         for (var entry : source.entries.entrySet()) {
+             EntryBuilder targetEntry = target.entries.computeIfAbsent(entry.getKey(), k -> new EntryBuilder());
+             targetEntry.addParent(entry.getValue());
+-            if (entry.getValue().implementor != null && targetEntry.implementor == null) {
+-                targetEntry.implementor = entry.getValue().implementor;
++            MethodReference candidate = entry.getValue().implementor;
++            if (candidate == null) {
++                continue;
++            }
++            if (targetEntry.implementor == null) {
++                targetEntry.implementor = candidate;
++            } else if (!targetEntry.implementor.equals(candidate) && isMoreSpecificDefault(candidate,
++                    targetEntry.implementor)) {
++                // wjharness patch 0006: a default of a more specific interface overrides an inherited default
++                targetEntry.implementor = candidate;
+             }
+         }
+     }
+ 
++    private boolean isMoreSpecificDefault(MethodReference candidate, MethodReference current) {
++        ClassReader currentOwner = classes.get(current.getClassName());
++        ClassReader candidateOwner = classes.get(candidate.getClassName());
++        if (currentOwner == null || candidateOwner == null
++                || !currentOwner.hasModifier(ElementModifier.INTERFACE)
++                || !candidateOwner.hasModifier(ElementModifier.INTERFACE)) {
++            return false;
++        }
++        return classes.isSuperType(current.getClassName(), candidate.getClassName()).orElse(false);
++    }
++
+     private void cleanupVirtualTables() {
+         for (String className : classes.getClassNames()) {
+             TableBuilder table = tables.get(className);

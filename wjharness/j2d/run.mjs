@@ -1,12 +1,19 @@
 // jbox2d three-way capture: ONE run of one arm under perf, windowed on the bench's own batch lines.
 //
-//   wj j2d/run <ours|teavm|hotspot> <outdir> [--events A|B] [--timeout 240] [--no-attr]
+//   wj j2d/run <ours|teavm|hotspot> <outdir> [--events A|B|C|D|L] [--timeout 240] [--no-attr]
+//   wj j2d/run <ours|tvfull|hs<N>> <outdir> --bench mctick ...   the Minecraft 26.2 server tick (wjharness/bench/mctick):
+//           the same arms, windows and event sets over mctick's batches of ticks instead of jbox2d's steps. ours runs
+//           ?bench&jar=mctick.jar on a copy of the 262n seed (its OPFS holds 26.2 and the save), HotSpot runs
+//           $WJ_STATE/arms/mctick/cp-jvm.txt on the native stage's save, TeaVM serves $WJ_STATE/arms/mctick/teavm-full.
+//           --schedule W,S,N is warmup ticks, ticks per batch, batches (default 2000,100,20; window 10,20).
 //
 // Arms (all pinned to the P-core threads 0-7, as natrun and the Minecraft census are -- R369):
 //   ours    the ikvmcraft ?bench page (dev server :5021), the shipped runtime + MONO_WASM_JIT_ORIGIN/CAPTURE
 //           (custom section + console capture only; enctest t9 shows they change no code). jitdump via --perf-prof.
-//   teavm   $TEAVM_BASELINE/teavm-wasm-fixed.html (the 2026-07-27 legacy linear-memory
-//           build, R180 arm A), served from a local static server. Same chromium, same flags.
+//   tvfull  TeaVM linear-memory wasm, optimization FULL (R180 arm A); tvsimple: SIMPLE (arm B, passes off). Built by
+//           wj bench/jbox2d/build into $WJ_STATE/arms/j2d/teavm-{full,simple} with the pinned TeaVM (bench/teavm-cli),
+//           served from a local static server, schedule as ?args=W,S,N. Same chromium, same flags.
+//           tvfull60 / tvsimple60 / teavm are the earlier builds (schedule compiled in; teavm = 2026-07-27, 600 batches).
 //   hs8     java-8-openjdk (the log's reference JVM, and natrun's) on the same jar, with j2d/jvmti/j2dagent (set A)
 //           writing every nmethod's code and pc -> (method, bci) map for j2d/hsledger.py.
 //   hs21    java-21-openjdk, same. On 2026-10-03 JDK 8u504 runs this jar at ~0.51 ms/step against ~0.36 for JDK 21,
@@ -20,38 +27,60 @@
 // 2200 steps of steady state. Times are CLOCK_MONOTONIC (process.hrtime), the clock `perf record -k 1` stamps.
 // Writes <outdir>/{perf.data, jit-*.dump (wasm arms), game.log, window.json}.
 import { spawn, execSync } from "child_process";
-import { mkdirSync, rmSync, writeFileSync, createWriteStream, existsSync, mkdtempSync, readdirSync, statSync } from "fs";
-import { join, dirname } from "path";
+import { mkdirSync, rmSync, writeFileSync, createWriteStream, existsSync, mkdtempSync, readdirSync, statSync, readFileSync } from "fs";
+import { join, dirname, resolve } from "path";
 import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { connect, attachPage, consoleTap } from "../lib/browser.mjs";
-import { driveLauncher } from "../lib/mcdrive.mjs";
+import { driveLauncher, seedProfile } from "../lib/mcdrive.mjs";
 import { ARMS, need, cfg, serveUrl, assertOutdir, tool } from "../lib/paths.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const pos = args.filter((a) => !a.startsWith("--"));
-const opt = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : d; };
-const [arm, outdir] = pos;
-const TEAVM_DIRS = {   // served root of each TeaVM arm (all legacy linear-memory wasm, WasmFixedWorkBenchmarkStarter)
-  teavm: () => need("TEAVM_BASELINE", "the teavm arm"),   // 2026-07-27, 600 batches (stopped at 12)
-  tvfull: () => join(ARMS(), "teavm-full"),       // current source, 12 batches, wasm optimization AGGRESSIVE (TeaVM FULL), R180 arm A
-  tvsimple: () => join(ARMS(), "teavm-simple"),   // the same with -Pteavm.wasm.optimization=NONE (TeaVM SIMPLE: passes off), R180 arm B
-  tvfull60: () => join(ARMS(), "teavm-full60"),   // tvfull / tvsimple rebuilt with BATCHES = 60 (the steady-state schedule, below)
-  tvsimple60: () => join(ARMS(), "teavm-simple60"),
+const opt = (k, d) => {   // --k V or --k=V
+  const i = args.indexOf(`--${k}`);
+  if (i >= 0) return args[i + 1];
+  const e = args.find((x) => x.startsWith(`--${k}=`));
+  return e !== undefined ? e.slice(k.length + 3) : d;
 };
+const arm = pos[0], outdir = pos[1] && resolve(pos[1]);   // absolute: the workload runs with outdir as its cwd
+const BENCH = opt("bench", "jbox2d");   // jbox2d | mctick
+const MC = BENCH === "mctick";
+if (!["jbox2d", "mctick"].includes(BENCH)) { console.error(`unknown --bench ${BENCH}`); process.exit(1); }
+const TEAVM_DIRS = {   // served root of each TeaVM arm (all linear-memory wasm, WasmFixedWorkBenchmarkStarter)
+  tvfull: () => join(ARMS(), "j2d", "teavm-full"),       // wj bench/jbox2d/build: optimization FULL, any schedule (?args)
+  tvsimple: () => join(ARMS(), "j2d", "teavm-simple"),   // the same at SIMPLE
+  // the gradle-sample builds of R180-R527 (TeaVM 9be5eca57 too), batch count compiled in: 60, or 600 for teavm
+  tvfull60: () => join(ARMS(), "teavm-full60"),
+  tvsimple60: () => join(ARMS(), "teavm-simple60"),
+  teavm: () => join(ARMS(), "teavm-baseline"),           // 2026-07-27, 600 batches (stopped at 12)
+};
+const TEAVM_ARGS = new Set(["tvfull", "tvsimple"]);    // the arms that take the schedule at run time
+if (MC) {   // mctick's TeaVM builds (wj bench/mctick/build-teavm [-O 1]); the jbox2d-only arms are refused below
+  for (const k of Object.keys(TEAVM_DIRS)) delete TEAVM_DIRS[k];
+  TEAVM_DIRS.tvfull = () => join(ARMS(), "mctick", "teavm-full");       // optimization FULL
+  TEAVM_DIRS.tvsimple = () => join(ARMS(), "mctick", "teavm-simple");   // SIMPLE: no inlining, devirtualization or ADVANCED passes
+  TEAVM_DIRS.tvsplit = () => join(ARMS(), "mctick", "teavm-split");     // FULL, one module per executed function (bench/mctick/split-teavm.py)
+}
 /* CheerpJ (2026-11-04): cj<V> = CheerpJ's default engine (its JIT emits JavaScript), cjgc<V> = the experimental WasmGC
  * engine (cheerpjInit({wasmGC:true}), JIT emits wasm), on Java V (8/11/17/21/25). j2d/cheerpj/index.html loads the
  * loader from Leaning Technologies' CDN (--cj-loader, default 5.0) and runs j2d/cheerpj/bench.jar -- the same jar as
  * every other arm -- with the schedule as positional args, served cross-origin isolated like the TeaVM arms. */
 const CJ = /^cj(gc)?(\d+)$/.exec(arm || "");
-if (!(["ours", ...Object.keys(TEAVM_DIRS)].includes(arm) || /^hs\d+$/.test(arm || "") || CJ) || !outdir) {
-  console.error("usage: run.mjs <ours|teavm|tvfull|tvsimple|hs8|hs21|cj<V>|cjgc<V>> <outdir> [--events A|B] [--timeout S] [--no-attr] [--no-perf]"
-    + " [--stop-after N] [--knob K=V (ours)] [--dumps (ours: dumpWasmJit at batch 1 and 12)] [--perf-extra 'ARGS']");
+/* IKVM on native CoreCLR 10 (--bench mctick only): $WJ_STATE/arms/ikvm-clr10*'s jre/bin/java after one of its env files,
+ * the IKVM configurations native/mcnative --ikvm runs (those READMEs): clr = the wasm app's switches (lazy linking; no
+ * in-place relink on CoreCLR, so generation 1 stays), clrrelink = the same with the MonoMod relink backend (the closest
+ * native analogue of ours), clrclassic = eager linking (upstream IKVM's mode, IKVM's best case). */
+const CLR_ENVS = { clr: "ikvm-clr10/env.sh", clrrelink: "ikvm-clr10-relink/env-relink.sh", clrclassic: "ikvm-clr10/env-classic.sh" };
+const CLR = MC ? CLR_ENVS[arm] : undefined;
+if (!(["ours", ...Object.keys(TEAVM_DIRS)].includes(arm) || /^hs\d+$/.test(arm || "") || CJ || CLR) || !outdir) {
+  console.error("usage: run.mjs <ours|tvfull|tvsimple|tvfull60|tvsimple60|teavm|hs<N>|cj<V>|cjgc<V>|clr|clrrelink|clrclassic (mctick)> <outdir> [--events A|B|C|D|L] [--timeout S] [--no-attr] [--no-perf]"
+    + " [--stop-after N] [--knob K=V (ours)] [--dumps (ours: dumpWasmJit at batch 1 and 12)] [--perf-extra 'ARGS'] [--js-flags-extra 'F1,F2' (browser arms: appended to V8's --js-flags)] [--tv-dir DIR (a TeaVM arm's served directory, e.g. a split-teavm.py output)]");
   process.exit(1);
 }
 const SET = opt("events", "A");
-const TIMEOUT = Number(opt("timeout", 240)) * 1000;
+const TIMEOUT = Number(opt("timeout", MC ? 1500 : 240)) * 1000;
 const ATTR = !args.includes("--no-attr");
 const CPUS = process.env.J2D_CPUS || cfg("WJ_PCPUS");   // the big cores (lib/paths.mjs autodetects them)
 const PERF = !args.includes("--no-perf");          // timing-only: the workload alone, no perf in the tree
@@ -61,8 +90,8 @@ const PERF = !args.includes("--no-perf");          // timing-only: the workload 
  * mid-window -- so a steady-state comparison runs 600,200,60 and reads batches 41..60. HotSpot gets the schedule as
  * the jar's positional args, ours as Java system properties bench.* (?jprop.*, read by IkvmBenchmarkStarter), TeaVM
  * by picking a build with that many batches (its schedule is compiled in). */
-const SCHED = (opt("schedule", "600,200,12")).split(",").map(Number);
-const [WA, WB] = (opt("window-batches", "1,12")).split(",").map(Number);
+const SCHED = (opt("schedule", MC ? "2000,100,20" : "600,200,12")).split(",").map(Number);
+const [WA, WB] = (opt("window-batches", MC ? "10,20" : "1,12")).split(",").map(Number);
 const STOP_AFTER = Number(opt("stop-after", WB));
 const DUMPS = args.includes("--dumps");             // ours: dumpWasmJit() at batch 1 and batch 12, so the LAST dump is the window
 const PERF_EXTRA = (opt("perf-extra", "") || "").split(/\s+/).filter(Boolean);   // e.g. "-g" for fp call chains
@@ -95,6 +124,23 @@ const EVENTS = {
     `${C}/dtlb_load_misses.walk_completed,period=2003/u`,
     `${C}/br_inst_retired.indirect,period=200003/u`,
     `${C}/icache_data.stalls,period=400009/u`,
+  ],
+  // D: where the cycles stall (mctick, 2026-11-19): B's dTLB and icache events throttled thousands of times a window on
+  // ours at B's periods (a lower bound only), so these run 10x coarser; plus completed iTLB walks, mispredicted branches
+  // and cycles with an L1D miss outstanding (memory_activity.stalls_l1d_miss).
+  D: [
+    `${C}/instructions,period=20000003/u`,
+    `${C}/cycles,period=8000009/u`,
+    `${C}/dtlb_load_misses.walk_active,period=2000003/u`,
+    `${C}/itlb_misses.walk_completed,period=20011/u`,
+    `${C}/icache_data.stalls,period=4000037/u`,
+    `${C}/br_misp_retired.all_branches,period=200003/u`,
+    `${C}/memory_activity.stalls_l1d_miss,period=4000037/u`,
+  ],
+  // L: call edges (mctick split layouts, 2026-11-19): cycles at a coarse period with the branch stack filtered to calls
+  // (-j any_call,u below), read by bench/mctick/lbredges.py into the edge profile split-teavm.py co-locates by.
+  L: [
+    `${C}/cycles,period=2000003/u`,
   ],
   // C: call sites, PEBS (R432). The eventing IP of a retired near call is the CALL itself, so samples land on the
   // caller's call instruction: wledger.py's calls_per_step column, per caller and call form. ~30 k calls/step at
@@ -130,17 +176,40 @@ function onLine(text) {
     if (Number(m[1]) === STOP_AFTER && STOP_AFTER < Number(m[2])) { done = true; stoppedEarly = true; }
     if (DUMPS && (Number(m[1]) === WA || Number(m[1]) === WB)) dumpQueue.push(Number(m[1]));
   }
-  m = text.match(/\[bench\] mean ([\d.]+) ms\/step/); if (m) mean = Number(m[1]);
+  m = text.match(/\[bench\] mean ([\d.]+) ms\/(step|tick)/); if (m) mean = Number(m[1]);
   m = text.match(/\[bench\] checksum (-?\d+)/); if (m) { checksum = m[1]; done = true; }
   if (/LOAD FAILED/.test(text)) failed = text;
+  if (MC && /\[mctick\] DISCONNECTED/.test(text)) failed = failed || text;
   if (CJ && /^\[cj\] (LOAD FAILED|exit)/.test(text) && checksum === null) failed = failed || text;
 }
 
 // ---------------------------------------------------------------- the workload command
 let server = null, cmd, env = { ...process.env }, url = null;
 const HS = /^hs\d+$/.test(arm);
-if (HS) {
-  const jar = join(need("TEAVM_DIR", "the HotSpot arms run its ikvm-bench jar"), "samples/benchmark/ikvm-bench/target/ikvm-bench-1.0-SNAPSHOT-jar-with-dependencies.jar");
+if (HS && MC) {
+  const cpFile = join(ARMS(), "mctick", "cp-jvm.txt");   // wj bench/mctick/build
+  if (!existsSync(cpFile)) { console.error(`no ${cpFile}: run wj bench/mctick/build`); process.exit(1); }
+  const javaHome = need(`JAVA_HOME_${arm.slice(2)}`, `the ${arm} arm`);
+  const agent = join(ARMS(), "jvmti", "libj2dagent.so");
+  const save = join(cfg("WJ_STATE"), "native", opt("stage", "sa262n"), "template", "saves", "New World");
+  cmd = ["taskset", "-c", CPUS, join(javaHome, "bin", "java"), "-Xmx4g",
+    ...(ATTR && SET === "A" ? ["-XX:+UnlockDiagnosticVMOptions", "-XX:+DebugNonSafepoints",
+      `-agentpath:${agent}=${join(outdir, "j2dagent.txt")}`] : []),
+    `-Dmctick.world=${save}`, `-Dmctick.work=${join(outdir, "work")}`,
+    "-cp", readFileSync(cpFile, "utf8").trim(), "wjbench.mctick.Mctick", ...SCHED.map(String)];
+} else if (CLR) {
+  const cpFile = join(ARMS(), "mctick", "cp-jvm.txt");
+  if (!existsSync(cpFile)) { console.error(`no ${cpFile}: run wj bench/mctick/build`); process.exit(1); }
+  const envFile = join(ARMS(), CLR), java = join(dirname(envFile), "jre", "bin", "java");
+  if (!existsSync(envFile) || !existsSync(java)) { console.error(`no ${envFile} or ${java}: see native/mcnative.sh --ikvm`); process.exit(1); }
+  const save = join(cfg("WJ_STATE"), "native", opt("stage", "sa262n"), "template", "saves", "New World");
+  const q = (x) => `'${String(x).replace(/'/g, "'\\''")}'`;
+  cmd = ["taskset", "-c", CPUS, "bash", "-c", `. ${q(envFile)} && exec ${q(java)} -Xmx4g ${q(`-Dmctick.world=${save}`)} `
+    + `${q(`-Dmctick.work=${join(outdir, "work")}`)} -cp ${q(readFileSync(cpFile, "utf8").trim())} wjbench.mctick.Mctick `
+    + SCHED.join(" ")];
+} else if (HS) {
+  const jar = join(ARMS(), "j2d", "bench.jar");   // wj bench/jbox2d/build (its classes are byte-identical to ikvmcraft's public/bench.jar)
+  if (!existsSync(jar)) { console.error(`no ${jar}: run wj bench/jbox2d/build`); process.exit(1); }
   const javaHome = need(`JAVA_HOME_${arm.slice(2)}`, `the ${arm} arm`);
   const agent = join(ARMS(), "jvmti", "libj2dagent.so");   // built by j2d/jvmti/build.sh
   /* j2d/jvmti/j2dagent: code bytes + inlining-aware pc maps at nmethod load, for j2d/hsledger.py. NOT
@@ -155,18 +224,25 @@ if (HS) {
     // --base: another ikvmcraft dev server, e.g. rvcmp/jdk8's :5022 serving a saved IKVM flavor
     url = `${(opt("base") || serveUrl()).replace(/\/$/, "")}/?bench` + (ATTR ? "&wj.MONO_WASM_JIT_ORIGIN=1&wj.MONO_WASM_JIT_CAPTURE=1" : "")
       + args.flatMap((x, i) => x === "--knob" ? [`&wj.${args[i + 1]}`] : []).join("")   // --knob K=V (ours)
-      + (opt("schedule") ? `&jprop.bench.warmup=${SCHED[0]}&jprop.bench.batchSteps=${SCHED[1]}&jprop.bench.batches=${SCHED[2]}` : "")
-      + (opt("jar") ? `&jar=${encodeURIComponent(opt("jar"))}` : "");   // --jar FILE: another jar from public/ (ours)
+      + (MC ? `&jar=mctick.jar&jprop.mctick.world=${encodeURIComponent("/libsdl/minecraft/saves/New World")}`
+          + `&jprop.mctick.work=${encodeURIComponent("/tmp/mctick")}&jprop.mctick.noexit=true`
+          + `&jprop.mctick.warmup=${SCHED[0]}&jprop.mctick.batchTicks=${SCHED[1]}&jprop.mctick.batches=${SCHED[2]}`
+        : (opt("schedule") ? `&jprop.bench.warmup=${SCHED[0]}&jprop.bench.batchSteps=${SCHED[1]}&jprop.bench.batches=${SCHED[2]}` : "")
+          + (opt("jar") ? `&jar=${encodeURIComponent(opt("jar"))}` : ""));   // --jar FILE: another jar from public/ (ours)
   } else {
     const port = 8000 + Math.floor(Math.random() * 900);
-    server = spawn("node", [tool("serve-coep.mjs"), CJ ? `${join(HERE, "cheerpj")}:${join(ARMS(), "cheerpj")}` : TEAVM_DIRS[arm](), String(port)],
+    server = spawn("node", [tool("serve-coep.mjs"), CJ ? `${join(HERE, "cheerpj")}:${join(ARMS(), "cheerpj")}` : (opt("tv-dir") || TEAVM_DIRS[arm]()), String(port)],
       { stdio: "ignore" });
     url = CJ ? `http://localhost:${port}/index.html?v=${CJ[2]}&gc=${CJ[1] ? 1 : 0}&loader=${opt("cj-loader", "5.0")}`
         + (opt("schedule") ? `&args=${SCHED.join(",")}` : "")
-      : `http://localhost:${port}/teavm-wasm-fixed.html`;
+      : MC ? `http://localhost:${port}/mctick.html?args=${SCHED.join(",")}`
+      : `http://localhost:${port}/teavm-wasm-fixed.html` + (TEAVM_ARGS.has(arm) && opt("schedule") ? `?args=${SCHED.join(",")}` : "");
     await sleep(800);
   }
-  const prof = mkdtempSync(join(tmpdir(), "wj-j2d-"));   // the wj- prefix is how preflight and reap recognise a harness browser
+  /* mctick on ours needs the 262n seed's OPFS (26.2's jars and the save): a reflink copy beside the run, never on /tmp
+   * (lib/mcdrive.mjs seedProfile). Everything else gets an empty profile. */
+  const prof = MC && arm === "ours" ? seedProfile(join(outdir, "profile"), { seed: "262n" })
+    : mkdtempSync(join(tmpdir(), "wj-j2d-"));   // the wj- prefix is how preflight and reap recognise a harness browser
   /* lib/browser.mjs launchChrome's flag set (kept in step with mcdrive.mjs launchGame), plus --perf-prof for the
    * jitdump (code bytes for every compiled wasm function, which the ledger matches against d8). */
   cmd = ["taskset", "-c", CPUS, process.env.CHROME_BIN || "/usr/bin/chromium",
@@ -176,22 +252,23 @@ if (HS) {
     "--disable-sync", "--disable-background-networking", "--disable-client-side-phishing-detection",
     "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
     "--ignore-gpu-blocklist", "--use-gl=angle", `--use-angle=${process.env.MC_ANGLE || "gl"}`,
-    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${PERF && (SET === "A" || SET === "C") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, and C's call-site census); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
+    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
     "about:blank"];
   delete env.WAYLAND_DISPLAY; delete env.XDG_SESSION_TYPE;
   env.__J2D_PROFILE = prof;
 }
 
-const perfArgs = PERF ? ["record", "-q", "-k", "1", ...PERF_EXTRA, "-e", EVENTS.join(","), "-o", join(outdir, "perf.data"), "--", ...cmd] : cmd;
+const perfArgs = PERF ? ["record", "-q", "-k", "1", ...(SET === "L" ? ["-j", "any_call,u"] : []), ...PERF_EXTRA, "-e", EVENTS.join(","), "-o", join(outdir, "perf.data"), "--", ...cmd] : cmd;
 const exe = PERF ? "perf" : perfArgs.shift();
 writeFileSync(join(outdir, "cmd.txt"), [exe, ...perfArgs].join(" ") + "\n");
-// detached: perf and the workload get their own process group, so the teardown signals exactly them.
-const perf = spawn(exe, perfArgs, { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+// detached: perf and the workload get their own process group, so the teardown signals exactly them. cwd outdir: the
+// native arms' Minecraft writes logs/ into its cwd.
+const perf = spawn(exe, perfArgs, { env, cwd: outdir, detached: true, stdio: ["ignore", "pipe", "pipe"] });
 let perfErr = "", exited = false;
 perf.on("exit", () => { exited = true; });
 
 const t0 = Date.now();
-if (HS) {
+if (HS || CLR) {
   let buf = "";
   const feed = (d) => { buf += d.toString(); let k; while ((k = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, k)); buf = buf.slice(k + 1); } };
   perf.stdout.on("data", feed);
@@ -217,7 +294,7 @@ if (HS) {
     /* Since ikvmcraft 246560a (R514) ?bench boots through the launcher like the game: nothing runs until Play. The version
      * typed is irrelevant (?bench skips the Minecraft download check and runs bench.jar). */
     if (arm === "ours")
-      await driveLauncher(conn, sid, "mcsr", { log: onLine }).catch((e) => { failed = `launcher: ${e.message}`; });
+      await driveLauncher(conn, sid, MC ? "262n" : "mcsr", { log: onLine }).catch((e) => { failed = `launcher: ${e.message}`; });
     let dumps = 0;
     while (!done && !failed && Date.now() - t0 < TIMEOUT) {
       while (dumpQueue.length) {   // dump from here, not the console callback: the RPC needs the loop
@@ -242,7 +319,8 @@ try { process.kill(-perf.pid, "SIGINT"); } catch { }
 for (let i = 0; i < 300 && !exited; i++) await sleep(100);
 if (!exited) { try { process.kill(-perf.pid, "SIGKILL"); } catch { } await sleep(500); }
 if (server) server.kill("SIGKILL");
-if (env.__J2D_PROFILE) rmSync(env.__J2D_PROFILE, { recursive: true, force: true });
+// a failed mctick run keeps its seed copy: it holds the OPFS state at the failure (lib/mcdrive.mjs reapProfile)
+if (env.__J2D_PROFILE && !(MC && (failed || checksum === null))) rmSync(env.__J2D_PROFILE, { recursive: true, force: true });
 log.end();
 
 /* CheerpJ flushes System.out only when the Java thread yields -- in this bench, at exit -- so every batch line arrives
@@ -256,7 +334,7 @@ if (CJ && checksum !== null && batchT[WB]) {
 const steps = (WB - WA) * SCHED[1];
 const ok = done && batchT[WA] && batchT[WB] && (checksum !== null || stoppedEarly);
 const win = {
-  arm, set: SET, attr: ATTR, perf: PERF, cpus: CPUS, ok: Boolean(ok), checksum, stopped_early: stoppedEarly, mean_ms_per_step: mean,
+  bench: BENCH, arm, set: SET, attr: ATTR, perf: PERF, cpus: CPUS, ok: Boolean(ok), checksum, stopped_early: stoppedEarly, mean_ms_per_step: mean,
   window: ok ? [batchT[WA], batchT[WB]] : null, steps, schedule: SCHED, window_batches: [WA, WB],
   // the bench's own timing of the windowed batches (WA+1..WB)
   window_ms_per_step: ok ? Array.from({ length: WB - WA }, (_, i) => batchMs[WA + 1 + i]).reduce((s, v) => s + v, 0) / steps : null,
@@ -265,7 +343,7 @@ const win = {
 writeFileSync(join(outdir, "window.json"), JSON.stringify(win, null, 1) + "\n");
 const dumps = existsSync(outdir) ? readdirSync(outdir).filter((f) => /^jit-\d+\.dump$/.test(f)) : [];
 const sz = existsSync(join(outdir, "perf.data")) ? statSync(join(outdir, "perf.data")).size : 0;
-console.log(`${arm} ${SET}: ${ok ? "ok" : "FAILED"} checksum ${checksum} mean ${mean} window ${win.window_ms_per_step?.toFixed(4)} ms/step`
+console.log(`${arm} ${SET}: ${ok ? "ok" : "FAILED"} checksum ${checksum} mean ${mean} window ${win.window_ms_per_step?.toFixed(4)} ms/${MC ? "tick" : "step"}`
   + ` (${win.window ? (win.window[1] - win.window[0]).toFixed(2) : "?"} s) perf.data ${(sz / 1e6).toFixed(1)} MB, ${dumps.length} jitdump(s)`
   + (failed ? ` FAILED: ${failed}` : ""));
 process.exit(ok ? 0 : 1);

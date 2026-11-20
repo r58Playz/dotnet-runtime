@@ -1,0 +1,177 @@
+Low-level (linear-memory wasm) classlib fixes found running Minecraft 26.2's server:
+  Class.getEnumConstants returned a clone of the runtime's constants array, whose class is not E[], so the cast
+  every caller makes ((E[]) X.class.getEnumConstants(), Minecraft's StaticAction) threw ClassCastException. The
+  constants are now copied into a new E[].
+  RandomAccessFile in a read-write mode threw FileNotFoundException for a missing file; the JDK creates it. And it
+  truncated an existing file (the in-memory file system truncates every writable open that does not append), so
+  Minecraft's region files read back empty and every saved chunk was regenerated without any error.
+  Path.of(URI) / Paths.get(URI) went through FileSystems.getFileSystem(uri), which accepts only the root URI, so
+  every other file: URI threw; the scheme's provider now resolves it (JDK semantics). (Not low-level specific.)
+  Files.find concatenated a null stream for a non-matching directory (NPE) and emitted a matching one twice.
+  The default file system's Path: iterator() returned null, equals(this) was false (so p.relativize(p) threw), and
+  resolving against the empty path prepended a separator.
+  Class.getSuperclass read JS-shaped metadata; on the low-level targets it now answers RuntimeClass.parent
+  (Minecraft's SynchedEntityData numbers entity data by walking superclasses: "Duplicate id value for 0").
+Codegen: these methods on the low-level targets only.
+
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java b/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java
+index c2704bb70..6f6b7e35b 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/io/TRandomAccessFile.java
+@@ -55,14 +55,33 @@ public class TRandomAccessFile implements DataInput, DataOutput, Closeable {
+         }
+ 
+         VirtualFile virtualFile = file.findVirtualFile();
++        if (!readOnly && (virtualFile == null || (!virtualFile.isFile() && !virtualFile.isDirectory()))) {
++            // wjharness patch 0009: the read-write modes create a missing file, as on the JDK
++            try {
++                file.createNewFile();
++            } catch (java.io.IOException e) {
++                throw new FileNotFoundException(file.getPath());
++            }
++            virtualFile = file.findVirtualFile();
++        }
+         if (virtualFile == null || !virtualFile.isFile()) {
+-            throw new FileNotFoundException();
++            throw new FileNotFoundException(file.getPath());
+         }
+ 
+-        accessor = virtualFile.createAccessor(true, !readOnly, false);
++        // wjharness patch 0009: open without truncating. The virtual file system truncates a file opened writable
++        // unless appending (right for FileOutputStream), so "rw" emptied the file: Minecraft's region files read back
++        // as zeros and every saved chunk was generated again. Open in append mode, then start at 0.
++        accessor = virtualFile.createAccessor(true, !readOnly, !readOnly);
+         if (accessor == null) {
+             throw new FileNotFoundException();
+         }
++        if (!readOnly) {
++            try {
++                accessor.seek(0);
++            } catch (java.io.IOException e) {
++                throw new FileNotFoundException(e.getMessage());
++            }
++        }
+         buff = new byte[16];
+     }
+ 
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java b/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
+index fb62d4281..d0f8d0573 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/lang/TClass.java
+@@ -759,10 +759,20 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+ 
+     @SuppressWarnings("unchecked")
+     @PluggableDependency(ClassGenerator.class)
++    @DelegateTo("getSuperclassLowLevel")
+     public TClass<? super T> getSuperclass() {
+         return (TClass<? super T>) getClass(platformClass.getMetadata().getSuperclass());
+     }
+ 
++    // wjharness patch 0009: on the low-level targets a Class is its RuntimeClass, whose parent is the superclass (the
++    // metadata path above answered wrongly there, and Minecraft's SynchedEntityData numbers fields by walking it)
++    private static RuntimeClass getSuperclassLowLevel(RuntimeClass self) {
++        if ((self.flags & (RuntimeClass.INTERFACE | RuntimeClass.PRIMITIVE)) != 0) {
++            return null;
++        }
++        return self.parent;
++    }
++
+     @SuppressWarnings("unchecked")
+     @PluggableDependency(ClassGenerator.class)
+     public TClass<? super T>[] getInterfaces() {
+@@ -800,6 +810,13 @@ public final class TClass<T> extends TObject implements TGenericDeclaration, TTy
+         }
+         if (PlatformDetector.isWebAssemblyGC()) {
+             return (T[]) ClassSupport.getEnumConstants((Class<?>) (Object) this);
++        } else if (PlatformDetector.isLowLevel()) {
++            // wjharness patch 0009: the runtime's array is not an E[]; callers cast to E[]
++            Platform.initClass(platformClass);
++            Object[] constants = (Object[]) (Object) Platform.getEnumConstants(platformClass);
++            T[] result = (T[]) (Object) java.lang.reflect.Array.newInstance((Class<?>) (Object) this, constants.length);
++            System.arraycopy(constants, 0, result, 0, constants.length);
++            return result;
+         } else {
+             Platform.initClass(platformClass);
+             return (T[]) Platform.getEnumConstants(platformClass).clone();
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java
+index 14a1ed76a..013383c1d 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TFiles.java
+@@ -542,17 +542,18 @@ public final class TFiles {
+ 
+     private static Stream<TPath> findRec(TPath path, int maxDepth, BiPredicate<TPath, TBasicFileAttributes> matcher)
+             throws IOException {
++        // wjharness patch 0009: a path that did not match concatenated a null stream (NPE), and a matching directory
++        // was emitted twice
+         var attr = readAttributes(path, TBasicFileAttributes.class);
+-        var result = matcher.test(path, attr) ? Stream.of(path) : null;
++        Stream<TPath> result = matcher.test(path, attr) ? Stream.of(path) : Stream.empty();
+         if (maxDepth > 0 && attr.isDirectory()) {
+-            var next = Stream.concat(result, list(path).flatMap(child -> {
++            result = Stream.concat(result, list(path).flatMap(child -> {
+                 try {
+                     return findRec(child, maxDepth - 1, matcher);
+                 } catch (IOException e) {
+                     return Stream.empty();
+                 }
+             }));
+-            result = result != null ? Stream.concat(result, next) : next;
+         }
+         return result;
+     }
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java
+index 07ed83e46..372e7a859 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/nio/file/TPath.java
+@@ -25,7 +25,14 @@ public interface TPath extends Comparable<TPath>, Iterable<TPath> {
+     }
+ 
+     static TPath of(TURI uri) {
+-        return TFileSystems.getFileSystem(uri).provider().getPath(uri);
++        // wjharness patch 0009: the scheme's provider resolves the URI, as on the JDK (getFileSystem(uri) accepts only
++        // the file system's root URI, so this failed for every other file: URI)
++        for (var provider : org.teavm.classlib.java.nio.file.spi.TFileSystemProvider.installedProviders()) {
++            if (provider.getScheme().equalsIgnoreCase(uri.getScheme())) {
++                return provider.getPath(uri);
++            }
++        }
++        throw new TFileSystemNotFoundException();
+     }
+ 
+     TFileSystem getFileSystem();
+diff --git a/classlib/src/main/java/org/teavm/classlib/java/nio/file/impl/TDefaultPath.java b/classlib/src/main/java/org/teavm/classlib/java/nio/file/impl/TDefaultPath.java
+index e20fa8ca2..52d5155fd 100644
+--- a/classlib/src/main/java/org/teavm/classlib/java/nio/file/impl/TDefaultPath.java
++++ b/classlib/src/main/java/org/teavm/classlib/java/nio/file/impl/TDefaultPath.java
+@@ -202,6 +202,9 @@ public class TDefaultPath implements TPath {
+         if (other.isAbsolute()) {
+             return other;
+         }
++        if (pathString.isEmpty()) {
++            return other;   // wjharness patch 0009: "" resolved against x gave "/x"
++        }
+         if (other.getNameCount() == 1 && other.getFileName().toString().isEmpty()) {
+             return this;
+         }
+@@ -303,13 +306,19 @@ public class TDefaultPath implements TPath {
+ 
+     @Override
+     public Iterator<TPath> iterator() {
+-        return null;
++        // wjharness patch 0009: was null
++        int count = getNameCount();
++        var names = new java.util.ArrayList<TPath>(count);
++        for (int i = 0; i < count; ++i) {
++            names.add(getName(i));
++        }
++        return names.iterator();
+     }
+ 
+     @Override
+     public boolean equals(Object obj) {
+         if (this == obj) {
+-            return false;
++            return true;   // wjharness patch 0009: was false (and p.relativize(p) then threw)
+         }
+         if (!(obj instanceof TDefaultPath)) {
+             return false;
