@@ -1600,11 +1600,16 @@ int mono_wasm_jit_entry_poll = 0;
  * and removes a repeat only when an earlier one dominates it (late-load-elimination-reducer.h), so a loop poll whose
  * body has no dominating read re-derives the address every iteration: 7 x86 instructions in computeNext (findings note
  * 2026-11-18 evening, item 4). The cost is one value live across the body (R110: a method-long local is not free).
- * 0 = global.get at every poll. */
-int mono_wasm_jit_poll_local = 0;
+ * 0 = global.get at every poll.
+ * THE 2026-11-20 SET -- POLL_LOCAL, T1_TEE, PIN_ALIAS=1, ILOFS_DEDUPE=1, DIVREM, T1_GLOBALS, PIC_L0=1 and F4 bit 16, shipped
+ * together (plan snuggly-mapping-goblet phases 1-2): 262n Q60, server thread, n=3 a side, 0 skipped ticks (runs/2026-11-20-g1):
+ * cycles 86.46 (86.04-86.85) -> 83.94 (82.42-85.51) M a tick, -2.9%, disjoint; instructions -4.9%, stores -12.0%, both
+ * disjoint. mctick (quiet box, n=6): instructions -4.0% disjoint, cycles -1.9% overlapping. No per-knob split on the game;
+ * on mctick ILOFS_DEDUPE and POLL_LOCAL carry most of the instructions, PIN_ALIAS and T1_GLOBALS read as base. */
+int mono_wasm_jit_poll_local = 1;
 /* MONO_WASM_JIT_T1_TEE=1: a tier-1 entry or loop counter tests the value it just stored, kept in a local, instead of
  * loading the word again. 0 = the reload. */
-int mono_wasm_jit_t1_tee = 0;
+int mono_wasm_jit_t1_tee = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
 /* MONO_WASM_JIT_PIN_ALIAS: a call argument's carrier (the OP_MOVE the call lowering adds, E:wj_call_args) gets no
  * frame slot of its own when its SOURCE vreg is slotted anyway and nothing between the move and the call redefines
  * the source or reaches a GC point: the source's slot holds the same object for the call's whole duration, and its
@@ -1615,24 +1620,24 @@ int mono_wasm_jit_t1_tee = 0;
  * before each aliased call that the source's slot holds the carrier's value (a miss counts WJC_PIN_ALIAS_RT_BAD at run
  * time; both must read 0); 3 = the positive control: no kill extension, so BAD must fire (and is repaired: the carrier
  * keeps its own slot) and RT_BAD fires wherever the source's slot was zeroed before the call; 0 = off. */
-int mono_wasm_jit_pin_alias = 0;
+int mono_wasm_jit_pin_alias = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
 /* MONO_WASM_JIT_ILOFS_DEDUPE: an EH-record method's block skips its IL-offset store when every predecessor has the same
  * offset and region and reaches it by a plain edge, so the record already holds it (60% of getBlockState's executed
  * IL-offset stores repeat, findings note 2026-11-18 evening). Exclusions at the emitter (E: the il_offsets loop); R353
  * record mode only. 1 = on; 2 = on, each skipped store replaced by a check that counts WJC_ILOFS_DEDUPE_RT_BAD and stores
  * on a miss (must read 0); 3 = mode 2 plus handler entries, the positive control (RT_BAD must fire, and is repaired);
  * 0 = off. */
-int mono_wasm_jit_ilofs_dedupe = 0;
+int mono_wasm_jit_ilofs_dedupe = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
 /* MONO_WASM_JIT_DIVREM=1: drop mono's INT_MIN / -1 OverflowException test before a signed 32-bit division whose block is
  * entered only through IKVM's own `divisor != -1` branch (E: wj_divrem_prune). Cursor3D.advance, four divisions a call,
  * executes 1.70 M instructions a tick against HotSpot's 0.26 M (findings note 2026-11-18 evening). 0 = keep the test. */
-int mono_wasm_jit_divrem = 0;
+int mono_wasm_jit_divrem = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
 /* MONO_WASM_JIT_T1_GLOBALS=1: a tier-1 body's entry and loop counters live in module-defined globals (WASM_RELOC_GLOBAL),
  * which V8 keeps in the instance's globals buffer beside the s.* values those bodies already load, instead of in words
  * scattered over the heap. An S2 entry record (read by C: site frequencies) gets 64 added every 64 entries and keeps
  * the tier-2 test (E: the S0 counter). Counts become per instance. The gate is cache and TLB misses in the tier-1
  * rows, not instructions (plan snuggly-mapping-goblet 2.3). 0 = the heap words. */
-int mono_wasm_jit_t1_globals = 0;
+int mono_wasm_jit_t1_globals = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
 /* MONO_WASM_JIT_PIC_L0: a compact virtual site (VSITE_COMPACT) checks two module globals -- the receiver vtable and the
  * f-slot of its last PIC hit on this instance -- before the worker PIC; a way-0 or F9 hit refills them, a miss takes
  * the stub as before (so the call profile is fed as before). The f-slot came out of this pthread's PIC, so it is
@@ -1640,7 +1645,7 @@ int mono_wasm_jit_t1_globals = 0;
  * beside the s.* values, where the PIC is a per-thread array the site reaches through two loads and a bounds check
  * (plan snuggly-mapping-goblet 2.2: the gate is the IC rows' misses). 1 = on; 2 = on, and every L0 hit tests the
  * f-slot's liveness (WJC_PIC_L0_NOTLIVE must read 0); 0 = off. */
-int mono_wasm_jit_pic_l0 = 0;
+int mono_wasm_jit_pic_l0 = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
 /* MONO_WASM_JIT_VOLATILE_LOAD=1: a SEQ barrier followed (past null checks and constants) by a load mono flagged
  * MONO_INST_VOLATILE -- IKVM's Java volatile read, which it brackets as Thread.MemoryBarrier(); volatile. ldfld -- emits no
  * fence, and the load becomes a seq-cst wasm atomic load (a plain mov on x64). Only 1-, 2- and 4-byte loads at a naturally
@@ -1797,15 +1802,15 @@ gint32 mono_wasm_jit_cha_wrong;
  *   4  the IC's method-identity fallback (R311) remembers the last vtable it matched, in the PIC entry, so an
  *      alternating second class pays one load instead of vtable->klass->vtable[slot];
  *   8  the same memo for a devirt arm's MID guard, in a process-wide word per arm (its target is baked).
- *  16  (needs 1; not in the default) bit 1 as a greatest fixpoint that also takes a move of a vtable vreg (S4 turns a
+ *  16  (needs 1) bit 1 as a greatest fixpoint that also takes a move of a vtable vreg (S4 turns a
  *      repeated [obj+0] load into one) and `load [vtable + 0]` -- MonoVTable.klass, a MonoClass * in metadata, never
  *      moved -- and moves of that: 5.1% of the top server functions' executed pins (findings note 2026-11-18 evening).
  * See the g2 ledger: 3.41 M cycles/tick in 4+-load dispatch chains, PIN 1.12. Shipped with the wave-1 set: the
  * b2 census (2026-10-01, Minecraft server tick, P-cores, b t t b, 0 skipped ticks): F4=15 + F9=1 + INLINE_BFI=1 +
  * IKVM_LAZY_SIGDEPS + IKVM_LAZY_ARITY together, cycles 94.00 -> 89.04 M/tick (-5.3%, spreads 1.4% / 2.0%, R382).
  * Measured as one set; no per-lever split. The mapping diff puts PIN at -0.36 M; bit 2 was dead in that build (R382) and is
- * validated by b3's gates, not timed. */
-int mono_wasm_jit_f4 = 15;
+ * validated by b3's gates, not timed. Bit 16 joined with the 2026-11-20 set (measured at MONO_WASM_JIT_POLL_LOCAL). */
+int mono_wasm_jit_f4 = 31;
 /* MONO_WASM_JIT_F9 (plan2x F9): bit 1 = the megamorphic cache. A one-way PIC misses on every receiver change at a
  * site with many classes (g2: one GoalSelector wrapper, class_4135:method_6264, alone took 0.35 M cycles/tick of
  * resolve + admit_live + publish); the C resolver's own memo still costs the helper call. A per-thread table of

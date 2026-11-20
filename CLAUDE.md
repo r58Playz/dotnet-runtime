@@ -69,9 +69,12 @@ version). Line numbers drift: if something surprising turns up, re-check the tre
   (bounds, canonical-type check, index arithmetic, `call *`), and V8 does not fold a constant index into a direct call.
 * **`local.get` / `local.set` / `local.tee` emit nothing** (`LocalGet` is an SSA rename). Local count and copy chains are
   wire size only; what costs is how many values are live across a call.
-* **An imported MUTABLE global costs 4 extra loads per access**, against one hoisted load for an immutable import or a
-  module-defined global (`compiler/turboshaft/wasm-lowering-reducer.h`). `s.p` (`__stack_pointer`) is the only one, and
-  every framed method reads and writes it.
+* **An imported MUTABLE global costs 4 extra loads per access** (`compiler/turboshaft/wasm-lowering-reducer.h`). An
+  immutable import or a module-defined global is the instance's globals buffer, then the value; the two share that
+  untagged buffer (`wasm/module-instantiate.cc` ProcessImportedGlobal, `wasm/module-decoder-impl.h`
+  CalculateGlobalOffsets), and a repeat read is removed only where an earlier one dominates it
+  (`compiler/turboshaft/late-load-elimination-reducer.h`), so a loop poll with no dominating read re-derives `s.g` every
+  iteration. `s.p` (`__stack_pointer`) is the only mutable import, and every framed method reads and writes it.
 * **V8 eliminates no linear-memory load and has no wasm LICM** (every load is `.NotLoadEliminable()`; the passes are in
   `compiler/turboshaft/wasm-optimize-phase.cc`). Load CSE and LICM happen in mono's middle end or nowhere (R378).
 * **Every `WebAssembly.Module` is its own code space** (~8 KB of VmData at least), **and every worker re-validates it**:
@@ -463,6 +466,12 @@ findings note "mctick":
   metadata layout) and iTLB walks (70.6 vs 15.7 k: code volume; our hot functions are 4-7x TeaVM's wasm bytes).
 * Every arm does the same work only through `BenchServer.shouldRun` (every queued task due) and the TeaVM drain loop;
   without them HotSpot and ours loaded a fifth of the save's entities. Gate on the end state, not the checksum.
+* **Ours frames no B4 groups in a default mctick run** (`[wasm-jit b4] ... framed=0/256 plans=0`): `MONO_WASM_JIT_B4_QUIET`
+  holds framing while the tier grows, and every window of a run this short reads GROWING. The game's Q60 window comes
+  after B4 has framed. So the table above, and every mctick number for ours before 2026-11-20, is ours WITHOUT co-location.
+* **Ours' calls are bimodal across runs** (0.545 or ~0.50 M a tick on mctick): tier 2's guarded inlining of the
+  block-state chain (`getBlockState` -> `SimpleBitStorage.get` / `valueFor`) lands one of two ways depending on the profile
+  when it compiles. ~2-3% of instructions, more than most single levers: stratify an A/B by it, or run n >= 6.
 * The TeaVM arm is the pin plus `bench/teavm-patches` 0001-0012 (two FULL miscompiles of 26.2 among them); at FULL the
   build prints `wj: methods declared without a program: N` -- 1 is OptionalLong.isPresent, unreferenced.
 
@@ -634,7 +643,9 @@ inlined away). Prove a revert both ways: the new marker present and the reverted
 
 **The box** (i7-1360P) sits at 95-98 C in game, and that is normal: 2-3-core arms hold 3.6-3.7 GHz. Builds and deploys
 are all-core and do throttle. Measure on mains power (preflight refuses on battery). Ambient desktop load is the confound
-that is real, and preflight's refusal for it is worth obeying.
+that is real, and preflight's refusal for it is worth obeying. **So is memory contention preflight does not see**: on
+2026-11-19 an evening's mctick runs read 15.5-17 ms/tick against 13.7, with L1D-miss stall cycles 33 against 24 M a tick at
+the same instructions, while kswapd ran and `/proc/pressure/memory` avg300 sat near 0.4; read it before a timing round.
 
 **Reading a run**
 

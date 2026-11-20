@@ -7880,7 +7880,7 @@ co_ranges_done:
 					 * Call its AOT code DIRECTLY with the native ABI — the jiterpreter directJitCalls/enableDirect
 					 * path emitted inline: push (this, args by value, rgctx); call_indirect <cinfo->addr>. No
 					 * interp_entry, no frame, no LMF (validated jit102: conservative GC + local resume-state).
-					 * Gated by MONO_WASM_JIT_INLINE_AOT (default off). byref args/ret bail to the residual; a
+					 * Unconditional (MONO_WASM_JIT_INLINE_AOT shipped 1 and is gone, below). byref args/ret bail to the residual; a
 					 * throwing AOT callee would escape uncaught until Build 2 adds wasm-EH — test non-throwing. */
 					{
 						extern gboolean mono_wasm_jit_aot_call_target (MonoMethod *m, gpointer *addr, gpointer *rgctx, gboolean *has_extra_arg);
