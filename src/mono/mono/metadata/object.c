@@ -48,6 +48,8 @@
 #include <mono/utils/mono-memory-model.h>
 #include <mono/utils/checked-build.h>
 #include <mono/utils/mono-threads.h>
+#include <mono/utils/mono-lazy-init.h>
+#include <mono/utils/mono-os-mutex.h>
 #include <mono/utils/mono-threads-coop.h>
 #include <mono/utils/mono-logger-internals.h>
 #include <minipal/getexepath.h>
@@ -2107,6 +2109,63 @@ mono_vtable_alloc_slots (MonoVTable *vt)
 	return slots;
 }
 
+/*
+ * MONO_WASM_META_ARENA=1 (read once, at the first use): MonoVTables (with their IMT prefix) and class static-field storage
+ * come from one process-wide bump arena of 1 MiB chunks instead of the class's memory-manager mempool (vtables,
+ * non-reference statics) and g_calloc (reference statics), so the runtime metadata JIT code reads on dispatch, casts and
+ * static access sits densely: on 2026-11-18 vtables 10.8 MB + IMTs 4.8 MB + statics 0.95 MB sat ~one hot line a page across
+ * a 2.2 GiB span, and malloc'd metadata took 37% of the server tick's STLB-miss loads (findings note 2026-11-18; plan
+ * snuggly-mapping-goblet 3.1). Never freed, which is safe because nothing frees either kind (static storage has no
+ * mono_gc_free_fixed caller; vtables go only with their mempool); collectible memory managers keep the old path.
+ * Reference statics keep their GC root registration. Unset or 0: the memory manager and g_calloc, as before.
+ */
+static mono_lazy_init_t meta_arena_status = MONO_LAZY_INIT_STATUS_NOT_INITIALIZED;
+static int meta_arena_on;
+static mono_mutex_t meta_arena_mutex;
+static guint8 *meta_arena_cur, *meta_arena_end;
+/* read by the wasm JIT's stats dump */
+gint64 mono_meta_arena_bytes, mono_meta_arena_chunks, mono_meta_arena_allocs;
+int mono_meta_arena_enabled (void);
+
+#define META_ARENA_CHUNK (1 << 20)
+
+static void
+meta_arena_init (void)
+{
+	const char *e = g_getenv ("MONO_WASM_META_ARENA");
+	meta_arena_on = e && *e && *e != '0';
+	mono_os_mutex_init (&meta_arena_mutex);
+}
+
+int
+mono_meta_arena_enabled (void)
+{
+	mono_lazy_initialize (&meta_arena_status, meta_arena_init);
+	return meta_arena_on;
+}
+
+/* Zeroed, 8-aligned, never freed; NULL when the arena is off or the request is large (the caller falls back). */
+static gpointer
+meta_arena_alloc0 (size_t size)
+{
+	gpointer res;
+	if (!mono_meta_arena_enabled () || size == 0 || size > META_ARENA_CHUNK / 4)
+		return NULL;
+	size = (size + 7) & ~(size_t) 7;
+	mono_os_mutex_lock (&meta_arena_mutex);
+	if (!meta_arena_cur || size > (size_t) (meta_arena_end - meta_arena_cur)) {
+		meta_arena_cur = (guint8 *) g_malloc0 (META_ARENA_CHUNK);
+		meta_arena_end = meta_arena_cur + META_ARENA_CHUNK;
+		mono_meta_arena_chunks++;
+	}
+	res = meta_arena_cur;
+	meta_arena_cur += size;
+	mono_meta_arena_bytes += size;
+	mono_meta_arena_allocs++;
+	mono_os_mutex_unlock (&meta_arena_mutex);
+	return res;
+}
+
 static gpointer*
 alloc_vtable (MonoClass *klass, size_t vtable_size, size_t imt_table_bytes)
 {
@@ -2129,7 +2188,12 @@ MONO_DISABLE_WARNING(4127) /* conditional expression is constant */
 	}
 MONO_RESTORE_WARNING
 
-	return (gpointer*) ((char*)m_class_alloc0 (klass, (guint)vtable_size) + alloc_offset);
+	{
+		gpointer mem = m_class_get_mem_manager (klass)->collectible ? NULL : meta_arena_alloc0 (vtable_size);
+		if (!mem)
+			mem = m_class_alloc0 (klass, (guint)vtable_size);
+		return (gpointer*) ((char*)mem + alloc_offset);
+	}
 }
 
 static MonoVTable *
@@ -2279,12 +2343,19 @@ mono_class_create_runtime_vtable (MonoClass *klass, MonoError *error)
 			bitmap = compute_class_bitmap (klass, default_bitmap, sizeof (default_bitmap) * 8, 0, &max_set, TRUE);
 			/*g_print ("bitmap 0x%x for %s.%s (size: %d)\n", bitmap [0], klass->name_space, klass->name, class_size);*/
 			statics_gc_descr = mono_gc_make_descr_from_bitmap (bitmap, max_set + 1);
-			vt->vtable [m_class_get_vtable_size (klass)] = mono_gc_alloc_fixed (class_size, statics_gc_descr, MONO_ROOT_SOURCE_STATIC, vt, "Static Fields");
+			{
+				/* MONO_WASM_META_ARENA: the same root over arena storage */
+				gpointer sd = (vt->loader_alloc || mem_manager->collectible) ? NULL : meta_arena_alloc0 (class_size);
+				if (sd && !mono_gc_register_root ((char *) sd, class_size, statics_gc_descr, MONO_ROOT_SOURCE_STATIC, vt, "Static Fields"))
+					sd = NULL;   /* that arena space is simply lost */
+				vt->vtable [m_class_get_vtable_size (klass)] = sd ? sd : mono_gc_alloc_fixed (class_size, statics_gc_descr, MONO_ROOT_SOURCE_STATIC, vt, "Static Fields");
+			}
 
 			if (bitmap != default_bitmap)
 				g_free (bitmap);
 		} else {
-			vt->vtable [m_class_get_vtable_size (klass)] = m_class_alloc0 (klass, class_size);
+			gpointer sd = mem_manager->collectible ? NULL : meta_arena_alloc0 (class_size);   /* MONO_WASM_META_ARENA */
+			vt->vtable [m_class_get_vtable_size (klass)] = sd ? sd : m_class_alloc0 (klass, class_size);
 		}
 		vt->has_static_fields = TRUE;
 		UnlockedAdd (&mono_stats.class_static_data_size, class_size);

@@ -1512,6 +1512,29 @@ enum {
 	WJC_RECV_OVERRIDDEN,         /* ... sites whose class's method something loaded overrides: left to the profile (GI gate + emitter) */
 	WJC_RECV_WIDENED,            /* ... interface sites whose record agreed on the target: the slot guard added behind the profiled vtable */
 	WJC_PROF_SAMPLE_SITES,       /* MONO_WASM_JIT_PROF_SAMPLE: tier-1 virtual sites emitted with the sampling countdown */
+	WJC_POLL_LOCAL_BODIES,       /* MONO_WASM_JIT_POLL_LOCAL: bodies that read s.g into a local after the prologue */
+	WJC_POLL_LOCAL_SITES,        /* ... safepoint polls emitted loading through that local */
+	WJC_T1_TEE_SITES,            /* MONO_WASM_JIT_T1_TEE: tier-1 counters emitted keeping the increment in a local */
+	WJC_PIN_ALIAS_CARRIERS,      /* MONO_WASM_JIT_PIN_ALIAS: call-argument carriers left unpinned, their source's slot covering the call */
+	WJC_PIN_ALIAS_BAD,           /* ... aliases the post-SLOTZERO check found uncovered (source slot elided or killed before the call) and
+	                              * repaired by restoring the carrier's slot: MUST be 0 except under the positive control (PIN_ALIAS=3) */
+	WJC_F4_KLASS_NONREF,         /* MONO_WASM_JIT_F4 & 16: MonoClass * vregs (load [vtable+0], or moves of one) exempted from the ref frame */
+	WJC_F4_VT_MOVE_NONREF,       /* ... vtable vregs defined by a move (S4's reuse) that bit 1's all-loads test missed */
+	WJC_PIN_ALIAS_RT_BAD,        /* PIN_ALIAS=2/3 run time: an aliased call found its source's slot not holding the carrier */
+	WJC_ILOFS_DEDUPE_BLOCKS,     /* MONO_WASM_JIT_ILOFS_DEDUPE: non-entry blocks of EH-record methods considered */
+	WJC_ILOFS_DEDUPE_SITES,      /* ... of them, IL-offset stores skipped (mode 3: + handler entries) */
+	WJC_ILOFS_DEDUPE_RT_BAD,     /* ... run time (modes 2/3): a skipped block found another offset in the record */
+	WJC_DIVREM_OVF_CHECKS,       /* MONO_WASM_JIT_DIVREM: decompose's INT_MIN / -1 test sequences seen */
+	WJC_DIVREM_OVF_DROPPED,      /* ... of them, proven dead and removed */
+	WJC_DIVREM_NO_PRED,          /* ... not removed: the block has more than one way in, or its predecessor ends without a two-way branch */
+	WJC_DIVREM_EDGE,             /* ... not removed: the edge in is not a "!= -1" edge (another branch opcode or target) */
+	WJC_DIVREM_NO_CMP,           /* ... not removed: the predecessor's compare is not against -1 */
+	WJC_DIVREM_CLASS,            /* ... not removed: the divisor is not provably the compared value */
+	WJC_DIVREM_TEMPS,            /* ... not removed: a temporary of the sequence is a variable or read after it */
+	WJC_T1G_ENTRY_SITES,         /* MONO_WASM_JIT_T1_GLOBALS: tier-1 entry counters kept in a module global */
+	WJC_T1G_LOOP_SITES,          /* ... tier-1 loop counters (R409) kept in a module global */
+	WJC_PIC_L0_SITES,            /* MONO_WASM_JIT_PIC_L0: compact virtual sites given the two L0 globals */
+	WJC_PIC_L0_NOTLIVE,          /* ... PIC_L0=2 run time: an L0 hit whose f-slot is not live on this pthread (MUST be 0) */
 	WJC_MAX
 };
 

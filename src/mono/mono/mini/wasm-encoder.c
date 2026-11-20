@@ -263,7 +263,7 @@ wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, 
 	e->site_kd = 0;
 	e->site_rec = 0;
 	e->edge_cnt = 0;
-	if (kind != WASM_RELOC_TYPE_U && kind != WASM_RELOC_TYPE_S) {
+	if (kind != WASM_RELOC_TYPE_U && kind != WASM_RELOC_TYPE_S && kind != WASM_RELOC_GLOBAL) {
 		/* a call: it ends the previous call's run, and its key is the last memory access of its own */
 		wasm_site_key_open (b);
 		if (b->key_src >= 0 && (guint32) b->key_src < b->len && b->len - (guint32) b->key_src <= WASM_SITE_KD_MASK)
@@ -429,6 +429,9 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 			break;
 		case WASM_RELOC_TYPE_S:
 			wasm_sleb (out, (gint64) ti);
+			break;
+		case WASM_RELOC_GLOBAL:
+			wasm_uleb (out, fix [k].idx);   /* the module's global index, resolved by the framer */
 			break;
 		case WASM_RELOC_INDIRECT:
 			WASM_COUNT_SITE (WASM_SF_DYNAMIC);
@@ -986,6 +989,27 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 		wasm_uleb (&sec, base + 1);      /* entry-thunk type = its second */
 	emit_section (out, 3, &sec);
 	wasm_buf_free (&sec);
+
+	/* Global section (6): the members' module-defined globals, in member order, each a mutable i32 starting at 0. No
+	 * section at all when there are none, so a module without them is byte-identical to one framed before they
+	 * existed. V8 places them in the instance's untagged globals buffer right after the imported s.* values. */
+	{
+		guint32 ng = 0;
+		for (i = 0; i < nmembers; ++i)
+			ng += members [i].nglobals;
+		if (ng) {
+			wasm_buf_init (&sec);
+			wasm_uleb (&sec, ng);
+			for (i = 0; i < ng; ++i) {
+				wasm_u8 (&sec, (guint8) WASM_I32);
+				wasm_u8 (&sec, 0x01);                  /* mutable */
+				wasm_i32_const (&sec, 0);
+				wasm_op (&sec, WASM_OP_END);
+			}
+			emit_section (out, 6, &sec);
+			wasm_buf_free (&sec);
+		}
+	}
 
 	/* Export section (7) */
 	wasm_buf_init (&sec);

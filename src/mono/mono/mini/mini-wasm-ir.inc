@@ -3989,6 +3989,7 @@ typedef struct _WjBody {
 	gpointer       body_imethod;  /* R516: the InterpMethod this body was compiled against (MonoCompile.wasm_jit_caller_imethod), for the stack walk's module records */
 	WjSwInl       *sw_inl;        /* R516: its inlinees (owned; [1..sw_ninl]), for the stack walk's module records */
 	int            sw_ninl;
+	guint32        nglobals;      /* module-defined globals its body uses (WASM_RELOC_GLOBAL 0..nglobals-1); re-framed with it */
 } WjBody;
 
 static int
@@ -4152,6 +4153,7 @@ typedef struct {
 	gpointer              body_imethod;   /* R516: WjBody.body_imethod, for the stack walk's module record */
 	const WjSwInl        *sw_inl;         /* R516: WjBody.sw_inl / sw_ninl */
 	int                   sw_ninl;
+	guint32               nglobals;       /* WjBody.nglobals */
 } WjAsmMember;
 
 typedef struct {
@@ -4453,6 +4455,7 @@ wj_member_from_body (WjAsmMember *m, WjBody *b, int f_slot)
 	m->body_imethod  = b->body_imethod;
 	m->sw_inl        = b->sw_inl;
 	m->sw_ninl       = b->sw_ninl;
+	m->nglobals      = b->nglobals;
 }
 
 /* wj_shadow_candidate, WjShadowCand and wj_collect_shadows lived here -- the eligibility test, the
@@ -4528,6 +4531,17 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 		case WASM_RELOC_TYPE_S:
 		case WASM_RELOC_INDIRECT:
 			continue;   /* a type index only; there is no form to choose */
+		case WASM_RELOC_GLOBAL: {
+			/* a module-defined global: numbered after the imported s.* ones, members' blocks in member order. The
+			 * form stays INDIRECT so pass 2's function-index rebase leaves `idx` alone. */
+			guint32 gb = WASM_IMPORTED_GLOBALS;
+			int j;
+			for (j = 0; j < self_index; ++j)
+				gb += mem [j].nglobals;
+			g_assert (self_index >= 0 && r->table_index < mem [self_index].nglobals);
+			fix [k].idx = gb + r->table_index;
+			continue;
+		}
 		case WASM_RELOC_SELF:
 			/* The entry thunk calling its own method. They are framed together by construction, so this
 			 * is always module-local. The member index is turned into a function index below.
@@ -4772,6 +4786,7 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 		am [i].e_body = &bodies [2 * i + 1];
 		am [i].types = types [i];
 		am [i].ntypes = 2 + mem [i].nextra;
+		am [i].nglobals = mem [i].nglobals;
 	}
 	wasm_module_assemble (am, (guint32) n, (guint32) nexport, import_table, import_eh_tag, eh_type_idx,
 	                      himp, (guint32) nhimp, out);

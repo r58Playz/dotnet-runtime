@@ -1951,6 +1951,150 @@ wj_coalesce_ranges_big (MonoCompile *cfg, int nvreg, int nbb2, int *bb_lo, int *
 	return ordn;
 }
 
+/* MONO_WASM_JIT_DIVREM (mini-wasm.c): mono's decompose (decompose.c, OP_IDIV / OP_IREM under need_div_check) puts the
+ * INT_MIN / -1 OverflowException test before every signed 32-bit division:
+ *     icompare_imm b, -1; int_ceq r1; icompare_imm a, 0x80000000; int_ceq r2; int_and r1, r1, r2; icompare_imm r1, 1;
+ *     cond_exc_ieq "OverflowException"
+ * (by the time the emitter sees it the and's result is a vreg of its own: the re-definition of r1 was renamed; and on a
+ * 32-bit target MONO_EMIT_NEW_ICOMPARE_IMM emits OP_COMPARE_IMM, ir-emit.h, so both compare forms are accepted).
+ * IKVM guards every Java idiv / irem with its own `b != -1` branch (Java's INT_MIN / -1 does not throw; CodeEmitter
+ * Emit_idiv), so that test is dead when the division's block has one way in, the "b != -1" edge of a compare of x with
+ * -1 (icompare_imm, or icompare against an iconst: ADD_BINCOND builds the register form) ending its predecessor, and b
+ * holds x's value. Values are followed through OP_MOVE across the predecessor and the block (a class per value; an
+ * address-taken or volatile variable's class is never trusted). The seven instructions become OP_NOPs; their three
+ * temporaries must be block-local (no variable) and unused after the sequence. Runs before any analysis reads the IR.
+ * Every sequence found is counted, and each one not proven dead counts the first test it failed. */
+static G_GNUC_UNUSED void
+wj_divrem_prune (MonoCompile *cfg)
+{
+	MonoBasicBlock *d;
+	int nvreg = cfg->next_vreg;
+	gint32 *cls, fresh = -1;
+	guint8 *ism1;          /* the vreg holds the constant -1 (an OP_ICONST seen in this scan) */
+	guint32 *stamp, epoch = 0;
+	if (nvreg <= 0)
+		return;
+	cls = (gint32 *) mono_mempool_alloc (cfg->mempool, sizeof (gint32) * nvreg);
+	ism1 = (guint8 *) mono_mempool_alloc (cfg->mempool, nvreg);
+	stamp = (guint32 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint32) * nvreg);
+#define WJ_DR_TRUSTED(v) ({ MonoInst *_vi = get_vreg_to_inst (cfg, (v)); !(_vi && (_vi->flags & (MONO_INST_VOLATILE | MONO_INST_INDIRECT))); })
+#define WJ_DR_CLASS(v) ((v) < 0 || (v) >= nvreg || !WJ_DR_TRUSTED (v) ? fresh-- : (stamp [(v)] == epoch ? cls [(v)] : (v) + 1))
+#define WJ_DR_M1(v) ((v) >= 0 && (v) < nvreg && stamp [(v)] == epoch && ism1 [(v)])
+#define WJ_DR_CMPI(i) ((i)->opcode == OP_ICOMPARE_IMM || (i)->opcode == OP_COMPARE_IMM)   /* i32 either way on wasm32 */
+#define WJ_DR_CMP(i) ((i)->opcode == OP_ICOMPARE || (i)->opcode == OP_COMPARE)
+#define WJ_DR_STEP(ins) do { \
+		MonoInst *_s = (ins); \
+		if (_s->dreg >= 0 && _s->dreg < nvreg && !MONO_IS_STORE_MEMBASE (_s) && INS_INFO (_s->opcode) [MONO_INST_DEST] != ' ') { \
+			gint32 _c = _s->opcode == OP_MOVE ? WJ_DR_CLASS (_s->sreg1) : fresh--; \
+			guint8 _m = _s->opcode == OP_ICONST ? _s->inst_c0 == -1 : (_s->opcode == OP_MOVE && WJ_DR_M1 (_s->sreg1)); \
+			cls [_s->dreg] = _c; ism1 [_s->dreg] = _m; stamp [_s->dreg] = epoch; \
+		} } while (0)
+	for (d = cfg->bb_entry; d; d = d->next_bb) {
+		MonoInst *ins, *seq [7];
+		int n;
+		if (d->flags & BB_EXCEPTION_HANDLER)
+			continue;
+		MONO_BB_FOR_EACH_INS (d, ins) {
+			MonoBasicBlock *p;
+			MonoInst *br, *cmp, *x, *y;
+			gint32 k;
+			int xv = -1, why = 0;
+			if (!WJ_DR_CMPI (ins) || (gint32) ins->inst_imm != -1)
+				continue;
+			for (n = 0, x = ins; n < 7 && x; ++n, x = x->next)
+				seq [n] = x;
+			if (!(n == 7 &&
+			      seq [1]->opcode == OP_ICEQ &&
+			      WJ_DR_CMPI (seq [2]) && (gint32) seq [2]->inst_imm == G_MININT32 &&
+			      seq [3]->opcode == OP_ICEQ &&
+			      seq [4]->opcode == OP_IAND && seq [4]->sreg1 == seq [1]->dreg && seq [4]->sreg2 == seq [3]->dreg &&
+			      WJ_DR_CMPI (seq [5]) && seq [5]->sreg1 == seq [4]->dreg && seq [5]->inst_imm == 1 &&
+			      seq [6]->opcode == OP_COND_EXC_IEQ))
+				continue;
+			wj_count (WJC_DIVREM_OVF_CHECKS);
+			/* the one way in */
+			p = d->in_count == 1 ? d->in_bb [0] : NULL;
+			br = p && p != d ? p->last_ins : NULL;
+			cmp = br ? br->prev : NULL;
+			if (!br || !cmp || !br->inst_true_bb || !br->inst_false_bb) {
+				why = WJC_DIVREM_NO_PRED;
+				goto refuse;
+			}
+			if (!((br->opcode == OP_IBNE_UN && br->inst_true_bb == d && br->inst_false_bb != d) ||
+			      (br->opcode == OP_IBEQ && br->inst_false_bb == d && br->inst_true_bb != d))) {
+				why = WJC_DIVREM_EDGE;
+				goto refuse;
+			}
+			/* the predecessor, up to its compare (nothing but the branch follows it) */
+			if (++epoch == 0) {
+				memset (stamp, 0, sizeof (guint32) * nvreg);
+				epoch = 1;
+			}
+			MONO_BB_FOR_EACH_INS (p, y) {
+				if (y == cmp)
+					break;
+				WJ_DR_STEP (y);
+			}
+			if (WJ_DR_CMPI (cmp) && (gint32) cmp->inst_imm == -1)
+				xv = cmp->sreg1;
+			else if (WJ_DR_CMP (cmp) && WJ_DR_M1 (cmp->sreg2))
+				xv = cmp->sreg1;
+			else if (WJ_DR_CMP (cmp) && WJ_DR_M1 (cmp->sreg1))
+				xv = cmp->sreg2;
+			if (xv < 0) {
+				why = WJC_DIVREM_NO_CMP;
+				goto refuse;
+			}
+			k = WJ_DR_CLASS (xv);
+			/* the division's block up to the sequence: the predecessor's classes hold at its start */
+			MONO_BB_FOR_EACH_INS (d, y) {
+				if (y == ins)
+					break;
+				WJ_DR_STEP (y);
+			}
+			if (WJ_DR_CLASS (ins->sreg1) != k) {
+				why = WJC_DIVREM_CLASS;
+				goto refuse;
+			}
+			/* the temporaries: no variable behind them, and nothing after the sequence reads them */
+			{
+				int tv [3] = { seq [1]->dreg, seq [3]->dreg, seq [4]->dreg }, t, u2, ns2, srcs2 [MONO_MAX_SRC_REGS];
+				gboolean used = FALSE;
+				for (t = 0; t < 3 && !used; ++t)
+					if (tv [t] < 0 || get_vreg_to_inst (cfg, tv [t]))
+						used = TRUE;
+				for (y = seq [6]->next; y && !used; y = y->next) {
+					ns2 = mono_inst_get_src_registers (y, srcs2);
+					for (u2 = 0; u2 < ns2; ++u2)
+						for (t = 0; t < 3; ++t)
+							if (srcs2 [u2] == tv [t])
+								used = TRUE;
+					if (MONO_IS_STORE_MEMBASE (y))
+						for (t = 0; t < 3; ++t)
+							if (y->dreg == tv [t])
+								used = TRUE;
+				}
+				if (used) {
+					why = WJC_DIVREM_TEMPS;
+					goto refuse;
+				}
+			}
+			for (n = 0; n < 7; ++n)
+				NULLIFY_INS (seq [n]);
+			wj_count (WJC_DIVREM_OVF_DROPPED);
+			break;   /* one division per guarded block; the instruction list was just edited */
+		refuse:
+			wj_count (why);
+		}
+	}
+#undef WJ_DR_STEP
+#undef WJ_DR_CMP
+#undef WJ_DR_CMPI
+#undef WJ_DR_M1
+#undef WJ_DR_CLASS
+#undef WJ_DR_TRUSTED
+}
+
 void
 mono_wasm_emit_method (MonoCompile *cfg)
 {
@@ -2005,6 +2149,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int i, cnt [4] = { 0, 0, 0, 0 }, base [4], run [4] = { 0, 0, 0, 0 };
 	WasmLocalGroup groups [4];
 	int dispatch_idx = 0, N = 0;
+	/* Module-defined globals this body uses (WASM_RELOC_GLOBAL 0..nmglobals-1, allocated by nmglobals++), and the one
+	 * MONO_WASM_JIT_T1_GLOBALS gives the body's loop counter (-1: none yet). */
+	guint32 nmglobals = 0;
+	int t1g_loop G_GNUC_UNUSED = -1;
+	/* global.get / global.set of this body's module-defined global G: the index is a hole the framer fills */
+#define WJ_MGLOBAL_OP(OP, G) do { wasm_op (&body, (OP)); wasm_reloc (&body, WASM_RELOC_GLOBAL, 0, (guint32) (G), NULL); } while (0)
+	/* MONO_WASM_JIT_ILOFS_DEDUPE: per dense block, 1 = its EH-record IL-offset store is redundant (every way in leaves
+	 * the record at this block's offset already), or NULL. Built with the EH table. */
+	guint8 *ilofs_skip G_GNUC_UNUSED = NULL;
 	int *disp_id = NULL, disp_n = 0;   /* MONO_WASM_JIT_SPARSE_DISPATCH: a block's index in the dispatcher's table, or -1 */
 	guint32 *nce_in = NULL; int *nce_cv = NULL, nce_nc = 0, nce_cw = 0;   /* MONO_WASM_JIT_NCE_FLOW: wj_nce_flow's in-sets */
 	int scratch_idx G_GNUC_UNUSED = 0; /* i32 local holding the per-thread interp-residual scratch ptr */
@@ -2037,6 +2190,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	int vc_aotkind_idx = 0;            /* i32 local: VCALL_AOT dispatch kind from vcall_aot_target (0=residual,1=+rgctx,2=no-extra) */
 	int aic_vtab_idx = 0, aic_ti_idx = 0, aic_rgctx_idx = 0; /* i32 locals: AOT-vcall IC — this->vtable, ti<<1|kind2, rgctx */
 	int dic_base_idx = 0;              /* i32 local: delegate-IC entry base for the way under test (wire-byte hoist) */
+	int actw_idx G_GNUC_UNUSED = -1;   /* MONO_WASM_JIT_POLL_LOCAL: i32 local holding s.g (the action word's address) */
 	int slotlive_ptr_idx = 0, slotlive_cap_idx = 0; /* i32 locals: cached &wj_slot_live / &wj_slot_live_cap for the INLINE f-slot-IC liveness check (dead in methods with no vcall) */
 	/* Only the POINTER addresses need locals: the pointer is re-loaded through its address on every dispatch
 	 * (so a realloc is picked up), while each capacity is loaded once in the prologue straight into its value
@@ -2072,6 +2226,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * instruction ordinal links them: sl_kill_head[ord] = first vreg whose slot dies right BEFORE the
 	 * ord-th instruction (its last use), sl_kill_next[vreg] = next vreg dying at the same ordinal. */
 	int *sl_kill_head = NULL;          /* [nins] ordinal -> first dying vreg, or -1 */
+	/* MONO_WASM_JIT_PIN_ALIAS=2/3: the aliases to check inline before their call, chained by call ordinal like the
+	 * kill chains (pa_vhead[ord] = first alias index, pa_vnext[alias] = next); pa_vc / pa_vs the carrier and source. */
+	int *pa_vhead G_GNUC_UNUSED = NULL, *pa_vnext G_GNUC_UNUSED = NULL, *pa_vc G_GNUC_UNUSED = NULL, *pa_vs G_GNUC_UNUSED = NULL;
 	/* [nvreg] MONO_WASM_JIT_LCSE: vreg holds a reference with NO pin slot (SLOTLIVE elided it). Such a
 	 * value must never be cached or reused by LCSE — see WJ_LCSE_UNPINNED at the LOADM macro. NULL when
 	 * slot elision is not in play, in which case every isref vreg is pinned and the question is moot. */
@@ -2138,6 +2295,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	wasm_buf_init (&body);
 	wasm_buf_init_relocs (&body);   /* every call site and type index in it is a hole; see wasm-encoder.h */
 	wj_sw_tab = wj_sw_inl_freeze (cfg, &wj_sw_ranges, &wj_sw_n);   /* R516: inlining is done; tag call sites below */
+#ifdef HOST_BROWSER
+	{ extern int mono_wasm_jit_divrem;
+	  if (G_UNLIKELY (mono_wasm_jit_divrem))
+		wj_divrem_prune (cfg); }
+#endif
 	{ extern int mono_wasm_jit_s2;   /* plan2x S2: "this method has a tier-1 body", for the hot rule's callee test */
 	  if (G_UNLIKELY (mono_wasm_jit_s2 & 1) && cfg->wasm_jit_tier < 2)
 		mono_wasm_jit_s2_note_body (cfg); }
@@ -3058,6 +3220,21 @@ co_ranges_done:
 	 * (2020 one-arg stubs) sits ~64 B over the cap, so bytes at this scale decide inlinability. */
 	dic_base_idx = nwparams + cnt [0];
 	cnt [0] += 1;
+	/* MONO_WASM_JIT_POLL_LOCAL: one i32 local for s.g, declared only under the knob and only in a body with a non-entry
+	 * safepoint, so every other body's output is byte-identical. */
+	{
+		extern int mono_wasm_jit_poll_local;
+		gboolean has_loop_poll = FALSE;
+		if (mono_wasm_jit_poll_local)
+			for (bb = cfg->bb_entry; bb && !has_loop_poll; bb = bb->next_bb)
+				if (bb != cfg->bb_entry)
+					MONO_BB_FOR_EACH_INS (bb, ins)
+						if (ins->opcode == OP_GC_SAFE_POINT) { has_loop_poll = TRUE; break; }
+		if (has_loop_poll) {
+			actw_idx = nwparams + cnt [0];
+			cnt [0] += 1;
+		}
+	}
 	/* two i32 locals caching &wj_slot_live / &wj_slot_live_cap for the inline f-slot-IC liveness check
 	 * (dead in methods with no vcall — harmless unused declared locals) */
 	slotlive_ptr_idx = nwparams + cnt [0];
@@ -3286,6 +3463,44 @@ co_ranges_done:
 					vtvreg [i] = TRUE;
 					wj_count (WJC_F4_VT_NONREF);
 				}
+			/* F4 & 16: the same exemption as a greatest fixpoint over two classes, VT (a MonoVTable *) and KL (a
+			 * MonoClass *): a def is VT if it loads [object+0] (bit 1's test) or moves a VT, KL if it loads
+			 * [VT+0] (MonoVTable.klass is the first field) or moves a KL. Optimistic start (every defined vreg
+			 * TOP), each pass lowers a vreg to the meet of its defs; TOP left at the end (a move cycle with no
+			 * grounding load) and mixed VT/KL are refused. Both are metadata, malloc'd, never moved. */
+			if (mono_wasm_jit_f4 & 16) {
+				enum { K_TOP = 0, K_VT = 1, K_KL = 2, K_BAD = 3 };
+				guint8 *kc = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+				gboolean kchg = TRUE;
+				int kpass;
+				for (i = 0; i < nvreg; ++i)
+					kc [i] = vtvreg [i] ? K_VT : (vt_seen [i] ? K_TOP : K_BAD);
+				for (kpass = 0; kchg && kpass <= nvreg; ++kpass) {
+					kchg = FALSE;
+					for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+						MONO_BB_FOR_EACH_INS (bb, ins) {
+							int d = ins->dreg, b_ = ins->sreg1, dc, nk;
+							if (d < 0 || d >= nvreg || vtvreg [d] || kc [d] == K_BAD)
+								continue;
+							if (ins->opcode == OP_MOVE && b_ >= 0 && b_ < nvreg)
+								dc = kc [b_];
+							else if (ins->opcode == OP_LOAD_MEMBASE && ins->inst_offset == 0 && b_ >= 0 && b_ < nvreg &&
+								 MONO_STRUCT_OFFSET (MonoVTable, klass) == 0 && (kc [b_] == K_VT || kc [b_] == K_TOP))
+								dc = kc [b_] == K_VT ? K_KL : K_TOP;
+							else
+								dc = K_BAD;
+							nk = kc [d] == K_TOP ? dc : (dc == K_TOP || dc == kc [d] ? kc [d] : K_BAD);
+							if (nk != kc [d]) { kc [d] = (guint8) nk; kchg = TRUE; }
+						}
+					}
+				}
+				for (i = 0; i < nvreg; ++i)
+					if (!vtvreg [i] && (kc [i] == K_VT || kc [i] == K_KL) && vt [i] == WASM_I32 &&
+					    !vreg_is_ref (cfg, i) && !vreg_is_mp (cfg, i)) {
+						vtvreg [i] = TRUE;
+						wj_count (kc [i] == K_KL ? WJC_F4_KLASS_NONREF : WJC_F4_VT_MOVE_NONREF);
+					}
+			}
 		  } }
 		/* knock candidates down to ref: a vreg is provably non-ref only if EVERY definition is scalar */
 		for (pass = 0; changed && pass <= nvreg; ++pass) {
@@ -3486,6 +3701,14 @@ co_ranges_done:
 				int *def_gen = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nvreg);
 				int *last_use_ord = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
 				int *last_def_ord = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+				/* MONO_WASM_JIT_PIN_ALIAS (mini-wasm.c): per ref vreg, the source of the OP_MOVE that defined it and
+				 * where (ordinal, generation, block, skipped raises so far); use and def counts; and the
+				 * (carrier, source, call ordinal) candidates found at calls. All NULL with the knob off. */
+				extern int mono_wasm_jit_pin_alias;
+				const int pin_alias = mono_wasm_jit_pin_alias;
+				int *ca_src = NULL, *ca_ord = NULL, *ca_gen = NULL, *ca_bb = NULL, *ca_raises = NULL;
+				guint8 *ca_nuse = NULL, *ca_ndef = NULL;
+				int *pa_c = NULL, *pa_s = NULL, *pa_o = NULL, npa = 0, nal = 0;
 				int *bb_last_gcp, *sl_bbidx; int nbbs = 0, nins = 0;
 				MonoBasicBlock *bbl; MonoInst *insl;
 				MonoInst *last_gcp_ins = NULL;
@@ -3525,6 +3748,20 @@ co_ranges_done:
 					ev_bb [i] = -1;
 					last_use_ord [i] = -1;
 					last_def_ord [i] = -1;
+				}
+				if (pin_alias) {
+					ca_src = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+					ca_ord = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nvreg);
+					ca_gen = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nvreg);
+					ca_bb = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nvreg);
+					ca_raises = (int *) mono_mempool_alloc0 (cfg->mempool, sizeof (int) * nvreg);
+					ca_nuse = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
+					ca_ndef = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
+					pa_c = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+					pa_s = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+					pa_o = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+					for (i = 0; i < nvreg; ++i)
+						ca_src [i] = -1;
 				}
 				/* args are defined by the prologue: entry bb (walk ordinal 0), generation 0 */
 				for (i = 0; i < nargs; ++i) {
@@ -3609,6 +3846,8 @@ co_ranges_done:
 		/* sl_fwd_guard is 0 only at RAISE_NOGC=2, the POSITIVE CONTROL, which reproduces the pre-fix
 		 * codegen by dropping exactly this term. Everything else about level 2 is level 1. */ \
 		else if (gcp && (!_fwd || (sl_fwd_guard && gen_skipped_raises > 0))) needs_slot [_u] = TRUE; \
+		/* one count per using instruction: a call may name an argument in its sregs and its arg list both */ \
+		if (ca_nuse && last_use_ord [_u] != ord && ca_nuse [_u] < 255) ca_nuse [_u]++; \
 		last_use_ord [_u] = ord; \
 	} } while (0)
 						for (u = 0; u < nsrc; ++u) {
@@ -3632,6 +3871,21 @@ co_ranges_done:
 							}
 						}
 #undef WJ_SL_USE
+						/* MONO_WASM_JIT_PIN_ALIAS: a GC-capable, non-forwarding call's argument whose carrier was defined
+						 * in this block, in this generation (no GC point since), with no raise skipped since, from a
+						 * source not redefined since, is a candidate. Decided after the walk. */
+						if (pin_alias && sl_call && sl_cw && gcp && !forward_call) {
+							for (u = 0; u < sl_cw->nargs; ++u) {
+								int c_ = wj_arg_vreg (sl_call, u), s_;
+								if (c_ < 0 || c_ >= nvreg || !isref [c_] || ca_src [c_] < 0 || npa >= nvreg)
+									continue;
+								s_ = ca_src [c_];
+								if (ca_bb [c_] != bbn || ca_gen [c_] != gc_gen || ca_raises [c_] != method_skipped_raises ||
+								    last_def_ord [s_] > ca_ord [c_])
+									continue;
+								pa_c [npa] = c_; pa_s [npa] = s_; pa_o [npa] = ord; npa++;
+							}
+						}
 						if (gcp) {
 							gc_gen++;
 							gen_skipped_raises = 0;   /* a real GC point starts a new generation */
@@ -3647,11 +3901,39 @@ co_ranges_done:
 							if (ev_bb [d] == -1) { ev_bb [d] = bbn; sl_def_first [d] = 1; def_gen [d] = gc_gen; }
 							else if (ev_bb [d] != bbn) { sl_multi [d] = 1; needs_slot [d] = TRUE; }
 							else def_gen [d] = gc_gen;
+							if (pin_alias) {
+								if (ca_ndef [d] < 255) ca_ndef [d]++;
+								if (insl->opcode == OP_MOVE && insl->sreg1 >= 0 && insl->sreg1 < nvreg && isref [insl->sreg1]) {
+									ca_src [d] = insl->sreg1; ca_ord [d] = ord; ca_gen [d] = gc_gen; ca_bb [d] = bbn;
+									ca_raises [d] = method_skipped_raises;
+								}
+							}
 						}
 						ord++;
 					}
 				}
 				nins = ord;
+				/* MONO_WASM_JIT_PIN_ALIAS: drop a candidate carrier's slot when its source is slotted anyway (needs_slot
+				 * from its own uses), both are write-through (no address-taken slot), the source is not a volatile or
+				 * indirect variable, and the carrier is the single-def, single-use vreg the call lowering made. The
+				 * source's last use moves to the call, so its SLOTZERO kill (and the terminal-handoff test below)
+				 * see it live across the call. Mode 3, the positive control, skips that extension. */
+				for (i = 0; i < npa; ++i) {
+					int c_ = pa_c [i], s_ = pa_s [i], o_ = pa_o [i];
+					MonoInst *sv_;
+					if (!needs_slot [s_] || !needs_slot [c_] || ca_nuse [c_] != 1 || ca_ndef [c_] != 1)
+						continue;
+					if (li [c_] < 0 || li [s_] < 0 || addrslot [c_] != -1 || addrslot [s_] != -1)
+						continue;
+					sv_ = get_vreg_to_inst (cfg, s_);
+					if (sv_ && (sv_->flags & (MONO_INST_VOLATILE | MONO_INST_INDIRECT)))
+						continue;
+					needs_slot [c_] = FALSE;
+					if (pin_alias != 3 && last_use_ord [s_] < o_)
+						last_use_ord [s_] = o_;
+					pa_c [nal] = c_; pa_s [nal] = s_; pa_o [nal] = o_; nal++;
+					wj_count (WJC_PIN_ALIAS_CARRIERS);
+				}
 				/* With a terminal pinned virtual call and no way to loop back, every reference whose
 				 * textual final use is at/before this call is dead in the caller while the callee runs
 				 * or owns a root in the callee/miss frame. Earlier effective points are allowed only
@@ -3811,6 +4093,33 @@ co_ranges_done:
 							sl_kill_head = NULL;   /* nothing to do: skip the per-ins check in the emit loop */
 						else if (mono_wasm_jit_stats)
 							mono_wasm_jit_add (WJC_SLOT_ZERO_STORES, nzero);
+					}
+				}
+				/* MONO_WASM_JIT_PIN_ALIAS, the post-check: an alias is covered only if its source still has a slot
+				 * (not elided by any arm) and the source's last use -- hence any SLOTZERO kill, at last use + 1 --
+				 * is at or after the call. Anything else restores the carrier's own slot (it gets one in the refslot
+				 * loop below; with no SLOTZERO kill, it pins until its frame pops) and counts. */
+				for (i = 0; i < nal; ++i) {
+					int c_ = pa_c [i], s_ = pa_s [i], o_ = pa_o [i];
+					if (!sl_elide [s_] && needs_slot [s_] && last_use_ord [s_] >= o_)
+						continue;
+					/* the carrier would have been elided without the alias (arms 1 and 3 above do not read
+					 * needs_slot): nothing to restore */
+					if (method_nogc || (effective_gcp_count == 1 && terminal_vcall_handoff && last_use_ord [c_] <= terminal_vcall_ord))
+						continue;
+					sl_elide [c_] = 0;
+					needs_slot [c_] = TRUE;
+					wj_count (WJC_PIN_ALIAS_BAD);
+				}
+				if (pin_alias >= 2 && nal > 0) {
+					pa_vhead = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nins + 1));
+					pa_vnext = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nal);
+					pa_vc = pa_c; pa_vs = pa_s;
+					for (i = 0; i < nins + 1; ++i)
+						pa_vhead [i] = -1;
+					for (i = 0; i < nal; ++i) {
+						pa_vnext [i] = pa_vhead [pa_o [i]];
+						pa_vhead [pa_o [i]] = i;
 					}
 				}
 			}
@@ -4683,6 +4992,73 @@ co_ranges_done:
 				_prev = bb;
 			}
 		}
+#ifdef HOST_BROWSER
+		/* MONO_WASM_JIT_ILOFS_DEDUPE (mini-wasm.c): with the R353 record, its IL offset is written only by the push
+		 * (-1, or the entry block's under the slim fold) and by each block's store, and read by pass 1, the stack
+		 * walk and eh_dispatch. A block leaves the record at its own offset whether it stored or skipped, so a
+		 * block may skip when every predecessor has its exact offset and region and reaches it by a plain edge.
+		 * Never skipped: the entry block (the push wrote -1), handler and filter entries (entered by the landing
+		 * pad or pass 1), blocks with no predecessor, the continuation after OP_CALL_HANDLER (entered from the
+		 * finally's ENDFINALLY dispatch, whose last block's offset is in the record), and successors of a block
+		 * holding a CALL_HANDLER / ENDFINALLY / ENDFILTER. Mode 3 also marks handler entries, the positive control
+		 * for the check-and-repair modes 2 and 3 emit. */
+		{
+			extern int mono_wasm_jit_ilofs_dedupe, mono_wasm_jit_eh_rec;
+			if (mono_wasm_jit_ilofs_dedupe && mono_wasm_jit_eh_rec && N > 0) {
+				guint8 *_ehx = (guint8 *) mono_mempool_alloc0 (cfg->mempool, N);   /* holds an EH-transfer op */
+				guint8 *_cont = (guint8 *) mono_mempool_alloc0 (cfg->mempool, N);  /* a CALL_HANDLER continuation */
+				MonoInst *_ii;
+				ilofs_skip = (guint8 *) mono_mempool_alloc0 (cfg->mempool, N);
+				for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+					int _bd = bbidx [bb->block_num];
+					if (_bd < 0 || _bd >= N)
+						continue;
+					MONO_BB_FOR_EACH_INS (bb, _ii) {
+						if (_ii->opcode == OP_CALL_HANDLER || _ii->opcode == OP_ENDFINALLY || _ii->opcode == OP_ENDFILTER)
+							_ehx [_bd] = 1;
+						if (_ii->opcode == OP_CALL_HANDLER) {
+							MonoInst *_nx = _ii->next;
+							while (_nx && (_nx->opcode == OP_NOP || _nx->opcode == OP_IL_SEQ_POINT || _nx->opcode == OP_SEQ_POINT))
+								_nx = _nx->next;
+							if (_nx && _nx->opcode == OP_BR && _nx->inst_target_bb) {
+								int _cd = bbidx [_nx->inst_target_bb->block_num];
+								if (_cd >= 0 && _cd < N)
+									_cont [_cd] = 1;
+							}
+						}
+					}
+				}
+				for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+					int _bd = bbidx [bb->block_num], _p;
+					gboolean _ok;
+					if (_bd < 0 || _bd >= N || bb == cfg->bb_entry)
+						continue;
+					wj_count (WJC_ILOFS_DEDUPE_BLOCKS);
+					if (bb->flags & BB_EXCEPTION_HANDLER) {
+						if (mono_wasm_jit_ilofs_dedupe == 3) {
+							ilofs_skip [_bd] = 1;
+							wj_count (WJC_ILOFS_DEDUPE_SITES);
+						}
+						continue;
+					}
+					if (bb->in_count == 0 || _cont [_bd])
+						continue;
+					_ok = TRUE;
+					for (_p = 0; _p < bb->in_count && _ok; ++_p) {
+						MonoBasicBlock *_pb = bb->in_bb [_p];
+						int _pd = _pb ? bbidx [_pb->block_num] : -1;
+						if (_pd < 0 || _pd >= N || _ehx [_pd] || _pb->region != bb->region ||
+						    eh_table->il_offsets [_pd] != eh_table->il_offsets [_bd])
+							_ok = FALSE;
+					}
+					if (_ok) {
+						ilofs_skip [_bd] = 1;
+						wj_count (WJC_ILOFS_DEDUPE_SITES);
+					}
+				}
+			}
+		}
+#endif
 		_ents = (WasmEhClause *) g_malloc0 (sizeof (WasmEhClause) * _ecap);
 		for (_ci = 0; _ci < (_e1 ? (guint) cfg->wasm_eh_root_nclauses : cfg->header->num_clauses); ++_ci) {
 			MonoExceptionClause *_c = &cfg->header->clauses [_ci];
@@ -4989,6 +5365,15 @@ co_ranges_done:
 				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dpic_capval_idx);
 			}
 		}
+	}
+	/* MONO_WASM_JIT_POLL_LOCAL: s.g once, here, ahead of the dispatch loop, so the read dominates every block's poll
+	 * (handler blocks included: a local survives an in-function unwind). The address is fixed for the worker's life
+	 * (mini-wasm-publish.inc: a slab slot), so a body never needs it re-read. */
+	if (actw_idx >= 0) {
+		uses_calls = TRUE;
+		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9);
+		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) actw_idx);
+		wj_count (WJC_POLL_LOCAL_BODIES);
 	}
 #endif
 
@@ -5562,6 +5947,26 @@ co_ranges_done:
 				 * NOTHING live across the method's calls. */
 				if (WJ_EHSLIM_ENTRY_FOLD (i, bb)) {
 					/* the slim push wrote this block's offset */
+				} else if (ehrec_on && ilofs_skip && ilofs_skip [i]) {
+					/* MONO_WASM_JIT_ILOFS_DEDUPE: the record already holds this offset. Modes 2 and 3 check it, and on
+					 * a miss count WJC_ILOFS_DEDUPE_RT_BAD and store it after all. */
+					extern int mono_wasm_jit_ilofs_dedupe;
+					if (mono_wasm_jit_ilofs_dedupe >= 2) {
+						extern gint64 mono_wasm_jit_counters [];
+						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+						EHREC_I32_LOAD (mono_wasm_jit_ehrec_layout ()->il_offset);
+						wasm_i32_const (&body, eh_table->il_offsets [i]);
+						wasm_op (&body, WASM_OP_I32_NE);
+						wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+						wasm_i32_const (&body, (gint32) (intptr_t) &mono_wasm_jit_counters [WJC_ILOFS_DEDUPE_RT_BAD]);
+						wasm_i64_const (&body, 1);
+						wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x1f); wasm_memarg (&body, 3, 0);   /* i64.atomic.rmw.add */
+						wasm_op (&body, WASM_OP_DROP);
+						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+						wasm_i32_const (&body, eh_table->il_offsets [i]);
+						EHREC_I32_STORE (mono_wasm_jit_ehrec_layout ()->il_offset);
+						wasm_op (&body, WASM_OP_END);
+					}
 				} else if (ehrec_on) {
 					/* R353: straight into this frame's own record through refbase, which is live for the
 					 * landing pad anyway -- no load of the current island at all */
@@ -5676,6 +6081,28 @@ co_ranges_done:
 			    !(lazy_cold_frame && wj_ins_is_raise (ins)) &&
 			    !(lazy_ref_frame && terminal_vcall_handoff && ins == terminal_vcall_ins))
 				ENSURE_REF_FRAME ();
+			/* MONO_WASM_JIT_PIN_ALIAS=2/3: before an aliased call (its frame ensured just above: the call is an
+			 * effective GC point and not the terminal handoff), the source's slot must hold the carrier's value;
+			 * a miss counts WJC_PIN_ALIAS_RT_BAD. Stack-neutral. A cold-only lazy frame has no hot calls. */
+			if (G_UNLIKELY (pa_vhead != NULL) && !lazy_cold_frame) {
+				extern gint64 mono_wasm_jit_counters [];
+				int ka;
+				for (ka = pa_vhead [my_ord]; ka >= 0; ka = pa_vnext [ka]) {
+					int c_ = pa_vc [ka], s_ = pa_vs [ka];
+					if (refslot [s_] < 0 || li [c_] < 0)
+						continue;
+					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+					wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) (refslot [s_] * 4));
+					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) li [c_]);
+					wasm_op (&body, WASM_OP_I32_NE);
+					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+					wasm_i32_const (&body, (gint32) (intptr_t) &mono_wasm_jit_counters [WJC_PIN_ALIAS_RT_BAD]);
+					wasm_i64_const (&body, 1);
+					wasm_op (&body, WASM_OP_ATOMIC_PREFIX); wasm_u8 (&body, 0x1f); wasm_memarg (&body, 3, 0);   /* i64.atomic.rmw.add */
+					wasm_op (&body, WASM_OP_DROP);
+					wasm_op (&body, WASM_OP_END);
+				}
+			}
 #endif
 			switch (ins->opcode) {
 			case OP_NOP: case OP_IL_SEQ_POINT: case OP_SEQ_POINT:
@@ -5932,7 +6359,7 @@ co_ranges_done:
 					for (pk = 0; pk < nextra; ++pk) if (functype_eq (&extra_types [pk], &pt)) { pti = ti_base + pk; break; }
 					if (pti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pt; pti = ti_base + nextra++; }
 					uses_calls = TRUE;
-					{ extern int mono_wasm_jit_t2, mono_wasm_jit_t2_count, mono_wasm_jit_s2;
+					{ extern int mono_wasm_jit_t2, mono_wasm_jit_t2_count, mono_wasm_jit_s2, mono_wasm_jit_t1_tee, mono_wasm_jit_t1_globals;
 					  /* plan2x S0: count this tier-1 body's entries; at the threshold, request tier 2. A process-wide
 					   * word (the bytes stay identical on every worker); racing increments lose counts, which a
 					   * threshold tolerates. Emitted before the action-word check, at the entry poll only. Under S2
@@ -5940,13 +6367,70 @@ co_ranges_done:
 					  gboolean _t2c = mono_wasm_jit_t2_count > 0 && mono_wasm_jit_t2 && cfg->wasm_jit_caller_imethod;
 					  gboolean _s2e = (mono_wasm_jit_s2 & 1) != 0;
 					  gint32 *_cw = NULL;
+					  gboolean _cw_s2 = FALSE;   /* _cw is the S2 entry record, which C reads (site frequencies' denominator) */
 					  if (bb == cfg->bb_entry && cfg->wasm_jit_tier < 2 && (_t2c || _s2e)) {
 						if (_s2e)
-							_cw = wj_s2_entry_word (cfg);
+							_cw_s2 = (_cw = wj_s2_entry_word (cfg)) != NULL;
 						if (!_cw && _t2c)
 							_cw = wj_word_alloc ();
 					  }
-					  if (_cw && !_t2c) {
+					  if (_cw && mono_wasm_jit_t1_globals) {
+						/* MONO_WASM_JIT_T1_GLOBALS: count in a module global (the instance's own globals buffer, beside the
+						 * s.* values; per instance, so per worker, restarting from 0 when re-framed). An S2 record is
+						 * still the count C reads: it gets PUB added every PUB entries, and the tier-2 test reads it
+						 * there, at its old rate (PUB divides the period). A word only emitted code read is gone. */
+						extern void mono_wasm_jit_t2_count_hit (gpointer imethod);
+						guint32 _ca = (guint32) (gsize) _cw, _per = 1, _pub = 64, _g = nmglobals++;
+						int pci = -1, pkc;
+						if (_t2c) {
+							WasmFuncType pc;
+							memset (&pc, 0, sizeof (pc)); pc.ret = WASM_VOID; pc.nparams = 1; pc.params [0] = WASM_I32;
+							for (pkc = 0; pkc < nextra; ++pkc) if (functype_eq (&extra_types [pkc], &pc)) { pci = ti_base + pkc; break; }
+							if (pci < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pc; pci = ti_base + nextra++; }
+							while (_per < (guint32) mono_wasm_jit_t2_count && _per < 0x40000000u)
+								_per <<= 1;
+							if (_per < _pub)
+								_pub = _per;
+						}
+						WJ_MGLOBAL_OP (WASM_OP_GLOBAL_GET, _g);
+						wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_ADD);
+						wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) rtmp_idx);
+						WJ_MGLOBAL_OP (WASM_OP_GLOBAL_SET, _g);
+						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) rtmp_idx);
+						wasm_i32_const (&body, (gint32) ((_cw_s2 ? _pub : _per) - 1));
+						wasm_op (&body, WASM_OP_I32_AND);
+						wasm_op (&body, WASM_OP_I32_EQZ);
+						WJ_HINT (0);
+						wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+						if (_cw_s2) {
+							wasm_i32_const (&body, 0);
+							wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _ca);
+							wasm_i32_const (&body, (gint32) _pub); wasm_op (&body, WASM_OP_I32_ADD);
+							if (_t2c) {
+								wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) rtmp_idx);
+								wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _ca);
+								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) rtmp_idx);
+								wasm_i32_const (&body, (gint32) (_per - 1));
+								wasm_op (&body, WASM_OP_I32_AND);
+								wasm_op (&body, WASM_OP_I32_EQZ);
+								WJ_HINT (0);
+								wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+							} else {
+								wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _ca);
+							}
+						}
+						if (_t2c) {
+							ENSURE_REF_FRAME ();
+							wasm_i32_const (&body, (gint32) (intptr_t) cfg->wasm_jit_caller_imethod);
+							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_t2_count_hit, (guint32) pci);
+							RELEASE_LAZY_REF_FRAME ();
+							wj_count (WJC_T2C_SITES);
+							if (_cw_s2)
+								wasm_op (&body, WASM_OP_END);
+						}
+						wasm_op (&body, WASM_OP_END);
+						wj_count (WJC_T1G_ENTRY_SITES);
+					  } else if (_cw && !_t2c) {
 						guint32 _ca = (guint32) (gsize) _cw;
 						wasm_i32_const (&body, 0);
 						wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _ca);
@@ -5962,8 +6446,15 @@ co_ranges_done:
 						wasm_i32_const (&body, 0);
 						wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _ca);
 						wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_ADD);
-						wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _ca);
-						wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _ca);
+						if (mono_wasm_jit_t1_tee) {   /* MONO_WASM_JIT_T1_TEE: test the stored value, not a reload */
+							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) rtmp_idx);
+							wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _ca);
+							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) rtmp_idx);
+							wj_count (WJC_T1_TEE_SITES);
+						} else {
+							wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _ca);
+							wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _ca);
+						}
 						{   /* every 2^ceil(log2 T2_COUNT) entries, not once at exactly T2_COUNT: a request released on a
 						     * BUSY give-up must be able to fire again (b4 gate, 2026-10-01: the hottest tier-1 root was lost
 						     * that way). mono_wasm_jit_t2_count_hit ignores a method already requested or done. */
@@ -5983,14 +6474,14 @@ co_ranges_done:
 						wasm_op (&body, WASM_OP_END);
 						wj_count (WJC_T2C_SITES);
 					  } }
-					{ extern int mono_wasm_jit_t2, mono_wasm_jit_t2_loop_count;
+					{ extern int mono_wasm_jit_t2, mono_wasm_jit_t2_loop_count, mono_wasm_jit_t1_tee, mono_wasm_jit_t1_globals;
 					  /* R409: count this tier-1 body's LOOP polls (one word per body, shared by its loops); every
 					   * 2^ceil(log2 T2_LOOP_COUNT) back-edges, request tier 2 exactly as S0's entry counter does. The sampler
 					   * credits the poll that a timer tick lands on, and a loop that spends its time in poll-free callees is
 					   * undersampled ~30x (R334: selectTicks) -- this does not sample. */
 					  if (mono_wasm_jit_t2_loop_count > 0 && mono_wasm_jit_t2 && bb != cfg->bb_entry && cfg->wasm_jit_tier < 2 &&
 					      cfg->wasm_jit_caller_imethod &&
-					      (cfg->wasm_t2_loop_word || (cfg->wasm_t2_loop_word = wj_word_alloc ()))) {
+					      (mono_wasm_jit_t1_globals || cfg->wasm_t2_loop_word || (cfg->wasm_t2_loop_word = wj_word_alloc ()))) {
 						extern void mono_wasm_jit_t2_count_hit (gpointer imethod);
 						guint32 _la, _per = 1;
 						WasmFuncType plc; int plci = -1, pklc;
@@ -6000,11 +6491,30 @@ co_ranges_done:
 						if (plci < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = plc; plci = ti_base + nextra++; }
 						while (_per < (guint32) mono_wasm_jit_t2_loop_count && _per < 0x40000000u)
 							_per <<= 1;
+						if (mono_wasm_jit_t1_globals) {
+							/* MONO_WASM_JIT_T1_GLOBALS: the body's loop count in a module global (only emitted code reads it) */
+							if (t1g_loop < 0)
+								t1g_loop = (int) nmglobals++;
+							WJ_MGLOBAL_OP (WASM_OP_GLOBAL_GET, t1g_loop);
+							wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_ADD);
+							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) rtmp_idx);
+							WJ_MGLOBAL_OP (WASM_OP_GLOBAL_SET, t1g_loop);
+							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) rtmp_idx);
+							wj_count (WJC_T1G_LOOP_SITES);
+						} else {
 						wasm_i32_const (&body, 0);
 						wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _la);
 						wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_ADD);
-						wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _la);
-						wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _la);
+						if (mono_wasm_jit_t1_tee) {   /* MONO_WASM_JIT_T1_TEE: test the stored value, not a reload */
+							wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) rtmp_idx);
+							wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _la);
+							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) rtmp_idx);
+							wj_count (WJC_T1_TEE_SITES);
+						} else {
+							wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _la);
+							wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _la);
+						}
+						}
 						wasm_i32_const (&body, (gint32) (_per - 1));
 						wasm_op (&body, WASM_OP_I32_AND);
 						wasm_op (&body, WASM_OP_I32_EQZ);
@@ -6024,7 +6534,12 @@ co_ranges_done:
 						if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_ENTRY_POLL_DROPPED]);
 						break;
 					  } }
-					wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = this worker's action word */
+					if (actw_idx >= 0) {   /* MONO_WASM_JIT_POLL_LOCAL: read once after the prologue */
+						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) actw_idx);
+						wj_count (WJC_POLL_LOCAL_SITES);
+					} else {
+						wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 9); /* s.g = this worker's action word */
+					}
 					{
 						extern int mono_wasm_jit_t2, mono_wasm_jit_t2_sample_loop;
 						/* R355: under T2_SAMPLE_LOOP=2 an ENTRY poll reads only the low byte, so the loop-owed
@@ -8742,9 +9257,30 @@ vcall_nullchk_done:
 								if (vs_slot > 0) {
 									WjVslowDesc *vsd = wj_vslow_desc (vic, aic, call->method, (int) vpic_site, mono_wasm_jit_vcall_ways,
 										(vc_mid_slot >= 0 && mono_wasm_jit_ic_mid) ? vc_mid_slot : -1);
+									/* MONO_WASM_JIT_PIC_L0 (mini-wasm.c): two module globals in front of the worker PIC, the
+									 * receiver vtable and the f-slot of this site's last PIC hit. l0d = the one extra block level
+									 * ($l0hit) they add around $chit. */
+									extern int mono_wasm_jit_pic_l0;
+									int l0k = -1, l0f = -1, l0v_ti = -1, l0d = 0;
+									if (mono_wasm_jit_pic_l0) {
+										l0k = (int) nmglobals++;
+										l0f = (int) nmglobals++;
+										l0d = 1;
+										wj_count (WJC_PIC_L0_SITES);
+										if (mono_wasm_jit_pic_l0 == 2) {
+											WasmFuncType l0t;
+											memset (&l0t, 0, sizeof (l0t)); l0t.ret = WASM_VOID; l0t.nparams = 1; l0t.params [0] = WASM_I32;
+											for (vk = 0; vk < nextra; ++vk) if (functype_eq (&extra_types [vk], &l0t)) { l0v_ti = ti_base + vk; break; }
+											if (l0v_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = l0t; l0v_ti = ti_base + nextra++; }
+										}
+									}
 									wj_count (WJC_VSLOW_SITES);
-									/* $cslow: a br out of it calls the stub. $chit: a br out of it holds an admitted f-slot in vc_fslot. */
+									/* $cslow: a br out of it calls the stub. $chit: a br out of it holds an admitted f-slot in vc_fslot.
+									 * $l0hit (PIC_L0 only): a br out of it holds one too, from the L0 globals, and skips their refill. */
 									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $cslow */
+									if (l0d) {
+										wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $l0hit */
+									}
 									wasm_op (&body, WASM_OP_BLOCK); wasm_u8 (&body, 0x40);   /* $chit */
 									{ extern int mono_wasm_jit_f4;
 									  int _irvt = (mono_wasm_jit_f4 & 2) ? wj_ir_vtable_vreg (ins, this_vr) : -1;
@@ -8755,11 +9291,29 @@ vcall_nullchk_done:
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 									  } }
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
+									if (l0d) {
+										/* L0: the vtable of this site's last PIC hit on this instance, and its f-slot -- admitted
+										 * here, since it came out of this pthread's PIC (the instance lives within one pthread,
+										 * R293). Initially 0, which no receiver vtable is. */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										WJ_MGLOBAL_OP (WASM_OP_GLOBAL_GET, l0k);
+										wasm_op (&body, WASM_OP_I32_EQ);
+										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+											if (l0v_ti >= 0) {   /* PIC_L0=2: the f-slot must be live on this pthread */
+												extern void mono_wasm_jit_pic_l0_verify (int fslot);
+												WJ_MGLOBAL_OP (WASM_OP_GLOBAL_GET, l0f);
+												wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_pic_l0_verify, (guint32) l0v_ti);
+											}
+											WJ_MGLOBAL_OP (WASM_OP_GLOBAL_GET, l0f);
+											wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_fslot_idx);
+											wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 2);   /* -> out of $l0hit: the hit tail */
+										wasm_op (&body, WASM_OP_END);
+									}
 									wasm_i32_const (&body, (gint32) vpic_site);
 									EMIT_IC_VPIC_CAPVAL ();
 									wasm_op (&body, WASM_OP_I32_GE_U);
 									WJ_HINT2 (0, WJC_BRANCH_HINT_IC);
-									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1);   /* no PIC yet -> $cslow */
+									wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1 + l0d);   /* no PIC yet -> $cslow */
 									EMIT_IC_VPIC_PTR ();
 									wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_ti_idx);   /* the PIC array base */
@@ -8814,8 +9368,16 @@ vcall_nullchk_done:
 											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, 1);                /* hit -> $chit */
 										wasm_op (&body, WASM_OP_END);   /* $mc_miss */
 									  } }
-									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* -> $cslow */
+									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1 + l0d);   /* -> $cslow */
 									wasm_op (&body, WASM_OP_END);                        /* $chit */
+									if (l0d) {
+										/* a PIC hit (way 0 or F9): it becomes L0 */
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										WJ_MGLOBAL_OP (WASM_OP_GLOBAL_SET, l0k);
+										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										WJ_MGLOBAL_OP (WASM_OP_GLOBAL_SET, l0f);
+										wasm_op (&body, WASM_OP_END);                    /* $l0hit */
+									}
 									wj_emit_fast_count (&body, WJC_FAST_VIC);
 									for (ai = 0; ai < n2; ++ai)
 										if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "vslow hit arg ld"; goto done; }
@@ -10381,6 +10943,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 			am [0].body_imethod = cfg->wasm_jit_caller_imethod;
 			am [0].sw_inl = wj_sw_tab;
 			am [0].sw_ninl = wj_sw_n;
+			am [0].nglobals = nmglobals;
 			wj_asm_policy_init (&pol, FALSE /* keep self-recursion indirect, as it has always been */);
 			wasm_buf_init (&out);
 			/*
@@ -10452,6 +11015,7 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 			                               ret_vt, groups, extra_types, (guint32) nextra,
 			                               uses_calls, uses_eh_tag, eh_type_idx);
 			if (wj_stored_body) {
+				wj_stored_body->nglobals = nmglobals;
 				wj_stored_body->t1down = cfg->wasm_jit_t1_down;
 				wj_stored_body->body_imethod = cfg->wasm_jit_caller_imethod;
 				if (wj_sw_tab) {

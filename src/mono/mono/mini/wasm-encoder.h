@@ -423,7 +423,14 @@ typedef enum {
 	                       * constant-index indirect traffic on its own. */
 	WASM_RELOC_CALL,      /* a call to another JITted method, identified by `sym` and its f-slot */
 	WASM_RELOC_SELF,      /* a `call` naming the owning member's own method function; always module-local */
+	WASM_RELOC_GLOBAL,    /* the index immediate of a global.get / global.set of a MODULE-DEFINED global: `table_index` is
+	                       * the member's own global number (0..nglobals-1), written as WASM_IMPORTED_GLOBALS + the
+	                       * member's base in the module + that number (the resolver puts it in the fix's `idx`). Not a
+	                       * call: it neither ends a call's run nor takes a key, but like every hole it resets key_src */
 } WasmRelocKind;
+
+/* The s.* globals every module imports (emit_import_section's gnames): module-defined globals are numbered after them. */
+#define WASM_IMPORTED_GLOBALS 10
 
 typedef struct {
 	guint32  off;          /* insertion point in the code buffer. The hole occupies NO bytes. */
@@ -599,6 +606,8 @@ typedef struct {
 	const WasmBuf        *e_body;
 	const WasmFuncType   *types;
 	guint32               ntypes;
+	guint32               nglobals;   /* module-defined i32 globals the member's bodies use (mutable, initial 0); numbered
+	                                   * in member order after the imported ones (WASM_RELOC_GLOBAL) */
 } WasmAsmMember;
 
 /*
