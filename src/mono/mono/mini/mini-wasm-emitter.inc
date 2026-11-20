@@ -1951,6 +1951,62 @@ wj_coalesce_ranges_big (MonoCompile *cfg, int nvreg, int nbb2, int *bb_lo, int *
 	return ordn;
 }
 
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_B4_IC (mini-wasm.c): the IC site's dynamic call was just emitted (its WASM_RELOC_INDIRECT is the last
+ * hole). Give it an exact counter (bumped by the serializer while the body is framed alone, as B4_EXACT does for named
+ * calls) and record one B4 edge per profiled target holding at least B4_IC % of the site's observations and a JIT
+ * f-slot, weighted by that share of the counter. A target is a retained profile pointer: tested dead before the f-slot
+ * peek dereferences it. */
+static void
+wj_b4_ic_edges (WasmBuf *b, MonoCompile *cfg, MonoCallInst *call)
+{
+	extern int mono_wasm_jit_b4_ic;
+	extern int mono_wasm_jit_prof_targets (gpointer caller_ptr, MonoMethod *base, MonoMethod **out_t, guint32 *out_c, int max, guint32 *out_total);
+	extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+	extern int mono_wasm_jit_method_known_dead (MonoMethod *method, int site);
+	MonoMethod *t [8];
+	guint32 c [8], total = 0;
+	gint32 *cnt = NULL;
+	int n, i, ne = 0;
+	if (!b->relocs || !b->relocs->n || b->relocs->r [b->relocs->n - 1].kind != WASM_RELOC_INDIRECT)
+		return;
+	n = mono_wasm_jit_prof_targets (wj_call_prof_im (cfg, call), call->method, t, c, 8, &total);
+	if (n <= 0 || !total) {
+		wj_count (WJC_B4_IC_NOPROF);
+		return;
+	}
+	for (i = 0; i < n; ++i) {
+		guint32 share = (guint32) ((guint64) c [i] * 256 / total);
+		int fs;
+		if ((guint64) c [i] * 100 < (guint64) mono_wasm_jit_b4_ic * total)
+			continue;
+		if (mono_wasm_jit_method_known_dead (t [i], -1))
+			continue;
+		fs = mono_wasm_jit_get_callee_fslot (t [i]);
+		if (fs <= 0) {
+			wj_count (WJC_B4_IC_NOFSLOT);
+			continue;
+		}
+		if (!cnt) {
+			cnt = wj_word_alloc ();
+			if (!cnt)
+				return;
+			b->relocs->r [b->relocs->n - 1].edge_cnt = (guint32) (gsize) cnt;
+		}
+		{
+			WjEdge e = { t [i], fs, cnt, 0, 0, share ? share : 1 };
+			g_array_append_val (wj_edge_buf, e);
+		}
+		ne++;
+	}
+	if (ne) {
+		wj_count (WJC_B4_IC_SITES);
+		if (mono_wasm_jit_stats)
+			mono_wasm_jit_add (WJC_B4_IC_EDGES, ne);
+	}
+}
+#endif
+
 /* MONO_WASM_JIT_DIVREM (mini-wasm.c): mono's decompose (decompose.c, OP_IDIV / OP_IREM under need_div_check) puts the
  * INT_MIN / -1 OverflowException test before every signed 32-bit division:
  *     icompare_imm b, -1; int_ceq r1; icompare_imm a, 0x80000000; int_ceq r2; int_and r1, r1, r2; icompare_imm r1, 1;
@@ -9384,6 +9440,9 @@ vcall_nullchk_done:
 									WJ_PUSH_SP ();
 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
 									wj_emit_dynamic_call (&body, (guint32) ftdi, WJ_DYN_F);
+									{ extern int mono_wasm_jit_b4_ic;   /* MONO_WASM_JIT_B4_IC: this hit tail's targets as B4 edges */
+									  if (G_UNLIKELY (wj_edge_on) && mono_wasm_jit_b4_ic > 0 && mono_wasm_jit_b4_exact)
+										wj_b4_ic_edges (&body, cfg, call); }
 									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "vslow hit dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);       /* -> end $after */
 									wasm_op (&body, WASM_OP_END);                            /* $cslow */

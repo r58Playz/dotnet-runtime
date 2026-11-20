@@ -1535,6 +1535,10 @@ enum {
 	WJC_T1G_LOOP_SITES,          /* ... tier-1 loop counters (R409) kept in a module global */
 	WJC_PIC_L0_SITES,            /* MONO_WASM_JIT_PIC_L0: compact virtual sites given the two L0 globals */
 	WJC_PIC_L0_NOTLIVE,          /* ... PIC_L0=2 run time: an L0 hit whose f-slot is not live on this pthread (MUST be 0) */
+	WJC_B4_IC_SITES,             /* MONO_WASM_JIT_B4_IC: compact IC sites that recorded at least one B4 edge */
+	WJC_B4_IC_EDGES,             /* ... edges recorded (one per profiled target over the share) */
+	WJC_B4_IC_NOPROF,            /* ... sites with no settled profile record */
+	WJC_B4_IC_NOFSLOT,           /* ... targets over the share without a JIT f-slot */
 	WJC_MAX
 };
 

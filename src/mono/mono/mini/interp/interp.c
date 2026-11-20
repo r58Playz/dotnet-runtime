@@ -2095,6 +2095,52 @@ mono_wasm_jit_prof_predict_alt (gpointer caller_ptr, MonoMethod *base, MonoVTabl
 }
 
 /*
+ * MONO_WASM_JIT_B4_IC: every resolved target of a virtual site, merged by target (several receivers can share one
+ * override), with their observation counts and the site's total (which also counts untracked receivers). Same
+ * lock-free double read as predict_alt; an unusable target is skipped. Returns the number written to out_t / out_c.
+ */
+int mono_wasm_jit_prof_targets (gpointer caller_ptr, MonoMethod *base, MonoMethod **out_t, guint32 *out_c, int max, guint32 *out_total);
+int
+mono_wasm_jit_prof_targets (gpointer caller_ptr, MonoMethod *base, MonoMethod **out_t, guint32 *out_c, int max, guint32 *out_total)
+{
+	InterpMethod *caller = (InterpMethod *) caller_ptr;
+	WjProfSite *s;
+	guint32 k, nids1, nids2, total1, total2;
+	int n = 0, j;
+	*out_total = 0;
+	if (!caller || !base || max <= 0)
+		return 0;
+	s = wj_prof_site (caller, base, WJ_SITE_VIRTUAL, FALSE);
+	if (!s)
+		return 0;
+	nids1 = s->nids; total1 = s->total;
+	mono_memory_barrier ();
+	for (k = 0; k < nids1 && k < WJ_PROF_WAYS; ++k) {
+		MonoMethod *t = s->id_targets [k];
+		guint32 c = s->id_counts [k];
+		if (!s->ids [k] || !t || !c)
+			continue;
+		if (G_UNLIKELY (!wj_method_usable_profile (t)))
+			continue;
+		for (j = 0; j < n && out_t [j] != t; ++j)
+			;
+		if (j < n)
+			out_c [j] += c;
+		else if (n < max) {
+			out_t [n] = t;
+			out_c [n] = c;
+			n++;
+		}
+	}
+	mono_memory_barrier ();
+	nids2 = s->nids; total2 = s->total;
+	if (nids1 != nids2 || total1 != total2 || !total1)
+		return 0;
+	*out_total = total1;
+	return n;
+}
+
+/*
  * R215b: the dominant target at a DELEGATE site.
  *
  * Delegates need their own reader, and the reason is structural rather than cosmetic. For a delegate site

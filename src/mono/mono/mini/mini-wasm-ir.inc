@@ -2332,11 +2332,16 @@ wj_emit_stub_call (WasmBuf *b, gpointer addr, guint32 type_idx)
  * site had no record and the counter is the root's entry count. */
 /* `base`: MONO_WASM_JIT_B4_SEED bit 2 -- what the same (caller, callee) pair had counted in the body this one replaced,
  * when the replacement registered; 0 otherwise. Read every weight through wj_edge_weight. */
-typedef struct { gpointer callee; gint32 fslot; gint32 *wptr; guint32 est; guint32 base; } WjEdge;
+/* `share`: MONO_WASM_JIT_B4_IC -- an IC site's edge to one of its profiled targets counts the whole site (wptr), so it
+ * weighs that target's share of the site's observations, in 1/256 (0 = the whole count: a named call). */
+typedef struct { gpointer callee; gint32 fslot; gint32 *wptr; guint32 est; guint32 base; guint32 share; } WjEdge;
 static inline guint32
 wj_edge_weight (const WjEdge *ed)
 {
-	guint64 w = (guint64) (ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0u) + ed->base;
+	guint64 w = (guint64) (ed->wptr ? ((guint32) *ed->wptr & 0x7fffffffu) : 0u);
+	if (ed->share)
+		w = w * ed->share / 256;
+	w += ed->base;
 	return w > 0x7fffffffu ? 0x7fffffffu : (guint32) w;
 }
 static __thread GArray *wj_edge_buf;

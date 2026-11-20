@@ -434,6 +434,11 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 			wasm_uleb (out, fix [k].idx);   /* the module's global index, resolved by the framer */
 			break;
 		case WASM_RELOC_INDIRECT:
+			if (r->edge_cnt && fix [k].count_edge) {
+				/* MONO_WASM_JIT_B4_IC: an IC site counts itself while its body is framed alone, like a named call */
+				guint32 _ko = wasm_emit_count (out, r->edge_cnt, 0);
+				key = closed ? (gint64) (_ko - base) : -1;
+			}
 			WASM_COUNT_SITE (WASM_SF_DYNAMIC);
 			wasm_site_note (out, base, r, key);
 			wasm_op (out, WASM_OP_CALL_INDIRECT);

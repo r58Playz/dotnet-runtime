@@ -1431,6 +1431,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_divrem, "MONO_WASM_JIT_DIVREM", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t1_globals, "MONO_WASM_JIT_T1_GLOBALS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_pic_l0, "MONO_WASM_JIT_PIC_L0", 0, 2)
+	WJ_T2_KNOB (mono_wasm_jit_b4_ic, "MONO_WASM_JIT_B4_IC", 0, 100)
 #if defined(HOST_WASM) && defined(__wasm_atomics__)
 	/* mono_wasm_hw_fence lives in utils/atomic.c and exists only in the threaded wasm runtime, not in mono-aot-cross. */
 	WJ_T2_KNOB (mono_wasm_hw_fence, "MONO_WASM_HW_FENCE", 0, 1)
@@ -1645,7 +1646,13 @@ int mono_wasm_jit_t1_globals = 1;   /* (the 2026-11-20 set; measured at MONO_WAS
  * beside the s.* values, where the PIC is a per-thread array the site reaches through two loads and a bounds check
  * (plan snuggly-mapping-goblet 2.2: the gate is the IC rows' misses). 1 = on; 2 = on, and every L0 hit tests the
  * f-slot's liveness (WJC_PIC_L0_NOTLIVE must read 0); 0 = off. */
-int mono_wasm_jit_pic_l0 = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
+int mono_wasm_jit_pic_l0 = 1;
+/* MONO_WASM_JIT_B4_IC=<percent>: a compact virtual site's profiled targets that hold at least this % of its observations
+ * become B4 edges (weighted by that share of the site's own exact counter, bumped while the body is framed alone), so the
+ * planner can co-locate an IC's hot targets with the caller: a call_indirect into the same instance is cheaper on the
+ * instance data and is what V8's CallIndirectIC can inline (builtins/wasm.tq). With B4 framed, 85% of IC-published
+ * targets sat in another module (mctick, 2026-11-20). Needs MONO_WASM_JIT_B4_EXACT. 0 = named calls only. */
+int mono_wasm_jit_b4_ic = 0;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
 /* MONO_WASM_JIT_VOLATILE_LOAD=1: a SEQ barrier followed (past null checks and constants) by a load mono flagged
  * MONO_INST_VOLATILE -- IKVM's Java volatile read, which it brackets as Thread.MemoryBarrier(); volatile. ldfld -- emits no
  * fence, and the load becomes a seq-cst wasm atomic load (a plain mov on x64). Only 1-, 2- and 4-byte loads at a naturally
