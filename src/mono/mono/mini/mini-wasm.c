@@ -1695,9 +1695,14 @@ int mono_wasm_jit_b4_ic = 0;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT
  * The read-side fence is also the StoreLoad fence of any Java volatile store before it that has none of its own, and two
  * kinds do not: (a) IKVM merges a store's trailing barrier into the next barrier of the same straight-line IL
  * (CodeEmitter.RemoveRedundantMemoryBarriers) -- wj_vol_store_reaches keeps every fence a store reaches without an
- * intervening fence or call; (b) IKVM.Runtime's Unsafe emulation stores with Volatile.Write or a bare `volatile. stind`
- * and no fence, which nothing here can see. The first build without (a) stopped 262c's memwalk datapack (2026-11-16,
- * findings note "levers3"); with (b) unfixed the knob is NOT sound. */
+ * intervening fence or call; (b) IKVM.Runtime's Unsafe emulation stored with Volatile.Write or a bare `volatile. stind`
+ * and no fence. The first build without (a) stopped 262c's memwalk datapack (2026-11-16, findings note "levers3").
+ * (b) is closed (audit 2026-11-21, plan abstract-hatching-stearns E1): IKVM ada11be7e fences after every Unsafe
+ * put*Volatile; every other `volatile.` store IKVM emits for a Java volatile is followed by a barrier
+ * (RuntimeSimpleJavaField, atomic.cs, Unsafe's array-volatile delegate through its fenced callers); and Volatile.Write
+ * is OP_ATOMIC_STORE_* (intrinsics.c), a seq-cst wasm atomic store, which V8 lowers to xchg on x64
+ * (code-generator-x64.cc EmitStore<seq_cst>; the decoder's atomic order is kSeqCst, function-body-decoder-impl.h).
+ * The remaining gate is 262c's memwalk as a rate (>= 10 runs, the datapack stepping every time) at 1. */
 int mono_wasm_jit_volatile_load = 0;
 /* MONO_WASM_JIT_MAX_PARAMS: the largest wasm functype a JIT body or call site may use (this, args and the frame-base
  * argument). 16 (default) is the old fixed limit; up to WASM_FUNCTYPE_MAX_PARAMS (24): args spill into the per-thread
