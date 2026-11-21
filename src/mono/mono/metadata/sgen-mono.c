@@ -1994,6 +1994,38 @@ mono_gc_wasm_inline_alloc_size (MonoClass *klass)
 #endif
 }
 
+/*
+ * For a one-dimensional array class: the largest length the JIT may bump-allocate inline (its aligned size, header
+ * included, stays under SGEN_MAX_SMALL_OBJ_SIZE and the TLAB), with the element size in *esize; 0 when every
+ * allocation must call the allocator. mono_gc_wasm_inline_alloc_size's conditions otherwise. The fast path writes
+ * the vtable and max_length; bounds stays 0 from the cleared TLAB, as the managed array allocator leaves it.
+ */
+int
+mono_gc_wasm_inline_array_max (MonoClass *array_class, int *esize)
+{
+#ifdef MANAGED_ALLOCATION
+	int es;
+	gsize lim;
+	if (sgen_collect_before_allocs || mono_profiler_allocations_enabled () || sgen_nursery_canaries_enabled ())
+		return 0;
+	if (sgen_nursery_clear_policy != CLEAR_AT_TLAB_CREATION && sgen_nursery_clear_policy != CLEAR_AT_TLAB_CREATION_DEBUG &&
+	    sgen_nursery_clear_policy != CLEAR_AT_GC)
+		return 0;
+	if (m_class_get_rank (array_class) != 1 || m_class_get_byval_arg (array_class)->type != MONO_TYPE_SZARRAY)
+		return 0;
+	es = mono_array_element_size (array_class);
+	if (es <= 0 || es > 255)
+		return 0;
+	lim = MIN ((gsize) SGEN_MAX_SMALL_OBJ_SIZE - 1, (gsize) sgen_tlab_size);
+	if (lim <= MONO_SIZEOF_MONO_ARRAY + SGEN_ALLOC_ALIGN)
+		return 0;
+	*esize = es;
+	return (int) ((lim - MONO_SIZEOF_MONO_ARRAY - (SGEN_ALLOC_ALIGN - 1)) / (gsize) es);
+#else
+	return 0;
+#endif
+}
+
 /* A word read out of nursery memory, named if it is a class's own vtable. Every load is bounds-tested first: the word
  * can be anything. */
 static const char *

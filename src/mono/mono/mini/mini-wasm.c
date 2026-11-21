@@ -1407,6 +1407,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_fast_tls, "MONO_WASM_JIT_FAST_TLS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_trivial, "MONO_WASM_JIT_INLINE_TRIVIAL", 0, 64)
+	WJ_T2_KNOB (mono_wasm_jit_newarr_inline, "MONO_WASM_JIT_NEWARR_INLINE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
@@ -1985,6 +1986,11 @@ int mono_wasm_jit_inline_zero = 64;   /* max framebytes to zero inline; 0 disabl
  * The managed allocator wrapper that would have done this is unusable from here: a JIT call resolves it to the
  * interpreter, which cannot run its TLS opcodes (handle_alloc in method-to-ir.c). R305. */
 int mono_wasm_jit_inline_alloc = 1;
+/* MONO_WASM_JIT_NEWARR_INLINE (plan abstract-hatching-stearns C3): a CEE_NEWARR with no generic context bump-allocates
+ * a small array from the TLAB (OP_WASM_JIT_NEWARR_FAST, mono_gc_wasm_inline_array_max), calling
+ * ves_icall_array_new_specific only when the op yields 0 (too long, negative, TLAB exhausted, detached). mctick: 4.3 k
+ * array allocations a tick took the icall. 0 = every newarr calls it. */
+int mono_wasm_jit_newarr_inline = 0;
 gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,

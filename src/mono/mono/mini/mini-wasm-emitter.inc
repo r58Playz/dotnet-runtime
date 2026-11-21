@@ -3245,7 +3245,7 @@ co_ranges_done:
 		gboolean has_alloc_fast = FALSE;
 		for (bb = cfg->bb_entry; bb && !has_alloc_fast; bb = bb->next_bb)
 			MONO_BB_FOR_EACH_INS (bb, ins)
-				if (ins->opcode == OP_WASM_JIT_ALLOC_FAST) { has_alloc_fast = TRUE; break; }
+				if (ins->opcode == OP_WASM_JIT_ALLOC_FAST || ins->opcode == OP_WASM_JIT_NEWARR_FAST) { has_alloc_fast = TRUE; break; }
 		if (has_alloc_fast) {
 			alloc_tmp_idx = nwparams + cnt [0];
 			cnt [0] += 3;
@@ -6391,6 +6391,87 @@ co_ranges_done:
 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "alloc_fast dreg"; goto done; }
 #else
 				fail = "alloc_fast offline"; goto done;
+#endif
+				break;
+			}
+			case OP_WASM_JIT_NEWARR_FAST: {
+#ifdef HOST_BROWSER
+				/* C3: OP_WASM_JIT_ALLOC_FAST's bump for a one-dimensional array of length len = sreg1:
+				 *     if ((unsigned) len <= nmax) { size = (len * esize + 16 + 7) & ~7; <the bump>; p->max_length = len }
+				 * and 0 otherwise (a negative length is a huge unsigned one), so the caller's icall raises what it must.
+				 * MONO_SIZEOF_MONO_ARRAY is 16 on wasm32: vtable, sync, bounds, max_length, then the vector. */
+				static int tlab_next_off = -1, tlab_temp_end_off = -1;
+				int a = alloc_tmp_idx, p = alloc_tmp_idx + 1, n = alloc_tmp_idx + 2;
+				gint32 nmax = (gint32) (ins->inst_c1 >> 8), esize = (gint32) (ins->inst_c1 & 0xff);
+				if (G_UNLIKELY (tlab_next_off < 0)) {
+					extern void mono_gc_wasm_tlab_offsets (int *next_off, int *temp_end_off);
+					int no, eo;
+					mono_gc_wasm_tlab_offsets (&no, &eo);
+					tlab_temp_end_off = eo;
+					mono_memory_barrier ();
+					tlab_next_off = no;
+				}
+				if (!alloc_tmp_idx) { fail = "newarr_fast without temps"; goto done; }
+				if (MONO_STRUCT_OFFSET (MonoArray, max_length) != 12 || MONO_STRUCT_OFFSET (MonoArray, vector) != 16) {
+					fail = "newarr_fast array layout"; goto done;
+				}
+				if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "newarr_fast len"; goto done; }
+				wasm_i32_const (&body, nmax);
+				wasm_op (&body, WASM_OP_I32_LE_U);
+				WJ_HINT (1);   /* a small array */
+				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
+				  wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);                  /* s.b */
+				  wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_TLAB_SLOT);
+				  wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);
+				  WJ_HINT (1);
+				  wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
+				    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				    wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
+				    wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);                     /* a = SgenThreadInfo */
+				    WJ_HINT (1);
+				    wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
+				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				      wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_next_off);
+				      wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) p);
+				      if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "newarr_fast len"; goto done; }
+				      wasm_i32_const (&body, esize);
+				      wasm_op (&body, WASM_OP_I32_MUL);
+				      wasm_i32_const (&body, 16 + 7);
+				      wasm_op (&body, WASM_OP_I32_ADD);
+				      wasm_i32_const (&body, -8);
+				      wasm_op (&body, WASM_OP_I32_AND);
+				      wasm_op (&body, WASM_OP_I32_ADD);
+				      wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) n);
+				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				      wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_temp_end_off);
+				      wasm_op (&body, WASM_OP_I32_LT_U);
+				      WJ_HINT (1);   /* the TLAB has room */
+				      wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
+				        wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+				        wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) n);
+				        wasm_op (&body, WASM_OP_I32_STORE); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_next_off);
+				        wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) p);
+				        wasm_i32_const (&body, (gint32) (intptr_t) ins->inst_p0);
+				        wasm_op (&body, WASM_OP_I32_STORE); wasm_uleb (&body, 2); wasm_uleb (&body, 0);    /* p->vtable */
+				        wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) p);
+				        if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "newarr_fast len"; goto done; }
+				        wasm_op (&body, WASM_OP_I32_STORE); wasm_uleb (&body, 2); wasm_uleb (&body, 12);   /* p->max_length */
+				        wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) p);
+				      wasm_op (&body, WASM_OP_ELSE);
+				        wasm_i32_const (&body, 0);
+				      wasm_op (&body, WASM_OP_END);
+				    wasm_op (&body, WASM_OP_ELSE);
+				      wasm_i32_const (&body, 0);
+				    wasm_op (&body, WASM_OP_END);
+				  wasm_op (&body, WASM_OP_ELSE);
+				    wasm_i32_const (&body, 0);
+				  wasm_op (&body, WASM_OP_END);
+				wasm_op (&body, WASM_OP_ELSE);
+				  wasm_i32_const (&body, 0);
+				wasm_op (&body, WASM_OP_END);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "newarr_fast dreg"; goto done; }
+#else
+				fail = "newarr_fast offline"; goto done;
 #endif
 				break;
 			}

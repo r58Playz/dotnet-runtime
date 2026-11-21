@@ -1551,6 +1551,7 @@ enum {
 	WJC_CAST_ELIM_STATIC,        /* MONO_WASM_JIT_CAST_ELIM: checks removed (or verified, bit 4) as STATIC, compile time */
 	WJC_CAST_ELIM_DOMINATED,     /* ... as DOMINATED */
 	WJC_INLINE_TRIVIAL_DEPTH,    /* MONO_WASM_JIT_INLINE_TRIVIAL: callees past the depth cap admitted as trivial (stats) */
+	WJC_NEWARR_INLINE_SITES,     /* MONO_WASM_JIT_NEWARR_INLINE: newarr sites given the inline TLAB bump (compile time) */
 	WJC_MAX
 };
 

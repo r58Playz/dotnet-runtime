@@ -13676,10 +13676,50 @@ field_access_end:
 			} else {
 				/* Decompose later since it is needed by abcrem */
 				MonoClass *array_type = mono_class_create_array (klass, 1);
-				mono_class_vtable_checked (array_type, cfg->error);
+				MonoVTable *array_vt = mono_class_vtable_checked (array_type, cfg->error);
+				gboolean newarr_inline = FALSE;
 				CHECK_CFG_ERROR;
 				CHECK_TYPELOAD (array_type);
+				(void) array_vt;
 
+#if HOST_BROWSER
+				/* C3 (MONO_WASM_JIT_NEWARR_INLINE): the TLAB bump inline, the icall when it yields 0 -- handle_alloc's
+				 * shape for objects (R305). ABCREM, the reason OP_NEWARR is decomposed late, is off for the wasm JIT. */
+				if (COMPILE_WASM (cfg) && !cfg->after_method_to_ir && array_vt) {
+					extern int mono_wasm_jit_newarr_inline;
+					extern int mono_gc_wasm_inline_array_max (MonoClass *array_class, int *esize);
+					int esize = 0, nmax = mono_wasm_jit_newarr_inline ? mono_gc_wasm_inline_array_max (array_type, &esize) : 0;
+					if (nmax > 0 && nmax < (1 << 23)) {
+						MonoBasicBlock *slow_bb, *end_bb;
+						MonoInst *fast, *iargs [2], *call;
+						NEW_BBLOCK (cfg, slow_bb);
+						NEW_BBLOCK (cfg, end_bb);
+						MONO_INST_NEW (cfg, fast, OP_WASM_JIT_NEWARR_FAST);
+						fast->dreg = alloc_ireg_ref (cfg);
+						fast->sreg1 = sp [0]->dreg;
+						fast->inst_p0 = array_vt;
+						fast->inst_c1 = (nmax << 8) | esize;
+						fast->type = STACK_OBJ;
+						fast->klass = array_type;
+						MONO_ADD_INS (cfg->cbb, fast);
+						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, fast->dreg, 0);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, slow_bb);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, end_bb);
+						MONO_START_BB (cfg, slow_bb);
+						slow_bb->out_of_line = TRUE;
+						EMIT_NEW_VTABLECONST (cfg, iargs [0], array_vt);
+						iargs [1] = sp [0];
+						call = mono_emit_jit_icall (cfg, ves_icall_array_new_specific, iargs);
+						MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, fast->dreg, call->dreg);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, end_bb);
+						MONO_START_BB (cfg, end_bb);
+						mono_wasm_jit_counters [WJC_NEWARR_INLINE_SITES]++;
+						ins = fast;
+						newarr_inline = TRUE;
+					}
+				}
+#endif
+				if (!newarr_inline) {
 				MONO_INST_NEW (cfg, ins, OP_NEWARR);
 				ins->dreg = alloc_ireg_ref (cfg);
 				ins->sreg1 = sp [0]->dreg;
@@ -13692,6 +13732,7 @@ field_access_end:
 
 				/* Needed so mono_emit_load_get_addr () gets called */
 				mono_get_got_var (cfg);
+				}
 			}
 
 			len_ins = sp [0];

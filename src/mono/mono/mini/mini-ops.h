@@ -863,6 +863,9 @@ MINI_OP(OP_EXPAND_R8, "expand_r8", XREG, FREG, NONE)
 /* Runtime wasm JIT: inline TLAB bump for a known-size object. dreg = the new object, or 0 when the caller must
  * take the allocator call; inst_p0 = the MonoVTable, inst_c1 = the aligned size (handle_alloc, R305). */
 MINI_OP(OP_WASM_JIT_ALLOC_FAST, "wasm_jit_alloc_fast", IREG, NONE, NONE)
+/* ... and for a one-dimensional array: sreg1 = the length; inst_p0 = the array's MonoVTable, inst_c1 = (the largest
+ * length allocated inline << 8) | the element size (CEE_NEWARR, plan abstract-hatching-stearns C3). */
+MINI_OP(OP_WASM_JIT_NEWARR_FAST, "wasm_jit_newarr_fast", IREG, IREG, NONE)
 MINI_OP(OP_WASM_SIMD_BITMASK, "wasm_bitmask", IREG, XREG, NONE)
 MINI_OP3(OP_WASM_BITSELECT, "wasm_bitselect", XREG, XREG, XREG, XREG)
 MINI_OP3(OP_WASM_SIMD_SHUFFLE, "wasm_shuffle", XREG, XREG, XREG, XREG)
