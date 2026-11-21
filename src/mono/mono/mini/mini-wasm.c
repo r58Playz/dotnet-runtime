@@ -735,6 +735,12 @@ int mono_wasm_jit_t2 = 1;
 int mono_wasm_jit_t2_sample_ms = 2;      /* MONO_WASM_JIT_T2_SAMPLE_MS: sampling timer period */
 int mono_wasm_jit_t2_threshold = 48;     /* MONO_WASM_JIT_T2_THRESHOLD: samples before a method is queued */
 int mono_wasm_jit_t2_max = 5000;         /* MONO_WASM_JIT_T2_MAX: tier-2 requests per process (S0 makes ~1,950, R387) */
+/* MONO_WASM_JIT_T2_BYTES_BUDGET (plan abstract-hatching-stearns A2): MB of tier-2 module bytes after which no further
+ * method is promoted (counted, WJC_T2_BYTES_CAPPED). VmData is not visible from inside wasm; V8's code space and
+ * compile zones scale with the wasm bytes handed to it, so this budgets what drives VmData when T2_COUNT / T2_MAX
+ * are raised to promote the warm tail. 0 = no budget. mono_wasm_jit_t2_bytes is the running total, ungated. */
+int mono_wasm_jit_t2_bytes_budget = 0;
+gint64 mono_wasm_jit_t2_bytes;
 /* MONO_WASM_JIT_T2_COUNT (plan2x S0): N > 0 = a tier-1 body with an entry safepoint counts its entries in a
  * process-wide word and requests tier 2 every 2^ceil(log2 N) entries (the request is idempotent; periodic so that one
  * released on a BUSY give-up fires again), beside the time sampler. 0 = off. The sampler
@@ -1301,7 +1307,7 @@ mono_wasm_jit_auto_init (void)
 	    bx = g_getenv ("MONO_WASM_JIT_B4_SEED"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_seed = v & 3; } } }
 	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes; const char *b4 = g_getenv ("MONO_WASM_JIT_B4");
 	  if (b4 && *b4) mono_wasm_jit_b4 = atoi (b4);
-	  b4 = g_getenv ("MONO_WASM_JIT_B4_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v >= 2 && v <= 512) mono_wasm_jit_b4_max = v; }
+	  b4 = g_getenv ("MONO_WASM_JIT_B4_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v >= 2 && v <= 2048) mono_wasm_jit_b4_max = v; }   /* <= WJ_BATCH_MAX (mini-wasm-batching.inc) */
 	  b4 = g_getenv ("MONO_WASM_JIT_B4_BYTES"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_bytes = v; }
 	  { extern int mono_wasm_jit_b4_groups, mono_wasm_jit_b4_merge;
 	    b4 = g_getenv ("MONO_WASM_JIT_B4_GROUPS"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_groups = v; }
@@ -1363,6 +1369,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_sample_ms, "MONO_WASM_JIT_T2_SAMPLE_MS", 1, 1000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_threshold, "MONO_WASM_JIT_T2_THRESHOLD", 1, 1000000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_max, "MONO_WASM_JIT_T2_MAX", 0, 100000)
+	WJ_T2_KNOB (mono_wasm_jit_t2_bytes_budget, "MONO_WASM_JIT_T2_BYTES_BUDGET", 0, 4096)
 	WJ_T2_KNOB (mono_wasm_jit_t2_count, "MONO_WASM_JIT_T2_COUNT", 0, 100000000)
 	WJ_T2_KNOB (mono_wasm_jit_s2, "MONO_WASM_JIT_S2", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_s2_min, "MONO_WASM_JIT_S2_MIN", 1, 100000000)
@@ -7642,7 +7649,7 @@ wj_thread_state_free (void *unused)
 		mono_wasm_jit_free_note ((p), mono_wasm_jit_usable_size (p), "thread_exit"); g_free (p); (p) = NULL; } } while (0)
 	wj_slot_live_cap = 0; wj_slot_installed_cap = 0; wj_slot_payload_cap = 0; wj_slot_payload_lo = 0; wj_desc_state_cap = 0;
 	wj_clo_cap = 0; wj_clo_n = 0; wj_inst_cap = 0; wj_reach_cap = 0;
-	wj_walk_cap = 0; wj_walk_sp = 0; wj_walk_marks_cap = 0; wj_walk_marks_n = 0;
+	wj_walk_cap = 0; wj_walk_sp = 0; wj_walk_marks_cap = 0; wj_walk_marks_n = 0; wj_batch_deps_cap = 0; wj_asm_mi_cap = 0; wj_asm_mi_mem = NULL;
 	mono_memory_barrier ();
 	WJ_TFREE (wj_slot_live);
 	WJ_TFREE (wj_slot_installed);
@@ -7654,6 +7661,8 @@ wj_thread_state_free (void *unused)
 	WJ_TFREE (wj_inst_stamp);
 	WJ_TFREE (wj_walk_stack);
 	WJ_TFREE (wj_walk_marks);
+	WJ_TFREE (wj_batch_deps);
+	WJ_TFREE (wj_asm_mi);
 	WJ_TFREE (wj_census_seen);
 	WJ_TFREE (wj_reach_stamp);
 	WJ_TFREE (wj_reach_stack);

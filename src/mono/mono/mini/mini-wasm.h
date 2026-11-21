@@ -1547,6 +1547,7 @@ enum {
 	WJC_WALK_BATCH_SKIP,         /* ... sibling loops skipped: that batch was expanded in this generation (bit 2) */
 	WJC_WALK_DEPTH_MAX,          /* ... deepest walk: C recursion depth, or the explicit stack's (bit 1) */
 	WJC_WALK_EPOCH_US_MAX,       /* ... longest top-level admission on the slow path, microseconds (any bits) */
+	WJC_T2_BYTES_CAPPED,         /* MONO_WASM_JIT_T2_BYTES_BUDGET: tier-2 promotions refused, the byte budget spent */
 	WJC_MAX
 };
 

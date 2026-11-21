@@ -18,13 +18,33 @@
  * When a batch is active mono_wasm_emit_method captures its output here instead of framing a module,
  * instantiating and registering; the driver frames all members at once afterwards.
  */
-#define WJ_BATCH_MAX 512   /* a whole-program batch is the upper-bound experiment; islands are far smaller */
+/* The most members (plus B4 leaf copies) one framed module may hold. 512 until plan abstract-hatching-stearns A1, which
+ * frames the hot set as one image; MONO_WASM_JIT_B4_MAX is clamped to it (mini-wasm.c). Nothing on the C stack is sized
+ * by it: the arrays below and in the framer are heap. */
+#define WJ_BATCH_MAX 2048
 
 
 /* And the dependency set the assembler derives for each member of the same framing. See WjAsmDeps: it is
  * what mono_wasm_jit_batch_bind republishes onto WjRegEntry.deps, because a rebatch has no capture phase
- * and so no WjBatchMember to take them from. */
-static __thread WjAsmDeps wj_batch_deps [WJ_BATCH_MAX];
+ * and so no WjBatchMember to take them from. Per thread and grown on demand (it was a WJ_BATCH_MAX array in TLS,
+ * 10 KB on every pthread); every index is ensured before it is touched (R489). */
+static __thread WjAsmDeps *wj_batch_deps;
+static __thread int        wj_batch_deps_cap;
+
+static void
+wj_batch_deps_ensure (int need)
+{
+	int ncap;
+	if (need <= wj_batch_deps_cap)
+		return;
+	ncap = wj_batch_deps_cap ? wj_batch_deps_cap : 64;
+	while (ncap < need)
+		ncap *= 2;
+	wj_batch_deps = (WjAsmDeps *) g_realloc (wj_batch_deps, sizeof (WjAsmDeps) * (gsize) ncap);
+	memset (wj_batch_deps + wj_batch_deps_cap, 0, sizeof (WjAsmDeps) * (gsize) (ncap - wj_batch_deps_cap));
+	wj_batch_deps_cap = ncap;
+	wj_thread_state_note ();
+}
 
 
 /* Enumerate the JIT registry, so a caller can rebuild ALL registered methods as one module (the
@@ -432,8 +452,11 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 		 * WASM_FORM_LOCAL, so it is the dependency set of the module actually being installed rather than
 		 * of the one each member was compiled as. */
 		{
-			WjAsmDeps *ad = &wj_batch_deps [i];
-			WjDepSet *nds = wj_depset_new (ad->slot, ad->sig, ad->method, ad->n);
+			WjAsmDeps *ad;
+			WjDepSet *nds;
+			wj_batch_deps_ensure (i + 1);
+			ad = &wj_batch_deps [i];
+			nds = wj_depset_new (ad->slot, ad->sig, ad->method, ad->n);
 			if (G_UNLIKELY (mono_wasm_jit_stats)) {
 				int was = re->depset ? re->depset->n : 0;
 				mono_wasm_jit_add (WJC_TIGHT_DEPS_DROPPED, (was > ad->n) ? (was - ad->n) : 0);
@@ -641,6 +664,7 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 	wj_stack_probe ();
 	if (n <= 1 || n > WJ_BATCH_MAX || ncopy < 0 || n + ncopy > WJ_BATCH_MAX)
 		return 0;
+	wj_batch_deps_ensure (n + ncopy);
 	for (i = 0; i < n; ++i) {
 		WjRegEntry *re = desc_ids [i] > 0 ? wj_reg_at (desc_ids [i] - 1) : NULL;
 		int j;

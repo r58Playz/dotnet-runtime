@@ -11269,6 +11269,10 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 				 * re-entrant nested compile (cctors / AOT-target init) has its OWN cfg and can't clobber it —
 				 * no per-thread-relay ordering dance needed. We still write the e_slot gate AFTER
 				 * registration so it is only set once this method is findable by an admission walk. */
+				if (cfg->wasm_jit_tier >= 2) {   /* A2: ungated, the tier-2 byte budget reads it */
+					extern gint64 mono_wasm_jit_t2_bytes;
+					mono_atomic_add_i64 (&mono_wasm_jit_t2_bytes, (gint64) out.len);
+				}
 				if (G_UNLIKELY (mono_wasm_jit_stats)) {
 					mono_wasm_jit_count (WJC_REGISTERED); mono_wasm_jit_add (WJC_BYTES_GENERATED, (gint64) out.len);
 					if (self_has_byaddr) mono_wasm_jit_count (WJC_VT_BYADDR_METHODS);

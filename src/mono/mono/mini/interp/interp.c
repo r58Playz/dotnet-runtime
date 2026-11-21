@@ -3096,6 +3096,18 @@ static void wj_reemit_drain_one (void);
 /* Tier-2 requests made so far, by the sampler and by the plan2x S0 counter alike: MONO_WASM_JIT_T2_MAX bounds both. */
 static volatile gint32 t2_requested;
 
+/* A2: MONO_WASM_JIT_T2_BYTES_BUDGET, MB of tier-2 module bytes generated (mono_wasm_jit_t2_bytes, mini-wasm-emitter.inc). */
+static inline gboolean
+wj_t2_bytes_spent (void)
+{
+	extern int mono_wasm_jit_t2_bytes_budget;
+	extern gint64 mono_wasm_jit_t2_bytes;
+	if (G_LIKELY (mono_wasm_jit_t2_bytes_budget <= 0) || mono_wasm_jit_t2_bytes < ((gint64) mono_wasm_jit_t2_bytes_budget << 20))
+		return FALSE;
+	mono_wasm_jit_counters [WJC_T2_BYTES_CAPPED]++;
+	return TRUE;
+}
+
 void mono_wasm_jit_t2_sample (gpointer p);
 void
 mono_wasm_jit_t2_sample (gpointer p)
@@ -3127,7 +3139,7 @@ mono_wasm_jit_t2_sample (gpointer p)
 		return;
 	if (im->wasm_jit_desc <= 0 || im->wasm_jit_fslot <= 0 || im->retired)
 		return;
-	if (t2_requested >= mono_wasm_jit_t2_max)
+	if (t2_requested >= mono_wasm_jit_t2_max || wj_t2_bytes_spent ())
 		return;
 	im->wasm_jit_t2_want = 1;
 	mono_atomic_inc_i32 (&t2_requested);
@@ -3167,7 +3179,7 @@ mono_wasm_jit_t2_count_hit (gpointer p)
 		return;
 	if (im->wasm_jit_desc <= 0 || im->wasm_jit_fslot <= 0 || im->retired)
 		return;
-	if (t2_requested >= mono_wasm_jit_t2_max) {
+	if (t2_requested >= mono_wasm_jit_t2_max || wj_t2_bytes_spent ()) {
 		mono_wasm_jit_counters [WJC_T2C_CAPPED]++;
 		return;
 	}

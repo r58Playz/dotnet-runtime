@@ -4424,12 +4424,64 @@ wj_arm_abi_ok (MonoMethod *target, const WasmFuncType *want)
 	return TRUE;
 }
 
+/* A1 (plan abstract-hatching-stearns): pass 1 asks for the member of every CALL relocation, and a scan was O(relocs x n)
+ * for an image of thousands of members. wj_assemble indexes a large member list for the duration of pass 1 only:
+ * open addressing over the MonoMethod pointer (never dereferenced), member index + 1, the first index for a method
+ * winning as the scan's did. */
+static __thread const WjAsmMember *wj_asm_mi_mem;   /* the list indexed, or NULL: valid only inside pass 1 */
+static __thread int  wj_asm_mi_n, wj_asm_mi_cap, wj_asm_mi_mask;
+static __thread int *wj_asm_mi;
+
+static inline guint32
+wj_asm_mi_hash (MonoMethod *m)
+{
+	return (guint32) ((gsize) m >> 3) * 2654435761u;
+}
+
+static void
+wj_asm_mi_build (const WjAsmMember *mem, int n)
+{
+	int i, cap = 128;
+	wj_asm_mi_mem = NULL;
+	if (n < 64)
+		return;
+	while (cap < 2 * n)
+		cap *= 2;
+	if (cap > wj_asm_mi_cap) {
+		wj_asm_mi = (int *) g_realloc (wj_asm_mi, sizeof (int) * (gsize) cap);
+		wj_asm_mi_cap = cap;
+		wj_thread_state_note ();
+	}
+	memset (wj_asm_mi, 0, sizeof (int) * (gsize) cap);
+	wj_asm_mi_mask = cap - 1;
+	for (i = 0; i < n; ++i) {
+		guint32 h;
+		if (!mem [i].method)
+			continue;
+		for (h = wj_asm_mi_hash (mem [i].method) & (guint32) wj_asm_mi_mask; wj_asm_mi [h];
+		     h = (h + 1) & (guint32) wj_asm_mi_mask)
+			if (mem [wj_asm_mi [h] - 1].method == mem [i].method)
+				break;
+		if (!wj_asm_mi [h])
+			wj_asm_mi [h] = i + 1;
+	}
+	wj_asm_mi_mem = mem;
+	wj_asm_mi_n = n;
+}
+
 static int
 wj_asm_member_of (const WjAsmMember *m, int n, MonoMethod *callee)
 {
 	int i;
 	if (!callee)
 		return -1;
+	if (m == wj_asm_mi_mem && n == wj_asm_mi_n) {
+		guint32 h;
+		for (h = wj_asm_mi_hash (callee) & (guint32) wj_asm_mi_mask; wj_asm_mi [h]; h = (h + 1) & (guint32) wj_asm_mi_mask)
+			if (m [wj_asm_mi [h] - 1].method == callee)
+				return wj_asm_mi [h] - 1;
+		return -1;
+	}
 	for (i = 0; i < n; ++i)
 		if (m [i].method == callee)
 			return i;
@@ -4761,6 +4813,7 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 	/* Pass 1 -- decide every form, assigning import slots in first-use order. LOCAL results hold a MEMBER
 	 * index at this point, because the function index they need is nfimports + member and nfimports is not
 	 * final until the last hole has been looked at. */
+	wj_asm_mi_build (mem, n);
 	for (i = 0; i < n; ++i) {
 		const WasmRelocs *fr = mem [i].f_body->relocs, *er = mem [i].e_body->relocs;
 		fixes [2 * i] = g_new0 (WasmRelocFix, fr && fr->n ? fr->n : 1);
@@ -4770,6 +4823,7 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 		wj_asm_resolve_body (mem [i].e_body, fixes [2 * i + 1], ti_base [i], i, mem, n, types [i], pol, himp, &nhimp, &st,
 		                     out_deps ? &out_deps [i] : NULL);
 	}
+	wj_asm_mi_mem = NULL;   /* the next list may reuse this address */
 
 	/* Pass 2 -- imports are counted, so a member index becomes a function index, and the bodies can be
 	 * written out. Defined functions start at nhimp and the methods precede the thunks. */
