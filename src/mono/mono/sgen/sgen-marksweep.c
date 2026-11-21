@@ -178,6 +178,16 @@ typedef struct {
 #define MS_OBJ_ALLOCED(o,b)	(*(void**)(o) && (*(char**)(o) < MS_BLOCK_FOR_BLOCK_INFO (b) || *(char**)(o) >= MS_BLOCK_FOR_BLOCK_INFO (b) + ms_block_size))
 
 #define MS_BLOCK_OBJ_SIZE_FACTOR	(pow (2.0, 1.0 / 3))
+/*
+ * Plan abstract-hatching-stearns F1 (an experiment on how the Java heap's objects are spread over size classes): the
+ * classes are computed when the collector is initialised, before MONO_GC_PARAMS is parsed and with tables sized by
+ * their count, so they read the environment instead: MONO_GC_MS_SIZE_FACTOR (the geometric step past the exact sizes,
+ * default 2^(1/3), clamped to 1.1..4) and MONO_GC_MS_EXACT_SIZES (the exact 8-byte sizes run up to this many times the
+ * minimum object size, default 4, clamped to 1..8). Fewer, coarser classes put an object and the small arrays it owns
+ * in fewer blocks, at the cost of internal fragmentation.
+ */
+static double ms_size_factor;
+static int ms_exact_mult = 4;
 
 /*
  * This way we can lookup block object size indexes for sizes up to
@@ -2069,7 +2079,7 @@ ms_calculate_block_obj_sizes (double factor, int *arr)
 	 * proceed by increasing geometrically with the given factor.
 	 */
 
-	for (int size = SGEN_CLIENT_MINIMUM_OBJECT_SIZE; size <= 4 * SGEN_CLIENT_MINIMUM_OBJECT_SIZE; size += SGEN_ALLOC_ALIGN) {
+	for (int size = SGEN_CLIENT_MINIMUM_OBJECT_SIZE; size <= ms_exact_mult * SGEN_CLIENT_MINIMUM_OBJECT_SIZE; size += SGEN_ALLOC_ALIGN) {
 		if (arr)
 			arr [num_sizes] = size;
 		++num_sizes;
@@ -3052,9 +3062,24 @@ sgen_marksweep_init_internal (SgenMajorCollector *collector, gboolean is_concurr
 	if (mono_cpu_limit () <= 1)
 		is_parallel = FALSE;
 
-	num_block_obj_sizes = ms_calculate_block_obj_sizes (MS_BLOCK_OBJ_SIZE_FACTOR, NULL);
+	{   /* F1: the size classes from the environment (see MS_BLOCK_OBJ_SIZE_FACTOR) */
+		const char *ev = g_getenv ("MONO_GC_MS_SIZE_FACTOR");
+		ms_size_factor = MS_BLOCK_OBJ_SIZE_FACTOR;
+		if (ev && *ev) {
+			double f = atof (ev);
+			if (f >= 1.1 && f <= 4.0)
+				ms_size_factor = f;
+		}
+		ev = g_getenv ("MONO_GC_MS_EXACT_SIZES");
+		if (ev && *ev) {
+			int m = atoi (ev);
+			if (m >= 1 && m <= 8)
+				ms_exact_mult = m;
+		}
+	}
+	num_block_obj_sizes = ms_calculate_block_obj_sizes (ms_size_factor, NULL);
 	block_obj_sizes = (int *)sgen_alloc_internal_dynamic (sizeof (int) * num_block_obj_sizes, INTERNAL_MEM_MS_TABLES, TRUE);
-	ms_calculate_block_obj_sizes (MS_BLOCK_OBJ_SIZE_FACTOR, block_obj_sizes);
+	ms_calculate_block_obj_sizes (ms_size_factor, block_obj_sizes);
 
 	evacuate_block_obj_sizes = (gboolean *)sgen_alloc_internal_dynamic (sizeof (gboolean) * num_block_obj_sizes, INTERNAL_MEM_MS_TABLES, TRUE);
 	for (i = 0; i < num_block_obj_sizes; ++i)
