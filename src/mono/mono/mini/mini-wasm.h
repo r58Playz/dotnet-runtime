@@ -1550,6 +1550,7 @@ enum {
 	WJC_T2_BYTES_CAPPED,         /* MONO_WASM_JIT_T2_BYTES_BUDGET: tier-2 promotions refused, the byte budget spent */
 	WJC_CAST_ELIM_STATIC,        /* MONO_WASM_JIT_CAST_ELIM: checks removed (or verified, bit 4) as STATIC, compile time */
 	WJC_CAST_ELIM_DOMINATED,     /* ... as DOMINATED */
+	WJC_INLINE_TRIVIAL_DEPTH,    /* MONO_WASM_JIT_INLINE_TRIVIAL: callees past the depth cap admitted as trivial (stats) */
 	WJC_MAX
 };
 

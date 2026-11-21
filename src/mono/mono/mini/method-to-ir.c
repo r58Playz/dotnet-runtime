@@ -5650,8 +5650,21 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 	if (cfg->gsharedvt)
 		WJ_T2R_WHY ("gsharedvt");
 
-	if (cfg->inline_depth > (cfg->wasm_inline_depth_cap > 0 ? cfg->wasm_inline_depth_cap : 10))
-		WJ_T2R_WHY ("depth");
+	if (cfg->inline_depth > (cfg->wasm_inline_depth_cap > 0 ? cfg->wasm_inline_depth_cap : 10)) {
+		gboolean trivial = FALSE;
+#ifdef HOST_BROWSER
+		/* I1 (MONO_WASM_JIT_INLINE_TRIVIAL): a trivial callee is exempt from the depth cap, to depth 16 */
+		extern int mono_wasm_jit_inline_trivial;
+		if (COMPILE_WASM (cfg) && mono_wasm_jit_inline_trivial > 0 && cfg->inline_depth <= 16 &&
+		    mono_method_get_header_summary (method, &header) && header.code &&
+		    wj_il_hot_size (header.code, header.code_size) <= GINT_TO_UINT32 (mono_wasm_jit_inline_trivial)) {
+			trivial = TRUE;
+			wj_gi_count (WJC_INLINE_TRIVIAL_DEPTH);
+		}
+#endif
+		if (!trivial)
+			WJ_T2R_WHY ("depth");
+	}
 
 	if (!mono_method_get_header_summary (method, &header))
 		WJ_T2R_WHY ("no header summary");

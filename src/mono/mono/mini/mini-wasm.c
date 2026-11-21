@@ -767,6 +767,12 @@ int mono_wasm_jit_fast_tls = 1;
 /* MONO_WASM_JIT_INLINE_COLD_THROW (R318, plan Phase 3.4): throw-terminated IL segments are not counted toward the inline
  * size limit, under the per-compile policy only (tier 2, INLINE_CALLS). */
 int mono_wasm_jit_inline_cold_throw = 1;
+/* MONO_WASM_JIT_INLINE_TRIVIAL=<IL bytes> (plan abstract-hatching-stearns I1): a callee whose hot IL (R318's measure,
+ * wj_il_hot_size: throw segments not counted) is at most this many bytes is not refused for inline DEPTH, up to depth 16
+ * (HotSpot's MaxTrivialSize rule). The depth test ran before the header was read, so a getter whose only bulk is its
+ * exception tail (Holder$Reference.value: 32.7 k calls a mctick tick) was refused at depth before R318 could discount
+ * it. Counted WJC_INLINE_TRIVIAL_DEPTH. 0 = off. */
+int mono_wasm_jit_inline_trivial = 0;
 /* MONO_WASM_JIT_INLINE_COLD_CALL: a call site inside an IL block that ends in a throw is not inlined and is charged a flat
  * cost (method-to-ir.c wj_cold_call_site), under the per-compile policy only. R318 above discounts those blocks from the
  * SIZE gate; this keeps the COST gate and the inliner out of them. 2026-11-05: every traced cost refusal of the hot
@@ -1400,6 +1406,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_prof_origin, "MONO_WASM_JIT_PROF_ORIGIN", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_fast_tls, "MONO_WASM_JIT_FAST_TLS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_inline_trivial, "MONO_WASM_JIT_INLINE_TRIVIAL", 0, 64)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
