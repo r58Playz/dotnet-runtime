@@ -1415,7 +1415,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_inline_aggr_depth, "MONO_WASM_JIT_INLINE_AGGR_DEPTH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_newarr_inline, "MONO_WASM_JIT_NEWARR_INLINE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_img_dispatch, "MONO_WASM_JIT_IMG_DISPATCH", 0, 1)
-	WJ_T2_KNOB (mono_wasm_jit_img_reframe_ms, "MONO_WASM_JIT_IMG_REFRAME_MS", 0, 3600000)
+	WJ_T2_KNOB (mono_wasm_jit_reframe_ms, "MONO_WASM_JIT_REFRAME_MS", 0, 3600000)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
@@ -2009,13 +2009,15 @@ int mono_wasm_jit_newarr_inline = 0;
  * the first B4 group of >= 32 members framed becomes the image. Needs MONO_WASM_JIT_CLASS_RECORD bit 1 or 8 (the
  * per-class index array hangs off the record). 0 = neither: the emitted bytes are today's. */
 int mono_wasm_jit_img_dispatch = 0;
-/* MONO_WASM_JIT_IMG_REFRAME_MS: a member's re-emission (a tier-2 promotion, an IKVM body swap) re-frames its whole
- * group, and the image is thousands of members and megabytes: re-framed per member it was a GC stall of 1.1 s and a
- * re-compile on every worker each time (mctick census, 2026-11-21). So a member re-emitted within this many ms of the
- * image's last framing is deferred -- its new body stays registered on its descriptor, its old code keeps running in the
- * image -- and one re-frame takes them all once the interval has passed (mono_wasm_jit_b4_step). 0 = never re-frame the
- * image (members keep the code they were framed with). */
-int mono_wasm_jit_img_reframe_ms = 60000;
+/* MONO_WASM_JIT_REFRAME_MS: a member's re-emission (a tier-2 promotion, an IKVM body swap) re-frames its whole group
+ * (mono_wasm_jit_refresh_batch), and a group framed by a large B4 plan is up to 2048 members and megabytes: re-framed per
+ * member, the image was a GC stall of 1.1 s and a re-compile on every worker each time, and a run whose groups re-framed
+ * that way executed 2.2x the instructions (mctick, 2026-11-21, runs/2026-11-21-m census and lay-12). So in a group of at
+ * least 32 members, a member re-emitted within this many ms of the group's framing is deferred -- its new body stays
+ * registered on its descriptor, its old code keeps running in the group -- and the re-emission drainer re-frames the
+ * group once when the interval has passed (mono_wasm_jit_b4_step), taking every deferred member. 0 = re-frame at once,
+ * as before. Shipped B4 groups are at most 16 members, which this never touches. */
+int mono_wasm_jit_reframe_ms = 60000;
 gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,
@@ -3569,6 +3571,8 @@ typedef struct {
 	guint32 generation;
 	gint32 *guard;   /* plan2x S1: set to 1 when this generation is superseded or rolled back; NULL = unguarded */
 	guint32 payload; /* W1 C0: the id of `bytes`, immutable; what a member's install test compares against */
+	gint64 framed_ms;   /* when this generation was bound (MONO_WASM_JIT_REFRAME_MS) */
+	int reframe_due;    /* a member's re-emission was deferred to this group's next re-frame (the re-emission drainer's) */
 } WjBatchDesc;
 
 /* An immutable dependency set: the f-slots a body reaches by call_indirect, with the functype hash

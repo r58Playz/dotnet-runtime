@@ -4224,8 +4224,9 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		int br = mono_wasm_jit_refresh_batch (r.desc_id, &batch_bytes, &batch_len);
 		r.t2_refresh = br;   /* R337 */
 		if (br == -2) {
-			/* G: deferred to the image's next re-frame (mono_wasm_jit_refresh_batch). The new body is registered on the
-			 * descriptor; the image keeps the member's old code until then. Not retriable: the re-frame is what applies it. */
+			/* MONO_WASM_JIT_REFRAME_MS: deferred to the group's next re-frame (mono_wasm_jit_refresh_batch). The new body is
+			 * registered on the descriptor; the group keeps the member's old code until then. Not retriable: the re-frame
+			 * is what applies it. */
 #if HOST_BROWSER
 			{ extern void mono_wasm_jit_bytes_forget (const void *bytes); mono_wasm_jit_bytes_forget (r.bytes); }
 #endif

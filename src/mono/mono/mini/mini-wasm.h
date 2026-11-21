@@ -1560,7 +1560,7 @@ enum {
 	WJC_IMG_FILL_REFUSED,        /* ... misses at an image site not filled (target outside the image, no record, ...) */
 	WJC_IMG_INVALIDATED,         /* ... members whose code left the image after it was bound (their sites fall back) */
 	WJC_IMG_REFRAMES,            /* ... the image re-framed (kept the image: same members, same order) */
-	WJC_IMG_REFRAME_DEFERRED,    /* ... member re-emissions deferred to the next image re-frame (MONO_WASM_JIT_IMG_REFRAME_MS) */
+	WJC_IMG_REFRAME_DEFERRED,    /* MONO_WASM_JIT_REFRAME_MS: member re-emissions deferred to their group's next re-frame (any group >= 32) */
 	WJC_MAX
 };
 

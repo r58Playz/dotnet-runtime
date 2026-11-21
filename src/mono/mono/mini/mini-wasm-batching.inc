@@ -44,8 +44,6 @@ guint8 mono_wasm_jit_img_live [WJ_BATCH_MAX + 2];   /* [1 + member]: the member 
 static gint32 *volatile wj_img_member;               /* desc id -> 1 + member index, 0: not a member */
 static volatile int wj_img_member_n;
 static int wj_img_want;                              /* the drainer, b4_step -> wj_rebatch_core: frame this one as the image */
-static gint64 wj_img_framed_ms;                      /* when the image was last framed (mono_msec_ticks) */
-static volatile int wj_img_dirty;                    /* a member's re-emission was deferred to the next re-frame */
 
 /* Is DESC_IDS, in order, the image's member list? A re-frame of it (mono_wasm_jit_refresh_batch passes the batch's own
  * order) keeps every member's index, so the class index arrays stay right and it stays the image. */
@@ -56,13 +54,21 @@ wj_img_same (const int *desc_ids, int n)
 	return img && n == img->n && !memcmp (desc_ids, img->desc, sizeof (int) * (gsize) n);
 }
 
-/* Is a coalesced image re-frame due (a deferred member and the interval passed)? */
+/* MONO_WASM_JIT_REFRAME_MS: groups (>= WJ_REFRAME_MIN members) with a deferred member re-emission, oldest first. Only the
+ * single re-emission drainer touches the list (refresh_batch's callers and mono_wasm_jit_b4_step). A desc here may have
+ * been superseded since (its members bound into another group): checked before it is re-framed. */
+#define WJ_REFRAME_MIN 32
+#define WJ_REFRAME_PEND_MAX 512
+static WjBatchDesc *wj_reframe_pend [WJ_REFRAME_PEND_MAX];
+static int wj_reframe_npend;
+
+/* Is the oldest deferred group due (its interval passed)? */
 static gboolean
-wj_img_reframe_due (void)
+wj_reframe_due (void)
 {
-	extern int mono_wasm_jit_img_reframe_ms;
-	return wj_img_dirty && mono_wasm_jit_img_batch && mono_wasm_jit_img_reframe_ms > 0 &&
-		mono_msec_ticks () - wj_img_framed_ms >= mono_wasm_jit_img_reframe_ms;
+	extern int mono_wasm_jit_reframe_ms;
+	return wj_reframe_npend > 0 && mono_wasm_jit_reframe_ms > 0 &&
+		mono_msec_ticks () - wj_reframe_pend [0]->framed_ms >= mono_wasm_jit_reframe_ms;
 }
 
 int mono_wasm_jit_img_on (void);
@@ -485,6 +491,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 	bd->len = len;
 	bd->guard = guard;
 	bd->payload = payload;
+	bd->framed_ms = mono_msec_ticks ();
 	bd->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
 	for (i = 0; i < n; i++) {
 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
@@ -1035,8 +1042,6 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 				if (mono_wasm_jit_img_batch)
 					mono_wasm_jit_counters [WJC_IMG_REFRAMES]++;
 				mono_wasm_jit_img_batch = re0->batch;
-				wj_img_framed_ms = mono_msec_ticks ();
-				wj_img_dirty = 0;
 				mono_wasm_jit_counters [WJC_IMG_MEMBERS] = n;
 				{ /* the receivers already in the members' PICs never take the miss path that fills the rest */
 				  extern void mono_wasm_jit_img_fill_profiles (gpointer caller_imethod);
@@ -1126,11 +1131,15 @@ mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len)
 	mono_loader_lock ();
 	re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
 	if (re && re->batch) {
-		/* G: the image is re-framed at most once per MONO_WASM_JIT_IMG_REFRAME_MS, taking every deferred member then */
-		extern int mono_wasm_jit_img_reframe_ms;
-		if (re->batch == mono_wasm_jit_img_batch &&
-		    (mono_wasm_jit_img_reframe_ms <= 0 || mono_msec_ticks () - wj_img_framed_ms < mono_wasm_jit_img_reframe_ms)) {
-			wj_img_dirty = 1;
+		/* MONO_WASM_JIT_REFRAME_MS: a large group is re-framed at most once an interval, taking every deferred member */
+		extern int mono_wasm_jit_reframe_ms;
+		WjBatchDesc *b = re->batch;
+		if (mono_wasm_jit_reframe_ms > 0 && b->n >= WJ_REFRAME_MIN && mono_msec_ticks () - b->framed_ms < mono_wasm_jit_reframe_ms &&
+		    (b->reframe_due || wj_reframe_npend < WJ_REFRAME_PEND_MAX)) {
+			if (!b->reframe_due) {
+				b->reframe_due = 1;
+				wj_reframe_pend [wj_reframe_npend++] = b;
+			}
 			mono_wasm_jit_counters [WJC_IMG_REFRAME_DEFERRED]++;
 			mono_loader_unlock ();
 			wj_reg_read_leave ();
@@ -1574,7 +1583,7 @@ wj_b4_grown (void)
 gint32
 mono_wasm_jit_b4_due (void)
 {
-	return wj_b4_ipend < wj_b4_npend || wj_b4_grown () || wj_img_reframe_due ();
+	return wj_b4_ipend < wj_b4_npend || wj_b4_grown () || wj_reframe_due ();
 }
 
 /* A member's own bytes. NOT re->len: batch_bind sets that to the whole GROUP module's length, so once a member is framed
@@ -2137,21 +2146,31 @@ mono_wasm_jit_b4_step (void)
 	WjBatchDesc *first = NULL;
 	WjB4Group *g;
 
-	if (wj_img_reframe_due ()) {
-		/* G: one re-frame of the image takes every member re-emitted since its last framing (refresh_batch deferred them) */
-		WjBatchDesc *img = mono_wasm_jit_img_batch;
-		int in = img->n, ok, first;
-		gint32 *idescs = g_new (gint32, in);
-		memcpy (idescs, img->desc, sizeof (int) * (gsize) in);
-		first = idescs [0];
+	while (wj_reframe_due ()) {
+		/* MONO_WASM_JIT_REFRAME_MS: one re-frame takes every member re-emitted since the group's framing (refresh_batch
+		 * deferred them). The image stays the image (wj_rebatch_core's wj_img_same). */
+		WjBatchDesc *b = wj_reframe_pend [0];
+		WjRegEntry *r0;
+		int bn = b->n, ok, first, q;
+		gint32 *bdescs;
+		for (q = 1; q < wj_reframe_npend; ++q)
+			wj_reframe_pend [q - 1] = wj_reframe_pend [q];
+		wj_reframe_npend--;
 		wj_reg_read_enter ();
-		ok = mono_wasm_jit_rebatch ((const int *) idescs, in, NULL, NULL);
+		r0 = b->desc [0] > 0 ? wj_reg_at (b->desc [0] - 1) : NULL;
+		if (!r0 || r0->batch != b) {
+			wj_reg_read_leave ();
+			continue;   /* superseded since: its members' code is another group's now */
+		}
+		bdescs = g_new (gint32, bn);
+		memcpy (bdescs, b->desc, sizeof (int) * (gsize) bn);
+		first = bdescs [0];
+		ok = mono_wasm_jit_rebatch ((const int *) bdescs, bn, NULL, NULL);
 		wj_reg_read_leave ();
-		g_free (idescs);
+		g_free (bdescs);
 		if (!ok) {
-			wj_img_framed_ms = mono_msec_ticks ();   /* back off a whole interval; the deferred bodies wait */
 			mono_wasm_jit_counters [WJC_B4_REFUSED]++;
-			return 0;
+			return 0;   /* the deferred bodies wait for the members' next re-emission */
 		}
 		return first;   /* published with the next rendezvous, as a B4 group is */
 	}

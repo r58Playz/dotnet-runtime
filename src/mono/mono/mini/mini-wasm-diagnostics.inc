@@ -646,11 +646,11 @@ mono_wasm_jit_dump_stats (void)
 		printf ("[wasm-jit classrec] bits=%d offset=%d bytes=%lld refresh_changed=%d | display_sites=%lld sealed_sites=%lld\n",
 			mono_wasm_class_record_bits (), mono_wasm_class_record_offset (), (long long) mono_wasm_class_record_bytes,
 			(int) mono_wasm_class_record_changed, WJC_(WJC_CLASSREC_DISPLAY_SITES), WJC_(WJC_CLASSREC_SEALED_SITES));
-		extern int mono_wasm_jit_img_reframe_ms;
-		printf ("[wasm-jit img] knob=%d sites=%lld members=%lld fills=%lld fill_refused=%lld invalidated=%lld reframes=%lld deferred=%lld (reframe_ms=%d)\n",
+		extern int mono_wasm_jit_reframe_ms;
+		printf ("[wasm-jit img] knob=%d sites=%lld members=%lld fills=%lld fill_refused=%lld invalidated=%lld reframes=%lld | groups deferred=%lld (reframe_ms=%d)\n",
 			mono_wasm_jit_img_dispatch, WJC_(WJC_IMG_SITES), WJC_(WJC_IMG_MEMBERS), WJC_(WJC_IMG_FILLS),
 			WJC_(WJC_IMG_FILL_REFUSED), WJC_(WJC_IMG_INVALIDATED), WJC_(WJC_IMG_REFRAMES), WJC_(WJC_IMG_REFRAME_DEFERRED),
-			mono_wasm_jit_img_reframe_ms);
+			mono_wasm_jit_reframe_ms);
 	}
 	{
 		extern int mono_wasm_jit_admit_walk;
