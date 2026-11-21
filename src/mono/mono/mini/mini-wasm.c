@@ -1401,6 +1401,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_branch_hints, "MONO_WASM_JIT_BRANCH_HINTS", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_math_intrins, "MONO_WASM_JIT_MATH_INTRINS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_atomic_i8, "MONO_WASM_JIT_ATOMIC_I8", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_admit_walk, "MONO_WASM_JIT_ADMIT_WALK", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_vcall_vret, "MONO_WASM_JIT_VCALL_VRET", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_direct_deps, "MONO_WASM_JIT_DIRECT_DEPS", 1, MONO_WASM_JIT_MAX_DIRECT_DEPS)
 	WJ_T2_KNOB (mono_wasm_jit_icall_aot, "MONO_WASM_JIT_ICALL_AOT", 0, 1)
@@ -2122,6 +2123,20 @@ int mono_wasm_jit_residual_mode = 0;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.
  * DEFAULT OFF. Diagnostic only -- see wj_stack_probe. Exists because two rounds of shaving stack arrays
  * on a fault-count correlation established nothing, and one run of this settles it. */
 int mono_wasm_jit_stackprobe = 0;
+/* MONO_WASM_JIT_ADMIT_WALK (plan abstract-hatching-stearns A0), a bit mask over the admission's install walk
+ * (wj_install_closure):
+ *   1  walk with an explicit heap stack instead of C recursion. The recursive walk takes one C frame per descriptor
+ *      along the DFS and per batch sibling (a 512-member group nests ~512 deep before its dependencies), and
+ *      wj_admit_install_only's 512-byte error buffer can land in every one of those frames;
+ *   2  (with 1) expand a batch's siblings once per walk generation, keyed by the WjBatchDesc snapshot, instead of
+ *      re-looping all n siblings at every member reached (n^2 stamp checks a pass);
+ *   4  one walk generation and one budget per TOP-LEVEL admission: a cycle break inside it (wj_admit_impl's
+ *      state-1 arm) no longer starts a fresh pass over the whole closure. Every intra-group dependency edge is a
+ *      cycle break, so a group admission repeated the closure walk once per such edge.
+ * One admission of a 512-member group took 6-12 s with every bit clear (2026-11-20, p4; minor collections waited
+ * on it, `stw 1.9-12.3 s`). Install order inside a walk is irrelevant (a module's own lazy banks are ensured by its
+ * instantiation, mono_wasm_jit_instantiate_local / _batch_local), so 1 and 2 change cost and stack only. */
+int mono_wasm_jit_admit_walk = 0;
 /* Defined here (not in the HOST_BROWSER block) because mono_wasm_emit_method references it in BOTH the
  * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (HOST_BROWSER). */
 #ifndef HOST_BROWSER
@@ -5239,8 +5254,11 @@ wj_inst_stamp_ensure (int id)
  * bound means a pathologically large closure stops rather than recursing forever. Both leave the caller to
  * fail admission, which is the safe direction.
  */
+static gboolean wj_install_closure (int desc_id);
+static inline void wj_stack_probe (void);
+
 static gboolean
-wj_install_closure (int desc_id)
+wj_install_closure_rec (int desc_id)
 {
 	WjRegEntry *re;
 	gboolean ok = TRUE;
@@ -5260,6 +5278,7 @@ wj_install_closure (int desc_id)
 		return FALSE;
 	}
 	wj_inst_stamp [desc_id] = wj_inst_gen;
+	mono_wasm_jit_counters [WJC_WALK_NODES]++;
 	/* Collect the closure as it is stamped, so the publish pass can enumerate exactly what was
 	 * installed. Bounded by the same budget that bounds the walk. */
 	wj_clo_ensure (wj_clo_n + 1);
@@ -5311,6 +5330,7 @@ wj_install_closure (int desc_id)
 		WjBatchDesc *mb = snap_b;             /* one snapshot (R320) -- see WJC_ADMIT_BATCH_SWAPPED */
 		if (mb) {
 			int bi;
+			mono_wasm_jit_counters [WJC_WALK_BATCH_EXPAND]++;
 			for (bi = 0; bi < mb->n; ++bi) {
 				int m = mb->desc [bi];
 				if (m > 0 && m != desc_id && !wj_install_closure (m))
@@ -5321,6 +5341,289 @@ wj_install_closure (int desc_id)
 	if (!wj_admit_install_only (desc_id, re, snap_b, snap_bytes, snap_len, snap_payload))
 		ok = FALSE;
 	return ok;
+}
+
+/* ---- MONO_WASM_JIT_ADMIT_WALK (plan abstract-hatching-stearns A0) ----
+ *
+ * Bit 1: the same walk as wj_install_closure_rec -- the same stamp, budget, closure list, snapshot, dependency and
+ * sibling order, install after a node's dependencies and siblings -- on an explicit per-thread heap stack. The C
+ * stack stays flat whatever the closure's depth. */
+typedef struct {
+	int          desc_id;
+	int          phase;        /* 0 dependencies, 1 batch siblings, 2 install */
+	int          i;            /* the next dependency / sibling index */
+	gboolean     ok;
+	WjRegEntry  *re;
+	WjBatchDesc *snap_b;       /* R320: one reading of {batch, bytes, len, depset, payload} per node */
+	void        *snap_bytes;
+	int          snap_len;
+	WjDepSet    *snap_ds;
+	guint32      snap_payload;
+} WjWalkFrame;
+static __thread WjWalkFrame *wj_walk_stack;
+static __thread int          wj_walk_cap;
+static __thread int          wj_walk_sp;
+static __thread int          wj_walk_rdepth;   /* bit 1 clear: the recursion's current depth */
+
+/* Bit 2: which batches this generation has expanded. Open addressing keyed by the WjBatchDesc pointer (never
+ * dereferenced; a WjBatchDesc is never freed, so a pointer names one framing for the life of the process). An entry
+ * from an older generation reads as empty, so nothing is cleared between walks. */
+typedef struct { WjBatchDesc *b; guint32 gen; } WjWalkMark;
+static __thread WjWalkMark *wj_walk_marks;
+static __thread int         wj_walk_marks_cap;   /* a power of two */
+static __thread int         wj_walk_marks_n;     /* entries of wj_walk_marks_gen */
+static __thread guint32     wj_walk_marks_gen;
+
+/* Bit 4: a top-level admission owns one walk generation and one budget; every rooted walk inside it continues them.
+ * The timing fields run at every knob value. */
+static __thread int    wj_walk_epoch_open;
+static __thread int    wj_walk_epoch_timing;
+static __thread double wj_walk_epoch_t0;
+
+static void
+wj_inst_gen_next (void)
+{
+	if (++wj_inst_gen == 0) {
+		memset (wj_inst_stamp, 0, sizeof (guint32) * (gsize) wj_inst_cap);
+		if (wj_walk_marks)
+			memset (wj_walk_marks, 0, sizeof (WjWalkMark) * (gsize) wj_walk_marks_cap);
+		wj_walk_marks_n = 0;
+		wj_inst_gen = 1;
+	}
+}
+
+static void
+wj_walk_ensure (int need)
+{
+	int ncap;
+	if (need <= wj_walk_cap)
+		return;
+	ncap = wj_walk_cap ? wj_walk_cap * 2 : 256;
+	while (ncap < need)
+		ncap *= 2;
+	wj_walk_stack = (WjWalkFrame *) g_realloc (wj_walk_stack, sizeof (WjWalkFrame) * (gsize) ncap);
+	wj_walk_cap = ncap;
+	wj_thread_state_note ();
+}
+
+/* Insert `b` (known absent, room known) into the current generation. */
+static void
+wj_walk_mark_put (WjBatchDesc *b)
+{
+	int mask = wj_walk_marks_cap - 1;
+	int i = (int) (((guint32) ((gsize) b >> 3) * 2654435761u) & (guint32) mask);
+	while (wj_walk_marks [i].b && wj_walk_marks [i].gen == wj_inst_gen)
+		i = (i + 1) & mask;
+	wj_walk_marks [i].b = b;
+	wj_walk_marks [i].gen = wj_inst_gen;
+	wj_walk_marks_n++;
+}
+
+/* TRUE (and marks it) when this generation has not expanded `b` yet. Within one generation entries are only ever
+ * added, so a key's probe sequence never crosses an older entry before reaching it. */
+static gboolean
+wj_walk_mark_batch (WjBatchDesc *b)
+{
+	int i, mask;
+	if (wj_walk_marks_gen != wj_inst_gen) {
+		wj_walk_marks_gen = wj_inst_gen;
+		wj_walk_marks_n = 0;
+	}
+	if ((wj_walk_marks_n + 1) * 2 > wj_walk_marks_cap) {
+		int ocap = wj_walk_marks_cap;
+		WjWalkMark *old = wj_walk_marks;
+		wj_walk_marks_cap = ocap ? ocap * 2 : 256;
+		wj_walk_marks = g_new0 (WjWalkMark, wj_walk_marks_cap);
+		wj_walk_marks_n = 0;
+		for (i = 0; i < ocap; ++i)
+			if (old [i].b && old [i].gen == wj_inst_gen)
+				wj_walk_mark_put (old [i].b);
+		g_free (old);
+		wj_thread_state_note ();
+	}
+	mask = wj_walk_marks_cap - 1;
+	for (i = (int) (((guint32) ((gsize) b >> 3) * 2654435761u) & (guint32) mask); ; i = (i + 1) & mask) {
+		WjWalkMark *m = &wj_walk_marks [i];
+		if (!m->b || m->gen != wj_inst_gen) {
+			m->b = b;
+			m->gen = wj_inst_gen;
+			wj_walk_marks_n++;
+			return TRUE;
+		}
+		if (m->b == b)
+			return FALSE;
+	}
+}
+
+/* Enter one node: wj_install_closure_rec up to its first child. 1 = pushed (the loop walks it); 0 = finished here,
+ * with its result in *res. */
+static int
+wj_walk_enter (int desc_id, gboolean *res)
+{
+	WjRegEntry *re;
+	WjWalkFrame *f;
+
+	if (desc_id <= 0) {
+		*res = FALSE;
+		return 0;
+	}
+	wj_inst_stamp_ensure (desc_id + 1);
+	if (wj_inst_stamp [desc_id] == wj_inst_gen) {
+		*res = TRUE;                     /* already handled in this generation (or on the stack: a cycle) */
+		return 0;
+	}
+	if (wj_inst_budget-- <= 0) {         /* distinct nodes only, as in the recursive walk */
+		mono_wasm_jit_counters [WJC_INSTALL_BUDGET_OUT]++;
+		*res = FALSE;
+		return 0;
+	}
+	wj_inst_stamp [desc_id] = wj_inst_gen;
+	mono_wasm_jit_counters [WJC_WALK_NODES]++;
+	wj_clo_ensure (wj_clo_n + 1);
+	wj_clo_list [wj_clo_n++] = desc_id;
+	if (wj_clo_n > (int) mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX])
+		mono_wasm_jit_counters [WJC_SW_CLOSURE_MAX] = wj_clo_n;
+	re = wj_reg_at (desc_id - 1);
+	if (!re) {
+		*res = FALSE;
+		return 0;
+	}
+	wj_walk_ensure (wj_walk_sp + 1);
+	f = &wj_walk_stack [wj_walk_sp];
+	f->snap_b = NULL;
+	f->snap_bytes = NULL;
+	f->snap_len = 0;
+	f->snap_ds = NULL;
+	f->snap_payload = 0;
+	if (!wj_pub_snapshot2 (re, &f->snap_b, &f->snap_bytes, &f->snap_len, &f->snap_ds, &f->snap_payload)) {
+		mono_wasm_jit_counters [WJC_ADMIT_PAYLOAD_TORN]++;
+		*res = FALSE;
+		return 0;
+	}
+	f->desc_id = desc_id;
+	f->phase = 0;
+	f->i = 0;
+	f->ok = TRUE;
+	f->re = re;
+	++wj_walk_sp;
+	if (wj_walk_sp > (int) mono_wasm_jit_counters [WJC_WALK_DEPTH_MAX])
+		mono_wasm_jit_counters [WJC_WALK_DEPTH_MAX] = wj_walk_sp;
+	return 1;
+}
+
+static gboolean
+wj_install_closure_iter (int root)
+{
+	const int base = wj_walk_sp;   /* a nested walk (none is known) keeps the frames below it */
+	gboolean res = FALSE;
+
+	wj_stack_probe ();
+	if (!wj_walk_enter (root, &res))
+		return res;
+	while (wj_walk_sp > base) {
+		WjWalkFrame *f = &wj_walk_stack [wj_walk_sp - 1];
+		int child = 0;
+
+		if (f->phase == 0) {
+			WjDepSet *ds = f->snap_ds;
+			while (ds && f->i < ds->n) {
+				int slot = ds->slot [f->i++];
+				if (wj_lazy_is_pool_slot (slot) && !wj_lazy_dep_needs_real (slot)) {   /* Phase 5: the stub (invariant 1) */
+					if (!wj_lazy_dep_ok (slot))
+						f->ok = FALSE;
+					continue;
+				}
+				child = wj_desc_for_fslot (slot);
+				if (child > 0)
+					break;
+				child = 0;
+			}
+			if (!child) {
+				f->phase = 1;
+				f->i = 0;
+				if (f->snap_b) {
+					if ((mono_wasm_jit_admit_walk & 2) && !wj_walk_mark_batch (f->snap_b)) {
+						f->i = f->snap_b->n;    /* every sibling is stamped or on the walk already */
+						mono_wasm_jit_counters [WJC_WALK_BATCH_SKIP]++;
+					} else {
+						mono_wasm_jit_counters [WJC_WALK_BATCH_EXPAND]++;
+					}
+				}
+			}
+		}
+		if (!child && f->phase == 1) {
+			WjBatchDesc *mb = f->snap_b;
+			while (mb && f->i < mb->n) {
+				int m = mb->desc [f->i++];
+				if (m > 0 && m != f->desc_id) {
+					child = m;
+					break;
+				}
+			}
+			if (!child)
+				f->phase = 2;
+		}
+		if (child) {
+			gboolean cres = TRUE;
+			/* may grow (move) the stack: f is not used after this */
+			if (!wj_walk_enter (child, &cres) && !cres)
+				wj_walk_stack [wj_walk_sp - 1].ok = FALSE;
+			continue;
+		}
+		/* phase 2: install this node, pop, report to the parent */
+		{
+			gboolean ok = f->ok;
+			if (!wj_admit_install_only (f->desc_id, f->re, f->snap_b, f->snap_bytes, f->snap_len, f->snap_payload))
+				ok = FALSE;
+			--wj_walk_sp;
+			if (wj_walk_sp > base) {
+				if (!ok)
+					wj_walk_stack [wj_walk_sp - 1].ok = FALSE;
+			} else {
+				res = ok;
+			}
+		}
+	}
+	return res;
+}
+
+static gboolean
+wj_install_closure (int desc_id)
+{
+	gboolean r;
+	if (mono_wasm_jit_admit_walk & 1)
+		return wj_install_closure_iter (desc_id);
+	if (++wj_walk_rdepth > (int) mono_wasm_jit_counters [WJC_WALK_DEPTH_MAX])
+		mono_wasm_jit_counters [WJC_WALK_DEPTH_MAX] = wj_walk_rdepth;
+	wj_stack_probe ();
+	r = wj_install_closure_rec (desc_id);
+	--wj_walk_rdepth;
+	return r;
+}
+
+/* Called by wj_admit_impl at depth 0 on its slow path, and ended by mono_wasm_jit_admit when that returns. */
+static void
+wj_walk_epoch_begin (void)
+{
+	wj_walk_epoch_timing = 1;
+	wj_walk_epoch_t0 = emscripten_get_now ();
+	if (mono_wasm_jit_admit_walk & 4) {
+		wj_inst_gen_next ();
+		wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
+		wj_clo_n = 0;
+		wj_walk_epoch_open = 1;
+		mono_wasm_jit_counters [WJC_WALK_EPOCHS]++;
+	}
+}
+
+static void
+wj_walk_epoch_end (void)
+{
+	gint64 us = (gint64) ((emscripten_get_now () - wj_walk_epoch_t0) * 1000.0);
+	if (us > mono_wasm_jit_counters [WJC_WALK_EPOCH_US_MAX])
+		mono_wasm_jit_counters [WJC_WALK_EPOCH_US_MAX] = us;
+	wj_walk_epoch_timing = 0;
+	wj_walk_epoch_open = 0;
 }
 
 /* Did this install pass hold a coop-suspend off? The walk has no safepoint poll and is entered FROM
@@ -5336,17 +5639,22 @@ wj_walk_note_gc_pending (void)
 		mono_wasm_jit_counters [WJC_ADMIT_WALK_GC_PENDING]++;
 }
 
+/* The cycle break's walk. Inside a bit-4 epoch it continues the admission's generation: a descriptor an earlier
+ * walk of the same admission entered is not walked again (that walk completed, and its failure would have failed the
+ * admission). Otherwise a fresh generation and budget, as before. */
 static gboolean
 wj_install_closure_root (int desc_id, WjRegEntry *re)
 {
 	(void) re;
+	mono_wasm_jit_counters [WJC_WALK_PASSES]++;
 	wj_inst_stamp_ensure (desc_id + 1);
-	if (++wj_inst_gen == 0) {
-		memset (wj_inst_stamp, 0, sizeof (guint32) * (gsize) wj_inst_cap);
-		wj_inst_gen = 1;
+	if (wj_walk_epoch_open) {
+		mono_wasm_jit_counters [WJC_WALK_EPOCH_REUSE]++;
+	} else {
+		wj_inst_gen_next ();
+		wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
+		wj_clo_n = 0;
 	}
-	wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
-	wj_clo_n = 0;
 	{
 		gboolean r = wj_install_closure (desc_id);
 		wj_walk_note_gc_pending ();
@@ -5375,11 +5683,9 @@ wj_install_closure_group (int desc_id, WjRegEntry *re)
 	if (!ibatch)
 		return wj_install_closure_root (desc_id, re);
 
+	mono_wasm_jit_counters [WJC_WALK_PASSES]++;
 	wj_inst_stamp_ensure (desc_id + 1);
-	if (++wj_inst_gen == 0) {
-		memset (wj_inst_stamp, 0, sizeof (guint32) * (gsize) wj_inst_cap);
-		wj_inst_gen = 1;
-	}
+	wj_inst_gen_next ();
 	wj_inst_budget = wj_reg_n + WJ_INSTALL_SLACK;
 	wj_clo_n = 0;
 	for (i = 0; i < ibatch->n; ++i) {
@@ -5842,6 +6148,11 @@ wj_admit_impl (int desc_id)
 	if (G_UNLIKELY (mono_wasm_jit_single_writer))
 		return wj_make_callable (desc_id);
 
+	/* A0: the top-level slow path opens the admission's walk generation (MONO_WASM_JIT_ADMIT_WALK bit 4) and its
+	 * timing at every knob value; mono_wasm_jit_admit closes both. */
+	if (wj_admit_depth == 0 && !wj_walk_epoch_timing)
+		wj_walk_epoch_begin ();
+	wj_stack_probe ();
 	wj_desc_state_ensure (desc_id + 1);
 	mono_memory_barrier ();
 	re = wj_reg_at (desc_id - 1);
@@ -6349,6 +6660,8 @@ mono_wasm_jit_admit (int desc_id)
 	wj_reg_read_enter ();
 	result = wj_admit_impl (desc_id);
 	wj_reg_read_leave ();
+	if (G_UNLIKELY (wj_walk_epoch_timing) && wj_admit_depth == 0)
+		wj_walk_epoch_end ();
 	return result;
 }
 #include "mini-wasm-publish.inc"
@@ -6762,6 +7075,12 @@ wj_stack_probe (void)
 		if (head < wj_stack_min_headroom) {
 			wj_stack_min_headroom = head;
 			wj_stack_total_seen = (base > end) ? (gint32) (base - end) : 0;
+			/* A0: the stats dump never runs in a run the overflow kills, so name each new low under 128 KB as it
+			 * happens, with the two recursions that can take the stack there. */
+			static gint32 lowprint = 131072 + 8192;   /* a line per 8 KB of new low, from 128 KB down */
+			if (head + 8192 <= lowprint && (lowprint = head, TRUE))
+				printf ("[wasm-jit stackprobe] LOW headroom=%d of %d admit_depth=%d walk_rdepth=%d walk_sp=%d\n",
+					head, wj_stack_total_seen, wj_admit_depth, wj_walk_rdepth, wj_walk_sp);
 		}
 	}
 }
@@ -7323,6 +7642,7 @@ wj_thread_state_free (void *unused)
 		mono_wasm_jit_free_note ((p), mono_wasm_jit_usable_size (p), "thread_exit"); g_free (p); (p) = NULL; } } while (0)
 	wj_slot_live_cap = 0; wj_slot_installed_cap = 0; wj_slot_payload_cap = 0; wj_slot_payload_lo = 0; wj_desc_state_cap = 0;
 	wj_clo_cap = 0; wj_clo_n = 0; wj_inst_cap = 0; wj_reach_cap = 0;
+	wj_walk_cap = 0; wj_walk_sp = 0; wj_walk_marks_cap = 0; wj_walk_marks_n = 0;
 	mono_memory_barrier ();
 	WJ_TFREE (wj_slot_live);
 	WJ_TFREE (wj_slot_installed);
@@ -7332,6 +7652,8 @@ wj_thread_state_free (void *unused)
 	WJ_TFREE (wj_desc_permfail);
 	WJ_TFREE (wj_clo_list);
 	WJ_TFREE (wj_inst_stamp);
+	WJ_TFREE (wj_walk_stack);
+	WJ_TFREE (wj_walk_marks);
 	WJ_TFREE (wj_census_seen);
 	WJ_TFREE (wj_reach_stamp);
 	WJ_TFREE (wj_reach_stack);

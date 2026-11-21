@@ -1539,6 +1539,14 @@ enum {
 	WJC_B4_IC_EDGES,             /* ... edges recorded (one per profiled target over the share) */
 	WJC_B4_IC_NOPROF,            /* ... sites with no settled profile record */
 	WJC_B4_IC_NOFSLOT,           /* ... targets over the share without a JIT f-slot */
+	WJC_WALK_PASSES,             /* MONO_WASM_JIT_ADMIT_WALK: install walks rooted (cycle breaks + groups) */
+	WJC_WALK_EPOCHS,             /* ... top-level admissions that opened a walk generation (bit 4) */
+	WJC_WALK_EPOCH_REUSE,        /* ... rooted walks that reused their admission's generation (bit 4) */
+	WJC_WALK_NODES,              /* ... distinct descriptors entered by a walk */
+	WJC_WALK_BATCH_EXPAND,       /* ... batch sibling loops run */
+	WJC_WALK_BATCH_SKIP,         /* ... sibling loops skipped: that batch was expanded in this generation (bit 2) */
+	WJC_WALK_DEPTH_MAX,          /* ... deepest walk: C recursion depth, or the explicit stack's (bit 1) */
+	WJC_WALK_EPOCH_US_MAX,       /* ... longest top-level admission on the slow path, microseconds (any bits) */
 	WJC_MAX
 };
 
