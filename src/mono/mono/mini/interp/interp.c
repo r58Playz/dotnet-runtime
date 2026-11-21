@@ -4223,7 +4223,19 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		int batch_len = 0;
 		int br = mono_wasm_jit_refresh_batch (r.desc_id, &batch_bytes, &batch_len);
 		r.t2_refresh = br;   /* R337 */
-		if (br < 0) {
+		if (br == -2) {
+			/* G: deferred to the image's next re-frame (mono_wasm_jit_refresh_batch). The new body is registered on the
+			 * descriptor; the image keeps the member's old code until then. Not retriable: the re-frame is what applies it. */
+#if HOST_BROWSER
+			{ extern void mono_wasm_jit_bytes_forget (const void *bytes); mono_wasm_jit_bytes_forget (r.bytes); }
+#endif
+			g_free (r.bytes);
+			r.bytes = NULL;
+			r.bytes_len = 0;
+			r.e_slot = 0;
+			r.f_slot = 0;
+			r.retriable = 0;
+		} else if (br < 0) {
 			/* Keep the old shared batch canonical and retry the replacement. The temporary standalone
 			 * instance may exist on this worker, but no generation exposes it to other workers.
 			 *

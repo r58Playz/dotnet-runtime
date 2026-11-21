@@ -44,6 +44,26 @@ guint8 mono_wasm_jit_img_live [WJ_BATCH_MAX + 2];   /* [1 + member]: the member 
 static gint32 *volatile wj_img_member;               /* desc id -> 1 + member index, 0: not a member */
 static volatile int wj_img_member_n;
 static int wj_img_want;                              /* the drainer, b4_step -> wj_rebatch_core: frame this one as the image */
+static gint64 wj_img_framed_ms;                      /* when the image was last framed (mono_msec_ticks) */
+static volatile int wj_img_dirty;                    /* a member's re-emission was deferred to the next re-frame */
+
+/* Is DESC_IDS, in order, the image's member list? A re-frame of it (mono_wasm_jit_refresh_batch passes the batch's own
+ * order) keeps every member's index, so the class index arrays stay right and it stays the image. */
+static gboolean
+wj_img_same (const int *desc_ids, int n)
+{
+	WjBatchDesc *img = mono_wasm_jit_img_batch;
+	return img && n == img->n && !memcmp (desc_ids, img->desc, sizeof (int) * (gsize) n);
+}
+
+/* Is a coalesced image re-frame due (a deferred member and the interval passed)? */
+static gboolean
+wj_img_reframe_due (void)
+{
+	extern int mono_wasm_jit_img_reframe_ms;
+	return wj_img_dirty && mono_wasm_jit_img_batch && mono_wasm_jit_img_reframe_ms > 0 &&
+		mono_msec_ticks () - wj_img_framed_ms >= mono_wasm_jit_img_reframe_ms;
+}
 
 int mono_wasm_jit_img_on (void);
 int
@@ -883,7 +903,8 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 	   * and left the calls indirect, i.e. co-location's cost without its benefit. The policy FIELD
 	   * stays -- the lone-method path passes FALSE deliberately, to keep self-recursion indirect. */
 	  wj_asm_policy_init (&pol, TRUE);
-	  pol.image = wj_img_want && !mono_wasm_jit_img_batch && n + 1 < (int) sizeof (mono_wasm_jit_img_live);   /* G */
+	  pol.image = (wj_img_want && !mono_wasm_jit_img_batch && n + 1 < (int) sizeof (mono_wasm_jit_img_live)) ||
+	              wj_img_same (desc_ids, n);   /* G: the image, or the image re-framed */
 	  { extern int mono_wasm_jit_s1, mono_wasm_jit_b4;   /* plan2x S1: one word per group generation, never freed */
 	    if (guard_in || (((mono_wasm_jit_s1 & 1) || mono_wasm_jit_b4 >= 2) && (guard = wj_word_alloc ()) != NULL)) {
 		if (guard_in)
@@ -1011,7 +1032,11 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 				mono_memory_barrier ();
 				wj_img_member_n = mn;
 				mono_memory_barrier ();
+				if (mono_wasm_jit_img_batch)
+					mono_wasm_jit_counters [WJC_IMG_REFRAMES]++;
 				mono_wasm_jit_img_batch = re0->batch;
+				wj_img_framed_ms = mono_msec_ticks ();
+				wj_img_dirty = 0;
 				mono_wasm_jit_counters [WJC_IMG_MEMBERS] = n;
 				{ /* the receivers already in the members' PICs never take the miss path that fills the rest */
 				  extern void mono_wasm_jit_img_fill_profiles (gpointer caller_imethod);
@@ -1101,6 +1126,16 @@ mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len)
 	mono_loader_lock ();
 	re = (desc_id > 0 && desc_id <= wj_reg_n) ? wj_reg_at (desc_id - 1) : NULL;
 	if (re && re->batch) {
+		/* G: the image is re-framed at most once per MONO_WASM_JIT_IMG_REFRAME_MS, taking every deferred member then */
+		extern int mono_wasm_jit_img_reframe_ms;
+		if (re->batch == mono_wasm_jit_img_batch &&
+		    (mono_wasm_jit_img_reframe_ms <= 0 || mono_msec_ticks () - wj_img_framed_ms < mono_wasm_jit_img_reframe_ms)) {
+			wj_img_dirty = 1;
+			mono_wasm_jit_counters [WJC_IMG_REFRAME_DEFERRED]++;
+			mono_loader_unlock ();
+			wj_reg_read_leave ();
+			return -2;
+		}
 		n = re->batch->n;
 		descs = g_new (int, n);
 		memcpy (descs, re->batch->desc, sizeof (int) * (gsize) n);
@@ -1539,7 +1574,7 @@ wj_b4_grown (void)
 gint32
 mono_wasm_jit_b4_due (void)
 {
-	return wj_b4_ipend < wj_b4_npend || wj_b4_grown ();
+	return wj_b4_ipend < wj_b4_npend || wj_b4_grown () || wj_img_reframe_due ();
 }
 
 /* A member's own bytes. NOT re->len: batch_bind sets that to the whole GROUP module's length, so once a member is framed
@@ -2102,6 +2137,24 @@ mono_wasm_jit_b4_step (void)
 	WjBatchDesc *first = NULL;
 	WjB4Group *g;
 
+	if (wj_img_reframe_due ()) {
+		/* G: one re-frame of the image takes every member re-emitted since its last framing (refresh_batch deferred them) */
+		WjBatchDesc *img = mono_wasm_jit_img_batch;
+		int in = img->n, ok, first;
+		gint32 *idescs = g_new (gint32, in);
+		memcpy (idescs, img->desc, sizeof (int) * (gsize) in);
+		first = idescs [0];
+		wj_reg_read_enter ();
+		ok = mono_wasm_jit_rebatch ((const int *) idescs, in, NULL, NULL);
+		wj_reg_read_leave ();
+		g_free (idescs);
+		if (!ok) {
+			wj_img_framed_ms = mono_msec_ticks ();   /* back off a whole interval; the deferred bodies wait */
+			mono_wasm_jit_counters [WJC_B4_REFUSED]++;
+			return 0;
+		}
+		return first;   /* published with the next rendezvous, as a B4 group is */
+	}
 	if (mono_wasm_jit_counters [WJC_B4_FRAMED] >= mono_wasm_jit_b4_groups) {
 		wj_b4_ipend = wj_b4_npend;   /* the budget is spent: drop the rest of the plan */
 		return 0;

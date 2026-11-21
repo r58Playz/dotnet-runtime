@@ -1409,6 +1409,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_inline_trivial, "MONO_WASM_JIT_INLINE_TRIVIAL", 0, 64)
 	WJ_T2_KNOB (mono_wasm_jit_newarr_inline, "MONO_WASM_JIT_NEWARR_INLINE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_img_dispatch, "MONO_WASM_JIT_IMG_DISPATCH", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_img_reframe_ms, "MONO_WASM_JIT_IMG_REFRAME_MS", 0, 3600000)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
@@ -2002,6 +2003,13 @@ int mono_wasm_jit_newarr_inline = 0;
  * the first B4 group of >= 32 members framed becomes the image. Needs MONO_WASM_JIT_CLASS_RECORD bit 1 or 8 (the
  * per-class index array hangs off the record). 0 = neither: the emitted bytes are today's. */
 int mono_wasm_jit_img_dispatch = 0;
+/* MONO_WASM_JIT_IMG_REFRAME_MS: a member's re-emission (a tier-2 promotion, an IKVM body swap) re-frames its whole
+ * group, and the image is thousands of members and megabytes: re-framed per member it was a GC stall of 1.1 s and a
+ * re-compile on every worker each time (mctick census, 2026-11-21). So a member re-emitted within this many ms of the
+ * image's last framing is deferred -- its new body stays registered on its descriptor, its old code keeps running in the
+ * image -- and one re-frame takes them all once the interval has passed (mono_wasm_jit_b4_step). 0 = never re-frame the
+ * image (members keep the code they were framed with). */
+int mono_wasm_jit_img_reframe_ms = 60000;
 gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,
