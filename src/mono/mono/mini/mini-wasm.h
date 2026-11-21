@@ -1548,6 +1548,8 @@ enum {
 	WJC_WALK_DEPTH_MAX,          /* ... deepest walk: C recursion depth, or the explicit stack's (bit 1) */
 	WJC_WALK_EPOCH_US_MAX,       /* ... longest top-level admission on the slow path, microseconds (any bits) */
 	WJC_T2_BYTES_CAPPED,         /* MONO_WASM_JIT_T2_BYTES_BUDGET: tier-2 promotions refused, the byte budget spent */
+	WJC_CAST_ELIM_STATIC,        /* MONO_WASM_JIT_CAST_ELIM: checks removed (or verified, bit 4) as STATIC, compile time */
+	WJC_CAST_ELIM_DOMINATED,     /* ... as DOMINATED */
 	WJC_MAX
 };
 

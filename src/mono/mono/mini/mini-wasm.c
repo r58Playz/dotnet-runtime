@@ -1002,6 +1002,15 @@ gint32 mono_wasm_jit_cast_diag_sites;
  * absolute-address counter emitted ahead of the check. Every dump prints the sites that ran since the previous one
  * (WASM_JIT_CAST lines). 0 = off: the IR and the emitted bytes are unchanged. */
 int mono_wasm_jit_cast_census = 0;
+/* MONO_WASM_JIT_CAST_ELIM (plan abstract-hatching-stearns L0), a bit mask over the census's classification (computed
+ * whether or not the census itself is on): 1 = a castclass / isinst whose source's static class proves it (STATIC)
+ * becomes a move; 2 = one proven by a dominating castclass of the same single-definition value (DOMINATED) likewise;
+ * 4 = verify: those checks stay, preceded by an isinst of the same class whose failure on a non-null value adds to
+ * WJC_CAST_ELIM_BAD's run-time word (must read 0). RELOAD and FINAL are census categories only: a racing writer can
+ * change a re-read field between two reads, so they are not eliminated. mctick census, 2026-11-20/21: static 7.8-8.7%,
+ * dominated 0.6-0.7% of ~950 k checks a tick. 0 = off. */
+int mono_wasm_jit_cast_elim = 0;
+gint32 mono_wasm_jit_cast_elim_bad;   /* bumped by verify-mode code (bit 4), read by the stats dump */
 const char mono_wasm_jit_cast_note_tag [] = "wj-cast-note";
 
 /* MONO_WASM_JIT_CAST_UNFINISHED: a castclass or isinst whose class is a TypeBuilder's that CreateType has not completed
@@ -1423,6 +1432,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_nce_flow, "MONO_WASM_JIT_NCE_FLOW", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_cast_diag, "MONO_WASM_JIT_CAST_DIAG", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_census, "MONO_WASM_JIT_CAST_CENSUS", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_cast_elim, "MONO_WASM_JIT_CAST_ELIM", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)

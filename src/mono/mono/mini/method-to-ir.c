@@ -13577,9 +13577,9 @@ calli_end:
 
 field_access_end:
 #ifdef HOST_BROWSER
-			{ extern int mono_wasm_jit_cast_census;
+			{ extern int mono_wasm_jit_cast_census, mono_wasm_jit_cast_elim;
 			  extern void mono_wasm_jit_cast_census_note_field (MonoCompile *cfg, MonoInst *val, MonoClassField *field);
-			  if (G_UNLIKELY (mono_wasm_jit_cast_census) && COMPILE_WASM (cfg) && (il_op == MONO_CEE_LDFLD || il_op == MONO_CEE_LDSFLD) &&
+			  if (G_UNLIKELY (mono_wasm_jit_cast_census || mono_wasm_jit_cast_elim) && COMPILE_WASM (cfg) && (il_op == MONO_CEE_LDFLD || il_op == MONO_CEE_LDSFLD) &&
 			      field && sp > stack_start)
 				mono_wasm_jit_cast_census_note_field (cfg, sp [-1], field); }
 #endif

@@ -680,6 +680,9 @@ static __thread MonoCompile *wj_cc_cfg;
 static __thread MonoMethod *wj_cc_method;
 static __thread GHashTable *wj_cc_erased;   /* MonoInst * pushed by an ldfld / ldsfld -> its MonoClassField, this compile */
 static __thread GHashTable *wj_cc_site;     /* OP_CASTCLASS / OP_ISINST -> WjCastSite, this compile */
+static __thread GHashTable *wj_cc_why;      /* OP_CASTCLASS / OP_ISINST -> its category + 1, this compile (census or L0) */
+extern int mono_wasm_jit_cast_elim;
+extern gint32 mono_wasm_jit_cast_elim_bad;
 
 /* IKVM's erasure marker is a modopt (`object modopt(__<Unloadable>...)`); Java volatile is a modreq. Reads the
  * modifier list only: resolving the modifier's type in a compile section could load classes. */
@@ -706,6 +709,7 @@ wj_cc_reset (MonoCompile *cfg)
 	wj_cc_method = cfg->method;
 	if (wj_cc_erased) g_hash_table_remove_all (wj_cc_erased); else wj_cc_erased = g_hash_table_new (NULL, NULL);
 	if (wj_cc_site) g_hash_table_remove_all (wj_cc_site); else wj_cc_site = g_hash_table_new (NULL, NULL);
+	if (wj_cc_why) g_hash_table_remove_all (wj_cc_why); else wj_cc_why = g_hash_table_new (NULL, NULL);
 }
 
 /* method-to-ir.c, field_access_end: VAL is what an ldfld / ldsfld of a field of type FTYPE pushed. MonoInst.klass is
@@ -768,8 +772,10 @@ wj_cc_arg_type (MonoCompile *cfg, int i)
 	return (i >= 0 && i < sig->param_count) ? sig->params [i] : NULL;
 }
 
+/* Classify every castclass / isinst of the compile into wj_cc_why; with CENSUS, also a site record (and its counter
+ * address) per cast. */
 static void
-wj_cast_census_classify (MonoCompile *cfg)
+wj_cast_census_classify (MonoCompile *cfg, gboolean census)
 {
 	int nv = cfg->next_vreg, nb = cfg->num_bblocks, i, j, words, changed, iter;
 	guint8 *ndef;
@@ -847,8 +853,10 @@ wj_cast_census_classify (MonoCompile *cfg)
 		MonoInst *d = (v >= 0 && v < nv && ndef [v] == 1) ? def [v] : NULL;
 		gboolean single = d != NULL || argi >= 0;
 		MonoClass *src = NULL;
-		WjCastSite *s = g_new0 (WjCastSite, 1);
+		WjCastSite site_tmp, *s = &site_tmp;
 		MonoType *at = argi >= 0 ? wj_cc_arg_type (cfg, argi) : NULL;
+
+		memset (&site_tmp, 0, sizeof (site_tmp));
 
 		if (d && (d->opcode == OP_CASTCLASS || d->opcode == OP_ISINST)) {
 			src = d->klass;
@@ -948,6 +956,11 @@ wj_cast_census_classify (MonoCompile *cfg)
 		}
 		if (!s->erased && c->ins->sreg1 != v && c->ins->sreg1 >= 0 && c->ins->sreg1 < nv && ndef [c->ins->sreg1] == 1)
 			{ MonoClassField *fl = (MonoClassField *) g_hash_table_lookup (wj_cc_erased, def [c->ins->sreg1]); s->erased = fl && wj_cc_type_erased (fl->type); }
+		g_hash_table_insert (wj_cc_why, c->ins, GINT_TO_POINTER (s->why + 1));
+		if (!census)
+			continue;
+		s = g_new (WjCastSite, 1);
+		*s = site_tmp;
 		s->tier = (guint8) cfg->wasm_jit_tier;
 		s->isinst = c->ins->opcode == OP_ISINST;
 		s->iface = klass && mono_class_is_interface (klass);
@@ -1023,8 +1036,29 @@ mono_wasm_jit_cast_census_dump (void)
 }
 #endif
 
+#ifdef HOST_BROWSER
+/* L0 verify (MONO_WASM_JIT_CAST_ELIM bit 4): ahead of a check L0 would have removed, add (isinst (source) == null) -
+ * (source == null) -- 1 exactly when a non-null value fails -- to mono_wasm_jit_cast_elim_bad. Branch-free; the check
+ * itself follows unchanged. */
 static void
-mono_decompose_typecheck (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins)
+wj_cast_elim_verify (MonoCompile *cfg, MonoClass *klass, MonoInst *source)
+{
+	MonoInst *r = handle_isinst (cfg, klass, source, 0);
+	int a = alloc_preg (cfg), v = alloc_ireg (cfg), rz = alloc_ireg (cfg), sz = alloc_ireg (cfg), bad = alloc_ireg (cfg);
+	MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, r->dreg, 0);
+	MONO_EMIT_NEW_UNALU (cfg, OP_ICEQ, rz, -1);
+	MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, source->dreg, 0);
+	MONO_EMIT_NEW_UNALU (cfg, OP_ICEQ, sz, -1);
+	MONO_EMIT_NEW_BIALU (cfg, OP_ISUB, bad, rz, sz);
+	MONO_EMIT_NEW_PCONST (cfg, a, (gpointer) &mono_wasm_jit_cast_elim_bad);
+	MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, v, a, 0);
+	MONO_EMIT_NEW_BIALU (cfg, OP_IADD, v, v, bad);
+	MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STOREI4_MEMBASE_REG, a, 0, v);
+}
+#endif
+
+static void
+mono_decompose_typecheck (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins, gboolean verify_elim)
 {
 	MonoInst *ret, *move, *source;
 	MonoClass *klass = ins->klass;
@@ -1050,6 +1084,10 @@ mono_decompose_typecheck (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins)
 		with_cache = mono_wasm_jit_cast_unfinished != 0;
 		mono_wasm_jit_note_cast_unfinished (cfg->method, cfg->wasm_jit_tier, klass, is_isinst, with_cache);
 	}
+#endif
+#ifdef HOST_BROWSER
+	if (verify_elim && !with_cache && !context_used)
+		wj_cast_elim_verify (cfg, klass, source);
 #endif
 	if (with_cache) {
 		if (is_isinst)
@@ -1078,25 +1116,48 @@ void
 mono_decompose_typechecks (MonoCompile *cfg)
 {
 	gboolean found_typetest = FALSE;
+	int elim = 0;
 #ifdef HOST_BROWSER
-	if (G_UNLIKELY (mono_wasm_jit_cast_census) && COMPILE_WASM (cfg))
-		wj_cast_census_classify (cfg);
+	if (G_UNLIKELY (mono_wasm_jit_cast_census || mono_wasm_jit_cast_elim) && COMPILE_WASM (cfg)) {
+		wj_cast_census_classify (cfg, mono_wasm_jit_cast_census != 0);
+		elim = mono_wasm_jit_cast_elim;
+	}
 #endif
 	for (MonoBasicBlock *bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 		MonoInst *ins;
 		MONO_BB_FOR_EACH_INS (bb, ins) {
 			switch (ins->opcode) {
 			case OP_ISINST:
-			case OP_CASTCLASS:
+			case OP_CASTCLASS: {
+				gboolean verify_elim = FALSE;
 				found_typetest = TRUE;
-				mono_decompose_typecheck (cfg, bb, ins);
+#ifdef HOST_BROWSER
+				/* L0: a check the classification proves always passes is a move (bits 1 / 2), or is verified (bit 4) */
+				if (elim && wj_cc_why && wj_cc_cfg == cfg) {
+					int why = GPOINTER_TO_INT (g_hash_table_lookup (wj_cc_why, ins)) - 1;
+					if ((why == WJ_CC_STATIC && (elim & 1)) || (why == WJ_CC_DOMINATED && (elim & 2))) {
+						mono_wasm_jit_counters [why == WJ_CC_STATIC ? WJC_CAST_ELIM_STATIC : WJC_CAST_ELIM_DOMINATED]++;
+						if (elim & 4) {
+							verify_elim = TRUE;
+						} else {
+							ins->opcode = OP_MOVE;   /* dreg <- sreg1: the value, unchanged; null stays null */
+							break;
+						}
+					}
+				}
+#endif
+				mono_decompose_typecheck (cfg, bb, ins, verify_elim);
 				break;
+			}
 			}
 		}
 	}
 #ifdef HOST_BROWSER
-	if (G_UNLIKELY (mono_wasm_jit_cast_census) && COMPILE_WASM (cfg) && wj_cc_site && wj_cc_cfg == cfg) {
-		g_hash_table_remove_all (wj_cc_site);
+	if (G_UNLIKELY (mono_wasm_jit_cast_census || mono_wasm_jit_cast_elim) && COMPILE_WASM (cfg) && wj_cc_cfg == cfg) {
+		if (wj_cc_site)
+			g_hash_table_remove_all (wj_cc_site);
+		if (wj_cc_why)
+			g_hash_table_remove_all (wj_cc_why);
 		wj_cc_cfg = NULL; wj_cc_method = NULL;
 	}
 #endif
