@@ -77,7 +77,7 @@ const CJ = /^cj(gc)?(\d+)$/.exec(arm || "");
 const CLR_ENVS = { clr: "ikvm-clr10/env.sh", clrrelink: "ikvm-clr10-relink/env-relink.sh", clrclassic: "ikvm-clr10/env-classic.sh" };
 const CLR = MC ? CLR_ENVS[arm] : undefined;
 if (!(["ours", ...Object.keys(TEAVM_DIRS)].includes(arm) || /^hs\d+$/.test(arm || "") || CJ || CLR) || !outdir) {
-  console.error("usage: run.mjs <ours|tvfull|tvsimple|tvfull60|tvsimple60|teavm|hs<N>|cj<V>|cjgc<V>|clr|clrrelink|clrclassic (mctick)> <outdir> [--events A|B|C|D|L] [--timeout S] [--no-attr] [--no-perf]"
+  console.error("usage: run.mjs <ours|tvfull|tvsimple|tvfull60|tvsimple60|teavm|hs<N>|cj<V>|cjgc<V>|clr|clrrelink|clrclassic (mctick)> <outdir> [--events A|B|C|D|L] [--timeout S] [--no-attr] [--no-perf] [--no-jitdump]"
     + " [--stop-after N] [--knob K=V (ours)] [--dumps (ours: dumpWasmJit at batch 1 and 12)] [--perf-extra 'ARGS'] [--js-flags-extra 'F1,F2' (browser arms: appended to V8's --js-flags)] [--tv-dir DIR (a TeaVM arm's served directory, e.g. a split-teavm.py output)]");
   process.exit(1);
 }
@@ -86,6 +86,10 @@ const TIMEOUT = Number(opt("timeout", MC ? 1500 : 240)) * 1000;
 const ATTR = !args.includes("--no-attr");
 const CPUS = process.env.J2D_CPUS || cfg("WJ_PCPUS");   // the big cores (lib/paths.mjs autodetects them)
 const PERF = !args.includes("--no-perf");          // timing-only: the workload alone, no perf in the tree
+/* --no-jitdump: perf records the event set but V8 writes no jitdump (--perf-prof off). The counts (j2d/counts) need
+ * none; the ledger and per-function readers do. A jitdump is ~2.3 GB a mctick run with a 9 MB image, and re-framing
+ * churn made one 9.7 GB (2026-11-21): count-only timing batches pass this. */
+const JITDUMP = !args.includes("--no-jitdump");
 /* SCHEDULE W,S,N (default 600,200,12): warmup steps, steps per batch, batches. The window is batches WA+1..WB
  * (--window-batches WA,WB, default 1,12). R416: in the default schedule 45% of our JIT cycles in the window are
  * TIER-1 code -- the hottest methods (DynamicTree.query/insertLeaf, solveVelocityConstraints) get their tier-2 bodies
@@ -255,7 +259,7 @@ if (HS && MC) {
     "--disable-sync", "--disable-background-networking", "--disable-client-side-phishing-detection",
     "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
     "--ignore-gpu-blocklist", "--use-gl=angle", `--use-angle=${process.env.MC_ANGLE || "gl"}`,
-    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
+    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
     "about:blank"];
   delete env.WAYLAND_DISPLAY; delete env.XDG_SESSION_TYPE;
   env.__J2D_PROFILE = prof;
