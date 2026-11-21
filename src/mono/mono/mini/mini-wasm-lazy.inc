@@ -523,6 +523,8 @@ mono_wasm_jit_hook_route_locked (int desc_id, MonoMethod *m, gpointer imethod)
 	re->body_current = 0;
 	mono_memory_barrier ();
 	re->hooked = 1;
+	{ extern void mono_wasm_jit_img_invalidate (int desc_id);   /* G: the image's copy no longer stands for it */
+	  mono_wasm_jit_img_invalidate (desc_id); }
 	wj_entry_drop_body (re);   /* R531: compiled from IL no longer in force; the mandatory re-emission brings a new one */
 	/* B4 leaf copies (R452): every group carrying a private copy of this body calls it module-locally too */
 	{ extern void mono_wasm_jit_b4_copy_invalidate (int fslot);

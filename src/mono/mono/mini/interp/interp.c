@@ -2140,6 +2140,44 @@ mono_wasm_jit_prof_targets (gpointer caller_ptr, MonoMethod *base, MonoMethod **
 	return n;
 }
 
+/* G (plan abstract-hatching-stearns, mini-wasm-batching.inc mono_wasm_jit_img_fill): when the image is bound, the class
+ * index entries for every (receiver vtable, target) a member's virtual sites have observed. Receivers already in a
+ * site's PIC never take the miss path that fills the rest. Base and target are retained raw pointers, each tested
+ * with wj_method_usable_profile before use; an identity is a receiver's MonoVTable, which outlives its objects. */
+void mono_wasm_jit_img_fill_profiles (gpointer caller_ptr);
+void
+mono_wasm_jit_img_fill_profiles (gpointer caller_ptr)
+{
+	extern int mono_wasm_jit_img_fill (MonoVTable *vt, int slot, int fslot);
+	extern int mono_wasm_jit_mid_slot (MonoMethod *base);
+	InterpMethod *caller = (InterpMethod *) caller_ptr;
+	WjCallProfile *p;
+	if (!caller)
+		return;
+	for (p = (WjCallProfile *) mono_atomic_load_ptr ((gpointer *) &caller->wasm_jit_profile); p; p = p->next) {
+		guint32 i, n = p->n;
+		mono_memory_barrier ();
+		for (i = 0; i < n && i < p->cap; ++i) {
+			WjProfSite *s = &p->sites [i];
+			int slot, k;
+			if (s->kind != WJ_SITE_VIRTUAL || !s->base || !wj_method_usable_profile (s->base))
+				continue;
+			slot = mono_wasm_jit_mid_slot (s->base);
+			if (slot < 0)
+				continue;
+			for (k = 0; k < s->nids && k < WJ_PROF_WAYS; ++k) {
+				MonoMethod *t = s->id_targets [k];
+				InterpMethod *tim;
+				if (!s->ids [k] || !t || !wj_method_usable_profile (t))
+					continue;
+				tim = mono_interp_peek_imethod (t);
+				if (tim && tim->wasm_jit_fslot > 0)
+					mono_wasm_jit_img_fill ((MonoVTable *) s->ids [k], slot, tim->wasm_jit_fslot);
+			}
+		}
+	}
+}
+
 /*
  * R215b: the dominant target at a DELEGATE site.
  *
@@ -3486,6 +3524,15 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 			}
 			if (ps)
 				wj_prof_record_at (ps, WJ_SITE_VIRTUAL, vt, target, TRUE);
+			/* G: a miss at a site of an image member fills the receiver class's index entry for the site's slot */
+			{ extern int mono_wasm_jit_img_dispatch, mono_wasm_jit_img_on (void);
+			  if (G_UNLIKELY (mono_wasm_jit_img_dispatch) && fslot > 0 && mono_wasm_jit_img_on ()) {
+				extern int mono_wasm_jit_img_member (int desc_id), mono_wasm_jit_mid_slot (MonoMethod *base);
+				extern int mono_wasm_jit_img_fill (MonoVTable *vt, int slot, int fslot);
+				int slot;
+				if (mono_wasm_jit_img_member (site->caller_im->wasm_jit_desc) > 0 && (slot = mono_wasm_jit_mid_slot (site->base)) >= 0)
+					mono_wasm_jit_img_fill (vt, slot, fslot);
+			  } }
 		}
 		/* R208's RE-EMISSION TRIGGER stood here: enqueue the caller once its own emitted code had missed
 		 * at this site enough times. It was the right observation point -- a miss HERE means the profile

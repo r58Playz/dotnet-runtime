@@ -31,6 +31,87 @@
 static __thread WjAsmDeps *wj_batch_deps;
 static __thread int        wj_batch_deps_cap;
 
+/* MONO_WASM_JIT_IMG_DISPATCH (plan abstract-hatching-stearns G): THE IMAGE, one B4 group framed with a table of its own
+ * (table 1: entry 1 + i is member i's method function), through which a virtual site inside it calls a target inside it
+ * with `call_indirect <type> 1` -- a same-instance call V8's CallIndirectIC can inline -- on an index the receiver's
+ * class record supplies (wj_img_idx, filled at the IC miss path in interp.c). One image per process, chosen by
+ * mono_wasm_jit_b4_step (the first group it frames with at least 32 members); never freed. A member whose descriptor
+ * is later bound to other code (a re-frame, a re-registration, a hook, an orphaning) clears its live byte
+ * (mono_wasm_jit_img_invalidate) and its sites fall back to today's path: the index arrays are never rewritten, so
+ * the byte is what keeps a stale entry from being called. */
+WjBatchDesc *volatile mono_wasm_jit_img_batch;
+guint8 mono_wasm_jit_img_live [WJ_BATCH_MAX + 2];   /* [1 + member]: the member still runs the image's code */
+static gint32 *volatile wj_img_member;               /* desc id -> 1 + member index, 0: not a member */
+static volatile int wj_img_member_n;
+static int wj_img_want;                              /* the drainer, b4_step -> wj_rebatch_core: frame this one as the image */
+
+int mono_wasm_jit_img_on (void);
+int
+mono_wasm_jit_img_on (void)
+{
+	return mono_wasm_jit_img_batch != NULL;
+}
+
+int mono_wasm_jit_img_member (int desc_id);
+int
+mono_wasm_jit_img_member (int desc_id)
+{
+	gint32 *m = wj_img_member;
+	return (m && desc_id > 0 && desc_id < wj_img_member_n) ? m [desc_id] : 0;
+}
+
+/* Point VT's class index entry for vtable SLOT at the image member whose f-slot is FSLOT, when that member still runs
+ * the image's code (so table 1's entry is the very function table 0 holds at FSLOT: same function, same type). The
+ * array is the class record's (metadata/object.c), sized by the class's vtable when first needed -- a receiver's
+ * vtable is final by the time one of its objects is dispatched -- published by CAS, never freed. 1 = filled. */
+int mono_wasm_jit_img_fill (MonoVTable *vt, int slot, int fslot);
+int
+mono_wasm_jit_img_fill (MonoVTable *vt, int slot, int fslot)
+{
+	extern gpointer *mono_wasm_class_record_img_slot (MonoVTable *vt);
+	WjBatchDesc *img = mono_wasm_jit_img_batch;
+	gpointer *sp;
+	guint16 *arr;
+	int d, m, vsz;
+	if (!img || !vt || !vt->klass || slot < 0 || fslot <= 0)
+		return 0;
+	d = wj_desc_for_fslot (fslot);
+	m = mono_wasm_jit_img_member (d);
+	if (m <= 0 || m > img->n || img->f [m - 1] != fslot || !mono_wasm_jit_img_live [m] ||
+	    !(sp = mono_wasm_class_record_img_slot (vt))) {
+		mono_wasm_jit_counters [WJC_IMG_FILL_REFUSED]++;
+		return 0;
+	}
+	vsz = MAX ((int) m_class_get_vtable_size (vt->klass), slot + 1);
+	arr = (guint16 *) mono_atomic_load_ptr (sp);
+	if (!arr) {
+		guint16 *na = g_new0 (guint16, vsz);
+		if (mono_atomic_cas_ptr (sp, na, NULL) != NULL)
+			g_free (na);   /* another thread published first; this one was never visible */
+		arr = (guint16 *) mono_atomic_load_ptr (sp);
+	}
+	if (slot >= (int) m_class_get_vtable_size (vt->klass) && arr) {
+		mono_wasm_jit_counters [WJC_IMG_FILL_REFUSED]++;   /* past the array that was sized for this class */
+		return 0;
+	}
+	if (arr && arr [slot] != (guint16) m) {
+		arr [slot] = (guint16) m;
+		mono_wasm_jit_counters [WJC_IMG_FILLS]++;
+	}
+	return arr != NULL;
+}
+
+void mono_wasm_jit_img_invalidate (int desc_id);
+void
+mono_wasm_jit_img_invalidate (int desc_id)
+{
+	int m = mono_wasm_jit_img_member (desc_id);
+	if (m > 0 && mono_wasm_jit_img_live [m]) {
+		mono_wasm_jit_img_live [m] = 0;
+		mono_wasm_jit_counters [WJC_IMG_INVALIDATED]++;
+	}
+}
+
 static void
 wj_batch_deps_ensure (int need)
 {
@@ -400,6 +481,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 			saved [i].batch = re->batch;   /* NULL for a fresh group; the absorbed group on a merge */
 			saved [i].hooked = re->hooked;
 		}
+		mono_wasm_jit_img_invalidate (desc_ids [i]);   /* G: its code is about to be this group's */
 		wj_pub_begin (re);   /* R320: batch/bytes/depset change as one unit for admission; ended after the depset */
 		re->batch = bd;
 		/* Do NOT publish re->generation here. It is set below, AFTER mono_memory_barrier() and after
@@ -801,6 +883,7 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 	   * and left the calls indirect, i.e. co-location's cost without its benefit. The policy FIELD
 	   * stays -- the lone-method path passes FALSE deliberately, to keep self-recursion indirect. */
 	  wj_asm_policy_init (&pol, TRUE);
+	  pol.image = wj_img_want && !mono_wasm_jit_img_batch && n + 1 < (int) sizeof (mono_wasm_jit_img_live);   /* G */
 	  { extern int mono_wasm_jit_s1, mono_wasm_jit_b4;   /* plan2x S1: one word per group generation, never freed */
 	    if (guard_in || (((mono_wasm_jit_s1 & 1) || mono_wasm_jit_b4 >= 2) && (guard = wj_word_alloc ()) != NULL)) {
 		if (guard_in)
@@ -911,6 +994,36 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 		if (out_len) *out_len = (int) out.len;
 		if (mono_wasm_jit_verbose >= 2)
 			printf ("WASM_JIT_REBATCH members=%d bytes=%u instantiate=%.2fms\n", n, (unsigned) out.len, ms);
+		if (pol.image) {
+			/* G: the image is bound. Its member map and live bytes before the batch pointer that makes it visible. */
+			WjRegEntry *re0 = wj_reg_at (desc_ids [0] - 1);
+			if (re0 && re0->batch) {
+				int mn = wj_reg_n + 1;
+				gint32 *map = g_new0 (gint32, mn);
+				for (i = 0; i < n; ++i)
+					if (desc_ids [i] > 0 && desc_ids [i] < mn)
+						map [desc_ids [i]] = i + 1;
+				for (i = 0; i < n; ++i)
+					mono_wasm_jit_img_live [i + 1] = 1;
+				wj_img_member_n = 0;
+				mono_memory_barrier ();
+				wj_img_member = map;
+				mono_memory_barrier ();
+				wj_img_member_n = mn;
+				mono_memory_barrier ();
+				mono_wasm_jit_img_batch = re0->batch;
+				mono_wasm_jit_counters [WJC_IMG_MEMBERS] = n;
+				{ /* the receivers already in the members' PICs never take the miss path that fills the rest */
+				  extern void mono_wasm_jit_img_fill_profiles (gpointer caller_imethod);
+				  for (i = 0; i < n; ++i) {
+					WjRegEntry *mre = wj_reg_at (desc_ids [i] - 1);
+					if (mre && mre->logical_imethod)
+						mono_wasm_jit_img_fill_profiles (mre->logical_imethod);
+				  } }
+				printf ("[wasm-jit img] the image: %d members, %u bytes, payload %u, %lld class entries from profiles\n", n,
+					(unsigned) out.len, (unsigned) payload, (long long) mono_wasm_jit_counters [WJC_IMG_FILLS]);
+			}
+		}
 	}
 	wasm_buf_free (&out);
 done:
@@ -2122,8 +2235,11 @@ mono_wasm_jit_b4_step (void)
 			}
 		}
 	}
+	{ extern int mono_wasm_jit_img_dispatch;   /* G: the first group of at least 32 members framed becomes the image */
+	  wj_img_want = mono_wasm_jit_img_dispatch && !mono_wasm_jit_img_batch && n >= 32; }
 	ok = ncopy > 0 ? wj_rebatch_core (descs, n, copies, ncopy, guard, copy_bodies, NULL, NULL)
 	               : mono_wasm_jit_rebatch (descs, n, NULL, NULL);
+	wj_img_want = 0;
 	if (ok && ncopy > 0) {
 		/* Re-check each copy's source now that the module is published: a hook or a new owner that landed between
 		 * the choice and the note above found no ref, so it is caught here. */

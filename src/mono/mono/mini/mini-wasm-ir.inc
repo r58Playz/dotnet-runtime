@@ -4171,6 +4171,7 @@ typedef struct {
 	guint32 guard_addr;          /* plan2x S1: non-zero = guard every member-to-member call on this word */
 	guint32 guard_count_addr;    /* ... and count the taken arm here */
 	int    nexport;              /* B4 leaf copies (R452): members from this index on are private copies; 0 = all exported */
+	int    image;                /* plan abstract-hatching-stearns G: this module is the image (table 1, IMG_* relocations live) */
 } WjAsmPolicy;
 
 /* Per-member census of what the forms came out as; feeds the WJC_ counters and the tier dumps. */
@@ -4589,6 +4590,11 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 		case WASM_RELOC_TYPE_S:
 		case WASM_RELOC_INDIRECT:
 			continue;   /* a type index only; there is no form to choose */
+		case WASM_RELOC_IMG_GATE:
+		case WASM_RELOC_IMG_INDIRECT:
+			/* G: the gate's constant and the table index; INDIRECT form, so pass 2 leaves idx alone */
+			fix [k].idx = pol->image ? 1 : 0;
+			continue;
 		case WASM_RELOC_GLOBAL: {
 			/* a module-defined global: numbered after the imported s.* ones, members' blocks in member order. The
 			 * form stays INDIRECT so pass 2's function-index rebase leaves `idx` alone. */
@@ -4848,8 +4854,8 @@ wj_assemble (const WjAsmMember *mem, int n, int nexport, const WjAsmPolicy *pol,
 		am [i].ntypes = 2 + mem [i].nextra;
 		am [i].nglobals = mem [i].nglobals;
 	}
-	wasm_module_assemble (am, (guint32) n, (guint32) nexport, import_table, import_eh_tag, eh_type_idx,
-	                      himp, (guint32) nhimp, out);
+	wasm_module_assemble_ex (am, (guint32) n, (guint32) nexport, import_table || pol->image, import_eh_tag, eh_type_idx,
+	                         himp, (guint32) nhimp, pol->image ? (guint32) nexport : 0, out);
 	if (G_UNLIKELY (mono_wasm_jit_stats)) {
 		mono_wasm_jit_add (WJC_CALL_LOCAL, st.nlocal);
 		mono_wasm_jit_add (WJC_CALL_IMPORT, st.nimport);

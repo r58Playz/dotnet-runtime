@@ -1554,6 +1554,11 @@ enum {
 	WJC_NEWARR_INLINE_SITES,     /* MONO_WASM_JIT_NEWARR_INLINE: newarr sites given the inline TLAB bump (compile time) */
 	WJC_CLASSREC_DISPLAY_SITES,  /* MONO_WASM_JIT_CLASS_RECORD bit 1: class checks lowered to one display load (compile time) */
 	WJC_CLASSREC_SEALED_SITES,   /* ... bit 2: sealed checks lowered to a vtable compare (compile time) */
+	WJC_IMG_SITES,               /* MONO_WASM_JIT_IMG_DISPATCH: compact sites emitted with the image prefix (compile time) */
+	WJC_IMG_MEMBERS,             /* ... the image's member count (0: no image yet) */
+	WJC_IMG_FILLS,               /* ... class index entries written at the IC miss path */
+	WJC_IMG_FILL_REFUSED,        /* ... misses at an image site not filled (target outside the image, no record, ...) */
+	WJC_IMG_INVALIDATED,         /* ... members whose code left the image after it was bound (their sites fall back) */
 	WJC_MAX
 };
 

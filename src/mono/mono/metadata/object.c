@@ -2181,6 +2181,9 @@ meta_arena_alloc0 (size_t size)
  * it when a TypeBuilder's supertypes are rebuilt (sre.c resets them when a parent is set). 0 = no record.
  */
 #define MONO_WASM_CLASS_RECORD_SIZE 48
+/* the record: MonoClass *display [8] at 0; guint16 *img_idx at 32 (MONO_WASM_JIT_IMG_DISPATCH: the class's table-1
+ * index per vtable slot, allocated at its first fill, never freed); 12 bytes unused */
+#define MONO_WASM_CLASS_RECORD_IMG_IDX 32
 static int class_record_bits = -1;
 static int class_record_offset;   /* the record's offset from the MonoVTable (negative), 0 until the first record */
 gint64 mono_wasm_class_record_bytes;
@@ -2202,6 +2205,15 @@ int
 mono_wasm_class_record_offset (void)
 {
 	return class_record_offset;
+}
+
+/* G: the address of VT's record's index-array pointer, or NULL without records */
+gpointer *
+mono_wasm_class_record_img_slot (MonoVTable *vt)
+{
+	if (!class_record_offset || !vt)
+		return NULL;
+	return (gpointer *) ((char *) vt + class_record_offset + MONO_WASM_CLASS_RECORD_IMG_IDX);
 }
 
 /* Copy KLASS's first 8 supertypes into VT's record (zero past its depth). */

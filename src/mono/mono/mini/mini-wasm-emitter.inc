@@ -9428,6 +9428,48 @@ vcall_nullchk_done:
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 									  } }
 									wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) aic_vtab_idx);
+									/* G (MONO_WASM_JIT_IMG_DISPATCH, mini-wasm-batching.inc): inside the image -- the gate's
+									 * constant is 1 only in the image's module -- a receiver whose class record has a table-1
+									 * index for this vtable slot, of a member still running the image's code, is called through
+									 * the image's own table: `call_indirect <type> 1`, a same-instance call. Anything else falls
+									 * through to the site below. vc_fslot_idx is scratch here (the PIC path rewrites it). */
+									{ extern int mono_wasm_jit_img_dispatch;
+									  extern int mono_wasm_class_record_offset (void);
+									  extern guint8 mono_wasm_jit_img_live [];
+									  int _rec = mono_wasm_class_record_offset ();
+									  if (mono_wasm_jit_img_dispatch && cfg->wasm_jit_tier >= 2 && vc_mid_slot >= 0 && vc_mid_slot < 32768 && _rec) {
+										guint16 _io;
+										mono_wasm_jit_counters [WJC_IMG_SITES]++;
+										wasm_reloc (&body, WASM_RELOC_IMG_GATE, 0, 0, NULL);
+										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+										  wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+										  wasm_i32_const (&body, _rec + 32);   /* the record's img_idx (metadata/object.c) */
+										  wasm_op (&body, WASM_OP_I32_ADD);
+										  wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
+										  wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+										  wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+										    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										    wasm_op (&body, WASM_OP_I32_LOAD16_U); wasm_memarg (&body, 1, (guint32) (2 * vc_mid_slot));
+										    wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) vc_fslot_idx);
+										    wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+										      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+										      wasm_op (&body, WASM_OP_I32_LOAD8_U); wasm_memarg (&body, 0, (guint32) (gsize) mono_wasm_jit_img_live);
+										      wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+											for (ai = 0; ai < n2; ++ai)
+												if (!wj_emit_one_call_arg (&body, &lc, &vci, csig, call, ai)) { fail = "img arg ld"; goto done; }
+											WJ_PUSH_SP ();
+											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_fslot_idx);
+											_io = wasm_origin_push (&body, WJO_DYN_CALL);
+											wasm_reloc (&body, WASM_RELOC_IMG_INDIRECT, (guint32) ftdi, 0, NULL);
+											wj_site_link_reloc (&body, 0);
+											wasm_origin_pop (&body, _io);
+											if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "img dreg"; goto done; }
+											wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) (6 + l0d));   /* -> end $after */
+										      wasm_op (&body, WASM_OP_END);
+										    wasm_op (&body, WASM_OP_END);
+										  wasm_op (&body, WASM_OP_END);
+										wasm_op (&body, WASM_OP_END);
+									  } }
 									if (l0d) {
 										/* L0: the vtable of this site's last PIC hit on this instance, and its f-slot -- admitted
 										 * here, since it came out of this pthread's PIC (the instance lives within one pthread,

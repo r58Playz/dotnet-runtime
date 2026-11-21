@@ -29,6 +29,9 @@
 #   t15 module-defined globals (WASM_RELOC_GLOBAL): three members' globals numbered after the imported s.* ones, each
 #       member's its own, persistent across calls and per instance (EXECUTED in node, t15.mjs); no global section
 #       in a module without them
+#   t16 the image (plan abstract-hatching-stearns G): a module defining table 1 over its members (an active element segment)
+#       and dispatching through it at an IMG_INDIRECT hole under an IMG_GATE: EXECUTED in node (t16.mjs); the same
+#       member framed alone has gate 0, no table and no element section
 #   t5  ONE body framed at two different ti_base values asks for the SAME functype -- the re-framing case
 #       re-emission creates, which t1-t4 structurally cannot reach (they frame each body once). Carries
 #       its own negative control: a deliberately off-by-one ti_base must be caught, or the gate is inert.
@@ -39,7 +42,7 @@ set -e
 d=$(cd "$(dirname "$0")" && pwd)
 m=$(cd "$d/../../src/mono/mono/mini" && pwd)
 o=${ENCTEST_OUT:-$(mktemp -d)}; mkdir -p "$o"
-for t in t t2 t3 t4 t5 t6 t7 t9 t10 t11 t12 t13 t14 t15; do
+for t in t t2 t3 t4 t5 t6 t7 t9 t10 t11 t12 t13 t14 t15 t16; do
 	gcc -g -O1 -Wall -I"$d" -I"$m" -o "$o/$t.bin" "$d/$t.c" "$d/legacy.c" "$m/wasm-encoder.c"
 	(cd "$o" && "./$t.bin")
 done
@@ -48,4 +51,5 @@ done
 (cd "$o" && node "$d/t11.mjs")
 (cd "$o" && node "$d/t14.mjs")
 (cd "$o" && node "$d/t15.mjs")
+(cd "$o" && node "$d/t16.mjs")
 [ -n "${ENCTEST_OUT:-}" ] || rm -rf "$o"

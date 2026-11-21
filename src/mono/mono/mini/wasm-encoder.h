@@ -427,6 +427,9 @@ typedef enum {
 	                       * the member's own global number (0..nglobals-1), written as WASM_IMPORTED_GLOBALS + the
 	                       * member's base in the module + that number (the resolver puts it in the fix's `idx`). Not a
 	                       * call: it neither ends a call's run nor takes a key, but like every hole it resets key_src */
+	WASM_RELOC_IMG_GATE,  /* plan abstract-hatching-stearns G: `i32.const <0|1>`, 1 only in the image module (the fix's idx) */
+	WASM_RELOC_IMG_INDIRECT, /* ... `call_indirect <type> <0|1>` with the index on the stack: table 1 (the image's own, its
+	                       * members' functions) in the image module, table 0 elsewhere, where IMG_GATE makes it dead code */
 } WasmRelocKind;
 
 /* The s.* globals every module imports (emit_import_section's gnames): module-defined globals are numbered after them. */
@@ -647,6 +650,16 @@ void wasm_module_assemble (
 	gboolean import_table,
 	gboolean import_eh_tag, guint32 eh_type_idx,
 	const WasmFuncImport *fimports, guint32 nfimports,
+	WasmBuf *out);
+/* ... and with IMAGE_N > 0 the image module (plan abstract-hatching-stearns G): it also defines table 1, IMAGE_N + 1
+ * funcref entries, whose entry 1 + i is member i's method function (an active element segment); entry 0 stays null.
+ * Needs IMPORT_TABLE (table 0 is the imported f.f). */
+void wasm_module_assemble_ex (
+	const WasmAsmMember *members, guint32 nmembers, guint32 nexport,
+	gboolean import_table,
+	gboolean import_eh_tag, guint32 eh_type_idx,
+	const WasmFuncImport *fimports, guint32 nfimports,
+	guint32 image_n,
 	WasmBuf *out);
 
 

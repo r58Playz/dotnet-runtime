@@ -1408,6 +1408,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_trivial, "MONO_WASM_JIT_INLINE_TRIVIAL", 0, 64)
 	WJ_T2_KNOB (mono_wasm_jit_newarr_inline, "MONO_WASM_JIT_NEWARR_INLINE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_img_dispatch, "MONO_WASM_JIT_IMG_DISPATCH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
@@ -1996,6 +1997,11 @@ int mono_wasm_jit_inline_alloc = 1;
  * ves_icall_array_new_specific only when the op yields 0 (too long, negative, TLAB exhausted, detached). mctick: 4.3 k
  * array allocations a tick took the icall. 0 = every newarr calls it. */
 int mono_wasm_jit_newarr_inline = 0;
+/* MONO_WASM_JIT_IMG_DISPATCH (plan abstract-hatching-stearns G; mini-wasm-batching.inc mono_wasm_jit_img_batch): 1 = every
+ * tier-2 compact class-virtual site carries the image prefix (under a gate that is 1 only in the image's module), and
+ * the first B4 group of >= 32 members framed becomes the image. Needs MONO_WASM_JIT_CLASS_RECORD bit 1 or 8 (the
+ * per-class index array hangs off the record). 0 = neither: the emitted bytes are today's. */
+int mono_wasm_jit_img_dispatch = 0;
 gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,
@@ -4376,6 +4382,8 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			 * Contents before the pointer/word that publishes them, as everywhere else here. */
 			if (old_re && old_desc != (int) (n + 1)) {
 				old_re->orphaned = 1;
+				{ extern void mono_wasm_jit_img_invalidate (int desc_id);   /* G */
+				  mono_wasm_jit_img_invalidate (old_desc); }
 				mono_memory_barrier ();
 				wj_entry_drop_body (old_re);   /* R531: an orphan is never framed again */
 				old_re->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);

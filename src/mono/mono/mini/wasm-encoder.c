@@ -263,7 +263,7 @@ wasm_reloc (WasmBuf *b, WasmRelocKind kind, guint32 tpool, guint32 table_index, 
 	e->site_kd = 0;
 	e->site_rec = 0;
 	e->edge_cnt = 0;
-	if (kind != WASM_RELOC_TYPE_U && kind != WASM_RELOC_TYPE_S && kind != WASM_RELOC_GLOBAL) {
+	if (kind != WASM_RELOC_TYPE_U && kind != WASM_RELOC_TYPE_S && kind != WASM_RELOC_GLOBAL && kind != WASM_RELOC_IMG_GATE) {
 		/* a call: it ends the previous call's run, and its key is the last memory access of its own */
 		wasm_site_key_open (b);
 		if (b->key_src >= 0 && (guint32) b->key_src < b->len && b->len - (guint32) b->key_src <= WASM_SITE_KD_MASK)
@@ -444,6 +444,16 @@ wasm_body_serialize (const WasmBuf *src, const WasmRelocFix *fix, guint32 ti_bas
 			wasm_op (out, WASM_OP_CALL_INDIRECT);
 			wasm_uleb (out, ti);
 			wasm_uleb (out, 0);
+			break;
+		case WASM_RELOC_IMG_GATE:
+			wasm_i32_const (out, (gint32) fix [k].idx);   /* 1 in the image module */
+			break;
+		case WASM_RELOC_IMG_INDIRECT:
+			WASM_COUNT_SITE (WASM_SF_DYNAMIC);
+			wasm_site_note (out, base, r, key);
+			wasm_op (out, WASM_OP_CALL_INDIRECT);
+			wasm_uleb (out, ti);
+			wasm_uleb (out, fix [k].idx);                 /* table 1 in the image module, else 0 (dead code there) */
 			break;
 		case WASM_RELOC_SELF:
 			/* The entry thunk calling its own method. Always module-local: they are framed together. */
@@ -955,6 +965,16 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
                       const WasmFuncImport *fimports, guint32 nfimports,
                       WasmBuf *out)
 {
+	wasm_module_assemble_ex (members, nmembers, nexport, import_table, import_eh_tag, eh_type_idx, fimports, nfimports, 0, out);
+}
+
+void
+wasm_module_assemble_ex (const WasmAsmMember *members, guint32 nmembers, guint32 nexport,
+                         gboolean import_table, gboolean import_eh_tag, guint32 eh_type_idx,
+                         const WasmFuncImport *fimports, guint32 nfimports,
+                         guint32 image_n,
+                         WasmBuf *out)
+{
 	static const guint8 header [8] = { 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
 	static const WasmLocalGroup no_locals [1] = { { WASM_I32, 0 } };
 	WasmBuf sec;
@@ -994,6 +1014,19 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 		wasm_uleb (&sec, base + 1);      /* entry-thunk type = its second */
 	emit_section (out, 3, &sec);
 	wasm_buf_free (&sec);
+
+	/* Table section (4), the image only: table 1, after the imported f.f */
+	if (image_n) {
+		g_assert (import_table && image_n <= nmembers);
+		wasm_buf_init (&sec);
+		wasm_uleb (&sec, 1);
+		wasm_u8 (&sec, 0x70);            /* funcref */
+		wasm_u8 (&sec, 0x01);            /* limits: min and max */
+		wasm_uleb (&sec, image_n + 1);
+		wasm_uleb (&sec, image_n + 1);
+		emit_section (out, 4, &sec);
+		wasm_buf_free (&sec);
+	}
 
 	/* Global section (6): the members' module-defined globals, in member order, each a mutable i32 starting at 0. No
 	 * section at all when there are none, so a module without them is byte-identical to one framed before they
@@ -1037,6 +1070,22 @@ wasm_module_assemble (const WasmAsmMember *members, guint32 nmembers, guint32 ne
 	}
 	emit_section (out, 7, &sec);
 	wasm_buf_free (&sec);
+
+	/* Element section (9), the image only: one active segment, flags 2 (an explicit table index), table 1 from
+	 * offset 1, the members' method functions; entry 0 stays null and is never called */
+	if (image_n) {
+		wasm_buf_init (&sec);
+		wasm_uleb (&sec, 1);
+		wasm_uleb (&sec, 2);
+		wasm_uleb (&sec, 1);
+		wasm_op (&sec, WASM_OP_I32_CONST); wasm_sleb (&sec, 1); wasm_op (&sec, WASM_OP_END);
+		wasm_u8 (&sec, 0x00);            /* elemkind: funcref */
+		wasm_uleb (&sec, image_n);
+		for (i = 0; i < image_n; ++i)
+			wasm_uleb (&sec, nfimports + i);
+		emit_section (out, 9, &sec);
+		wasm_buf_free (&sec);
+	}
 
 	/* R339: branch hints (custom section "metadata.code.branch_hint"), before the code section. Offsets are relative
 	 * to the start of each function's LOCAL DECLARATIONS (V8: pc_offset - locals_offset_), so add that length. */
