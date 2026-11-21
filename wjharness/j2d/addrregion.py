@@ -10,7 +10,9 @@ Regions:
   wasm:sstack     linear memory inside THIS thread's shadow stack: the address range the emitter's own frame constructs
                   (PIN / FRAME / SLOTZERO / EXIT / EH_PUSH / EH_POP / BB_ILOFS stores and loads) touch, widened to the
                   enclosing 1 MiB-aligned window (a pthread's stack is one malloc'd block)
-  wasm:heap       the rest of linear memory (SGen objects, malloc'd metadata: vtables, classes, PIC tables, ...)
+  wasm:heap       the rest of linear memory (SGen objects, malloc'd metadata: vtables, classes, PIC tables, ...). With
+                  <rundir>/heapmap.json it reads instead wasm:nursery, wasm:major<=64 / <=512 / >512 (a major-heap block,
+                  by its object size), wasm:los, or wasm:malloc (everything sgen does not own)
   v8-sandbox      [anon:v8-sandbox] outside linear memory: the JS heap (FixedArrays, JSArrayBuffers, WasmGlobalObject
                   buffers, the instance object)
   v8              [anon:v8] rw: trusted space (WasmTrustedInstanceData, WasmDispatchTable), code metadata
@@ -103,8 +105,29 @@ class Regions:
             self.base -= self.base % 65536
         else:
             self.base = lm[0]
-        wasm = sorted(glob.glob(served_glob), key=os.path.getmtime)
+        # the deploy may serve the module in chunks (dotnet.native.<hash>.wasm0, 1, ...): the global section is in the first
+        wasm = sorted(glob.glob(served_glob) or glob.glob(served_glob + '0'), key=os.path.getmtime)
         self.sp_init = stack_pointer_init(wasm[-1]) if wasm else None
+        # Optional <rundir>/heapmap.json ({"heapmap": {"nursery": [lo, hi], "blockSize": n, "arenas": [[base, nblocks,
+        # [obj size of each block]], ...], "los": [[LOSObject, size], ...]}}, linear-memory OFFSETS read in the page at
+        # the window's edge): wasm:heap splits into sgen's own areas, and what is left is malloc'd (metadata, tables,
+        # stacks). An arena allocated after the map was taken reads wasm:malloc.
+        self.hm = None
+        hp = os.path.join(rundir, 'heapmap.json')
+        if os.path.exists(hp):
+            h = json.load(open(hp)).get('heapmap')
+            if h:
+                iv = [(h['nursery'][0], h['nursery'][1], 'wasm:nursery')]
+                bs = h['blockSize']
+                for base, nb, sizes in h['arenas']:
+                    for j, sz in enumerate(sizes[:nb]):
+                        iv.append((base + j * bs, base + (j + 1) * bs,
+                                   'wasm:major<=64' if 0 < sz <= 64 else 'wasm:major<=512' if 0 < sz <= 512 else 'wasm:major>512'))
+                for p, sz in h.get('los', []):
+                    iv.append((p, p + sz + 16, 'wasm:los'))
+                iv.sort()
+                self.hm = iv
+                self.hm_starts = [x[0] for x in iv]
         self.sstack = None
         self.nstack = None
         self._frame_addrs = []
@@ -153,6 +176,11 @@ class Regions:
                 return 'wasm:sstack'
             if self.sp_init is not None and off < self.sp_init:
                 return 'wasm:static'
+            if self.hm is not None:
+                k = bisect.bisect_right(self.hm_starts, off) - 1
+                if k >= 0 and self.hm[k][0] <= off < self.hm[k][1]:
+                    return self.hm[k][2]
+                return 'wasm:malloc'
             return 'wasm:heap'
         v = self.vma(ad)
         if v is None:
