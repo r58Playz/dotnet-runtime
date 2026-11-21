@@ -773,6 +773,11 @@ int mono_wasm_jit_inline_cold_throw = 1;
  * exception tail (Holder$Reference.value: 32.7 k calls a mctick tick) was refused at depth before R318 could discount
  * it. Counted WJC_INLINE_TRIVIAL_DEPTH. 0 = off. */
 int mono_wasm_jit_inline_trivial = 0;
+/* MONO_WASM_JIT_INLINE_AGGR_DEPTH=1: an [AggressiveInlining] callee is exempt from the inline depth cap too, to depth 16
+ * (wj_aggr_inline's block cap still applies). The census of 2026-11-21 (all levers) refused IKVM's
+ * Util.getClassFromObject -- AggressiveInlining since IKVM bb8874c0a, its fast path the point -- 4,521 times, all for
+ * depth: Java's getClass reaches it through two forwarding levels. Counted with WJC_INLINE_TRIVIAL_DEPTH. 0 = off. */
+int mono_wasm_jit_inline_aggr_depth = 0;
 /* MONO_WASM_JIT_INLINE_COLD_CALL: a call site inside an IL block that ends in a throw is not inlined and is charged a flat
  * cost (method-to-ir.c wj_cold_call_site), under the per-compile policy only. R318 above discounts those blocks from the
  * SIZE gate; this keeps the COST gate and the inliner out of them. 2026-11-05: every traced cost refusal of the hot
@@ -1407,6 +1412,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_fast_tls, "MONO_WASM_JIT_FAST_TLS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_trivial, "MONO_WASM_JIT_INLINE_TRIVIAL", 0, 64)
+	WJ_T2_KNOB (mono_wasm_jit_inline_aggr_depth, "MONO_WASM_JIT_INLINE_AGGR_DEPTH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_newarr_inline, "MONO_WASM_JIT_NEWARR_INLINE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_img_dispatch, "MONO_WASM_JIT_IMG_DISPATCH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_img_reframe_ms, "MONO_WASM_JIT_IMG_REFRAME_MS", 0, 3600000)

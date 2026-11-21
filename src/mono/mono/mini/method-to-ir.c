@@ -5654,11 +5654,14 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 		gboolean trivial = FALSE;
 #ifdef HOST_BROWSER
 		/* I1 (MONO_WASM_JIT_INLINE_TRIVIAL): a trivial callee is exempt from the depth cap, to depth 16 */
-		extern int mono_wasm_jit_inline_trivial;
+		extern int mono_wasm_jit_inline_trivial, mono_wasm_jit_inline_aggr_depth;
 		if (COMPILE_WASM (cfg) && mono_wasm_jit_inline_trivial > 0 && cfg->inline_depth <= 16 &&
 		    mono_method_get_header_summary (method, &header) && header.code &&
 		    wj_il_hot_size (header.code, header.code_size) <= GINT_TO_UINT32 (mono_wasm_jit_inline_trivial)) {
 			trivial = TRUE;
+			wj_gi_count (WJC_INLINE_TRIVIAL_DEPTH);
+		} else if (COMPILE_WASM (cfg) && mono_wasm_jit_inline_aggr_depth && cfg->inline_depth <= 16 && wj_aggr_inline (cfg, method)) {
+			trivial = TRUE;   /* MONO_WASM_JIT_INLINE_AGGR_DEPTH */
 			wj_gi_count (WJC_INLINE_TRIVIAL_DEPTH);
 		}
 #endif
