@@ -661,6 +661,366 @@ wj_cast_target_unfinished (MonoClass *klass)
 		klass = mono_class_get_generic_class (klass)->container_class;
 	return klass && image_is_dynamic (m_class_get_image (klass)) && !m_class_was_typebuilder (klass);
 }
+
+/* MONO_WASM_JIT_CAST_CENSUS (mini-wasm.c). A site is one castclass / isinst of one compile (tier 1 and 2, inlinees'
+ * included); records are never freed, the counter word is baked into the emitted code. */
+extern int mono_wasm_jit_cast_census;
+enum { WJ_CC_OPEN, WJ_CC_STATIC, WJ_CC_DOMINATED, WJ_CC_RELOAD, WJ_CC_FINAL };
+enum { WJ_CO_OTHER, WJ_CO_ARG, WJ_CO_CALL, WJ_CO_LOAD, WJ_CO_CAST, WJ_CO_MULTIDEF };
+typedef struct WjCastSite {
+	struct WjCastSite *next;
+	char *cls, *meth, *target;
+	gint32 il;                 /* IL offset in the compiled method, -1 inside an inlinee */
+	guint8 tier, isinst, why, origin, erased, iface, sealed_, array;
+	guint16 depth;
+	volatile gint32 count;
+} WjCastSite;
+static WjCastSite *volatile wj_cc_sites;
+static __thread MonoCompile *wj_cc_cfg;
+static __thread MonoMethod *wj_cc_method;
+static __thread GHashTable *wj_cc_erased;   /* MonoInst * pushed by an ldfld / ldsfld -> its MonoClassField, this compile */
+static __thread GHashTable *wj_cc_site;     /* OP_CASTCLASS / OP_ISINST -> WjCastSite, this compile */
+
+/* IKVM's erasure marker is a modopt (`object modopt(__<Unloadable>...)`); Java volatile is a modreq. Reads the
+ * modifier list only: resolving the modifier's type in a compile section could load classes. */
+static gboolean
+wj_cc_type_erased (MonoType *t)
+{
+	MonoCustomModContainer *c;
+	int i;
+	if (!t || !t->has_cmods || ((MonoTypeWithModifiers *) t)->is_aggregate)
+		return FALSE;
+	c = mono_type_get_cmods (t);
+	for (i = 0; c && i < c->count; ++i)
+		if (!c->modifiers [i].required)
+			return TRUE;
+	return FALSE;
+}
+
+static void
+wj_cc_reset (MonoCompile *cfg)
+{
+	if (wj_cc_cfg == cfg && wj_cc_method == cfg->method)
+		return;
+	wj_cc_cfg = cfg;
+	wj_cc_method = cfg->method;
+	if (wj_cc_erased) g_hash_table_remove_all (wj_cc_erased); else wj_cc_erased = g_hash_table_new (NULL, NULL);
+	if (wj_cc_site) g_hash_table_remove_all (wj_cc_site); else wj_cc_site = g_hash_table_new (NULL, NULL);
+}
+
+/* method-to-ir.c, field_access_end: VAL is what an ldfld / ldsfld of a field of type FTYPE pushed. MonoInst.klass is
+ * not initialised for every instruction (MONO_INST_NEW does not clear it), so the census takes a source's static class
+ * only from here, a call's signature, a cast's own class, or the method signature. */
+void mono_wasm_jit_cast_census_note_field (MonoCompile *cfg, MonoInst *val, MonoClassField *field);
+void
+mono_wasm_jit_cast_census_note_field (MonoCompile *cfg, MonoInst *val, MonoClassField *field)
+{
+	if (!val || !field || !field->type)
+		return;
+	wj_cc_reset (cfg);
+	g_hash_table_insert (wj_cc_erased, val, field);
+}
+
+typedef struct { MonoInst *ins; MonoBasicBlock *bb; int pos; int root; } WjCcCast;
+
+/* Does a value known to be HAVE pass a cast to TARGET? Parent chains only (supertypes of loaded classes, no loading
+ * in a compile section); interface and array targets count on identity alone, so those categories are lower bounds. */
+static gboolean
+wj_cc_proves (MonoClass *target, MonoClass *have)
+{
+	if (!target || !have)
+		return FALSE;
+	if (target == have)
+		return TRUE;
+	if (mono_class_is_interface (target) || m_class_get_rank (target) || mono_class_is_interface (have) || m_class_get_rank (have))
+		return FALSE;
+	return mono_class_has_parent (have, target);
+}
+
+static int
+wj_cc_root (int v, guint8 *ndef, MonoInst **def, int nv)
+{
+	int k;
+	for (k = 0; k < 16 && v >= 0 && v < nv && ndef [v] == 1 && def [v] && def [v]->opcode == OP_MOVE && def [v]->sreg1 >= 0; ++k)
+		v = def [v]->sreg1;
+	return v;
+}
+
+static int
+wj_cc_arg_index (MonoCompile *cfg, int v)
+{
+	int i, n = mono_method_signature_internal (cfg->method)->param_count + (mono_method_signature_internal (cfg->method)->hasthis ? 1 : 0);
+	for (i = 0; cfg->args && i < n; ++i)
+		if (cfg->args [i] && cfg->args [i]->dreg == v)
+			return i;
+	return -1;
+}
+
+static MonoType *
+wj_cc_arg_type (MonoCompile *cfg, int i)
+{
+	MonoMethodSignature *sig = mono_method_signature_internal (cfg->method);
+	if (sig->hasthis) {
+		if (i == 0)
+			return m_class_get_byval_arg (cfg->method->klass);
+		i--;
+	}
+	return (i >= 0 && i < sig->param_count) ? sig->params [i] : NULL;
+}
+
+static void
+wj_cast_census_classify (MonoCompile *cfg)
+{
+	int nv = cfg->next_vreg, nb = cfg->num_bblocks, i, j, words, changed, iter;
+	guint8 *ndef;
+	MonoInst **def;
+	GArray *casts;
+	guint64 *dom = NULL, *tmp = NULL;
+	MonoBasicBlock *bb;
+	MonoInst *ins;
+	MonoClass *object_class = mono_defaults.object_class;
+	const char *mcls = m_class_get_name (cfg->method->klass), *mns = m_class_get_name_space (cfg->method->klass);
+
+	wj_cc_reset (cfg);
+	casts = g_array_new (FALSE, FALSE, sizeof (WjCcCast));
+	ndef = g_new0 (guint8, nv);
+	def = g_new0 (MonoInst *, nv);
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+		int pos = 0;
+		MONO_BB_FOR_EACH_INS (bb, ins) {
+			if (ins->opcode == OP_CASTCLASS || ins->opcode == OP_ISINST) {
+				WjCcCast c = { ins, bb, pos, -1 };
+				g_array_append_val (casts, c);
+			}
+			if (ins->dreg >= 0 && ins->dreg < nv && ins->opcode != OP_NOP) {
+				if (ndef [ins->dreg] < 255) ndef [ins->dreg]++;
+				def [ins->dreg] = ins;
+			}
+			pos++;
+		}
+	}
+	if (!casts->len)
+		goto out;
+	/* dominators over block_num (< num_bblocks before mono_bb_ordering), iterated to a fixed point; capped */
+	words = (nb + 63) / 64;
+	if (nb > 0 && nb <= 4096) {
+		dom = g_new (guint64, (gsize) nb * words);
+		tmp = g_new (guint64, words);
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+			guint64 *d = dom + (gsize) bb->block_num * words;
+			if (bb == cfg->bb_entry) {
+				memset (d, 0, words * 8);
+				d [bb->block_num / 64] |= 1ull << (bb->block_num % 64);
+			} else {
+				memset (d, 0xff, words * 8);
+			}
+		}
+		for (iter = 0, changed = 1; changed && iter < 64; ++iter) {
+			changed = 0;
+			for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+				guint64 *d = dom + (gsize) bb->block_num * words;
+				if (bb == cfg->bb_entry)
+					continue;
+				if (bb->in_count == 0) {
+					memset (tmp, 0, words * 8);
+				} else {
+					memset (tmp, 0xff, words * 8);
+					for (i = 0; i < bb->in_count; ++i) {
+						guint64 *p = dom + (gsize) bb->in_bb [i]->block_num * words;
+						for (j = 0; j < words; ++j) tmp [j] &= p [j];
+					}
+				}
+				tmp [bb->block_num / 64] |= 1ull << (bb->block_num % 64);
+				if (memcmp (tmp, d, words * 8)) { memcpy (d, tmp, words * 8); changed = 1; }
+			}
+		}
+		if (changed) { g_free (dom); dom = NULL; }   /* did not settle: no dominance claims */
+	}
+	for (i = 0; i < (int) casts->len; ++i) {
+		WjCcCast *c = &g_array_index (casts, WjCcCast, i);
+		c->root = wj_cc_root (c->ins->sreg1, ndef, def, nv);
+	}
+	for (i = 0; i < (int) casts->len; ++i) {
+		WjCcCast *c = &g_array_index (casts, WjCcCast, i);
+		MonoClass *klass = c->ins->klass;
+		int v = c->root, argi = (v >= 0 && v < nv && ndef [v] == 0) ? wj_cc_arg_index (cfg, v) : -1;
+		MonoInst *d = (v >= 0 && v < nv && ndef [v] == 1) ? def [v] : NULL;
+		gboolean single = d != NULL || argi >= 0;
+		MonoClass *src = NULL;
+		WjCastSite *s = g_new0 (WjCastSite, 1);
+		MonoType *at = argi >= 0 ? wj_cc_arg_type (cfg, argi) : NULL;
+
+		if (d && (d->opcode == OP_CASTCLASS || d->opcode == OP_ISINST)) {
+			src = d->klass;
+		} else if (d && MONO_IS_CALL (d)) {
+			MonoMethodSignature *cs = ((MonoCallInst *) d)->signature;
+			if (cs && cs->ret && MONO_TYPE_IS_REFERENCE (cs->ret))
+				src = mono_class_from_mono_type_internal (cs->ret);
+		} else if (d) {
+			MonoClassField *fl = (MonoClassField *) g_hash_table_lookup (wj_cc_erased, d);
+			if (fl && MONO_TYPE_IS_REFERENCE (fl->type))
+				src = mono_class_from_mono_type_internal (fl->type);
+		} else if (at && MONO_TYPE_IS_REFERENCE (at)) {
+			src = mono_class_from_mono_type_internal (at);
+		}
+		s->why = WJ_CC_OPEN;
+		if (klass && src && src != object_class && wj_cc_proves (klass, src))
+			s->why = WJ_CC_STATIC;
+		if (s->why == WJ_CC_OPEN && single && klass) {
+			for (j = 0; j < (int) casts->len; ++j) {
+				WjCcCast *p = &g_array_index (casts, WjCcCast, j);
+				gboolean dominates;
+				if (j == i || p->ins->opcode != OP_CASTCLASS || p->root != v || !p->ins->klass)
+					continue;
+				if (!wj_cc_proves (klass, p->ins->klass))
+					continue;
+				if (p->bb == c->bb)
+					dominates = p->pos < c->pos;
+				else
+					dominates = dom && (dom [(gsize) c->bb->block_num * words + p->bb->block_num / 64] >> (p->bb->block_num % 64)) & 1;
+				if (dominates) { s->why = WJ_CC_DOMINATED; break; }
+			}
+		}
+		if (s->why == WJ_CC_OPEN && klass && d && MONO_IS_LOAD_MEMBASE (d) && d->sreg1 >= 0 && d->sreg1 < nv) {
+			/* an earlier castclass in this block whose source is a load of the same base + offset, nothing that
+			 * could store or call between the two loads */
+			for (j = 0; j < (int) casts->len; ++j) {
+				WjCcCast *p = &g_array_index (casts, WjCcCast, j);
+				MonoInst *pd, *k;
+				gboolean clean = TRUE, seen = FALSE;
+				if (j == i || p->bb != c->bb || p->pos >= c->pos || p->ins->opcode != OP_CASTCLASS || !p->ins->klass)
+					continue;
+				pd = (p->root >= 0 && p->root < nv && ndef [p->root] == 1) ? def [p->root] : NULL;
+				if (!pd || !MONO_IS_LOAD_MEMBASE (pd) || pd->sreg1 != d->sreg1 || pd->inst_offset != d->inst_offset)
+					continue;
+				if (!wj_cc_proves (klass, p->ins->klass))
+					continue;
+				MONO_BB_FOR_EACH_INS (c->bb, k) {
+					if (k == pd) { seen = TRUE; continue; }
+					if (k == d) break;
+					if (seen && (MONO_IS_STORE_MEMBASE (k) || MONO_IS_CALL (k) || k->dreg == d->sreg1)) { clean = FALSE; break; }
+				}
+				if (seen && clean) { s->why = WJ_CC_RELOAD; break; }
+			}
+		}
+		if (s->why == WJ_CC_OPEN && klass && d && MONO_IS_LOAD_MEMBASE (d)) {
+			/* a read of an initonly (Java final) field whose same field on the same single-definition base (or the same
+			 * static field) was read and castclass'd at a dominating position: the same value, checked once */
+			MonoClassField *fl = (MonoClassField *) g_hash_table_lookup (wj_cc_erased, d);
+			if (fl && (fl->type->attrs & FIELD_ATTRIBUTE_INIT_ONLY)) {
+				gboolean stat = (fl->type->attrs & FIELD_ATTRIBUTE_STATIC) != 0;
+				int b = stat ? -1 : wj_cc_root (d->sreg1, ndef, def, nv);
+				gboolean bsingle = stat || (b >= 0 && b < nv && (ndef [b] == 1 || (ndef [b] == 0 && wj_cc_arg_index (cfg, b) >= 0)));
+				for (j = 0; bsingle && j < (int) casts->len; ++j) {
+					WjCcCast *p = &g_array_index (casts, WjCcCast, j);
+					MonoInst *pd;
+					gboolean dominates;
+					if (j == i || p->ins->opcode != OP_CASTCLASS || !p->ins->klass || !wj_cc_proves (klass, p->ins->klass))
+						continue;
+					pd = (p->root >= 0 && p->root < nv && ndef [p->root] == 1) ? def [p->root] : NULL;
+					if (!pd || !MONO_IS_LOAD_MEMBASE (pd) || g_hash_table_lookup (wj_cc_erased, pd) != fl)
+						continue;
+					if (!stat && wj_cc_root (pd->sreg1, ndef, def, nv) != b)
+						continue;
+					if (p->bb == c->bb)
+						dominates = p->pos < c->pos;
+					else
+						dominates = dom && (dom [(gsize) c->bb->block_num * words + p->bb->block_num / 64] >> (p->bb->block_num % 64)) & 1;
+					if (dominates) { s->why = WJ_CC_FINAL; break; }
+				}
+			}
+		}
+		if (argi >= 0) {
+			s->origin = WJ_CO_ARG;
+			s->erased = at && wj_cc_type_erased (at);
+		} else if (!d) {
+			s->origin = WJ_CO_MULTIDEF;
+		} else if (MONO_IS_CALL (d)) {
+			s->origin = WJ_CO_CALL;
+			s->erased = ((MonoCallInst *) d)->signature && wj_cc_type_erased (((MonoCallInst *) d)->signature->ret);
+		} else if (d->opcode == OP_CASTCLASS || d->opcode == OP_ISINST) {
+			s->origin = WJ_CO_CAST;
+		} else if (MONO_IS_LOAD_MEMBASE (d)) {
+			s->origin = WJ_CO_LOAD;
+			{ MonoClassField *fl = (MonoClassField *) g_hash_table_lookup (wj_cc_erased, d); s->erased = fl && wj_cc_type_erased (fl->type); }
+		} else {
+			s->origin = WJ_CO_OTHER;
+		}
+		if (!s->erased && c->ins->sreg1 != v && c->ins->sreg1 >= 0 && c->ins->sreg1 < nv && ndef [c->ins->sreg1] == 1)
+			{ MonoClassField *fl = (MonoClassField *) g_hash_table_lookup (wj_cc_erased, def [c->ins->sreg1]); s->erased = fl && wj_cc_type_erased (fl->type); }
+		s->tier = (guint8) cfg->wasm_jit_tier;
+		s->isinst = c->ins->opcode == OP_ISINST;
+		s->iface = klass && mono_class_is_interface (klass);
+		s->sealed_ = klass && mono_class_is_sealed (klass);
+		s->array = klass && m_class_get_rank (klass) > 0;
+		s->depth = klass ? m_class_get_idepth (klass) : 0;
+		s->il = (c->ins->cil_code && cfg->header && c->ins->cil_code >= cfg->header->code &&
+		         c->ins->cil_code < cfg->header->code + cfg->header->code_size) ? (gint32) (c->ins->cil_code - cfg->header->code) : -1;
+		s->cls = g_strdup_printf ("%s%s%s", mns && *mns ? mns : "", mns && *mns ? "." : "", mcls);
+		s->meth = g_strdup (cfg->method->name);
+		if (klass) {
+			const char *tn = m_class_get_name (klass), *tns = m_class_get_name_space (klass);
+			s->target = g_strdup_printf ("%s%s%s", tns && *tns ? tns : "", tns && *tns ? "." : "", tn);
+		} else {
+			s->target = g_strdup ("?");
+		}
+		g_hash_table_insert (wj_cc_site, c->ins, s);
+		{
+			WjCastSite *h;
+			do { h = wj_cc_sites; s->next = h; } while (mono_atomic_cas_ptr ((gpointer *) &wj_cc_sites, s, h) != h);
+		}
+	}
+out:
+	g_hash_table_remove_all (wj_cc_erased);   /* consumed: a later compile at a reused address must not see them */
+	g_free (dom); g_free (tmp); g_free (ndef); g_free (def);
+	g_array_free (casts, TRUE);
+}
+
+/* The site's counter, ahead of the check (cfg->cbb is the cast's first block). */
+static void
+wj_cast_census_count (MonoCompile *cfg, MonoInst *cast)
+{
+	WjCastSite *s;
+	int a, v;
+	if (wj_cc_cfg != cfg || wj_cc_method != cfg->method || !wj_cc_site || !(s = (WjCastSite *) g_hash_table_lookup (wj_cc_site, cast)))
+		return;
+	a = alloc_preg (cfg);
+	v = alloc_ireg (cfg);
+	MONO_EMIT_NEW_PCONST (cfg, a, (gpointer) &s->count);
+	MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, v, a, 0);
+	MONO_EMIT_NEW_BIALU_IMM (cfg, OP_IADD_IMM, v, v, 1);
+	MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STOREI4_MEMBASE_REG, a, 0, v);
+}
+
+/* Every site that ran since the previous dump, then its count is cleared (the harness dumps at both edges of the
+ * window, so the second dump's lines are the window). Not synchronized with running code: a census. */
+void mono_wasm_jit_cast_census_dump (void);
+void
+mono_wasm_jit_cast_census_dump (void)
+{
+	static int seq;
+	static const char *whyn [] = { "open", "static", "dominated", "reload", "final" };
+	static const char *orgn [] = { "other", "arg", "call", "load", "cast", "multidef" };
+	WjCastSite *s;
+	gint64 tot = 0, by [5][2];
+	int lines = 0;
+	memset (by, 0, sizeof (by));
+	++seq;
+	for (s = wj_cc_sites; s; s = s->next) {
+		gint32 n = s->count;
+		if (n <= 0)
+			continue;
+		s->count = 0;
+		tot += n; by [s->why][s->erased ? 1 : 0] += n;
+		lines++;
+		printf ("WASM_JIT_CAST\t%d\t%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s:%s\n", seq, n, whyn [s->why], orgn [s->origin],
+			s->erased, s->isinst, s->iface, s->sealed_, s->array, s->depth, s->tier, s->il, s->target, s->cls, s->meth);
+	}
+	printf ("[wasm-jit cast-census v3] dump %d: %d sites ran, %lld checks; static %lld (erased %lld), dominated %lld (%lld), reload %lld (%lld), final %lld (%lld), open %lld (%lld)\n",
+		seq, lines, (long long) tot, (long long) (by [1][0] + by [1][1]), (long long) by [1][1], (long long) (by [2][0] + by [2][1]),
+		(long long) by [2][1], (long long) (by [3][0] + by [3][1]), (long long) by [3][1], (long long) (by [4][0] + by [4][1]), (long long) by [4][1],
+		(long long) (by [0][0] + by [0][1]), (long long) by [0][1]);
+}
 #endif
 
 static void
@@ -679,6 +1039,10 @@ mono_decompose_typecheck (MonoCompile *cfg, MonoBasicBlock *bb, MonoInst *ins)
 	MonoBasicBlock *first_bb;
 	NEW_BBLOCK (cfg, first_bb);
 	cfg->cbb = first_bb;
+#ifdef HOST_BROWSER
+	if (G_UNLIKELY (mono_wasm_jit_cast_census) && COMPILE_WASM (cfg))
+		wj_cast_census_count (cfg, ins);
+#endif
 
 	gboolean with_cache = mini_class_has_reference_variant_generic_argument (cfg, klass, context_used);
 #ifdef HOST_BROWSER
@@ -714,6 +1078,10 @@ void
 mono_decompose_typechecks (MonoCompile *cfg)
 {
 	gboolean found_typetest = FALSE;
+#ifdef HOST_BROWSER
+	if (G_UNLIKELY (mono_wasm_jit_cast_census) && COMPILE_WASM (cfg))
+		wj_cast_census_classify (cfg);
+#endif
 	for (MonoBasicBlock *bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 		MonoInst *ins;
 		MONO_BB_FOR_EACH_INS (bb, ins) {
@@ -726,6 +1094,12 @@ mono_decompose_typechecks (MonoCompile *cfg)
 			}
 		}
 	}
+#ifdef HOST_BROWSER
+	if (G_UNLIKELY (mono_wasm_jit_cast_census) && COMPILE_WASM (cfg) && wj_cc_site && wj_cc_cfg == cfg) {
+		g_hash_table_remove_all (wj_cc_site);
+		wj_cc_cfg = NULL; wj_cc_method = NULL;
+	}
+#endif
 	if ((cfg->verbose_level > 2) && found_typetest)
 		mono_print_code (cfg, "AFTER DECOMPOSE TYPE_CHECKS");
 

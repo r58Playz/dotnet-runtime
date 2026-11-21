@@ -988,6 +988,14 @@ gint32 mono_wasm_jit_nce_violations;
  * castclass-with-cache wrapper. 0 = off: with it off the IR and the emitted bytes are what they were. */
 int mono_wasm_jit_cast_diag = 0;
 gint32 mono_wasm_jit_cast_diag_sites;
+/* MONO_WASM_JIT_CAST_CENSUS (a diagnostic; type-checking.c wj_cast_census_classify): 1 = before decomposing a compile's
+ * castclass / isinst, classify each by what could remove it -- the source's static class proves it (RyuJIT's import-time
+ * fold), a dominating castclass of the same single-definition value proves it (RyuJIT's assertion propagation), a
+ * same-block reload of the same field after such a cast, or none of them -- and by where the source came from (an IKVM
+ * erased `modopt` field / parameter / return, a call, a load, a local), and count each site's executions with an
+ * absolute-address counter emitted ahead of the check. Every dump prints the sites that ran since the previous one
+ * (WASM_JIT_CAST lines). 0 = off: the IR and the emitted bytes are unchanged. */
+int mono_wasm_jit_cast_census = 0;
 const char mono_wasm_jit_cast_note_tag [] = "wj-cast-note";
 
 /* MONO_WASM_JIT_CAST_UNFINISHED: a castclass or isinst whose class is a TypeBuilder's that CreateType has not completed
@@ -1406,6 +1414,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_sparse_dispatch, "MONO_WASM_JIT_SPARSE_DISPATCH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_nce_flow, "MONO_WASM_JIT_NCE_FLOW", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_cast_diag, "MONO_WASM_JIT_CAST_DIAG", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_cast_census, "MONO_WASM_JIT_CAST_CENSUS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)

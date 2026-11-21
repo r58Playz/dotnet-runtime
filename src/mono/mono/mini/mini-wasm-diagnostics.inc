@@ -1343,6 +1343,8 @@ mono_wasm_jit_dump_stats (void)
 	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2 (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2 (4096); }   /* R331: every row -- a low-sample hot method sat below the old top 120 */
 	{ extern int mono_wasm_jit_t2; extern void mono_wasm_jit_dump_t2_refusals (int topn); if (mono_wasm_jit_t2) mono_wasm_jit_dump_t2_refusals (60); }
 	{ extern void mono_wasm_jit_dump_sites (void); mono_wasm_jit_dump_sites (); }   /* MONO_WASM_JIT_SITE_COUNT */
+	{ extern int mono_wasm_jit_cast_census; extern void mono_wasm_jit_cast_census_dump (void);
+	  if (mono_wasm_jit_cast_census) mono_wasm_jit_cast_census_dump (); }   /* MONO_WASM_JIT_CAST_CENSUS */
 	{ extern void mono_wasm_jit_roles_dump (void); mono_wasm_jit_roles_dump (); }   /* MONO_WASM_JIT_ROLES */
 #endif
 	{ extern int mono_wasm_jit_f4;

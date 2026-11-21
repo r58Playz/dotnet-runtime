@@ -13576,6 +13576,13 @@ calli_end:
 			}
 
 field_access_end:
+#ifdef HOST_BROWSER
+			{ extern int mono_wasm_jit_cast_census;
+			  extern void mono_wasm_jit_cast_census_note_field (MonoCompile *cfg, MonoInst *val, MonoClassField *field);
+			  if (G_UNLIKELY (mono_wasm_jit_cast_census) && COMPILE_WASM (cfg) && (il_op == MONO_CEE_LDFLD || il_op == MONO_CEE_LDSFLD) &&
+			      field && sp > stack_start)
+				mono_wasm_jit_cast_census_note_field (cfg, sp [-1], field); }
+#endif
 			if ((il_op == MONO_CEE_LDFLD || il_op == MONO_CEE_LDSFLD) && (ins_flag & MONO_INST_VOLATILE)) {
 				/* Volatile loads have acquire semantics, see 12.6.7 in Ecma 335 */
 				mini_emit_memory_barrier (cfg, MONO_MEMORY_BARRIER_ACQ);
