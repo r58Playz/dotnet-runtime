@@ -4374,6 +4374,15 @@ mono_class_setup_supertypes (MonoClass *klass)
 	/* Needed so idepth is visible before supertypes is set */
 	mono_memory_barrier ();
 	klass->supertypes = supertypes;
+#ifdef HOST_BROWSER
+	/* B1: a runtime vtable made before these supertypes (an IKVM TypeBuilder shell's) follows them */
+	{
+		extern void mono_wasm_class_record_fill (MonoVTable *vt);
+		MonoVTable *rvt = m_class_get_runtime_vtable (klass);
+		if (rvt)
+			mono_wasm_class_record_fill (rvt);
+	}
+#endif
 	mono_loader_unlock ();
 }
 

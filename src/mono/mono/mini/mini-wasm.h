@@ -1552,6 +1552,8 @@ enum {
 	WJC_CAST_ELIM_DOMINATED,     /* ... as DOMINATED */
 	WJC_INLINE_TRIVIAL_DEPTH,    /* MONO_WASM_JIT_INLINE_TRIVIAL: callees past the depth cap admitted as trivial (stats) */
 	WJC_NEWARR_INLINE_SITES,     /* MONO_WASM_JIT_NEWARR_INLINE: newarr sites given the inline TLAB bump (compile time) */
+	WJC_CLASSREC_DISPLAY_SITES,  /* MONO_WASM_JIT_CLASS_RECORD bit 1: class checks lowered to one display load (compile time) */
+	WJC_CLASSREC_SEALED_SITES,   /* ... bit 2: sealed checks lowered to a vtable compare (compile time) */
 	WJC_MAX
 };
 

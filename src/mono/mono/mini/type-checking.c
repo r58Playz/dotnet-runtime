@@ -101,6 +101,51 @@ mini_emit_class_check_inst (MonoCompile *cfg, int klass_reg, MonoClass *klass, M
 }
 
 
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_CLASS_RECORD (metadata/object.c, plan abstract-hatching-stearns B2). */
+extern int mono_wasm_class_record_bits (void);
+extern int mono_wasm_class_record_offset (void);
+static gboolean wj_cast_target_unfinished (MonoClass *klass);
+
+/* Bit 1: can the object's display decide a check against KLASS? A class of depth 1..8 (not an interface or array),
+ * with no generic context, not an unfinished TypeBuilder (CAST_UNFINISHED's case), once the first record exists. */
+static gboolean
+wj_display_ok (MonoCompile *cfg, MonoClass *klass, MonoInst *klass_inst)
+{
+	if (!COMPILE_WASM (cfg) || klass_inst || !(mono_wasm_class_record_bits () & 1) || !mono_wasm_class_record_offset ())
+		return FALSE;
+	if (mono_class_is_interface (klass) || m_class_get_rank (klass) || wj_cast_target_unfinished (klass))
+		return FALSE;
+	mono_class_setup_supertypes (klass);
+	return m_class_get_idepth (klass) >= 1 && m_class_get_idepth (klass) <= 8;
+}
+
+/* compare (display [idepth - 1] of the object whose vtable is VTABLE_REG, KLASS): the record is below the vtable, so the
+ * negative part of the offset is an add (the wasm memarg offset is unsigned) */
+static void
+wj_emit_display_compare (MonoCompile *cfg, int vtable_reg, MonoClass *klass)
+{
+	int rec = alloc_preg (cfg), disp = alloc_preg (cfg);
+	MONO_EMIT_NEW_BIALU_IMM (cfg, OP_PADD_IMM, rec, vtable_reg, mono_wasm_class_record_offset ());
+	MONO_EMIT_NEW_LOAD_MEMBASE (cfg, disp, rec, (m_class_get_idepth (klass) - 1) * TARGET_SIZEOF_VOID_P);
+	MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, disp, (gsize) klass);
+	mono_wasm_jit_counters [WJC_CLASSREC_DISPLAY_SITES]++;
+}
+
+/* Bit 2: KLASS's runtime vtable, when a sealed check may compare the object's vtable with it */
+static MonoVTable *
+wj_sealed_vtable (MonoCompile *cfg, MonoClass *klass)
+{
+	MonoVTable *vt;
+	if (!COMPILE_WASM (cfg) || !(mono_wasm_class_record_bits () & 2) || m_class_get_rank (klass) || wj_cast_target_unfinished (klass))
+		return NULL;
+	vt = mono_class_try_get_vtable (klass);
+	if (vt)
+		mono_wasm_jit_counters [WJC_CLASSREC_SEALED_SITES]++;
+	return vt;
+}
+#endif
+
 static void
 mini_emit_isninst_cast_inst (MonoCompile *cfg, int klass_reg, MonoClass *klass, MonoInst *klass_ins, MonoBasicBlock *false_target, MonoBasicBlock *true_target)
 {
@@ -432,16 +477,30 @@ handle_castclass (MonoCompile *cfg, MonoClass *klass, MonoInst *src, int context
 		MONO_EMIT_NEW_LOAD_MEMBASE (cfg, vtable_reg, obj_reg, MONO_STRUCT_OFFSET (MonoObject, vtable));
 
 		if (!m_class_get_rank (klass) && mono_class_is_sealed (klass)) {
+#ifdef HOST_BROWSER
+			MonoVTable *svt = cfg->compile_aot ? NULL : wj_sealed_vtable (cfg, klass);
+#else
+			MonoVTable *svt = NULL;
+#endif
 			if (cfg->compile_aot) {
 				MonoInst *vtable_ins;
 				EMIT_NEW_AOTCONST (cfg, vtable_ins, MONO_PATCH_INFO_VTABLE, klass);
 				MONO_EMIT_NEW_BIALU (cfg, OP_COMPARE, -1, vtable_reg, vtable_ins->dreg);
+			} else if (svt) {
+				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, vtable_reg, (gsize) svt);   /* B2 bit 2 */
 			} else {
 				MONO_EMIT_NEW_LOAD_MEMBASE (cfg, klass_reg, vtable_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
 				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, klass_reg, (gsize)klass);
 			}
 			MONO_EMIT_NEW_COND_EXC (cfg, NE_UN, "InvalidCastException");
-		} else {
+		}
+#ifdef HOST_BROWSER
+		else if (wj_display_ok (cfg, klass, klass_inst)) {
+			wj_emit_display_compare (cfg, vtable_reg, klass);   /* B2 bit 1 */
+			MONO_EMIT_NEW_COND_EXC (cfg, NE_UN, "InvalidCastException");
+		}
+#endif
+		else {
 			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, klass_reg, vtable_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
 			mini_emit_castclass_inst (cfg, obj_reg, klass_reg, klass, klass_inst, is_null_bb);
 		}
@@ -583,18 +642,32 @@ handle_isinst (MonoCompile *cfg, MonoClass *klass, MonoInst *src, int context_us
 			/* the is_null_bb target simply copies the input register to the output */
 			mini_emit_isninst_cast (cfg, klass_reg, m_class_get_cast_class (klass), false_bb, is_null_bb);
 		} else if (mono_class_is_sealed (klass)) {
+#ifdef HOST_BROWSER
+			MonoVTable *svt = cfg->compile_aot ? NULL : wj_sealed_vtable (cfg, klass);
+#else
+			MonoVTable *svt = NULL;
+#endif
 			g_assert (!context_used);
 			if (cfg->compile_aot) {
 				MonoInst *vtable_ins;
 				EMIT_NEW_AOTCONST (cfg, vtable_ins, MONO_PATCH_INFO_VTABLE, klass);
 				MONO_EMIT_NEW_BIALU (cfg, OP_COMPARE, -1, vtable_reg, vtable_ins->dreg);
+			} else if (svt) {
+				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, vtable_reg, (gsize) svt);   /* B2 bit 2 */
 			} else {
 				MONO_EMIT_NEW_LOAD_MEMBASE (cfg, klass_reg, vtable_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
 				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, klass_reg, (gsize)klass);
 			}
 			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, false_bb);
 			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, is_null_bb);
-		} else {
+		}
+#ifdef HOST_BROWSER
+		else if (wj_display_ok (cfg, klass, klass_inst)) {
+			wj_emit_display_compare (cfg, vtable_reg, klass);   /* B2 bit 1; the is_null_bb target copies the input */
+			MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, is_null_bb);
+		}
+#endif
+		else {
 			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, klass_reg, vtable_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
 			/* the is_null_bb target simply copies the input register to the output */
 			mini_emit_isninst_cast_inst (cfg, klass_reg, klass, klass_inst, false_bb, is_null_bb);
@@ -1117,6 +1190,7 @@ mono_decompose_typechecks (MonoCompile *cfg)
 {
 	gboolean found_typetest = FALSE;
 	int elim = 0;
+	(void) elim;
 #ifdef HOST_BROWSER
 	if (G_UNLIKELY (mono_wasm_jit_cast_census || mono_wasm_jit_cast_elim) && COMPILE_WASM (cfg)) {
 		wj_cast_census_classify (cfg, mono_wasm_jit_cast_census != 0);

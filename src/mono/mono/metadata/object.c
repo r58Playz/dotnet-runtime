@@ -2166,6 +2166,70 @@ meta_arena_alloc0 (size_t size)
 	return res;
 }
 
+#ifdef HOST_BROWSER
+/*
+ * MONO_WASM_JIT_CLASS_RECORD (plan abstract-hatching-stearns B1/B2), a bit mask read once, at the first runtime vtable,
+ * so every vtable has a record or none does:
+ *   1  a record below each vtable holding the class's first 8 supertypes (the "display"), which the wasm JIT's class
+ *      casts compare in one load instead of vt->klass->supertypes[d] (type-checking.c);
+ *   2  a cast to a sealed class compares the object's vtable with the class's runtime vtable (no record needed);
+ *   8  the record only (memory measurement).
+ * Layout: [record 48 B][IMT region padded to its full size for every class][MonoVTable][slots]: the record sits at
+ * a fixed offset below the vtable (mono_wasm_class_record_offset), below anything AOT or JIT code reads (the IMT is
+ * read at vt - MONO_IMT_SIZE.., the interpreter's below it), so no compiled layout moves. A class without interfaces
+ * pays the IMT region it did not need. A record follows its class's supertypes: mono_class_setup_supertypes refreshes
+ * it when a TypeBuilder's supertypes are rebuilt (sre.c resets them when a parent is set). 0 = no record.
+ */
+#define MONO_WASM_CLASS_RECORD_SIZE 48
+static int class_record_bits = -1;
+static int class_record_offset;   /* the record's offset from the MonoVTable (negative), 0 until the first record */
+gint64 mono_wasm_class_record_bytes;
+gint32 mono_wasm_class_record_changed;   /* refreshes that changed a display entry (a stale window, if a vtable was live) */
+
+int
+mono_wasm_class_record_bits (void)
+{
+	if (G_UNLIKELY (class_record_bits < 0)) {
+		const char *s = g_getenv ("MONO_WASM_JIT_CLASS_RECORD");
+		int v = (s && *s) ? atoi (s) : 0;
+		mono_memory_barrier ();
+		class_record_bits = v;
+	}
+	return class_record_bits;
+}
+
+int
+mono_wasm_class_record_offset (void)
+{
+	return class_record_offset;
+}
+
+/* Copy KLASS's first 8 supertypes into VT's record (zero past its depth). */
+void
+mono_wasm_class_record_fill (MonoVTable *vt)
+{
+	MonoClass *klass = vt->klass, **disp, **st;
+	int i, d, changed = 0;
+	if (!class_record_offset || !klass)
+		return;
+	st = m_class_get_supertypes (klass);
+	if (!st)
+		return;   /* filled when mono_class_setup_supertypes publishes them */
+	disp = (MonoClass **) ((char *) vt + class_record_offset);
+	d = MIN ((int) m_class_get_idepth (klass), 8);
+	for (i = 0; i < 8; ++i) {
+		MonoClass *c = i < d ? st [i] : NULL;
+		if (disp [i] != c) {
+			if (disp [i])
+				changed = 1;
+			disp [i] = c;
+		}
+	}
+	if (changed)
+		mono_atomic_inc_i32 (&mono_wasm_class_record_changed);
+}
+#endif
+
 static gpointer*
 alloc_vtable (MonoClass *klass, size_t vtable_size, size_t imt_table_bytes)
 {
@@ -2291,10 +2355,24 @@ mono_class_create_runtime_vtable (MonoClass *klass, MonoError *error)
 
 	vtable_size = (guint32)(imt_table_bytes + MONO_SIZEOF_VTABLE + vtable_slots * sizeof (gpointer));
 
+	size_t rec_pad = 0;
+#ifdef HOST_BROWSER
+	/* B1: the class record and the IMT region's padding below the vtable (see MONO_WASM_JIT_CLASS_RECORD above) */
+	if (mono_wasm_class_record_bits () & (1 | 8)) {
+		size_t imt_region = sizeof (gpointer) * MONO_IMT_SIZE * (use_interpreter ? 2 : 1);
+		rec_pad = MONO_WASM_CLASS_RECORD_SIZE + (imt_region - imt_table_bytes);
+		if (!class_record_offset)
+			class_record_offset = - (int) (imt_region + MONO_WASM_CLASS_RECORD_SIZE);
+		vtable_size += (guint32) rec_pad;
+		mono_atomic_fetch_add_i64 (&mono_wasm_class_record_bytes, (gint64) rec_pad);
+	}
+#endif
+
 	UnlockedIncrement (&mono_stats.used_class_count);
 	UnlockedAdd (&mono_stats.class_vtable_size, vtable_size);
 
-	interface_offsets = alloc_vtable (klass, vtable_size, imt_table_bytes);
+	interface_offsets = alloc_vtable (klass, vtable_size, rec_pad + imt_table_bytes);
+	interface_offsets = (gpointer*) ((char*) interface_offsets + rec_pad);
 	vt = (MonoVTable*) ((char*)interface_offsets + imt_table_bytes);
 	/* If on interp, skip the interp interface table */
 	if (use_interpreter)
@@ -2495,6 +2573,13 @@ mono_class_create_runtime_vtable (MonoClass *klass, MonoError *error)
 	g_ptr_array_add (mem_manager->class_vtable_array, vt);
 	mono_mem_manager_unlock (mem_manager);
 
+#ifdef HOST_BROWSER
+	if (class_record_offset && (mono_wasm_class_record_bits () & (1 | 8))) {
+		if (!m_class_get_supertypes (klass))
+			mono_class_setup_supertypes (klass);
+		mono_wasm_class_record_fill (vt);
+	}
+#endif
 	/*
 	 * Store the vtable in klass_vtable.
 	 * klass->runtime_vtable is accessed without locking, so this do this last after the vtable has been constructed.
