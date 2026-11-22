@@ -430,7 +430,7 @@ mono_wasm_jit_dump_stats (void)
 	 * a static function's name can be inlined away and then never appears in the name section. This line
 	 * exists for that, and it is printed rather than merely declared so it cannot be dropped as unused.
 	 * Bump the tag whenever a runtime change needs to be provably deployed. */
-	printf ("[wasm-jit build] wjbuild-parity-d1\n");
+	printf ("[wasm-jit build] wjbuild-parity-d2\n");
 	printf ("[wasm-jit stats] registered=%lld bailed=%lld invalid=%lld invoked=%lld residual=%lld fastvcall=%lld (counting %s)\n",
 		WJC_(WJC_REGISTERED), WJC_(WJC_BAILED), WJC_(WJC_INVALID),
 		WJC_(WJC_INVOKE), WJC_(WJC_RESIDUAL), WJC_(WJC_FASTVCALL),

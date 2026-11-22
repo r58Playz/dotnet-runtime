@@ -1430,6 +1430,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_prof_repair, "MONO_WASM_JIT_PROF_REPAIR", 1, 32767)
 	WJ_T2_KNOB (mono_wasm_jit_prof_repair_max, "MONO_WASM_JIT_PROF_REPAIR_MAX", 0, 1000000)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cast_discount, "MONO_WASM_JIT_INLINE_CAST_DISCOUNT", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_b4_residue, "MONO_WASM_JIT_B4_RESIDUE", 0, 4096)
 	WJ_T2_KNOB (mono_wasm_jit_stackprobe, "MONO_WASM_JIT_STACKPROBE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
@@ -1848,6 +1849,13 @@ int mono_wasm_jit_b4_plan_samples = 5000;
  * the bound on a group's largest member, which B4_BYTES excludes, so a giant can anchor a group of its callees. */
 int mono_wasm_jit_b4_t1 = 0;
 int mono_wasm_jit_b4_anchor = 262144;
+/* MONO_WASM_JIT_B4_RESIDUE=<members> (plan v3 L9): the plan also packs the live bodies no edge group took -- singletons,
+ * edge-less tier-1 bodies -- that ran since the previous plan into groups of up to this many members (and B4_BYTES), in
+ * descriptor order, ranked after the edge groups under the same B4_PER_PLAN / B4_GROUPS budgets (wj_b4_partition). The
+ * target is the cold tier-1 residue: on mctick 772 of 2,874 sampled functions still carried tier-1 counters in the
+ * window, 2.27 M cycles a tick for 0.26 M instructions (IPC 0.11), ~1.0 M of it stalls on V8 data private to each cold
+ * instance (2026-11-21 review). Census: `[wasm-jit b4] plan ... residue groups N members M`. 0 = off. */
+int mono_wasm_jit_b4_residue = 0;
 /* MONO_WASM_JIT_B4_DOWN: the downgrade recompile -- a tier-2 body over T2_MAX_BODY, recompiled at the ordinary policy
  * (mono_wasm_force_compile) -- records edges, though it is a tier-1 compile. ~30 bodies per run, the tick's giants
  * among them: ~13% of the server thread's JIT entries are theirs (R450). */
