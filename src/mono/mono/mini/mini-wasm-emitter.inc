@@ -9439,9 +9439,14 @@ vcall_nullchk_done:
 									  int _rec = mono_wasm_class_record_offset ();
 									  if (mono_wasm_jit_img_dispatch && cfg->wasm_jit_tier >= 2 && vc_mid_slot >= 0 && vc_mid_slot < 32768 && _rec) {
 										guint16 _io;
+										/* MONO_WASM_JIT_PROFILE_FAST: the prefix's outcomes, disjoint (entered = hit + no array + no
+										 * entry + not live); with the knob off no `else` arm is emitted and the bytes are as before */
+										extern int mono_wasm_jit_profile_fast;
+										gboolean _ic = mono_wasm_jit_profile_fast != 0;
 										mono_wasm_jit_counters [WJC_IMG_SITES]++;
 										wasm_reloc (&body, WASM_RELOC_IMG_GATE, 0, 0, NULL);
 										wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+										  wj_emit_fast_count (&body, WJC_IMG_RT_ENTER);
 										  wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
 										  wasm_i32_const (&body, _rec + 32);   /* the record's img_idx (metadata/object.c) */
 										  wasm_op (&body, WASM_OP_I32_ADD);
@@ -9464,9 +9469,13 @@ vcall_nullchk_done:
 											wj_site_link_reloc (&body, 0);
 											wasm_origin_pop (&body, _io);
 											if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "img dreg"; goto done; }
+											wj_emit_fast_count (&body, WJC_IMG_RT_HIT);
 											wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, (guint32) (6 + l0d));   /* -> end $after */
+										      if (_ic) { wasm_op (&body, WASM_OP_ELSE); wj_emit_fast_count (&body, WJC_IMG_RT_NOTLIVE); }
 										      wasm_op (&body, WASM_OP_END);
+										    if (_ic) { wasm_op (&body, WASM_OP_ELSE); wj_emit_fast_count (&body, WJC_IMG_RT_NOENTRY); }
 										    wasm_op (&body, WASM_OP_END);
+										  if (_ic) { wasm_op (&body, WASM_OP_ELSE); wj_emit_fast_count (&body, WJC_IMG_RT_NOARRAY); }
 										  wasm_op (&body, WASM_OP_END);
 										wasm_op (&body, WASM_OP_END);
 									  } }

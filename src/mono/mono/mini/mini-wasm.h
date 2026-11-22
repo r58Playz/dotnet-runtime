@@ -1561,6 +1561,11 @@ enum {
 	WJC_IMG_INVALIDATED,         /* ... members whose code left the image after it was bound (their sites fall back) */
 	WJC_IMG_REFRAMES,            /* ... the image re-framed (kept the image: same members, same order) */
 	WJC_IMG_REFRAME_DEFERRED,    /* MONO_WASM_JIT_REFRAME_MS: member re-emissions deferred to their group's next re-frame (any group >= 32) */
+	WJC_IMG_RT_ENTER,            /* MONO_WASM_JIT_PROFILE_FAST, run time: image prefixes entered (the image's own module) */
+	WJC_IMG_RT_HIT,              /* ... of them, called through table 1 */
+	WJC_IMG_RT_NOARRAY,          /* ... fell through: the receiver's class has no index array */
+	WJC_IMG_RT_NOENTRY,          /* ... fell through: no entry for this vtable slot */
+	WJC_IMG_RT_NOTLIVE,          /* ... fell through: the entry's member no longer runs the image's code */
 	WJC_MAX
 };
 
