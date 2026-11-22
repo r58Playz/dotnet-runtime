@@ -1569,6 +1569,29 @@ enum {
 	WJC_RV_DRAIN_IN_ADMIT,       /* rendezvous drains declined because this thread was inside an admission (re-entry) */
 	WJC_T2_REFRAME_DEFERRED,     /* tier-2 promotions whose re-frame was deferred (MONO_WASM_JIT_REFRAME_MS): tier 2, not failed */
 	WJC_T2_TOO_LATE,             /* MONO_WASM_JIT_T2_UNTIL_MS: tier-2 promotions refused past the cutoff */
+	WJC_GI_SHARE_PRED,           /* MONO_WASM_JIT_GI_SHARE: tier-2 GI predictions the share bar made (the margin predictor refused) */
+	WJC_GI_SHARE_REFUSED,        /* ... warm records (>= GI_MIN_N) whose lower bound missed the bar */
+	WJC_GI_COLD_MARKED,          /* guarded-inline fallback blocks marked wasm_cold (the inline landed; compile time, ungated) */
+	WJC_GI_COLD_HINTS,           /* MONO_WASM_JIT_GI_COLD: branch hints emitted because a target block was wasm_cold */
+	WJC_VOL_ATOMIC_CONV,         /* MONO_WASM_JIT_VOLATILE_LOAD: SEQ barriers converted (the fence dropped; ungated) */
+	WJC_VOL_ATOMIC_USED,         /* ... the marked load emitted as an atomic load (must equal _CONV) */
+	WJC_VOL_ATOMIC_LOST,         /* ... a mark reset before its load was emitted (must be 0) */
+	WJC_VOL_SCAN_STORE,          /* ... store-reach scan ends: a store, or a call into C# (fence kept) */
+	WJC_VOL_SCAN_FENCE,          /* ... a SEQ barrier or a seq-cst read-modify-write */
+	WJC_VOL_SCAN_CALL,           /* ... a call into IKVM-compiled Java (its callee fences its own stores) */
+	WJC_VOL_SCAN_ENTRY,          /* ... the method's entry */
+	WJC_VOL_SCAN_BUDGET,         /* ... the budget ran out (fence kept) */
+	WJC_VOL_SCAN_CALL_SKIPPED,   /* ... calls the scan passed over: helpers and wrappers mono added (R2) */
+	WJC_INLINE_CAST_DISCOUNTED,  /* MONO_WASM_JIT_INLINE_CAST_DISCOUNT: size refusals turned into admissions */
+	WJC_PROF_FB_SITES,           /* MONO_WASM_JIT_PROF_V2 & 4: fallback probes emitted (compile time) */
+	WJC_PROF_FB_SAMPLES,         /* ... sampled fallback calls recorded (run time) */
+	WJC_PROF_REPAIR_FOLDED,      /* ... records refolded from their fallback samples */
+	WJC_PROF_REPAIR_QUEUED,      /* ... of them, methods queued for re-emission */
+	WJC_PROF_REPAIR_SKIPPED,     /* ... refolded, but the method was re-emitted before, queued, or the cap was reached */
+	WJC_PROF_REPAIR_COMPILED,    /* ... repair re-emissions that produced a body */
+	WJC_PROF_MISS_SPLIT,         /* MONO_WASM_JIT_PROF_V2 & 1: IC misses kept out of the shares */
+	WJC_PROF_RECYCLED,           /* MONO_WASM_JIT_PROF_V2 & 2: identity entries replaced */
+	WJC_PROF_FB_PARKED,          /* MONO_WASM_JIT_PROF_V2 & 4: fallback probes parked (their site decided, or past the cutoff) */
 	WJC_MAX
 };
 

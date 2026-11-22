@@ -1606,45 +1606,91 @@ const char *const wj_lev_static_names [WJL_N] = { "pin_stores", "gap_i2l", "gap_
  * past what IKVM's `Thread.MemoryBarrier (); volatile. ldfld` puts between them -- sequence points, null checks and
  * their compares, constants and moves -- and stops at anything else. Set by the barrier, consumed by LOADM. */
 static __thread MonoInst *wj_vol_atomic;
+/* ... and this compile's conversions, emitted atomic loads and lost marks, added to WJC_VOL_ATOMIC_* only when the compile
+ * succeeds (a compile that fails between a barrier and its load would otherwise read as a lost fence). */
+static __thread int wj_vol_conv_here, wj_vol_used_here, wj_vol_lost_here;
+
+/* MONO_WASM_JIT_VOLATILE_LOAD: is `m` Java code IKVM compiled -- at run time (a dynamic image) or ahead of time (IKVM.Java,
+ * ikvmc_*)? Their volatile stores carry IKVM's trailing barrier. No metadata is resolved: two field reads. */
+static gboolean
+wj_vol_java_method (MonoMethod *m)
+{
+	MonoImage *img = (m && m->klass) ? m_class_get_image (m->klass) : NULL;
+	const char *an;
+	if (!img)
+		return FALSE;
+	if (image_is_dynamic (img))
+		return TRUE;
+	an = img->assembly_name;
+	return an && (!strcmp (an, "IKVM.Java") || !strncmp (an, "ikvmc_", 6));
+}
 
 /* MONO_WASM_JIT_VOLATILE_LOAD: can a store reach `bar` (in `bb`) with no SEQ fence, atomic read-modify-write or call
  * between them? Then the fence must stay whatever follows it. IKVM's CodeEmitter.RemoveRedundantMemoryBarriers merges a
  * volatile store's trailing barrier into the next barrier of the same straight-line IL, so `volatile store A; volatile
  * load B` arrives with ONE fence, in front of the load, and that fence is the store's StoreLoad (2026-11-16: dropping it
- * stopped 262c's memwalk datapack from ever stepping; findings note "levers3"). A call ends the scan because its callee
- * fences its own volatile stores (IKVM resets the merge at every call; its Unsafe emulation must fence too). A method's
- * entry ends it for the same reason. Conservative: a block with predecessors is followed into each of them, and running
- * out of the budget answers TRUE. */
+ * stopped 262c's memwalk datapack from ever stepping; findings note "levers3"). The merge resets at IL flow that is not
+ * `Next` (an IL call among it), and the barrier after a volatile store survives until then, so a call into code IKVM
+ * compiled from Java (wj_vol_java_method) returns with its own stores fenced: it ends the scan, as a method's entry
+ * does. Plan v3 L2 R2, two kinds of call that do NOT:
+ *   - a call mono ADDED for an IL instruction that is `Next` (an allocator for newarr / box, a cast helper, class init
+ *     for ldsfld, the stelemref wrapper: a wrapper or an icall) is no reset point in IKVM's eyes: the scan passes it;
+ *   - a call into C# (IKVM.Runtime's ByteCodeHelper.VolatileWrite*, CoreLib) may make a release-only store
+ *     (Volatile.Write) whose StoreLoad is exactly the barrier being scanned from, IKVM having merged the store's
+ *     trailing barrier (EmitUnsafeVolatileSetImpl emits one since R1) into it: the fence stays.
+ * Conservative: a block with predecessors is followed into each of them, and running out of the budget answers TRUE.
+ * Each ending is counted (WJC_VOL_SCAN_*; a multi-predecessor scan counts every path's). */
 static gboolean
 wj_vol_store_reaches (MonoBasicBlock *bb, MonoInst *from, int *budget)
 {
 	MonoInst *n;
 	int i;
-	if (--*budget < 0)
+	if (--*budget < 0) {
+		wj_count (WJC_VOL_SCAN_BUDGET);
 		return TRUE;
+	}
 	for (n = from; n; n = n->prev) {
-		if (MONO_IS_CALL (n))
-			return FALSE;
+		if (MONO_IS_CALL (n)) {
+			MonoMethod *cm = ((MonoCallInst *) n)->method;
+			if (!cm || cm->wrapper_type != MONO_WRAPPER_NONE) {
+				wj_count (WJC_VOL_SCAN_CALL_SKIPPED);
+				continue;
+			}
+			if (wj_vol_java_method (cm)) {
+				wj_count (WJC_VOL_SCAN_CALL);
+				return FALSE;
+			}
+			wj_count (WJC_VOL_SCAN_STORE);   /* C#: may have stored with release only */
+			return TRUE;
+		}
 		switch (n->opcode) {
 		case OP_MEMORY_BARRIER:
-			if (n->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_SEQ)
+			if (n->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_SEQ) {
+				wj_count (WJC_VOL_SCAN_FENCE);
 				return FALSE;
+			}
 			break;
 		case OP_ATOMIC_CAS_I4: case OP_ATOMIC_CAS_I8: case OP_ATOMIC_EXCHANGE_I4: case OP_ATOMIC_EXCHANGE_I8:
 		case OP_ATOMIC_ADD_I4: case OP_ATOMIC_ADD_I8:
+			wj_count (WJC_VOL_SCAN_FENCE);
 			return FALSE;   /* a seq-cst read-modify-write: a locked instruction on x64 */
 		case OP_STORE_MEMINDEX: case OP_STOREI1_MEMINDEX: case OP_STOREI2_MEMINDEX: case OP_STOREI4_MEMINDEX:
 		case OP_STOREI8_MEMINDEX: case OP_STORER4_MEMINDEX: case OP_STORER8_MEMINDEX:
 		case OP_MEMCPY: case OP_MEMSET:
+			wj_count (WJC_VOL_SCAN_STORE);
 			return TRUE;
 		default:
-			if (MONO_IS_STORE_MEMBASE (n))
+			if (MONO_IS_STORE_MEMBASE (n)) {
+				wj_count (WJC_VOL_SCAN_STORE);
 				return TRUE;
+			}
 			break;
 		}
 	}
-	if (bb->in_count == 0)
+	if (bb->in_count == 0) {
+		wj_count (WJC_VOL_SCAN_ENTRY);
 		return FALSE;   /* the method's entry */
+	}
 	for (i = 0; i < bb->in_count; ++i) {
 		MonoBasicBlock *p = bb->in_bb [i];
 		if (p == bb || wj_vol_store_reaches (p, p->last_ins, budget))

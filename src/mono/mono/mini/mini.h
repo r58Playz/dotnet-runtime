@@ -550,6 +550,10 @@ struct MonoBasicBlock {
 	 * the function epilog.
 	 */
 	guint out_of_line : 1;
+	/* Runtime wasm JIT: a guarded inline's fallback (method-to-ir.c, once the inline landed). Unlike out_of_line it changes
+	 * no IR pass; the emitter hints branches into it unlikely under MONO_WASM_JIT_GI_COLD and probes its calls under
+	 * MONO_WASM_JIT_PROF_V2 & 4. */
+	guint wasm_cold : 1;
 	/* MONO_WASM_JIT_EH_INLINE (plan zany-beacon E1): the block's EH position -- root IL offset, or an EH-inlined
 	 * instance's base + its own IL offset (method-to-ir.c, WjEhInst). Stamped by NEW_BBLOCK and per IL instruction
 	 * like real_offset; -1 for blocks created after import. Read only by a compile that EH-inlined something. */

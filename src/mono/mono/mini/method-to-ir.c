@@ -307,6 +307,29 @@ static __thread int wj_inline_last_costs;
 /* R329: TRUE iff the last wj_gi_predict answered from the static fallback (so the emission can count the ACTION). */
 static __thread gboolean wj_gi_static;
 
+/* MONO_WASM_JIT_GI_SHARE (knob comment in mini-wasm.c): the share bar on record `rec`, tier 2 only, for a verdict the
+ * margin predictor refused as cold or polymorphic. Ranked by target behind a method-identity guard (mid). Counted where
+ * it decides: WJC_GI_SHARE_PRED, and _REFUSED for a warm record under the bar. */
+static gboolean
+wj_gi_share (MonoCompile *cfg, gpointer rec, MonoMethod *cmethod, gboolean mid, int why,
+             MonoVTable **vt, MonoMethod **target, guint32 *samples)
+{
+	extern int mono_wasm_jit_gi_share, mono_wasm_jit_gi_min_n;
+	extern gboolean mono_wasm_jit_prof_predict_share (gpointer caller, MonoMethod *base, gboolean by_target, int min_n,
+		int lb_pct, MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples, int *out_verdict);
+	int verdict = 0;
+	if (mono_wasm_jit_gi_share <= 0 || cfg->wasm_jit_tier < 2 || !rec || (why != 2 && why != 3 && why != 4))
+		return FALSE;
+	if (mono_wasm_jit_prof_predict_share (rec, cmethod, mid, mono_wasm_jit_gi_min_n, mono_wasm_jit_gi_share,
+	                                      vt, target, samples, &verdict)) {
+		mono_wasm_jit_count (WJC_GI_SHARE_PRED);
+		return TRUE;
+	}
+	if (verdict == 3)
+		mono_wasm_jit_count (WJC_GI_SHARE_REFUSED);
+	return FALSE;
+}
+
 static gboolean
 wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mid_slot,
                MonoVTable **vt, MonoMethod **target, guint32 *samples, int *why)
@@ -344,6 +367,15 @@ wj_gi_predict (MonoCompile *cfg, MonoMethod *method, MonoMethod *cmethod, int mi
 		}
 		if (im)
 			wj_gi_last_inl = 10 + why2;
+	}
+	/* MONO_WASM_JIT_GI_SHARE: where both records' own predictors refused -- the root's record, then the inlinee's */
+	if (wj_gi_share (cfg, cfg->wasm_jit_caller_imethod, cmethod, mid, *why, vt, target, samples)) {
+		wj_gi_pred_im = cfg->wasm_jit_caller_imethod;
+		return TRUE;
+	}
+	if (inl_im && wj_gi_last_inl >= 10 && wj_gi_share (cfg, inl_im, cmethod, mid, why2, vt, target, samples)) {
+		wj_gi_pred_im = inl_im;
+		return TRUE;
 	}
 	/* R405: a COLD verdict whose record saw ONE receiver predicts it (interp.c mono_wasm_jit_prof_predict_cold) -- the
 	 * root's record, then the inlinee's. Before the static prediction below, which names the BASE: the recorded target is
@@ -5630,6 +5662,59 @@ wj_il_hot_size (const unsigned char *code, guint32 size)
 		cold += size - begin;
 	return size - cold;
 }
+
+static gboolean
+wj_il_is_ldloc (int op)
+{
+	return (op >= MONO_CEE_LDLOC_0 && op <= MONO_CEE_LDLOC_3) || op == MONO_CEE_LDLOC_S || op == MONO_CEE_LDLOC;
+}
+
+static gboolean
+wj_il_is_stloc (int op)
+{
+	return (op >= MONO_CEE_STLOC_0 && op <= MONO_CEE_STLOC_3) || op == MONO_CEE_STLOC_S || op == MONO_CEE_STLOC;
+}
+
+/* MONO_WASM_JIT_INLINE_CAST_DISCOUNT (knob comment in mini-wasm.c): the IL bytes of a method's castclass instructions,
+ * and of each whole IKVM_CAST_MEMO sequence around one (`dup; ldloc m; beq HIT; castclass T; dup; stloc m; br DONE; HIT:
+ * pop; ldloc m`, IKVM compiler.cs EmitRetypedFieldCastMemo). A castclass cannot be told from metadata-free IL to be a
+ * lazy-linking cast rather than a Java checkcast; both lower to a few loads and a compare here (CAST_ELIM, CLASS_RECORD)
+ * and neither brings a call site into the caller. Pure IL decoding, as wj_il_hot_size; 0 on anything undecodable. */
+static guint32
+wj_il_cast_bytes (const unsigned char *code, guint32 size)
+{
+	guint16 ops [WJ_HOT_SCAN_MAX], offs [WJ_HOT_SCAN_MAX + 1];
+	const unsigned char *ip, *end = code + size;
+	guint32 n = 0, i, bytes = 0;
+
+	if (!code || size > WJ_HOT_SCAN_MAX)
+		return 0;
+	for (ip = code; ip < end;) {
+		const unsigned char *p = ip;
+		MonoOpcodeEnum op;
+		int len = mono_opcode_value_and_size (&p, end, &op);
+		if (len <= 0 || ip + len > end || n >= WJ_HOT_SCAN_MAX)
+			return 0;
+		ops [n] = (guint16) op;
+		offs [n++] = (guint16) (ip - code);
+		ip += len;
+	}
+	offs [n] = (guint16) size;
+	for (i = 0; i < n; ++i) {
+		if (ops [i] != MONO_CEE_CASTCLASS)
+			continue;
+		if (i >= 3 && i + 5 < n && ops [i - 3] == MONO_CEE_DUP && wj_il_is_ldloc (ops [i - 2]) &&
+		    (ops [i - 1] == MONO_CEE_BEQ_S || ops [i - 1] == MONO_CEE_BEQ) && ops [i + 1] == MONO_CEE_DUP &&
+		    wj_il_is_stloc (ops [i + 2]) && (ops [i + 3] == MONO_CEE_BR_S || ops [i + 3] == MONO_CEE_BR) &&
+		    ops [i + 4] == MONO_CEE_POP && wj_il_is_ldloc (ops [i + 5])) {
+			bytes += offs [i + 6] - offs [i - 3];   /* the memo sequence, castclass included */
+			i += 5;
+		} else {
+			bytes += offs [i + 1] - offs [i];
+		}
+	}
+	return bytes;
+}
 #endif
 
 /* R316g: every refusal below names its gate for `[wasm-jit t2 refused]` (read only by wj_check_inlining_t2). */
@@ -5898,6 +5983,19 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
 			if (eff_size >= GINT_TO_UINT32 (limit) && (guint32) eh_hot < GINT_TO_UINT32 (limit))
 				mono_wasm_jit_count (WJC_EHINL_HOT_ADMIT);
 			eff_size = (guint32) eh_hot;
+		}
+	}
+	/* MONO_WASM_JIT_INLINE_CAST_DISCOUNT (plan v3 L6(d)): castclass bytes do not count. The size gate only; the cost gate
+	 * (inline_method's) still sees the cast's IR. Counted where it turns a refusal into an admission. */
+	{
+		extern int mono_wasm_jit_inline_cast_discount;
+		if (COMPILE_WASM (cfg) && mono_wasm_jit_inline_cast_discount && eff_size >= GINT_TO_UINT32 (limit) && header.code) {
+			guint32 cb = wj_il_cast_bytes (header.code, header.code_size);
+			if (cb && cb < eff_size) {
+				if (eff_size - cb < GINT_TO_UINT32 (limit))
+					mono_wasm_jit_count (WJC_INLINE_CAST_DISCOUNTED);
+				eff_size -= cb;
+			}
 		}
 	}
 #endif
@@ -10801,6 +10899,10 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						}
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_end_bb);
 						gi_active = TRUE;
+						/* plan v3 L8: the fallback is what the guard misses. Marked only here, where the inline landed: a
+						 * late refusal above makes the fallback the only path. */
+						gi_fallback_bb->wasm_cold = 1;
+						mono_wasm_jit_count (WJC_GI_COLD_MARKED);
 						wj_site_gi_note (cfg, ip, 'I');
 						wj_gi_count (WJC_GI_EMITTED);
 						if (gi_idhash) {
@@ -10878,6 +10980,8 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 										EMIT_NEW_TEMPSTORE (cfg, gi2_store, gi_ret_var->inst_c0, *gi_sp);
 									}
 									MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_end_bb);
+									gi2_fallback_bb->wasm_cold = 1;   /* plan v3 L8, as for arm 1 */
+									mono_wasm_jit_count (WJC_GI_COLD_MARKED);
 									wj_gi_count (WJC_T2_GI2_EMITTED);
 									cfg->wasm_gi2_n++;
 									wj_site_gi_note (cfg, ip, 'J');

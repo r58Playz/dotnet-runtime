@@ -1418,6 +1418,14 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_reframe_ms, "MONO_WASM_JIT_REFRAME_MS", 0, 3600000)
 	WJ_T2_KNOB (mono_wasm_jit_b4_once, "MONO_WASM_JIT_B4_ONCE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_until_ms, "MONO_WASM_JIT_T2_UNTIL_MS", 0, 3600000)
+	WJ_T2_KNOB (mono_wasm_jit_gi_share, "MONO_WASM_JIT_GI_SHARE", 0, 100)
+	WJ_T2_KNOB (mono_wasm_jit_gi_min_n, "MONO_WASM_JIT_GI_MIN_N", 1, 65535)
+	WJ_T2_KNOB (mono_wasm_jit_gi_cold, "MONO_WASM_JIT_GI_COLD", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_prof_v2, "MONO_WASM_JIT_PROF_V2", 0, 7)
+	WJ_T2_KNOB (mono_wasm_jit_prof_fb_period, "MONO_WASM_JIT_PROF_FB_PERIOD", 1, 65536)
+	WJ_T2_KNOB (mono_wasm_jit_prof_repair, "MONO_WASM_JIT_PROF_REPAIR", 1, 32767)
+	WJ_T2_KNOB (mono_wasm_jit_prof_repair_max, "MONO_WASM_JIT_PROF_REPAIR_MAX", 0, 1000000)
+	WJ_T2_KNOB (mono_wasm_jit_inline_cast_discount, "MONO_WASM_JIT_INLINE_CAST_DISCOUNT", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_stackprobe, "MONO_WASM_JIT_STACKPROBE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
@@ -1706,13 +1714,19 @@ int mono_wasm_jit_b4_ic = 0;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT
  * The read-side fence is also the StoreLoad fence of any Java volatile store before it that has none of its own, and two
  * kinds do not: (a) IKVM merges a store's trailing barrier into the next barrier of the same straight-line IL
  * (CodeEmitter.RemoveRedundantMemoryBarriers) -- wj_vol_store_reaches keeps every fence a store reaches without an
- * intervening fence or call; (b) IKVM.Runtime's Unsafe emulation stored with Volatile.Write or a bare `volatile. stind`
- * and no fence. The first build without (a) stopped 262c's memwalk datapack (2026-11-16, findings note "levers3").
- * (b) is closed (audit 2026-11-21, plan abstract-hatching-stearns E1): IKVM ada11be7e fences after every Unsafe
- * put*Volatile; every other `volatile.` store IKVM emits for a Java volatile is followed by a barrier
- * (RuntimeSimpleJavaField, atomic.cs, Unsafe's array-volatile delegate through its fenced callers); and Volatile.Write
- * is OP_ATOMIC_STORE_* (intrinsics.c), a seq-cst wasm atomic store, which V8 lowers to xchg on x64
- * (code-generator-x64.cc EmitStore<seq_cst>; the decoder's atomic order is kSeqCst, function-body-decoder-impl.h).
+ * intervening fence or call into IKVM-compiled Java; (b) IKVM.Runtime's Unsafe emulation stored with Volatile.Write or
+ * a bare `volatile. stind` and no fence. The first build without (a) stopped 262c's memwalk datapack (2026-11-16,
+ * findings note "levers3"). (b) (audit 2026-11-21, plan abstract-hatching-stearns E1): IKVM ada11be7e fences after every
+ * Unsafe put*Volatile; every other `volatile.` store IKVM emits for a Java volatile is followed by a barrier
+ * (RuntimeSimpleJavaField, atomic.cs, Unsafe's array-volatile delegate through its fenced callers). An INLINED
+ * Volatile.Write is OP_ATOMIC_STORE_* (intrinsics.c), a seq-cst wasm atomic store, which V8 lowers to xchg on x64
+ * (code-generator-x64.cc EmitStore<seq_cst>; the decoder's atomic order is kSeqCst, function-body-decoder-impl.h) -- but
+ * an AOT'd one is a plain store (intrinsics.c skips the intrinsic under llvm-only AOT), and ByteCodeHelper's
+ * VolatileWrite* for bool / byte / char / short / float are NoInlining Volatile.Writes (long / double use
+ * Interlocked.Exchange, seq-cst) (plan v3 review R1). So since plan v3:
+ * IKVM's EmitUnsafeVolatileSetImpl puts a barrier after its VolatileWrite* call (R1); the scan keeps the fence at a call
+ * into C#, passes a wrapper or icall mono added, and stops only at a call into Java (R2, wj_vol_store_reaches); and only
+ * a Java root converts (R3, wj_vol_java_method). [wasm-jit volatile] conv must equal used, lost must be 0.
  * The remaining gate is 262c's memwalk as a rate (>= 10 runs, the datapack stepping every time) at 1. */
 int mono_wasm_jit_volatile_load = 0;
 /* MONO_WASM_JIT_MAX_PARAMS: the largest wasm functype a JIT body or call site may use (this, args and the frame-base
@@ -2030,6 +2044,44 @@ int mono_wasm_jit_b4_final;   /* set when B4_ONCE's plan is consumed */
 /* MONO_WASM_JIT_T2_UNTIL_MS: no tier-2 promotion is requested later than this many ms after the JIT started (counted
  * WJC_T2_TOO_LATE), so tier 2 is settled before a timing window; 0 = no cutoff. */
 int mono_wasm_jit_t2_until_ms = 0;
+/* MONO_WASM_JIT_GI_SHARE=<pct> (plan v3 L1, PLAN-TEAVM-PARITY-v3.md): tier 2's guarded inlining also predicts a site whose
+ * record is not perfectly monomorphic, when its top receiver's share has a one-sided 95% Wilson lower bound of at least
+ * this many percent over at least MONO_WASM_JIT_GI_MIN_N observations (interp.c mono_wasm_jit_prof_predict_share). Read
+ * only by wj_gi_predict, after the margin and method-identity predictors refuse: the emitter's devirt arms keep
+ * MONO_WASM_JIT_PRED_PCT (whose monomorphic path drops ARM2). Counted WJC_GI_SHARE_PRED / _REFUSED. 0 = off. */
+int mono_wasm_jit_gi_share = 0;
+int mono_wasm_jit_gi_min_n = 32;
+/* MONO_WASM_JIT_GI_COLD=1 (plan v3 L8): hint the branch into a guarded inline's fallback (method-to-ir.c marks the block
+ * wasm_cold once the inline landed) unlikely, so V8 lays the ~600-850 B callvirt fallback after the hot path instead of
+ * in it (WJ_COND_HINT; counted WJC_GI_COLD_HINTS). A site whose guard mostly misses then jumps out of line. 0 = off. */
+int mono_wasm_jit_gi_cold = 0;
+/* MONO_WASM_JIT_PROF_V2 (bits; the call profile's second version, findings note 2026-11-22 "how accurate is the call
+ * profile"):
+ *   1  unbiased shares: an IC miss goes to the record's miss histogram (WjProfSite.miss_counts), never to id_counts /
+ *      total / margin, which then hold only the interpreter's and tier-1 sampling's observations; PROF_DECAY's live
+ *      window takes samples only. Needs MONO_WASM_JIT_PROF_SAMPLE > 0 (ignored without it: misses are then the only
+ *      post-JIT evidence).
+ *   2  identity recycling: a full identity set replaces an entry whose counts have decayed to 0, under a sequence
+ *      number the pair readers check (WjProfSite.nids above WJ_PROF_WAYS). Needs MONO_WASM_JIT_PROF_SERIAL, and does
+ *      nothing without MONO_WASM_JIT_PROF_DECAY (counts reach 0 only by halving).
+ *   4  repair: tier-2 code counts each guarded site's fallback calls in the cold path and hands every
+ *      MONO_WASM_JIT_PROF_FB_PERIOD-th receiver to mono_wasm_jit_prof_fallback_site (the first clears the record's miss
+ *      histogram); once MONO_WASM_JIT_PROF_REPAIR samples show a receiver the record held under 10% taking at least
+ *      half the fallbacks, the record is refolded from them and the method re-emitted once (InterpMethod.wasm_jit_repair;
+ *      at most MONO_WASM_JIT_PROF_REPAIR_MAX methods; none past MONO_WASM_JIT_T2_UNTIL_MS). A decided site's probe is
+ *      parked (its countdown set out of reach).
+ * 0 = off. */
+int mono_wasm_jit_prof_v2 = 0;
+int mono_wasm_jit_prof_fb_period = 64;
+int mono_wasm_jit_prof_repair = 32;   /* = GI_MIN_N: a refolded record must be warm enough for the share bar to read */
+int mono_wasm_jit_prof_repair_max = 2048;
+/* MONO_WASM_JIT_INLINE_CAST_DISCOUNT=1 (plan v3 L6(d)): mono_method_check_inlining_limit's size test does not count a
+ * callee's castclass instructions, nor each whole IKVM_CAST_MEMO sequence around one (method-to-ir.c wj_il_cast_bytes),
+ * so the casts lazy linking adds after erased reads (R527) do not refuse an inline eager linking would take. IL cannot
+ * tell those from Java checkcasts, so both are discounted (one inside a throw segment R318 already left out, twice). The
+ * size gate only, not inline_method's cost cap. Counted
+ * WJC_INLINE_CAST_DISCOUNTED where it turned a refusal into an admission. 0 = off. */
+int mono_wasm_jit_inline_cast_discount = 0;
 gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,

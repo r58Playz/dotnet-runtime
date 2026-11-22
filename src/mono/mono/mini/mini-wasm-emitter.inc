@@ -2224,6 +2224,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gboolean method_nogc G_GNUC_UNUSED = FALSE;        /* transitive direct-call effect published in WjRegEntry */
 	int effective_gcp_count G_GNUC_UNUSED = 0;         /* static returning GC points after direct no-GC resolution */
 	gboolean lazy_ref_frame = FALSE;     /* defer a pure ref frame until the first effective GC point */
+	/* This instruction's lazy frame was ensured at its start (it is an effective GC point and not the terminal handoff).
+	 * A helper probe inside it (WJ_PROBE_FRAME_ENTER / _LEAVE) then must not release the frame: the instruction's own call
+	 * still needs its refs pinned (plan v3 review: every probe in the virtual-call emission released it). */
+	gboolean wj_ins_framed = FALSE;
 	/* MONO_WASM_JIT_LAZY_COLD: the lazy frame can only materialise in a raise or poll taken arm, so it is
 	 * never live on the hot path -- no mirrors, kill stores, exit restore, or hot ENSURE (see the knob). */
 	gboolean lazy_cold_frame = FALSE;
@@ -4785,6 +4789,12 @@ co_ranges_done:
 #define ENSURE_REF_FRAME() do { } while (0)
 #endif
 
+/* A helper call made from inside an instruction's emission (a profiling or verify probe). When the instruction's frame
+ * was ensured at its start (wj_ins_framed) the probe runs inside it and leaves it alone; otherwise it brings its own
+ * lazy frame and releases it, as a conditional poll does. */
+#define WJ_PROBE_FRAME_ENTER() do { if (!wj_ins_framed) ENSURE_REF_FRAME (); } while (0)
+#define WJ_PROBE_FRAME_LEAVE() do { if (!wj_ins_framed) RELEASE_LAZY_REF_FRAME (); } while (0)
+
 /* A conditional safepoint poll needs roots only in its taken arm. After the poll returns, the wasm
  * locals contain the same pinned object addresses and no GC can observe them again until the next
  * materialization/handoff. Pop the lazy frame and clear its active marker so a later poll can rebuild
@@ -5789,9 +5799,14 @@ co_ranges_done:
  * one. The static rule keeps priority, so every R341 hint is unchanged. */
 #define WJ_PCOLD(TBB) ((TBB) && (TBB)->block_num >= 0 && (TBB)->block_num <= (int) cfg->max_block_num && \
 	bbidx [(TBB)->block_num] >= 0 && wj_pcold [bbidx [(TBB)->block_num]])
+/* MONO_WASM_JIT_GI_COLD (plan v3 L8): next, a guarded inline's fallback (wasm_cold, method-to-ir.c) is the unlikely one. */
 #define WJ_COND_HINT() do { \
+		extern int mono_wasm_jit_gi_cold; \
 		gboolean _tc = ins->inst_true_bb->out_of_line, _fc = ins->inst_false_bb && ins->inst_false_bb->out_of_line; \
+		gboolean _tg = mono_wasm_jit_gi_cold && ins->inst_true_bb->wasm_cold, \
+		         _fg = mono_wasm_jit_gi_cold && ins->inst_false_bb && ins->inst_false_bb->wasm_cold; \
 		if (_tc != _fc) WJ_HINT2 (_tc ? 0 : 1, WJC_BRANCH_HINT_OOL); \
+		else if (!_tc && _tg != _fg) WJ_HINT2 (_tg ? 0 : 1, WJC_GI_COLD_HINTS); \
 		else if (wj_pcold && !_tc) { \
 			gboolean _tp = WJ_PCOLD (ins->inst_true_bb), _fp = WJ_PCOLD (ins->inst_false_bb); \
 			if (_tp != _fp) WJ_PROF_HINT (_tp ? 0 : 1); \
@@ -5889,6 +5904,8 @@ co_ranges_done:
 		wj_cold_mark = body.len; \
 	} while (0)
 #endif
+	wj_vol_atomic = NULL;   /* a failed compile can leave a mark behind: it is not this compile's */
+	wj_vol_conv_here = wj_vol_used_here = wj_vol_lost_here = 0;
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
 		int loop_depth = N - 1 - i;
 		gboolean terminated = FALSE;
@@ -6042,7 +6059,11 @@ co_ranges_done:
 		}
 #endif
 
-		wj_vol_atomic = NULL;   /* MONO_WASM_JIT_VOLATILE_LOAD: a barrier's mark never crosses a block (or a compile) */
+		/* MONO_WASM_JIT_VOLATILE_LOAD: a barrier's mark never crosses a block (or a compile). A mark still set here is a fence
+		 * that was dropped with no atomic load emitted in its place: counted, must read 0. */
+		if (G_UNLIKELY (wj_vol_atomic != NULL))
+			wj_vol_lost_here++;
+		wj_vol_atomic = NULL;
 		MONO_BB_FOR_EACH_INS (bb, ins) {
 			int my_ord = sl_ord++;   /* bump for EVERY ins (incl. terminated-skipped) to stay aligned with the SLOTLIVE walk */
 			if (terminated) continue;   /* skip instrs after a bb terminator (e.g. the OP_BR following OP_CALL_HANDLER) */
@@ -6132,10 +6153,11 @@ co_ranges_done:
 				wasm_origin_pop (&body, _wjo_sz);
 			}
 #ifdef HOST_BROWSER
-			if (wj_ins_is_effective_gcpoint (cfg, ins) &&
+			wj_ins_framed = wj_ins_is_effective_gcpoint (cfg, ins) &&
 			    !(lazy_ref_frame && ins->opcode == OP_GC_SAFE_POINT) &&
 			    !(lazy_cold_frame && wj_ins_is_raise (ins)) &&
-			    !(lazy_ref_frame && terminal_vcall_handoff && ins == terminal_vcall_ins))
+			    !(lazy_ref_frame && terminal_vcall_handoff && ins == terminal_vcall_ins);
+			if (wj_ins_framed)
 				ENSURE_REF_FRAME ();
 			/* MONO_WASM_JIT_PIN_ALIAS=2/3: before an aliased call (its frame ensured just above: the call is an
 			 * effective GC point and not the terminal handoff), the source's slot must hold the carrier's value;
@@ -6284,7 +6306,11 @@ co_ranges_done:
 					extern int mono_wasm_jit_volatile_load;
 					/* MONO_WASM_JIT_VOLATILE_LOAD: the barrier IKVM puts in front of a volatile read becomes the read's own
 					 * seq-cst atomic load (LOADM below); every volatile store keeps its trailing fence. */
-					if (mono_wasm_jit_volatile_load && (wj_vol_atomic = wj_volatile_load_after (bb, ins))) {
+					/* only in Java IKVM compiled (plan v3 L2 R3): other .NET code may put a release-only store, a call
+					 * into Java and its own Thread.MemoryBarrier () in front of a volatile read */
+					if (mono_wasm_jit_volatile_load && wj_vol_java_method (cfg->method) &&
+					    (wj_vol_atomic = wj_volatile_load_after (bb, ins))) {
+						wj_vol_conv_here++;   /* WJC_VOL_ATOMIC_CONV at done: (ungated: _CONV == _USED is the soundness check) */
 						if (G_UNLIKELY (mono_wasm_jit_roles_on)) mono_atomic_inc_i64 (&wj_lev_static [WJL_VOLATILE_ATOMIC]);
 					} else {
 						wasm_u8 (&body, 0xfe);  /* atomic prefix */
@@ -7242,6 +7268,7 @@ co_ranges_done:
 #define LOADM(WOP, AL) do { \
 		if (G_UNLIKELY (wj_vol_atomic == ins)) {   /* MONO_WASM_JIT_VOLATILE_LOAD: the guarded volatile read */ \
 			wj_vol_atomic = NULL; \
+			wj_vol_used_here++; \
 			if (!wasm_guard_memaddr (&body, &lc, ins->sreg1, (gint32) ins->inst_offset)) { fail = "load addr guard"; goto done; } \
 			if (!wasm_ld (&body, &lc, ins->sreg1)) { fail = "load base"; goto done; } \
 			wasm_op (&body, WASM_OP_ATOMIC_PREFIX); \
@@ -9143,6 +9170,46 @@ vcall_nullchk_done:
 							}
 							if (!is_delegate_invoke) wj_emit_fast_count (&body, WJC_FAST_VSITE);   /* C1 route mix: denominator */
 #ifdef HOST_BROWSER
+							/* MONO_WASM_JIT_PROF_V2 & 4 (knob comment in mini-wasm.c): a tier-2 site's guard misses count a
+							 * process-wide word down, and the one that reaches zero hands the receiver's vtable to
+							 * mono_wasm_jit_prof_fallback_site, which parks the word once the site is decided. Emitted only
+							 * where a guard has already missed -- a guarded inline's fallback block (bb->wasm_cold), or
+							 * behind this site's devirt arm -- so the hot path pays nothing. No local: the word is reloaded
+							 * (a cold path). */
+#define WJ_EMIT_FB_PROBE() do { \
+								extern int mono_wasm_jit_prof_fb_period; \
+								extern void mono_wasm_jit_prof_fallback_site (gpointer ic, MonoVTable *vt, gint32 *word); \
+								gint32 *_fw = wj_word_alloc (); \
+								if (_fw) { \
+									guint32 _fa = (guint32) (gsize) _fw; \
+									WasmFuncType _ft; int _fti = -1, _fk; \
+									memset (&_ft, 0, sizeof (_ft)); _ft.ret = WASM_VOID; _ft.nparams = 3; _ft.params [0] = WASM_I32; _ft.params [1] = WASM_I32; _ft.params [2] = WASM_I32; \
+									for (_fk = 0; _fk < nextra; ++_fk) if (functype_eq (&extra_types [_fk], &_ft)) { _fti = ti_base + _fk; break; } \
+									if (_fti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _ft; _fti = ti_base + nextra++; } \
+									mono_wasm_jit_count (WJC_PROF_FB_SITES); \
+									wasm_i32_const (&body, 0); \
+									wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _fa); \
+									wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_SUB); \
+									wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _fa); \
+									wasm_i32_const (&body, 0); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, _fa); \
+									wasm_i32_const (&body, 1); wasm_op (&body, WASM_OP_I32_LT_S); \
+									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+										wasm_i32_const (&body, 0); wasm_i32_const (&body, mono_wasm_jit_prof_fb_period); \
+										wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _fa); \
+										WJ_PROBE_FRAME_ENTER (); \
+										wasm_i32_const (&body, (gint32) (intptr_t) vic); \
+										if (!wasm_ld (&body, &lc, this_vr)) { fail = "fallback probe this ld"; goto done; } \
+										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+										wasm_i32_const (&body, (gint32) _fa);   /* the helper parks a decided site's word */ \
+										wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_prof_fallback_site, (guint32) _fti); \
+										WJ_PROBE_FRAME_LEAVE (); \
+									wasm_op (&body, WASM_OP_END); \
+								} \
+							} while (0)
+							{ extern int mono_wasm_jit_prof_v2;
+							  if ((mono_wasm_jit_prof_v2 & 4) && cfg->wasm_jit_tier >= 2 && !is_delegate_invoke && vic && bb->wasm_cold)
+								WJ_EMIT_FB_PROBE ();
+							}
 							/* MONO_WASM_JIT_PROF_SAMPLE (tier 1): every dispatch of this site counts a process-wide word down,
 							 * and the one that reaches zero hands the receiver's vtable to the site's profile record. Ahead of
 							 * the arm, so it sees arm hits and IC hits alike. The receiver is non-null here (the site's
@@ -9169,12 +9236,12 @@ vcall_nullchk_done:
 									wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 										wasm_i32_const (&body, 0); wasm_i32_const (&body, mono_wasm_jit_prof_sample);
 										wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, _pa);
-										ENSURE_REF_FRAME ();
+										WJ_PROBE_FRAME_ENTER ();
 										wasm_i32_const (&body, (gint32) (intptr_t) _psite);
 										if (!wasm_ld (&body, &lc, this_vr)) { fail = "prof sample this ld"; goto done; }
 										wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0);
 										wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_prof_sample_site, (guint32) _pti);
-										RELEASE_LAZY_REF_FRAME ();
+										WJ_PROBE_FRAME_LEAVE ();
 									wasm_op (&body, WASM_OP_END);
 								}
 							  } }
@@ -9221,11 +9288,11 @@ vcall_nullchk_done:
 												memset (&pw, 0, sizeof (pw)); pw.ret = WASM_VOID; pw.nparams = 2; pw.params [0] = WASM_I32; pw.params [1] = WASM_I32;
 												for (pwk = 0; pwk < nextra; ++pwk) if (functype_eq (&extra_types [pwk], &pw)) { pwi = ti_base + pwk; break; }
 												if (pwi < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = pw; pwi = ti_base + nextra++; }
-												ENSURE_REF_FRAME ();
+												WJ_PROBE_FRAME_ENTER ();
 												wasm_i32_const (&body, (gint32) (intptr_t) pred_target);
 												wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
 												wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_cha_wrong_note, (guint32) pwi);
-												RELEASE_LAZY_REF_FRAME ();
+												WJ_PROBE_FRAME_LEAVE ();
 											}
 											wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1);   /* -> $pred_miss */
 										wasm_op (&body, WASM_OP_END);
@@ -9269,12 +9336,12 @@ vcall_nullchk_done:
 											memset (&_vt, 0, sizeof (_vt)); _vt.ret = WASM_I32; _vt.nparams = 2; _vt.params [0] = WASM_I32; _vt.params [1] = WASM_I32;
 											for (_vk2 = 0; _vk2 < nextra; ++_vk2) if (functype_eq (&extra_types [_vk2], &_vt)) { _vti = ti_base + _vk2; break; }
 											if (_vti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _vt; _vti = ti_base + nextra++; }
-											ENSURE_REF_FRAME ();
+											WJ_PROBE_FRAME_ENTER ();
 											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
 											wasm_i32_const (&body, (gint32) (intptr_t) ((mono_wasm_jit_recv_class & 16) ? mono_defaults.exception_class : call->wasm_recv_class));   /* 16: the negative control */
 											wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_recv_verify, (guint32) _vti);
 											wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) vc_aotkind_idx);
-											RELEASE_LAZY_REF_FRAME ();
+											WJ_PROBE_FRAME_LEAVE ();
 											wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) vc_aotkind_idx);
 											wasm_op (&body, WASM_OP_I32_EQZ);
 											wasm_op (&body, WASM_OP_BR_IF); wasm_uleb (&body, pred_vt ? 1 : 0);   /* -> $pred_miss */
@@ -9340,6 +9407,13 @@ vcall_nullchk_done:
 									if (rv != WASM_VOID && !wj_vc_store_result (&body, &lc, ins, is_vcall2, &vci, rv)) { fail = "devirt dreg"; goto done; }
 									wasm_op (&body, WASM_OP_BR); wasm_uleb (&body, 1); /* -> outer $after */
 								wasm_op (&body, WASM_OP_END); /* $pred_miss */
+#ifdef HOST_BROWSER
+								/* the arm missed: MONO_WASM_JIT_PROF_V2 & 4's probe (a guarded-inline fallback was probed above) */
+								{ extern int mono_wasm_jit_prof_v2;
+								  if ((mono_wasm_jit_prof_v2 & 4) && cfg->wasm_jit_tier >= 2 && vic && !bb->wasm_cold)
+									WJ_EMIT_FB_PROBE ();
+								}
+#endif
 							}
 							/* R206: SECOND guarded arm, structurally identical to the first. Its guard is only
 							 * reached when arm 1's missed, which is exactly the traffic the break-even is
@@ -11520,6 +11594,14 @@ vcall_compact_done:   /* typed-spindle C1: a compact site skips straight here, i
 	wasm_buf_free (&out);
 
 done:
+	if (!fail && (wj_vol_conv_here || wj_vol_used_here || wj_vol_lost_here || wj_vol_atomic)) {
+		/* MONO_WASM_JIT_VOLATILE_LOAD: a mark still set here was left in the last block */
+		mono_wasm_jit_add (WJC_VOL_ATOMIC_CONV, wj_vol_conv_here);
+		mono_wasm_jit_add (WJC_VOL_ATOMIC_USED, wj_vol_used_here);
+		mono_wasm_jit_add (WJC_VOL_ATOMIC_LOST, wj_vol_lost_here + (wj_vol_atomic ? 1 : 0));
+	}
+	wj_vol_conv_here = wj_vol_used_here = wj_vol_lost_here = 0;
+	wj_vol_atomic = NULL;
 	wj_edge_on = FALSE;
 	wj_sp_out_local = wj_sp_saved_local;
 	wj_sp_sync_on = wj_sp_saved_sync;

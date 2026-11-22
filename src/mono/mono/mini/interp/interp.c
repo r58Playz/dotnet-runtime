@@ -1316,7 +1316,29 @@ typedef struct {
 	 * adding a second, per CLAUDE.md. */
 	MonoMethod *id_targets [WJ_PROF_WAYS];
 	guint16     id_counts [WJ_PROF_WAYS];
+	/* MONO_WASM_JIT_PROF_V2 (knob comment in mini-wasm.c): the MISS HISTOGRAM, per entry of ids [] -- what reached the site
+	 * past something that had already taken some receivers (a worker's PIC under bit 1, a guard under bit 4). Those
+	 * observations are censored, so under bit 1 they stay out of id_counts / total / margin, which then remain a sample
+	 * of every dispatch. `misses` is their sum; both are halved together at 0x7fff. 24 B a site, unused with the knob
+	 * off (the struct cannot depend on it). */
+	guint16     miss_counts [WJ_PROF_WAYS];
+	guint32     misses;
+	guint16     fb_samples;    /* bit 4: fallback samples since the first (saturating; the first resets the miss histogram) */
+	guint8      repaired;      /* bit 4: refolded from its fallback samples; one-shot */
+	guint8      pad;
 } WjProfSite;
+
+/* Where an observation came from (wj_prof_record_at's `src`). */
+#define WJ_OBS_INTERP   0   /* the interpreter's dispatch: every call, unbiased */
+#define WJ_OBS_MISS     1   /* a JIT IC miss: censored by the worker's PIC and any arm ahead of it */
+#define WJ_OBS_SAMPLE   2   /* MONO_WASM_JIT_PROF_SAMPLE: every Nth tier-1 dispatch, ahead of the arm: unbiased */
+#define WJ_OBS_FALLBACK 3   /* MONO_WASM_JIT_PROF_V2 & 4: every Nth call a tier-2 guard missed: censored by the guard */
+
+/* MONO_WASM_JIT_PROF_V2 & 2: once a set is full, `nids` doubles as a sequence number. A replacement makes it odd, writes the
+ * entry, and makes it even again; values above WJ_PROF_WAYS all mean "WJ_PROF_WAYS entries". A pair reader accepts a scan
+ * only if nids read the same before and after it and was not odd above WJ_PROF_WAYS (WJ_PROF_WAYS is even). */
+#define WJ_PROF_NIDS_STABLE(n) ((n) <= WJ_PROF_WAYS || !((n) & 1))
+#define WJ_PROF_NIDS_SEQ_MAX 252
 
 typedef struct _WjCallProfile {
 	guint32 n;
@@ -1429,12 +1451,15 @@ mono_wasm_jit_prof_append_stats (gint32 *out)
 }
 
 /* Add `identity` to the site's distinct-identity set. Saturating: past WJ_PROF_WAYS it only sets the
- * overflow flag, so the cost stays bounded no matter how polymorphic the site is. */
+ * overflow flag, so the cost stays bounded no matter how polymorphic the site is. `miss` counts the observation in the
+ * miss histogram instead of id_counts (MONO_WASM_JIT_PROF_V2); `in_section`: the caller already holds the append
+ * section, so this neither enters nor leaves it. */
 static void
-wj_prof_note_identity (WjProfSite *s, gpointer identity, MonoMethod *target)
+wj_prof_note_identity (WjProfSite *s, gpointer identity, MonoMethod *target, gboolean miss, gboolean in_section)
 {
+	extern int mono_wasm_jit_prof_v2, mono_wasm_jit_prof_serial;
 	guint32 k, n, n_first = 0;
-	gboolean again = FALSE;
+	gboolean again = in_section;
 
 rescan:
 	n = s->nids;
@@ -1444,20 +1469,61 @@ rescan:
 		if (s->ids [k] == identity) {
 			/* Saturating: a count that wrapped would invert the ranking, which is worse than one that
 			 * stops growing -- once an identity is this dominant its rank cannot change. */
-			if (s->id_counts [k] < G_MAXUINT16)
+			if (miss) {
+				if (s->miss_counts [k] < G_MAXUINT16)
+					s->miss_counts [k]++;
+			} else if (s->id_counts [k] < G_MAXUINT16)
 				s->id_counts [k]++;
-			/* A sizing-only observation arrives with target == NULL; do not clobber a resolved one. */
+			/* A sizing-only observation arrives with target == NULL; do not clobber a resolved one. A CAS from NULL:
+			 * a plain store after the test could land after the entry was filled, decayed and recycled to another
+			 * receiver (MONO_WASM_JIT_PROF_V2 & 2), leaving it this receiver's target (plan v3 review). */
 			if (target && !s->id_targets [k])
-				s->id_targets [k] = target;
-			if (again) {
+				mono_atomic_cas_ptr ((volatile gpointer *) &s->id_targets [k], target, NULL);
+			if (again && !in_section) {
 				wj_prof_append_raced_id++;
 				wj_prof_append_leave ();
 			}
 			return;
 		}
 	if (n >= WJ_PROF_WAYS) {
+		/* MONO_WASM_JIT_PROF_V2 & 2: a full set replaces an entry whose counts have decayed to 0 -- never the
+		 * front-runner (the margin predictor looks its target up here) and never one without a resolved target (see
+		 * above). Inside the append section, under the nids sequence number (WJ_PROF_NIDS_STABLE). A virtual site
+		 * only: a delegate site's identity is its target, and nothing there is worth the churn. */
+		if ((mono_wasm_jit_prof_v2 & 2) && mono_wasm_jit_prof_serial && target && s->kind == WJ_SITE_VIRTUAL &&
+		    n <= WJ_PROF_NIDS_SEQ_MAX && WJ_PROF_NIDS_STABLE (n)) {
+			if (!again) {
+				if (!wj_prof_append_enter ())
+					return;
+				again = TRUE;
+				goto rescan;
+			}
+			for (k = 0; k < WJ_PROF_WAYS; ++k)
+				if (s->id_counts [k] == 0 && s->miss_counts [k] == 0 && s->id_targets [k] && s->ids [k] &&
+				    s->ids [k] != s->identity)
+					break;
+			if (k < WJ_PROF_WAYS) {
+				/* An identity is dropped: the readers that refuse an overflowed set (predict_method, _second, _cold,
+				 * prof_arity, same_target) refuse a recycled one -- the flag goes up BEFORE the odd sequence number,
+				 * so a reader that saw the odd value also sees it (plan v3 review). They check the sequence too. */
+				s->ids_overflow = 1;
+				mono_memory_barrier ();
+				s->nids = (guint8) (n + 1);   /* odd: a replacement in flight */
+				mono_memory_barrier ();
+				s->id_targets [k] = target;
+				s->id_counts [k] = miss ? 0 : 1;
+				s->miss_counts [k] = miss ? 1 : 0;
+				s->ids [k] = identity;
+				mono_memory_barrier ();
+				s->nids = (guint8) (n + 2);
+				mono_wasm_jit_counters [WJC_PROF_RECYCLED]++;
+				if (!in_section)
+					wj_prof_append_leave ();
+				return;
+			}
+		}
 		s->ids_overflow = 1;
-		if (again)
+		if (again && !in_section)
 			wj_prof_append_leave ();
 		return;
 	}
@@ -1468,15 +1534,17 @@ rescan:
 		again = TRUE;
 		goto rescan;
 	}
-	if (n != n_first)
+	if (!in_section && n != n_first)
 		wj_prof_append_other_id++;
 	/* The entry is whole before the count that publishes it: readers stop at nids. */
 	s->id_targets [n] = target;
-	s->id_counts [n] = 1;
+	s->id_counts [n] = miss ? 0 : 1;
+	s->miss_counts [n] = miss ? 1 : 0;
 	s->ids [n] = identity;
 	mono_memory_barrier ();
 	s->nids = (guint8) (n + 1);
-	wj_prof_append_leave ();
+	if (!in_section)
+		wj_prof_append_leave ();
 }
 
 /* R484: the site capacity of the next block of a chain whose blocks already hold `used_cap` slots; 0 when the
@@ -1670,10 +1738,41 @@ rescan:
  */
 static guint32 wj_prof_decays;   /* MONO_WASM_JIT_PROF_DECAY: halvings (racy, a census) */
 
+/* MONO_WASM_JIT_PROF_V2: a censored observation (an IC miss under bit 1, a guard's fallback under bit 4) goes to the miss
+ * histogram and nowhere else. Bounded like the shares: halved at 0x7fff; an IC miss stops being recorded at 1024 (a
+ * fallback sample is already 1 in MONO_WASM_JIT_PROF_FB_PERIOD), so a thrashing PIC pays a load and a compare. */
 static void
-wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod *target,
-                   gboolean from_jit)
+wj_prof_note_miss (WjProfSite *s, gpointer identity, MonoMethod *target, int src)
 {
+	guint32 k;
+	if (src == WJ_OBS_MISS) {
+		if (s->misses >= 1024)
+			return;
+		mono_wasm_jit_counters [WJC_PROF_MISS_SPLIT]++;   /* after the cap: not a store per IC miss */
+	}
+	if (s->misses >= 0x7fff) {
+		for (k = 0; k < WJ_PROF_WAYS; ++k)
+			s->miss_counts [k] >>= 1;
+		s->misses >>= 1;
+	}
+	s->misses++;
+	wj_prof_samples++;
+	wj_prof_jit_samples++;
+	wj_prof_note_identity (s, identity, target, TRUE, FALSE);
+}
+
+static void
+wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod *target, int src)
+{
+	extern int mono_wasm_jit_prof_v2, mono_wasm_jit_prof_sample;
+	gboolean from_jit = src != WJ_OBS_INTERP;
+	if (G_UNLIKELY (src == WJ_OBS_FALLBACK ||
+	                (src == WJ_OBS_MISS && (mono_wasm_jit_prof_v2 & 1) && mono_wasm_jit_prof_sample > 0)) &&
+	    kind == WJ_SITE_VIRTUAL) {
+		wj_prof_note_miss (s, identity, target, src);
+		return;
+	}
+
 	/* `total == 0` is FIRST OBSERVATION. It used to be spelled `!added && s->total != 0`, and the
 	 * `added` conjunct was redundant: wj_prof_site appends into a zeroed block, so a site it reports as
 	 * added always has total == 0 and the two tests can never disagree. Dropping it is what lets the
@@ -1700,14 +1799,21 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
 			s->identity = target ? identity : NULL;
 			s->target = target;
 			s->margin = target ? 1 : 0;
-			/* The identity set's first entry gets its target and count here too: the set path
-			 * (wj_prof_note_identity) is not taken for a first observation, and a record left at ONE observation
-			 * -- a hot monomorphic IC site -- had ids [0] with no target and a count of 0 until R405. */
-			s->id_targets [0] = target;
-			s->id_counts [0] = 1;
-			s->ids [0] = identity;
-			s->nids = 1;
-			s->ids_overflow = 0;
+			if (s->nids == 0) {
+				/* The identity set's first entry gets its target and count here too: the set path
+				 * (wj_prof_note_identity) is not taken for a first observation, and a record left at ONE observation
+				 * -- a hot monomorphic IC site -- had ids [0] with no target and a count of 0 until R405. */
+				s->id_targets [0] = target;
+				s->id_counts [0] = 1;
+				s->miss_counts [0] = 0;
+				s->ids [0] = identity;
+				s->nids = 1;
+				s->ids_overflow = 0;
+			} else {
+				/* MONO_WASM_JIT_PROF_V2: the miss histogram made entries before the first share observation. Rewriting
+				 * ids [0] and nids here would hand a lock-free reader one receiver's slot with another's target. */
+				wj_prof_note_identity (s, identity, target, FALSE, TRUE);
+			}
 			mono_memory_barrier ();
 			s->total = 1;
 		} else {
@@ -1733,14 +1839,19 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
 		 * a tier-1 site's sample -- is never refused, and the counts are halved when the total reaches the knob, so the
 		 * record follows what the site dispatches to now. The interpreter's own observations still stop at saturation:
 		 * that early-out is its whole cost. Counts only: an identity keeps its slot and its target, so no reader can pair
-		 * one receiver with another's target. */
+		 * one receiver with another's target. Under MONO_WASM_JIT_PROF_V2 & 1 an IC miss never gets here (the miss
+		 * histogram, above), so the window is the samples' alone: a miss-fed window drifts toward whatever the arm
+		 * misses (the palette record, 98% -> 67% over a run, findings note 2026-11-22). */
 		gboolean live = from_jit && target && kind == WJ_SITE_VIRTUAL && mono_wasm_jit_prof_decay > 0;
 		if (seen >= WJ_PROF_SATURATE && !live)
 			return;                       /* decided; stop paying for this site */
 		if (live && s->total >= (guint32) mono_wasm_jit_prof_decay) {
 			guint32 dk;
-			for (dk = 0; dk < s->nids && dk < WJ_PROF_WAYS; ++dk)
+			for (dk = 0; dk < s->nids && dk < WJ_PROF_WAYS; ++dk) {
 				s->id_counts [dk] >>= 1;
+				s->miss_counts [dk] >>= 1;   /* PROF_V2: an entry seen only by misses long ago becomes recyclable too */
+			}
+			s->misses >>= 1;
 			s->margin >>= 1;
 			s->total >>= 1;
 			wj_prof_decays++;
@@ -1749,7 +1860,7 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
 		if (from_jit)
 			wj_prof_jit_samples++;
 		s->total++;
-		wj_prof_note_identity (s, identity, target);
+		wj_prof_note_identity (s, identity, target, FALSE, FALSE);
 		if (!target)
 			return;                       /* sizing-only observation; leave the majority alone */
 		if (s->identity == identity) {
@@ -1770,7 +1881,7 @@ wj_prof_record_at (WjProfSite *s, WjSiteKind kind, gpointer identity, MonoMethod
  * wj_prof_record_at directly instead; this form re-scans the caller's site table every call. */
 static void
 wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointer identity,
-                MonoMethod *target, gboolean from_jit)
+                MonoMethod *target, int src)
 {
 	WjProfSite *s;
 	extern int mono_wasm_jit_auto;
@@ -1785,7 +1896,7 @@ wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointe
 	s = wj_prof_site (caller, base, kind, TRUE);
 	if (!s)
 		return;
-	wj_prof_record_at (s, kind, identity, target, from_jit);
+	wj_prof_record_at (s, kind, identity, target, src);
 }
 
 /*
@@ -1839,7 +1950,7 @@ wj_prof_record_delegate (InterpMethod *caller, MonoDelegate *del)
 	}
 	if (!invoke)
 		return;
-	wj_prof_record (caller, invoke, WJ_SITE_DELEGATE, del->method, NULL, FALSE);
+	wj_prof_record (caller, invoke, WJ_SITE_DELEGATE, del->method, NULL, WJ_OBS_INTERP);
 }
 
 /* A fresh inline-cache site id, one per emitted site.
@@ -2081,8 +2192,9 @@ mono_wasm_jit_prof_predict_alt (gpointer caller_ptr, MonoMethod *base, MonoVTabl
 	mono_memory_barrier ();
 	nids2 = s->nids; total2 = s->total;
 	/* nids only grows and total only grows; a change means the set moved under us. Refusing is free --
-	 * the site keeps its IC and the next emission sees a settled record. */
-	if (nids1 != nids2 || total1 != total2 || !best_id || !best_t || !total1)
+	 * the site keeps its IC and the next emission sees a settled record. (PROF_V2 & 2: an odd nids above
+	 * WJ_PROF_WAYS is a replacement in flight.) */
+	if (nids1 != nids2 || !WJ_PROF_NIDS_STABLE (nids1) || total1 != total2 || !best_id || !best_t || !total1)
 		return FALSE;
 	if (!wj_pred_verify (caller, base, (MonoVTable *) best_id, best_t, 3))
 		return FALSE;
@@ -2134,7 +2246,7 @@ mono_wasm_jit_prof_targets (gpointer caller_ptr, MonoMethod *base, MonoMethod **
 	}
 	mono_memory_barrier ();
 	nids2 = s->nids; total2 = s->total;
-	if (nids1 != nids2 || total1 != total2 || !total1)
+	if (nids1 != nids2 || !WJ_PROF_NIDS_STABLE (nids1) || total1 != total2 || !total1)
 		return 0;
 	*out_total = total1;
 	return n;
@@ -2166,15 +2278,25 @@ mono_wasm_jit_img_fill_profiles (gpointer caller_ptr)
 			if (slot < 0)
 				continue;
 			for (k = 0; k < s->nids && k < WJ_PROF_WAYS; ++k) {
-				MonoMethod *t = s->id_targets [k];
+				/* PROF_V2 & 2: read the pair under the nids sequence number (a recycled entry changes in place) */
+				guint32 sq1 = s->nids, sq2;
+				gpointer kid;
+				MonoMethod *t;
 				InterpMethod *tim;
-				if (!s->ids [k] || !t || !wj_method_usable_profile (t))
+				mono_memory_barrier ();
+				kid = s->ids [k];
+				t = s->id_targets [k];
+				mono_memory_barrier ();
+				sq2 = s->nids;
+				if (!WJ_PROF_NIDS_STABLE (sq1) || (sq1 != sq2 && (sq1 >= WJ_PROF_WAYS || sq2 > WJ_PROF_WAYS)))
+					continue;
+				if (!kid || !t || !wj_method_usable_profile (t))
 					continue;
 				if (m_class_is_valuetype (t->klass))
 					continue;   /* the JIT reaches a valuetype override through its unbox wrapper, not this f-slot */
 				tim = mono_interp_peek_imethod (t);
 				if (tim && tim->wasm_jit_fslot > 0)
-					mono_wasm_jit_img_fill ((MonoVTable *) s->ids [k], slot, tim->wasm_jit_fslot);
+					mono_wasm_jit_img_fill ((MonoVTable *) kid, slot, tim->wasm_jit_fslot);
 			}
 		}
 	}
@@ -2295,6 +2417,7 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 			guint32 k, nids1 = s->nids, best_c = 0, nids2, total2b;
 			gpointer best_id = NULL;
 			MonoMethod *best_t = NULL;
+			mono_memory_barrier ();   /* the sequence read before the scan (PROF_V2 & 2) */
 			for (k = 0; k < nids1 && k < WJ_PROF_WAYS; ++k) {
 				gpointer id = s->ids [k];
 				MonoMethod *t = s->id_targets [k];
@@ -2308,7 +2431,7 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 			}
 			mono_memory_barrier ();
 			nids2 = s->nids; total2b = s->total;
-			if (nids1 != nids2 || total1 != total2b) {
+			if (nids1 != nids2 || !WJ_PROF_NIDS_STABLE (nids1) || total1 != total2b) {
 				if (out_why) *out_why = WJ_PRED_TORN;
 				return FALSE;
 			}
@@ -2338,11 +2461,19 @@ mono_wasm_jit_prof_predict (gpointer caller_ptr, MonoMethod *base, MonoVTable **
 		if (mono_wasm_jit_prof_serial && id1) {
 			guint32 k, nids = s->nids;
 			MonoMethod *t = NULL;
+			mono_memory_barrier ();
 			for (k = 0; k < nids && k < WJ_PROF_WAYS; ++k)
 				if (s->ids [k] == id1) {
 					t = s->id_targets [k];
 					break;
 				}
+			/* PROF_V2 & 2: the entry may have been recycled under the scan. Below WJ_PROF_WAYS the set only grows by
+			 * appends, which leave existing entries alone: no refusal there, as before the knob. */
+			mono_memory_barrier ();
+			if (!WJ_PROF_NIDS_STABLE (nids) || (s->nids != nids && (nids >= WJ_PROF_WAYS || s->nids > WJ_PROF_WAYS))) {
+				if (out_why) *out_why = WJ_PRED_TORN;
+				return FALSE;
+			}
 			target1 = t;
 		}
 	}
@@ -2458,7 +2589,7 @@ mono_wasm_jit_prof_predict_method (gpointer caller_ptr, MonoMethod *base, MonoVT
 		return FALSE;
 	n1 = s->nids; total1 = s->total;
 	mono_memory_barrier ();
-	if (s->ids_overflow || n1 == 0 || total1 < 8)
+	if (s->ids_overflow || n1 == 0 || !WJ_PROF_NIDS_STABLE (n1) || total1 < 8)
 		return FALSE;
 	for (k = 0; k < n1 && k < WJ_PROF_WAYS; ++k) {
 		gpointer id = s->ids [k];
@@ -2499,7 +2630,7 @@ mono_wasm_jit_prof_predict_second (gpointer caller_ptr, MonoMethod *base, MonoMe
 		return FALSE;
 	n1 = s->nids; total1 = s->total;
 	mono_memory_barrier ();
-	if (s->ids_overflow || n1 < 2 || !total1)
+	if (s->ids_overflow || n1 < 2 || !WJ_PROF_NIDS_STABLE (n1) || !total1)
 		return FALSE;
 	for (k = 0; k < n1 && k < WJ_PROF_WAYS; ++k) {
 		MonoMethod *t = s->id_targets [k];
@@ -2528,6 +2659,74 @@ mono_wasm_jit_prof_predict_second (gpointer caller_ptr, MonoMethod *base, MonoMe
 	*out_vt = (MonoVTable *) best_vt;
 	*out_target = best_t;
 	*out_pct = (guint32) MIN (100, (guint64) best_sum * 100 / total1);
+	return TRUE;
+}
+
+/* MONO_WASM_JIT_GI_SHARE (knob comment in mini-wasm.c): tier 2's guarded-inline share bar. The top TARGET (by_target:
+ * summed over the receivers resolving to it, for a method-identity guard, with its most frequent receiver as the guard's
+ * cheap first test) or the top RECEIVER, accepted when the one-sided 95% Wilson lower bound of its share of `total` is at
+ * least lb_pct, over at least min_n observations. Not refused on an overflowed set, unlike predict_second: `total` counts
+ * every observation, tracked or not, so the share is already a lower bound. *out_verdict: 0 predicted, 1 no record or
+ * torn, 2 cold (< min_n), 3 under the bar. Pairs are read under the nids sequence number and verified (src 7). */
+gboolean
+mono_wasm_jit_prof_predict_share (gpointer caller_ptr, MonoMethod *base, gboolean by_target, int min_n, int lb_pct,
+	MonoVTable **out_vt, MonoMethod **out_target, guint32 *out_samples, int *out_verdict)
+{
+	WjProfSite *s = (caller_ptr && base) ? wj_prof_site ((InterpMethod *) caller_ptr, base, WJ_SITE_VIRTUAL, FALSE) : NULL;
+	guint32 k, j, n1, n2, total1, total2, best_sum = 0, best_vc = 0;
+	MonoMethod *best_t = NULL;
+	gpointer best_vt = NULL;
+	double n, p, z = 1.6448536269514722, z2, lb;
+
+	*out_verdict = 1;
+	if (!s || !out_vt || !out_target)
+		return FALSE;
+	n1 = s->nids; total1 = s->total;
+	mono_memory_barrier ();
+	if (n1 == 0 || !WJ_PROF_NIDS_STABLE (n1) || !total1)
+		return FALSE;
+	if (total1 < (guint32) min_n) {
+		*out_verdict = 2;
+		return FALSE;
+	}
+	for (k = 0; k < n1 && k < WJ_PROF_WAYS; ++k) {
+		MonoMethod *t = s->id_targets [k];
+		guint32 sum = 0, vc = 0;
+		gpointer vt = NULL;
+		if (!t || !s->ids [k])
+			continue;
+		if (by_target) {
+			for (j = 0; j < n1 && j < WJ_PROF_WAYS; ++j)
+				if (s->id_targets [j] == t) {
+					sum += s->id_counts [j];
+					if (s->id_counts [j] > vc) { vc = s->id_counts [j]; vt = s->ids [j]; }
+				}
+		} else {
+			sum = vc = s->id_counts [k];
+			vt = s->ids [k];
+		}
+		if (sum > best_sum && G_LIKELY (wj_method_usable_profile (t))) { best_sum = sum; best_t = t; best_vt = vt; best_vc = vc; }
+	}
+	mono_memory_barrier ();
+	n2 = s->nids; total2 = s->total;
+	if (n1 != n2 || total1 != total2 || !best_t || !best_vt || !best_vc)
+		return FALSE;
+	/* counts are racy against total by design: a share over 1 is read as 1 */
+	n = (double) total1;
+	p = MIN (1.0, (double) best_sum / n);
+	z2 = z * z;
+	lb = (p + z2 / (2 * n) - z * sqrt (p * (1 - p) / n + z2 / (4 * n * n))) / (1 + z2 / n);
+	if (lb * 100.0 < (double) lb_pct) {
+		*out_verdict = 3;
+		return FALSE;
+	}
+	if (!wj_pred_verify ((InterpMethod *) caller_ptr, base, (MonoVTable *) best_vt, best_t, 7))
+		return FALSE;
+	*out_vt = (MonoVTable *) best_vt;
+	*out_target = best_t;
+	if (out_samples)
+		*out_samples = total1;
+	*out_verdict = 0;
 	return TRUE;
 }
 
@@ -3430,26 +3629,14 @@ mono_wasm_jit_hook_publish (int desc_id, MonoMethod *m, InterpMethod *im)
  * class-virtual slot, or the class's offset for a non-generic interface); anything else is recorded unresolved. No
  * allocation beyond the record's own, no managed code, no lock. */
 static guint32 wj_prof_sampled, wj_prof_sampled_unresolved;
-void mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt);
-void
-mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt)
+
+/* The override a receiver of class `k` runs for `base`, read off the class the way get_virtual_method does for the plain
+ * cases (a class-virtual slot, or the class's offset for a non-generic interface); NULL for anything else. No managed
+ * code, no lock: callable from a helper emitted code calls. */
+static MonoMethod *
+wj_prof_resolve_target (MonoMethod *base, MonoClass *k)
 {
-	WjVcallSite *site;
-	WjProfSite *s;
-	MonoMethod *base, *t = NULL;
-	MonoClass *k;
-	if (!ic || !vt || !(k = vt->klass))
-		return;
-	site = wj_vcall_site (ic);
-	if (!site->caller_im || !(base = site->base))
-		return;
-	s = site->prof;
-	if (G_UNLIKELY (!s)) {
-		s = wj_prof_site (site->caller_im, base, WJ_SITE_VIRTUAL, TRUE);
-		if (!s)
-			return;
-		site->prof = s;
-	}
+	MonoMethod *t = NULL;
 	if (!base->is_inflated && !base->is_generic && base->slot >= 0 && base->klass && m_class_get_vtable (k) &&
 	    !mono_class_is_ginst (k) && !m_class_get_rank (k)) {
 		int slot = -1;
@@ -3469,10 +3656,151 @@ mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt)
 				t = NULL;
 		}
 	}
+	return t;
+}
+
+/* The record a JIT site's observations go to (the compiled method's own, memoised in WjVcallSite.prof), or NULL. */
+static WjProfSite *
+wj_vcall_site_prof (WjVcallSite *site)
+{
+	WjProfSite *s;
+	if (!site->caller_im || !site->base)
+		return NULL;
+	s = site->prof;
+	if (G_UNLIKELY (!s)) {
+		s = wj_prof_site (site->caller_im, site->base, WJ_SITE_VIRTUAL, TRUE);
+		if (s)
+			site->prof = s;
+	}
+	return s;
+}
+
+void mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt);
+void
+mono_wasm_jit_prof_sample_site (gpointer ic, MonoVTable *vt)
+{
+	WjVcallSite *site;
+	WjProfSite *s;
+	MonoMethod *t;
+	if (!ic || !vt || !vt->klass)
+		return;
+	site = wj_vcall_site (ic);
+	if (!(s = wj_vcall_site_prof (site)))
+		return;
+	t = wj_prof_resolve_target (site->base, vt->klass);
 	wj_prof_sampled++;
 	if (!t)
 		wj_prof_sampled_unresolved++;
-	wj_prof_record_at (s, WJ_SITE_VIRTUAL, vt, t, TRUE);
+	wj_prof_record_at (s, WJ_SITE_VIRTUAL, vt, t, WJ_OBS_SAMPLE);
+}
+
+/* MONO_WASM_JIT_PROF_V2 & 4 (knob comment in mini-wasm.c): is the record `s` contradicted by its fallback samples? The
+ * receiver taking the most of them, when it takes at least half and the record (as compiled from) held it under 10% of
+ * its observations, is a phase change the record cannot have seen -- profacc's dead arms (findings note 2026-11-22).
+ * Then the record is REFOLDED: its shares become the fallback histogram, so the next compile predicts what the guard has
+ * been missing; the receiver it guarded is left to the inline cache (the evidence says nothing about how often it still
+ * hits). Inside the append section, which also makes the fold one-shot. Returns TRUE if it folded. */
+static gboolean
+wj_prof_repair_fold (WjProfSite *s)
+{
+	guint32 k, n, best = WJ_PROF_WAYS, best_c = 0, misses, total, share;
+	if (!wj_prof_append_enter ())
+		return FALSE;
+	if (s->repaired) {
+		wj_prof_append_leave ();
+		return FALSE;
+	}
+	n = MIN ((guint32) s->nids, (guint32) WJ_PROF_WAYS);
+	misses = s->misses;
+	total = s->total;
+	for (k = 0; k < n; ++k)
+		if (s->ids [k] && s->id_targets [k] && s->miss_counts [k] > best_c) {
+			best_c = s->miss_counts [k];
+			best = k;
+		}
+	share = (best < WJ_PROF_WAYS && total) ? (guint32) ((guint64) s->id_counts [best] * 100 / total) : 0;
+	if (best >= WJ_PROF_WAYS || !misses || best_c * 2 < misses || share >= 10 || s->ids [best] == s->identity) {
+		wj_prof_append_leave ();
+		return FALSE;
+	}
+	/* Counts only: every pair stays where it is, so no reader can be handed a torn one. A predictor reading across the
+	 * fold sees `total` change and refuses (a coincidentally equal total mixes counts, never pairs). */
+	for (k = 0; k < n; ++k)
+		s->id_counts [k] = s->miss_counts [k];
+	s->identity = s->ids [best];
+	s->target = s->id_targets [best];
+	s->margin = best_c * 2 - misses;
+	s->repaired = 1;
+	mono_memory_barrier ();
+	s->total = misses;
+	wj_prof_append_leave ();
+	return TRUE;
+}
+
+/* MONO_WASM_JIT_PROF_V2 & 4: one sampled call a tier-2 guard missed, (i32 the site's IC cell, i32 the receiver's vtable,
+ * i32 the probe's countdown word)->void, from the fallback's cold path every MONO_WASM_JIT_PROF_FB_PERIOD-th time. The
+ * PIC behind the guard cannot see these (it answers a repeated receiver without a miss), the counter ahead of it does.
+ * The first sample of a record clears its miss histogram (bit 1 filled it with tier 1's IC misses), so a fold reads what
+ * the tier-2 guards missed. Every MONO_WASM_JIT_PROF_REPAIR-th sample asks wj_prof_repair_fold; a fold queues the method
+ * for one re-emission (wasm_jit_repair = 1, set on the canonical and the current generation before the enqueue, which
+ * the drain follows and lets through without MONO_WASM_JIT_REEMIT, on its own cap). A probe whose site has nothing
+ * left to decide -- folded, its method's repair taken, the sample count saturated, past MONO_WASM_JIT_T2_UNTIL_MS --
+ * is PARKED: its countdown word is set out of reach, so the cold path pays only the countdown from then on. */
+void mono_wasm_jit_prof_fallback_site (gpointer ic, MonoVTable *vt, gint32 *word);
+void
+mono_wasm_jit_prof_fallback_site (gpointer ic, MonoVTable *vt, gint32 *word)
+{
+	extern int mono_wasm_jit_prof_repair, mono_wasm_jit_prof_repair_max, mono_wasm_jit_t2_until_ms;
+	extern gint64 mono_wasm_jit_start_ms;
+	extern gint64 mono_msec_ticks (void);
+	WjVcallSite *site;
+	WjProfSite *s;
+	InterpMethod *cim, *cur, *dim;
+	guint32 k;
+	if (!ic || !vt || !vt->klass)
+		return;
+	site = wj_vcall_site (ic);
+	cim = site->caller_im;
+	if (!cim || !(s = wj_vcall_site_prof (site)))
+		goto park;
+	cur = interp_imethod_current (cim, TRUE);
+	/* MONO_WASM_JIT_T2_UNTIL_MS settles tier 2 before a timing window; a repair is a tier-2 compile and keeps to it */
+	if (s->repaired || s->fb_samples >= G_MAXUINT16 || cim->wasm_jit_repair || cur->wasm_jit_repair ||
+	    (mono_wasm_jit_t2_until_ms > 0 && mono_msec_ticks () - mono_wasm_jit_start_ms > mono_wasm_jit_t2_until_ms))
+		goto park;
+	if (s->fb_samples == 0) {
+		for (k = 0; k < WJ_PROF_WAYS; ++k)
+			s->miss_counts [k] = 0;   /* counts only, racy by design: no pair moves */
+		s->misses = 0;
+	}
+	mono_wasm_jit_counters [WJC_PROF_FB_SAMPLES]++;
+	wj_prof_record_at (s, WJ_SITE_VIRTUAL, vt, wj_prof_resolve_target (site->base, vt->klass), WJ_OBS_FALLBACK);
+	s->fb_samples++;
+	if ((s->fb_samples % (guint32) mono_wasm_jit_prof_repair) != 0 || !wj_prof_repair_fold (s))
+		return;
+	mono_wasm_jit_counters [WJC_PROF_REPAIR_FOLDED]++;
+	dim = cim->wasm_jit_desc > 0 ? cim : cur;
+	if (dim->wasm_jit_desc <= 0 || dim->wasm_jit_fslot <= 0 ||
+	    mono_wasm_jit_counters [WJC_PROF_REPAIR_QUEUED] >= (gint64) mono_wasm_jit_prof_repair_max) {
+		mono_wasm_jit_counters [WJC_PROF_REPAIR_SKIPPED]++;
+		goto park;
+	}
+	/* before the enqueue: a drainer on another worker can pop it at once (plan v3 review) */
+	cim->wasm_jit_repair = 1;
+	cur->wasm_jit_repair = 1;
+	mono_memory_barrier ();
+	if (wj_reemit_enqueue (dim->wasm_jit_desc, FALSE)) {
+		mono_wasm_jit_counters [WJC_PROF_REPAIR_QUEUED]++;
+	} else {
+		cim->wasm_jit_repair = 0;
+		cur->wasm_jit_repair = 0;
+		mono_wasm_jit_counters [WJC_PROF_REPAIR_SKIPPED]++;
+	}
+park:
+	if (word && *word != G_MAXINT32) {
+		*word = G_MAXINT32;
+		mono_wasm_jit_counters [WJC_PROF_FB_PARKED]++;
+	}
 }
 
 void mono_wasm_jit_prof_sample_stats (guint32 *sampled, guint32 *unresolved, guint32 *decays);
@@ -3532,7 +3860,7 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 					mono_wasm_jit_count (WJC_PD_MISS_DIFF_TGT);
 			}
 			if (ps)
-				wj_prof_record_at (ps, WJ_SITE_VIRTUAL, vt, target, TRUE);
+				wj_prof_record_at (ps, WJ_SITE_VIRTUAL, vt, target, WJ_OBS_MISS);
 			/* G: a miss at a site of an image member fills the receiver class's index entry for the site's slot */
 			{ extern int mono_wasm_jit_img_dispatch, mono_wasm_jit_img_on (void);
 			  if (G_UNLIKELY (mono_wasm_jit_img_dispatch) && fslot > 0 && mono_wasm_jit_img_on ()) {
@@ -4555,6 +4883,14 @@ wj_reemit_drain_one (void)
 	 * the registry may still name an older one. Follow first; for anything else this is the same object. */
 	if (im && mono_wasm_jit_t2 && interp_imethod_current (im, TRUE)->wasm_jit_t2_want)
 		im = interp_imethod_current (im, TRUE);
+	/* MONO_WASM_JIT_PROF_V2 & 4: a repair as well (the same IL, like tier 2), carrying its flag to the current generation */
+	if (im) {
+		InterpMethod *rcur = interp_imethod_current (im, TRUE);
+		if (rcur != im && (im->wasm_jit_repair == 1 || rcur->wasm_jit_repair == 1)) {
+			rcur->wasm_jit_repair = 1;
+			im = rcur;
+		}
+	}
 	/* H3: a body swap's request too. Interpreter tier-up does not copy `wasm_jit_reemit_required` and the registry can
 	 * name the untiered compilation, which the refusal below then dropped -- and with it the swap's republication, so
 	 * every worker kept the previous body in its table. Follow, carrying the request. */
@@ -4585,7 +4921,8 @@ wj_reemit_drain_one (void)
 			mono_wasm_jit_counters [WJC_REEMIT_REQUIRED_DROPPED]++; \
 		} \
 	} while (0)
-	if (!mono_wasm_jit_reemit && !im->wasm_jit_reemit_required && !im->wasm_jit_t2_want)
+	/* MONO_WASM_JIT_PROF_V2 & 4: a repair (wasm_jit_repair == 1) is let through without MONO_WASM_JIT_REEMIT */
+	if (!mono_wasm_jit_reemit && !im->wasm_jit_reemit_required && !im->wasm_jit_t2_want && im->wasm_jit_repair != 1)
 		goto out;
 	/* PUBLICATION IS GONE, SO COMPILING IS POINTLESS. The rendezvous log is finite and its exhaustion is
 	 * a latch, not a transient: past that point every publication returns 0, and a broker that keeps
@@ -4598,7 +4935,8 @@ wj_reemit_drain_one (void)
 	 * dropped because profile-guided recompilation exhausted its allowance. */
 	/* Tier 2 has its own cap (mono_wasm_jit_t2_sample stops requesting at MONO_WASM_JIT_T2_MAX); the optional-reemit
 	 * budget is already consumed by mandatory relinks (~600/run, R269), which count toward it. */
-	if (!im->wasm_jit_reemit_required && !im->wasm_jit_t2_want &&
+	/* A repair has its own cap (MONO_WASM_JIT_PROF_REPAIR_MAX, applied when it was queued). */
+	if (!im->wasm_jit_reemit_required && !im->wasm_jit_t2_want && im->wasm_jit_repair != 1 &&
 	    mono_wasm_jit_counters [WJC_REEMIT_COMPILED] >= (gint64) mono_wasm_jit_reemit_max) {
 		mono_wasm_jit_counters [WJC_REEMIT_CAPPED]++;
 		goto out;
@@ -4610,7 +4948,9 @@ wj_reemit_drain_one (void)
 	/* R316: a tier-2 request is the SAME IL, so an interpreter-tiered (optimized) canonical imethod is fine -- the
 	 * refusal exists for a body swap to DIFFERENT IL. Non-canonical ones are still refused. */
 	/* H3: a body swap's re-emission is the same IL as the canonical (interpreter-optimized) compilation, as tier 2 is. */
-	if ((im->optimized && !im->wasm_jit_t2_want && !im->wasm_jit_reemit_required) || im->optimized_imethod || im->retired) {
+	/* ... and so is a repair (MONO_WASM_JIT_PROF_V2 & 4: the same IL, recompiled with a refolded profile) */
+	if ((im->optimized && !im->wasm_jit_t2_want && !im->wasm_jit_reemit_required && im->wasm_jit_repair != 1) ||
+	    im->optimized_imethod || im->retired) {
 		mono_wasm_jit_counters [WJC_REEMIT_REFUSED]++;
 		if (im->wasm_jit_t2_want) {
 			im->wasm_jit_t2_want = 0;
@@ -4754,6 +5094,10 @@ wj_reemit_drain_one (void)
 	 * a semantic replacement is a different feature that happens to share this broker, and consuming the
 	 * one-shot on its behalf silently disqualifies the method from ever being re-emitted with a matured
 	 * profile (it reports WJC_REEMIT_METHOD_DONE forever after). Different question, different flag. */
+	if (im->wasm_jit_repair == 1) {
+		mono_wasm_jit_counters [WJC_PROF_REPAIR_COMPILED]++;
+		im->wasm_jit_repair = 2;
+	}
 	if (!im->wasm_jit_reemit_required)
 		im->wasm_jit_reemitted = 2;
 	if (res.f_slot != old_f)
@@ -14292,7 +14636,7 @@ main_loop:
 #if HOST_BROWSER
 			if (G_UNLIKELY (wj_prof_base != NULL))
 				wj_prof_record (frame->imethod, wj_prof_base, WJ_SITE_VIRTUAL, this_arg->vtable,
-					cmethod->method, FALSE);
+					cmethod->method, WJ_OBS_INTERP);
 #endif
 			if (m_class_is_valuetype (cmethod->method->klass)) {
 				/* unbox */
