@@ -1638,15 +1638,13 @@ wj_b4_hot (int desc, gboolean take)
 
 static WjB4Group *wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nest, guint64 *out_total,
                                        guint64 *out_inside, gboolean take, guint64 **out_hot, WjB4Dup *dup);
-/* MONO_WASM_JIT_B4_RESIDUE: the last partition's residue groups and their members (the planner's census) */
-static gint32 wj_b4_res_groups, wj_b4_res_members;
 
 static WjB4Group *
 wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nest, guint64 *out_total, guint64 *out_inside,
                  gboolean take, guint64 **out_hot, WjB4Dup *dup)
 {
 	extern int mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes, mono_wasm_jit_b4_anchor, mono_wasm_jit_b4_hot;
-	extern int mono_wasm_jit_b4_seed, mono_wasm_jit_b4_merge, mono_wasm_jit_b4_residue;
+	extern int mono_wasm_jit_b4_seed, mono_wasm_jit_b4_merge;
 	GArray *edges;
 	guint8 *fz;
 	if (mono_wasm_jit_b4_hot > 0)
@@ -1790,17 +1788,15 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 		}
 	}
 	/* Each group's HEAT: its members' tier-2-body samples since the previous plan (R446). Groups are ordered by heat (a
-	 * group nobody ran since then has none and is not listed), the internal weight only breaking ties. h1: each
-	 * descriptor's own (B4_RESIDUE reads the singletons'; read for them only when it is on or the plan takes). */
-	gint32 *h1 = g_new0 (gint32, n + 1);
+	 * group nobody ran since then has none and is not listed), the internal weight only breaking ties. */
 	{
 		guint64 *heat = g_new0 (guint64, n + 1);
 		for (i = 1; i <= n; ++i) {
 			gint32 r = wj_b4_find (par, i);
-			if (sz [r] >= 2 || take || mono_wasm_jit_b4_residue > 1)
-				h1 [i] = wj_b4_hot (i, take);
 			if (sz [r] >= 2)
-				heat [r] += (guint64) h1 [i];
+				heat [r] += (guint64) wj_b4_hot (i, take);
+			else if (take)
+				(void) wj_b4_hot (i, TRUE);
 		}
 		slot = g_new (gint32, n + 1);
 		for (i = 0; i <= n; ++i) slot [i] = -1;
@@ -1826,51 +1822,6 @@ wj_b4_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out_nes
 		if (slot [r] >= 0)
 			groups [slot [r]].desc [groups [slot [r]].n++] = i;
 	}
-	/* MONO_WASM_JIT_B4_RESIDUE (knob comment in mini-wasm.c): the live bodies no group took -- singletons, edge-less
-	 * tier-1 bodies -- that ran since the previous plan, packed in descriptor order (compile order: what started running
-	 * together) into groups of up to the knob's members and B4_BYTES, after the edge groups and under the same budgets.
-	 * A cold body then shares its instance (memory base, globals, its functions' code-pointer entries) with others. */
-	wj_b4_res_groups = wj_b4_res_members = 0;
-	if (mono_wasm_jit_b4_residue > 1) {
-		int rcap = MIN (mono_wasm_jit_b4_residue, WJ_BATCH_MAX), rn = 0, rbytes = 0;
-		gint32 *rm = g_new (gint32, rcap);
-		guint64 rheat = 0;
-		for (i = 1; i <= n + 1; ++i) {
-			int b = 0;
-			gboolean cand = FALSE;
-			if (i <= n) {
-				gint32 r = wj_b4_find (par, i);
-				WjRegEntry *re = wj_reg_at (i - 1);
-				if (slot [r] < 0 && !fz [r] && h1 [i] > 0 && re && !re->batch && wj_entry_body (re) && re->e > 0 && re->f > 0 &&
-				    wj_desc_for_fslot (re->f) == i) {
-					b = wj_b4_size (re);
-					cand = b > 0 && b <= mono_wasm_jit_b4_anchor;
-				}
-			}
-			/* close the open group at the end, or when this candidate does not fit in it */
-			if (i > n || (cand && (rn >= rcap || (rn > 0 && rbytes + b > mono_wasm_jit_b4_bytes)))) {
-				if (rn >= 2) {
-					groups = g_renew (WjB4Group, groups, ngroups + 1);
-					*out_hot = g_renew (guint64, *out_hot, ngroups + 1);
-					groups [ngroups].n = rn;
-					groups [ngroups].desc = g_new (gint32, rn);
-					memcpy (groups [ngroups].desc, rm, (gsize) rn * sizeof (gint32));
-					(*out_hot) [ngroups] = rheat;
-					ngroups++;
-					wj_b4_res_groups++;
-					wj_b4_res_members += rn;
-				}
-				rn = 0; rbytes = 0; rheat = 0;
-			}
-			if (cand) {
-				rm [rn++] = i;
-				rbytes += b;
-				rheat += (guint64) h1 [i];
-			}
-		}
-		g_free (rm);
-	}
-	g_free (h1);
 	*out_ngroups = ngroups; *out_ndesc = ndesc; *out_nedges = (int) edges->len; *out_nest = nest;
 	*out_total = total; *out_inside = inside;
 	g_free (par); g_free (sz); g_free (by); g_free (gw); g_free (slot); g_free (mx); g_free (fz);
@@ -1902,10 +1853,9 @@ mono_wasm_jit_b4_plan (void)
 	for (k = 0; k < ng; ++k)
 		nmem += g [k].n;
 	printf ("[wasm-jit b4] plan (dry run): bodies with edges=%d edges=%d (entry-estimated %d) weight=%llu | groups=%d "
-		"members=%d (residue groups %d members %d) internal=%.1f%% (cap %d members / %d body bytes) | framed=%lld/%d (group budget) refused=%lld published=%lld "
+		"members=%d internal=%.1f%% (cap %d members / %d body bytes) | framed=%lld/%d (group budget) refused=%lld published=%lld "
 		"plans=%lld merge=%d (heat-ranked, tier-1 edges %d, anchor %d, exact %d, delay %d s, seed %d, inherited %lld)\n", nd, ne, nest,
-		(unsigned long long) total, ng, nmem, (int) wj_b4_res_groups, (int) wj_b4_res_members,
-		total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max,
+		(unsigned long long) total, ng, nmem, total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max,
 		mono_wasm_jit_b4_bytes, (long long) mono_wasm_jit_counters [WJC_B4_FRAMED], mono_wasm_jit_b4_groups,
 		(long long) mono_wasm_jit_counters [WJC_B4_REFUSED], (long long) mono_wasm_jit_counters [WJC_B4_PUBLISHED],
 		(long long) mono_wasm_jit_counters [WJC_B4_PLANS], mono_wasm_jit_b4_merge, mono_wasm_jit_b4_t1, mono_wasm_jit_b4_anchor,
