@@ -107,6 +107,7 @@ int main (void) {
 		WasmLocalGroup groups [4];
 		WasmFuncType types [2];
 		WasmAsmMember m;
+		memset (&m, 0, sizeof (m));   /* every field the assembler reads (nglobals: module-defined globals) */
 		WasmOrigins *saved;
 		guint32 nfimp = rnd (4);
 

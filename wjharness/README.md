@@ -147,6 +147,7 @@ measured from the launcher's Play.
 | `sitewhy`, `inltree` | The call-site census by inline verdict (`--tier`, `--no-phantoms` drops FAST_TLS's non-calls); mono's verbose inline trees (`MONO_VERBOSE_METHOD=<root>;...`) with costs of refused subtrees |
 | `ledger/refresh` | The gap ledger: one mapping run -> ours ledger, optional HotSpot ledger, joined report (needs `D8`). `ledger.py --align` (on in refresh) recovers functions whose live layout V8's feedback inlining changed: d8's instructions are aligned to the live ones and the inserted callee code is tagged `v8:inlined-callee` |
 | `j2d/prep`, `j2d/wledger`, `j2d/hsledger`, `j2d/counts`, `j2d/report`, `cjledger`, `cjcapture`, `cjprobe` | jbox2d ledgers and counts per run; CheerpJ codegen capture and GC-contract probe |
+| `j2d/armsumm`, `j2d/mechsumm` | per-arm mean / range of a batch's counts against `base`; a census run's image-dispatch outcomes and calls a tick into the plan's targeted helpers |
 | `native/buckets`, `join`, `split`, `servertid`, `natstat`, `natcensus` | Per-bucket instructions against native's whole frame; per-method join on Java names; the server tid **by the symbols it ran** (both busy threads are `DedicatedWorker`). `--tid`/`--thread` explicitly, always |
 | `boot/bootattr`, `stages`, `critpath`, `segs`, `trend`, `natboot` | Boot attribution by anchor, stages, the client thread's critical path, HotSpot's boot reference |
 

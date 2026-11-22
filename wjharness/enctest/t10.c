@@ -26,6 +26,7 @@ frame (int which, const char *fn, int nexport)
 	FILE *f;
 	int j;
 	memset (tA, 0, sizeof (tA)); memset (tB, 0, sizeof (tB)); memset (groups, 0, sizeof (groups));
+	memset (nm, 0, sizeof (nm));   /* every field the assembler reads, nglobals (module-defined globals) included */
 	for (j = 0; j < 4; ++j) { groups [j].type = WASM_I32; groups [j].count = 0; }
 	/* the callee's functype, shared by member A's call and member B's own signature */
 	if (which == 0) { tA [0].nparams = 1; tA [0].params [0] = WASM_I32; tA [0].ret = WASM_I32; }

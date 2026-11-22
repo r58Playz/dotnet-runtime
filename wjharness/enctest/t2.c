@@ -13,6 +13,7 @@ int main (void) {
 	for (iter = 0; iter < 300; ++iter) {
 		WasmModuleMember om [MAXM];
 		WasmAsmMember nm [MAXM];
+		memset (nm, 0, sizeof (nm));   /* every field the assembler reads (nglobals: module-defined globals) */
 		WasmValtype params [MAXM][WASM_FUNCTYPE_MAX_PARAMS];
 		WasmValtype rets [MAXM];
 		WasmFuncType extra [MAXM][16], types [MAXM][18];

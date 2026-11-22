@@ -20,6 +20,7 @@ int main (void) {
 		WasmFuncImport fimp [8];
 		WasmBuf fb, eb, a, b;
 		WasmAsmMember m;
+		memset (&m, 0, sizeof (m));   /* every field the assembler reads (nglobals: module-defined globals) */
 		guint32 nparams = rnd (WASM_FUNCTYPE_MAX_PARAMS + 1), nextra = rnd (24), nfimp = rnd (8);
 		guint32 i, j;
 		gboolean tbl = rnd (2), tag = rnd (2);

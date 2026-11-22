@@ -127,6 +127,7 @@ int main (void) {
 		WasmLocalGroup groups [MAXM][1];
 		WasmBuf raw_f [MAXM], raw_e [MAXM], ser_f [MAXM], ser_e [MAXM], grp;
 		WasmAsmMember am [MAXM];
+		memset (am, 0, sizeof (am));   /* every field the assembler reads (nglobals: module-defined globals) */
 		WasmRelocFix fix [MAXE + 1];
 		Ft dtypes [MAXTY];
 		guint32 tis [MAXE], negctl_member = negctl ? 1 + rnd (n - 1) : (guint32) -1;
@@ -213,6 +214,7 @@ int main (void) {
 		if (!negctl) for (i = 0; i < n; ++i) {
 			WasmBuf solo_f, solo_e, solo;
 			WasmAsmMember one;
+			memset (&one, 0, sizeof (one));   /* every field the assembler reads (nglobals: module-defined globals) */
 			Ft styp [MAXTY];
 			guint32 stis [MAXE], got;
 			wasm_buf_init (&solo_f); wasm_buf_init (&solo_e); wasm_buf_init (&solo);

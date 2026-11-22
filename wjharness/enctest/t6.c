@@ -76,6 +76,7 @@ int main (void) {
 		WasmLocalGroup groups [4];
 		WasmFuncType types [2];
 		WasmAsmMember m;
+		memset (&m, 0, sizeof (m));   /* every field the assembler reads (nglobals: module-defined globals) */
 		WasmFuncImport fimp [4];
 		guint32 nfimp = rnd (4), off = 8, hint_func = 0, hint_n = 0, code_seen = 0, hint_sec_seen = 0;
 		guint32 hint_offs [256]; guint8 hint_vals [256];
