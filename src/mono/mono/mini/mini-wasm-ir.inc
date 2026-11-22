@@ -4584,7 +4584,8 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
 		fix [k].idx = 0;
 		fix [k].guard = fix [k].guard_count = 0;
 		fix [k].in_group = n > 1;   /* MONO_WASM_JIT_SITE_COUNT: an indirect call from a group module counts apart */
-		fix [k].count_edge = n == 1;   /* MONO_WASM_JIT_B4_EXACT: edge counters only while the method is framed alone */
+		{ extern int mono_wasm_jit_b4_final;   /* MONO_WASM_JIT_B4_EXACT: edge counters only while the method is framed alone, */
+		  fix [k].count_edge = n == 1 && !mono_wasm_jit_b4_final; }   /* and not once B4_ONCE's plan is consumed */
 		switch ((WasmRelocKind) r->kind) {
 		case WASM_RELOC_TYPE_U:
 		case WASM_RELOC_TYPE_S:

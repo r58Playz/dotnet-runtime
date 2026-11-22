@@ -2170,6 +2170,8 @@ mono_wasm_jit_img_fill_profiles (gpointer caller_ptr)
 				InterpMethod *tim;
 				if (!s->ids [k] || !t || !wj_method_usable_profile (t))
 					continue;
+				if (m_class_is_valuetype (t->klass))
+					continue;   /* the JIT reaches a valuetype override through its unbox wrapper, not this f-slot */
 				tim = mono_interp_peek_imethod (t);
 				if (tim && tim->wasm_jit_fslot > 0)
 					mono_wasm_jit_img_fill ((MonoVTable *) s->ids [k], slot, tim->wasm_jit_fslot);
@@ -3140,6 +3142,13 @@ wj_t2_bytes_spent (void)
 {
 	extern int mono_wasm_jit_t2_bytes_budget;
 	extern gint64 mono_wasm_jit_t2_bytes;
+	extern int mono_wasm_jit_t2_until_ms;
+	extern gint64 mono_wasm_jit_start_ms;
+	extern gint64 mono_msec_ticks (void);
+	if (G_UNLIKELY (mono_wasm_jit_t2_until_ms > 0) && mono_msec_ticks () - mono_wasm_jit_start_ms > mono_wasm_jit_t2_until_ms) {
+		mono_wasm_jit_counters [WJC_T2_TOO_LATE]++;   /* MONO_WASM_JIT_T2_UNTIL_MS */
+		return TRUE;
+	}
 	if (G_LIKELY (mono_wasm_jit_t2_bytes_budget <= 0) || mono_wasm_jit_t2_bytes < ((gint64) mono_wasm_jit_t2_bytes_budget << 20))
 		return FALSE;
 	mono_wasm_jit_counters [WJC_T2_BYTES_CAPPED]++;
@@ -3530,7 +3539,8 @@ wj_vcall_pic_publish (gpointer ic, MonoVTable *vt, MonoMethod *target, gint32 fs
 				extern int mono_wasm_jit_img_member (int desc_id), mono_wasm_jit_mid_slot (MonoMethod *base);
 				extern int mono_wasm_jit_img_fill (MonoVTable *vt, int slot, int fslot);
 				int slot;
-				if (mono_wasm_jit_img_member (site->caller_im->wasm_jit_desc) > 0 && (slot = mono_wasm_jit_mid_slot (site->base)) >= 0)
+				if (target && !m_class_is_valuetype (target->klass) &&   /* a valuetype override goes through an unbox wrapper */
+				    mono_wasm_jit_img_member (site->caller_im->wasm_jit_desc) > 0 && (slot = mono_wasm_jit_mid_slot (site->base)) >= 0)
 					mono_wasm_jit_img_fill (vt, slot, fslot);
 			  } }
 		}
@@ -4218,10 +4228,11 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 	r.body_epoch = snap_epoch;
 	r.t2_refresh = -9;
 	if (reemit && r.e_slot > 0 && r.desc_id > 0) {
-		extern int mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len);
+		extern int mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len, gboolean allow_defer);
 		void *batch_bytes = NULL;
 		int batch_len = 0;
-		int br = mono_wasm_jit_refresh_batch (r.desc_id, &batch_bytes, &batch_len);
+		/* a body swap (reemit_required) is never deferred: a hook may be waiting on it (MONO_WASM_JIT_REFRAME_MS) */
+		int br = mono_wasm_jit_refresh_batch (r.desc_id, &batch_bytes, &batch_len, !im->wasm_jit_reemit_required);
 		r.t2_refresh = br;   /* R337 */
 		if (br == -2) {
 			/* MONO_WASM_JIT_REFRAME_MS: deferred to the group's next re-frame (mono_wasm_jit_refresh_batch). The new body is
@@ -4636,13 +4647,20 @@ wj_reemit_drain_one (void)
 	/* R316: one tier-2 attempt per method, whatever the outcome (a lost CAS keeps the request for the re-queue).
 	 * R327's retry of a BLOCKED attempt parked on its blockers went with the islands (R367): a tier-2 body's
 	 * uncompiled direct callees take pool slots, so no compile reports one. */
+	/* MONO_WASM_JIT_REFRAME_MS: a deferred re-frame (refresh_batch -2) compiled and registered the body; its group's next
+	 * re-frame installs it. Neither a tier-2 failure nor a re-emission failure. */
+	gboolean deferred = res.t2_refresh == -2;
 	if (im->wasm_jit_t2_want && r != WASM_JIT_COMPILE_BUSY) {
-		wj_t2_note (im, &res, r == WASM_JIT_COMPILE_JITTED);   /* R316d */
+		wj_t2_note (im, &res, r == WASM_JIT_COMPILE_JITTED || deferred);   /* R316d */
 		im->wasm_jit_t2_want = 0;
-		im->wasm_jit_tier = r == WASM_JIT_COMPILE_JITTED ? 2 : 3;
-		if (G_UNLIKELY (mono_wasm_jit_stats))
+		im->wasm_jit_tier = (r == WASM_JIT_COMPILE_JITTED || deferred) ? 2 : 3;
+		if (deferred)
+			mono_wasm_jit_counters [WJC_T2_REFRAME_DEFERRED]++;
+		else if (G_UNLIKELY (mono_wasm_jit_stats))
 			mono_wasm_jit_count (r == WASM_JIT_COMPILE_JITTED ? WJC_T2_COMPILED : WJC_T2_FAILED);
 	}
+	if (deferred)
+		goto out;
 	if (r == WASM_JIT_COMPILE_BUSY) {
 		/* R179 BUG #2: a lost CAS is not a verdict. Put it back -- but ON A BUDGET.
 		 *

@@ -105,6 +105,7 @@ mini_emit_class_check_inst (MonoCompile *cfg, int klass_reg, MonoClass *klass, M
 /* MONO_WASM_JIT_CLASS_RECORD (metadata/object.c, plan abstract-hatching-stearns B2). */
 extern int mono_wasm_class_record_bits (void);
 extern int mono_wasm_class_record_offset (void);
+extern gboolean mono_wasm_class_record_had_provisional_vtable (MonoClass *klass);
 static gboolean wj_cast_target_unfinished (MonoClass *klass);
 
 /* Bit 1: can the object's display decide a check against KLASS? A class of depth 1..8 (not an interface or array),
@@ -122,12 +123,38 @@ wj_display_ok (MonoCompile *cfg, MonoClass *klass, MonoInst *klass_inst)
 
 /* compare (display [idepth - 1] of the object whose vtable is VTABLE_REG, KLASS): the record is below the vtable, so the
  * negative part of the offset is an add (the wasm memarg offset is unsigned) */
+extern gint32 mono_wasm_jit_classrec_bad;
 static void
 wj_emit_display_compare (MonoCompile *cfg, int vtable_reg, MonoClass *klass)
 {
-	int rec = alloc_preg (cfg), disp = alloc_preg (cfg);
+	int rec = alloc_preg (cfg), disp = alloc_preg (cfg), d = m_class_get_idepth (klass);
 	MONO_EMIT_NEW_BIALU_IMM (cfg, OP_PADD_IMM, rec, vtable_reg, mono_wasm_class_record_offset ());
-	MONO_EMIT_NEW_LOAD_MEMBASE (cfg, disp, rec, (m_class_get_idepth (klass) - 1) * TARGET_SIZEOF_VOID_P);
+	MONO_EMIT_NEW_LOAD_MEMBASE (cfg, disp, rec, (d - 1) * TARGET_SIZEOF_VOID_P);
+	if (mono_wasm_class_record_bits () & 16) {
+		/* verify: the old answer -- vt->klass->idepth >= d && vt->klass->supertypes [d - 1] == klass -- against the
+		 * display's, branch-free (a supertypes read past the class's own table is masked by the depth test), every
+		 * disagreement added to mono_wasm_jit_classrec_bad (`[wasm-jit classrec] ... verify_bad=`, must read 0) */
+		int kr = alloc_preg (cfg), idep = alloc_ireg (cfg), st = alloc_preg (cfg), sty = alloc_preg (cfg);
+		int lt = alloc_ireg (cfg), deep = alloc_ireg (cfg), same = alloc_ireg (cfg), old_ok = alloc_ireg (cfg);
+		int dok = alloc_ireg (cfg), bad = alloc_ireg (cfg), a = alloc_preg (cfg), v = alloc_ireg (cfg);
+		MONO_EMIT_NEW_LOAD_MEMBASE (cfg, kr, vtable_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
+		MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADU2_MEMBASE, idep, kr, GINTPTR_TO_TMREG (m_class_offsetof_idepth ()));
+		MONO_EMIT_NEW_LOAD_MEMBASE (cfg, st, kr, GINTPTR_TO_TMREG (m_class_offsetof_supertypes ()));
+		MONO_EMIT_NEW_LOAD_MEMBASE (cfg, sty, st, (d - 1) * TARGET_SIZEOF_VOID_P);
+		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, idep, d);
+		MONO_EMIT_NEW_UNALU (cfg, OP_ICLT_UN, lt, -1);
+		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_IXOR_IMM, deep, lt, 1);
+		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, sty, (gsize) klass);
+		MONO_EMIT_NEW_UNALU (cfg, OP_ICEQ, same, -1);
+		MONO_EMIT_NEW_BIALU (cfg, OP_IAND, old_ok, deep, same);
+		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, disp, (gsize) klass);
+		MONO_EMIT_NEW_UNALU (cfg, OP_ICEQ, dok, -1);
+		MONO_EMIT_NEW_BIALU (cfg, OP_IXOR, bad, old_ok, dok);
+		MONO_EMIT_NEW_PCONST (cfg, a, (gpointer) &mono_wasm_jit_classrec_bad);
+		MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, v, a, 0);
+		MONO_EMIT_NEW_BIALU (cfg, OP_IADD, v, v, bad);
+		MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STOREI4_MEMBASE_REG, a, 0, v);
+	}
 	MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, disp, (gsize) klass);
 	mono_wasm_jit_counters [WJC_CLASSREC_DISPLAY_SITES]++;
 }
@@ -139,6 +166,8 @@ wj_sealed_vtable (MonoCompile *cfg, MonoClass *klass)
 	MonoVTable *vt;
 	if (!COMPILE_WASM (cfg) || !(mono_wasm_class_record_bits () & 2) || m_class_get_rank (klass) || wj_cast_target_unfinished (klass))
 		return NULL;
+	if (mono_wasm_class_record_had_provisional_vtable (klass))
+		return NULL;   /* it may have two live vtables (metadata/object.c) */
 	vt = mono_class_try_get_vtable (klass);
 	if (vt)
 		mono_wasm_jit_counters [WJC_CLASSREC_SEALED_SITES]++;
@@ -924,7 +953,11 @@ wj_cast_census_classify (MonoCompile *cfg, gboolean census)
 		MonoClass *klass = c->ins->klass;
 		int v = c->root, argi = (v >= 0 && v < nv && ndef [v] == 0) ? wj_cc_arg_index (cfg, v) : -1;
 		MonoInst *d = (v >= 0 && v < nv && ndef [v] == 1) ? def [v] : NULL;
-		gboolean single = d != NULL || argi >= 0;
+		MonoInst *vvar = (v >= 0 && v < nv) ? get_vreg_to_inst (cfg, v) : NULL;
+		/* a variable written through its address (ldloca / ldarga) or volatile (live into a handler) has writes ndef does
+		 * not see: never single-definition for DOMINATED (its static type still holds for STATIC) */
+		gboolean indirect = vvar && vvar != (MonoInst *) -1 && (vvar->flags & (MONO_INST_INDIRECT | MONO_INST_VOLATILE));
+		gboolean single = (d != NULL || argi >= 0) && !indirect;
 		MonoClass *src = NULL;
 		WjCastSite site_tmp, *s = &site_tmp;
 		MonoType *at = argi >= 0 ? wj_cc_arg_type (cfg, argi) : NULL;

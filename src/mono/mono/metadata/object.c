@@ -2173,7 +2173,9 @@ meta_arena_alloc0 (size_t size)
  *   1  a record below each vtable holding the class's first 8 supertypes (the "display"), which the wasm JIT's class
  *      casts compare in one load instead of vt->klass->supertypes[d] (type-checking.c);
  *   2  a cast to a sealed class compares the object's vtable with the class's runtime vtable (no record needed);
- *   8  the record only (memory measurement).
+ *   8  the record only (memory measurement);
+ *  16  verify: every display check also computes the old supertypes answer and counts disagreements
+ *      (mono_wasm_jit_classrec_bad, `[wasm-jit classrec] ... verify_bad=`, must read 0).
  * Layout: [record 48 B][IMT region padded to its full size for every class][MonoVTable][slots]: the record sits at
  * a fixed offset below the vtable (mono_wasm_class_record_offset), below anything AOT or JIT code reads (the IMT is
  * read at vt - MONO_IMT_SIZE.., the interpreter's below it), so no compiled layout moves. A class without interfaces
@@ -2187,6 +2189,7 @@ meta_arena_alloc0 (size_t size)
 static int class_record_bits = -1;
 static int class_record_offset;   /* the record's offset from the MonoVTable (negative), 0 until the first record */
 gint64 mono_wasm_class_record_bytes;
+gint32 mono_wasm_jit_classrec_bad;   /* bit 16's run-time disagreements between the display and the supertypes check */
 gint32 mono_wasm_class_record_changed;   /* refreshes that changed a display entry (a stale window, if a vtable was live) */
 
 int
@@ -2205,6 +2208,65 @@ int
 mono_wasm_class_record_offset (void)
 {
 	return class_record_offset;
+}
+
+/* Classes that had a runtime vtable while still an unfinished TypeBuilder (an IKVM shell). After CreateType an undersized
+ * one is dropped and replaced (sre.c typebuilder_invalidate_undersized_runtime_vtable) while its objects keep it, so such
+ * a class can have two live vtables, and a compile between CreateType's finish and the drop could bake the doomed one: a
+ * check must not compare an object's vtable with "the" class vtable for any of them (B2 bit 2). Keyed by the MonoClass
+ * pointer, never dereferenced; read under its own mutex. Never shrinks. */
+static GHashTable *class_record_replaced;
+static mono_mutex_t class_record_replaced_lock;
+static mono_lazy_init_t class_record_replaced_status = MONO_LAZY_INIT_STATUS_NOT_INITIALIZED;
+gint32 mono_wasm_class_record_replaced_n;
+void mono_wasm_class_record_fill (MonoVTable *vt);
+
+static void
+class_record_replaced_init_once (void)
+{
+	mono_os_mutex_init (&class_record_replaced_lock);
+	class_record_replaced = g_hash_table_new (NULL, NULL);
+}
+
+static void
+class_record_replaced_init (void)
+{
+	mono_lazy_initialize (&class_record_replaced_status, class_record_replaced_init_once);
+}
+
+static void
+class_record_note_provisional (MonoClass *klass)
+{
+	class_record_replaced_init ();
+	mono_os_mutex_lock (&class_record_replaced_lock);
+	if (!g_hash_table_contains (class_record_replaced, klass)) {
+		g_hash_table_add (class_record_replaced, klass);
+		mono_wasm_class_record_replaced_n++;
+	}
+	mono_os_mutex_unlock (&class_record_replaced_lock);
+}
+
+/* sre.c, before it drops KLASS's provisional runtime vtable OLD: OLD's record gets the final supertypes -- the class is
+ * finished, they no longer change, and OLD's objects stay live while mono_class_setup_supertypes refreshes only the
+ * class's current vtable. */
+void
+mono_wasm_class_record_vtable_replaced (MonoClass *klass, MonoVTable *old)
+{
+	mono_class_setup_supertypes (klass);
+	if (old)
+		mono_wasm_class_record_fill (old);
+	class_record_note_provisional (klass);
+}
+
+gboolean
+mono_wasm_class_record_had_provisional_vtable (MonoClass *klass)
+{
+	gboolean r;
+	class_record_replaced_init ();
+	mono_os_mutex_lock (&class_record_replaced_lock);
+	r = g_hash_table_contains (class_record_replaced, klass);
+	mono_os_mutex_unlock (&class_record_replaced_lock);
+	return r;
 }
 
 /* G: the address of VT's record's index-array pointer, or NULL without records */
@@ -2369,6 +2431,9 @@ mono_class_create_runtime_vtable (MonoClass *klass, MonoError *error)
 
 	size_t rec_pad = 0;
 #ifdef HOST_BROWSER
+	/* B2 bit 2: a vtable made for an unfinished TypeBuilder may later be replaced while its objects keep it */
+	if (image_is_dynamic (m_class_get_image (klass)) && !m_class_was_typebuilder (klass) && (mono_wasm_class_record_bits () & 2))
+		class_record_note_provisional (klass);
 	/* B1: the class record and the IMT region's padding below the vtable (see MONO_WASM_JIT_CLASS_RECORD above) */
 	if (mono_wasm_class_record_bits () & (1 | 8)) {
 		size_t imt_region = sizeof (gpointer) * MONO_IMT_SIZE * (use_interpreter ? 2 : 1);

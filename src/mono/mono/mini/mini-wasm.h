@@ -1566,6 +1566,9 @@ enum {
 	WJC_IMG_RT_NOARRAY,          /* ... fell through: the receiver's class has no index array */
 	WJC_IMG_RT_NOENTRY,          /* ... fell through: no entry for this vtable slot */
 	WJC_IMG_RT_NOTLIVE,          /* ... fell through: the entry's member no longer runs the image's code */
+	WJC_RV_DRAIN_IN_ADMIT,       /* rendezvous drains declined because this thread was inside an admission (re-entry) */
+	WJC_T2_REFRAME_DEFERRED,     /* tier-2 promotions whose re-frame was deferred (MONO_WASM_JIT_REFRAME_MS): tier 2, not failed */
+	WJC_T2_TOO_LATE,             /* MONO_WASM_JIT_T2_UNTIL_MS: tier-2 promotions refused past the cutoff */
 	WJC_MAX
 };
 

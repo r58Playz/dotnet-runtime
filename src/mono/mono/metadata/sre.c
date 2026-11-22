@@ -200,6 +200,12 @@ typebuilder_invalidate_undersized_runtime_vtable (MonoClass *klass)
 		int alloc_slots = mono_vtable_alloc_slots (vtable);
 		int current_size = klass->vtable_size;
 		if (alloc_slots >= 0 && current_size > alloc_slots) {
+#ifdef HOST_BROWSER
+			/* MONO_WASM_JIT_CLASS_RECORD: the provisional vtable's objects stay live; its record must hold the final
+			 * supertypes, and a sealed check must not assume one vtable for this class (object.c) */
+			extern void mono_wasm_class_record_vtable_replaced (MonoClass *klass, MonoVTable *old);
+			mono_wasm_class_record_vtable_replaced (klass, vtable);
+#endif
 			klass->runtime_vtable = NULL;
 		}
 	}

@@ -290,6 +290,14 @@ mono_wasm_jit_rendezvous_drain (void)
 		return;
 	if (wj_draining)
 		return;
+	/* NOT INSIDE AN ADMISSION. An instantiate inside the install walk leaves its GC-safe region through here
+	 * (WJ_JS_BLOCKING_END), and a nested admission would then reuse the outer one's walk generation
+	 * (MONO_WASM_JIT_ADMIT_WALK bit 4), taking descriptors the outer walk has stamped but not yet installed for
+	 * installed -- a caller could go live over a placeholder. The drain runs at this thread's next poll instead. */
+	if (wj_walk_epoch_timing || wj_walk_sp > 0 || wj_walk_rdepth > 0) {
+		mono_wasm_jit_counters [WJC_RV_DRAIN_IN_ADMIT]++;
+		return;
+	}
 	wj_draining = 1;
 again:
 	completed = wj_local_epoch;

@@ -1116,10 +1116,11 @@ wj_reinstall_batch_local (int desc_id)
 }
 
 /* Re-frame the complete batch currently containing desc_id after one member's retained body changed.
- * Returns 0 for a standalone descriptor, 1 on a successful batch refresh, and -1 for a transient failure.
+ * Returns 0 for a standalone descriptor, 1 on a successful batch refresh, -1 for a transient failure, and -2 when
+ * ALLOW_DEFER and MONO_WASM_JIT_REFRAME_MS defer the re-frame to the group's next one (mono_wasm_jit_b4_step).
  * The descriptor list is copied under the registry lock; framing/instantiation stays outside it. */
 int
-mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len)
+mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len, gboolean allow_defer)
 {
 	WjRegEntry *re;
 	int *descs = NULL, n = 0, ok;
@@ -1134,7 +1135,7 @@ mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len)
 		/* MONO_WASM_JIT_REFRAME_MS: a large group is re-framed at most once an interval, taking every deferred member */
 		extern int mono_wasm_jit_reframe_ms;
 		WjBatchDesc *b = re->batch;
-		if (mono_wasm_jit_reframe_ms > 0 && b->n >= WJ_REFRAME_MIN && mono_msec_ticks () - b->framed_ms < mono_wasm_jit_reframe_ms &&
+		if (allow_defer && mono_wasm_jit_reframe_ms > 0 && b->n >= WJ_REFRAME_MIN && mono_msec_ticks () - b->framed_ms < mono_wasm_jit_reframe_ms &&
 		    (b->reframe_due || wj_reframe_npend < WJ_REFRAME_PEND_MAX)) {
 			if (!b->reframe_due) {
 				b->reframe_due = 1;
@@ -1583,7 +1584,8 @@ wj_b4_grown (void)
 gint32
 mono_wasm_jit_b4_due (void)
 {
-	return wj_b4_ipend < wj_b4_npend || wj_b4_grown () || wj_reframe_due ();
+	extern int mono_wasm_jit_b4_final;
+	return wj_b4_ipend < wj_b4_npend || (!mono_wasm_jit_b4_final && wj_b4_grown ()) || wj_reframe_due ();
 }
 
 /* A member's own bytes. NOT re->len: batch_bind sets that to the whole GROUP module's length, so once a member is framed
@@ -2156,6 +2158,7 @@ mono_wasm_jit_b4_step (void)
 		for (q = 1; q < wj_reframe_npend; ++q)
 			wj_reframe_pend [q - 1] = wj_reframe_pend [q];
 		wj_reframe_npend--;
+		b->reframe_due = 0;   /* a failed re-frame below lets the next deferral queue it again */
 		wj_reg_read_enter ();
 		r0 = b->desc [0] > 0 ? wj_reg_at (b->desc [0] - 1) : NULL;
 		if (!r0 || r0->batch != b) {
@@ -2180,6 +2183,16 @@ mono_wasm_jit_b4_step (void)
 	}
 	if (wj_b4_delayed ())
 		return 0;
+	{ /* MONO_WASM_JIT_B4_ONCE: the first plan, consumed, is the last */
+	  extern int mono_wasm_jit_b4_once, mono_wasm_jit_b4_final;
+	  if (wj_b4_ipend >= wj_b4_npend && mono_wasm_jit_b4_once && mono_wasm_jit_counters [WJC_B4_PLANS] >= 1) {
+		if (!mono_wasm_jit_b4_final) {
+			mono_wasm_jit_b4_final = 1;
+			printf ("[wasm-jit b4] B4_ONCE: the plan is consumed (%lld groups framed); no further plan\n",
+				(long long) mono_wasm_jit_counters [WJC_B4_FRAMED]);
+		}
+		return 0;
+	  } }
 	if (wj_b4_ipend >= wj_b4_npend) {
 		int nd, ne, nest;
 		guint64 total, inside;

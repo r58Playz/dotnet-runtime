@@ -1416,6 +1416,9 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_newarr_inline, "MONO_WASM_JIT_NEWARR_INLINE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_img_dispatch, "MONO_WASM_JIT_IMG_DISPATCH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_reframe_ms, "MONO_WASM_JIT_REFRAME_MS", 0, 3600000)
+	WJ_T2_KNOB (mono_wasm_jit_b4_once, "MONO_WASM_JIT_B4_ONCE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_t2_until_ms, "MONO_WASM_JIT_T2_UNTIL_MS", 0, 3600000)
+	WJ_T2_KNOB (mono_wasm_jit_stackprobe, "MONO_WASM_JIT_STACKPROBE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_prof_share, "MONO_WASM_JIT_PROF_SHARE", 0, 1)
@@ -2018,6 +2021,15 @@ int mono_wasm_jit_img_dispatch = 0;
  * group once when the interval has passed (mono_wasm_jit_b4_step), taking every deferred member. 0 = re-frame at once,
  * as before. Shipped B4 groups are at most 16 members, which this never touches. */
 int mono_wasm_jit_reframe_ms = 60000;
+/* MONO_WASM_JIT_B4_ONCE=1: after the first B4 plan's groups are framed, no further plan (deferred re-frames still run), and
+ * modules assembled from then on carry no B4 edge counters (mono_wasm_jit_b4_final). A layout that keeps changing in a
+ * timing window measures the changes: between the window's edges a layout-only mctick run re-planned twice and framed 7
+ * more groups (2026-11-21 review of runs/2026-11-21-m lays-17). 0 = re-plan as before. */
+int mono_wasm_jit_b4_once = 0;
+int mono_wasm_jit_b4_final;   /* set when B4_ONCE's plan is consumed */
+/* MONO_WASM_JIT_T2_UNTIL_MS: no tier-2 promotion is requested later than this many ms after the JIT started (counted
+ * WJC_T2_TOO_LATE), so tier 2 is settled before a timing window; 0 = no cutoff. */
+int mono_wasm_jit_t2_until_ms = 0;
 gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,
