@@ -781,8 +781,12 @@ int mono_wasm_jit_inline_aggr_depth = 0;
 /* MONO_WASM_JIT_INLINE_COLD_CALL: a call site inside an IL block that ends in a throw is not inlined and is charged a flat
  * cost (method-to-ir.c wj_cold_call_site), under the per-compile policy only. R318 above discounts those blocks from the
  * SIZE gate; this keeps the COST gate and the inliner out of them. 2026-11-05: every traced cost refusal of the hot
- * block-access chain was exception-message code inlined into such a block (findings log). Census char 'T'. */
-int mono_wasm_jit_inline_cold_call = 0;
+ * block-access chain was exception-message code inlined into such a block (findings log). Census char 'T'.
+ * Alone on 262n Q60 (2026-11-17, n=3): +1.6% cycles, overlapping. Default since 2026-11-22 with GI_SHARE, which it lets
+ * inline the block-state chain, in the M1 set: 262n Q60 with GI_SHARE=70 + INLINE_COLD_CALL=1 + GI_COLD=1 + VOLATILE_LOAD=1 on the then
+ * defaults (2026-11-22, n=3 a side, disjoint): server-tick cycles 79.19 -> 73.88 M (-6.7%), instructions -2.8%, calls -9%
+ * (findings note "plan v3 M1 + call profile v2 implemented"; not split by knob on 262n). */
+int mono_wasm_jit_inline_cold_call = 1;
 /* MONO_WASM_JIT_INLINE_BFI (R319): inline a method of a BeforeFieldInit class whose cctor has not run, without running it.
  * BeforeFieldInit only requires the cctor before a static FIELD access, and such an access inside the inlinee is still
  * guarded (method-to-ir's ldsfld path: a runtime init check, or INLINE_FAILURE "class init"). Shipped with the wave-1
@@ -1710,7 +1714,7 @@ int mono_wasm_jit_b4_ic = 0;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT
 /* MONO_WASM_JIT_VOLATILE_LOAD=1: a SEQ barrier followed (past null checks and constants) by a load mono flagged
  * MONO_INST_VOLATILE -- IKVM's Java volatile read, which it brackets as Thread.MemoryBarrier(); volatile. ldfld -- emits no
  * fence, and the load becomes a seq-cst wasm atomic load (a plain mov on x64). Only 1-, 2- and 4-byte loads at a naturally
- * aligned offset; others keep the fence. 0 (default) = the fence, as before.
+ * aligned offset; others keep the fence. 0 = the fence, as before.
  * The read-side fence is also the StoreLoad fence of any Java volatile store before it that has none of its own, and two
  * kinds do not: (a) IKVM merges a store's trailing barrier into the next barrier of the same straight-line IL
  * (CodeEmitter.RemoveRedundantMemoryBarriers) -- wj_vol_store_reaches keeps every fence a store reaches without an
@@ -1727,8 +1731,11 @@ int mono_wasm_jit_b4_ic = 0;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT
  * IKVM's EmitUnsafeVolatileSetImpl puts a barrier after its VolatileWrite* call (R1); the scan keeps the fence at a call
  * into C#, passes a wrapper or icall mono added, and stops only at a call into Java (R2, wj_vol_store_reaches); and only
  * a Java root converts (R3, wj_vol_java_method). [wasm-jit volatile] conv must equal used, lost must be 0.
- * The remaining gate is 262c's memwalk as a rate (>= 10 runs, the datapack stepping every time) at 1. */
-int mono_wasm_jit_volatile_load = 0;
+ * 262c memwalk gate (2026-11-22, runs/2026-11-22-v3/MW): 10 of 10 runs at 1 stepped (5 of 5 controls). mctick: -1.3 M
+ * cycles a tick (n=3, overlapping). Default since then, in the M1 set: 262n Q60 with GI_SHARE=70 + INLINE_COLD_CALL=1 + GI_COLD=1 + VOLATILE_LOAD=1 on the then
+ * defaults (2026-11-22, n=3 a side, disjoint): server-tick cycles 79.19 -> 73.88 M (-6.7%), instructions -2.8%, calls -9%
+ * (findings note "plan v3 M1 + call profile v2 implemented"; not split by knob on 262n). */
+int mono_wasm_jit_volatile_load = 1;
 /* MONO_WASM_JIT_MAX_PARAMS: the largest wasm functype a JIT body or call site may use (this, args and the frame-base
  * argument). 16 (default) is the old fixed limit; up to WASM_FUNCTYPE_MAX_PARAMS (24): args spill into the per-thread
  * scratch at 8 bytes a slot below the result slot at 192, and the residual path passes > 16 through many_args. */
@@ -2048,13 +2055,21 @@ int mono_wasm_jit_t2_until_ms = 0;
  * record is not perfectly monomorphic, when its top receiver's share has a one-sided 95% Wilson lower bound of at least
  * this many percent over at least MONO_WASM_JIT_GI_MIN_N observations (interp.c mono_wasm_jit_prof_predict_share). Read
  * only by wj_gi_predict, after the margin and method-identity predictors refuse: the emitter's devirt arms keep
- * MONO_WASM_JIT_PRED_PCT (whose monomorphic path drops ARM2). Counted WJC_GI_SHARE_PRED / _REFUSED. 0 = off. */
-int mono_wasm_jit_gi_share = 0;
+ * MONO_WASM_JIT_PRED_PCT (whose monomorphic path drops ARM2). Counted WJC_GI_SHARE_PRED / _REFUSED. 0 = off.
+ * mctick (with INLINE_COLD_CALL=1): the block-state chain inlined in 9 of 9 runs (the bimodality), -1.0 M cycles a tick
+ * (n=3, overlapping). Default 70 since 2026-11-22, in the M1 set: 262n Q60 with GI_SHARE=70 + INLINE_COLD_CALL=1 + GI_COLD=1 + VOLATILE_LOAD=1 on the then
+ * defaults (2026-11-22, n=3 a side, disjoint): server-tick cycles 79.19 -> 73.88 M (-6.7%), instructions -2.8%, calls -9%
+ * (findings note "plan v3 M1 + call profile v2 implemented"; not split by knob on 262n). */
+int mono_wasm_jit_gi_share = 70;
 int mono_wasm_jit_gi_min_n = 32;
 /* MONO_WASM_JIT_GI_COLD=1 (plan v3 L8): hint the branch into a guarded inline's fallback (method-to-ir.c marks the block
  * wasm_cold once the inline landed) unlikely, so V8 lays the ~600-850 B callvirt fallback after the hot path instead of
- * in it (WJ_COND_HINT; counted WJC_GI_COLD_HINTS). A site whose guard mostly misses then jumps out of line. 0 = off. */
-int mono_wasm_jit_gi_cold = 0;
+ * in it (WJ_COND_HINT; counted WJC_GI_COLD_HINTS). A site whose guard mostly misses then jumps out of line. 0 = off.
+ * mctick: -4.1 M cycles a tick (-10%, n=3, disjoint) at equal instructions and calls, 10.7 k fewer L2 misses. Default
+ * since 2026-11-22, in the M1 set: 262n Q60 with GI_SHARE=70 + INLINE_COLD_CALL=1 + GI_COLD=1 + VOLATILE_LOAD=1 on the then
+ * defaults (2026-11-22, n=3 a side, disjoint): server-tick cycles 79.19 -> 73.88 M (-6.7%), instructions -2.8%, calls -9%
+ * (findings note "plan v3 M1 + call profile v2 implemented"; not split by knob on 262n). */
+int mono_wasm_jit_gi_cold = 1;
 /* MONO_WASM_JIT_PROF_V2 (bits; the call profile's second version, findings note 2026-11-22 "how accurate is the call
  * profile"):
  *   1  unbiased shares: an IC miss goes to the record's miss histogram (WjProfSite.miss_counts), never to id_counts /
