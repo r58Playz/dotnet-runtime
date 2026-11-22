@@ -1,6 +1,6 @@
 // jbox2d three-way capture: ONE run of one arm under perf, windowed on the bench's own batch lines.
 //
-//   wj j2d/run <ours|teavm|hotspot> <outdir> [--events A|B|C|D|L] [--timeout 240] [--no-attr]
+//   wj j2d/run <ours|teavm|hotspot> <outdir> [--events A|A4|B|C|D|L] [--timeout 240] [--no-attr]
 //   wj j2d/run <ours|tvfull|hs<N>> <outdir> --bench mctick ...   the Minecraft 26.2 server tick (wjharness/bench/mctick):
 //           the same arms, windows and event sets over mctick's batches of ticks instead of jbox2d's steps. ours runs
 //           ?bench&jar=mctick.jar on a copy of the 262n seed (its OPFS holds 26.2 and the save), HotSpot runs
@@ -77,7 +77,7 @@ const CJ = /^cj(gc)?(\d+)$/.exec(arm || "");
 const CLR_ENVS = { clr: "ikvm-clr10/env.sh", clrrelink: "ikvm-clr10-relink/env-relink.sh", clrclassic: "ikvm-clr10/env-classic.sh" };
 const CLR = MC ? CLR_ENVS[arm] : undefined;
 if (!(["ours", ...Object.keys(TEAVM_DIRS)].includes(arm) || /^hs\d+$/.test(arm || "") || CJ || CLR) || !outdir) {
-  console.error("usage: run.mjs <ours|tvfull|tvsimple|tvfull60|tvsimple60|teavm|hs<N>|cj<V>|cjgc<V>|clr|clrrelink|clrclassic (mctick)> <outdir> [--events A|B|C|D|L] [--timeout S] [--no-attr] [--no-perf] [--no-jitdump]"
+  console.error("usage: run.mjs <ours|tvfull|tvsimple|tvfull60|tvsimple60|teavm|hs<N>|cj<V>|cjgc<V>|clr|clrrelink|clrclassic (mctick)> <outdir> [--events A|A4|B|C|D|L] [--timeout S] [--no-attr] [--no-perf] [--no-jitdump]"
     + " [--stop-after N] [--knob K=V (ours)] [--dumps (ours: dumpWasmJit at batch 1 and 12)] [--perf-extra 'ARGS'] [--js-flags-extra 'F1,F2' (browser arms: appended to V8's --js-flags)] [--tv-dir DIR (a TeaVM arm's served directory, e.g. a split-teavm.py output)]");
   process.exit(1);
 }
@@ -119,6 +119,18 @@ const EVENTS = {
     `${C}/mem_load_retired.l1_miss,period=100003/upp`,
     `${C}/mem_load_retired.l2_miss,period=5003/upp`,
     `${C}/mem_load_retired.l3_miss,period=2003/upp`,
+    `${C}/br_inst_retired.near_call,period=200003/u`,
+    `${C}/mem_inst_retired.all_loads,period=8000009/u`,
+  ],
+  // A4: A with the L2 / L3 periods 4x coarser (2026-11-21): at A's periods TeaVM's mctick window throttled L2 (~600-1200)
+  // and L3 (~250-2000) samples in its miss-dense chunk phase, which voids those counts (j2d/counts.py); quote L2 / L3
+  // across arms from A4 runs.
+  A4: [
+    `${C}/instructions,period=20000003/upp`,
+    `${C}/cycles,period=8000009/upp`,
+    `${C}/mem_load_retired.l1_miss,period=100003/upp`,
+    `${C}/mem_load_retired.l2_miss,period=20011/upp`,
+    `${C}/mem_load_retired.l3_miss,period=8009/upp`,
     `${C}/br_inst_retired.near_call,period=200003/u`,
     `${C}/mem_inst_retired.all_loads,period=8000009/u`,
   ],
