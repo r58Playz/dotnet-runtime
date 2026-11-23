@@ -70,6 +70,13 @@ def clean_pairs(rows, lo, hi):
         a["clean_ns"] += t - p[0]; a["pairs"] += 1
     return acc
 
+# Each counting mode's CounterMetricByThread array, in array order (its areaGraphSepcIndexTometricIndex read against its
+# metricLegend in a capture's TOC, 2026-11-23). Shares of the thread's cycles in the window.
+MODE_ARRAYS = {
+    "bottlenecks": ("useful", "processing", "delivery", "discarded"),
+    "processing": ("executing", "crit_l1d_miss_executing", "crit_l1d_miss", "noncrit_l1d_miss", "exec_latency"),
+}
+
 def bottlenecks(trace, thread, lo, hi):
     """The template's own top-down split for one thread (CounterMetricByThread: ~1 ms intervals, each a 4-array of
     basis points). Its spec-to-metric map (areaGraphSepcIndexTometricIndex [2: 3, 3: 1, 1: 2, 4: 0] against the legend
@@ -82,7 +89,7 @@ def bottlenecks(trace, thread, lo, hi):
         if i is not None: ids[i] = e
         for c in e: reg(c)
     D = lambda e: ids.get(e.get("ref"), e) if e is not None else None
-    acc = [0.0] * 4; tot = 0
+    acc = None; tot = 0
     for row in root.iter("row"):
         cs = list(row)
         for c in cs: reg(c)
@@ -92,10 +99,13 @@ def bottlenecks(trace, thread, lo, hi):
         if (lo is not None and tt < lo) or (hi is not None and tt > hi): continue
         w = int(du.text); x = [int(q) for q in v.text.split()]
         sx = sum(x) or 1
-        for k in range(4): acc[k] += w * x[k] / sx
+        if acc is None: acc = [0.0] * len(x)
+        for k in range(min(len(x), len(acc))): acc[k] += w * x[k] / sx
         tot += w
     if not tot: return None
-    return dict(zip(("useful", "processing", "delivery", "discarded"), (a / tot for a in acc)))
+    mode = (re.search(r'counting-mode="bottleneck (\w+)', export(trace, None).decode()) or [None, "bottlenecks"])[1]
+    names = MODE_ARRAYS.get(mode, tuple(f"m{k}" for k in range(len(acc))))
+    return {"mode": mode, **dict(zip(names, (a / tot for a in acc)))}
 
 def main():
     ap = argparse.ArgumentParser()

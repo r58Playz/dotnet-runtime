@@ -112,6 +112,10 @@ const XCPROF = args.includes("--xcprof") || XCPROF_JIT;   // the same capture wi
 const XCT = args.includes("--xctrace") || XCPROF;
 if (XCT && process.platform !== "darwin") { console.error("--xctrace is darwin-only (use the perf event sets)"); process.exit(1); }
 let xct = null;
+/* --xc-mode M: the CPU Counters counting mode (RecountDT's bottleneck.json: bottlenecks [default], processing, delivery,
+ * l1d_miss_sampling, discarded_sampling, ...), passed as xctrace --recording-options */
+const XC_MODE = opt("xc-mode");
+const XC_JIT = args.includes("--xc-jit");   // keep V8's perf map and jitdump with a counters capture too (fe/xcmiss.py)
 const batchWall = {};
 
 /* EVENTS. Five general-purpose counters plus the two fixed ones is what this P-core schedules without
@@ -227,7 +231,17 @@ function startXct () {
   const pid = busiestRenderer();
   if (!pid) { onLine("[j2d] xctrace: no renderer found"); return { failed: true }; }
   const out = join(outdir, XCPROF ? "profile.trace" : "counters.trace");
-  const p = spawn("xcrun", ["xctrace", "record", "--template", XCPROF ? "Time Profiler" : "CPU Counters", "--attach", String(pid), "--output", out, "--no-prompt"],
+  const xopts = [];
+  if (XC_MODE && !XCPROF) {
+    const f = join(outdir, "xc-options.json");
+    /* the whole object `xctrace record --show-recording-options` prints: a partial one fails to load ("missing") */
+    writeFileSync(f, JSON.stringify({ "CPU Counters": { allEventsAndFormulas: [], configurationType: { guided: {} }, countingLevel: "EL0",
+      pmiEventAliasOrMnemonic: "", pmiThreshold: 1000000, processBucketSize: 10, sampleByTime: !/_sampling$/.test(XC_MODE),
+      selectedCountingMode: { analysisMode: "bottleneck", countingMode: XC_MODE }, useDebuggingInformation: false,
+      useHighFrequencyForGuidedMode: false, useHighFrequencyForManualMode: false } }));
+    xopts.push("--recording-options", f);
+  }
+  const p = spawn("xcrun", ["xctrace", "record", "--template", XCPROF ? "Time Profiler" : "CPU Counters", ...xopts, "--attach", String(pid), "--output", out, "--no-prompt"],
     { stdio: ["ignore", "pipe", "pipe"], detached: true });
   let tail = ""; p.stdout.on("data", (d) => { tail += d; }); p.stderr.on("data", (d) => { tail += d; });
   const st = { p, pid, out, exited: false, tail: () => tail.slice(-400) };
@@ -307,7 +321,7 @@ if (HS && MC) {
     "--disable-sync", "--disable-background-networking", "--disable-client-side-phishing-detection",
     "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
     "--ignore-gpu-blocklist", "--use-gl=angle", `--use-angle=${angleBackend()}`,
-    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${XCPROF ? ",--perf-basic-prof" : ""}${XCPROF_JIT ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
+    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${XCPROF || XC_JIT ? ",--perf-basic-prof" : ""}${XCPROF_JIT || XC_JIT ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
     "about:blank"];
   delete env.WAYLAND_DISPLAY; delete env.XDG_SESSION_TYPE;
   env.__J2D_PROFILE = prof;
@@ -402,11 +416,11 @@ const win = {
   window_ms_per_step: ok ? Array.from({ length: WB - WA }, (_, i) => batchMs[WA + 1 + i]).reduce((s, v) => s + v, 0) / steps : null,
   batch_ms: batchMs, failed, perf_stderr_tail: perfErr.slice(-600),
 };
-if (XCPROF && xct?.pid) {   // V8's map for the renderer, beside the capture; every map this browser wrote leaves /tmp
+if ((XCPROF || XC_JIT) && xct?.pid) {   // V8's map for the renderer, beside the capture; every map this browser wrote leaves /tmp
   const pm = `/tmp/perf-${xct.pid}.map`;
   if (existsSync(pm)) execSync(`cp ${JSON.stringify(pm)} ${JSON.stringify(join(outdir, "perf.map"))}`);
   /* the renderer's jitdump is the one fe/xchot.py reads; the browser's other processes wrote small ones beside it */
-  if (XCPROF_JIT && existsSync(join(outdir, `jit-${xct.pid}.dump`))) {
+  if ((XCPROF_JIT || XC_JIT) && existsSync(join(outdir, `jit-${xct.pid}.dump`))) {
     execSync(`mv ${JSON.stringify(join(outdir, `jit-${xct.pid}.dump`))} ${JSON.stringify(join(outdir, "jit.dump"))}`);
     for (const f of readdirSync(outdir).filter((f) => /^jit-\d+\.dump$/.test(f))) rmSync(join(outdir, f));
   }
