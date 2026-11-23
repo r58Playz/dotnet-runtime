@@ -107,7 +107,9 @@ version). Line numbers drift: if something surprising turns up, re-check the tre
   out-of-profile method of the same image goes indirect and may enter the interpreter. No profile ships: the AOT
   whitelist is CoreLib, IKVM.Runtime, IKVM.ByteCode and System.Memory (ikvmcraft `loader/IkvmWasm.csproj`).
 * **R479's deadlock fix is upstream in emscripten 6** (21a3a81daf), as are emsdk.patch, .2 and .5; FNA-WASM-Build net11
-  carries .3 (a backport of upstream #27937's readwrite-unsafe OPFS handles), .4, .6, .8-.11 rebased, and .12.
+  carries .3 (a backport of upstream #27937's readwrite-unsafe OPFS handles), .4, .6, .8-.11 rebased, .12, and .13
+  (R533: wasmfs `rename` locked directories child-then-parent against every lookup's parent-then-child, so a save
+  could hang the game; `runs/2026-11-22-emsdk13/renamelock.c` is its positive control).
 * **emscripten 6 picks the wasm EH encoding at COMPILE time** (default legacy) and V8 refuses a module that mixes the two
   (`function-body-decoder-impl.h`, "module uses a mix of legacy and new exception handling instructions"). Every native
   object with wasm EH or wasm setjmp is built `-fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0`, and the JIT emits
@@ -448,11 +450,29 @@ findings note "mctick":
 | ours, no co-location (B4 never framed: the runs above) | 13.72 | 6.92x | 74.8 / 66.9 | 1.12 |
 | **ours, co-located, 2026-11-20 defaults** (6000-tick warm-up, n=3) | **12.04** | **6.08x** | 66.0 / 56.8 | 1.16 |
 
-* **Against TeaVM the gap is IPC, not work**: TeaVM FULL makes as many calls (0.52 vs 0.55 M a tick) and 1.29x fewer
-  instructions; TeaVM SIMPLE executes 1.37x OUR instructions and is still 1.37x faster. Of our +38.7 M cycles, about half
-  is L1D-miss stall (25.3 vs 6.0 M a tick), ~7 M icache stall (with 14x the iTLB walks: a code space per module), ~8.5 M
-  the extra instructions. TeaVM runs in the same V8 at 0.76 M dTLB-walk cycles a tick against our 7.7: the stalls are
-  not wasm.
+**Ours against TeaVM FULL in one batch, 2026-11-22** (`runs/2026-11-22-v3` 90-95, order tv ng ng tv tv ng, n=3 a side,
+schedule 40000,100,50, window batches 11-50, set A, P-cores; findings note "Final figure"). Ours is wjbuild-parity-u2
+with emsdk.13, its defaults (M1 on, `MONO_WASM_JIT_T1_UNIT` off) plus allng's knobs through the URL (`CLASS_RECORD=3`,
+`CAST_ELIM=3`, `NEWARR_INLINE`, `INLINE_TRIVIAL=16`, `ATOMIC_I8`, IKVM `ATOMIC_INLINE` / `GETCLASS_INLINE` /
+`CAST_MEMO`) and a late-settle layout (`T2_UNTIL_MS=240000`, `B4_DELAY=230`, `B4_ONCE`): `NGL` in that run's `run.sh`,
+not the shipped defaults. TeaVM read 5.36 here against 5.77 on 2026-11-19, so compare rows within a table, not across.
+
+| | ms/tick | vs TeaVM | M instructions / cycles a tick | IPC | k calls a tick | k L1 misses a tick |
+|---|---|---|---|---|---|---|
+| TeaVM FULL | 5.36 (5.31-5.40) | 1.00x | 53.8 / 26.2 | 2.05 | 487 | 275 |
+| **ours** | **8.37 (8.27-8.50)** | **1.56x** (1.51x in cycles) | 52.9 / 39.5 | 1.34 | 277 | 482 |
+
+* **Against TeaVM the gap is IPC, not work**: on 2026-11-22 we execute 0.98x TeaVM FULL's instructions and make 0.57x
+  its calls; the whole 1.51x in cycles is IPC (1.75x its L1 misses) plus a ~4% lower clock (4.71 vs 4.89 GHz). The
+  breakdown is 2026-11-19's (set D, before co-location and M1, when TeaVM FULL made as many calls and 1.29x fewer
+  instructions; TeaVM SIMPLE executes 1.37x OUR instructions and is still 1.37x faster): of our +38.7 M cycles, about
+  half was L1D-miss stall (25.3 vs 6.0 M a tick), ~7 M icache stall (with 14x the iTLB walks: a code space per module),
+  ~8.5 M the extra instructions. TeaVM runs in the same V8 at 0.76 M dTLB-walk cycles a tick against our 7.7: the
+  stalls are not wasm.
+* **A ~2.8 s stall at a fixed wall time, ~293 s after page start, is open** (findings note "Open: a ~2.8 s stall"):
+  ~7x a batch's instructions on the bench thread while seven V8 pool threads work. With a 24,000-tick warm-up it lands
+  in ours' window (a 28 ms/tick `[bench] batch` line, `thr` below ~93% in `j2d/counts`); warm 40,000 ticks to open past
+  it, and read the per-batch lines before quoting a window.
 * **TeaVM's code in our call layout** (`bench/mctick/split-teavm.py --inline-runtime --sp-global`: every executed function
   in its own module, calls `call_indirect` / imports, its allocStack and type checks inlined, its stack pointer an
   imported mutable global like `s.p`; n=3, 2026-11-19, findings note "mctick" addendum 4): 6.58 ms/tick as one module
