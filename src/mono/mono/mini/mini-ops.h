@@ -866,6 +866,9 @@ MINI_OP(OP_WASM_JIT_ALLOC_FAST, "wasm_jit_alloc_fast", IREG, NONE, NONE)
 /* ... and for a one-dimensional array: sreg1 = the length; inst_p0 = the array's MonoVTable, inst_c1 = (the largest
  * length allocated inline << 8) | the element size (CEE_NEWARR, plan abstract-hatching-stearns C3). */
 MINI_OP(OP_WASM_JIT_NEWARR_FAST, "wasm_jit_newarr_fast", IREG, IREG, NONE)
+/* ... the current thread's static_data array, for a ThreadStatic field's address (MONO_WASM_JIT_TLS_SD, M9): dreg = the
+ * array, through the per-thread cache threads.c keeps, else thread -> static_data. Not a reference (a fixed root). */
+MINI_OP(OP_WASM_JIT_TLS_STATIC_DATA, "wasm_jit_tls_static_data", IREG, NONE, NONE)
 MINI_OP(OP_WASM_SIMD_BITMASK, "wasm_bitmask", IREG, XREG, NONE)
 MINI_OP3(OP_WASM_BITSELECT, "wasm_bitselect", XREG, XREG, XREG, XREG)
 MINI_OP3(OP_WASM_SIMD_SHUFFLE, "wasm_shuffle", XREG, XREG, XREG, XREG)

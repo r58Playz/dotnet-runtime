@@ -764,6 +764,14 @@ int mono_wasm_jit_t2_gi_size = 120;      /* MONO_WASM_JIT_T2_GI_SIZE: guarded-in
 int mono_wasm_jit_prof_origin = 1;
 /* MONO_WASM_JIT_FAST_TLS (R317, plan M3): mono_tls_get_thread_extern emitted as two loads through `s.b`. */
 int mono_wasm_jit_fast_tls = 1;
+/* MONO_WASM_JIT_TLS_SD (M9): a ThreadStatic field's address takes the thread's static_data array from the per-thread
+ * cache threads.c keeps (mono_wasm_tls_static_data, through `s.b`) instead of thread -> static_data: three dependent
+ * loads to the field's chunk where FAST_TLS's form takes five; NULL in the cache takes that full chain. On the M4,
+ * IKVM's Thread.currentThread (a ThreadStatic) was the hottest load-miss pair in ServerChunkCache.getChunk (findings M8).
+ * M9 (2026-11-23, mctick, one binary, n=3 a side, both orders): 16.56 -> 16.40 M cycles a tick (-1.0%), 3.993 -> 3.945
+ * ms/tick, ranges overlapping -- the size the mechanism predicts (1290 sites, two dependent loads fewer each); 262u and
+ * mcsr clean with it. 0 = the chain. */
+int mono_wasm_jit_tls_sd = 1;
 /* MONO_WASM_JIT_INLINE_COLD_THROW (R318, plan Phase 3.4): throw-terminated IL segments are not counted toward the inline
  * size limit, under the per-compile policy only (tier 2, INLINE_CALLS). */
 int mono_wasm_jit_inline_cold_throw = 1;
@@ -1418,6 +1426,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_t2_gi_size, "MONO_WASM_JIT_T2_GI_SIZE", 0, 4096)
 	WJ_T2_KNOB (mono_wasm_jit_prof_origin, "MONO_WASM_JIT_PROF_ORIGIN", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_fast_tls, "MONO_WASM_JIT_FAST_TLS", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_tls_sd, "MONO_WASM_JIT_TLS_SD", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_trivial, "MONO_WASM_JIT_INLINE_TRIVIAL", 0, 64)
 	WJ_T2_KNOB (mono_wasm_jit_inline_aggr_depth, "MONO_WASM_JIT_INLINE_AGGR_DEPTH", 0, 1)

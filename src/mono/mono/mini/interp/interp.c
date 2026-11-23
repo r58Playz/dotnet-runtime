@@ -8159,11 +8159,12 @@ mono_wasm_jit_vcall_ic_miss (MonoObject *this_obj, MonoMethod *base_method, gpoi
  *  - the result slot is written then read in strict nested (LIFO) order across reentrancy.
  * Per-thread => MT-safe. The address can't be baked into the emitted module (a __thread address
  * differs per thread), so the JITted code fetches it via mono_wasm_jit_scratch() at each call site. */
-static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 48] __attribute__ ((aligned (8)));   /* + the TLAB, thread, LMF-address, finally-depth, census-select and LMF-head slots */
+static __thread guint8 wj_scratch [WJ_SCRATCH_SIZE + 56] __attribute__ ((aligned (8)));   /* + the TLAB, thread, LMF-address, finally-depth, census-select and LMF-head slots */
 g_static_assert (WJ_SCRATCH_THREAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
 g_static_assert (WJ_SCRATCH_FINSP_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
 g_static_assert (WJ_SCRATCH_SITESEL_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
-g_static_assert (WJ_SCRATCH_LMFHEAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 48);
+g_static_assert (WJ_SCRATCH_LMFHEAD_SLOT + 8 <= WJ_SCRATCH_SIZE + 56);
+g_static_assert (WJ_SCRATCH_SD_SLOT + 8 <= WJ_SCRATCH_SIZE + 56);
 g_static_assert (WJ_SCRATCH_ROLE_OFF + 4 <= WJ_SCRATCH_LMFHEAD_SLOT);
 
 /* --- MONO_WASM_JIT_ROLES: per-role counters for the lever census (a counting instrument; never in a timing arm) ---
@@ -8584,6 +8585,10 @@ mono_wasm_jit_scratch (void)
 	extern gpointer mono_wasm_tls_thread_addr (void);
 	*(gpointer *) (wj_scratch + WJ_SCRATCH_TLAB_SLOT) = mono_wasm_sgen_tls_info_addr ();
 	*(gpointer *) (wj_scratch + WJ_SCRATCH_THREAD_SLOT) = mono_wasm_tls_thread_addr ();   /* R317, same reasoning */
+	{
+		extern gpointer mono_wasm_tls_static_data_addr (void);
+		*(gpointer *) (wj_scratch + WJ_SCRATCH_SD_SLOT) = mono_wasm_tls_static_data_addr ();   /* MONO_WASM_JIT_TLS_SD */
+	}
 	/* R353's EH records: the address of this thread's LMF-address mirror (mini-runtime.c, NULL while detached,
 	 * like the thread slot) and of its finally-save depth. Both are __thread, so both addresses are constant. */
 	{

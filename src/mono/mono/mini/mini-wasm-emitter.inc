@@ -6651,6 +6651,34 @@ co_ranges_done:
 				}
 				break;
 			}
+			case OP_WASM_JIT_TLS_STATIC_DATA: {
+#ifdef HOST_BROWSER
+				/* MONO_WASM_JIT_TLS_SD (M9): the current thread's static_data array --
+				 *     d = **(s.b + WJ_SCRATCH_SD_SLOT)    mono_wasm_tls_static_data, the owning thread's cache
+				 *     if (!d) d = (*(*(s.b + WJ_SCRATCH_THREAD_SLOT)))->static_data   FAST_TLS's chain
+				 * No call, not a GC point. rtmp is free here: the dreg is never a reference (wj_opcode_is_nonref). */
+				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);                  /* s.b */
+				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_SD_SLOT);
+				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
+				wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) rtmp_idx);
+				wasm_op (&body, WASM_OP_I32_EQZ);
+				WJ_HINT (0);
+				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
+				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);
+				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_THREAD_SLOT);
+				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
+				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) MONO_STRUCT_OFFSET (MonoInternalThread, static_data));
+				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) rtmp_idx);
+				wj_count (WJC_TLS_SD_FALLBACK_SITES);
+				wasm_op (&body, WASM_OP_END);
+				wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) rtmp_idx);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "tls_sd dreg"; goto done; }
+				wj_count (WJC_TLS_SD_SITES);
+#else
+				fail = "tls_sd offline"; goto done;
+#endif
+				break;
+			}
 			case OP_WASM_JIT_ALLOC_FAST: {
 #ifdef HOST_BROWSER
 				/* Inline TLAB bump (handle_alloc in method-to-ir.c, R305) -- the managed allocator wrapper's fast

@@ -210,11 +210,28 @@ mono_wasm_tls_thread_addr (void)
 	return &mono_wasm_tls_thread;
 }
 
+/*
+ * The current thread's static_data array (MONO_WASM_JIT_TLS_SD, M9): a ThreadStatic access in wasm-JITted code reads
+ * this through `s.b` instead of thread -> static_data, two dependent loads fewer. Written only by the owning thread:
+ * when its thread object is set, when its array is created during its own registration, and when it is freed at its
+ * exit. An array another thread created for it (alloc_thread_static_data_helper) leaves it NULL, and emitted code takes
+ * the full chain on NULL. The array is mono_gc_alloc_fixed's: it never moves, and is freed only at the thread's exit.
+ */
+__thread gpointer *mono_wasm_tls_static_data;
+
+gpointer mono_wasm_tls_static_data_addr (void);
+gpointer
+mono_wasm_tls_static_data_addr (void)
+{
+	return &mono_wasm_tls_static_data;
+}
+
 static inline void
 wj_set_current_object (MonoInternalThread *value)
 {
 	mono_tls_set_thread (value);
 	mono_wasm_tls_thread = value;
+	mono_wasm_tls_static_data = value ? value->static_data : NULL;
 }
 #define SET_CURRENT_OBJECT   wj_set_current_object
 #else
@@ -867,6 +884,10 @@ mono_thread_attach_internal (MonoThread *thread, gboolean force_attach)
 		guint32 offset = MAKE_SPECIAL_STATIC_OFFSET (thread_static_info.idx, thread_static_info.offset, 0);
 		mono_alloc_static_data (&internal->static_data, offset, (void*)(gsize)MONO_UINT_TO_NATIVE_THREAD_ID (internal->tid));
 	}
+#ifdef HOST_BROWSER
+	if (internal == mono_wasm_tls_thread)
+		mono_wasm_tls_static_data = internal->static_data;   /* MONO_WASM_JIT_TLS_SD: created by its own thread */
+#endif
 
 	mono_threads_unlock ();
 
@@ -1063,6 +1084,10 @@ mono_thread_detach_internal (MonoInternalThread *thread)
 	mono_domain_unset ();
 	mono_memory_barrier ();
 
+#ifdef HOST_BROWSER
+	if (thread == mono_wasm_tls_thread)
+		mono_wasm_tls_static_data = NULL;   /* MONO_WASM_JIT_TLS_SD: before the array goes */
+#endif
 	mono_free_static_data (thread->static_data);
 	thread->static_data = NULL;
 

@@ -56,6 +56,7 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_GET_EX_OBJ:   /* caught exception object -> i32 (ref) on wasm32 */
 	case OP_WASM_JIT_ALLOC_FAST:   /* new object or 0 -> i32 (ref) on wasm32 */
 	case OP_WASM_JIT_NEWARR_FAST:  /* new array or 0 -> i32 (ref) on wasm32 */
+	case OP_WASM_JIT_TLS_STATIC_DATA:   /* the thread's static_data array -> i32 */
 	case OP_IADD: case OP_ISUB: case OP_IMUL:
 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
 	case OP_IAND: case OP_IOR: case OP_IXOR:
@@ -175,6 +176,7 @@ wj_opcode_is_nonref (MonoInst *ins)
 	 * The fixpoint loop taint-propagates them instead: add/sub/mask of a proven-scalar source
 	 * stays scalar, of a possible-ref source is a possible ref. */
 	case OP_ICONST: case OP_I8CONST:
+	case OP_WASM_JIT_TLS_STATIC_DATA:   /* a mono_gc_alloc_fixed root array: never moves, needs no pin */
 	case OP_IMUL:
 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
 	case OP_IAND: case OP_IOR: case OP_IXOR:

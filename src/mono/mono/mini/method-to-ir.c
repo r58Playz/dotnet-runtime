@@ -13425,13 +13425,22 @@ calli_end:
 				}
 			}
 
-			if (is_special_static && ((gsize)addr & 0x80000000) == 0)
+			gboolean wj_tls_sd = FALSE;
+#ifdef TARGET_WASM
+			{
+				/* MONO_WASM_JIT_TLS_SD (M9): the static_data array straight from a per-thread cache, not the thread */
+				extern int mono_wasm_jit_tls_sd;
+				wj_tls_sd = COMPILE_WASM (cfg) && mono_wasm_jit_tls_sd && !cfg->compile_aot && !context_used &&
+					is_special_static && ((gsize)addr & 0x80000000) == 0;
+			}
+#endif
+			if (is_special_static && ((gsize)addr & 0x80000000) == 0 && !wj_tls_sd)
 				thread_ins = mono_create_tls_get (cfg, TLS_KEY_THREAD);
 			else
 				thread_ins = NULL;
 
 			/* Generate IR to compute the field address */
-			if (is_special_static && ((gsize)addr & 0x80000000) == 0 && thread_ins &&
+			if (is_special_static && ((gsize)addr & 0x80000000) == 0 && (thread_ins || wj_tls_sd) &&
 				!(context_used && cfg->gsharedvt && mini_is_gsharedvt_klass (klass))) {
 				/*
 				 * Fast access to TLS data
@@ -13442,6 +13451,14 @@ calli_end:
 				int idx, static_data_reg, array_reg, dreg;
 
 				static_data_reg = alloc_ireg (cfg);
+#ifdef TARGET_WASM
+				if (wj_tls_sd) {
+					MonoInst *sd;
+					MONO_INST_NEW (cfg, sd, OP_WASM_JIT_TLS_STATIC_DATA);
+					sd->dreg = static_data_reg;
+					MONO_ADD_INS (cfg->cbb, sd);
+				} else
+#endif
 				MONO_EMIT_NEW_LOAD_MEMBASE (cfg, static_data_reg, thread_ins->dreg, MONO_STRUCT_OFFSET (MonoInternalThread, static_data));
 
 				if (cfg->compile_aot || context_used) {

@@ -1603,6 +1603,8 @@ enum {
 	WJC_PIN_COLD_METHODS,        /* MONO_WASM_JIT_PIN_COLD: compiles with at least one cold-only ref */
 	WJC_PIN_COLD_VREGS,          /* ... cold-only refs (no def mirror) */
 	WJC_PIN_COLD_FLUSHES,        /* ... stores placed before cold GC points (static) */
+	WJC_TLS_SD_SITES,            /* MONO_WASM_JIT_TLS_SD: ThreadStatic addresses emitted through the static_data cache */
+	WJC_TLS_SD_FALLBACK_SITES,   /* ... (the same sites: each carries the thread-chain fallback) */
 	WJC_MAX
 };
 
@@ -1656,6 +1658,9 @@ int mono_wasm_jit_role_match (const char *mname);
  * store (MONO_WASM_JIT_EH_SLIM). The scratch is a __thread array, so the address outlives a detach and re-attach of the
  * pthread, which &jit_tls->lmf does not. */
 #define WJ_SCRATCH_LMFHEAD_SLOT (WJ_SCRATCH_SITESEL_SLOT + 8)
+/* MONO_WASM_JIT_TLS_SD (M9): the address of this thread's mono_wasm_tls_static_data (threads.c), the current thread's
+ * static_data array or NULL. */
+#define WJ_SCRATCH_SD_SLOT (WJ_SCRATCH_LMFHEAD_SLOT + 8)
 
 /* Byte offsets of interp.c's WjEhRec (R353), for the emitter, which cannot see MonoLMFExt from here. */
 typedef struct {
