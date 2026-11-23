@@ -1833,8 +1833,12 @@ int mono_wasm_jit_b4_merge = 0;
 /* MONO_WASM_JIT_LIT_RESCUE: 1 = a managed-object constant that reaches the emitter without its literal-table slot
  * (inst_p1) takes the slot this compile interned for the same pointer value (WjLitNote, mini-wasm.h) instead of failing
  * the compile at "managed pconst not interned". 2026-11-11, 26.2: that bail keeps ServerChunkCache.getChunk (25.6 k
- * calls a tick from its tier-1 body), Level.getEntities, ServerLevel.tickNonPassenger and Minecraft.runTick at tier 1. */
-int mono_wasm_jit_lit_rescue = 0;
+ * calls a tick from its tier-1 body), Level.getEntities, ServerLevel.tickNonPassenger and Minecraft.runTick at tier 1.
+ * M4, 2026-11-23 (findings M10): every unslotted constant was a System.String (cast elimination's OP_MOVE and copy
+ * propagation fold it without inst_p1); with the rescue, mctick's tier-2 downgrades 17 -> 1 and getChunk compiles at
+ * tier 2 (149 inlines); one binary, n=3 a side, both orders: 4.043 (4.021-4.072) -> 3.904 (3.865-3.973) ms/tick,
+ * disjoint; 262u and mcsr clean. 0 = fail the compile. */
+int mono_wasm_jit_lit_rescue = 1;
 gint32 mono_wasm_jit_lit_rescued, mono_wasm_jit_lit_unslotted;
 /* MONO_WASM_JIT_B4_EXACT: 1 = a tier-2 body's named call sites count themselves while the body is framed alone (the
  * serializer writes the counter; a group module carries none), and the planner weighs an edge by that count, one edge

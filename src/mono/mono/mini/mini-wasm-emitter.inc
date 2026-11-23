@@ -7104,11 +7104,18 @@ co_ranges_done:
 				}
 				if (!ins->inst_p1) {
 					/* ~10-25 a run, so ungated: which constant, for finding its producer */
-					if (mono_atomic_inc_i32 (&mono_wasm_jit_lit_unslotted) <= 40)
-						printf ("[wasm-jit pconst] no literal slot: R%d il %d tier %d notes %s %s\n", ins->dreg,
+					if (mono_atomic_inc_i32 (&mono_wasm_jit_lit_unslotted) <= 40) {
+						/* the constant's own class names its producer (a failure path: the object is live, the compile
+						 * holds it as a constant); ins->klass, when set, is what the front end typed it as */
+						MonoVTable *_pvt = *(MonoVTable **) ins->inst_p0;
+						MonoClass *_pk = _pvt ? _pvt->klass : NULL;
+						printf ("[wasm-jit pconst] no literal slot: R%d il %d tier %d notes %s %s | object %s.%s | ins klass %s | flags 0x%x\n", ins->dreg,
 							(ins->cil_code && cfg->header && ins->cil_code >= cfg->header->code &&
 							 ins->cil_code < cfg->header->code + cfg->header->code_size) ? (int) (ins->cil_code - cfg->header->code) : -1,
-							(int) cfg->wasm_jit_tier, cfg->wasm_jit_literals ? "some" : "none", mname ? mname : "?");
+							(int) cfg->wasm_jit_tier, cfg->wasm_jit_literals ? "some" : "none", mname ? mname : "?",
+							_pk ? m_class_get_name_space (_pk) : "?", _pk ? m_class_get_name (_pk) : "?",
+							ins->klass ? m_class_get_name (ins->klass) : "-", (unsigned) ins->flags);
+					}
 					fail = "managed pconst not interned"; goto done;
 				}
 					wasm_i32_const (&body, (gint32) (intptr_t) ins->inst_p1);
