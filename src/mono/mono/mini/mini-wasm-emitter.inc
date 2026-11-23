@@ -2151,6 +2151,242 @@ wj_divrem_prune (MonoCompile *cfg)
 #undef WJ_DR_TRUSTED
 }
 
+/* MONO_WASM_JIT_PIN_COLD's plan (wj_pin_cold_plan, below); declared in both builds, empty in the cross compiler */
+typedef struct { guint8 *cold; int *fhead, *fnext, *fvreg; int ncold, nflush, nhot_pts, ncold_pts; } WjPinCold;
+
+#ifdef HOST_BROWSER
+/*
+ * MONO_WASM_JIT_PIN_COLD (mini-wasm.c): which slotted refs only COLD GC points observe, and what each cold point must
+ * store first.
+ *
+ * Write-through mirrors a slotted ref into its frame slot at every def, so (I2) -- every slot current at every GC
+ * point -- holds without knowing where the GC points are. Under guarded inlining that pays on the fast path for the
+ * slow path: the receiver feeds the slow-path call, so it has a slot, and its def mirrors it whether or not the slow
+ * path runs. jbox2d's DynamicTree.query at tier 2 makes 150 of its 197 stores this way (2026-11-22, M2).
+ *
+ * The plan: backward liveness over the candidate refs (slotted, write-through, no address slot) on the IR CFG; at each
+ * effective GC point g, OBS(g) = the refs live after g other than its own def, plus the refs g uses (a call argument
+ * stays pinned by the caller for the whole call), plus the source of any PIN_ALIAS carrier g passes (the carrier has no
+ * slot of its own). g is COLD if it is a conditional safepoint poll or sits in an out_of_line block, and is not a raise;
+ * otherwise HOT. A ref in OBS of any hot point keeps its def mirror. Every other candidate is cold-only: no def mirror,
+ * and each cold g stores every cold-only ref of OBS(g) before itself (a poll: inside its taken arm). So at a hot point
+ * every observed slot is current by write-through, and at a cold point by the stores just emitted: (I2).
+ *
+ * The GC-point classification is wj_ins_is_effective_gcpoint, the one SLOTLIVE already trusts to leave single-bb refs
+ * with no slot at all. The CFG's throw edges to end_bblock only add liveness. Callers exclude clauses (handlers resume
+ * into the frame), lazy frames, address slots and the debug guards.
+ *
+ * Out: cold[v] (the cold-only set, NULL when empty) and the flush chains: fhead[ord] = first entry for the ord-th
+ * instruction (the SLOTLIVE ordinal), fnext[k] / fvreg[k] the chain and its ref.
+ */
+
+static gboolean
+wj_pc_dreg_is_base (int op)
+{
+	switch (op) {
+	case OP_STORE_MEMBASE_REG: case OP_STOREI4_MEMBASE_REG: case OP_STOREI1_MEMBASE_REG:
+	case OP_STOREI2_MEMBASE_REG: case OP_STOREI8_MEMBASE_REG: case OP_STORER4_MEMBASE_REG: case OP_STORER8_MEMBASE_REG:
+	case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_IMM: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_IMM:
+	case OP_ATOMIC_STORE_I1: case OP_ATOMIC_STORE_U1:
+	case OP_ATOMIC_STORE_I2: case OP_ATOMIC_STORE_U2: case OP_ATOMIC_STORE_I4: case OP_ATOMIC_STORE_U4:
+	case OP_ATOMIC_STORE_R4: case OP_ATOMIC_STORE_R8:
+	case OP_ATOMIC_STORE_I8: case OP_ATOMIC_STORE_U8:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+/* The vregs INS reads, as the SLOTLIVE walk counts them: its source registers, a store's base, a call's positional
+ * arguments and vret. Returns the count written to OUT (at most MAX; more is reported as -1). */
+static int
+wj_pc_uses (MonoInst *ins, int *out, int max)
+{
+	int srcs [MONO_MAX_SRC_REGS], n = 0, k, ns = mono_inst_get_src_registers (ins, srcs);
+	for (k = 0; k < ns; ++k) { if (n >= max) return -1; out [n++] = srcs [k]; }
+	if (wj_pc_dreg_is_base (ins->opcode)) { if (n >= max) return -1; out [n++] = ins->dreg; }
+	if (MONO_IS_CALL (ins)) {
+		MonoCallInst *call = (MonoCallInst *) ins;
+		WjCallArgs *cw = (WjCallArgs *) call->call_info;
+		if (cw)
+			for (k = 0; k <= cw->nargs; ++k) { if (n >= max) return -1; out [n++] = wj_arg_vreg (call, k); }
+	}
+	return n;
+}
+
+static gboolean
+wj_pin_cold_plan (MonoCompile *cfg, int nvreg, const int *refslot, const guint8 *ref_wt, const int *li, const int *addrslot,
+                  const int *pa_c, const int *pa_s, const int *pa_o, int nal, WjPinCold *out)
+{
+	MonoBasicBlock *bb, **bbs;
+	MonoInst *ins;
+	int *cidx, *cv, ncand = 0, nbbs = 0, nins = 0, W, b, k, v;
+	int *idx, *start;
+	guint64 *use, *def, *lin, *lout, *live, *obs;
+	guint8 *hot;
+	int *rec_ord, *rec_v, nrec = 0, cap_rec;
+	gboolean changed;
+	int uses [64];
+
+	memset (out, 0, sizeof (*out));
+	cidx = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+	cv = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nvreg);
+	for (v = 0; v < nvreg; ++v) {
+		cidx [v] = -1;
+		if (refslot [v] >= 0 && ref_wt [v] && li [v] >= 0 && (!addrslot || addrslot [v] == -1)) {
+			cidx [v] = ncand;
+			cv [ncand++] = v;
+		}
+	}
+	if (ncand == 0)
+		return FALSE;
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+		nbbs++;
+		MONO_BB_FOR_EACH_INS (bb, ins)
+			nins++;
+	}
+	if (nbbs == 0 || nins == 0)
+		return FALSE;
+	W = (ncand + 63) / 64;
+	bbs = (MonoBasicBlock **) mono_mempool_alloc (cfg->mempool, sizeof (gpointer) * nbbs);
+	start = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nbbs + 1));
+	idx = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * ((int) cfg->max_block_num + 1));
+	for (k = 0; k <= (int) cfg->max_block_num; ++k)
+		idx [k] = -1;
+	b = 0; k = 0;
+	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++b) {
+		bbs [b] = bb;
+		start [b] = k;
+		if (bb->block_num >= 0 && bb->block_num <= (int) cfg->max_block_num)
+			idx [bb->block_num] = b;
+		MONO_BB_FOR_EACH_INS (bb, ins)
+			k++;
+	}
+	start [nbbs] = k;
+	use = (guint64 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint64) * W * nbbs);
+	def = (guint64 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint64) * W * nbbs);
+	lin = (guint64 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint64) * W * nbbs);
+	lout = (guint64 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint64) * W * nbbs);
+	live = (guint64 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint64) * W);
+	obs = (guint64 *) mono_mempool_alloc0 (cfg->mempool, sizeof (guint64) * W);
+#define PC_SET(a, i) ((a) [(i) >> 6] |= (guint64) 1 << ((i) & 63))
+#define PC_CLR(a, i) ((a) [(i) >> 6] &= ~((guint64) 1 << ((i) & 63)))
+#define PC_TST(a, i) (((a) [(i) >> 6] >> ((i) & 63)) & 1)
+	/* local use (upward-exposed) and def sets */
+	for (b = 0; b < nbbs; ++b) {
+		guint64 *U = use + (gsize) b * W, *D = def + (gsize) b * W;
+		MONO_BB_FOR_EACH_INS (bbs [b], ins) {
+			int nu = wj_pc_uses (ins, uses, G_N_ELEMENTS (uses));
+			if (nu < 0)
+				return FALSE;   /* a call wider than the scratch: leave the method as it is */
+			for (k = 0; k < nu; ++k)
+				if (uses [k] >= 0 && uses [k] < nvreg && cidx [uses [k]] >= 0 && !PC_TST (D, cidx [uses [k]]))
+					PC_SET (U, cidx [uses [k]]);
+			if (!wj_pc_dreg_is_base (ins->opcode) && ins->dreg >= 0 && ins->dreg < nvreg && cidx [ins->dreg] >= 0)
+				PC_SET (D, cidx [ins->dreg]);
+		}
+	}
+	/* live_out = U live_in(succ); live_in = use | (live_out & ~def), to a fixpoint. An edge we cannot index makes
+	 * every candidate live (an unknown successor must read as using everything). */
+	do {
+		changed = FALSE;
+		for (b = nbbs - 1; b >= 0; --b) {
+			guint64 *O = lout + (gsize) b * W, *I = lin + (gsize) b * W;
+			MonoBasicBlock *x = bbs [b];
+			int oi, w;
+			for (oi = 0; oi < x->out_count; ++oi) {
+				MonoBasicBlock *s = x->out_bb [oi];
+				int si = (s && s->block_num >= 0 && s->block_num <= (int) cfg->max_block_num) ? idx [s->block_num] : -1;
+				for (w = 0; w < W; ++w) {
+					guint64 nv = O [w] | (si >= 0 ? lin [(gsize) si * W + w] : ~(guint64) 0);
+					if (nv != O [w]) { O [w] = nv; changed = TRUE; }
+				}
+			}
+			for (w = 0; w < W; ++w) {
+				guint64 nv = use [(gsize) b * W + w] | (O [w] & ~def [(gsize) b * W + w]);
+				if (nv != I [w]) { I [w] = nv; changed = TRUE; }
+			}
+		}
+	} while (changed);
+	/* backward walk per block: classify each effective GC point and record what it observes */
+	hot = (guint8 *) mono_mempool_alloc0 (cfg->mempool, ncand);
+	cap_rec = 256;
+	rec_ord = (int *) g_malloc (sizeof (int) * cap_rec);
+	rec_v = (int *) g_malloc (sizeof (int) * cap_rec);
+	for (b = 0; b < nbbs; ++b) {
+		MonoBasicBlock *x = bbs [b];
+		int ord = start [b + 1] - 1;
+		memcpy (live, lout + (gsize) b * W, sizeof (guint64) * W);
+		for (ins = x->last_ins; ins; ins = ins->prev, --ord) {
+			int nu = wj_pc_uses (ins, uses, G_N_ELEMENTS (uses));
+			int dc = (!wj_pc_dreg_is_base (ins->opcode) && ins->dreg >= 0 && ins->dreg < nvreg) ? cidx [ins->dreg] : -1;
+			if (wj_ins_is_effective_gcpoint (cfg, ins)) {
+				gboolean is_cold = !wj_ins_is_raise (ins) && (ins->opcode == OP_GC_SAFE_POINT || x->out_of_line);
+				int a, w;
+				/* OBS = (live after, without the def) | uses | alias sources at this ordinal */
+				memcpy (obs, live, sizeof (guint64) * W);
+				if (dc >= 0) PC_CLR (obs, dc);
+				for (k = 0; k < nu; ++k)
+					if (uses [k] >= 0 && uses [k] < nvreg && cidx [uses [k]] >= 0)
+						PC_SET (obs, cidx [uses [k]]);
+				for (a = 0; a < nal; ++a)
+					if (pa_o [a] == ord && pa_s [a] >= 0 && pa_s [a] < nvreg && cidx [pa_s [a]] >= 0)
+						PC_SET (obs, cidx [pa_s [a]]);
+				for (w = 0; w < W; ++w) {
+					guint64 m = obs [w];
+					while (m) {
+						int bit = __builtin_ctzll (m), c = w * 64 + bit;
+						m &= m - 1;
+						if (!is_cold) {
+							hot [c] = 1;
+						} else {
+							if (nrec == cap_rec) {
+								cap_rec *= 2;
+								rec_ord = (int *) g_realloc (rec_ord, sizeof (int) * cap_rec);
+								rec_v = (int *) g_realloc (rec_v, sizeof (int) * cap_rec);
+							}
+							rec_ord [nrec] = ord; rec_v [nrec] = c; nrec++;
+						}
+					}
+				}
+				if (is_cold) out->ncold_pts++; else out->nhot_pts++;
+			}
+			if (dc >= 0) PC_CLR (live, dc);
+			for (k = 0; k < nu; ++k)
+				if (uses [k] >= 0 && uses [k] < nvreg && cidx [uses [k]] >= 0)
+					PC_SET (live, cidx [uses [k]]);
+		}
+	}
+#undef PC_SET
+#undef PC_CLR
+#undef PC_TST
+	out->cold = (guint8 *) mono_mempool_alloc0 (cfg->mempool, nvreg);
+	for (k = 0; k < ncand; ++k)
+		if (!hot [k]) { out->cold [cv [k]] = 1; out->ncold++; }
+	if (out->ncold == 0) {
+		out->cold = NULL;
+		g_free (rec_ord); g_free (rec_v);
+		return FALSE;
+	}
+	out->fhead = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nins + 1));
+	for (k = 0; k <= nins; ++k)
+		out->fhead [k] = -1;
+	out->fnext = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nrec ? nrec : 1));
+	out->fvreg = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nrec ? nrec : 1));
+	for (k = 0; k < nrec; ++k) {
+		int vv = cv [rec_v [k]];
+		if (!out->cold [vv])
+			continue;   /* a hot point also observes it: its def mirror keeps the slot current */
+		out->fvreg [out->nflush] = vv;
+		out->fnext [out->nflush] = out->fhead [rec_ord [k]];
+		out->fhead [rec_ord [k]] = out->nflush;
+		out->nflush++;
+	}
+	g_free (rec_ord); g_free (rec_v);
+	return TRUE;
+}
+#endif
+
 void
 mono_wasm_emit_method (MonoCompile *cfg)
 {
@@ -2294,12 +2530,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * slot elision is not in play, in which case every isref vreg is pinned and the question is moot. */
 	guint8 *lcse_nopin = NULL;
 	int *sl_kill_next = NULL;          /* [nvreg] chain */
+	/* MONO_WASM_JIT_PIN_COLD: the plan (wj_pin_cold_plan), and the PIN_ALIAS pairs it must see (carrier, source, call
+	 * ordinal), stashed from the SLOTLIVE block. pc.cold NULL = off for this method. */
+	WjPinCold pcold G_GNUC_UNUSED;
+	int *pc_pa_c G_GNUC_UNUSED = NULL, *pc_pa_s G_GNUC_UNUSED = NULL, *pc_pa_o G_GNUC_UNUSED = NULL, pc_nal G_GNUC_UNUSED = 0;
 	int addrbase_idx = 0;              /* i32 local: addressable-locals frame base address (OP_LDADDR) */
 	int addr_tmp_idx [4] = { 0, 0, 0, 0 }; /* per-type scratch locals for addr-frame stores (i32/i64/f32/f64) */
 	gboolean has_rrem = FALSE;         /* TRUE: method has an inline-lowered OP_RREM (float32 %) */
 	int rrem_tmp = -1;                 /* two f64 scratch locals for it: |x|, then the remainder; |y| */
 	int naddrbytes = 0;                /* total bytes of addressable-locals frame (8 per address-taken local) */
 	WjCtx lc;
+	memset (&pcold, 0, sizeof (pcold));
 	int *bbidx;
 	int structured_cfg_kind = WJ_CFG_DISPATCH;
 	int structured_loop_h = -1, structured_loop_l = -1;
@@ -3392,7 +3633,7 @@ co_ranges_done:
 	lc.li = li; lc.nvreg = nvreg; lc.refslot = NULL; lc.ref_wt = NULL; lc.refbase = refbase_idx; lc.rtmp = rtmp_idx;
 	/* In lazy methods spentry is zero until materialization, then becomes the nonzero entry SP.
 	 * Reuse it as the active marker instead of reserving one extra i32 local in every JIT method. */
-	lc.lazy_frame = 0; lc.frame_active = spentry_idx;
+	lc.lazy_frame = 0; lc.frame_active = spentry_idx; lc.pin_cold = NULL;
 	lc.vt = vt; lc.addrbase = addrbase_idx;
 	{ /* addrslot must be visible to the OP_LDADDR emit when there are ONLY sentinel entries (refvt -2 /
 	   * by-addr arg -3, no addr-frame bytes) — otherwise naddrbytes==0 would NULL it and those ldaddrs
@@ -4171,6 +4412,7 @@ co_ranges_done:
 					needs_slot [c_] = TRUE;
 					wj_count (WJC_PIN_ALIAS_BAD);
 				}
+				pc_pa_c = pa_c; pc_pa_s = pa_s; pc_pa_o = pa_o; pc_nal = nal;
 				if (pin_alias >= 2 && nal > 0) {
 					pa_vhead = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (nins + 1));
 					pa_vnext = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * nal);
@@ -4343,6 +4585,32 @@ co_ranges_done:
 			mono_wasm_jit_add (WJC_REF_SLOTS, nrefslots);
 			mono_wasm_jit_add (WJC_FRAME_BYTES, framebytes);
 		}
+#ifdef HOST_BROWSER
+		/* MONO_WASM_JIT_PIN_COLD: the exclusions are the plan's preconditions (wj_pin_cold_plan) */
+		{
+			extern int mono_wasm_jit_pin_cold;
+			if (mono_wasm_jit_pin_cold && nrefslots > 0 && lc.ref_wt && !lazy_ref_frame && !eh_on && gcp_walked &&
+			    cfg->header->num_clauses == 0 && naddrbytes == 0 && !lc.storeguard && !lc.objguard &&
+			    mono_wasm_jit_raise_nogc != 2 &&
+			    wj_pin_cold_plan (cfg, nvreg, refslot, lc.ref_wt, li, addrslot, pc_pa_c, pc_pa_s, pc_pa_o, pc_nal, &pcold)) {
+				lc.pin_cold = pcold.cold;
+				/* LCSE must not extend a cold-only ref's range past a GC point the plan did not see */
+				if (!lcse_nopin) {
+					lcse_nopin = pcold.cold;
+				} else {
+					guint8 *m = (guint8 *) mono_mempool_alloc (cfg->mempool, nvreg);
+					for (i = 0; i < nvreg; ++i)
+						m [i] = lcse_nopin [i] | pcold.cold [i];
+					lcse_nopin = m;
+				}
+				if (G_UNLIKELY (mono_wasm_jit_stats)) {
+					mono_wasm_jit_add (WJC_PIN_COLD_VREGS, pcold.ncold);
+					mono_wasm_jit_add (WJC_PIN_COLD_FLUSHES, pcold.nflush);
+					mono_wasm_jit_count (WJC_PIN_COLD_METHODS);
+				}
+			}
+		}
+#endif
 
 		/* MISSED-REF FINDER (MONO_WASM_JIT_MISSEDREF=1): the corruptor class is a ref left in a plain
 		 * wasm local (isref=FALSE) that goes stale after a GC. The dangerous uses are dereferences: a MEMBASE
@@ -4820,6 +5088,15 @@ co_ranges_done:
 /* Materialize before a call that C++-throws, so exception allocation cannot run while this method's
  * roots live only in wasm locals. */
 #define RAISE_ENSURE_REF_FRAME() ENSURE_REF_FRAME ()
+
+/* MONO_WASM_JIT_PIN_COLD: store the cold-only refs the current instruction observes (pc.fhead chains, by the SLOTLIVE
+ * ordinal). Before a cold call; inside a poll's taken arm. */
+#define PIN_COLD_FLUSH() do { if (G_UNLIKELY (pcold.fhead != NULL)) { int _pk; \
+	for (_pk = pcold.fhead [my_ord]; _pk >= 0; _pk = pcold.fnext [_pk]) { int _pv = pcold.fvreg [_pk]; \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) li [_pv]); \
+		wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [_pv] * 4)); \
+	} } } while (0)
 
 
 	/* MONO_WASM_JIT_NCE: per-bb "already proven non-null" vreg bitmap (see the flag's comment).
@@ -6136,7 +6413,7 @@ co_ranges_done:
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 				}
 				while (kv >= 0) {
-					if (!lazy_cold_frame) {
+					if (!lazy_cold_frame && !(pcold.cold && pcold.cold [kv])) {   /* PIN_COLD: never mirrored at a def */
 						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
 						wasm_i32_const (&body, 0);
 						wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [kv] * 4));
@@ -6159,6 +6436,8 @@ co_ranges_done:
 			    !(lazy_ref_frame && terminal_vcall_handoff && ins == terminal_vcall_ins);
 			if (wj_ins_framed)
 				ENSURE_REF_FRAME ();
+			if (wj_ins_framed && ins->opcode != OP_GC_SAFE_POINT)
+				PIN_COLD_FLUSH ();   /* a poll flushes in its taken arm */
 			/* MONO_WASM_JIT_PIN_ALIAS=2/3: before an aliased call (its frame ensured just above: the call is an
 			 * effective GC point and not the terminal handoff), the source's slot must hold the carrier's value;
 			 * a miss counts WJC_PIN_ALIAS_RT_BAD. Stack-neutral. A cold-only lazy frame has no hot calls. */
@@ -6583,7 +6862,7 @@ co_ranges_done:
 							}
 						}
 						if (_t2c) {
-							ENSURE_REF_FRAME ();
+							ENSURE_REF_FRAME (); PIN_COLD_FLUSH ();
 							wasm_i32_const (&body, (gint32) (intptr_t) cfg->wasm_jit_caller_imethod);
 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_t2_count_hit, (guint32) pci);
 							RELEASE_LAZY_REF_FRAME ();
@@ -6630,7 +6909,7 @@ co_ranges_done:
 						}
 						WJ_HINT (0);
 						wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-						ENSURE_REF_FRAME ();
+						ENSURE_REF_FRAME (); PIN_COLD_FLUSH ();
 						wasm_i32_const (&body, (gint32) (intptr_t) cfg->wasm_jit_caller_imethod);
 						wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_t2_count_hit, (guint32) pci);
 						RELEASE_LAZY_REF_FRAME ();
@@ -6683,7 +6962,7 @@ co_ranges_done:
 						wasm_op (&body, WASM_OP_I32_EQZ);
 						WJ_HINT (0);
 						wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
-						ENSURE_REF_FRAME ();
+						ENSURE_REF_FRAME (); PIN_COLD_FLUSH ();
 						wasm_i32_const (&body, (gint32) (intptr_t) cfg->wasm_jit_caller_imethod);
 						wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_t2_count_hit, (guint32) plci);
 						RELEASE_LAZY_REF_FRAME ();
@@ -6716,7 +6995,7 @@ co_ranges_done:
 					WJ_HINT (0);   /* R339: the action word is almost always 0 */
 					wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);
 					/* Materialize roots inside the rare taken arm, not before the flag load. */
-					ENSURE_REF_FRAME ();
+					ENSURE_REF_FRAME (); PIN_COLD_FLUSH ();
 					/* Direct import: a C function address in dotnet.native.wasm, fixed for the process. The ENTRY
 					 * poll gets its own helper while edge sampling is on (R295), so a sample is a method entry. */
 					{

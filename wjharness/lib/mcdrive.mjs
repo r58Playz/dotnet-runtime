@@ -492,6 +492,7 @@ const SANDBOXED_RENDERER_LIMIT = 8 * 1024 ** 3;
  * matches the profile path on its own cmdline, and picking it would measure the wrong thing. */
 function findRendererPid (profile) {
   let best = null, bestN = 0;
+  if (!existsSync("/proc")) return null;   /* darwin: no procfs; the memory sampler reports nothing */
   for (const d of readdirSync("/proc")) {
     if (!/^\d+$/.test(d)) continue;
     let cl = "";
@@ -1210,7 +1211,7 @@ export function buildUrl ({ base = serveUrl(), knobs = {}, runtimeOptions = {}, 
 export function launchGame ({ url, profile, logPath, jsFlags = null, extraArgs = [], headless = true, chromeBin = null }) {
   const bin = chromeBin || process.env.CHROME_BIN || "/usr/bin/chromium";
   const cdpPort = process.env.MC_CDP_PORT || 9333;
-  for (const d of readdirSync("/proc")) {
+  for (const d of existsSync("/proc") ? readdirSync("/proc") : []) {   /* darwin: no procfs, no stale-browser check */
     if (!/^\d+$/.test(d)) continue;
     let cmd;
     try { cmd = readFileSync(`/proc/${d}/cmdline`, "utf8"); } catch { continue; }

@@ -10708,20 +10708,22 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					 * Java is EH-dense and mono refuses to inline ANY method carrying a try/catch. SIZE
 					 * is the one a knob can move. OTHER is everything else, and it existing at all is
 					 * what stops the first two from quietly absorbing a cause nobody named. */
+					/* the size the gate above tested: tier 2's cap (T2_GI_SIZE) where set, else GUARDED_INLINE_SIZE */
+					int gi_limit = cfg->wasm_gi_size > 0 ? cfg->wasm_gi_size : mono_wasm_jit_guarded_inline_size;
 					if (G_UNLIKELY (cfg->verbose_level > 2)) {
 						/* for MONO_VERBOSE_METHOD roots: the gate's own reason (WJ_T2R_WHY; NULL = the size test) */
 						MonoMethodHeaderSummary gi_vhs;
 						printf ("GI REFUSED %s -> %s: %s (IL %d, limit %d)\n", mono_method_full_name (cfg->method, TRUE),
 							mono_method_full_name (gi_target, TRUE), cfg->wasm_t2r_why ? cfg->wasm_t2r_why : "size",
 							mono_method_get_header_summary (gi_target, &gi_vhs) ? (int) gi_vhs.code_size : -1,
-							cfg->wasm_gi_size > 0 ? cfg->wasm_gi_size : mono_wasm_jit_guarded_inline_size);
+							gi_limit);
 					}
 					{   /* W3 census: which check_inlining refusal (the header summary is the one it just read) */
 						extern int mono_wasm_jit_site_count;
 						if (G_UNLIKELY (mono_wasm_jit_site_count)) {
 							MonoMethodHeaderSummary gi_hs2;
 							wj_site_gi_note (cfg, ip, !mono_method_get_header_summary (gi_target, &gi_hs2) ? 'O'
-								: gi_hs2.has_clauses ? 'E' : (int) gi_hs2.code_size >= mono_wasm_jit_guarded_inline_size ? 'Z' : 'O');
+								: gi_hs2.has_clauses ? 'E' : (int) gi_hs2.code_size >= gi_limit ? 'Z' : 'O');
 						}
 					}
 					if (G_UNLIKELY (mono_wasm_jit_stats)) {
@@ -10730,7 +10732,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 							mono_wasm_jit_count (WJC_GI_REFUSED_OTHER);
 						else if (gi_hs.has_clauses)
 							mono_wasm_jit_count (WJC_GI_REFUSED_CLAUSES);
-						else if ((int) gi_hs.code_size >= mono_wasm_jit_guarded_inline_size)
+						else if ((int) gi_hs.code_size >= gi_limit)
 							mono_wasm_jit_count (WJC_GI_REFUSED_SIZE);
 						else
 							mono_wasm_jit_count (WJC_GI_REFUSED_OTHER);

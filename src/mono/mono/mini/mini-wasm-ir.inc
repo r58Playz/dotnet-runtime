@@ -742,6 +742,10 @@ typedef struct {
 	int lazy_frame;       /* 0 eager; 1 absent until the first effective returning GC point; 2 cold-only:
 	                       * materialised solely inside raise/poll taken arms (MONO_WASM_JIT_LAZY_COLD) */
 	int frame_active;     /* wasm i32 local: lazy frame has been materialized */
+	/* MONO_WASM_JIT_PIN_COLD: per-vreg, the slotted write-through refs only COLD GC points observe (their stores
+	 * sit before those points, wj_pin_cold_plan); a def stores the local only. NULL = every slotted ref mirrors at
+	 * its def. */
+	guint8 *pin_cold;
 	/* OP_LDADDR support: address-taken SCALAR locals live in the per-thread addressable-locals frame
 	 * (linear memory) instead of a wasm local, so their address can be passed to callees. addrslot[vreg]
 	 * is the byte offset into that frame (>=0 if the vreg is such a local, else -1); addrbase is the wasm
@@ -2766,7 +2770,7 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
 		/* lazy_frame 2 (MONO_WASM_JIT_LAZY_COLD): the frame is only ever live inside a raise or poll taken
 		 * arm, never at a def, and the gate required every slotted ref to be write-through -- the local
 		 * just set IS the value home, and ENSURE_REF_FRAME copies it into the slot when a GC can happen. */
-		if (c->lazy_frame == 2) {
+		if (c->lazy_frame == 2 || (c->pin_cold && c->pin_cold [vreg])) {
 			wasm_origin_pop (b, _o);
 			return TRUE;
 		}

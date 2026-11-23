@@ -1600,6 +1600,9 @@ enum {
 	WJC_T1U_COMPILE_FAIL,        /* ... candidates whose compile produced nothing (left to their own threshold) */
 	WJC_T1U_FRAME_FAIL,          /* ... units whose framing failed (members published alone) */
 	WJC_T1U_PUBLISH_FAIL,        /* ... members compiled but refused at publication (a body swap landed in between) */
+	WJC_PIN_COLD_METHODS,        /* MONO_WASM_JIT_PIN_COLD: compiles with at least one cold-only ref */
+	WJC_PIN_COLD_VREGS,          /* ... cold-only refs (no def mirror) */
+	WJC_PIN_COLD_FLUSHES,        /* ... stores placed before cold GC points (static) */
 	WJC_MAX
 };
 
