@@ -10617,6 +10617,18 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						}
 						wj_gi_count (WJC_RECV_GI_PRED);
 					}
+				  }
+				  /* MONO_WASM_JIT_S3 & 16: a PROFILE prediction that names the base itself (a vtable or method-identity guard,
+				   * both of which read the receiver's header first) takes the CHA word while nothing overrides the base: one
+				   * load of a hot global instead of a load of a possibly cold receiver line (M11). */
+				  if (gi_pred && !gi_cha && gi_target == cmethod && (gi_vt || gi_mid_slot >= 0) && (mono_wasm_jit_s3 & 17) == 17 &&
+				      s3_tier_ok && !mono_class_is_interface (cmethod->klass)) {
+					gboolean pc_cand = FALSE;
+					gint32 *pc_word = mono_wasm_jit_cha_final_word (cmethod, &pc_cand);
+					if (pc_word) {
+						gi_cha = pc_word; gi_vt = NULL; gi_mid_slot = -1; gi_widened = FALSE;
+						wj_gi_count (WJC_S3_GI_PROF);
+					}
 				  } }
 				/* MONO_WASM_JIT_IDHASH (knob comment in mini-wasm.c): a site nothing above predicted that calls
 				 * System.Object's GetHashCode (bit 1) or Equals(object) (bit 2) inlines Object's own body behind the

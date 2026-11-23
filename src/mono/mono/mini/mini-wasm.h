@@ -1605,6 +1605,8 @@ enum {
 	WJC_PIN_COLD_FLUSHES,        /* ... stores placed before cold GC points (static) */
 	WJC_TLS_SD_SITES,            /* MONO_WASM_JIT_TLS_SD: ThreadStatic addresses emitted through the static_data cache */
 	WJC_TLS_SD_FALLBACK_SITES,   /* ... (the same sites: each carries the thread-chain fallback) */
+	WJC_S3_GI_PROF,              /* MONO_WASM_JIT_S3 & 16: profile predictions of the base whose receiver guard the CHA word replaced */
+	WJC_CLASSREC_ARRAY_SITES,    /* MONO_WASM_JIT_CLASS_RECORD & 4: vector castclasses given an exact-vtable fast path (compile time) */
 	WJC_MAX
 };
 

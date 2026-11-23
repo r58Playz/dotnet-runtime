@@ -1415,7 +1415,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_s2_budget, "MONO_WASM_JIT_S2_BUDGET", 0, 1000000)
 	WJ_T2_KNOB (mono_wasm_jit_s2_cold, "MONO_WASM_JIT_S2_COLD", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_s2_bb, "MONO_WASM_JIT_S2_BB", 0, 2)
-	WJ_T2_KNOB (mono_wasm_jit_s3, "MONO_WASM_JIT_S3", 0, 15)
+	WJ_T2_KNOB (mono_wasm_jit_s3, "MONO_WASM_JIT_S3", 0, 31)
 	WJ_T2_KNOB (mono_wasm_jit_s4, "MONO_WASM_JIT_S4", 0, 3)
 	WJ_T2_KNOB (mono_wasm_jit_t2_strict, "MONO_WASM_JIT_T2_STRICT", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_strict_limit, "MONO_WASM_JIT_T2_STRICT_LIMIT", 1, 1000)
@@ -1798,10 +1798,14 @@ int mono_wasm_jit_s2_bb = 0;
  *      base behind a one-load guard on its word;
  *   2  the emitter's devirt arm: such a site calls the base's f-slot behind the same guard instead of the IC;
  *   4  verify: a CHA arm also checks the receiver's vtable slot, and counts a mismatch (must read 0);
- *   8  bits 1 and 2 at tier 2 only -- CHA's extra code at both tiers cost +319 MiB peak VmData (R397).
+ *   8  bits 1 and 2 at tier 2 only -- CHA's extra code at both tiers cost +319 MiB peak VmData (R397);
+ *  16  with 1: a PROFILE prediction naming the base itself takes the CHA word instead of its receiver guard, which loads
+ *      the receiver's header (a vtable guard) and, for a method-identity guard, vt->klass->vtable[slot] too (M11).
  * 11 = arms + GI at tier 2: b10 census (2026-10-02, server tick, P-cores, on the S0 + S2 base) -4.9% cycles, peak
- * VmData +32 MiB (R398); both tiers (3) -5.7% at +326 MiB. */
-int mono_wasm_jit_s3 = 11;
+ * VmData +32 MiB (R398); both tiers (3) -5.7% at +326 MiB. 27 = 11 + 16: mctick (M4 Mac, goal protocol, one binary,
+ * n=3 a side, both orders, 2026-11-23) 16.28 -> 15.90 M cycles a tick, 3.98 -> 3.86 ms (ranges touch); jbox2d level;
+ * 8,251 sites converted, `[wasm-jit s3] wrong=0`. */
+int mono_wasm_jit_s3 = 27;
 /* MONO_WASM_JIT_T2_STRICT (plan2x S0b): 1 = a tier-2 compile that fails on T2_MAX_BODY is retried ONCE at tier 2 with
  * strict inlining (mono_wasm_force_compile) before the tier-1-policy downgrade; 0 = straight to the downgrade. Neutral
  * before VSITE_COMPACT, because the giants still missed the cap (R390); with it, part of R466's bundle (see there). */

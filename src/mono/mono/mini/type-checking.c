@@ -173,6 +173,24 @@ wj_sealed_vtable (MonoCompile *cfg, MonoClass *klass)
 		mono_wasm_jit_counters [WJC_CLASSREC_SEALED_SITES]++;
 	return vt;
 }
+
+/* Bit 4: KLASS's runtime vtable when KLASS is a vector (rank 1, SZARRAY): a castclass compares the object's vtable with
+ * it first and succeeds on a match, before the general array check (vt -> klass -> rank, cast_class -> supertypes, and
+ * the bounds word: ~5 dependent loads). IKVM's erased signatures (R527) cast every load of an array-typed field (M11). */
+static MonoVTable *
+wj_array_exact_vtable (MonoCompile *cfg, MonoClass *klass)
+{
+	MonoVTable *vt;
+	if (!COMPILE_WASM (cfg) || !(mono_wasm_class_record_bits () & 4) || m_class_get_rank (klass) != 1 ||
+	    m_class_get_byval_arg (klass)->type != MONO_TYPE_SZARRAY || wj_cast_target_unfinished (klass))
+		return NULL;
+	if (mono_wasm_class_record_had_provisional_vtable (klass) || mono_wasm_class_record_had_provisional_vtable (m_class_get_element_class (klass)))
+		return NULL;
+	vt = mono_class_try_get_vtable (klass);
+	if (vt)
+		mono_wasm_jit_counters [WJC_CLASSREC_ARRAY_SITES]++;
+	return vt;
+}
 #endif
 
 static void
@@ -530,6 +548,13 @@ handle_castclass (MonoCompile *cfg, MonoClass *klass, MonoInst *src, int context
 		}
 #endif
 		else {
+#ifdef HOST_BROWSER
+			MonoVTable *avt = (cfg->compile_aot || klass_inst) ? NULL : wj_array_exact_vtable (cfg, klass);
+			if (avt) {   /* B2 bit 4: the exact vector type passes on one compare */
+				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, vtable_reg, (gsize) avt);
+				MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, is_null_bb);
+			}
+#endif
 			MONO_EMIT_NEW_LOAD_MEMBASE (cfg, klass_reg, vtable_reg, MONO_STRUCT_OFFSET (MonoVTable, klass));
 			mini_emit_castclass_inst (cfg, obj_reg, klass_reg, klass, klass_inst, is_null_bb);
 		}
