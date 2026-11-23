@@ -73,11 +73,23 @@ logs.sort((a, b) => a.mtime - b.mtime);
 
 const DEDUPE_MS = 1000;
 const perClass = new Map();          // cls -> { events, files:Set, keys:Map }
+const clash = new Map();
 let filesWithAny = 0, scanned = 0;
 
 for (const { p } of logs) {
   let text; try { text = readFileSync(p, "utf8"); } catch { continue; }
   scanned++;
+  if (disjointOnly) {
+    for (const line of text.split("\n")) {
+      const hits = RULES_FOR_TEST.filter((r) => r.rx.test(line) && !(r.not && r.not.test(line))).map((r) => r.cls);
+      if (hits.length > 1) {
+        const k = hits.sort().join(" + ");
+        if (!clash.has(k)) clash.set(k, { n: 0, sample: line.trim().slice(-140) });
+        clash.get(k).n++;
+      }
+    }
+    continue;
+  }
   const seen = [];                   // {cls, at} of the last event per class, for dedupe
   const local = [];
   let lineNo = 0;
@@ -106,18 +118,6 @@ for (const { p } of logs) {
 }
 
 if (disjointOnly) {
-  const clash = new Map();
-  for (const { p } of logs) {
-    let t; try { t = readFileSync(p, "utf8"); } catch { continue; }
-    for (const line of t.split("\n")) {
-      const hits = RULES_FOR_TEST.filter((r) => r.rx.test(line) && !(r.not && r.not.test(line))).map((r) => r.cls);
-      if (hits.length > 1) {
-        const k = hits.sort().join(" + ");
-        if (!clash.has(k)) clash.set(k, { n: 0, sample: line.trim().slice(-140) });
-        clash.get(k).n++;
-      }
-    }
-  }
   if (!clash.size) { console.log(`\ndisjointness: OK over ${scanned} logs -- no line matches two classes\n`); process.exit(0); }
   console.log(`\ndisjointness: ${clash.size} OVERLAPPING PAIR(S) over ${scanned} logs`);
   for (const [k, v] of [...clash.entries()].sort((a, b) => b[1].n - a[1].n))

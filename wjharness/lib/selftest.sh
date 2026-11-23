@@ -1,11 +1,11 @@
 #!/bin/bash
-# wj selftest -- every self-check that needs no browser, capture or deploy. Seconds.
+# wj selftest -- every self-check that needs no browser, capture or deploy.
 #   syntax      node --check on every .mjs/.js, py_compile on every .py, bash -n on every .sh
 #   verdict     lib/verdict.mjs's selftest (real fault signatures from archived logs)
 #   hotinsn     read/hotinsn.py --selftest (the instruction classifier against known encodings)
 #   enctest     the encoder gates (enctest/run.sh: framers, serializer, stub banks executed in node)
 #   paths       no tool names this machine's paths (the portability gate), and paths.mjs resolves
-#   corpus      read/faultcensus.mjs --disjoint over $WJ_STATE/corpus, when it exists (~4 min over 4,506 logs; --no-corpus skips)
+#   corpus      read/faultcensus.mjs --disjoint over $WJ_STATE/corpus, when it exists (--no-corpus skips)
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 H=$WJ_HARNESS
