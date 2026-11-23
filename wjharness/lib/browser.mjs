@@ -18,6 +18,7 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { angleBackend } from "./paths.mjs";
 import "./paths.mjs";   // exports the resolved configuration (CHROME_BIN, ...) into process.env
 
 /* WJ_BLOCK_HOSTS=<host>[,<host>...]: hosts the browser must fail to resolve at once. The app's page loads an external
@@ -54,7 +55,7 @@ export function launchChrome({ extraArgs = [], headless = true, gl = true } = {}
     "--ignore-gpu-blocklist",
     ...(gl ? (process.env.MC_SOFTWARE_GL === "1"
       ? ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
-      : ["--use-gl=angle", `--use-angle=${process.env.MC_ANGLE || "gl"}`]) : []),
+      : ["--use-gl=angle", `--use-angle=${angleBackend()}`]) : []),
     "--js-flags=--stack-trace-limit=64",
     ...blockedHostArgs(),
     ...extraArgs,

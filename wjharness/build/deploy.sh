@@ -157,7 +157,7 @@ cp -r statics/ikvm/image frontend/public/
 # Neither surfaced while the jbox2d bench was the workload: it creates no GL window, and a JIT that
 # silently failed to link still yields a plausible (merely slower) ms/step.
 echo "deploy: applying post-publish patches"
-sed -i 's/this.appendULeb(32768)/this.appendULeb(65535)/' frontend/public/_framework/dotnet.runtime.*.js
+sedi 's/this.appendULeb(32768)/this.appendULeb(65535)/' frontend/public/_framework/dotnet.runtime.*.js
 # The transferredCanvasNames patch (2.) is GONE: ikvmcraft's Makefile dropped it on 2026-10-21 (commit 246560a, "css"),
 # with GL on the main thread by default and index.ts making the canvas resizable itself (glfwOnWindowCreated). This
 # script follows the Makefile, so a deploy serves what `make build` serves.
@@ -182,12 +182,12 @@ if [ "${#WS[@]}" -gt 1 ]; then
 	exit 1
 fi
 W="${WS[0]}"
-echo "deploy: served wasm = $(basename "$W")  $(( $(stat -c%s "$W") / 1048576 )) MB  ($(stat -c%y "$W" | cut -d. -f1))"
+echo "deploy: served wasm = $(basename "$W")  $(( $(fsize "$W") / 1048576 )) MB  ($(fmtime "$W"))"
 # Size is the cheapest AOT check there is: ~86 MB (82 MiB) with the AOT whitelist (CoreLib, IKVM.Runtime,
 # IKVM.ByteCode, System.Memory; 2026-11-05), ~35 MB without. The threshold was 100 MB from when the whole app was
 # AOT'd (~188 MB) and warned on every correct deploy since the whitelist. If this number moves by 2x between deploys,
 # the workload changed even though the runtime source did not.
-if [ "$(stat -c%s "$W")" -lt 60000000 ] && [ "${AOT:-true}" != "false" ]; then
+if [ "$(fsize "$W")" -lt 60000000 ] && [ "${AOT:-true}" != "false" ]; then
 	echo "  WARNING: AOT was requested but the wasm is small — check /tmp/ikvmcraft-publish.log" >&2
 fi
 
@@ -259,7 +259,16 @@ restarted=""
 # names used to coexist (ikvmcraft-dev / pnpm here-and-there, ikvmcraft-vite / npm here), so this branch missed the live
 # unit and killed its process from the one below.
 udir="$(systemctl --user show "$DEV_UNIT.service" -p WorkingDirectory --value 2>/dev/null)"
-if systemctl --user is-active --quiet "$DEV_UNIT.service" 2>/dev/null && [ "$udir" != "$APP/frontend" ]; then
+if [ "$WJ_OS" = Darwin ]; then
+	# No systemd on darwin: kill whatever holds the port and relaunch $DEV_CMD in a detached session.
+	vpid="$(port_pid "$VITE_PORT")"
+	if [ -n "$vpid" ]; then
+		kill "$vpid" 2>/dev/null
+		for _i in $(seq 1 15); do port_listening "$VITE_PORT" || break; sleep 1; done
+	fi
+	dev_server_start "$APP/frontend"
+	restarted="detached dev server in $APP/frontend${vpid:+ (replaced pid $vpid)}"
+elif systemctl --user is-active --quiet "$DEV_UNIT.service" 2>/dev/null && [ "$udir" != "$APP/frontend" ]; then
 	# The unit serves ANOTHER checkout (IKVMCRAFT now names a different tree, e.g. a worktree). A restart keeps the
 	# transient unit's working directory, so it would go on serving the old tree; re-create it here instead.
 	systemctl --user stop "$DEV_UNIT.service" 2>/dev/null
@@ -333,14 +342,14 @@ check_served () {   # <label> <url-path> <expected-bytes>
 	return 0
 }
 if [ -f "$W" ]; then
-	check_served "wasm" "/_framework/$(basename "$W")" "$(stat -c%s "$W")" || exit 1
+	check_served "wasm" "/_framework/$(basename "$W")" "$(fsize "$W")" || exit 1
 else   # split by split-resources.py above: the parts and the manifest are what the page fetches
-	check_served "wasm part 0" "/_framework/$(basename "$W")0" "$(stat -c%s "${W}0")" || exit 1
-	check_served "split manifest" "/_framework/split-resources.json" "$(stat -c%s frontend/public/_framework/split-resources.json)" || exit 1
+	check_served "wasm part 0" "/_framework/$(basename "$W")0" "$(fsize "${W}0")" || exit 1
+	check_served "split manifest" "/_framework/split-resources.json" "$(fsize frontend/public/_framework/split-resources.json)" || exit 1
 fi
 # a webcil build (WasmEnableWebcil) serves assemblies as .wasm
 DLL="$(ls frontend/public/_framework/IKVM.Runtime.*.dll frontend/public/_framework/IKVM.Runtime.*.wasm 2>/dev/null | head -1)"
 if [ -n "$DLL" ]; then
-	check_served "dll" "/_framework/$(basename "$DLL")" "$(stat -c%s "$DLL")" || exit 1
+	check_served "dll" "/_framework/$(basename "$DLL")" "$(fsize "$DLL")" || exit 1
 fi
 echo "deploy: ok"

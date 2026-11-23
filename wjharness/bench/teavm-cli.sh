@@ -46,7 +46,7 @@ done
 # compiled as part of the classlib module so the patched classes and these can refer to each other. Classes outside
 # java.* (sun.misc.Unsafe, javax.security.cert.X509Certificate) are not mapped by TeaVM and javac refuses them in that
 # module: they go into teavm-extra.jar, built below, under their own names.
-( cd "$HERE/teavm-classlib/src" && find . -name '*.java' -not -path './sun/*' -not -path './javax/*' -exec cp --parents {} "$WT/classlib/src/main/java/" \; )
+( cd "$HERE/teavm-classlib/src" && find . -name '*.java' -not -path './sun/*' -not -path './javax/*' | cp_parents "$WT/classlib/src/main/java" )
 ( cd "$WT" && JAVA_HOME="$JH" ./gradlew --no-daemon -q :tools:cli:shadowJar -x test -x javadoc )
 EX="$WJ_RUNS/.tmp/teavm-extra"; rm -rf "$EX"; mkdir -p "$EX/classes"
 "$JH/bin/javac" -nowarn --release 8 -d "$EX/classes" $(find "$HERE/teavm-classlib/src/sun" "$HERE/teavm-classlib/src/javax" -name '*.java')
@@ -70,7 +70,7 @@ rm -rf "$SVC"
   echo "teavm-cli $PIN ($(git -C "$TEAVM_DIR" log -1 --format='%ci %s' "$PIN"))"
   for p in "${PATCHES[@]}"; do [ -f "$p" ] && echo "  + $(basename "$p") $(sha256sum "$p" | cut -c1-12)"; done
   echo "  + bench/teavm-classlib $(cd "$HERE/teavm-classlib/src" && find . -name '*.java' | sort | xargs cat | sha256sum | cut -c1-12) ($(find "$HERE/teavm-classlib/src" -name '*.java' | wc -l) files)"
-  echo "built $(date -Is) with $("$JH/bin/java" -version 2>&1 | head -1)"
+  echo "built $(isodate) with $("$JH/bin/java" -version 2>&1 | head -1)"
   echo "sha256 $(sha256sum "$JAR" | cut -d' ' -f1)"
   echo "the last TeaVM commit with the linear-memory wasm backend (removed in d83fab4ae); see wjharness/bench/teavm-cli.sh"
 } > "$OUT/BUILD.txt"

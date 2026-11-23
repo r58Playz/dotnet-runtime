@@ -20,6 +20,7 @@ import { existsSync, readFileSync, mkdirSync } from "fs";
 import { resolve, join, dirname, relative, isAbsolute, delimiter } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
+import { execFileSync } from "child_process";
 
 export const HARNESS = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const REPO = resolve(HARNESS, "..");
@@ -38,12 +39,15 @@ const KEYS = [
   ["PRISM_INSTANCE", "the native Prism instance natrun drives (MCSRRanked-Linux-1.16.1-Basic)", undefined],
   ["NW_TAR", "the OPFS export tar ours plays (mods, config, options, save): natrun restores its world from it; mcstage stages it whole for the 1.16.1 stage `sa` (--tar)", undefined],
   ["PRISM_HOME", "Prism Launcher's data dir: mcstage reads libraries/, assets/ and meta/org.lwjgl3 from it, read-only", () => {
-    const d = join(HOME, ".local", "share", "PrismLauncher"); return existsSync(join(d, "libraries")) ? d : undefined; }],
+    for (const d of [join(HOME, ".local", "share", "PrismLauncher"), join(HOME, "Library", "Application Support", "PrismLauncher")])
+      if (existsSync(join(d, "libraries"))) return d;
+    return undefined; }],
   ["D8", "a d8 binary for ledger/d8x86.py", undefined],
   ["FNA_WASM_BUILD", "the FNA-WASM-Build checkout (build-dotnet.sh)", () => resolve(REPO, "..", "FNA-WASM-Build")],
   ["DOTNET_ZIP", "the runtime pack build-dotnet.sh writes and deploy installs", () => join(REPO, "dotnet-jit.zip")],
   ["EMSDK", "the canonical emsdk (llvm-dwarfdump, embuilder)", () => cfg("IKVMCRAFT") && join(cfg("IKVMCRAFT"), "statics", "emsdk")],
-  ["CHROME_BIN", "the browser every driver launches", () => which("chromium") || which("chromium-browser") || which("google-chrome-stable")],
+  ["CHROME_BIN", "the browser every driver launches", () => which("chromium") || which("chromium-browser") || which("google-chrome-stable")
+    || ["/Applications/Chromium.app/Contents/MacOS/Chromium", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"].find((p) => existsSync(p))],
   ["SERVE_URL", "where the dev server serves the app", () => "https://localhost:5021/"],
   ["DEV_UNIT", "systemd --user unit that runs the dev server", () => "ikvmcraft-dev"],
   ["DEV_CMD", "the dev server command (run in $IKVMCRAFT/frontend)", () => "pnpm dev"],
@@ -113,9 +117,25 @@ function which (bin) {
   return undefined;
 }
 function jdk (n) {
-  for (const p of [`/usr/lib/jvm/java-${n}-openjdk`, `/usr/lib/jvm/java-${n}-openjdk-amd64`, `/usr/lib/jvm/jdk-${n}`])
+  for (const p of [`/usr/lib/jvm/java-${n}-openjdk`, `/usr/lib/jvm/java-${n}-openjdk-amd64`, `/usr/lib/jvm/jdk-${n}`,
+    `/opt/homebrew/opt/openjdk@${n}/libexec/openjdk.jdk/Contents/Home`])
     if (existsSync(join(p, "bin", "java"))) return p;
+  if (process.platform === "darwin") {
+    /* java_home -v N matches N or newer unless it is exact: check the version it reports. */
+    try {
+      const p = execFileSync("/usr/libexec/java_home", ["-v", String(n)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const rel = readSys(join(p, "release")) || "";
+      const v = (/^JAVA_VERSION="(?:1\.)?(\d+)/m.exec(rel) || [])[1];
+      if (p && Number(v) === n && existsSync(join(p, "bin", "java"))) return p;
+    } catch {}
+  }
   return undefined;
+}
+/* sysctl -n <name> on darwin, or undefined. */
+function sysctl (name) {
+  if (process.platform !== "darwin") return undefined;
+  try { return execFileSync("/usr/sbin/sysctl", ["-n", name], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  catch { return undefined; }
 }
 function readSys (p) { try { return readFileSync(p, "utf8").trim(); } catch { return undefined; } }
 
@@ -143,6 +163,15 @@ export function formatCpuList (list) {
 let topoCache;
 function topo () {
   if (topoCache) return topoCache;
+  /* Apple silicon: perflevel0 is the P-cluster. macOS has no hard affinity, so these lists are recorded, not pinned
+   * (the drivers skip taskset on darwin); the P-count says how many threads can run at full speed. */
+  const np = Number(sysctl("hw.perflevel0.logicalcpu")), nall = Number(sysctl("hw.logicalcpu"));
+  if (np > 0 && nall >= np) {
+    const all = [...Array(nall).keys()];
+    topoCache = { p: formatCpuList(all.slice(0, np)), e: formatCpuList(all.slice(np)), census: formatCpuList(all.slice(np)),
+      boot: formatCpuList(all) };
+    return topoCache;
+  }
   const core = readSys("/sys/devices/cpu_core/cpus"), atom = readSys("/sys/devices/cpu_atom/cpus");
   if (core && atom) {
     const e = parseCpuList(atom);
@@ -244,3 +273,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   if (process.argv.includes("--json")) console.log(JSON.stringify(o));
   else for (const [k, v] of Object.entries(o)) console.log(`export ${k}='${String(v).replace(/'/g, "'\\''")}'`);
 }
+
+/* Platform shims. macOS has no hard CPU affinity (no taskset): an arm runs unpinned there and the run's window.json
+ * still records WJ_PCPUS. APFS clones with `cp -c`, btrfs/xfs reflink with `--reflink=auto`. ANGLE's GL backend is
+ * deprecated on macOS: Metal is its native one. */
+export const IS_DARWIN = process.platform === "darwin";
+export const pinPrefix = (cpus) => (IS_DARWIN || !cpus ? [] : ["taskset", "-c", cpus]);
+export const cloneCopyArgs = (src, dest) => (IS_DARWIN ? ["-c", "-a", src, dest] : ["-a", "--reflink=auto", src, dest]);
+export const angleBackend = () => process.env.MC_ANGLE || (IS_DARWIN ? "metal" : "gl");

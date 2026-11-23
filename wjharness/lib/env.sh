@@ -42,7 +42,7 @@ wj_setenv_args () {
 
 # wj_outdir DIR -- refuse an output directory inside the harness code.
 wj_outdir () {
-  local abs; abs=$(realpath -m "$1")
+  local abs; abs=$(wj_abspath "$1")
   case "$abs/" in "$WJ_HARNESS"/*) echo "refusing to write output inside the harness code ($abs); use $WJ_RUNS/..." >&2; exit 1 ;; esac
   printf '%s' "$abs"
 }
@@ -53,3 +53,35 @@ wj_rundir () {
   [ -e "$d" ] && d="$d-$(date +%H%M%S)"
   mkdir -p "$d" && printf '%s' "$d"
 }
+
+# ---- portability (GNU coreutils on Linux, BSD userland on darwin)
+WJ_OS=$(uname -s)
+# wj_abspath P -- absolute, normalised, need not exist (realpath -m).
+wj_abspath () { python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+# fsize F -- bytes; fmtime F -- "YYYY-MM-DD HH:MM:SS".
+fsize () { wc -c < "$1" | tr -d ' '; }
+fmtime () { if [ "$WJ_OS" = Darwin ]; then stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$1"; else stat -c%y "$1" | cut -d. -f1; fi; }
+# sedi EXPR FILE... -- in-place sed.
+sedi () { if [ "$WJ_OS" = Darwin ]; then sed -i '' "$@"; else sed -i "$@"; fi; }
+# port_listening PORT -- exit 0 when something listens on TCP PORT; port_pid PORT -- its pid.
+port_listening () { if [ "$WJ_OS" = Darwin ]; then lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; else ss -ltn 2>/dev/null | grep -q ":$1 "; fi; }
+port_pid () {
+  if [ "$WJ_OS" = Darwin ]; then lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1
+  else ss -ltnp 2>/dev/null | awk -v p=":$1" '$4 ~ p".*" {match($0, /pid=[0-9]+/); if (RSTART) print substr($0, RSTART+4, RLENGTH-4)}' | head -1; fi
+}
+# detach DIR LOG CMD... -- run CMD in DIR in a new session, outliving the caller (darwin has no setsid command).
+detach () {
+  local dir=$1 log=$2; shift 2
+  ( cd "$dir" && nohup python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" </dev/null >"$log" 2>&1 & disown ) 2>/dev/null
+}
+# dev_server_start -- (re)start $DEV_CMD in $APP/frontend: a systemd --user unit on Linux, a detached session on darwin
+# (log /tmp/ikvmcraft-dev.log).
+dev_server_start () {
+  if [ "$WJ_OS" = Darwin ]; then detach "$1" /tmp/ikvmcraft-dev.log bash -lc "exec $DEV_CMD"; return 0; fi
+  systemctl --user reset-failed "$DEV_UNIT" >/dev/null 2>&1
+  systemd-run --user --quiet --unit="$DEV_UNIT" --working-directory="$1" -- bash -lc "exec $DEV_CMD </dev/null"
+}
+# cp_parents DEST -- copy each relative path read from stdin to DEST/<path>, creating directories (GNU cp --parents).
+cp_parents () { local f; while IFS= read -r f; do mkdir -p "$1/$(dirname "$f")"; cp "$f" "$1/$f"; done; }
+# isodate -- ISO 8601 now, seconds precision (GNU date -Is).
+isodate () { date +%Y-%m-%dT%H:%M:%S%z; }

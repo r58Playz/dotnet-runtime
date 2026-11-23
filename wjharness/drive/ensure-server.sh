@@ -11,6 +11,15 @@ set -u
 APP=$(need IKVMCRAFT "the dev server serves $IKVMCRAFT/frontend")
 U=$DEV_UNIT
 PORT=$(node -e 'const u=new URL(process.argv[1]); console.log(u.port || (u.protocol==="https:"?443:80))' "$SERVE_URL")
+if [ "$WJ_OS" = Darwin ]; then
+  # No systemd: whatever listens on the port is the server. A 200 from it is accepted (a server rooted in another
+  # checkout is not detected here: check `lsof -p <pid> | grep cwd` if IKVMCRAFT changed).
+  for _ in $(seq 1 40); do
+    [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$SERVE_URL" 2>/dev/null)" = "200" ] && exit 0
+    port_listening "$PORT" || { dev_server_start "$APP/frontend"; sleep 5; }
+    sleep 3
+  done
+else
 # A 200 from a server rooted in ANOTHER checkout is not this app: IKVMCRAFT may name a different tree (a worktree)
 # than the one the running unit was started in. Stop it; the loop below re-creates it in $APP/frontend.
 udir=$(systemctl --user show "$U" -p WorkingDirectory --value 2>/dev/null)
@@ -23,11 +32,12 @@ for _ in $(seq 1 40); do
   if ! systemctl --user is-active "$U" >/dev/null 2>&1; then
     systemctl --user stop "$U" >/dev/null 2>&1
     systemctl --user reset-failed "$U" >/dev/null 2>&1
-    for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$PORT " || break; sleep 1; done
+    for _ in $(seq 1 30); do port_listening "$PORT" || break; sleep 1; done
     systemd-run --user --quiet --unit="$U" \
       --working-directory="$APP/frontend" -- bash -lc "$DEV_CMD"
   fi
   sleep 3
 done
+fi
 echo "ensure-server: dev server never reached HTTP 200" >&2
 exit 1

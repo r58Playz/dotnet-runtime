@@ -13,7 +13,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$WJ_STATE/arms/mctick"; STAGE=sa262n; OPT=3; DEBUG=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --out) OUT=$(realpath -m "$2"); shift 2 ;;
+    --out) OUT=$(wj_abspath "$2"); shift 2 ;;
     --stage) STAGE=$2; shift 2 ;;
     -O) OPT=$2; shift 2 ;;
     -g) DEBUG=(-g); shift ;;   # writes .wast and C dumps (~1 GB) beside the module; frames still print unnamed
@@ -34,7 +34,7 @@ done < <(tr ':' '\n' < "$ST/cp.txt")
 CP="$ST/client.jar:$(IFS=:; echo "${LIBS[*]}")"
 CLS="$OUT/classes-teavm"; rm -rf "$CLS"; mkdir -p "$CLS"
 "$JDK25/bin/javac" -g -nowarn -encoding UTF-8 -cp "$CLI:$CP" -d "$CLS" $(find "$HERE/src" "$HERE/src-teavm" -name '*.java')
-( cd "$HERE/src-teavm" && find . -type f -not -name '*.java' -exec cp --parents {} "$CLS/" \; )   # service files
+( cd "$HERE/src-teavm" && find . -type f -not -name '*.java' | cp_parents "$CLS" )   # service files
 # bytecode patches to Minecraft classes (teavm-patch/PatchClasses.java says which and why), with the stage's ASM
 ASM=$(tr ':' '\n' < "$ST/cp.txt" | grep '/org/ow2/asm/asm/' | head -1)
 ASMT=$(tr ':' '\n' < "$ST/cp.txt" | grep '/org/ow2/asm/asm-tree/' | head -1)

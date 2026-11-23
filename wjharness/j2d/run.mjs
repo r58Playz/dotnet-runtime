@@ -35,7 +35,7 @@ import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { connect, attachPage, consoleTap } from "../lib/browser.mjs";
 import { driveLauncher, seedProfile } from "../lib/mcdrive.mjs";
-import { ARMS, need, cfg, serveUrl, assertOutdir, tool } from "../lib/paths.mjs";
+import { ARMS, need, cfg, serveUrl, assertOutdir, tool, pinPrefix, angleBackend } from "../lib/paths.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -210,7 +210,7 @@ if (HS && MC) {
   const javaHome = need(`JAVA_HOME_${arm.slice(2)}`, `the ${arm} arm`);
   const agent = join(ARMS(), "jvmti", "libj2dagent.so");
   const save = join(cfg("WJ_STATE"), "native", opt("stage", "sa262n"), "template", "saves", "New World");
-  cmd = ["taskset", "-c", CPUS, join(javaHome, "bin", "java"), "-Xmx4g",
+  cmd = [...pinPrefix(CPUS), join(javaHome, "bin", "java"), "-Xmx4g",
     ...(ATTR && SET === "A" ? ["-XX:+UnlockDiagnosticVMOptions", "-XX:+DebugNonSafepoints",
       `-agentpath:${agent}=${join(outdir, "j2dagent.txt")}`] : []),
     `-Dmctick.world=${save}`, `-Dmctick.work=${join(outdir, "work")}`,
@@ -222,7 +222,7 @@ if (HS && MC) {
   if (!existsSync(envFile) || !existsSync(java)) { console.error(`no ${envFile} or ${java}: see native/mcnative.sh --ikvm`); process.exit(1); }
   const save = join(cfg("WJ_STATE"), "native", opt("stage", "sa262n"), "template", "saves", "New World");
   const q = (x) => `'${String(x).replace(/'/g, "'\\''")}'`;
-  cmd = ["taskset", "-c", CPUS, "bash", "-c", `. ${q(envFile)} && exec ${q(java)} -Xmx4g ${q(`-Dmctick.world=${save}`)} `
+  cmd = [...pinPrefix(CPUS), "bash", "-c", `. ${q(envFile)} && exec ${q(java)} -Xmx4g ${q(`-Dmctick.world=${save}`)} `
     + `${q(`-Dmctick.work=${join(outdir, "work")}`)} -cp ${q(readFileSync(cpFile, "utf8").trim())} wjbench.mctick.Mctick `
     + SCHED.join(" ")];
 } else if (HS) {
@@ -233,7 +233,7 @@ if (HS && MC) {
   /* j2d/jvmti/j2dagent: code bytes + inlining-aware pc maps at nmethod load, for j2d/hsledger.py. NOT
    * -XX:+PrintAssembly: that disassembles on the compiler thread and delays C2 -- JDK 21 read 0.50 ms/step under it
    * against 0.36 without, 69% of the window outside compiled code. The agent's cost is not measurable. */
-  cmd = ["taskset", "-c", CPUS, join(javaHome, "bin", "java"),
+  cmd = [...pinPrefix(CPUS), join(javaHome, "bin", "java"),
     ...(ATTR && SET === "A" ? ["-XX:+UnlockDiagnosticVMOptions", "-XX:+DebugNonSafepoints",
       `-agentpath:${agent}=${join(outdir, "j2dagent.txt")}`] : []),
     "-jar", jar, ...(opt("schedule") ? SCHED.map(String) : [])];
@@ -264,13 +264,13 @@ if (HS && MC) {
     : mkdtempSync(join(tmpdir(), "wj-j2d-"));   // the wj- prefix is how preflight and reap recognise a harness browser
   /* lib/browser.mjs launchChrome's flag set (kept in step with mcdrive.mjs launchGame), plus --perf-prof for the
    * jitdump (code bytes for every compiled wasm function, which the ledger matches against d8). */
-  cmd = ["taskset", "-c", CPUS, process.env.CHROME_BIN || "/usr/bin/chromium",
+  cmd = [...pinPrefix(CPUS), process.env.CHROME_BIN || "/usr/bin/chromium",
     "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${prof}`,
     "--no-first-run", "--no-default-browser-check", "--disable-dev-shm-usage", "--ignore-certificate-errors",
     "--no-sandbox", "--unlimited-storage", "--disable-extensions", "--disable-component-extensions-with-background-pages",
     "--disable-sync", "--disable-background-networking", "--disable-client-side-phishing-detection",
     "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
-    "--ignore-gpu-blocklist", "--use-gl=angle", `--use-angle=${process.env.MC_ANGLE || "gl"}`,
+    "--ignore-gpu-blocklist", "--use-gl=angle", `--use-angle=${angleBackend()}`,
     `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
     "about:blank"];
   delete env.WAYLAND_DISPLAY; delete env.XDG_SESSION_TYPE;

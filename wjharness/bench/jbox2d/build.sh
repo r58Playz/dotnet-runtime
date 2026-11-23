@@ -27,7 +27,11 @@ while [ $# -gt 0 ]; do
     *) echo "usage: build.sh [--out DIR] [--install]" >&2; exit 1 ;;
   esac
 done
-JDK8=$(need JAVA_HOME_8 "bench.jar is compiled for Java 8")
+# bench.jar is compiled for Java 8 (class files 52). Without a JDK 8 (Apple silicon has no Oracle/OpenJDK 8 build in
+# reach of brew without a pkg installer), javac 21 --release 8 builds it: same class version, but javac's output may
+# differ from the byte-identical jar the R180-R527 rounds ran, so BUILD.txt names the compiler and --install refuses.
+if [ -n "${JAVA_HOME_8:-}" ]; then JDK8=$JAVA_HOME_8; REL8=()
+else JDK8=$(need JAVA_HOME_21 "no JAVA_HOME_8: javac 21 --release 8 stands in"); REL8=(--release 8); fi
 JBOX=~/.m2/repository/org/jbox2d/jbox2d-library/2.2.1.1/jbox2d-library-2.2.1.1.jar
 if [ ! -f "$JBOX" ]; then
   mkdir -p "$(dirname "$JBOX")"
@@ -43,7 +47,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # ---- bench.jar (javac 8; jar-with-dependencies layout: jbox2d's classes unpacked beside ours)
 mkdir -p "$TMP/classes" "$TMP/fat"
-"$JDK8/bin/javac" -g -nowarn -encoding UTF-8 -cp "$JBOX" -d "$TMP/classes" $(find "$HERE/src" -name '*.java' -not -path '*/benchmark/teavm/*')
+"$JDK8/bin/javac" ${REL8[@]+"${REL8[@]}"} -g -nowarn -encoding UTF-8 -cp "$JBOX" -d "$TMP/classes" $(find "$HERE/src" -name '*.java' -not -path '*/benchmark/teavm/*')
 ( cd "$TMP/fat" && "$JDK8/bin/jar" xf "$JBOX" && rm -rf META-INF )
 cp -r "$TMP/classes/." "$TMP/fat/"
 printf 'Main-Class: org.teavm.samples.benchmark.ikvm.IkvmBenchmarkStarter\n' > "$TMP/manifest"
@@ -51,7 +55,7 @@ printf 'Main-Class: org.teavm.samples.benchmark.ikvm.IkvmBenchmarkStarter\n' > "
 
 # ---- TeaVM arms
 mkdir -p "$TMP/tclasses"
-"$JDK8/bin/javac" -g -nowarn -encoding UTF-8 -cp "$JBOX" -d "$TMP/tclasses" $(find "$HERE/src" -name '*.java' -not -path '*/benchmark/ikvm/*')
+"$JDK8/bin/javac" ${REL8[@]+"${REL8[@]}"} -g -nowarn -encoding UTF-8 -cp "$JBOX" -d "$TMP/tclasses" $(find "$HERE/src" -name '*.java' -not -path '*/benchmark/ikvm/*')
 for lvl in full simple; do
   O=$([ $lvl = full ] && echo 3 || echo 1)
   rm -rf "$OUT/teavm-$lvl"; mkdir -p "$OUT/teavm-$lvl/wasm"
@@ -63,16 +67,18 @@ for lvl in full simple; do
 done
 
 {
-  echo "jbox2d arms built $(date -Is) from wjharness/bench/jbox2d ($(git -C "$WJ_HARNESS" rev-parse --short HEAD 2>/dev/null || echo '?'))"
-  echo "javac: $("$JDK8/bin/javac" -version 2>&1)"
+  echo "jbox2d arms built $(isodate) from wjharness/bench/jbox2d ($(git -C "$WJ_HARNESS" rev-parse --short HEAD 2>/dev/null || echo '?'))"
+  echo "javac: $("$JDK8/bin/javac" -version 2>&1)${REL8[@]+ ${REL8[*]}}"
   echo "jbox2d-library 2.2.1.1 sha1 $(sha1sum "$JBOX" | cut -d' ' -f1)"
   echo "$(head -1 "$WJ_STATE/arms/teavm-cli/BUILD.txt")"
   for f in bench.jar teavm-full/wasm/benchmark.wasm teavm-simple/wasm/benchmark.wasm; do
-    echo "$f $(stat -c %s "$OUT/$f") B sha256 $(sha256sum "$OUT/$f" | cut -d' ' -f1)"
+    echo "$f $(fsize "$OUT/$f") B sha256 $(sha256sum "$OUT/$f" | cut -d' ' -f1)"
   done
 } | tee "$OUT/BUILD.txt"
 
-if [ $INSTALL = 1 ]; then
+if [ $INSTALL = 1 ] && [ ${#REL8[@]} -gt 0 ]; then
+  echo "not installing: bench.jar was built by javac 21 --release 8, not the JDK 8 jar ikvmcraft serves" >&2
+elif [ $INSTALL = 1 ]; then
   for dst in "$(need IKVMCRAFT)/frontend/public/bench.jar" "$WJ_STATE/arms/cheerpj/bench.jar"; do
     [ -f "$dst" ] && ! cmp -s "$dst" "$OUT/bench.jar" && cp -p "$dst" "$dst.prev"
     cp "$OUT/bench.jar" "$dst" && echo "installed $dst"

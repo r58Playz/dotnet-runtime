@@ -44,7 +44,7 @@ for c in "$SRC"/artifacts/jdk25/bin/IKVM.Runtime/Release/net8.0/IKVM.Runtime.dll
   [ -f "$c" ] && { [ -z "$DLL" ] || [ "$c" -nt "$DLL" ]; } && DLL=$c
 done
 [ -n "$DLL" ] || { echo "no IKVM.Runtime.dll under $SRC/artifacts/jdk25/bin/IKVM.Runtime" >&2; exit 1; }
-echo "built   $(sha256sum "$DLL" | cut -c1-16)  $DLL  ($(stat -c '%y' "$DLL" | cut -c1-19))"
+echo "built   $(sha256sum "$DLL" | cut -c1-16)  $DLL  ($(fmtime "$DLL"))"
 JDLL=""
 if [ "$JAVA" = 1 ]; then
   dotnet msbuild /m /nr:false /restore "${PROPS[@]}" /p:PreReleaseLabel= /p:PreReleaseNumber=0 /p:Version=8.14.0 \
@@ -55,7 +55,7 @@ if [ "$JAVA" = 1 ]; then
     [ -f "$c" ] && { [ -z "$JDLL" ] || [ "$c" -nt "$JDLL" ]; } && JDLL=$c
   done
   [ -n "$JDLL" ] || { echo "no IKVM.Java.dll under $SRC/artifacts/jdk25/bin/IKVM.Java.runtime.linux" >&2; exit 1; }
-  echo "built   $(sha256sum "$JDLL" | cut -c1-16)  $JDLL  ($(stat -c '%y' "$JDLL" | cut -c1-19))"
+  echo "built   $(sha256sum "$JDLL" | cut -c1-16)  $JDLL  ($(fmtime "$JDLL"))"
 fi
 [ "$INSTALL" = 1 ] || exit 0
 

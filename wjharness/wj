@@ -8,7 +8,7 @@
 #   wj doctor                 check configuration and the external tools the harness needs
 #   wj selftest               every self-check that needs no capture or browser
 #   wj reap [--apply] ...     prune runs/ (dry run by default; never touches state/ or notes/)
-#   wj bg <name> -- <cmd...>  run <cmd> in a transient systemd --user service, so it survives the shell that started it;
+#   wj bg <name> -- <cmd...>  run <cmd> in a transient systemd --user service (darwin: a nohup'd new session), so it survives the shell that started it;
 #                             log and exit code land in $WJ_RUNS/.bg/<name>.{log,rc}. `wj bg <name>` alone prints status.
 set -euo pipefail
 WJ_SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -58,12 +58,23 @@ case "$cmd" in
     dir="$WJ_RUNS/.bg"; mkdir -p "$dir"
     if [ $# -eq 0 ]; then
       if [ -f "$dir/$name.rc" ]; then echo "$name: exited $(cat "$dir/$name.rc")"
-      elif systemctl --user is-active --quiet "wj-$name"; then echo "$name: running (log $dir/$name.log)"
+      elif [ "$(uname -s)" = Darwin ] && [ -f "$dir/$name.pid" ] && kill -0 "$(cat "$dir/$name.pid")" 2>/dev/null; then
+        echo "$name: running (log $dir/$name.log)"
+      elif [ "$(uname -s)" != Darwin ] && systemctl --user is-active --quiet "wj-$name"; then echo "$name: running (log $dir/$name.log)"
       else echo "$name: unknown"; fi
       exit 0
     fi
     [ "${1:-}" = "--" ] && shift
     rm -f "$dir/$name.rc"
+    if [ "$(uname -s)" = Darwin ]; then
+      # No systemd: a new session (setsid via python, which macOS lacks as a command) under nohup, detached from this
+      # shell's process group, so it outlives the caller. The pid file is what `wj bg <name>` checks.
+      nohup python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+        bash -c 'echo $$ > "$0.pid"; "$@" > "$0.log" 2>&1; echo $? > "$0.rc"' "$dir/$name" "$@" < /dev/null > /dev/null 2>&1 &
+      disown
+      echo "started wj-$name; log $dir/$name.log, exit code -> $dir/$name.rc"
+      exit 0
+    fi
     # A transient SERVICE, not --scope: a scope lives in the caller's session and dies with it (CLAUDE.md). A service
     # starts from the user manager's environment, so carry this shell's whole environment across (MC_TASKSET, knobs...).
     envargs=()

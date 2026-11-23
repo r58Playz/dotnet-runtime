@@ -55,7 +55,7 @@ import { join, resolve } from "path";
 import { connect, attachPage, blockedHostArgs } from "./browser.mjs";
 import { readPartitionStats } from "./partition-alloc.mjs";
 import { SEEDS, resolveSeed, seedFromArgs } from "./seeds.mjs";
-import { serveUrl } from "./paths.mjs";
+import { serveUrl, IS_DARWIN, cloneCopyArgs, angleBackend } from "./paths.mjs";
 export { SEEDS, resolveSeed, seedFromArgs };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1108,7 +1108,7 @@ export function seedProfile (dest, { seed } = {}) {
   if (!existsSync(seed)) throw new Error(`no seed profile at ${seed} — a fresh profile would re-download Minecraft mid-boot`);
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(resolve(dest, ".."), { recursive: true });
-  spawnSync("cp", ["-a", "--reflink=auto", seed, dest], { stdio: "inherit" });
+  spawnSync("cp", cloneCopyArgs(seed, dest), { stdio: "inherit" });
   if (!existsSync(join(dest, "Default"))) throw new Error(`seed copy to ${dest} produced no Default/`);
   return dest;
 }
@@ -1257,7 +1257,7 @@ export function launchGame ({ url, profile, logPath, jsFlags = null, extraArgs =
     "--ignore-gpu-blocklist",
     ...(process.env.MC_SOFTWARE_GL === "1"
       ? ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
-      : ["--use-gl=angle", `--use-angle=${process.env.MC_ANGLE || "gl"}`]),
+      : ["--use-gl=angle", `--use-angle=${angleBackend()}`]),
     /* ALWAYS raise the stack trace limit. V8 defaults to 10 frames and EVERY wasm trap this harness
      * has captured (WORKER_TRAP_STACK) was truncated at exactly that -- which is why the
      * ghashtable.c:334 and mono-internal-hash.c:47 aborts showed their mono callee chain but never
@@ -1286,7 +1286,7 @@ export function launchGame ({ url, profile, logPath, jsFlags = null, extraArgs =
    * i7-1360P's P-cores. R362's variance note: the server thread's E-core share swings 12.5-15.2 M cycles/tick between
    * arms and E-cores retire at ~0.64 IPC, so "cycles" mixes a scheduling draw into every census. taskset EXECs the
    * command, so proc.pid is still the browser's. Recorded in the returned command line like every other knob. */
-  const pin = process.env.MC_TASKSET;
+  const pin = IS_DARWIN ? "" : process.env.MC_TASKSET;
   const proc = pin
     ? spawn("taskset", ["-c", pin, bin, ...args], { stdio: ["ignore", fd, fd], env, detached: true })
     : spawn(bin, args, { stdio: ["ignore", fd, fd], env, detached: true });

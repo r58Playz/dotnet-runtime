@@ -22,7 +22,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$WJ_STATE/arms/mctick"; STAGE=sa262n; INSTALL=0; TEAVM=1
 while [ $# -gt 0 ]; do
   case "$1" in
-    --out) OUT=$(realpath -m "$2"); shift 2 ;;
+    --out) OUT=$(wj_abspath "$2"); shift 2 ;;
     --stage) STAGE=$2; shift 2 ;;
     --install) INSTALL=1; shift ;;
     --no-teavm) TEAVM=0; shift ;;
@@ -67,11 +67,11 @@ if [ $TEAVM = 1 ]; then
 fi
 
 {
-  echo "mctick built $(date -Is) from wjharness/bench/mctick ($(git -C "$WJ_HARNESS" rev-parse --short HEAD 2>/dev/null || echo '?'))"
+  echo "mctick built $(isodate) from wjharness/bench/mctick ($(git -C "$WJ_HARNESS" rev-parse --short HEAD 2>/dev/null || echo '?'))"
   echo "stage $STAGE: $(grep '^client.jar' "$ST/STAGE.txt" 2>/dev/null || echo "client.jar sha1 $(sha1sum "$ST/client.jar" | cut -d' ' -f1)")"
   echo "libraries ${#LIBS[@]}: ${REL[*]}"
   echo "mctick.jar sha256 $(sha256sum "$OUT/mctick.jar" | cut -d' ' -f1)"
-  [ -f "$OUT/teavm-full/wasm/mctick.wasm" ] && echo "teavm-full/wasm/mctick.wasm $(stat -c %s "$OUT/teavm-full/wasm/mctick.wasm") B"
+  [ -f "$OUT/teavm-full/wasm/mctick.wasm" ] && echo "teavm-full/wasm/mctick.wasm $(fsize "$OUT/teavm-full/wasm/mctick.wasm") B"
   true
 } | tee "$OUT/BUILD.txt"
 
