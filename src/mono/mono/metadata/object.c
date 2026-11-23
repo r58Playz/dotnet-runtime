@@ -2180,7 +2180,8 @@ meta_arena_alloc0 (size_t size)
  * a fixed offset below the vtable (mono_wasm_class_record_offset), below anything AOT or JIT code reads (the IMT is
  * read at vt - MONO_IMT_SIZE.., the interpreter's below it), so no compiled layout moves. A class without interfaces
  * pays the IMT region it did not need. A record follows its class's supertypes: mono_class_setup_supertypes refreshes
- * it when a TypeBuilder's supertypes are rebuilt (sre.c resets them when a parent is set). 0 = no record.
+ * it when a TypeBuilder's supertypes are rebuilt (sre.c resets them when a parent is set). Unset = 3 (bits 1 and 2),
+ * with the M3 bundle (mini-wasm.c's MONO_WASM_JIT_CAST_ELIM has the numbers; mctick: 3.8 MB of records). 0 = no record.
  */
 #define MONO_WASM_CLASS_RECORD_SIZE 48
 /* the record: MonoClass *display [8] at 0; guint16 *img_idx at 32 (MONO_WASM_JIT_IMG_DISPATCH: the class's table-1
@@ -2197,7 +2198,7 @@ mono_wasm_class_record_bits (void)
 {
 	if (G_UNLIKELY (class_record_bits < 0)) {
 		const char *s = g_getenv ("MONO_WASM_JIT_CLASS_RECORD");
-		int v = (s && *s) ? atoi (s) : 0;
+		int v = (s && *s) ? atoi (s) : 3;
 		mono_memory_barrier ();
 		class_record_bits = v;
 	}

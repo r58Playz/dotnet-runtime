@@ -771,8 +771,8 @@ int mono_wasm_jit_inline_cold_throw = 1;
  * wj_il_hot_size: throw segments not counted) is at most this many bytes is not refused for inline DEPTH, up to depth 16
  * (HotSpot's MaxTrivialSize rule). The depth test ran before the header was read, so a getter whose only bulk is its
  * exception tail (Holder$Reference.value: 32.7 k calls a mctick tick) was refused at depth before R318 could discount
- * it. Counted WJC_INLINE_TRIVIAL_DEPTH. 0 = off. */
-int mono_wasm_jit_inline_trivial = 0;
+ * it. Counted WJC_INLINE_TRIVIAL_DEPTH. 16 with the M3 bundle (MONO_WASM_JIT_CAST_ELIM has the numbers). 0 = off. */
+int mono_wasm_jit_inline_trivial = 16;
 /* MONO_WASM_JIT_INLINE_AGGR_DEPTH=1: an [AggressiveInlining] callee is exempt from the inline depth cap too, to depth 16
  * (wj_aggr_inline's block cap still applies). The census of 2026-11-21 (all levers) refused IKVM's
  * Util.getClassFromObject -- AggressiveInlining since IKVM bb8874c0a, its fast path the point -- 4,521 times, all for
@@ -935,8 +935,9 @@ int mono_wasm_jit_math_intrins = 1;
 /* MONO_WASM_JIT_ATOMIC_I8 (J1c, the no-AOT plan): intrinsics.c turns 64-bit Interlocked.Read/Increment/Decrement/Add/
  * Exchange/CompareExchange and Volatile.Read/Write into OP_ATOMIC_*_I8 for a wasm-JIT compile, and the emitter lowers
  * them to i64 wasm atomics. 0 leaves them as calls: the icall, which JIT code reaches through the interpreter unless an
- * AOT'd wrapper exists (R326/R328 priced the AOT'd CAS_long / VolatileRead_long at 0.87 + 0.69 M instr per server tick). */
-int mono_wasm_jit_atomic_i8 = 0;
+ * AOT'd wrapper exists (R326/R328 priced the AOT'd CAS_long / VolatileRead_long at 0.87 + 0.69 M instr per server tick).
+ * On with the M3 bundle (MONO_WASM_JIT_CAST_ELIM has the numbers); IKVM_ATOMIC_INLINE needs it. 0 = calls. */
+int mono_wasm_jit_atomic_i8 = 1;
 /* MONO_WASM_JIT_VCALL_VRET (J1e, the no-AOT plan): lower OP_VCALL2_MEMBASE -- a virtual call whose result is a value
  * type -- instead of bailing the whole caller with "unsupported opcode". A multi-field result goes through the trailing
  * hidden-vret pointer (the internal JIT ABI) on the IC and f-slot routes and through scratch+232 on the residual; a
@@ -1023,8 +1024,11 @@ int mono_wasm_jit_cast_census = 0;
  * 4 = verify: those checks stay, preceded by an isinst of the same class whose failure on a non-null value adds to
  * WJC_CAST_ELIM_BAD's run-time word (must read 0). RELOAD and FINAL are census categories only: a racing writer can
  * change a re-read field between two reads, so they are not eliminated. mctick census, 2026-11-20/21: static 7.8-8.7%,
- * dominated 0.6-0.7% of ~950 k checks a tick. 0 = off. */
-int mono_wasm_jit_cast_elim = 0;
+ * dominated 0.6-0.7% of ~950 k checks a tick. M4 (2026-11-22, findings M3): promoted in a bundle with CLASS_RECORD=3, CAST_ELIM=3, NEWARR_INLINE, INLINE_TRIVIAL=16,
+ * ATOMIC_I8, INLINE_CAST_DISCOUNT and IKVM's ATOMIC_INLINE / GETCLASS_INLINE / CAST_MEMO, measured together, not
+ * apart: mctick 19.59 -> 18.64 M cycles a tick (-4.8%, n=3 a side, both orders, disjoint), jbox2d 1.93 -> 1.83 M
+ * cycles a step (n=1). Verify modes on mctick read 0. 0 = off. */
+int mono_wasm_jit_cast_elim = 3;
 gint32 mono_wasm_jit_cast_elim_bad;   /* bumped by verify-mode code (bit 4), read by the stats dump */
 const char mono_wasm_jit_cast_note_tag [] = "wj-cast-note";
 
@@ -2042,8 +2046,9 @@ int mono_wasm_jit_inline_alloc = 1;
 /* MONO_WASM_JIT_NEWARR_INLINE (plan abstract-hatching-stearns C3): a CEE_NEWARR with no generic context bump-allocates
  * a small array from the TLAB (OP_WASM_JIT_NEWARR_FAST, mono_gc_wasm_inline_array_max), calling
  * ves_icall_array_new_specific only when the op yields 0 (too long, negative, TLAB exhausted, detached). mctick: 4.3 k
- * array allocations a tick took the icall. 0 = every newarr calls it. */
-int mono_wasm_jit_newarr_inline = 0;
+ * array allocations a tick took the icall. On by default with the M3 bundle (MONO_WASM_JIT_CAST_ELIM has the numbers).
+ * 0 = every newarr calls it. */
+int mono_wasm_jit_newarr_inline = 1;
 /* MONO_WASM_JIT_IMG_DISPATCH (plan abstract-hatching-stearns G; mini-wasm-batching.inc mono_wasm_jit_img_batch): 1 = every
  * tier-2 compact class-virtual site carries the image prefix (under a gate that is 1 only in the image's module), and
  * the first B4 group of >= 32 members framed becomes the image. Needs MONO_WASM_JIT_CLASS_RECORD bit 1 or 8 (the
@@ -2111,8 +2116,9 @@ int mono_wasm_jit_prof_repair_max = 2048;
  * so the casts lazy linking adds after erased reads (R527) do not refuse an inline eager linking would take. IL cannot
  * tell those from Java checkcasts, so both are discounted (one inside a throw segment R318 already left out, twice). The
  * size gate only, not inline_method's cost cap. Counted
- * WJC_INLINE_CAST_DISCOUNTED where it turned a refusal into an admission. 0 = off. */
-int mono_wasm_jit_inline_cast_discount = 0;
+ * WJC_INLINE_CAST_DISCOUNTED where it turned a refusal into an admission. On with the M3 bundle (MONO_WASM_JIT_CAST_ELIM
+ * has the numbers; alone on jbox2d -3.7% cycles a step, n=1). 0 = off. */
+int mono_wasm_jit_inline_cast_discount = 1;
 /* MONO_WASM_JIT_T1_UNIT=<members> (plan v3 L9, 2026-11-22): tier 1 compiles a method together with a UNIT -- the warm
  * methods of its class and of the classes it calls or is called by most in the interpreter -- and publishes them as one
  * module. interp.c: wasm_jit_maybe_compile feeds a warm list per class (a method crossing MONO_WASM_JIT_T1_UNIT_WARM
