@@ -20,24 +20,35 @@ def start_epoch_ms(trace):
     return datetime.datetime.fromisoformat(re.search(r"<start-date>([^<]+)</start-date>", toc).group(1)).timestamp() * 1000
 
 class PerfMap:
+    """Address -> name. Entries over BIG bytes (a few builtin blobs) are scanned linearly; the rest are found by
+    bisection, looking back only BIG bytes, so one huge entry cannot make every lookup linear (it did: 28 min on a
+    mctick capture, 2026-11-22). Overlaps resolve to the LAST entry in the file."""
+    BIG = 1 << 16
     def __init__(self, path):
-        ents = []
+        small, big = [], []
         for i, line in enumerate(open(path, errors="replace")):
             p = line.rstrip("\n").split(" ", 2)
             if len(p) < 3: continue
-            try: ents.append((int(p[0], 16), int(p[1], 16), i, p[2]))
+            try: e = (int(p[0], 16), int(p[1], 16), i, p[2])
             except ValueError: continue
-        ents.sort()
-        self.starts = [e[0] for e in ents]; self.ents = ents
-        self.maxlen = max((e[1] for e in ents), default=0)
+            (big if e[1] > self.BIG else small).append(e)
+        small.sort()
+        self.starts = [e[0] for e in small]; self.ents = small; self.big = big
+        self.cache = {}
     def lookup(self, a):
-        i = bisect.bisect_right(self.starts, a) - 1
+        r = self.cache.get(a, 0)
+        if r != 0: return r
         best = None
-        while i >= 0 and a - self.starts[i] <= self.maxlen:
+        i = bisect.bisect_right(self.starts, a) - 1
+        while i >= 0 and a - self.starts[i] <= self.BIG:
             s, n, order, name = self.ents[i]
             if s <= a < s + n and (best is None or order > best[0]): best = (order, name)
             i -= 1
-        return best[1] if best else None
+        for s, n, order, name in self.big:
+            if s <= a < s + n and (best is None or order > best[0]): best = (order, name)
+        r = best[1] if best else None
+        self.cache[a] = r
+        return r
 
 STRIP = re.compile(r"-\d+-(turbofan|liftoff)$")
 

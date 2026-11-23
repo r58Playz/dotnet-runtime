@@ -1406,7 +1406,7 @@ export function spinCheck (pid, before, wallMs, { busyFrac = 0.8 } = {}) {
 export async function driveLauncher (conn, sid, seed, { log = console.log, timeoutMs = 90000 } = {}) {
   const s = resolveSeed(seed);
   const ev = async (expression) => (await conn.send("Runtime.evaluate", { expression, returnByValue: true }, sid))?.result?.value;
-  const t0 = Date.now();
+  let t0 = Date.now(), reloaded = false;
   let st = null;
   for (;;) {
     st = await ev(`(() => {
@@ -1435,6 +1435,15 @@ export async function driveLauncher (conn, sid, seed, { log = console.log, timeo
           modules: state.filter(Boolean).map((x) => x.replace(location.origin, "")) });
       })()` }, sid).then((r) => r?.result?.value ?? JSON.stringify(r?.exceptionDetails || r).slice(0, 400), (e) => `diagnosis failed: ${e.message}`);
       log(`  launcher: never became usable; the page: ${diag}`);
+      /* One reload before giving up (M4 box, 2026-11-22: 3 runs of ~60 died here with a dev-server module fetch at
+       * status 0 and nothing pending). Logged, so a run that needed it says so. */
+      if (!reloaded) {
+        reloaded = true;
+        log(`  launcher: reloading the page once`);
+        await conn.send("Page.reload", { ignoreCache: true }, sid).catch(() => {});
+        t0 = Date.now();
+        continue;
+      }
       throw new Error(`launcher never became usable (last state: ${st})`);
     }
     await sleep(300);
