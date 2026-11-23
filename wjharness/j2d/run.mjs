@@ -35,7 +35,7 @@ import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { connect, attachPage, consoleTap } from "../lib/browser.mjs";
 import { driveLauncher, seedProfile } from "../lib/mcdrive.mjs";
-import { ARMS, need, cfg, serveUrl, assertOutdir, tool, pinPrefix, angleBackend } from "../lib/paths.mjs";
+import { ARMS, need, cfg, serveUrl, assertOutdir, tool, pinPrefix, angleBackend, IS_DARWIN } from "../lib/paths.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -397,6 +397,16 @@ if (!exited) { try { process.kill(-perf.pid, "SIGKILL"); } catch { } await sleep
 if (server) server.kill("SIGKILL");
 // a failed mctick run keeps its seed copy: it holds the OPFS state at the failure (lib/mcdrive.mjs reapProfile)
 if (env.__J2D_PROFILE && !(MC && (failed || checksum === null))) rmSync(env.__J2D_PROFILE, { recursive: true, force: true });
+/* macOS leftovers (2026-11-23: 39 GB of them filled the disk): xctrace's temporary .ktrace, which outlives a SIGINTed
+ * recording, and the code-sign clone Chrome makes of itself at launch and removes only on a clean exit. Only what this run
+ * created (born after t0), and no clone a live process runs from. */
+if (IS_DARWIN) {
+  const T = tmpdir(), X = join(dirname(T.replace(/\/$/, "")), "X", "com.google.Chrome.code_sign_clone");
+  let ps = ""; try { ps = execSync("ps -axo command=", { encoding: "utf8", maxBuffer: 64 << 20 }); } catch { }
+  const mine = (f) => { try { return statSync(f).birthtimeMs >= t0 - 5000; } catch { return false; } };
+  try { for (const n of readdirSync(T)) if (/^instruments.*\.ktrace$/.test(n) && mine(join(T, n)) && !/xctrace/.test(ps)) rmSync(join(T, n), { recursive: true, force: true }); } catch { }
+  try { for (const n of readdirSync(X)) if (n.startsWith("code_sign_clone.") && mine(join(X, n)) && !ps.includes(n)) rmSync(join(X, n), { recursive: true, force: true }); } catch { }
+}
 log.end();
 
 /* CheerpJ flushes System.out only when the Java thread yields -- in this bench, at exit -- so every batch line arrives
