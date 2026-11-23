@@ -70,6 +70,33 @@ def clean_pairs(rows, lo, hi):
         a["clean_ns"] += t - p[0]; a["pairs"] += 1
     return acc
 
+def bottlenecks(trace, thread, lo, hi):
+    """The template's own top-down split for one thread (CounterMetricByThread: ~1 ms intervals, each a 4-array of
+    basis points). Its spec-to-metric map (areaGraphSepcIndexTometricIndex [2: 3, 3: 1, 1: 2, 4: 0] against the legend
+    1 delivery, 2 discarded, 3 processing, 4 useful) orders the array [useful, processing, delivery, discarded].
+    Duration-weighted over [lo, hi]."""
+    root = ET.fromstring(export(trace, '/trace-toc/run[@number="1"]/data/table[@schema="CounterMetricByThread"]'))
+    ids = {}
+    def reg(e):
+        i = e.get("id")
+        if i is not None: ids[i] = e
+        for c in e: reg(c)
+    D = lambda e: ids.get(e.get("ref"), e) if e is not None else None
+    acc = [0.0] * 4; tot = 0
+    for row in root.iter("row"):
+        cs = list(row)
+        for c in cs: reg(c)
+        t, du, th, v = D(cs[0]), D(cs[1]), D(cs[3]), D(cs[-1])
+        if th is None or th.get("fmt") != thread or v is None or not v.text: continue
+        tt = int(t.text)
+        if (lo is not None and tt < lo) or (hi is not None and tt > hi): continue
+        w = int(du.text); x = [int(q) for q in v.text.split()]
+        sx = sum(x) or 1
+        for k in range(4): acc[k] += w * x[k] / sx
+        tot += w
+    if not tot: return None
+    return dict(zip(("useful", "processing", "delivery", "discarded"), (a / tot for a in acc)))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace"); ap.add_argument("--from-ms", type=float); ap.add_argument("--to-ms", type=float)
@@ -90,11 +117,15 @@ def main():
                      "clean_instructions": x["instructions"], "clean_cycles": x["cycles"]})
     rows.sort(key=lambda r: -r["cycles"])
     for r in rows: r["ipc"] = r["instructions"] / r["cycles"] if r["cycles"] else None
+    if rows:
+        try: rows[0]["bottlenecks"] = bottlenecks(a.trace, rows[0]["thread"], lo, hi)
+        except Exception as e: rows[0]["bottlenecks"] = {"error": str(e)[:200]}
     if a.json:
         print(json.dumps({"trace_start_ms": base, "from_ms": a.from_ms, "to_ms": a.to_ms, "window_s": win_ns / 1e9, "threads": rows[:a.top]}))
         return
     for r in rows[:a.top]:
         print(f"{r['cycles']/1e9:9.3f} G cyc {r['instructions']/1e9:9.3f} G ins  IPC {r['ipc'] or 0:5.2f}  coverage {r['coverage']:5.2f}  {r['pairs']:6d} pairs  {r['thread'][:70]}")
+        if r.get("bottlenecks"): print("          " + "  ".join(f"{k} {v:.1%}" if isinstance(v, float) else f"{k} {v}" for k, v in r["bottlenecks"].items()))
 
 if __name__ == "__main__":
     main()
