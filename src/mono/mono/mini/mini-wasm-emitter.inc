@@ -2173,8 +2173,10 @@ typedef struct { guint8 *cold; int *fhead, *fnext, *fvreg; int ncold, nflush, nh
  * every observed slot is current by write-through, and at a cold point by the stores just emitted: (I2).
  *
  * The GC-point classification is wj_ins_is_effective_gcpoint, the one SLOTLIVE already trusts to leave single-bb refs
- * with no slot at all. The CFG's throw edges to end_bblock only add liveness. Callers exclude clauses (handlers resume
- * into the frame), lazy frames, address slots and the debug guards.
+ * with no slot at all. The CFG's throw edges to end_bblock only add liveness. Callers exclude lazy frames, address slots,
+ * the debug guards and EH methods outside R353's record mode (island mode's il_state data[] is a GC root of its own).
+ * In an EH method every ref live into a handler block is hot: an exception reaches a handler from any GC point of its
+ * try, with collections possible on the way, and no CFG edge says so (M5).
  *
  * Out: cold[v] (the cold-only set, NULL when empty) and the flush chains: fhead[ord] = first entry for the ord-th
  * instruction (the SLOTLIVE ordinal), fnext[k] / fvreg[k] the chain and its ref.
@@ -2218,6 +2220,7 @@ static gboolean
 wj_pin_cold_plan (MonoCompile *cfg, int nvreg, const int *refslot, const guint8 *ref_wt, const int *li, const int *addrslot,
                   const int *pa_c, const int *pa_s, const int *pa_o, int nal, WjPinCold *out)
 {
+	const gboolean clauses = cfg->header->num_clauses != 0;
 	MonoBasicBlock *bb, **bbs;
 	MonoInst *ins;
 	int *cidx, *cv, ncand = 0, nbbs = 0, nins = 0, W, b, k, v;
@@ -2310,6 +2313,21 @@ wj_pin_cold_plan (MonoCompile *cfg, int nvreg, const int *refslot, const guint8 
 	} while (changed);
 	/* backward walk per block: classify each effective GC point and record what it observes */
 	hot = (guint8 *) mono_mempool_alloc0 (cfg->mempool, ncand);
+	/* An EH method (record mode only, see the caller): an exception can land in a handler from ANY GC point of its
+	 * try, and pass 1/2 can collect before it does, so every ref live into a handler block stays write-through. The
+	 * normal CFG reaches no handler, so this is the only thing that keeps them pinned. */
+	if (clauses) {
+		for (b = 0; b < nbbs; ++b) {
+			int rk = bbs [b]->region == -1 ? 0 : (bbs [b]->region & (0xf << 4));
+			if (rk == MONO_REGION_CATCH || rk == MONO_REGION_FILTER || rk == MONO_REGION_FAULT || rk == MONO_REGION_FINALLY) {
+				int w;
+				for (w = 0; w < W; ++w) {
+					guint64 m = lin [(gsize) b * W + w];
+					while (m) { int bit = __builtin_ctzll (m); m &= m - 1; hot [w * 64 + bit] = 1; }
+				}
+			}
+		}
+	}
 	cap_rec = 256;
 	rec_ord = (int *) g_malloc (sizeof (int) * cap_rec);
 	rec_v = (int *) g_malloc (sizeof (int) * cap_rec);
@@ -4589,8 +4607,9 @@ co_ranges_done:
 		/* MONO_WASM_JIT_PIN_COLD: the exclusions are the plan's preconditions (wj_pin_cold_plan) */
 		{
 			extern int mono_wasm_jit_pin_cold;
-			if (mono_wasm_jit_pin_cold && nrefslots > 0 && lc.ref_wt && !lazy_ref_frame && !eh_on && gcp_walked &&
-			    cfg->header->num_clauses == 0 && naddrbytes == 0 && !lc.storeguard && !lc.objguard &&
+			if (mono_wasm_jit_pin_cold && nrefslots > 0 && lc.ref_wt && !lazy_ref_frame && gcp_walked &&
+			    (eh_on ? (mono_wasm_jit_pin_cold >= 2 && ehrec_on && !ehslim) : cfg->header->num_clauses == 0) &&
+			    naddrbytes == 0 && !lc.storeguard && !lc.objguard &&
 			    mono_wasm_jit_raise_nogc != 2 &&
 			    wj_pin_cold_plan (cfg, nvreg, refslot, lc.ref_wt, li, addrslot, pc_pa_c, pc_pa_s, pc_pa_o, pc_nal, &pcold)) {
 				lc.pin_cold = pcold.cold;

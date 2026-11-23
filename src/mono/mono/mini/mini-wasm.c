@@ -1473,7 +1473,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_cast_diag, "MONO_WASM_JIT_CAST_DIAG", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_census, "MONO_WASM_JIT_CAST_CENSUS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_elim, "MONO_WASM_JIT_CAST_ELIM", 0, 7)
-	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
@@ -1698,7 +1698,10 @@ int mono_wasm_jit_pin_alias = 1;   /* (the 2026-11-20 set; measured at MONO_WASM
  * refs skip their SLOTZERO store and are LCSE-unpinned. Plan and soundness: wj_pin_cold_plan (emitter). Measured on the
  * M4 (2026-11-22, findings M2, within one binary, n=3 a side, both orders): jbox2d (best knob set) 1.83 -> 1.75 M cycles
  * a step (-4.4%, disjoint), 0.457 -> 0.436 ms; mctick (defaults) 20.06 -> 19.57 M cycles a tick (-2.5%, touching),
- * instructions -2.6% (disjoint). 262n, 262u and mcsr game runs clean (n=1 each, a smoke test). 0 = off. */
+ * instructions -2.6% (disjoint). 262n, 262u and mcsr game runs clean (n=1 each, a smoke test). 2 = also EH methods in
+ * R353's record mode, every ref live into a handler block kept hot (getBlockState's tier-2 module: 190 of its 335 stores
+ * are slot stores): measured NULL on mctick (M5, 2026-11-23, n=3 a side, both orders: 17.70 vs 17.71 M cycles a tick;
+ * verify modes 0), so not the default. 1 = clause-free methods only. 0 = off. */
 int mono_wasm_jit_pin_cold = 1;
 /* MONO_WASM_JIT_ILOFS_DEDUPE: an EH-record method's block skips its IL-offset store when every predecessor has the same
  * offset and region and reaches it by a plain edge, so the record already holds it (60% of getBlockState's executed
