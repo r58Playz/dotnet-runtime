@@ -447,7 +447,8 @@ if (XCPROF && xct?.out && existsSync(xct.out) && existsSync(join(outdir, "perf.m
 } else if (!XCPROF && xct?.out && existsSync(xct.out) && ok) {
   try {
     const r = JSON.parse(execSync(`python3 ${JSON.stringify(join(HERE, "..", "fe", "xctrace.py"))} ${JSON.stringify(xct.out)} --json --from-ms ${batchWall[WA]} --to-ms ${batchWall[WB]}`, { encoding: "utf8", maxBuffer: 1 << 26 }));
-    const b = r.threads[0];
+    /* the bench thread: the most clean pairs (a short-lived worker can sort first; 2026-11-23, Chrome 158) */
+    const b = (r.threads || []).reduce((m, t) => (!m || (t.pairs || 0) > (m.pairs || 0) ? t : m), null);
     win.xct = { renderer: xct.pid, ...r, per: b ? { instructions: b.instructions / steps, cycles: b.cycles / steps, ipc: b.ipc, thread: b.thread, covered_s: b.span_s,
       window_s: (batchWall[WB] - batchWall[WA]) / 1000 } : null };
   } catch (e) { win.xct = { error: String(e.message || e).slice(0, 400), tail: xct.tail() }; }
