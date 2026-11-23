@@ -33,6 +33,16 @@ PROPS=(/p:Configuration=Release /p:EnabledRuntimes=linux-x64 /p:EnabledImageRunt
   /p:EnabledToolRuntimes=linux-x64 /p:RuntimeIdentifier=linux-x64 /p:BuildNet6JreImages=false)
 # IkvmToolReference is not a NuGet ProjectReference, so the runtime's /restore does not visit ikvmc or ikvmstub
 # (NETSDK1112 "runtime pack ... was not downloaded" otherwise).
+# IKVM.Runtime references IKVM.Java, whose build runs the JDK 25 build (IKVM.OpenJdk.Make). Where that cannot run
+# (darwin: ext/openjdk is a Linux build), compile against the IKVM.Java.dll ikvmcraft serves; IKVM_JAVA_PREBUILT=<dll>
+# forces it anywhere. --java still needs the real build.
+JPRE=${IKVM_JAVA_PREBUILT:-}
+if [ -z "$JPRE" ] && [ "$WJ_OS" = Darwin ] && [ "$JAVA" = 0 ]; then JPRE="$(need IKVMCRAFT)/statics/ikvm/IKVM.Java.dll"; fi
+if [ -n "$JPRE" ]; then
+  [ -f "$JPRE" ] || { echo "no prebuilt IKVM.Java at $JPRE" >&2; exit 1; }
+  PROPS+=("/p:CustomAfterMicrosoftCommonTargets=$WJ_HARNESS/build/ikvm-java-prebuilt.targets" "/p:IkvmJavaPrebuilt=$JPRE")
+  echo "ikvm-runtime: IKVM.Runtime compiles against the prebuilt $JPRE ($(sha256sum "$JPRE" | cut -c1-12))"
+fi
 for t in src/ikvmc/ikvmc.csproj src/ikvmstub/ikvmstub.csproj; do dotnet msbuild /t:Restore /nr:false "${PROPS[@]}" "$t" >/dev/null; done
 dotnet msbuild /m /nr:false /restore "${PROPS[@]}" /p:PreReleaseLabel= /p:PreReleaseNumber=0 /p:Version=8.14.0 \
   /p:AssemblyVersion=8.14.0.0 /p:InformationalVersion=8.14.0 /p:FileVersion=8.14.0.0 /p:PackageVersion=8.14.0 \

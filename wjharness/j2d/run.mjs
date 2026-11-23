@@ -102,6 +102,15 @@ const STOP_AFTER = Number(opt("stop-after", WB));
 const DUMPS = args.includes("--dumps");             // ours: dumpWasmJit() at batch 1 and batch 12, so the LAST dump is the window
 const PERF_EXTRA = (opt("perf-extra", "") || "").split(/\s+/).filter(Boolean);   // e.g. "-g" for fp call chains
 const dumpQueue = [];  // end the run at this batch (teavm-baseline is a 600-batch build)
+/* --xctrace (darwin, browser arms): the macOS stand-in for the perf event sets. At the first batch line, Instruments'
+ * "CPU Counters" template attaches to the busiest renderer (mctick: at the first batch line; jbox2d, whose batches are
+ * ~0.1 s against xctrace's seconds of start-up: at navigation); it stops after batch WB, and fe/xctrace.py reads every
+ * thread's instructions and cycles over the window [batch WA, batch WB] by wall clock. The bench thread is the one
+ * with the most cycles. window.json gets them as `xct`. */
+const XCT = args.includes("--xctrace");
+if (XCT && process.platform !== "darwin") { console.error("--xctrace is darwin-only (use the perf event sets)"); process.exit(1); }
+let xct = null;
+const batchWall = {};
 
 /* EVENTS. Five general-purpose counters plus the two fixed ones is what this P-core schedules without
  * multiplexing (measured 2026-10-03: a sixth GP event drops every event to 50-88% coverage, which would make
@@ -189,7 +198,9 @@ function onLine(text) {
   if (!text.includes("[bench]")) return;
   let m = text.match(/\[bench\] batch (\d+)\/(\d+): ([\d.]+) ms/);
   if (m) {
-    batchT[Number(m[1])] = t; batchMs[Number(m[1])] = Number(m[3]);
+    batchT[Number(m[1])] = t; batchMs[Number(m[1])] = Number(m[3]); batchWall[Number(m[1])] = Date.now();
+    if (XCT && !xct && MC && Number(m[1]) < WA) xct = startXct();   // jbox2d's batches are too short: it starts at navigation
+    if (XCT && xct && Number(m[1]) === WB) stopXct();
     // stop at STOP_AFTER when the build runs more batches than that (teavm-baseline: 600; no checksum then)
     if (Number(m[1]) === STOP_AFTER && STOP_AFTER < Number(m[2])) { done = true; stoppedEarly = true; }
     if (DUMPS && (Number(m[1]) === WA || Number(m[1]) === WB)) dumpQueue.push(Number(m[1]));
@@ -200,6 +211,29 @@ function onLine(text) {
   if (MC && /\[mctick\] DISCONNECTED/.test(text)) failed = failed || text;
   if (CJ && /^\[cj\] (LOAD FAILED|exit)/.test(text) && checksum === null) failed = failed || text;
 }
+
+/* the renderer whose CPU is highest among the browser's descendants (ps; darwin has no /proc) */
+function busiestRenderer () {
+  const rows = execSync("ps -Ao pid=,ppid=,pcpu=,command=", { encoding: "utf8" }).split("\n").map((l) => l.trim().match(/^(\d+)\s+(\d+)\s+([\d.]+)\s+(.*)$/)).filter(Boolean)
+    .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), cpu: Number(m[3]), cmd: m[4] }));
+  const kids = new Set([perf.pid]);
+  for (let grew = true; grew;) { grew = false; for (const r of rows) if (kids.has(r.ppid) && !kids.has(r.pid)) { kids.add(r.pid); grew = true; } }
+  const rend = rows.filter((r) => kids.has(r.pid) && /--type=renderer/.test(r.cmd)).sort((a, b) => b.cpu - a.cpu);
+  return rend[0]?.pid;
+}
+function startXct () {
+  const pid = busiestRenderer();
+  if (!pid) { onLine("[j2d] xctrace: no renderer found"); return { failed: true }; }
+  const out = join(outdir, "counters.trace");
+  const p = spawn("xcrun", ["xctrace", "record", "--template", "CPU Counters", "--attach", String(pid), "--output", out, "--no-prompt"],
+    { stdio: ["ignore", "pipe", "pipe"], detached: true });
+  let tail = ""; p.stdout.on("data", (d) => { tail += d; }); p.stderr.on("data", (d) => { tail += d; });
+  const st = { p, pid, out, exited: false, tail: () => tail.slice(-400) };
+  p.on("exit", () => { st.exited = true; });
+  onLine(`[j2d] xctrace: attached to renderer ${pid}`);
+  return st;
+}
+function stopXct () { if (xct?.p && !xct.stopping) { xct.stopping = true; try { xct.p.kill("SIGINT"); } catch { } } }
 
 // ---------------------------------------------------------------- the workload command
 let server = null, cmd, env = { ...process.env }, url = null;
@@ -310,6 +344,7 @@ if (HS || CLR) {
     await conn.send("Runtime.enable", {}, sid);
     await conn.send("Page.enable", {}, sid);
     await conn.send("Page.navigate", { url }, sid);
+    if (XCT && !MC && !xct) { await sleep(1500); xct = startXct(); }   // after the renderer for the page exists
     /* Since ikvmcraft 246560a (R514) ?bench boots through the launcher like the game: nothing runs until Play. The version
      * typed is irrelevant (?bench skips the Minecraft download check and runs bench.jar). */
     if (arm === "ours")
@@ -333,6 +368,12 @@ if (HS || CLR) {
   }
 }
 
+// ---------------------------------------------------------------- the counters capture: stop it before the browser goes
+if (xct?.p) {
+  stopXct();
+  for (let i = 0; i < 1200 && !xct.exited; i++) await sleep(100);   // saving a long capture takes a while
+  if (!xct.exited) { try { process.kill(-xct.p.pid, "SIGKILL"); } catch { } }
+}
 // ---------------------------------------------------------------- teardown: the whole group, then wait for perf
 try { process.kill(-perf.pid, "SIGINT"); } catch { }
 for (let i = 0; i < 300 && !exited; i++) await sleep(100);
@@ -359,10 +400,19 @@ const win = {
   window_ms_per_step: ok ? Array.from({ length: WB - WA }, (_, i) => batchMs[WA + 1 + i]).reduce((s, v) => s + v, 0) / steps : null,
   batch_ms: batchMs, failed, perf_stderr_tail: perfErr.slice(-600),
 };
+if (xct?.out && existsSync(xct.out) && ok) {
+  try {
+    const r = JSON.parse(execSync(`python3 ${JSON.stringify(join(HERE, "..", "fe", "xctrace.py"))} ${JSON.stringify(xct.out)} --json --from-ms ${batchWall[WA]} --to-ms ${batchWall[WB]}`, { encoding: "utf8", maxBuffer: 1 << 26 }));
+    const b = r.threads[0];
+    win.xct = { renderer: xct.pid, ...r, per: b ? { instructions: b.instructions / steps, cycles: b.cycles / steps, ipc: b.ipc, thread: b.thread, covered_s: b.span_s,
+      window_s: (batchWall[WB] - batchWall[WA]) / 1000 } : null };
+  } catch (e) { win.xct = { error: String(e.message || e).slice(0, 400), tail: xct.tail() }; }
+} else if (xct) win.xct = { error: "no capture", tail: xct.tail?.() };
 writeFileSync(join(outdir, "window.json"), JSON.stringify(win, null, 1) + "\n");
 const dumps = existsSync(outdir) ? readdirSync(outdir).filter((f) => /^jit-\d+\.dump$/.test(f)) : [];
 const sz = existsSync(join(outdir, "perf.data")) ? statSync(join(outdir, "perf.data")).size : 0;
 console.log(`${arm} ${SET}: ${ok ? "ok" : "FAILED"} checksum ${checksum} mean ${mean} window ${win.window_ms_per_step?.toFixed(4)} ms/${MC ? "tick" : "step"}`
   + ` (${win.window ? (win.window[1] - win.window[0]).toFixed(2) : "?"} s) perf.data ${(sz / 1e6).toFixed(1)} MB, ${dumps.length} jitdump(s)`
+  + (win.xct?.per ? ` | ${(win.xct.per.instructions / 1e6).toFixed(3)} M ins ${(win.xct.per.cycles / 1e6).toFixed(3)} M cyc /${MC ? "tick" : "step"} IPC ${win.xct.per.ipc?.toFixed(2)}` : win.xct?.error ? ` | xctrace: ${win.xct.error.slice(0, 120)}` : "")
   + (failed ? ` FAILED: ${failed}` : ""));
 process.exit(ok ? 0 : 1);

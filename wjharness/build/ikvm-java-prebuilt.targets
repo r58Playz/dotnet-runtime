@@ -1,0 +1,8 @@
+<Project>
+  <!-- wj ikvm-runtime on a host that cannot run the JDK 25 build IKVM.Java needs (macOS): IKVM.Runtime compiles against
+       a prebuilt IKVM.Java.dll ($(IkvmJavaPrebuilt), the one ikvmcraft serves) instead of building it. -->
+  <ItemGroup Condition=" '$(MSBuildProjectName)' == 'IKVM.Runtime' ">
+    <ProjectReference Remove="..\IKVM.Java\IKVM.Java.ikvmproj" />
+    <Reference Include="IKVM.Java" HintPath="$(IkvmJavaPrebuilt)" Private="false" />
+  </ItemGroup>
+</Project>
