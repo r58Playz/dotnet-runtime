@@ -754,6 +754,9 @@ static volatile gint32 wj_b4_ncopyref;
  * generation word to guard on (the caller registered it against the copies' slots BEFORE framing); `copy_bodies`
  * receives the body each copy was framed from (NULL for a candidate dropped here). Copies are re-validated under the
  * registry bracket -- the caller chose them outside it -- and an invalid one is dropped, not fatal. */
+/* MONO_WASM_JIT_T1_UNIT: set by mono_wasm_jit_rebatch_unit around its one framing (compiles are serialised) */
+static int wj_rebatch_table_calls;
+
 static int
 wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gint32 *guard_in, WjBody **copy_bodies,
                  void **out_bytes, int *out_len)
@@ -909,7 +912,9 @@ wj_rebatch_core (const int *desc_ids, int n, const int *copy_ids, int ncopy, gin
 	   * module is that calls between them become `call <funcidx>`; the losing arm framed them together
 	   * and left the calls indirect, i.e. co-location's cost without its benefit. The policy FIELD
 	   * stays -- the lone-method path passes FALSE deliberately, to keep self-recursion indirect. */
-	  wj_asm_policy_init (&pol, TRUE);
+	  /* MONO_WASM_JIT_T1_UNIT: a unit frames with its members' calls to each other left on the table unless
+	   * MONO_WASM_JIT_T1_UNIT_LOCAL (mono_wasm_jit_rebatch_unit) */
+	  wj_asm_policy_init (&pol, !wj_rebatch_table_calls);
 	  pol.image = (wj_img_want && !mono_wasm_jit_img_batch && n + 1 < (int) sizeof (mono_wasm_jit_img_live)) ||
 	              wj_img_same (desc_ids, n);   /* G: the image, or the image re-framed */
 	  { extern int mono_wasm_jit_s1, mono_wasm_jit_b4;   /* plan2x S1: one word per group generation, never freed */
@@ -1077,6 +1082,20 @@ int
 mono_wasm_jit_rebatch (const int *desc_ids, int n, void **out_bytes, int *out_len)
 {
 	return wj_rebatch_core (desc_ids, n, NULL, 0, NULL, NULL, out_bytes, out_len);
+}
+
+/* MONO_WASM_JIT_T1_UNIT: frame a tier-1 unit. With `local_calls` 0 its members call each other through the table, so a
+ * later re-frame (a member's tier-2 body, an IKVM swap) cannot leave a frame that never returns calling the old copies
+ * module-locally (R337, the reason R338 turned tier-1 co-location off under tier 2). Inside the compile section. */
+int mono_wasm_jit_rebatch_unit (const int *desc_ids, int n, int local_calls);
+int
+mono_wasm_jit_rebatch_unit (const int *desc_ids, int n, int local_calls)
+{
+	int ok;
+	wj_rebatch_table_calls = !local_calls;
+	ok = wj_rebatch_core (desc_ids, n, NULL, 0, NULL, NULL, NULL, NULL);
+	wj_rebatch_table_calls = 0;
+	return ok;
 }
 
 /*

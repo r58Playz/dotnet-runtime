@@ -1430,6 +1430,11 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_prof_repair, "MONO_WASM_JIT_PROF_REPAIR", 1, 32767)
 	WJ_T2_KNOB (mono_wasm_jit_prof_repair_max, "MONO_WASM_JIT_PROF_REPAIR_MAX", 0, 1000000)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cast_discount, "MONO_WASM_JIT_INLINE_CAST_DISCOUNT", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_t1_unit, "MONO_WASM_JIT_T1_UNIT", 0, 64)
+	WJ_T2_KNOB (mono_wasm_jit_t1_unit_bytes, "MONO_WASM_JIT_T1_UNIT_BYTES", 1024, 16777216)
+	WJ_T2_KNOB (mono_wasm_jit_t1_unit_warm, "MONO_WASM_JIT_T1_UNIT_WARM", 1, 99)
+	WJ_T2_KNOB (mono_wasm_jit_t1_unit_nbr, "MONO_WASM_JIT_T1_UNIT_NBR", 0, 8)
+	WJ_T2_KNOB (mono_wasm_jit_t1_unit_local, "MONO_WASM_JIT_T1_UNIT_LOCAL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_stackprobe, "MONO_WASM_JIT_STACKPROBE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_call, "MONO_WASM_JIT_INLINE_COLD_CALL", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_bfi, "MONO_WASM_JIT_INLINE_BFI", 0, 1)
@@ -2097,6 +2102,26 @@ int mono_wasm_jit_prof_repair_max = 2048;
  * size gate only, not inline_method's cost cap. Counted
  * WJC_INLINE_CAST_DISCOUNTED where it turned a refusal into an admission. 0 = off. */
 int mono_wasm_jit_inline_cast_discount = 0;
+/* MONO_WASM_JIT_T1_UNIT=<members> (plan v3 L9, 2026-11-22): tier 1 compiles a method together with a UNIT -- the warm
+ * methods of its class and of the classes it calls or is called by most in the interpreter -- and publishes them as one
+ * module. interp.c: wasm_jit_maybe_compile feeds a warm list per class (a method crossing MONO_WASM_JIT_T1_UNIT_WARM
+ * percent of the tier-1 threshold) and a class-to-class call profile (every 8th counted interpreted call);
+ * wasm_jit_compile_publish forms the unit at the threshold, compiles its members, frames them (mono_wasm_jit_rebatch)
+ * and only then publishes every member, so no member ever has a module of its own: nothing live is re-framed (R214,
+ * R338) and no solo instance is left alive. Bound (runs/2026-11-22-v3/BOUND): TeaVM in our call layout with its 6%-heat
+ * tail grouped by class + class edges, -1.0 M cycles (-2.5%, n=3, disjoint) against the tail one module per function;
+ * memory, d8 15.8 with our import shape, ~2.8 KB VmData a module per isolate. MEASURED, it loses: T1_UNIT=16 on mctick
+ * with tier 2 settled (T2_UNTIL_MS=240000, 24,000-tick warm-up, n=3 a side, 2026-11-22) +6.3% ms/tick, +6.9% cycles,
+ * +27% calls, disjoint; boot and 262u peak VmData unchanged (findings "T1_UNIT late-settle A/B", "T1_UNIT=16 gates").
+ * MONO_WASM_JIT_T1_UNIT_BYTES caps a unit's solo module bytes; MONO_WASM_JIT_T1_UNIT_NBR is how many neighbour classes
+ * are asked. Counted WJC_T1U_*. 0 = off. */
+int mono_wasm_jit_t1_unit = 0;
+int mono_wasm_jit_t1_unit_bytes = 65536;
+int mono_wasm_jit_t1_unit_warm = 50;
+int mono_wasm_jit_t1_unit_nbr = 3;
+/* MONO_WASM_JIT_T1_UNIT_LOCAL=1: a unit's members call each other module-locally (`call <funcidx>`, V8-inlinable) instead
+ * of through the table; exposes the unit to R337's stale-instance hazard when a member is re-framed. 0 = table calls. */
+int mono_wasm_jit_t1_unit_local = 0;
 gint32 mono_wasm_jit_inline_alloc_sites;   /* emit-time count of allocations lowered inline */
 /* MONO_WASM_JIT_FRAME_ZERO: 0 = leave a frame's write-through ref region unzeroed (the emitter's eager
  * prologue carries the argument). ~3.5 M instr/tick (R294f, R299); its cost is more conservative stack pins,

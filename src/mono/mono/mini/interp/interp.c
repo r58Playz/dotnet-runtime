@@ -4470,6 +4470,12 @@ mono_wasm_jit_repoint_imethod_bytes (gpointer imethod_ptr, void *bytes, int len)
 	jit_mm_unlock (jit_mm);
 }
 
+/* MONO_WASM_JIT_T1_UNIT (defined below wasm_jit_maybe_compile): the unit compiled and framed with a tier-1 compile */
+#define WJ_UNIT_MAX 64                /* the knob's ceiling */
+static int wj_unit_form (InterpMethod *im, MonoWasmJitResult *r, InterpMethod **mim, MonoWasmJitResult **mres, guint32 *mepoch,
+                         gboolean *framed);
+static void wj_unit_publish (InterpMethod *c, MonoWasmJitResult *rc, guint32 snap_epoch, gboolean framed);
+
 /* Compile im->method to wasm and, on success, publish the result onto its InterpMethod (so callers
  * see its f-slot). Returns 1 = JITted+published; 0 = retriable bail (a per-worker instantiate failure or a
  * failed re-frame; no compile blocks on a callee since R366); 2 = transient retry (another thread was
@@ -4477,6 +4483,12 @@ mono_wasm_jit_repoint_imethod_bytes (gpointer imethod_ptr, void *bytes, int len)
 static int
 wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean reemit)
 {
+	extern int mono_wasm_jit_t1_unit;
+	InterpMethod **unit_im = NULL;
+	MonoWasmJitResult **unit_res = NULL;
+	guint32 *unit_epoch = NULL;
+	int unit_n = 0;
+	gboolean unit_framed = FALSE;
 	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
 	extern gboolean mono_wasm_jit_method_denied (MonoMethod *m);
 	extern int mono_wasm_jit_colocate_deps_now (int desc_id);
@@ -4608,6 +4620,14 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 	}
 	if (out)
 		*out = r;
+	/* MONO_WASM_JIT_T1_UNIT: a tier-1 compile (never a re-emission) brings its unit along, framed before anything of it
+	 * is published (wj_unit_form) */
+	if (G_UNLIKELY (mono_wasm_jit_t1_unit > 1) && !reemit && r.e_slot > 0 && r.desc_id > 0) {
+		unit_im = g_new0 (InterpMethod *, WJ_UNIT_MAX);
+		unit_res = g_new0 (MonoWasmJitResult *, WJ_UNIT_MAX);
+		unit_epoch = g_new0 (guint32, WJ_UNIT_MAX);
+		unit_n = wj_unit_form (im, &r, unit_im, unit_res, unit_epoch, &unit_framed);
+	}
 	if (r.e_slot > 0) {
 		extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
 		MonoMethod *logical_method = im->method;
@@ -4629,13 +4649,25 @@ wasm_jit_compile_publish (InterpMethod *im, MonoWasmJitResult *out, gboolean ree
 		 * note there for why it must not be JITTED. */
 		if (im) {
 			im->wasm_jit_fslot = r.f_slot;
-			im->wasm_jit_bytes = r.bytes;
-			im->wasm_jit_bytes_len = r.bytes_len;
+			if (!unit_framed) {   /* MONO_WASM_JIT_T1_UNIT: a framed unit's bind already set the group module; r.bytes is retired */
+				im->wasm_jit_bytes = r.bytes;
+				im->wasm_jit_bytes_len = r.bytes_len;
+			}
 			im->wasm_jit_desc = r.desc_id;
 			mono_memory_barrier ();   /* publish the immutable descriptor and compatibility fields before the slot gate */
 			im->wasm_jit_slot = r.e_slot;
 		}
 		jit_mm_unlock (jit_mm);
+		/* MONO_WASM_JIT_T1_UNIT: the unit's members, now that the module holding them is framed */
+		{
+			int ui;
+			for (ui = 0; ui < unit_n; ++ui) {
+				wj_unit_publish (unit_im [ui], unit_res [ui], unit_epoch [ui], unit_framed);
+				g_free (unit_res [ui]);
+			}
+			g_free (unit_im); g_free (unit_res); g_free (unit_epoch);
+			unit_im = NULL; unit_res = NULL; unit_epoch = NULL; unit_n = 0;
+		}
 		/* MONO_WASM_JIT_HEAL_WAIT registered this method as a waiter on each of r.heal_callees[], so the
 		 * callee's own publish would wake it for RE-EMISSION and the new body would replace the
 		 * late-f-slot healing block with a plain direct call. Deleted with re-emission: the mechanism
@@ -5300,6 +5332,289 @@ wasm_jit_drain_promotions (void)
 	}
 }
 
+/*
+ * MONO_WASM_JIT_T1_UNIT (knob comment in mini-wasm.c): tier-1 units. Two tables, both fed by wasm_jit_maybe_compile and
+ * both behind one section (a bounded test-and-test-and-set spin that drops the observation when it cannot get in, as the
+ * profile's append section does: nothing here blocks, allocates under a JIT lock or reaches a safepoint):
+ *   - per class, the methods that crossed MONO_WASM_JIT_T1_UNIT_WARM percent of the tier-1 threshold (InterpMethod
+ *     pointers, retained raw: every reader tests them against the freed-method set before dereferencing);
+ *   - class-to-class call weights, one sample per 8 counted interpreted calls below the threshold.
+ * Keys are pointers (never dereferenced for hashing). Allocated at the first observation, never freed.
+ */
+#define WJ_UNIT_CLASSES 8192          /* open-addressed, power of two */
+#define WJ_UNIT_WARM_MAX 32
+#define WJ_UNIT_EDGES 16384           /* open-addressed, power of two */
+#define WJ_UNIT_PROBE 16
+typedef struct {
+	MonoClass *klass;                 /* NULL = empty */
+	gint32 n;
+	InterpMethod *warm [WJ_UNIT_WARM_MAX];
+} WjUnitClass;
+typedef struct { MonoClass *a, *b; guint32 w; } WjUnitEdge;
+static WjUnitClass *wj_unit_classes;
+static WjUnitEdge *wj_unit_edges;
+static volatile gint32 wj_unit_section;
+
+static gboolean
+wj_unit_enter (void)
+{
+	int spins;
+	for (spins = 0; spins < 4096; ++spins)
+		if (mono_atomic_load_i32 (&wj_unit_section) == 0 && mono_atomic_cas_i32 (&wj_unit_section, 1, 0) == 0)
+			return TRUE;
+	mono_wasm_jit_counters [WJC_T1U_DROP]++;
+	return FALSE;
+}
+
+static void
+wj_unit_leave (void)
+{
+	mono_atomic_store_i32 (&wj_unit_section, 0);
+}
+
+static inline guint32
+wj_unit_hash (gconstpointer p)
+{
+	return (guint32) (((gsize) p >> 3) * 0x9E3779B1u);
+}
+
+/* The class's slot (created when `create`), or NULL. Inside the section. */
+static WjUnitClass *
+wj_unit_class_at (MonoClass *k, gboolean create)
+{
+	guint32 h = wj_unit_hash (k), i;
+	if (!wj_unit_classes) {
+		if (!create)
+			return NULL;
+		wj_unit_classes = g_new0 (WjUnitClass, WJ_UNIT_CLASSES);
+	}
+	for (i = 0; i < WJ_UNIT_PROBE; ++i) {
+		WjUnitClass *c = &wj_unit_classes [(h + i) & (WJ_UNIT_CLASSES - 1)];
+		if (c->klass == k)
+			return c;
+		if (!c->klass) {
+			if (!create)
+				return NULL;
+			c->klass = k;
+			return c;
+		}
+	}
+	return NULL;
+}
+
+/* A counted interpreted call of `cmethod` (its `hits`-th), from `frame` when the caller is interpreted. */
+static void
+wj_unit_observe (InterpMethod *cmethod, InterpFrame *frame, gint32 hits)
+{
+	extern int mono_wasm_jit_thresh, mono_wasm_jit_t1_unit_warm;
+	gint32 warm = (gint32) ((gint64) mono_wasm_jit_thresh * mono_wasm_jit_t1_unit_warm / 100);
+	MonoClass *ck = cmethod->method ? cmethod->method->klass : NULL;
+	if (!ck)
+		return;
+	if (warm < 1)
+		warm = 1;
+	if (hits == warm && wj_unit_enter ()) {
+		WjUnitClass *c = wj_unit_class_at (ck, TRUE);
+		int k;
+		if (!c || c->n >= WJ_UNIT_WARM_MAX) {
+			mono_wasm_jit_counters [WJC_T1U_DROP]++;
+		} else {
+			for (k = 0; k < c->n && c->warm [k] != cmethod; ++k)
+				;
+			if (k == c->n) {
+				c->warm [c->n] = cmethod;
+				mono_memory_barrier ();
+				c->n++;
+				mono_wasm_jit_counters [WJC_T1U_WARM]++;
+			}
+		}
+		wj_unit_leave ();
+	}
+	if (frame && frame->imethod && frame->imethod->method && (hits & 7) == 0 && hits < mono_wasm_jit_thresh) {
+		MonoClass *a = frame->imethod->method->klass;
+		if (a && a != ck && wj_unit_enter ()) {
+			guint32 h = wj_unit_hash (a) ^ (wj_unit_hash (ck) * 0x85EBCA77u), i;
+			gboolean done = FALSE;
+			if (!wj_unit_edges)
+				wj_unit_edges = g_new0 (WjUnitEdge, WJ_UNIT_EDGES);
+			for (i = 0; i < WJ_UNIT_PROBE && !done; ++i) {
+				WjUnitEdge *e = &wj_unit_edges [(h + i) & (WJ_UNIT_EDGES - 1)];
+				if (e->a == a && e->b == ck) {
+					e->w++;
+					done = TRUE;
+				} else if (!e->a) {
+					e->a = a; e->b = ck; e->w = 1;
+					done = TRUE;
+				}
+			}
+			if (done)
+				mono_wasm_jit_counters [WJC_T1U_EDGE]++;
+			else
+				mono_wasm_jit_counters [WJC_T1U_DROP]++;
+			wj_unit_leave ();
+		}
+	}
+}
+
+/* The unit's candidates: the warm methods of `im`'s class, then of its heaviest neighbour classes (class-to-class call
+ * weight, both directions summed), at most `max`. Pointers only, copied out inside the section. */
+static int
+wj_unit_candidates (InterpMethod *im, InterpMethod **cand, int max)
+{
+	extern int mono_wasm_jit_t1_unit_nbr;
+	MonoClass *k = im->method->klass, *nk [64], *cls [9];
+	guint64 nw [64];
+	int nn = 0, ncls = 0, nc = 0, i, j;
+	if (!k || !wj_unit_enter ())
+		return 0;
+	cls [ncls++] = k;
+	if (wj_unit_edges && mono_wasm_jit_t1_unit_nbr > 0) {
+		for (i = 0; i < WJ_UNIT_EDGES; ++i) {
+			WjUnitEdge *e = &wj_unit_edges [i];
+			MonoClass *o = e->a == k ? e->b : e->b == k ? e->a : NULL;
+			if (!o || !e->w)
+				continue;
+			for (j = 0; j < nn && nk [j] != o; ++j)
+				;
+			if (j < nn)
+				nw [j] += e->w;
+			else if (nn < 64) {
+				nk [nn] = o; nw [nn] = e->w; nn++;
+			}
+		}
+		while (ncls < 1 + mono_wasm_jit_t1_unit_nbr && nn > 0) {
+			int best = 0;
+			for (j = 1; j < nn; ++j)
+				if (nw [j] > nw [best])
+					best = j;
+			cls [ncls++] = nk [best];
+			nk [best] = nk [nn - 1]; nw [best] = nw [nn - 1]; nn--;
+		}
+	}
+	for (i = 0; i < ncls && nc < max; ++i) {
+		WjUnitClass *c = wj_unit_class_at (cls [i], FALSE);
+		for (j = 0; c && j < c->n && nc < max; ++j)
+			if (c->warm [j] != im)
+				cand [nc++] = c->warm [j];
+	}
+	wj_unit_leave ();
+	return nc;
+}
+
+/* MONO_WASM_JIT_T1_UNIT: compile the unit of the method that just compiled into `r` and frame it with it. Inside the
+ * compile section, BEFORE anything of the unit is published: a member is reachable only through its InterpMethod's
+ * published slot (the interpreter's entry, the vcall resolve, mono_wasm_jit_late_fslot all read wasm_jit_fslot /
+ * wasm_jit_slot), so no worker instantiates a member alone, and the framed module is the first and only one each member
+ * has. Each candidate passes the threshold path's own gates (not dead, not compiled, not permanently bailed, no relink
+ * pending, not retired, not denied, no AOT code); a compile that yields nothing leaves the method to its own threshold.
+ * Results on the heap (each MonoWasmJitResult carries KBs of dependency arrays; this chain's stack margin is R194's).
+ * Returns the members compiled (`im` excluded); the caller publishes them with wj_unit_publish and frees mres. */
+static int
+wj_unit_form (InterpMethod *im, MonoWasmJitResult *r, InterpMethod **mim, MonoWasmJitResult **mres, guint32 *mepoch,
+              gboolean *framed)
+{
+	extern void mono_wasm_force_compile (MonoMethod *m, MonoWasmJitResult *out);
+	extern gboolean mono_wasm_jit_method_denied (MonoMethod *m);
+	extern void mono_wasm_jit_snap_begin (MonoMethod *method);
+	extern void mono_wasm_jit_snap_end (void);
+	extern guint32 mono_wasm_jit_snap_epoch (void);
+	extern int mono_wasm_jit_rebatch_unit (const int *desc_ids, int n, int local_calls);
+	extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
+	extern int mono_wasm_jit_method_known_dead (MonoMethod *method, int site);
+	extern int mono_wasm_jit_t1_unit, mono_wasm_jit_t1_unit_bytes, mono_wasm_jit_t1_unit_local;
+	InterpMethod **cand = g_new (InterpMethod *, WJ_UNIT_MAX * 4);
+	int cap = MIN (mono_wasm_jit_t1_unit, WJ_UNIT_MAX), ncand, n = 0, i, j, bytes = r->bytes_len;
+	ncand = wj_unit_candidates (im, cand, WJ_UNIT_MAX * 4);
+	for (i = 0; i < ncand && n + 1 < cap && bytes < mono_wasm_jit_t1_unit_bytes; ++i) {
+		InterpMethod *c = cand [i];
+		MonoMethod *cm;
+		MonoWasmJitResult *rc;
+		guint32 ep;
+		if (!c || c == im || mono_wasm_jit_method_known_dead ((MonoMethod *) c, -1))
+			continue;
+		cm = c->method;
+		if (!cm || mono_wasm_jit_method_known_dead (cm, -1))
+			continue;
+		c = interp_imethod_current (c, TRUE);
+		cm = c->method;
+		if (c == im || cm == im->method || c->wasm_jit_fslot > 0 || c->wasm_jit_slot == -1 || c->relink_pending || c->retired)
+			continue;
+		for (j = 0; j < n && mim [j] != c; ++j)
+			;
+		if (j < n)
+			continue;
+		if (mono_wasm_jit_method_denied (cm) || mono_interp_jit_call_supported (cm, mono_method_signature_internal (cm)))
+			continue;
+		rc = g_new0 (MonoWasmJitResult, 1);
+		mono_wasm_jit_snap_begin (cm);
+		ep = mono_wasm_jit_snap_epoch ();
+		mono_wasm_force_compile (cm, rc);
+		mono_wasm_jit_snap_end ();
+		if (rc->e_slot <= 0 || rc->desc_id <= 0) {
+			mono_wasm_jit_counters [WJC_T1U_COMPILE_FAIL]++;
+			g_free (rc);
+			continue;
+		}
+		rc->body_epoch = ep;
+		mim [n] = c; mres [n] = rc; mepoch [n] = ep; n++;
+		bytes += rc->bytes_len;
+	}
+	g_free (cand);
+	*framed = FALSE;
+	if (n > 0) {
+		int *descs = g_new (int, n + 1);
+		descs [0] = r->desc_id;
+		for (i = 0; i < n; ++i)
+			descs [i + 1] = mres [i]->desc_id;
+		/* Bind every descriptor to its method FIRST, as publication does before co-location: the batch bind repoints
+		 * each member's InterpMethod bytes at the group module and unpatches its interpreter-entry adapter through
+		 * re->logical_imethod, and the solo bytes it supersedes are retired (freed once readers quiesce). Framed
+		 * unbound, publication then handed every member those retired solo bytes. */
+		mono_wasm_jit_bind_logical (r->desc_id, im->method);
+		for (i = 0; i < n; ++i)
+			mono_wasm_jit_bind_logical (mres [i]->desc_id, mim [i]->method);
+		if (mono_wasm_jit_rebatch_unit (descs, n + 1, mono_wasm_jit_t1_unit_local)) {
+			*framed = TRUE;
+			mono_wasm_jit_counters [WJC_T1U_FORMED]++;
+			mono_wasm_jit_counters [WJC_T1U_MEMBERS] += n + 1;
+		} else {
+			mono_wasm_jit_counters [WJC_T1U_FRAME_FAIL]++;   /* each member keeps its own module, published below */
+		}
+		g_free (descs);
+	}
+	return n;
+}
+
+/* Publish a unit member compiled by wj_unit_form: what wasm_jit_compile_publish does for the method it compiled. */
+static void
+wj_unit_publish (InterpMethod *c, MonoWasmJitResult *rc, guint32 snap_epoch, gboolean framed)
+{
+	extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
+	MonoMethod *logical_method = c->method;
+	MonoJitMemoryManager *jit_mm = jit_mm_for_method (logical_method);
+	InterpMethod *im;
+	mono_wasm_jit_bind_logical (rc->desc_id, logical_method);
+	jit_mm_lock (jit_mm);
+	im = wj_publish_imethod_locked (jit_mm, logical_method);
+	if (im && mono_body_override_info (logical_method, NULL, NULL) != snap_epoch) {
+		mono_wasm_jit_counters [WJC_EPOCH_REFUSED_PUBLISH]++;
+		im = NULL;
+	}
+	if (im) {
+		im->wasm_jit_fslot = rc->f_slot;
+		if (!framed) {   /* framed: the batch bind already pointed it at the group module; rc->bytes is retired */
+			im->wasm_jit_bytes = rc->bytes;
+			im->wasm_jit_bytes_len = rc->bytes_len;
+		}
+		im->wasm_jit_desc = rc->desc_id;
+		mono_memory_barrier ();
+		im->wasm_jit_slot = rc->e_slot;
+	} else {
+		mono_wasm_jit_counters [WJC_T1U_PUBLISH_FAIL]++;
+	}
+	jit_mm_unlock (jit_mm);
+}
+
 /* Work the drains inside wasm_jit_maybe_compile could do: a promotion queued, or a re-emission queued / batched.
  * Unsynchronised reads, as the drains' own early-outs are: a missed visit is picked up by the next one. */
 static inline gboolean
@@ -5343,7 +5658,14 @@ wasm_jit_maybe_compile (InterpMethod *cmethod, InterpFrame *frame, const guint16
 	 * emit from generation-1 IL and then have to be refused by the swap, because an f-slot other modules
 	 * may already have baked cannot be invalidated. The hits counter still advances, so the method
 	 * re-reaches the threshold once the replacement clears the flag. */
-	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && !cmethod->relink_pending && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot) && mono_atomic_inc_i32 (&cmethod->wasm_jit_hits) == mono_wasm_jit_thresh) {
+	gint32 wj_hits = 0;
+	if (G_UNLIKELY (mono_wasm_jit_auto > 0) && !cmethod->relink_pending && wj_slot_hot_retry_eligible (cmethod->wasm_jit_slot)) {
+		extern int mono_wasm_jit_t1_unit;
+		wj_hits = mono_atomic_inc_i32 (&cmethod->wasm_jit_hits);
+		if (G_UNLIKELY (mono_wasm_jit_t1_unit > 1))
+			wj_unit_observe (cmethod, frame, wj_hits);   /* MONO_WASM_JIT_T1_UNIT: warm lists and class edges */
+	}
+	if (wj_hits == mono_wasm_jit_thresh && wj_hits > 0) {
 		int r;
 		/* Don't whole-method-JIT a method that already has AOT code. MONO_WASM_JIT_OVER_AOT gated this,
 		 * letting the same hotness/island machinery compile it again with the runtime wasm emitter and

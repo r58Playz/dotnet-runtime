@@ -1592,6 +1592,14 @@ enum {
 	WJC_PROF_MISS_SPLIT,         /* MONO_WASM_JIT_PROF_V2 & 1: IC misses kept out of the shares */
 	WJC_PROF_RECYCLED,           /* MONO_WASM_JIT_PROF_V2 & 2: identity entries replaced */
 	WJC_PROF_FB_PARKED,          /* MONO_WASM_JIT_PROF_V2 & 4: fallback probes parked (their site decided, or past the cutoff) */
+	WJC_T1U_WARM,                /* MONO_WASM_JIT_T1_UNIT: methods entered on their class's warm list */
+	WJC_T1U_EDGE,                /* ... class-to-class call samples recorded */
+	WJC_T1U_DROP,                /* ... observations dropped (the section was busy, or a table full) */
+	WJC_T1U_FORMED,              /* ... units framed and published as one module */
+	WJC_T1U_MEMBERS,             /* ... their members, the triggering method included */
+	WJC_T1U_COMPILE_FAIL,        /* ... candidates whose compile produced nothing (left to their own threshold) */
+	WJC_T1U_FRAME_FAIL,          /* ... units whose framing failed (members published alone) */
+	WJC_T1U_PUBLISH_FAIL,        /* ... members compiled but refused at publication (a body swap landed in between) */
 	WJC_MAX
 };
 
