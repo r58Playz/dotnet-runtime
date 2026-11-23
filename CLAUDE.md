@@ -23,8 +23,8 @@ file leaves out.
 | the backend | `src/mono/mono/mini/mini-wasm.c` (knobs, registry, admission, GC shadow frame) + its `#include`d `.inc` files: `-emitter` IR -> wasm, `-ir` the relocatable body (`WjBody`) and `wj_assemble`, `-batching` co-location, `-publish` asynchronous republication, `-lazy` lazy f-slot pools, `-vslow`, `-diagnostics`; and `wasm-encoder.c` |
 | JIT <-> interp boundary | `src/mono/mono/mini/interp/interp.c`, `ee.h`, `transform.c` |
 | this branch | `wasm-jit-11.0.0` (.NET 11.0.0, emscripten 6.0.3, no JSPI), the main checkout `~/fna-wasm/dotnet-runtime-jit`, which holds `.git` and `scratchpad/`. The 10.0.3 tree is a worktree at `~/fna-wasm/dotnet-runtime-jspi` (keep it: this branch's build uses the emscripten .NET provisioned in ITS `.dotnet`; its `scratchpad` is a symlink here). Rounds before 2026-11-10 cite `wasm-jspi-jit-10.0.3` (frozen at de5ea57c395); `scratchpad/notes/REBASE-11.0.0-HASHMAP.txt` maps each of its commits to this branch's (`cherry picked from` lines too) |
-| the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft` (branch `net11`), `frontend/src/dotnet/index.ts`; the 10.0.3 app is its worktree `~/Documents/ikvm-wasm/ikvmcraft-10.0.3` (branch `master`) |
-| IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm`; its natives from ikvm-wasm-build `net11-sockets` |
+| the app + shipped knob set | `~/Documents/ikvm-wasm/ikvmcraft` (branch `master`, which `net11` was merged into on 2026-11-22; the 10.0.3 worktree is gone), `frontend/src/dotnet/index.ts` |
+| IKVM (Java -> CLR) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/ikvm/ikvm`, branch `wasm`; its natives from ikvm-wasm-build `master` (`net11-sockets` merged in) |
 | the GL stack (mesa-wink) | `~/Documents/ikvm-wasm/ikvm-wasm-build/tools/native-deps/mesa-wink`, its own repo (branch `wink`, origin `MercuryWorkshop/mesa-wink`; ikvm-wasm-build ignores it) -- see **The GL stack** |
 | measurement harness | `wjharness/` (tracked; `wjharness/wj <tool>`, reference in `wjharness/README.md`); its data in `scratchpad/` -- see **The harness** |
 | the benchmarks and the TeaVM arms | `wjharness/bench/` (`README.md` there): jbox2d and mctick (26.2's server tick) sources and builds, and the pinned TeaVM (9be5eca57, the last commit with its linear-memory wasm backend, plus `bench/teavm-patches/`). The TeaVM checkout (`$TEAVM_DIR`) is only the source of that pin |
@@ -32,7 +32,7 @@ file leaves out.
 | chromium / V8 source | `~/Documents/chromium/src` (v8 at `src/v8`) |
 | split DWARF for the shipped wasm | `~/Documents/ikvm-wasm/ikvmcraft/loader/obj/dotnet.native.debug.wasm` |
 | the canonical emsdk (6.0.3) | `~/Documents/ikvm-wasm/ikvmcraft/statics/emsdk` -- see **Building** |
-| FNA-WASM-Build (runtime build, emsdk patches) | `~/fna-wasm/FNA-WASM-Build`, branch `net11`; the 10.0.3 one is its worktree `~/fna-wasm/FNA-WASM-Build-10.0.3` (branch `main`) |
+| FNA-WASM-Build (runtime build, emsdk patches) | `~/fna-wasm/FNA-WASM-Build`, branch `main` (the .NET 11 work merged in on 2026-11-22; the 10.0.3 worktree is gone) |
 
 The findings log is long. The alternative to reading the relevant part is re-running an experiment that already has an
 answer.
@@ -106,7 +106,7 @@ version). Line numbers drift: if something surprising turns up, re-check the tre
 * **A partial AOT profile is worse than none unless it is closed over direct calls** (R498): an AOT'd call to an
   out-of-profile method of the same image goes indirect and may enter the interpreter. No profile ships: the AOT
   whitelist is CoreLib, IKVM.Runtime, IKVM.ByteCode and System.Memory (ikvmcraft `loader/IkvmWasm.csproj`).
-* **R479's deadlock fix is upstream in emscripten 6** (21a3a81daf), as are emsdk.patch, .2 and .5; FNA-WASM-Build net11
+* **R479's deadlock fix is upstream in emscripten 6** (21a3a81daf), as are emsdk.patch, .2 and .5; FNA-WASM-Build `main`
   carries .3 (a backport of upstream #27937's readwrite-unsafe OPFS handles), .4, .6, .8-.11 rebased, .12, and .13
   (R533: wasmfs `rename` locked directories child-then-parent against every lookup's parent-then-child, so a save
   could hang the game; `runs/2026-11-22-emsdk13/renamelock.c` is its positive control).
@@ -656,8 +656,8 @@ inlined away). Prove a revert both ways: the new marker present and the reverted
   `bool(os.getenv(..., 'True'))`), then a redeploy. **embuilder clears the whole cache when `cache/sanity.txt` names
   another toolchain path** (R502), and the provisioned sanity.txt names .NET's CI path; the freeze script handles both.
 * **The harness needs no environment for this branch**: `~/.config/wjharness/machine.env` names `IKVMCRAFT` (the
-  `net11` checkout) and `FNA_WASM_BUILD=~/fna-wasm/FNA-WASM-Build`, `WJ_HOME` defaults to this checkout's
-  `scratchpad/`, and `DOTNET_ZIP` to `dotnet-jit.zip`. To measure the 10.0.3 app, set `IKVMCRAFT` to its worktree:
+  `master` checkout) and `FNA_WASM_BUILD=~/fna-wasm/FNA-WASM-Build`, `WJ_HOME` defaults to this checkout's
+  `scratchpad/`, and `DOTNET_ZIP` to `dotnet-jit.zip`. To measure another ikvmcraft checkout, set `IKVMCRAFT` to it:
   `ensure-server` re-creates the dev server there.
 * **Never edit a source file while a build of it is in flight.** The binary's contents become unknowable, and so does
   every number taken on it. Treat the build and deploy windows as read-only and queue the edits.
