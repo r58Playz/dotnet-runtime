@@ -8,7 +8,10 @@ access). This puts TeaVM's code in that layout:
     (co-location: calls inside a group are module-local `call`s, which V8 can inline; across groups they stay
     call_indirect / imports): --mode class (the methods of one class), edges (greedy merge along the hottest call
     edges), classedges (class groups, then merged along the hottest edges between groups), hot (the hottest functions
-    packed together, the rest alone), one (no split at all: TeaVM's single module through the same rewrites);
+    packed together, the rest alone), hotone / hotclassedges (hot's packing of the hottest, the cold rest packed into
+    modules in placement order / grouped by class and merged along the edges between cold groups only: the cold
+    tail's own grouping, priced against hot with the hot groups identical, 2026-11-22), one (no split at all: TeaVM's
+    single module through the same rewrites);
     --cap BYTES bounds a group's wasm bytes (default 1 MiB);
   * --inline-runtime: TeaVM's WasmRuntime.allocStack and supertypeof_* (its shadow-frame allocation and type checks)
     are inlined into those functions first (wasmrw.inline; our JIT emits both inline), so they do not become import
@@ -51,7 +54,7 @@ FEATURES = ['--mvp-features', '--enable-exception-handling', '--enable-reference
             '--enable-sign-ext', '--enable-nontrapping-float-to-int', '--enable-mutable-globals']   # what V8 runs: not --all-features (binaryen 130 then emits `exact` imports)
 KEEP = re.compile(r'^(meth_otr_|meth_otbw|teavm_|initclass_|supertypeof_|start$|_start$)')
 SP_ADDR = 3444      # TeaVM 9be5eca57's WasmRuntime stack-pointer word in this build: checked below, not assumed
-assert MODE in ('function', 'class', 'edges', 'classedges', 'hot', 'one'), MODE
+assert MODE in ('function', 'class', 'edges', 'classedges', 'hot', 'hotone', 'hotclassedges', 'one'), MODE
 
 # the executed set
 jd = max(glob.glob(os.path.join(RUN, 'jit-*.dump')), key=os.path.getsize)
@@ -124,7 +127,7 @@ elif MODE == 'class' or MODE == 'classedges':
         groups.append(cur)
 elif MODE == 'edges':
     groups = [[n_] for n_ in split]
-elif MODE == 'hot':
+elif MODE in ('hot', 'hotone', 'hotclassedges'):
     heat = collections.Counter()
     for f in read_tsv(opt('--hot'), 2):
         heat[f[0][len('trampoline_'):] if f[0].startswith('trampoline_') else f[0]] += float(f[1])
@@ -142,10 +145,34 @@ elif MODE == 'hot':
     if cur:
         groups.append(cur)
     hs = set(hot)
-    groups += [[n_] for n_ in split if n_ not in hs]
-    log.append(f'hot: {len(hot)} functions hold {100 * acc / max(tot, 1):.1f}% of the profiled heat, packed in {len(groups) - (len(split) - len(hot))} modules')
-if MODE in ('edges', 'classedges'):
-    # greedy union along the heaviest edges, capped
+    nhot_groups = len(groups)
+    cold = [n_ for n_ in split if n_ not in hs]
+    if MODE == 'hot':
+        groups += [[n_] for n_ in cold]
+    elif MODE == 'hotone':
+        cur, cb = [], 0
+        for n_ in cold:
+            if cur and cb + size[n_] > CAP:
+                groups.append(cur); cur, cb = [], 0
+            cur.append(n_); cb += size[n_]
+        if cur:
+            groups.append(cur)
+    else:
+        by = collections.defaultdict(list)
+        for n_ in cold:
+            by[cls_of(n_)].append(n_)
+        for k, ms in sorted(by.items()):
+            cur, cb = [], 0
+            for n_ in sorted(ms, key=lambda x: -size[x]):
+                if cur and cb + size[n_] > CAP:
+                    groups.append(cur); cur, cb = [], 0
+                cur.append(n_); cb += size[n_]
+            groups.append(cur)
+    log.append(f'{MODE}: {len(hot)} functions hold {100 * acc / max(tot, 1):.1f}% of the profiled heat, packed in {nhot_groups} modules; '
+               f'{len(cold)} cold functions in {len(groups) - nhot_groups} modules')
+if MODE in ('edges', 'classedges', 'hotclassedges'):
+    # greedy union along the heaviest edges, capped (hotclassedges: between cold groups only; the hot groups are hot's)
+    frozen = set(range(nhot_groups)) if MODE == 'hotclassedges' else set()
     gid = {}
     for i, g_ in enumerate(groups):
         for n_ in g_:
@@ -160,7 +187,7 @@ if MODE in ('edges', 'classedges'):
     merges = 0
     for (x, y), wt in sorted(w.items(), key=lambda kv: -kv[1]):
         gx, gy = gid[x], gid[y]
-        if gx == gy or gbytes[gx] + gbytes[gy] > CAP:
+        if gx == gy or gx in frozen or gy in frozen or gbytes[gx] + gbytes[gy] > CAP:
             continue
         if len(members[gx]) < len(members[gy]):
             gx, gy = gy, gx
