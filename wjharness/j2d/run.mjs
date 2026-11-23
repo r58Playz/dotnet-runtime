@@ -107,7 +107,8 @@ const dumpQueue = [];  // end the run at this batch (teavm-baseline is a 600-bat
  * ~0.1 s against xctrace's seconds of start-up: at navigation); it stops after batch WB, and fe/xctrace.py reads every
  * thread's instructions and cycles over the window [batch WA, batch WB] by wall clock. The bench thread is the one
  * with the most cycles. window.json gets them as `xct`. */
-const XCT = args.includes("--xctrace");
+const XCPROF = args.includes("--xcprof");   // the same capture with the Time Profiler template + V8's perf map: per-function time (fe/xcprof.py)
+const XCT = args.includes("--xctrace") || XCPROF;
 if (XCT && process.platform !== "darwin") { console.error("--xctrace is darwin-only (use the perf event sets)"); process.exit(1); }
 let xct = null;
 const batchWall = {};
@@ -224,8 +225,8 @@ function busiestRenderer () {
 function startXct () {
   const pid = busiestRenderer();
   if (!pid) { onLine("[j2d] xctrace: no renderer found"); return { failed: true }; }
-  const out = join(outdir, "counters.trace");
-  const p = spawn("xcrun", ["xctrace", "record", "--template", "CPU Counters", "--attach", String(pid), "--output", out, "--no-prompt"],
+  const out = join(outdir, XCPROF ? "profile.trace" : "counters.trace");
+  const p = spawn("xcrun", ["xctrace", "record", "--template", XCPROF ? "Time Profiler" : "CPU Counters", "--attach", String(pid), "--output", out, "--no-prompt"],
     { stdio: ["ignore", "pipe", "pipe"], detached: true });
   let tail = ""; p.stdout.on("data", (d) => { tail += d; }); p.stderr.on("data", (d) => { tail += d; });
   const st = { p, pid, out, exited: false, tail: () => tail.slice(-400) };
@@ -305,7 +306,7 @@ if (HS && MC) {
     "--disable-sync", "--disable-background-networking", "--disable-client-side-phishing-detection",
     "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
     "--ignore-gpu-blocklist", "--use-gl=angle", `--use-angle=${angleBackend()}`,
-    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
+    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${XCPROF ? ",--perf-basic-prof" : ""}${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
     "about:blank"];
   delete env.WAYLAND_DISPLAY; delete env.XDG_SESSION_TYPE;
   env.__J2D_PROFILE = prof;
@@ -400,7 +401,20 @@ const win = {
   window_ms_per_step: ok ? Array.from({ length: WB - WA }, (_, i) => batchMs[WA + 1 + i]).reduce((s, v) => s + v, 0) / steps : null,
   batch_ms: batchMs, failed, perf_stderr_tail: perfErr.slice(-600),
 };
-if (xct?.out && existsSync(xct.out) && ok) {
+if (XCPROF && xct?.pid) {   // V8's map for the renderer, beside the capture; every map this browser wrote leaves /tmp
+  const pm = `/tmp/perf-${xct.pid}.map`;
+  if (existsSync(pm)) execSync(`cp ${JSON.stringify(pm)} ${JSON.stringify(join(outdir, "perf.map"))}`);
+  for (const f of readdirSync("/tmp").filter((f) => /^perf-\d+\.map$/.test(f))) {
+    const fp = join("/tmp", f); try { if (statSync(fp).mtimeMs >= t0 - 1000) rmSync(fp); } catch { }
+  }
+}
+if (XCPROF && xct?.out && existsSync(xct.out) && existsSync(join(outdir, "perf.map")) && ok) {
+  try {
+    const txt = execSync(`python3 ${JSON.stringify(join(HERE, "..", "fe", "xcprof.py"))} ${JSON.stringify(xct.out)} ${JSON.stringify(join(outdir, "perf.map"))} --incl --top 80 --from-ms ${batchWall[WA]} --to-ms ${batchWall[WB]}`, { encoding: "utf8", maxBuffer: 1 << 26 });
+    writeFileSync(join(outdir, "xcprof.txt"), txt);
+    win.xcprof = txt.split("\n").slice(0, 12).join("\n");
+  } catch (e) { win.xcprof = `error: ${String(e.message || e).slice(0, 300)}`; }
+} else if (!XCPROF && xct?.out && existsSync(xct.out) && ok) {
   try {
     const r = JSON.parse(execSync(`python3 ${JSON.stringify(join(HERE, "..", "fe", "xctrace.py"))} ${JSON.stringify(xct.out)} --json --from-ms ${batchWall[WA]} --to-ms ${batchWall[WB]}`, { encoding: "utf8", maxBuffer: 1 << 26 }));
     const b = r.threads[0];
