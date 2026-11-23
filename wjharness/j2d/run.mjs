@@ -107,7 +107,8 @@ const dumpQueue = [];  // end the run at this batch (teavm-baseline is a 600-bat
  * ~0.1 s against xctrace's seconds of start-up: at navigation); it stops after batch WB, and fe/xctrace.py reads every
  * thread's instructions and cycles over the window [batch WA, batch WB] by wall clock. The bench thread is the one
  * with the most cycles. window.json gets them as `xct`. */
-const XCPROF = args.includes("--xcprof");   // the same capture with the Time Profiler template + V8's perf map: per-function time (fe/xcprof.py)
+const XCPROF_JIT = args.includes("--xcprof-jit");   // + V8's jitdump (code bytes) for fe/xchot.py; a mctick one is GBs
+const XCPROF = args.includes("--xcprof") || XCPROF_JIT;   // the same capture with the Time Profiler template + V8's perf map: per-function time (fe/xcprof.py)
 const XCT = args.includes("--xctrace") || XCPROF;
 if (XCT && process.platform !== "darwin") { console.error("--xctrace is darwin-only (use the perf event sets)"); process.exit(1); }
 let xct = null;
@@ -306,7 +307,7 @@ if (HS && MC) {
     "--disable-sync", "--disable-background-networking", "--disable-client-side-phishing-detection",
     "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
     "--ignore-gpu-blocklist", "--use-gl=angle", `--use-angle=${angleBackend()}`,
-    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${XCPROF ? ",--perf-basic-prof" : ""}${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
+    `--js-flags=--stack-trace-limit=64,--no-logfile-per-isolate,--logfile=+${XCPROF ? ",--perf-basic-prof" : ""}${XCPROF_JIT ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}${opt("js-flags-extra") ? "," + opt("js-flags-extra") : ""}${PERF && JITDUMP && (SET === "A" || SET === "C" || SET === "D" || SET === "L") ? `,--perf-prof,--perf-prof-path=${outdir}` : ""}`,  // jitdump only where the ledger needs it (A, C's call-site census, D's stalls by function); the logfile pair stops --perf-prof's implied --log writing isolate-*.log into the cwd (lib/mcdrive.mjs launchGame)
     "about:blank"];
   delete env.WAYLAND_DISPLAY; delete env.XDG_SESSION_TYPE;
   env.__J2D_PROFILE = prof;
@@ -404,6 +405,11 @@ const win = {
 if (XCPROF && xct?.pid) {   // V8's map for the renderer, beside the capture; every map this browser wrote leaves /tmp
   const pm = `/tmp/perf-${xct.pid}.map`;
   if (existsSync(pm)) execSync(`cp ${JSON.stringify(pm)} ${JSON.stringify(join(outdir, "perf.map"))}`);
+  /* the renderer's jitdump is the one fe/xchot.py reads; the browser's other processes wrote small ones beside it */
+  if (XCPROF_JIT && existsSync(join(outdir, `jit-${xct.pid}.dump`))) {
+    execSync(`mv ${JSON.stringify(join(outdir, `jit-${xct.pid}.dump`))} ${JSON.stringify(join(outdir, "jit.dump"))}`);
+    for (const f of readdirSync(outdir).filter((f) => /^jit-\d+\.dump$/.test(f))) rmSync(join(outdir, f));
+  }
   for (const f of readdirSync("/tmp").filter((f) => /^perf-\d+\.map$/.test(f))) {
     const fp = join("/tmp", f); try { if (statSync(fp).mtimeMs >= t0 - 1000) rmSync(fp); } catch { }
   }
