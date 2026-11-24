@@ -161,6 +161,12 @@ public final class Mctick {
                 + String.format("%.1f %.1f %.1f", player.getX(), player.getY(), player.getZ()) + "; joined at " + msSince(t0) + " ms; "
                 + "difficulty " + player.level().getDifficulty() + ", day time " + player.level().getDefaultClockTime());
 
+        // ---- no wandering traders: WanderingTraderSpawner rolls at random every 1200 ticks once its delay runs out. On
+        // ours one arrived (with two llamas) in 3 of ~60 runs through 2026-11-23 and on TeaVM in none of 39, and those
+        // runs ticked ~15% slower, so the arms did not do the same work. Off for every arm.
+        server.getGameRules().set(net.minecraft.world.level.gamerules.GameRules.SPAWN_WANDERING_TRADERS, false, server);
+        log("[mctick] spawn_wandering_traders " + server.getGameRules().get(net.minecraft.world.level.gamerules.GameRules.SPAWN_WANDERING_TRADERS));
+
         // ---- warmup: ticks as the game runs them; report the world's state as it settles
         Ticker ticker = new Ticker(server, conn, player);
         long tw = System.nanoTime();

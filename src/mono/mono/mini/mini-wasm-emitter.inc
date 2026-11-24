@@ -2167,7 +2167,8 @@ typedef struct { guint8 *cold; int *fhead, *fnext, *fvreg; int ncold, nflush, nh
  * The plan: backward liveness over the candidate refs (slotted, write-through, no address slot) on the IR CFG; at each
  * effective GC point g, OBS(g) = the refs live after g other than its own def, plus the refs g uses (a call argument
  * stays pinned by the caller for the whole call), plus the source of any PIN_ALIAS carrier g passes (the carrier has no
- * slot of its own). g is COLD if it is a conditional safepoint poll or sits in an out_of_line block, and is not a raise;
+ * slot of its own). g is COLD if it is a conditional safepoint poll or sits in an out_of_line block (PIN_COLD & 4: or a
+ * guarded inline's fallback, bb->wasm_cold), and is not a raise;
  * otherwise HOT. A ref in OBS of any hot point keeps its def mirror. Every other candidate is cold-only: no def mirror,
  * and each cold g stores every cold-only ref of OBS(g) before itself (a poll: inside its taken arm). So at a hot point
  * every observed slot is current by write-through, and at a cold point by the stores just emitted: (I2).
@@ -2339,7 +2340,7 @@ wj_pin_cold_plan (MonoCompile *cfg, int nvreg, const int *refslot, const guint8 
 			int nu = wj_pc_uses (ins, uses, G_N_ELEMENTS (uses));
 			int dc = (!wj_pc_dreg_is_base (ins->opcode) && ins->dreg >= 0 && ins->dreg < nvreg) ? cidx [ins->dreg] : -1;
 			if (wj_ins_is_effective_gcpoint (cfg, ins)) {
-				gboolean is_cold = !wj_ins_is_raise (ins) && (ins->opcode == OP_GC_SAFE_POINT || x->out_of_line);
+				gboolean is_cold = !wj_ins_is_raise (ins) && (ins->opcode == OP_GC_SAFE_POINT || x->out_of_line || ((mono_wasm_jit_pin_cold & 4) && x->wasm_cold));
 				int a, w;
 				/* OBS = (live after, without the def) | uses | alias sources at this ordinal */
 				memcpy (obs, live, sizeof (guint64) * W);
@@ -4608,7 +4609,7 @@ co_ranges_done:
 		{
 			extern int mono_wasm_jit_pin_cold;
 			if (mono_wasm_jit_pin_cold && nrefslots > 0 && lc.ref_wt && !lazy_ref_frame && gcp_walked &&
-			    (eh_on ? (mono_wasm_jit_pin_cold >= 2 && ehrec_on && !ehslim) : cfg->header->num_clauses == 0) &&
+			    (eh_on ? ((mono_wasm_jit_pin_cold & 2) && ehrec_on && !ehslim) : cfg->header->num_clauses == 0) &&
 			    naddrbytes == 0 && !lc.storeguard && !lc.objguard &&
 			    mono_wasm_jit_raise_nogc != 2 &&
 			    wj_pin_cold_plan (cfg, nvreg, refslot, lc.ref_wt, li, addrslot, pc_pa_c, pc_pa_s, pc_pa_o, pc_nal, &pcold)) {

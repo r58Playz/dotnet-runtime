@@ -1482,7 +1482,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_cast_diag, "MONO_WASM_JIT_CAST_DIAG", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_census, "MONO_WASM_JIT_CAST_CENSUS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_elim, "MONO_WASM_JIT_CAST_ELIM", 0, 7)
-	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 2)
+	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
@@ -1699,8 +1699,8 @@ int mono_wasm_jit_t1_tee = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JI
  * time; both must read 0); 3 = the positive control: no kill extension, so BAD must fire (and is repaired: the carrier
  * keeps its own slot) and RT_BAD fires wherever the source's slot was zeroed before the call; 0 = off. */
 int mono_wasm_jit_pin_alias = 1;   /* (the 2026-11-20 set; measured at MONO_WASM_JIT_POLL_LOCAL) */
-/* MONO_WASM_JIT_PIN_COLD: a slotted write-through ref that only COLD GC points observe -- a call in an out_of_line
- * block (a guarded inline's or IC's slow path) or a conditional safepoint poll -- is not mirrored at its def; each
+/* MONO_WASM_JIT_PIN_COLD, a bit mask: a slotted write-through ref that only COLD GC points observe -- a call in an
+ * out_of_line block or a conditional safepoint poll -- is not mirrored at its def; each
  * cold point stores the refs it observes (live across it, used by it, or a PIN_ALIAS carrier's source) right before
  * it, a poll inside its taken arm. Refs any hot GC point observes keep the def mirror, so (I2) holds at every GC
  * point. Eager-frame, clause-free methods without address slots or debug guards only; raises count as hot. Its
@@ -1710,8 +1710,11 @@ int mono_wasm_jit_pin_alias = 1;   /* (the 2026-11-20 set; measured at MONO_WASM
  * instructions -2.6% (disjoint). 262n, 262u and mcsr game runs clean (n=1 each, a smoke test). 2 = also EH methods in
  * R353's record mode, every ref live into a handler block kept hot (getBlockState's tier-2 module: 190 of its 335 stores
  * are slot stores): measured NULL on mctick (M5, 2026-11-23, n=3 a side, both orders: 17.70 vs 17.71 M cycles a tick;
- * verify modes 0), so not the default. 1 = clause-free methods only. 0 = off. */
-int mono_wasm_jit_pin_cold = 1;
+ * verify modes 0), so not the default. 4 = a call in a guarded inline's fallback block (bb->wasm_cold, which is NOT
+ * out_of_line: the M2 plan treated those calls as hot) is cold too: mctick (M4, goal protocol, one binary, n=3 a side,
+ * both orders, 2026-11-23, findings M12b) 15.81 -> 15.28 M cycles a tick, 3.95 -> 3.81 ms (ranges touch), instructions
+ * -2.3%; jbox2d level; cold refs 55 k -> 69 k; 262u / mcsr mcbench clean. 1 = clause-free methods only. 0 = off. */
+int mono_wasm_jit_pin_cold = 5;
 /* MONO_WASM_JIT_ILOFS_DEDUPE: an EH-record method's block skips its IL-offset store when every predecessor has the same
  * offset and region and reaches it by a plain edge, so the record already holds it (60% of getBlockState's executed
  * IL-offset stores repeat, findings note 2026-11-18 evening). Exclusions at the emitter (E: the il_offsets loop); R353
