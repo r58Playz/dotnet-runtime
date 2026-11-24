@@ -1305,7 +1305,7 @@ mono_wasm_jit_dump_stats (void)
 					WJC_(WJC_PIN_ALIAS_CARRIERS), WJC_(WJC_PIN_ALIAS_BAD), WJC_(WJC_PIN_ALIAS_RT_BAD), WJC_(WJC_F4_KLASS_NONREF), WJC_(WJC_F4_VT_MOVE_NONREF),
 					mono_wasm_jit_pin_alias, mono_wasm_jit_f4); }
 				{ extern int mono_wasm_jit_arraycopy_on;
-				  printf ("[wasm-jit arraycopy] sites=%lld fast=%lld declined=%lld (arraycopy=%d: IKVM's arraycopy tries a C copy first)\n",
+				  printf ("[wasm-jit arraycopy] sites=%lld fast=%lld declined=%lld (arraycopy=%d: IKVM's arraycopy tries a C copy first; cross-type too)\n",
 					WJC_(WJC_ARRAYCOPY_SITES), WJC_(WJC_ARRAYCOPY_FAST), WJC_(WJC_ARRAYCOPY_DECLINED), mono_wasm_jit_arraycopy_on); }
 				{ extern int mono_wasm_jit_hash_inline;
 				  printf ("[wasm-jit hashinline] sites=%lld (hash_inline=%d: RuntimeHelpers.GetHashCode reads the lock word inline; default 1)\n",
