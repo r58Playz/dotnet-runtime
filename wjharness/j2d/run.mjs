@@ -197,10 +197,12 @@ const batchT = {}, batchMs = {};
 let mean = null, checksum = null, done = false, failed = null, stoppedEarly = false;
 /* --done-rx RX: the run is over when a line matches (a jar that is not the benchmark, run with --jar) */
 const DONE_RX = opt("done-rx") ? new RegExp(opt("done-rx")) : null;
+let lastProgress = 0;   // Date.now() of the last [bench] / [mctick] line: the stall watchdog's clock
 function onLine(text) {
   const t = mono();
   log.write(`${t.toFixed(6)}\t${text}\n`);
   if (DONE_RX && DONE_RX.test(text)) done = true;
+  if (/\[bench\]|\[mctick\]/.test(text)) lastProgress = Date.now();
   if (!text.includes("[bench]")) return;
   let m = text.match(/\[bench\] batch (\d+)\/(\d+): ([\d.]+) ms/);
   if (m) {
@@ -357,6 +359,19 @@ if (HS || CLR) {
     const conn = await connect(wsUrl);
     const sid = await attachPage(conn);
     consoleTap(conn, sid, onLine);
+    /* Workers' uncaught exceptions with their stacks (2026-11-23: three mctick runs died of "worker sent an error! ...
+     * memory access out of bounds", which the page's ErrorEvent reports without one). Runtime only, no Debugger. */
+    conn.on((m) => {
+      if (m.method === "Target.attachedToTarget" && m.params?.targetInfo?.type === "worker") {
+        const ws = m.params.sessionId;
+        conn.send("Runtime.enable", {}, ws).catch(() => { });
+        conn.send("Runtime.runIfWaitingForDebugger", {}, ws).catch(() => { });
+      } else if (m.method === "Runtime.exceptionThrown" && m.sessionId && m.sessionId !== sid) {
+        const d = m.params?.exceptionDetails;
+        onLine(`[worker-exception] ${(d?.exception?.description || d?.text || "").replace(/\n/g, " | ").slice(0, 4000)}`);
+      }
+    });
+    await conn.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sid).catch(() => { });
     await conn.send("Runtime.enable", {}, sid);
     await conn.send("Page.enable", {}, sid);
     await conn.send("Page.navigate", { url }, sid);
@@ -367,6 +382,9 @@ if (HS || CLR) {
       await driveLauncher(conn, sid, MC ? "262n" : "mcsr", { log: onLine }).catch((e) => { failed = `launcher: ${e.message}`; });
     let dumps = 0;
     while (!done && !failed && Date.now() - t0 < TIMEOUT) {
+      /* stall watchdog: once the bench has printed, 120 s without a [bench] / [mctick] line is a dead run (a worker
+       * trap leaves the page alive and silent until TIMEOUT) */
+      if (lastProgress && Date.now() - lastProgress > 120000) { failed = `stall: no bench progress for ${Math.round((Date.now() - lastProgress) / 1000)} s`; break; }
       while (dumpQueue.length) {   // dump from here, not the console callback: the RPC needs the loop
         const b = dumpQueue.shift();
         const r = await conn.send("Runtime.evaluate", { expression: "globalThis.dumpWasmJit ? (globalThis.dumpWasmJit(), 1) : 0", returnByValue: true }, sid);
