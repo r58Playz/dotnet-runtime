@@ -1305,7 +1305,7 @@ mono_wasm_jit_dump_stats (void)
 					WJC_(WJC_PIN_ALIAS_CARRIERS), WJC_(WJC_PIN_ALIAS_BAD), WJC_(WJC_PIN_ALIAS_RT_BAD), WJC_(WJC_F4_KLASS_NONREF), WJC_(WJC_F4_VT_MOVE_NONREF),
 					mono_wasm_jit_pin_alias, mono_wasm_jit_f4); }
 				{ extern int mono_wasm_jit_pin_cold;
-				  printf ("[wasm-jit pincold] methods=%lld cold_refs=%lld flush_stores=%lld (pin_cold=%d; 2 = EH record methods, 4 = GI fallbacks cold)\n",
+				  printf ("[wasm-jit pincold] methods=%lld cold_refs=%lld flush_stores=%lld (pin_cold=%d; 1 on, 2 = EH record methods, 4 = GI fallbacks cold; default 5)\n",
 					WJC_(WJC_PIN_COLD_METHODS), WJC_(WJC_PIN_COLD_VREGS), WJC_(WJC_PIN_COLD_FLUSHES), mono_wasm_jit_pin_cold); }
 				{ extern int mono_wasm_jit_tls_sd;
 				  printf ("[wasm-jit tlssd] sites=%lld (tls_sd=%d)\n", WJC_(WJC_TLS_SD_SITES), mono_wasm_jit_tls_sd); }
