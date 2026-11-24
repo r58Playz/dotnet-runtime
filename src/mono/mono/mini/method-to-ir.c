@@ -10541,6 +10541,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 				gboolean gi_recv = FALSE;   /* this site's prediction is the static one */
 				gboolean gi_widened = FALSE;   /* ... or the profile's, with the static slot guard behind its vtable */
 				gboolean gi_idhash = FALSE;   /* ... or System.Object's own method (MONO_WASM_JIT_IDHASH) */
+				int gi_profcha_slot = -1;   /* S3 & 16 took this site: the base's vtable slot, for RECV_CLASS & 8's verify */
 				cfg->wasm_site_base = NULL;
 				if (mono_wasm_jit_recv_class && cfg->wasm_jit_tier >= 2 && (gi_rk = wj_recv_arg_class (cfg, sp [0]))) {
 					wj_gi_count (WJC_RECV_SITE);
@@ -10627,6 +10628,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					gint32 *pc_word = mono_wasm_jit_cha_final_word (cmethod, &pc_cand);
 					if (pc_word) {
 						gi_cha = pc_word; gi_vt = NULL; gi_mid_slot = -1; gi_widened = FALSE;
+						gi_profcha_slot = mono_wasm_jit_mid_slot (cmethod);
 						wj_gi_count (WJC_S3_GI_PROF);
 					}
 				  } }
@@ -10830,6 +10832,13 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, gi_fallback_bb);
 						if (gi_recv && (mono_wasm_jit_recv_class & 8))
 							WJ_RECV_VERIFY (TRUE);
+						else if (gi_profcha_slot >= 0 && (mono_wasm_jit_recv_class & 8)) {
+							/* S3 & 16's site: the receiver is the base's class or below and its slot holds the base */
+							MonoClass *pv_rk = gi_rk; int pv_slot = gi_st_slot;
+							gi_rk = cmethod->klass; gi_st_slot = gi_profcha_slot;
+							WJ_RECV_VERIFY (TRUE);
+							gi_rk = pv_rk; gi_st_slot = pv_slot;
+						}
 					} else if (gi_mid_slot >= 0) {
 						/* R311 METHOD-IDENTITY GUARD. The predicted receiver still pays one compare; any
 						 * other receiver whose class holds gi_target in the same vtable slot -- i.e.

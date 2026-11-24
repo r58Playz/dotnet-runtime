@@ -1290,7 +1290,7 @@ mono_wasm_jit_dump_stats (void)
 					WJC_(WJC_EHSLIM_EMITTED), WJC_(WJC_EHSLIM_FIN_MARK), mono_wasm_jit_eh_slim); }
 				{ extern int mono_wasm_jit_recv_class;
 				  extern gint32 mono_wasm_jit_recv_wrong;
-				  printf ("[wasm-jit recv] frames=%lld sites=%lld unresolved=%lld overridden=%lld gi_pred=%lld gi_emitted=%lld arm_pred=%lld arm_emitted=%lld widened=%lld filtered=%lld (recv_class=%d) verify wrong=%d -- wrong MUST be 0 unless recv_class has 16\n",
+				  printf ("[wasm-jit recv] frames=%lld sites=%lld unresolved=%lld overridden=%lld gi_pred=%lld gi_emitted=%lld arm_pred=%lld arm_emitted=%lld widened=%lld filtered=%lld (recv_class=%d) verify wrong=%d (S3 & 16 sites too) -- wrong MUST be 0 unless recv_class has 16\n",
 					WJC_(WJC_RECV_FRAMES), WJC_(WJC_RECV_SITE), WJC_(WJC_RECV_UNRESOLVED), WJC_(WJC_RECV_OVERRIDDEN), WJC_(WJC_RECV_GI_PRED),
 					WJC_(WJC_RECV_GI_EMITTED), WJC_(WJC_RECV_ARM_PRED), WJC_(WJC_RECV_ARM_EMITTED), WJC_(WJC_RECV_WIDENED), WJC_(WJC_RECV_FILTERED),
 					mono_wasm_jit_recv_class, (int) mono_wasm_jit_recv_wrong); }
