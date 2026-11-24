@@ -1410,9 +1410,13 @@ export async function driveLauncher (conn, sid, seed, { log = console.log, timeo
   let st = null;
   for (;;) {
     st = await ev(`(() => {
-      if (document.readyState !== "complete") return "loading";
+      /* "interactive", not "complete": the page's deferred external analytics script can hold the load event for the
+       * whole timeout in a headless run (2026-11-23, every run waited 90 s and reloaded). Ready = Play enabled AND the
+       * version field rendered (Play renders first; pressing ahead of the fields failed "launcher fields not found"). */
+      if (document.readyState === "loading") return "loading";
       const play = [...document.querySelectorAll("button")].find((b) => b.textContent.trim() === "Play");
-      if (play) return play.disabled ? "disabled" : "launcher";
+      const verField = [...document.querySelectorAll("span")].some((x) => x.textContent.trim().startsWith("Minecraft version"));
+      if (play) return play.disabled ? "disabled" : verField ? "launcher" : "fields";
       return document.querySelector("canvas#canvas") ? "autostart" : "none";
     })()`).catch(() => "loading");
     if (st === "launcher" || st === "autostart") break;
