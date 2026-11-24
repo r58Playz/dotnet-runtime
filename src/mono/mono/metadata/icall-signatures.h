@@ -266,6 +266,7 @@ ICALL_SIG (5, (void, ptr, ptr, int, object))	\
 ICALL_SIG (5, (void, ptr, ptr, int, ptr))	\
 ICALL_SIG (5, (ptr, ptr, ptr, ptr, ptr))	\
 ICALL_SIG (6, (int, int, int, ptr, ptr, ptr))		\
+ICALL_SIG (6, (int32, object, int32, object, int32, int32))	\
 ICALL_SIG (6, (int, ptr, int, int, ptr, object))	\
 ICALL_SIG (6, (object, ptr, int, int, int, int))	\
 ICALL_SIG (6, (object, ptr, ptr, ptr, ptr, ptr))	\

@@ -1608,6 +1608,9 @@ enum {
 	WJC_S3_GI_PROF,              /* MONO_WASM_JIT_S3 & 16: profile predictions of the base whose receiver guard the CHA word replaced */
 	WJC_CLASSREC_ARRAY_SITES,    /* MONO_WASM_JIT_CLASS_RECORD & 4: vector castclasses given an exact-vtable fast path (compile time) */
 	WJC_HASH_INLINE_SITES,       /* MONO_WASM_JIT_HASH_INLINE: RuntimeHelpers.(Try)GetHashCode calls lowered to an inline lock-word read */
+	WJC_ARRAYCOPY_SITES,         /* MONO_WASM_JIT_ARRAYCOPY: ByteCodeHelper.arraycopy calls given the C copy first (compile time) */
+	WJC_ARRAYCOPY_FAST,          /* ... copies the C helper did (run time) */
+	WJC_ARRAYCOPY_DECLINED,      /* ... copies it handed back to IKVM's own (run time) */
 	WJC_MAX
 };
 

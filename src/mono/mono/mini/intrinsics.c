@@ -1082,6 +1082,30 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 	if (!(cfg->opt & MONO_OPT_INTRINS))
 		return NULL;
 
+#ifdef HOST_BROWSER
+	/* MONO_WASM_JIT_ARRAYCOPY (mini-wasm.c): IKVM's System.arraycopy goes to a C copy first; 0 = not handled, IKVM's own */
+	{ extern int mono_wasm_jit_arraycopy_on;
+	  if (COMPILE_WASM (cfg) && mono_wasm_jit_arraycopy_on && fsig->param_count == 5 && !fsig->hasthis &&
+	      fsig->params [0]->type == MONO_TYPE_OBJECT && fsig->params [2]->type == MONO_TYPE_OBJECT &&
+	      !strcmp (cmethod->name, "arraycopy") && !strcmp (cmethod_klass_name, "ByteCodeHelper") &&
+	      !strcmp (cmethod_klass_name_space, "IKVM.Runtime")) {
+		MonoBasicBlock *ac_slow, *ac_end;
+		MonoInst *ac_r;
+		NEW_BBLOCK (cfg, ac_slow);
+		NEW_BBLOCK (cfg, ac_end);
+		ac_r = mono_emit_jit_icall (cfg, mono_wasm_jit_arraycopy, args);
+		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, ac_r->dreg, 0);
+		MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBEQ, ac_slow);
+		MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, ac_end);
+		MONO_START_BB (cfg, ac_slow);
+		ac_slow->out_of_line = TRUE;   /* bounds, nulls, mixed types: the throwing / checked path */
+		mono_emit_method_call (cfg, cmethod, args, NULL);
+		MONO_START_BB (cfg, ac_end);
+		mono_wasm_jit_counters [WJC_ARRAYCOPY_SITES]++;
+		return ac_r;
+	  } }
+#endif
+
 	if (cmethod->klass == mono_defaults.string_class) {
 		if (strcmp (cmethod->name, "get_Chars") == 0 && fsig->param_count + fsig->hasthis == 2) {
 			int dreg = alloc_ireg (cfg);

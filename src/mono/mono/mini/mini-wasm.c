@@ -868,6 +868,66 @@ gint32 mono_wasm_jit_recv_wrong;
 int mono_wasm_jit_idhash = 0;
 gint32 mono_wasm_jit_idhash_pred, mono_wasm_jit_idhash_emitted;
 
+#ifdef HOST_BROWSER
+/* MONO_WASM_JIT_ARRAYCOPY's copy (knob comment above): 1 = copied, 0 = not handled (nulls, negative or out-of-range
+ * bounds, different vtables, a multi-dimensional array, a value type with references), which the caller hands to IKVM's
+ * own ByteCodeHelper.arraycopy for its exceptions and store checks. One vtable for both arrays means one element type, so
+ * no element needs a store check; the copy is overlap-safe either way. Registered without a wrapper: it neither
+ * allocates nor throws. Two different reference vector types are copied too when no element needs a store check. */
+int mono_wasm_jit_arraycopy (MonoObject *so, int sp, MonoObject *dobj, int dp, int len);
+int
+mono_wasm_jit_arraycopy (MonoObject *so, int sp, MonoObject *dobj, int dp, int len)
+{
+	MonoArray *src = (MonoArray *) so, *dst = (MonoArray *) dobj;
+	MonoVTable *vt;
+	MonoClass *ac, *ec;
+	int esize;
+	if (!src || !dst || len < 0 || sp < 0 || dp < 0)
+		goto declined;
+	vt = so->vtable;
+	if (vt->rank != 1 || dobj->vtable->rank != 1 || src->bounds || dst->bounds)
+		goto declined;
+	if ((gint64) sp + len > (gint64) src->max_length || (gint64) dp + len > (gint64) dst->max_length)
+		goto declined;
+	if (vt != dobj->vtable) {
+		/* Two reference vector types: storable without a check into Object[]; otherwise every element must be null or
+		 * exactly the destination's element class (TimSort's Object[] tmp back into the Pair[] it sorts). Scanned before
+		 * anything is copied, so a mismatch hands the WHOLE copy to IKVM, which copies up to the bad element and throws. */
+		MonoClass *se = m_class_get_element_class (vt->klass), *de = m_class_get_element_class (dobj->vtable->klass);
+		if (m_class_is_valuetype (se) || m_class_is_valuetype (de))
+			goto declined;
+		if (de != mono_defaults.object_class) {
+			MonoObject **sv = (MonoObject **) mono_array_addr_with_size_fast (src, sizeof (gpointer), sp);
+			for (int i = 0; i < len; i++)
+				if (sv [i] && sv [i]->vtable->klass != de)
+					goto declined;
+		}
+		mono_gc_wbarrier_arrayref_copy_internal (mono_array_addr_with_size_fast (dst, sizeof (gpointer), dp),
+			mono_array_addr_with_size_fast (src, sizeof (gpointer), sp), len);
+		goto done;
+	}
+	ac = vt->klass;
+	ec = m_class_get_element_class (ac);
+	esize = mono_array_element_size (ac);
+	if (len) {
+		if (!m_class_is_valuetype (ec))
+			mono_gc_wbarrier_arrayref_copy_internal (mono_array_addr_with_size_fast (dst, esize, dp), mono_array_addr_with_size_fast (src, esize, sp), len);
+		else if (!m_class_has_references (ec))
+			memmove (mono_array_addr_with_size_fast (dst, esize, dp), mono_array_addr_with_size_fast (src, esize, sp), (gsize) len * esize);
+		else
+			goto declined;
+	}
+done:
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_counters [WJC_ARRAYCOPY_FAST]++;
+	return 1;
+declined:
+	if (G_UNLIKELY (mono_wasm_jit_stats))
+		mono_wasm_jit_counters [WJC_ARRAYCOPY_DECLINED]++;
+	return 0;
+}
+#endif
+
 /* MONO_WASM_JIT_RECV_CLASS & 8, the emitter arm's verify: is the receiver's class `k` or below it? (i32,i32)->i32.
  * A failure counts and the first eight print the two classes (field reads; both are live). */
 int mono_wasm_jit_recv_verify (MonoVTable *vt, MonoClass *k);
@@ -1484,6 +1544,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_cast_elim, "MONO_WASM_JIT_CAST_ELIM", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_hash_inline, "MONO_WASM_JIT_HASH_INLINE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_arraycopy_on, "MONO_WASM_JIT_ARRAYCOPY", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
@@ -1723,6 +1784,12 @@ int mono_wasm_jit_pin_cold = 5;
  * against TeaVM's 1.5 (M16, 2026-11-23). mctick (M4, goal protocol, one binary, n=4 / n=3, both orders, 2026-11-23):
  * 15.72 -> 15.22 M cycles a tick (-3.2%), 3.930 -> 3.800 ms, disjoint; 254 sites. 0 = off. */
 int mono_wasm_jit_hash_inline = 1;
+/* MONO_WASM_JIT_ARRAYCOPY: a call to IKVM.Runtime.ByteCodeHelper.arraycopy (System.arraycopy) calls
+ * mono_wasm_jit_arraycopy first, which copies when both arrays have the same vtable (a vector: same type, so every element
+ * is storable) and the bounds hold -- memmove, or the bulk ref copy + card marks -- and returns 0 otherwise, so IKVM's own
+ * code throws or store-checks. IKVM's is AOT'd C#: per element a loop check, two frame stores and a card mark (jbox2d's
+ * TimSort: 3.5% of the step, M14). 0 = off. */
+int mono_wasm_jit_arraycopy_on = 0;
 /* MONO_WASM_JIT_ILOFS_DEDUPE: an EH-record method's block skips its IL-offset store when every predecessor has the same
  * offset and region and reaches it by a plain edge, so the record already holds it (60% of getBlockState's executed
  * IL-offset stores repeat, findings note 2026-11-18 evening). Exclusions at the emitter (E: the il_offsets loop); R353

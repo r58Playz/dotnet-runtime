@@ -5388,6 +5388,10 @@ register_icalls (void)
 	register_icall (mini_llvmonly_init_delegate, mono_icall_sig_void_object_ptr, TRUE);
 	register_icall (mini_llvmonly_throw_nullref_exception, mono_icall_sig_void, TRUE);
 	register_icall (mono_wasm_seq_fence, mono_icall_sig_void, TRUE);
+#ifdef HOST_BROWSER
+	{ extern int mono_wasm_jit_arraycopy (MonoObject *, int, MonoObject *, int, int);
+	  register_icall (mono_wasm_jit_arraycopy, mono_icall_sig_int32_object_int32_object_int32_int32, TRUE); }
+#endif
 	register_icall (mini_llvmonly_throw_index_out_of_range_exception, mono_icall_sig_void, TRUE);
 	register_icall (mini_llvmonly_throw_invalid_cast_exception, mono_icall_sig_void, TRUE);
 	register_icall (mini_llvmonly_throw_aot_failed_exception, mono_icall_sig_void_ptr, TRUE);
