@@ -1406,7 +1406,9 @@ export function spinCheck (pid, before, wallMs, { busyFrac = 0.8 } = {}) {
 export async function driveLauncher (conn, sid, seed, { log = console.log, timeoutMs = 90000 } = {}) {
   const s = resolveSeed(seed);
   const ev = async (expression) => (await conn.send("Runtime.evaluate", { expression, returnByValue: true }, sid))?.result?.value;
-  let t0 = Date.now(), reloaded = false;
+  /* The first wait is short: a stalled load (a dev-server dep fetch at status 0 leaves the module graph pending; 2026-11-23,
+   * ~1 run in 6) never recovers by waiting, and a reload fixes it. Two reloads before giving up. */
+  let t0 = Date.now(), reloads = 0, waitMs = Math.min(timeoutMs, 25000);
   let st = null;
   for (;;) {
     st = await ev(`(() => {
@@ -1420,7 +1422,7 @@ export async function driveLauncher (conn, sid, seed, { log = console.log, timeo
       return document.querySelector("canvas#canvas") ? "autostart" : "none";
     })()`).catch(() => "loading");
     if (st === "launcher" || st === "autostart") break;
-    if (Date.now() - t0 > timeoutMs) {
+    if (Date.now() - t0 > waitMs) {
       /* Say what the page is waiting for before giving up: this failure comes in clusters (2026-11-12: nine launches)
        * and leaves nothing in the log after `[vite] connected.`. A module that is still pending 3 s after being
        * imported again is waiting on a top-level await or on one of its own imports; the ones whose imports all
@@ -1441,11 +1443,11 @@ export async function driveLauncher (conn, sid, seed, { log = console.log, timeo
       log(`  launcher: never became usable; the page: ${diag}`);
       /* One reload before giving up (M4 box, 2026-11-22: 3 runs of ~60 died here with a dev-server module fetch at
        * status 0 and nothing pending). Logged, so a run that needed it says so. */
-      if (!reloaded) {
-        reloaded = true;
-        log(`  launcher: reloading the page once`);
+      if (reloads < 2) {
+        reloads++;
+        log(`  launcher: reloading the page (${reloads} of 2)`);
         await conn.send("Page.reload", { ignoreCache: true }, sid).catch(() => {});
-        t0 = Date.now();
+        t0 = Date.now(); waitMs = timeoutMs;
         continue;
       }
       throw new Error(`launcher never became usable (last state: ${st})`);
@@ -1454,7 +1456,10 @@ export async function driveLauncher (conn, sid, seed, { log = console.log, timeo
   }
   if (st === "autostart") { log(`  launcher: none on this page (app starts on load)`); return { mode: "autostart" }; }
   if (!s.version) throw new Error(`seed ${s.name} names no version to type into the launcher`);
-  const r = JSON.parse(await ev(`(() => {
+  /* the version inputs can render a moment after their labels: retry the fill for up to 10 s */
+  let r = {};
+  for (let tries = 0; tries < 40; tries++) {
+  r = JSON.parse(await ev(`(() => {
     const field = (label) => {
       const sp = [...document.querySelectorAll("span")].find((x) => x.textContent.trim().startsWith(label));
       return sp && sp.parentElement && sp.parentElement.querySelector("input");
@@ -1465,6 +1470,9 @@ export async function driveLauncher (conn, sid, seed, { log = console.log, timeo
     set(ver, ${JSON.stringify(s.version)}); set(fab, ${JSON.stringify(s.fabric)});
     return JSON.stringify({ version: ver.value, fabric: fab.value });
   })()`) || "{}");
+  if (!r.err) break;
+  await sleep(250);
+  }
   if (r.err) throw new Error(r.err);
   if (r.version !== s.version || r.fabric !== s.fabric)
     throw new Error(`launcher kept ${r.version}/${r.fabric}, wanted ${s.version}/${s.fabric}`);
