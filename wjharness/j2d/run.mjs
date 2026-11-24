@@ -422,7 +422,7 @@ if (IS_DARWIN) {
   const T = tmpdir(), X = join(dirname(T.replace(/\/$/, "")), "X", "com.google.Chrome.code_sign_clone");
   let ps = ""; try { ps = execSync("ps -axo command=", { encoding: "utf8", maxBuffer: 64 << 20 }); } catch { }
   const mine = (f) => { try { return statSync(f).birthtimeMs >= t0 - 5000; } catch { return false; } };
-  try { for (const n of readdirSync(T)) if (/^instruments.*\.ktrace$/.test(n) && mine(join(T, n)) && !/xctrace/.test(ps)) rmSync(join(T, n), { recursive: true, force: true }); } catch { }
+  try { for (const n of readdirSync(T)) if (/^instruments.*\.ktrace$/.test(n) && mine(join(T, n)) && !/xctrace (record|export)/.test(ps)) rmSync(join(T, n), { recursive: true, force: true }); } catch { }
   try { for (const n of readdirSync(X)) if (n.startsWith("code_sign_clone.") && mine(join(X, n)) && !ps.includes(n)) rmSync(join(X, n), { recursive: true, force: true }); } catch { }
 }
 log.end();
