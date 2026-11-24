@@ -469,6 +469,9 @@ if (XCPROF && xct?.out && existsSync(xct.out) && existsSync(join(outdir, "perf.m
     const b = (r.threads || []).reduce((m, t) => (!m || (t.pairs || 0) > (m.pairs || 0) ? t : m), null);
     win.xct = { renderer: xct.pid, ...r, per: b ? { instructions: b.instructions / steps, cycles: b.cycles / steps, ipc: b.ipc, thread: b.thread, covered_s: b.span_s,
       window_s: (batchWall[WB] - batchWall[WA]) / 1000 } : null };
+    /* the counting capture is 150-300 MB a run and window.json now holds what it says: drop it unless asked to keep it
+     * (--keep-trace, or a sampling mode, whose PCs fe/xcmiss.py reads) -- 2026-11-23, two full disks */
+    if (b && !XC_JIT && !args.includes("--keep-trace") && !/_sampling$/.test(XC_MODE || "")) rmSync(xct.out, { recursive: true, force: true });
   } catch (e) { win.xct = { error: String(e.message || e).slice(0, 400), tail: xct.tail() }; }
 } else if (xct) win.xct = { error: "no capture", tail: xct.tail?.() };
 writeFileSync(join(outdir, "window.json"), JSON.stringify(win, null, 1) + "\n");
