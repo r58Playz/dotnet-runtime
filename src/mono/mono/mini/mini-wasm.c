@@ -1483,6 +1483,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_cast_census, "MONO_WASM_JIT_CAST_CENSUS", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_elim, "MONO_WASM_JIT_CAST_ELIM", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 7)
+	WJ_T2_KNOB (mono_wasm_jit_hash_inline, "MONO_WASM_JIT_HASH_INLINE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
@@ -1715,6 +1716,13 @@ int mono_wasm_jit_pin_alias = 1;   /* (the 2026-11-20 set; measured at MONO_WASM
  * both orders, 2026-11-23, findings M12b) 15.81 -> 15.28 M cycles a tick, 3.95 -> 3.81 ms (ranges touch), instructions
  * -2.3%; jbox2d level; cold refs 55 k -> 69 k; 262u / mcsr mcbench clean. 1 = clause-free methods only. 0 = off. */
 int mono_wasm_jit_pin_cold = 5;
+/* MONO_WASM_JIT_HASH_INLINE: RuntimeHelpers.GetHashCode (object) / TryGetHashCode (object) -- Java's identity hash under
+ * IKVM, Object.GetHashCode -- read the lock word inline (null, no hash yet or inflated: InternalGetHashCode / 0), as the
+ * interpreter's MINT_INTRINS_GET_HASHCODE does with a C call. The managed ObjectHeader.TryGetHashCode takes `ref o` and an
+ * `out int`, so the JIT gave Object.hashCode a 64-byte frame and a store/reload per step: 44 us a mctick tick of self time
+ * against TeaVM's 1.5 (M16, 2026-11-23). mctick (M4, goal protocol, one binary, n=4 / n=3, both orders, 2026-11-23):
+ * 15.72 -> 15.22 M cycles a tick (-3.2%), 3.930 -> 3.800 ms, disjoint; 254 sites. 0 = off. */
+int mono_wasm_jit_hash_inline = 1;
 /* MONO_WASM_JIT_ILOFS_DEDUPE: an EH-record method's block skips its IL-offset store when every predecessor has the same
  * offset and region and reaches it by a plain edge, so the record already holds it (60% of getBlockState's executed
  * IL-offset stores repeat, findings note 2026-11-18 evening). Exclusions at the emitter (E: the il_offsets loop); R353

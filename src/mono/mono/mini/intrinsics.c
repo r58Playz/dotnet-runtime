@@ -1183,6 +1183,48 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
 		} else
 			return NULL;
 	} else if (cmethod->klass == runtime_helpers_class) {
+#ifdef HOST_BROWSER
+		/* MONO_WASM_JIT_HASH_INLINE (mini-wasm.c): GetHashCode (object) / TryGetHashCode (object) read the lock word inline */
+		extern int mono_wasm_jit_hash_inline;
+		if (COMPILE_WASM (cfg) && mono_wasm_jit_hash_inline && fsig->param_count == 1 && fsig->params [0]->type == MONO_TYPE_OBJECT &&
+		    fsig->ret->type == MONO_TYPE_I4 && (!strcmp (cmethod->name, "GetHashCode") || !strcmp (cmethod->name, "TryGetHashCode"))) {
+			gboolean try_only = cmethod->name [0] == 'T';
+			MonoMethod *slow_m = NULL;
+			if (!try_only) {
+				ERROR_DECL (hash_err);
+				slow_m = mono_class_get_method_from_name_checked (runtime_helpers_class, "InternalGetHashCode", 1, 0, hash_err);
+				mono_error_cleanup (hash_err);
+			}
+			if (try_only || slow_m) {
+				MonoBasicBlock *slow_bb, *end_bb;
+				MonoInst *var, *hins, *store, *sres;
+				int lw = alloc_preg (cfg), st = alloc_ireg (cfg), h = alloc_ireg (cfg);
+				NEW_BBLOCK (cfg, slow_bb);
+				NEW_BBLOCK (cfg, end_bb);
+				var = mono_compile_create_var (cfg, m_class_get_byval_arg (mono_defaults.int32_class), OP_LOCAL);
+				/* null, no hash yet, or inflated: the slow path (InternalGetHashCode returns 0 for null) */
+				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, args [0]->dreg, 0);
+				MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, slow_bb);
+				MONO_EMIT_NEW_LOAD_MEMBASE (cfg, lw, args [0]->dreg, MONO_STRUCT_OFFSET (MonoObject, synchronisation));
+				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_IAND_IMM, st, lw, LOCK_WORD_STATUS_MASK);
+				MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, st, LOCK_WORD_HAS_HASH);
+				MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, slow_bb);
+				EMIT_NEW_BIALU_IMM (cfg, hins, OP_ISHR_UN_IMM, h, lw, LOCK_WORD_HASH_SHIFT);   /* lock_word_get_hash */
+				EMIT_NEW_TEMPSTORE (cfg, store, var->inst_c0, hins);
+				MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, end_bb);
+				MONO_START_BB (cfg, slow_bb);
+				if (try_only)
+					EMIT_NEW_ICONST (cfg, sres, 0);
+				else
+					sres = mono_emit_method_call (cfg, slow_m, args, NULL);
+				EMIT_NEW_TEMPSTORE (cfg, store, var->inst_c0, sres);
+				MONO_START_BB (cfg, end_bb);
+				EMIT_NEW_TEMPLOAD (cfg, ins, var->inst_c0);
+				mono_wasm_jit_counters [WJC_HASH_INLINE_SITES]++;
+				return ins;
+			}
+		}
+#endif
 		if (!strcmp (cmethod->name, "GetRawData")) {
 			int dreg = alloc_preg (cfg);
 			EMIT_NEW_BIALU_IMM (cfg, ins, OP_PADD_IMM, dreg, args [0]->dreg, MONO_ABI_SIZEOF (MonoObject));

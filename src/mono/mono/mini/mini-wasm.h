@@ -1607,6 +1607,7 @@ enum {
 	WJC_TLS_SD_FALLBACK_SITES,   /* ... (the same sites: each carries the thread-chain fallback) */
 	WJC_S3_GI_PROF,              /* MONO_WASM_JIT_S3 & 16: profile predictions of the base whose receiver guard the CHA word replaced */
 	WJC_CLASSREC_ARRAY_SITES,    /* MONO_WASM_JIT_CLASS_RECORD & 4: vector castclasses given an exact-vtable fast path (compile time) */
+	WJC_HASH_INLINE_SITES,       /* MONO_WASM_JIT_HASH_INLINE: RuntimeHelpers.(Try)GetHashCode calls lowered to an inline lock-word read */
 	WJC_MAX
 };
 
