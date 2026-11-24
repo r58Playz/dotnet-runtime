@@ -1305,7 +1305,7 @@ mono_wasm_jit_dump_stats (void)
 					WJC_(WJC_PIN_ALIAS_CARRIERS), WJC_(WJC_PIN_ALIAS_BAD), WJC_(WJC_PIN_ALIAS_RT_BAD), WJC_(WJC_F4_KLASS_NONREF), WJC_(WJC_F4_VT_MOVE_NONREF),
 					mono_wasm_jit_pin_alias, mono_wasm_jit_f4); }
 				{ extern int mono_wasm_jit_hash_inline;
-				  printf ("[wasm-jit hashinline] sites=%lld (hash_inline=%d: RuntimeHelpers.GetHashCode reads the lock word inline)\n",
+				  printf ("[wasm-jit hashinline] sites=%lld (hash_inline=%d: RuntimeHelpers.GetHashCode reads the lock word inline; default 1)\n",
 					WJC_(WJC_HASH_INLINE_SITES), mono_wasm_jit_hash_inline); }
 				{ extern int mono_wasm_jit_pin_cold;
 				  printf ("[wasm-jit pincold] methods=%lld cold_refs=%lld flush_stores=%lld (pin_cold=%d; 1 on, 2 = EH record methods, 4 = GI fallbacks cold; default 5)\n",
