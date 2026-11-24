@@ -644,7 +644,7 @@ mono_wasm_jit_dump_stats (void)
 		extern gint32 mono_wasm_class_record_changed;
 		extern int mono_wasm_jit_img_dispatch;
 		extern gint32 mono_wasm_jit_classrec_bad, mono_wasm_class_record_replaced_n;
-		printf ("[wasm-jit classrec] bits=%d offset=%d bytes=%lld refresh_changed=%d | display_sites=%lld sealed_sites=%lld array_sites=%lld provisional_classes=%d | verify_bad=%d (bit 16; must be 0)\n",
+		printf ("[wasm-jit classrec] bits=%d offset=%d bytes=%lld refresh_changed=%d | display_sites=%lld sealed_sites=%lld array_sites=%lld provisional_classes=%d | verify_bad=%d (bit 16; must be 0; bit 32: identity guards read the record)\n",
 			mono_wasm_class_record_bits (), mono_wasm_class_record_offset (), (long long) mono_wasm_class_record_bytes,
 			(int) mono_wasm_class_record_changed, WJC_(WJC_CLASSREC_DISPLAY_SITES), WJC_(WJC_CLASSREC_SEALED_SITES), WJC_(WJC_CLASSREC_ARRAY_SITES),
 			(int) mono_wasm_class_record_replaced_n, (int) mono_wasm_jit_classrec_bad);

@@ -10854,8 +10854,18 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 							MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_vtreg, (gssize) gi_vt);
 							MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, gi_hot_bb);
 						}
-						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_kreg, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass));
-						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mvreg, gi_kreg, mono_wasm_jit_class_vtable_off ());
+						{ int moff = 0;
+#ifdef HOST_BROWSER
+						  extern int mono_wasm_class_record_methods_off (void);
+						  moff = mono_wasm_class_record_methods_off ();   /* CLASS_RECORD & 32 */
+#endif
+						  if (moff) {
+							MONO_EMIT_NEW_BIALU_IMM (cfg, OP_PADD_IMM, gi_kreg, gi_vtreg, moff);
+							MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mvreg, gi_kreg, 0);
+						  } else {
+							MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_kreg, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass));
+							MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mvreg, gi_kreg, mono_wasm_jit_class_vtable_off ());
+						  } }
 						MONO_EMIT_NEW_LOAD_MEMBASE (cfg, gi_mreg, gi_mvreg, gi_mid_slot * TARGET_SIZEOF_VOID_P);
 						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, gi_mreg, (gssize) gi_target);
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBNE_UN, gi_fallback_bb);
@@ -10982,8 +10992,18 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 									extern int mono_wasm_jit_class_vtable_off (void);
 									int k2 = alloc_preg (cfg), mv2 = alloc_preg (cfg), m2 = alloc_preg (cfg);
 									MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_PBEQ, gi2_hot_bb);
-									MONO_EMIT_NEW_LOAD_MEMBASE (cfg, k2, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass));
-									MONO_EMIT_NEW_LOAD_MEMBASE (cfg, mv2, k2, mono_wasm_jit_class_vtable_off ());
+									{ int moff2 = 0;
+#ifdef HOST_BROWSER
+									  extern int mono_wasm_class_record_methods_off (void);
+									  moff2 = mono_wasm_class_record_methods_off ();
+#endif
+									  if (moff2) {
+										MONO_EMIT_NEW_BIALU_IMM (cfg, OP_PADD_IMM, k2, gi_vtreg, moff2);
+										MONO_EMIT_NEW_LOAD_MEMBASE (cfg, mv2, k2, 0);
+									  } else {
+										MONO_EMIT_NEW_LOAD_MEMBASE (cfg, k2, gi_vtreg, MONO_STRUCT_OFFSET (MonoVTable, klass));
+										MONO_EMIT_NEW_LOAD_MEMBASE (cfg, mv2, k2, mono_wasm_jit_class_vtable_off ());
+									  } }
 									MONO_EMIT_NEW_LOAD_MEMBASE (cfg, m2, mv2, gi_mid_slot * TARGET_SIZEOF_VOID_P);
 									MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, m2, (gssize) gi2_target);
 								}

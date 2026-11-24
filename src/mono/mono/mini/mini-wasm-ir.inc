@@ -3897,9 +3897,20 @@ wj_emit_fast_count (WasmBuf *body, int idx)
 static G_GNUC_UNUSED void
 wj_emit_class_slot_method (WasmBuf *body, int vt_local, int class_vtable_off, int slot)
 {
+	int moff = 0;
+#ifdef HOST_BROWSER   /* this file also links into mono-aot-cross, which has no class records */
+	extern int mono_wasm_class_record_methods_off (void);
+	moff = mono_wasm_class_record_methods_off ();   /* CLASS_RECORD & 32: the record's klass->vtable copy */
+#endif
 	wasm_op_local (body, WASM_OP_LOCAL_GET, (guint32) vt_local);
-	wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) MONO_STRUCT_OFFSET (MonoVTable, klass));
-	wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) class_vtable_off);
+	if (moff) {
+		wasm_i32_const (body, moff);   /* negative: the record is below the vtable, and a memarg offset is unsigned */
+		wasm_op (body, WASM_OP_I32_ADD);
+		wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, 0);
+	} else {
+		wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) MONO_STRUCT_OFFSET (MonoVTable, klass));
+		wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) class_vtable_off);
+	}
 	wasm_op (body, WASM_OP_I32_LOAD); wasm_memarg (body, 2, (guint32) (slot * 4));
 }
 
