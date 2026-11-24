@@ -404,10 +404,11 @@ def _role(ins, k):
     return 'unknown'
 
 
-def word_to_global(mod, addr):
+def word_to_global(mod, addr, value_fns=()):
     """Move the i32 at linear address `addr` into a new module-defined mutable global. Returns (global index, loads
     rewritten, stores rewritten, refused) -- a non-zero refused count means some access did not match and the module
-    must not be used."""
+    must not be used. `value_fns`: function names whose unmatched uses of the constant were read by hand and are plain
+    values (not counted as refused; the constant stays)."""
     g = mod.nimported_globals + mod.nglobals
     gs = mod.section(6)
     ent = b'\x7f\x01\x41\x00\x0b'                    # i32, mutable, init i32.const 0
@@ -457,7 +458,7 @@ def word_to_global(mod, addr):
                 j += 1
             if ok:
                 drop.add(k); repl[j] = (0x24, g, gset); stores += 1
-            elif _role(ins, k) != 'value':
+            elif _role(ins, k) != 'value' and mod.names.get(bi + mod.nfimports) not in value_fns:
                 refused += 1                         # an address use (or an unknown one) that did not match
         ins = [repl.get(k, x) for k, x in enumerate(ins) if k not in drop]
         mod.bodies[bi] = encode_body(groups, ins)

@@ -21,6 +21,8 @@ access). This puts TeaVM's code in that layout:
     access matched);
   * what stays in the primary: TeaVM's runtime, class-init and type-check helpers, never-executed code.
 
+  --sp-value F,..  under --sp-global, functions whose unmatched uses of the address constant are plain values, read
+                   by hand (M4 build: meth_nmudf_BlockStateData_bootstrapD passes 3488 as a call argument)
   <tvrun>          a j2d/run set-A, -D or -L run of the FULL arm: its V8 jitdump lists every function V8 compiled; V8
                    compiles wasm lazily, so that is the executed set
   --from DIR       the arm to rewrite (default $WJ_STATE/arms/mctick/teavm-full)
@@ -53,7 +55,7 @@ RUN = a[0]
 FEATURES = ['--mvp-features', '--enable-exception-handling', '--enable-reference-types', '--enable-bulk-memory',
             '--enable-sign-ext', '--enable-nontrapping-float-to-int', '--enable-mutable-globals']   # what V8 runs: not --all-features (binaryen 130 then emits `exact` imports)
 KEEP = re.compile(r'^(meth_otr_|meth_otbw|teavm_|initclass_|supertypeof_|start$|_start$)')
-SP_ADDR = 3444      # TeaVM 9be5eca57's WasmRuntime stack-pointer word in this build: checked below, not assumed
+SP_ADDR = None      # TeaVM's WasmRuntime stack-pointer word: read off allocStack below (3444 in the x86 box's build)
 assert MODE in ('function', 'class', 'edges', 'classedges', 'hot', 'hotone', 'hotclassedges', 'one'), MODE
 
 # the executed set
@@ -77,17 +79,21 @@ ex = mod.section(7)
 n, o = wasmrw.uleb(ex[1], 0)
 ex[1] = wasmrw.enc_u(n + 1) + ex[1][o:] + wasmrw.enc_u(9) + b'__wj_init' + b'\x00' + wasmrw.enc_u(sidx)
 
+alloc = byname['meth_otbw_WasmRuntime_allocStack']
+# the stack-pointer word, read off allocStack itself: `i32.const ADDR; i32.load` first
+_, ai = wasmrw.decode(mod.bodies[alloc - mod.nfimports])
+assert ai[0][0] == 0x41 and ai[1][0] == 0x28, 'allocStack no longer starts with the SP load'
+SP_ADDR = ai[0][1]
+log.append(f'stack-pointer word: {SP_ADDR}')
 if '--inline-runtime' in a:
-    alloc = byname['meth_otbw_WasmRuntime_allocStack']
-    # the stack-pointer word, read off allocStack itself: `i32.const ADDR; i32.load` first
-    _, ai = wasmrw.decode(mod.bodies[alloc - mod.nfimports])
-    assert ai[0][0] == 0x41 and ai[0][1] == SP_ADDR and ai[1][0] == 0x28, 'allocStack no longer starts with the SP load'
     callees = {alloc} | {i for n_, i in byname.items() if n_.startswith('supertypeof_') and i >= mod.nfimports}
     ch, sites = wasmrw.inline(mod, callees, [byname[n_] for n_ in split])
     log.append(f'inline-runtime: allocStack + {len(callees) - 1} supertypeof_* inlined at {sites} call sites in {ch} functions')
 if '--sp-global' in a:
-    g, nl, ns, refused = wasmrw.word_to_global(mod, SP_ADDR)
-    log.append(f'sp-global: word {SP_ADDR} -> global {g}: {nl} loads, {ns} stores rewritten, {refused} refused')
+    vf = set(opt('--sp-value', '').split(',')) - {''}   # functions whose other uses of the address constant were read as values
+    g, nl, ns, refused = wasmrw.word_to_global(mod, SP_ADDR, vf)
+    log.append(f'sp-global: word {SP_ADDR} -> global {g}: {nl} loads, {ns} stores rewritten, {refused} refused'
+               + (f' (uses read as values in: {",".join(sorted(vf))})' if vf else ''))
     assert refused == 0, 'an access to the stack-pointer word did not match: refusing'
 
 if os.path.exists(OUT):
