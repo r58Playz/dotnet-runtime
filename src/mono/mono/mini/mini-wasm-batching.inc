@@ -1556,7 +1556,7 @@ wj_b4_delayed (void)
 {
 	extern int mono_wasm_jit_b4_delay;
 	extern gint64 mono_wasm_jit_start_ms;
-	extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win;
+	extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win, mono_wasm_jit_b4_quiet_small;
 	extern int mono_wasm_jit_stats;
 	if (mono_wasm_jit_b4_delay > 0 && mono_msec_ticks () - mono_wasm_jit_start_ms < (gint64) mono_wasm_jit_b4_delay * 1000)
 		return TRUE;
@@ -1568,6 +1568,9 @@ wj_b4_delayed (void)
 		 * is "the work done so far doubled and the tier barely grew", which a 20 s kernel reaches and a boot does not;
 		 * later it is a rate. */
 		gint32 win = MIN (mono_wasm_jit_b4_quiet_win, MAX (1000, wj_b4_q_samples));
+		/* MONO_WASM_JIT_B4_QUIET_SMALL: a small tier gets short windows, so a short workload sees a second one */
+		if (mono_wasm_jit_b4_quiet_small > 0 && bd < mono_wasm_jit_b4_quiet_small)
+			win = 250;
 		if (s - wj_b4_q_samples >= win) {
 			/* A window that added at most WJ_B4_QUIET_FLOOR bodies is quiet whatever the percentage: on a small
 			 * tier one late compile is several percent (jbox2d: 52 -> 55 bodies read GROWING, the run ended before
@@ -1575,9 +1578,10 @@ wj_b4_delayed (void)
 			gboolean noisy = bd - wj_b4_q_bodies > WJ_B4_QUIET_FLOOR &&
 				(gint64) (bd - wj_b4_q_bodies) * 100 > (gint64) mono_wasm_jit_b4_quiet * MAX (wj_b4_q_bodies, 1);
 			if (G_UNLIKELY (mono_wasm_jit_stats) && (noisy != wj_b4_noisy || wj_b4_q_windows < 4 || (wj_b4_q_windows & 7) == 0))
-				printf ("[wasm-jit b4 quiet] +%.1fs window %d: bodies %d -> %d over %d samples (window of %d): %s (framed %lld)\n",
+				printf ("[wasm-jit b4 quiet] +%.1fs window %d: bodies %d -> %d over %d samples (window of %d%s): %s (framed %lld)\n",
 					(double) (mono_msec_ticks () - mono_wasm_jit_start_ms) / 1000.0, wj_b4_q_windows, wj_b4_q_bodies, bd,
-					s - wj_b4_q_samples, win, noisy ? "GROWING, B4 holds" : "quiet", (long long) mono_wasm_jit_counters [WJC_B4_FRAMED]);
+					s - wj_b4_q_samples, win, win == 250 && mono_wasm_jit_b4_quiet_small > 0 ? ", small tier" : "",
+					noisy ? "GROWING, B4 holds" : "quiet", (long long) mono_wasm_jit_counters [WJC_B4_FRAMED]);
 			wj_b4_noisy = noisy; wj_b4_q_samples = s; wj_b4_q_bodies = bd; wj_b4_q_windows++;
 		}
 		return wj_b4_noisy;

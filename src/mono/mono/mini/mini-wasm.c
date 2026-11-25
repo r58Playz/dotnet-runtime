@@ -1396,9 +1396,10 @@ mono_wasm_jit_auto_init (void)
 	{ extern int mono_wasm_jit_b4_exact, mono_wasm_jit_b4_delay; const char *bx = g_getenv ("MONO_WASM_JIT_B4_EXACT");
 	  if (bx && *bx) mono_wasm_jit_b4_exact = *bx != '0';
 	  bx = g_getenv ("MONO_WASM_JIT_B4_DELAY"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_delay = v; }
-	  { extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win;
+	  { extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win, mono_wasm_jit_b4_quiet_small;
 	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_quiet = v; }
-	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET_WIN"); if (bx && *bx) { int v = atoi (bx); if (v >= 100) mono_wasm_jit_b4_quiet_win = v; } }
+	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET_WIN"); if (bx && *bx) { int v = atoi (bx); if (v >= 100) mono_wasm_jit_b4_quiet_win = v; }
+	    bx = g_getenv ("MONO_WASM_JIT_B4_QUIET_SMALL"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_quiet_small = v; } }
 	  { extern int mono_wasm_jit_b4_seed;
 	    bx = g_getenv ("MONO_WASM_JIT_B4_SEED"); if (bx && *bx) { int v = atoi (bx); if (v >= 0) mono_wasm_jit_b4_seed = v & 3; } } }
 	{ extern int mono_wasm_jit_b4, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes; const char *b4 = g_getenv ("MONO_WASM_JIT_B4");
@@ -1945,6 +1946,12 @@ int mono_wasm_jit_b4_delay = 0;
  * did (2026-11-12, findings notes "the fault and memory gate" and "F's memory step"). */
 int mono_wasm_jit_b4_quiet = 5;
 int mono_wasm_jit_b4_quiet_win = 15000;
+/* MONO_WASM_JIT_B4_QUIET_SMALL=<bodies> (0 = off): while the edge-carrying tier holds fewer than this many bodies, a quiet
+ * window is 250 samples, not 1000 and up. A short workload never got a second window: jbox2d's first closes ~5.5 s in at
+ * "bodies 0 -> 56, GROWING" (growth from an empty tier always reads so) and the run ends before the next, so it framed no
+ * group although its dry-run plan holds 97.9% of the edge weight in 7 groups (findings M25, M32); the game's tier is
+ * thousands of bodies, past this bound. */
+int mono_wasm_jit_b4_quiet_small = 0;
 /* MONO_WASM_JIT_B4_SEED, a bit mask (2026-11-16, lever 7 of the levers3 round):
  *   1  the partition starts from the framed groups, each one set and frozen (wj_b4_partition), so a plan pairs fresh
  *      members with each other instead of spending a fresh callee on a framed caller the framing step will leave out;
