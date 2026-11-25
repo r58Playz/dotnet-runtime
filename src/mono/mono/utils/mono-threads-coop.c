@@ -148,6 +148,44 @@ mono_threads_state_poll (void)
 	mono_threads_state_poll_with_info (mono_thread_info_current_unchecked ());
 }
 
+#ifdef HOST_BROWSER
+#include <emscripten.h>
+/* `[wasm-jit latesuspend]` (findings M36): the 262n game's slow mode is GC stop-the-world waiting seconds for a thread left
+ * at STATE_ASYNC_SUSPEND_REQUESTED -- running, and reaching no safepoint (the render thread, in the dumps). The late thread
+ * says so itself where it finally answers -- a poll, or entering a blocking region -- with the delay and its JS stack (V8
+ * names the wasm frames), when the request waited more than 250 ms. At most 32 reports. */
+static const char *wj_late_where;
+/* Measure where the request is answered; report only later, once this thread is resumed or GC-safe: worker stdout is
+ * proxied to the main thread, which can itself be parked by the same stop-the-world, so printing before answering could
+ * deadlock the rendezvous. The delay rides in wj_suspend_req_ms as a negative number until reported. */
+static void
+wj_note_late_suspend (MonoThreadInfo *info, const char *where)
+{
+	gint64 req = info->wj_suspend_req_ms;
+	if (req <= 0)
+		return;
+	gint64 waited = mono_msec_ticks () - req;
+	info->wj_suspend_req_ms = waited >= 250 ? -waited : 0;
+	if (waited >= 250)
+		wj_late_where = where;
+}
+
+static void
+wj_report_late_suspend (MonoThreadInfo *info)
+{
+	gint64 v = info->wj_suspend_req_ms;
+	if (v >= 0)
+		return;
+	info->wj_suspend_req_ms = 0;
+	static gint32 nlate;
+	if (mono_atomic_inc_i32 (&nlate) > 32)
+		return;
+	printf ("[wasm-jit latesuspend] thread 0x%x answered a suspend request after %lld ms at %s\n",
+		(unsigned) (gsize) mono_thread_info_get_tid (info), (long long) -v, wj_late_where ? wj_late_where : "?");
+	EM_ASM ({ console.log ("[wasm-jit latesuspend] stack: " + new Error ().stack); });
+}
+#endif
+
 static void
 mono_threads_state_poll_with_info (MonoThreadInfo *info)
 {
@@ -172,6 +210,9 @@ mono_threads_state_poll_with_info (MonoThreadInfo *info)
 	}
 
 	++coop_save_count;
+#ifdef HOST_BROWSER
+	wj_note_late_suspend (info, "poll");
+#endif
 	mono_threads_get_runtime_callbacks ()->thread_state_init (&info->thread_saved_state [SELF_SUSPEND_STATE_INDEX]);
 
 	/* commit the saved state and notify others if needed */
@@ -183,6 +224,9 @@ mono_threads_state_poll_with_info (MonoThreadInfo *info)
 		mono_thread_info_wait_for_resume (info);
 		break;
 	}
+#ifdef HOST_BROWSER
+	wj_report_late_suspend (info);
+#endif
 
 	MONO_WASM_JIT_RENDEZVOUS_DRAIN ();
 
@@ -363,8 +407,15 @@ retry:
 	++coop_save_count;
 	mono_threads_get_runtime_callbacks ()->thread_state_init (&info->thread_saved_state [SELF_SUSPEND_STATE_INDEX]);
 
+#ifdef HOST_BROWSER
+	if (info->thread_state.state == STATE_ASYNC_SUSPEND_REQUESTED)
+		wj_note_late_suspend (info, function_name ? function_name : "blocking");
+#endif
 	switch (mono_threads_transition_do_blocking (info, function_name)) {
 	case DoBlockingContinue:
+#ifdef HOST_BROWSER
+		wj_report_late_suspend (info);   /* GC-safe now: the stop-the-world counts this thread as suspended */
+#endif
 		break;
 	case DoBlockingPollAndRetry:
 		mono_threads_state_poll_with_info (info);

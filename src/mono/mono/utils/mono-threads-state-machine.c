@@ -11,6 +11,7 @@
 #include <mono/utils/atomic.h>
 #include <mono/utils/checked-build.h>
 #include <mono/utils/mono-threads-debug.h>
+#include <mono/utils/mono-time.h>
 
 #include <errno.h>
 
@@ -277,6 +278,9 @@ retry_state_change:
 		if (thread_state_cas (&info->thread_state, build_thread_state (STATE_ASYNC_SUSPEND_REQUESTED, 1, no_safepoints), raw_state) != raw_state)
 			goto retry_state_change;
 		trace_state_change ("SUSPEND_INIT_REQUESTED", info, raw_state, STATE_ASYNC_SUSPEND_REQUESTED, no_safepoints, 1);
+#ifdef HOST_BROWSER
+		info->wj_suspend_req_ms = mono_msec_ticks ();   /* `[wasm-jit latesuspend]`, mono-threads-coop.c */
+#endif
 		return ReqSuspendInitSuspendRunning; //This is the first async suspend request against the target
 
 	case STATE_BLOCKING_SELF_SUSPENDED:

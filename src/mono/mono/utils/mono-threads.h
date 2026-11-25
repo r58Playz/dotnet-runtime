@@ -316,6 +316,10 @@ typedef struct _MonoThreadInfo {
 	/* The wasm JIT's per-worker action-word slot + 1 this thread claimed (mini-wasm-publish.inc), 0 = none: how a hook's
 	 * acknowledgement wait (plan H6) finds a live thread's acknowledged epoch. Unused elsewhere. */
 	gint32 wasm_jit_worker_slot1;
+
+	/* `[wasm-jit latesuspend]` (mono-threads-coop.c, findings M36): mono_msec_ticks () when an async suspend was last
+	 * requested of this thread while it ran (state machine, RUNNING -> ASYNC_SUSPEND_REQUESTED), 0 once answered. */
+	gint64 wj_suspend_req_ms;
 } MonoThreadInfo;
 
 typedef struct {
