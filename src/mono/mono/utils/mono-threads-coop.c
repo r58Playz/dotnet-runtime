@@ -164,7 +164,7 @@ wj_note_late_suspend (MonoThreadInfo *info, const char *where)
 	gint64 req = info->wj_suspend_req_ms;
 	if (req <= 0)
 		return;
-	gint64 waited = mono_msec_ticks () - req;
+	gint64 waited = mono_wj_shared_ms () - req;
 	info->wj_suspend_req_ms = waited >= 250 ? -waited : 0;
 	if (waited >= 250)
 		wj_late_where = where;

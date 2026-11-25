@@ -317,10 +317,24 @@ typedef struct _MonoThreadInfo {
 	 * acknowledgement wait (plan H6) finds a live thread's acknowledged epoch. Unused elsewhere. */
 	gint32 wasm_jit_worker_slot1;
 
-	/* `[wasm-jit latesuspend]` (mono-threads-coop.c, findings M36): mono_msec_ticks () when an async suspend was last
+	/* `[wasm-jit latesuspend]` (mono-threads-coop.c, findings M36): mono_wj_shared_ms () when an async suspend was last
 	 * requested of this thread while it ran (state machine, RUNNING -> ASYNC_SUSPEND_REQUESTED), 0 once answered. */
 	gint64 wj_suspend_req_ms;
 } MonoThreadInfo;
+
+#ifdef HOST_BROWSER
+#include <time.h>
+/* `[wasm-jit latesuspend]`'s clock: CLOCK_REALTIME (Date.now ()), the one every worker shares. Each worker's monotonic clock
+ * (mono_msec_ticks) has its own origin, so a stamp taken on the initiator's worker and read on the target's was off by the
+ * difference between their start times (findings M40). */
+static inline gint64
+mono_wj_shared_ms (void)
+{
+	struct timespec ts;
+	clock_gettime (CLOCK_REALTIME, &ts);
+	return (gint64) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+#endif
 
 typedef struct {
 	void* (*thread_attach)(THREAD_INFO_TYPE *info);
