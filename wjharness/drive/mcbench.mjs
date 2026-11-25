@@ -26,7 +26,7 @@
 import { runSession, buildUrl, seedProfile, formatPhases, seedFromArgs } from "../lib/mcdrive.mjs";
 import { preflight, sampleEnv } from "../lib/preflight.mjs";
 import { describeDeployment, printDeployment } from "../lib/provenance.mjs";
-import { mkdirSync, appendFileSync, writeFileSync, readFileSync } from "fs";
+import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { defaultOut, STATE } from "../lib/paths.mjs";
 
@@ -130,7 +130,10 @@ const cpuState = () => {
 };
 
 for (let i = 1; i <= RUNS; i++) {
-  const name = `${TAG}-${i}`;
+  /* never reuse a name: the same tag run again into the same day's directory overwrote the earlier run's log and profile
+   * (a game run's OOB trap evidence was lost that way, 2026-11-25) */
+  let name = `${TAG}-${i}`;
+  for (let k = 2; existsSync(join(OUT, `${name}.log`)) || existsSync(join(OUT, `profile-${name}`)); k++) name = `${TAG}-${i}.${k}`;
   const profile = join(OUT, `profile-${name}`);
   const logPath = join(OUT, `${name}.log`);
   console.log(`\n=== run ${i}/${RUNS} (${name}) ===`);
