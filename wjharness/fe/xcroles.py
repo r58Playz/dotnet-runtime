@@ -10,8 +10,8 @@ PCs through the jitdump, as fe/xchot.py). A static pass over each sampled functi
              call_indirect's bounds / signature / target loads), at most 24 instructions back to a branch target
   ret-land   the 2 instructions after a call: where the return lands and a timer sample after a long call skids to
   trap       the out-of-line trap tail (the run of `bl`s at the end) -- should read ~0
-  glob-load  a load addressed `[base, xN]` where xN was just built by mov/movk (a constant linear address: S3 CHA words,
-             the s.g poll, statics, class records)
+  glob-load  a load addressed `[base, xN]` where xN was just built from an immediate by mov/movk (a constant linear
+             address: S3 CHA words, statics, B4 counters, literal slots; a `mov xN, xM` copy is not one)
   spill      a load / store addressed off sp or x29 (V8's spills and reloads)
   load / store / cmp-br / alu   everything else, by mnemonic
 
@@ -80,7 +80,9 @@ def roles(ins):
             built = False
             for j in range(k - 1, max(-1, k - 5), -1):
                 pm, po = ins[j][1], ins[j][2]
-                if po.split(",")[0].strip() in (idx, "w" + idx[1:]) and pm in ("mov", "movk", "movz"): built = True; break
+                if po.split(",")[0].strip() in (idx, "w" + idx[1:]) and pm in ("mov", "movk", "movz"):
+                    built = "#" in po   # an immediate builds a constant address; `mov x11, x9` is a register copy
+                    break
             r[k] = "glob-load" if built else "load"
         elif c in ("branch", "cmp"): r[k] = "cmp-br"
         elif c in ("load", "store"): r[k] = c
@@ -94,6 +96,10 @@ def selftest():
             (40, "ldr", "w10, [x1, x9]"), (44, "ldr", "x2, [sp, #0x10]"), (48, "blr", "x13"), (52, "and", "w0, w0, #0xff"),
             (56, "add", "w0, w0, #1"), (60, "mov", "x5, x6"), (64, "ldp", "x29, x30, [sp, #0x10]"), (68, "ret", ""),
             (72, "bl", "#0x-100"), (76, "bl", "#0x-100")]
+    reg = [(0, "b.ls", "#0x1c"), (4, "cbz", "w0, #0x1c"), (8, "mov", "x11, x9"), (12, "ldr", "w11, [x1, x11]"),
+           (16, "mov", "x12, #0x10"), (20, "ldr", "w12, [x1, x12]"), (24, "cbnz", "w12, #0x1c"), (28, "ret", "")]
+    rr = roles(reg)
+    assert rr[3] == "load" and rr[5] == "glob-load", list(zip([p[1] for p in reg], rr))
     got = roles(prog)
     want = ["entry"] * 6 + ["cmp-br", "call", "call", "call", "call", "call", "call", "ret-land", "ret-land", "exit", "exit", "exit", "trap", "trap"]
     assert got == want, list(zip([p[1] for p in prog], got, want))
