@@ -5757,6 +5757,24 @@ get_virtual_method (InterpMethod *imethod, MonoVTable *vtable)
 		slot += ioffset;
 	}
 
+	/* `[wasm-jit badvmethod]` (findings M34): the guardEntityTick fault family -- this assert, loader.c:1827 on a garbage
+	 * MonoMethod, a CLR cast failure -- fits one read here of a receiver class with no (or a short) method vtable: an
+	 * unfinished TypeBuilder's class has none (class-setup-vtable.c refuses it) while objects of it already exist (a
+	 * provisional runtime vtable), and NULL [slot] reads low linear memory, which does not trap in wasm. Say what the
+	 * receiver was before reading. Plain field reads only. */
+	{
+		MonoClass *rk = vtable->klass;
+		MonoMethod **mvt = m_class_get_vtable (rk);
+		if (G_UNLIKELY (!mvt || slot < 0 || slot >= m_class_get_vtable_size (rk))) {
+			static gint32 nbad;
+			if (mono_atomic_inc_i32 (&nbad) <= 16)
+				printf ("[wasm-jit badvmethod] receiver %s.%s (dynamic image %d) method vtable %p size %d, slot %d of %s.%s::%s (interface %d)\n",
+					m_class_get_name_space (rk), m_class_get_name (rk), image_is_dynamic (m_class_get_image (rk)) ? 1 : 0,
+					(void *) mvt, m_class_get_vtable_size (rk), slot, m_class_get_name_space (m->klass), m_class_get_name (m->klass),
+					m->name, mono_class_is_interface (m->klass) ? 1 : 0);
+		}
+	}
+
 	MonoMethod *virtual_method = m_class_get_vtable (vtable->klass) [slot];
 	g_assert (virtual_method);
 
