@@ -12969,6 +12969,13 @@ mono_wasm_jit_aot_call_target (MonoMethod *method, gpointer *out_addr, gpointer 
 		    !(method->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL) && !m_class_get_rank (method->klass))
 			return wj_icall_aot_target (method, out_addr, out_rgctx, out_has_extra_arg);
 	}
+	{
+		/* MONO_WASM_JIT_PINVOKE_AOT (G5, mini-wasm.c): a P/Invoke takes the same route to its AOT'd managed-to-native
+		 * wrapper (which does the GC transition and the native call) instead of the residual's ves_pinvoke_method. */
+		extern int mono_wasm_jit_pinvoke_aot;
+		if (mono_wasm_jit_pinvoke_aot && (method->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL) && !m_class_get_rank (method->klass))
+			return wj_icall_aot_target (method, out_addr, out_rgctx, out_has_extra_arg);
+	}
 	if (!mono_interp_jit_call_supported (method, sig))
 		return FALSE;
 	InterpMethod *imethod = mono_interp_get_imethod (method);

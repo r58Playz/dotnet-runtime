@@ -1615,6 +1615,12 @@ enum {
 	WJC_S4_CKEY,                 /* ... S4 & 8: rewrites whose entry came through another vreg holding the same constant */
 	WJC_PROMOTE_CONTENDED,       /* Lever A's promotion queue: a push or a pop that found the lock taken and gave up (M45) */
 	WJC_PROMOTE_INVERTED,        /* ... head and tail found more than a queue apart and resynchronised: must read 0 (M45) */
+	WJC_SELECT_DIAMONDS,         /* MONO_WASM_JIT_SELECT: diamonds turned into selects (compile time) */
+	WJC_SELECT_TRIANGLES,        /* ... one-armed ifs turned into selects */
+	WJC_SELECT_VALUES,           /* ... selects emitted (values assigned by the converted arms) */
+	WJC_SELECT_REFUSED,          /* ... speculable shapes refused (a swap, a compare operand, a volatile variable, too many values) */
+	WJC_INLINE_FWD_SKIP,         /* MONO_WASM_JIT_INLINE_FWD: forwarders inlined without spending a level of the depth cap */
+	WJC_S4_HOISTED,              /* MONO_WASM_JIT_S4 & 32: loop-invariant loads moved to their loop's preheader */
 	WJC_MAX
 };
 

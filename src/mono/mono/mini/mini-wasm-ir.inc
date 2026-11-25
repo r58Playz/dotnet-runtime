@@ -57,6 +57,7 @@ wasm_valtype_of_opcode (int opcode)
 	case OP_WASM_JIT_ALLOC_FAST:   /* new object or 0 -> i32 (ref) on wasm32 */
 	case OP_WASM_JIT_NEWARR_FAST:  /* new array or 0 -> i32 (ref) on wasm32 */
 	case OP_WASM_JIT_TLS_STATIC_DATA:   /* the thread's static_data array -> i32 */
+	case OP_WASM_JIT_SETCC_BR:   /* MONO_WASM_JIT_SELECT's condition -> i32 (0/1) */
 	case OP_IADD: case OP_ISUB: case OP_IMUL:
 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
 	case OP_IAND: case OP_IOR: case OP_IXOR:
@@ -177,6 +178,7 @@ wj_opcode_is_nonref (MonoInst *ins)
 	 * stays scalar, of a possible-ref source is a possible ref. */
 	case OP_ICONST: case OP_I8CONST:
 	case OP_WASM_JIT_TLS_STATIC_DATA:   /* a mono_gc_alloc_fixed root array: never moves, needs no pin */
+	case OP_WASM_JIT_SETCC_BR:   /* MONO_WASM_JIT_SELECT's condition: 0 or 1 */
 	case OP_IMUL:
 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
 	case OP_IAND: case OP_IOR: case OP_IXOR:
@@ -449,7 +451,8 @@ wj_ins_is_gcpoint (MonoInst *ins, gboolean raise_exempt)
 	case OP_FMIN: case OP_FMAX: case OP_RMIN: case OP_RMAX: case OP_FCOPYSIGN: case OP_RCOPYSIGN:
 	case OP_LZCNT32: case OP_LZCNT64: case OP_POPCNT32: case OP_POPCNT64:
 	case OP_SEXT_I4: case OP_ZEXT_I4:
-	/* compares + setcc + branches */
+	/* compares + setcc + branches (and MONO_WASM_JIT_SELECT's setcc and select: no memory, no allocation) */
+	case OP_WASM_JIT_SETCC_BR: case OP_WASM_JIT_SELECT:
 	case OP_ICEQ: case OP_ICNEQ: case OP_ICLT: case OP_ICLT_UN: case OP_ICGT: case OP_ICGT_UN:
 	case OP_ICLE: case OP_ICLE_UN: case OP_ICGE: case OP_ICGE_UN:
 	case OP_LCEQ: case OP_LCGT: case OP_LCGT_UN: case OP_LCLT: case OP_LCLT_UN:
@@ -1098,9 +1101,9 @@ typedef struct { gint32 op, base, off, val; guint8 inv, cls, ck; gssize cv; } Wj
 #define WJ_S4_ENTS 64
 typedef struct { WjS4Ent e [WJ_S4_ENTS]; int n; } WjS4Tab;
 typedef struct { const char *meth; gint32 il; gint32 op; gint32 n, rem, hoist; guint8 mask; } WjS4Row;
-typedef struct { gint32 base, off, sz; guint8 cls; } WjS4St;
+typedef struct { gint32 base, off, sz; guint8 cls, kind; } WjS4St;
 #define WJ_S4_LSTORES 64
-typedef struct { guint8 *def; gboolean clob; int nst, nblocks; WjS4St st [WJ_S4_LSTORES]; } WjS4Loop;
+typedef struct { guint8 *def; gboolean clob; int nst, nblocks; MonoBasicBlock *h; WjS4St st [WJ_S4_LSTORES]; } WjS4Loop;
 
 static guint8
 wj_s4_entcls (const guint8 *cls, int base, gint32 off)
@@ -1121,8 +1124,34 @@ wj_s4_invariant (const guint8 *cls, int base, gint32 off)
 		return TRUE;
 	return FALSE;
 }
+/* MONO_WASM_JIT_S4 & 16 (G2, findings M48): the value kind an access moves. A managed object's field has one type, so a store of
+ * one kind cannot change a load of another kind from the same object and offset: a float stored to Vec2.x (+0xc) leaves a
+ * cached ref load of AABB.lowerBound (+0xc) alone. Refs and 4-byte integers share opcodes on wasm32 and so share a kind;
+ * 0 = unknown, aliases everything. Type punning through Unsafe.As on an object base, or an explicit-layout class whose
+ * overlapping fields differ in kind, breaks the premise: Java cannot express either, and the caller keeps the rule out of
+ * CoreLib methods, where both live. */
+static int
+wj_s4_kind (int op)
+{
+	switch (op) {
+	case OP_LOADR4_MEMBASE: case OP_STORER4_MEMBASE_REG:
+		return 1;
+	case OP_LOADR8_MEMBASE: case OP_STORER8_MEMBASE_REG:
+		return 2;
+	case OP_LOADI8_MEMBASE: case OP_STOREI8_MEMBASE_REG: case OP_STOREI8_MEMBASE_IMM:
+		return 3;
+	case OP_LOAD_MEMBASE: case OP_LOADI4_MEMBASE: case OP_LOADU4_MEMBASE:
+	case OP_STORE_MEMBASE_REG: case OP_STORE_MEMBASE_IMM: case OP_STOREI4_MEMBASE_REG: case OP_STOREI4_MEMBASE_IMM:
+		return 4;
+	case OP_LOADI1_MEMBASE: case OP_LOADU1_MEMBASE: case OP_LOADI2_MEMBASE: case OP_LOADU2_MEMBASE:
+	case OP_STOREI1_MEMBASE_REG: case OP_STOREI1_MEMBASE_IMM: case OP_STOREI2_MEMBASE_REG: case OP_STOREI2_MEMBASE_IMM:
+		return 5;
+	default:
+		return 0;
+	}
+}
 static void
-wj_s4_kill_store (WjS4Tab *t, const guint8 *cls, int base, gint32 off, int sz, gboolean keyed, gboolean sck, gssize scv)
+wj_s4_kill_store (WjS4Tab *t, const guint8 *cls, int base, gint32 off, int sz, gboolean keyed, gboolean sck, gssize scv, int skind)
 {
 	int i, j = 0;
 	gboolean objbase = cls [base] == WJ_S4_OBJ, constbase = cls [base] == WJ_S4_CONST;
@@ -1136,7 +1165,8 @@ wj_s4_kill_store (WjS4Tab *t, const guint8 *cls, int base, gint32 off, int sz, g
 		else if (!objbase && !constbase)
 			kill = TRUE;                                   /* a store through a derived pointer can hit any field */
 		else if (objbase)
-			kill = e->cls == 1 && e->off < off + sz && off < e->off + wj_s4_size (e->op);
+			kill = e->cls == 1 && e->off < off + sz && off < e->off + wj_s4_size (e->op) &&
+				(!skind || !wj_s4_kind (e->op) || skind == wj_s4_kind (e->op));   /* skind: S4 & 16 */
 		else if (!keyed)
 			kill = e->cls == 4 && e->base == base && e->off < off + sz && off < e->off + wj_s4_size (e->op);
 		else if (sck && e->ck)   /* S4 & 8: both addresses are known; kill on overlap of the absolute ranges */
@@ -1189,6 +1219,402 @@ wj_s4_invariant_strict (const guint8 *cls, int base, gint32 off)
 	return FALSE;
 }
 
+/* MONO_WASM_JIT_SELECT (G1, findings M48): if-conversion. V8 if-converts nothing -- a wasm `select` becomes a
+ * conditional select (arm64 fcsel / csel) while the same if/else stays a branch -- so a data-dependent diamond of
+ * plain moves pays a mispredict per wrong guess (AABB.combine's four `a < b ? a : b`, TimSort.binarySort's left/right
+ * update: a third of jbox2d's mispredicts). A diamond or triangle whose arms are short runs of pure, non-faulting
+ * instructions becomes: the arms' instructions hoisted (renamed into temps) ahead of the compare, the condition
+ * materialised once (OP_WASM_JIT_SETCC_BR, consuming the compare as the branch did), and one OP_WASM_JIT_SELECT per
+ * value the arms assign. Runs at the top of mono_wasm_emit_method, before next_vreg is read, so the temps are ordinary
+ * vregs to every later pass. The CFG is edited as mono's own if_conversion does (branch-opts.c): the arm blocks are
+ * unlinked, removed from the block list and from every loop's block list (dominator data is not read after this). */
+#define WJ_SEL_MAX_ARM_OPS 3   /* non-move instructions an arm may speculate */
+#define WJ_SEL_MAX_VALS 4      /* values one diamond may select */
+#define WJ_SEL_MAP 8
+static gboolean
+wj_sel_is_cmp (int op)
+{
+	switch (op) {
+	case OP_ICOMPARE: case OP_COMPARE: case OP_ICOMPARE_IMM: case OP_COMPARE_IMM:
+	case OP_LCOMPARE: case OP_LCOMPARE_IMM: case OP_FCOMPARE: case OP_RCOMPARE:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+static gboolean
+wj_sel_is_br (int op)
+{
+	switch (op) {
+	case OP_IBEQ: case OP_IBNE_UN: case OP_IBLT: case OP_IBLT_UN: case OP_IBGT: case OP_IBGT_UN:
+	case OP_IBLE: case OP_IBLE_UN: case OP_IBGE: case OP_IBGE_UN:
+	case OP_LBEQ: case OP_LBNE_UN: case OP_LBLT: case OP_LBLT_UN: case OP_LBGT: case OP_LBGT_UN:
+	case OP_LBLE: case OP_LBLE_UN: case OP_LBGE: case OP_LBGE_UN:
+	case OP_FBEQ: case OP_FBNE_UN: case OP_FBLT: case OP_FBLT_UN: case OP_FBGT: case OP_FBGT_UN:
+	case OP_FBLE: case OP_FBLE_UN: case OP_FBGE: case OP_FBGE_UN:
+	case OP_RBEQ: case OP_RBNE_UN: case OP_RBLT: case OP_RBLT_UN: case OP_RBGT: case OP_RBGT_UN:
+	case OP_RBLE: case OP_RBLE_UN: case OP_RBGE: case OP_RBGE_UN:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+/* 1 = a move (forwarded, never hoisted), 2 = pure arithmetic that cannot trap (hoisted into a temp), 0 = refused.
+ * No load, no division, no conversion (wasm's float->int truncation traps), nothing that allocates or calls. */
+static int
+wj_sel_arm_kind (MonoInst *ins)
+{
+	switch (ins->opcode) {
+	case OP_MOVE: case OP_LMOVE: case OP_FMOVE: case OP_RMOVE:
+		return 1;
+	case OP_ICONST: case OP_I8CONST: case OP_R4CONST: case OP_R8CONST:
+	case OP_IADD: case OP_ISUB: case OP_IMUL: case OP_IAND: case OP_IOR: case OP_IXOR:
+	case OP_ISHL: case OP_ISHR: case OP_ISHR_UN: case OP_INEG: case OP_INOT:
+	case OP_IADD_IMM: case OP_ISUB_IMM: case OP_IMUL_IMM: case OP_IAND_IMM: case OP_IOR_IMM: case OP_IXOR_IMM:
+	case OP_ISHL_IMM: case OP_ISHR_IMM: case OP_ISHR_UN_IMM:
+	case OP_LADD: case OP_LSUB: case OP_LMUL: case OP_LAND: case OP_LOR: case OP_LXOR:
+	case OP_LADD_IMM: case OP_LSUB_IMM: case OP_LAND_IMM: case OP_LOR_IMM: case OP_LXOR_IMM:
+	case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FNEG:
+	case OP_RADD: case OP_RSUB: case OP_RMUL: case OP_RNEG:
+		/* a pointer-typed result is an interior pointer: speculating one is harmless, but keep refs to plain moves */
+		return (ins->type == STACK_OBJ || ins->type == STACK_MP) ? 0 : 2;
+	default:
+		return 0;
+	}
+}
+/* Vregs known non-null at the end of a block: null-checked there (a compare with 0 feeding a COND_EXC, mono's
+ * MONO_EMIT_NULL_CHECK shape), marked OP_NOT_NULL, or moved from one of those. An arm's re-check of one of them is
+ * redundant (S4 turns an arm's reload into a move, and local cprop hands the check the original vreg), so the arm
+ * may still be speculated and the check dropped with it. */
+#define WJ_SEL_NN 32
+typedef struct { int v [WJ_SEL_NN]; int n; } WjSelNN;
+static gboolean
+wj_sel_nn_has (const WjSelNN *nn, int v)
+{
+	int i;
+	for (i = 0; i < nn->n; ++i)
+		if (nn->v [i] == v)
+			return TRUE;
+	return FALSE;
+}
+static void
+wj_sel_nn_add (WjSelNN *nn, int v)
+{
+	if (v >= 0 && nn->n < WJ_SEL_NN && !wj_sel_nn_has (nn, v))
+		nn->v [nn->n++] = v;
+}
+static void
+wj_sel_nn_kill (WjSelNN *nn, int v)
+{
+	int i;
+	for (i = 0; i < nn->n; ++i)
+		if (nn->v [i] == v) { nn->v [i] = nn->v [--nn->n]; return; }
+}
+static gboolean
+wj_sel_is_null_check (MonoInst *ins)
+{
+	return (ins->opcode == OP_COMPARE_IMM || ins->opcode == OP_ICOMPARE_IMM) && ins->inst_imm == 0 && ins->next &&
+		(ins->next->opcode == OP_COND_EXC_EQ || ins->next->opcode == OP_COND_EXC_IEQ);
+}
+/* Update NN across one instruction (FALSE: not a shape this tracks, nothing changed but a def's kill). */
+static void
+wj_sel_nn_step (WjSelNN *nn, MonoInst *ins)
+{
+	if (wj_sel_is_null_check (ins) || ins->opcode == OP_NOT_NULL) {
+		wj_sel_nn_add (nn, ins->sreg1);
+		return;
+	}
+	if (ins->dreg < 0 || MONO_IS_STORE_MEMBASE (ins))
+		return;
+	if (ins->opcode == OP_MOVE && wj_sel_nn_has (nn, ins->sreg1))
+		wj_sel_nn_add (nn, ins->dreg);
+	else
+		wj_sel_nn_kill (nn, ins->dreg);
+}
+/* An arm instruction that is a redundant null check against NN (the compare, its COND_EXC, or an OP_NOT_NULL). */
+static gboolean
+wj_sel_redundant_check (const WjSelNN *nn, MonoInst *ins)
+{
+	if (ins->opcode == OP_NOT_NULL)
+		return wj_sel_nn_has (nn, ins->sreg1);
+	if (wj_sel_is_null_check (ins))
+		return wj_sel_nn_has (nn, ins->sreg1);
+	if ((ins->opcode == OP_COND_EXC_EQ || ins->opcode == OP_COND_EXC_IEQ) && ins->prev && wj_sel_is_null_check (ins->prev))
+		return wj_sel_nn_has (nn, ins->prev->sreg1);
+	return FALSE;
+}
+
+/* The arm's single successor, or NULL when ARM cannot be speculated from A. */
+static MonoBasicBlock *
+wj_sel_arm_ok (MonoCompile *cfg, MonoBasicBlock *a, MonoBasicBlock *arm, int *nops, const WjSelNN *nn_a)
+{
+	MonoInst *ins;
+	int n = 0;
+	WjSelNN nn = *nn_a;
+	if (arm == a || arm == cfg->bb_exit || arm == cfg->bb_entry || arm->in_count != 1 || arm->in_bb [0] != a ||
+	    arm->out_count != 1 || arm->out_bb [0] == arm || arm->out_bb [0] == a || arm->region != a->region ||
+	    arm->out_of_line || arm->wasm_cold || (arm->flags & BB_EXCEPTION_HANDLER))
+		return NULL;
+	MONO_BB_FOR_EACH_INS (arm, ins) {
+		int k;
+		if (ins->opcode == OP_NOP || ins->opcode == OP_IL_SEQ_POINT)
+			continue;
+		if (ins->opcode == OP_BR) {
+			if (ins != arm->last_ins || ins->inst_target_bb != arm->out_bb [0])
+				return NULL;
+			continue;
+		}
+		if (wj_sel_redundant_check (&nn, ins))
+			continue;
+		if (ins->flags & MONO_INST_VOLATILE)
+			return NULL;
+		k = wj_sel_arm_kind (ins);
+		if (!k || ins->dreg < 0)
+			return NULL;
+		if (k == 2 && ++n > WJ_SEL_MAX_ARM_OPS)
+			return NULL;
+		wj_sel_nn_step (&nn, ins);
+	}
+	*nops = n;
+	return arm->out_bb [0];
+}
+static gboolean
+wj_sel_var_ok (MonoCompile *cfg, int v)
+{
+	MonoInst *var = get_vreg_to_inst (cfg, v);
+	if (cfg->ret && v == cfg->ret->dreg)
+		return FALSE;   /* mono keeps assignments to the return register at the end of a block (branch-opts.c) */
+	return !(var && (var->flags & (MONO_INST_VOLATILE | MONO_INST_INDIRECT)));
+}
+typedef struct { int orig, val; } WjSelMap;
+static int
+wj_sel_lookup (const WjSelMap *m, int n, int v)
+{
+	int i;
+	for (i = n - 1; i >= 0; --i)
+		if (m [i].orig == v)
+			return m [i].val;
+	return v;
+}
+/* Simulate (APPLY = FALSE) or perform (APPLY = TRUE) one arm's renaming: moves forward their source, arithmetic writes a
+ * fresh temp and is hoisted before INSERT_BEFORE in A. Returns the map's size, or -1 if it overflows. */
+static int
+wj_sel_rename_arm (MonoCompile *cfg, MonoBasicBlock *a, MonoInst *insert_before, MonoBasicBlock *arm, WjSelMap *m, gboolean apply)
+{
+	MonoInst *ins, *next;
+	int n = 0, tmpn = 0;
+	if (!arm)
+		return 0;
+	for (ins = arm->code; ins; ins = next) {
+		int k, d, v, i;
+		next = ins->next;
+		if (ins->opcode == OP_NOP || ins->opcode == OP_IL_SEQ_POINT || ins->opcode == OP_BR)
+			continue;
+		/* the redundant null checks wj_sel_arm_ok admitted leave with the arm */
+		if (ins->opcode == OP_NOT_NULL || ins->opcode == OP_COND_EXC_EQ || ins->opcode == OP_COND_EXC_IEQ || wj_sel_is_null_check (ins))
+			continue;
+		k = wj_sel_arm_kind (ins);
+		d = ins->dreg;
+		if (k == 1) {
+			v = wj_sel_lookup (m, n, ins->sreg1);
+		} else {
+			if (apply) {
+				ins->sreg1 = ins->sreg1 >= 0 ? wj_sel_lookup (m, n, ins->sreg1) : ins->sreg1;
+				ins->sreg2 = ins->sreg2 >= 0 ? wj_sel_lookup (m, n, ins->sreg2) : ins->sreg2;
+				switch (wasm_valtype_of_opcode (ins->opcode)) {
+				case WASM_I64: v = (int) alloc_lreg (cfg); break;
+				case WASM_F32: case WASM_F64: v = (int) alloc_freg (cfg); break;
+				default: v = (int) alloc_ireg (cfg); break;
+				}
+				ins->dreg = v;
+				MONO_REMOVE_INS (arm, ins);
+				mono_bblock_insert_before_ins (a, insert_before, ins);
+			} else {
+				v = -2 - tmpn++;   /* a placeholder: a temp is never one of the selected variables */
+			}
+		}
+		for (i = 0; i < n; ++i)
+			if (m [i].orig == d)
+				break;
+		if (i == n) {
+			if (n == WJ_SEL_MAP)
+				return -1;
+			m [n++].orig = d;
+		}
+		m [i].val = v;
+	}
+	return n;
+}
+/* MONO_WASM_JIT_SELECT_TRACE=<substring of a method name> (diagnostic): every conditional branch in a matching method prints
+ * its blocks, its arms' instructions and what wj_select_run decided, as WASM_JIT_SELECT_TRACE lines. */
+static void
+wj_sel_trace_bb (const char *tag, MonoBasicBlock *x)
+{
+	MonoInst *ins;
+	if (!x) { printf ("WASM_JIT_SELECT_TRACE   %s: -\n", tag); return; }
+	printf ("WASM_JIT_SELECT_TRACE   %s: BB%d in=%d out=%d region=%u ool=%d cold=%d flags=%x:", tag, x->block_num, x->in_count, x->out_count,
+		x->region, (int) x->out_of_line, (int) x->wasm_cold, (unsigned) x->flags);
+	MONO_BB_FOR_EACH_INS (x, ins)
+		printf (" %s(%d<-%d,%d)", wj_opname (ins->opcode), ins->dreg, ins->sreg1, ins->sreg2);
+	printf ("\n");
+}
+static int
+wj_select_run (MonoCompile *cfg)
+{
+	extern int mono_wasm_jit_select;
+	MonoBasicBlock *a;
+	int done = 0;
+	/* the knob's shape filters (mini-wasm.c): 4 diamonds only, 8 float compares only, 16 arms of moves only */
+	gboolean only_diamonds = (mono_wasm_jit_select & 4) != 0, only_float = (mono_wasm_jit_select & 8) != 0,
+		only_moves = (mono_wasm_jit_select & 16) != 0;
+	static const char *trace_sub;
+	static int trace_init;
+	gboolean trace;
+	if (!trace_init) { trace_sub = g_getenv ("MONO_WASM_JIT_SELECT_TRACE"); trace_init = 1; }
+	trace = trace_sub && *trace_sub && cfg->method && cfg->method->name && strstr (cfg->method->name, trace_sub);
+#define WJ_SEL_TR(why) do { if (G_UNLIKELY (trace)) { \
+		printf ("WASM_JIT_SELECT_TRACE %s tier=%d BB%d %s: %s\n", cfg->method->name, cfg->wasm_jit_tier, a->block_num, wj_opname (br->opcode), (why)); \
+		wj_sel_trace_bb ("A", a); wj_sel_trace_bb ("T", br->inst_true_bb); wj_sel_trace_bb ("F", br->inst_false_bb); } } while (0)
+	for (a = cfg->bb_entry; a; a = a->next_bb) {
+		MonoInst *br = a->last_ins, *cmp, *setcc, *ins;
+		MonoBasicBlock *t, *f, *j, *jt, *jf, *hb;
+		WjSelMap mt [WJ_SEL_MAP], mf [WJ_SEL_MAP];
+		int nt, nf, ot = 0, of = 0, nv = 0, i, k, c;
+		int vd [WJ_SEL_MAX_VALS], vtv [WJ_SEL_MAX_VALS], vfv [WJ_SEL_MAX_VALS];
+		gboolean tri = FALSE;
+		WjSelNN nn;
+		if (!br || !wj_sel_is_br (br->opcode) || a->out_count != 2)
+			continue;
+		cmp = br->prev;
+		if (!cmp || !wj_sel_is_cmp (cmp->opcode)) {
+			WJ_SEL_TR ("no compare before the branch");
+			continue;
+		}
+		if (only_float && cmp->opcode != OP_FCOMPARE && cmp->opcode != OP_RCOMPARE)
+			continue;
+		t = br->inst_true_bb; f = br->inst_false_bb;
+		if (!t || !f || t == f)
+			continue;
+		nn.n = 0;
+		MONO_BB_FOR_EACH_INS (a, ins)
+			wj_sel_nn_step (&nn, ins);
+		jt = wj_sel_arm_ok (cfg, a, t, &ot, &nn);
+		jf = wj_sel_arm_ok (cfg, a, f, &of, &nn);
+		if (jt && jf && jt == jf) {
+			j = jt;
+		} else if (jt == f) {
+			j = f; f = NULL; tri = TRUE;   /* if (c) { arm } -- the false edge is the join */
+		} else if (jf == t) {
+			j = t; t = NULL; tri = TRUE;
+		} else {
+			WJ_SEL_TR (jt || jf ? "arms do not join" : "neither arm speculable");
+			continue;
+		}
+		if (j == a || j == cfg->bb_exit || j->region != a->region) {
+			WJ_SEL_TR ("join");
+			continue;
+		}
+		if ((only_diamonds && tri) || (only_moves && (ot || of))) {
+			WJ_SEL_TR ("filtered by the knob's shape bits");
+			continue;
+		}
+		/* dry run: the values, and the refusals that need them */
+		nt = wj_sel_rename_arm (cfg, a, cmp, t, mt, FALSE);
+		nf = wj_sel_rename_arm (cfg, a, cmp, f, mf, FALSE);
+		if (nt < 0 || nf < 0 || nt + nf == 0) {
+			WJ_SEL_TR ("no values");
+			mono_wasm_jit_counters [WJC_SELECT_REFUSED]++;
+			continue;
+		}
+		for (i = 0; i < nt + nf; ++i) {
+			int d = i < nt ? mt [i].orig : mf [i - nt].orig;
+			for (k = 0; k < nv; ++k)
+				if (vd [k] == d)
+					break;
+			if (k < nv)
+				continue;
+			if (nv == WJ_SEL_MAX_VALS || !wj_sel_var_ok (cfg, d))
+				goto refuse;
+			vd [nv++] = d;
+		}
+		/* A select writes its variable before the next one reads its operands: refuse when an operand is another
+		 * selected variable (a swap), or one the compare still reads. */
+		for (k = 0; k < nv; ++k) {
+			int tv = wj_sel_lookup (mt, nt, vd [k]), fv = wj_sel_lookup (mf, nf, vd [k]);
+			for (i = 0; i < nv; ++i)
+				if (i != k && (tv == vd [i] || fv == vd [i]))
+					goto refuse;
+			if (vd [k] == cmp->sreg1 || vd [k] == cmp->sreg2)
+				goto refuse;
+		}
+		/* apply */
+		nt = wj_sel_rename_arm (cfg, a, cmp, t, mt, TRUE);
+		nf = wj_sel_rename_arm (cfg, a, cmp, f, mf, TRUE);
+		for (k = 0; k < nv; ++k) {
+			vtv [k] = wj_sel_lookup (mt, nt, vd [k]);
+			vfv [k] = wj_sel_lookup (mf, nf, vd [k]);
+		}
+		c = (int) alloc_ireg (cfg);
+		MONO_INST_NEW (cfg, setcc, OP_WASM_JIT_SETCC_BR);
+		setcc->dreg = c;
+		setcc->inst_c0 = br->opcode;
+		setcc->type = STACK_I4;
+		setcc->cil_code = br->cil_code;
+		mono_bblock_insert_after_ins (a, cmp, setcc);
+		ins = setcc;
+		for (k = 0; k < nv; ++k) {
+			MonoInst *s;
+			MONO_INST_NEW (cfg, s, OP_WASM_JIT_SELECT);
+			s->dreg = vd [k];
+			s->sreg1 = vtv [k];
+			s->sreg2 = vfv [k];
+			s->sreg3 = c;
+			s->type = STACK_I4;
+			s->cil_code = br->cil_code;
+			mono_bblock_insert_after_ins (a, ins, s);
+			ins = s;
+		}
+		WJ_SEL_TR ("converted");
+		mono_wasm_jit_counters [WJC_SELECT_VALUES] += nv;
+		mono_wasm_jit_counters [tri ? WJC_SELECT_TRIANGLES : WJC_SELECT_DIAMONDS]++;
+		/* the branch becomes a jump to the join; the arms leave the CFG */
+		br->opcode = OP_BR;
+		br->inst_target_bb = j;
+		{
+			MonoBasicBlock *arms [2] = { t, f };
+			for (i = 0; i < 2; ++i) {
+				MonoBasicBlock *x = arms [i];
+				if (!x)
+					continue;
+				mono_unlink_bblock (cfg, a, x);
+				mono_unlink_bblock (cfg, x, j);
+				mono_remove_bblock (cfg, x);
+				x->code = x->last_ins = NULL;
+				for (hb = cfg->bb_entry; hb; hb = hb->next_bb) {
+					GList *l;
+					for (l = hb->loop_blocks; l; l = l->next) {
+						if (l->data != x)
+							continue;
+						if (l->prev) l->prev->next = l->next; else hb->loop_blocks = l->next;
+						if (l->next) l->next->prev = l->prev;
+						break;   /* mempool links: unlinked, never freed */
+					}
+				}
+			}
+		}
+		if (tri)
+			mono_unlink_bblock (cfg, a, j);   /* the direct edge; relinked once below */
+		mono_link_bblock (cfg, a, j);
+		done++;
+		continue;
+refuse:
+		WJ_SEL_TR ("refused: a variable, a swap, a compare operand or too many values");
+		mono_wasm_jit_counters [WJC_SELECT_REFUSED]++;
+	}
+#undef WJ_SEL_TR
+	return done;
+}
+
 /* APPLY = FALSE: the census (MONO_WASM_JIT_S4C), which prints. APPLY = TRUE: every load found available is rewritten
  * into a typed move from the vreg holding it, under the strict invariant set; nothing is printed. */
 static int
@@ -1204,6 +1630,13 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 	gint64 tl = 0, tr = 0, th = 0;
 	extern int mono_wasm_jit_s4;
 	gboolean s4_meet = (mono_wasm_jit_s4 & 4) != 0, s4_ckey = (mono_wasm_jit_s4 & 8) != 0;
+	/* S4 & 16: value-kind aliasing (wj_s4_kind); not in CoreLib, where explicit layouts and Unsafe.As punning live */
+	gboolean s4_kind = (mono_wasm_jit_s4 & 16) != 0 && cfg->method && m_class_get_image (cfg->method->klass) != mono_defaults.corlib;
+	/* S4 & 32 (G3, findings M49): a load the loop summary proves invariant moves to the loop's preheader (applying only) */
+	gboolean s4_hoist = apply && (mono_wasm_jit_s4 & 32) != 0;
+	guint8 *ndef = NULL;
+	MonoInst **hz_ins = NULL; MonoBasicBlock **hz_from = NULL, **hz_to = NULL;
+	int nhz = 0, caphz = 0;
 	guint8 *kc = NULL;   /* S4 & 8: kc [v] = v is a constant base keyed by its value kv [v] */
 	gssize *kv = NULL;
 	if (nvreg <= 0 || !cfg->header)
@@ -1244,6 +1677,33 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 				if (cls [i] != WJ_S4_OBJ) {
 					guint8 nv = (!bad [i] && tent [i]) ? tent [i] : WJ_S4_UNK;
 					if (nv != cls [i]) { cls [i] = nv; changed = 1; }
+				}
+		}
+	}
+	/* S4 & 64 (findings M53): a load's base is matched through copies. A vreg with exactly one def, an OP_MOVE from another
+	 * single-def vreg, neither a variable, holds that vreg's value for its whole life, so `v2 = MOVE v1; load [v2 + off]` finds
+	 * the entry of `load [v1 + off]` (javac's re-read of a field in each arm of `c ? a.f.x : b.f.x` reaches S4 that way). */
+	int *canon = NULL;
+	if (mono_wasm_jit_s4 & 64) {
+		guint8 *nd1 = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+		int pass, chg = 1;
+		canon = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (gsize) nvreg);
+		for (i = 0; i < nvreg; ++i)
+			canon [i] = i;
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+			MONO_BB_FOR_EACH_INS (bb, ins)
+				if (ins->dreg >= 0 && ins->dreg < nvreg && !MONO_IS_STORE_MEMBASE (ins) && nd1 [ins->dreg] < 2)
+					nd1 [ins->dreg]++;
+		for (pass = 0; chg && pass < 8; ++pass) {
+			chg = 0;
+			for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+				MONO_BB_FOR_EACH_INS (bb, ins) {
+					int d = ins->dreg, sv = ins->sreg1;
+					if (ins->opcode != OP_MOVE || d < 0 || d >= nvreg || sv < 0 || sv >= nvreg || nd1 [d] != 1 || nd1 [sv] != 1 ||
+					    cls [d] != cls [sv] || get_vreg_to_inst (cfg, d) || get_vreg_to_inst (cfg, sv) || canon [d] == canon [sv])
+						continue;
+					canon [d] = canon [sv];
+					chg = 1;
 				}
 		}
 	}
@@ -1301,6 +1761,7 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 					continue;
 				L = &loops [li_];
 				L->def = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+				L->h = h;
 				for (l = h->loop_blocks; l; l = l->next) {
 					MonoBasicBlock *lb = (MonoBasicBlock *) l->data;
 					MonoInst *li;
@@ -1310,9 +1771,13 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 						if (MONO_IS_STORE_MEMBASE (li)) {
 							int sb = li->dreg;
 							if (L->nst == WJ_S4_LSTORES || sb < 0 || sb >= nvreg) L->clob = TRUE;
-							else { WjS4St *st = &L->st [L->nst++]; st->base = sb; st->off = (gint32) li->inst_offset; st->sz = wj_s4_size (li->opcode); st->cls = cls [sb]; }
+							else { WjS4St *st = &L->st [L->nst++]; st->base = sb; st->off = (gint32) li->inst_offset; st->sz = wj_s4_size (li->opcode); st->cls = cls [sb]; st->kind = s4_kind ? (guint8) wj_s4_kind (li->opcode) : 0; }
 							continue;
 						}
+						/* S4 & 32: a loop's safepoint poll runs no managed code, and what the shadow frame holds is pinned, so a
+						 * field value read before it is still the field's value after it (the poll stays a GC point) */
+						if (s4_hoist && li->opcode == OP_GC_SAFE_POINT)
+							continue;
 						if ((li->flags & MONO_INST_VOLATILE) || (wj_s4_is_call (li) ? calls_kill : wj_ins_clobbers_mem (li)))
 							L->clob = TRUE;
 						if (li->dreg >= 0 && li->dreg < nvreg)
@@ -1374,7 +1839,7 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 		MONO_BB_FOR_EACH_INS (bb, ins) {
 			int hit = 0, hoist = 0;
 			if (wj_s4_is_load (ins->opcode) && ins->sreg1 >= 0 && ins->sreg1 < nvreg && !(ins->flags & MONO_INST_VOLATILE)) {
-				int b = ins->sreg1, k;
+				int b0 = ins->sreg1, b = canon ? canon [b0] : b0, k;
 				guint8 ec = wj_s4_entcls (cls, b, (gint32) ins->inst_offset);
 				gboolean lck = kc && kc [b];
 				gssize lcv = lck ? kv [b] : 0;
@@ -1384,7 +1849,7 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 				/* LICM: against the precomputed summary of bb's innermost natural loop */
 				if (!hit && inner && bb->block_num < nbb && inner [bb->block_num] >= 0) {
 					WjS4Loop *L = &loops [inner [bb->block_num]];
-					if (!L->def [b]) {
+					if (!L->def [b] && !L->def [b0]) {   /* b0: the instruction's own base register, which a hoist reads */
 						if (wj_s4_invariant (cls, b, (gint32) ins->inst_offset))
 							hoist = 1;
 						else if (!L->clob && ec != 8) {
@@ -1393,7 +1858,8 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 								WjS4St *st = &L->st [q];
 								gint32 lo = (gint32) ins->inst_offset, hi = lo + wj_s4_size (ins->opcode);
 								if (st->cls != WJ_S4_OBJ && st->cls != WJ_S4_CONST) ok = 0;
-								else if (st->cls == WJ_S4_OBJ && ec == 1 && st->off < hi && lo < st->off + st->sz) ok = 0;
+								else if (st->cls == WJ_S4_OBJ && ec == 1 && st->off < hi && lo < st->off + st->sz &&
+									 (!st->kind || !wj_s4_kind (ins->opcode) || st->kind == wj_s4_kind (ins->opcode))) ok = 0;
 								else if (st->cls == WJ_S4_CONST && ec == 4 && st->base == b && st->off < hi && lo < st->off + st->sz) ok = 0;
 							}
 							hoist = ok;
@@ -1440,6 +1906,38 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 							wj_count (WJC_S4_CKEY);
 					}
 				}
+				if (s4_hoist && hoist && !hit && ins->dreg >= 0 && ins->dreg < nvreg) {
+					/* the loop's preheader: the header's one predecessor outside the loop, flowing only into the header */
+					WjS4Loop *L = &loops [inner [bb->block_num]];
+					MonoBasicBlock *h = L->h, *pre = NULL;
+					int p, npre = 0;
+					if (!ndef) {
+						MonoBasicBlock *db; MonoInst *di;
+						ndef = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+						for (db = cfg->bb_entry; db; db = db->next_bb)
+							MONO_BB_FOR_EACH_INS (db, di)
+								if (di->dreg >= 0 && di->dreg < nvreg && !MONO_IS_STORE_MEMBASE (di) && ndef [di->dreg] < 2)
+									ndef [di->dreg]++;
+					}
+					for (p = 0; h && p < h->in_count; ++p) {
+						MonoBasicBlock *pb = h->in_bb [p];
+						GList *l;
+						gboolean inloop = FALSE;
+						for (l = h->loop_blocks; l && !inloop; l = l->next)
+							inloop = l->data == pb;
+						if (!inloop) { pre = pb; npre++; }
+					}
+					if (npre == 1 && pre->out_count == 1 && pre->region == bb->region && !(pre->flags & BB_EXCEPTION_HANDLER) &&
+					    ndef [ins->dreg] == 1 && !get_vreg_to_inst (cfg, ins->dreg) && !(ins->flags & MONO_INST_VOLATILE)) {
+						if (nhz == caphz) {
+							caphz = caphz ? caphz * 2 : 16;
+							hz_ins = (MonoInst **) g_realloc (hz_ins, sizeof (gpointer) * (gsize) caphz);
+							hz_from = (MonoBasicBlock **) g_realloc (hz_from, sizeof (gpointer) * (gsize) caphz);
+							hz_to = (MonoBasicBlock **) g_realloc (hz_to, sizeof (gpointer) * (gsize) caphz);
+						}
+						hz_ins [nhz] = ins; hz_from [nhz] = bb; hz_to [nhz] = pre; nhz++;
+					}
+				}
 				/* the def kills, then the load becomes available */
 				wj_s4_kill_vreg (cur, ins->dreg);
 				if (!hit && ins->dreg >= 0 && ins->dreg != b) {
@@ -1456,7 +1954,8 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 			if (MONO_IS_STORE_MEMBASE (ins)) {
 				int sb = ins->dreg;
 				if (sb >= 0 && sb < nvreg)
-					wj_s4_kill_store (cur, cls, sb, (gint32) ins->inst_offset, wj_s4_size (ins->opcode), s4_ckey, kc && kc [sb], kc ? kv [sb] : 0);
+					wj_s4_kill_store (cur, cls, sb, (gint32) ins->inst_offset, wj_s4_size (ins->opcode), s4_ckey, kc && kc [sb], kc ? kv [sb] : 0,
+						s4_kind ? wj_s4_kind (ins->opcode) : 0);
 				else
 					wj_s4_kill_all (cur);
 				continue;   /* a store's dreg is its base, not a def */
@@ -1483,6 +1982,20 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 					rows [i].il, wj_opname (rows [i].op), rows [i].n, rows [i].rem, rows [i].hoist, (unsigned) rows [i].mask);
 		printf ("%s_M\t%d\t%s\t%lld\t%lld\t%lld\n", tag, cfg->wasm_jit_tier, mname ? mname : "?", (long long) tl, (long long) tr, (long long) th);
 	}
+	/* S4 & 32: move the recorded loads, after the walk (moving one mid-walk would carry the iteration into the preheader). A load
+	 * from a base that may be null reads low linear memory in wasm rather than trapping, so speculating it is safe; the null
+	 * check stays where it was. */
+	for (i = 0; i < nhz; ++i) {
+		MonoInst *last = hz_to [i]->last_ins;
+		MONO_REMOVE_INS (hz_from [i], hz_ins [i]);
+		hz_ins [i]->next = hz_ins [i]->prev = NULL;
+		if (last && last->opcode == OP_BR)
+			mono_bblock_insert_before_ins (hz_to [i], last, hz_ins [i]);
+		else
+			mono_add_ins_to_end (hz_to [i], hz_ins [i]);
+		wj_count (WJC_S4_HOISTED);
+	}
+	g_free (hz_ins); g_free (hz_from); g_free (hz_to);
 	g_free (rows);
 	return apply ? (int) tr : 0;   /* applying: the loads rewritten */
 }

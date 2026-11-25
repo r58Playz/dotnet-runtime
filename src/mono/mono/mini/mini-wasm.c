@@ -781,6 +781,12 @@ int mono_wasm_jit_inline_cold_throw = 1;
  * exception tail (Holder$Reference.value: 32.7 k calls a mctick tick) was refused at depth before R318 could discount
  * it. Counted WJC_INLINE_TRIVIAL_DEPTH. 16 with the M3 bundle (MONO_WASM_JIT_CAST_ELIM has the numbers). 0 = off. */
 int mono_wasm_jit_inline_trivial = 16;
+/* MONO_WASM_JIT_INLINE_FWD (G6, findings M48): an inlinee whose IL is only `ldarg*; call|callvirt; ret` (a wrapper, a bridge,
+ * IKVM's default-method forwarder on an implementor) does not spend a level of the inline depth cap; the value is how many
+ * such levels one inline stack may skip. 26.2's interface -> forwarder -> <default> chains ran into the cap: tier 2 refused
+ * LevelReader.<default>getMinY at 51 sites and <default>getHeight at 47 for depth in one mctick run, and <default> helpers
+ * held 4.1% of the tick self (2026-11-25). 0 = off. */
+int mono_wasm_jit_inline_fwd = 0;
 /* MONO_WASM_JIT_INLINE_AGGR_DEPTH=1: an [AggressiveInlining] callee is exempt from the inline depth cap too, to depth 16
  * (wj_aggr_inline's block cap still applies). The census of 2026-11-21 (all levers) refused IKVM's
  * Util.getClassFromObject -- AggressiveInlining since IKVM bb8874c0a, its fast path the point -- 4,521 times, all for
@@ -1027,6 +1033,14 @@ int mono_wasm_jit_direct_deps = 512;
  * cycles 96.20 (95.99-96.41) -1.7%, instructions -2.2%; the render thread's interpreter door for icalls 178 -> 4,128 a
  * second through AOT instead (2026-11-16 role census). */
 int mono_wasm_jit_icall_aot = 1;
+/* MONO_WASM_JIT_PINVOKE_AOT (G5, findings M48): a direct call to a P/Invoke takes the inline-AOT route to the P/Invoke's
+ * AOT-compiled managed-to-native wrapper, as MONO_WASM_JIT_ICALL_AOT does for an icall, instead of the residual. jbox2d's
+ * System.nanoTime -> Stopwatch.GetTimestamp inlines down to Interop.Sys.GetTimestamp, which the residual ran 344 k times in
+ * a stats run (`[wasm-jit iroute top] ... aot-backed pinvoke emit=aot-target-at-emit`): 14.3 us a step against TeaVM's
+ * 3.6. A P/Invoke whose wrapper the AOT image left out keeps the residual. jbox2d (R440 protocol, one binary, knob only, n=3
+ * a side, 2026-11-25, findings M52): 0.4086 -> 0.3995 ms/step (-2.2%, disjoint); residual calls 492 k -> 141 k in a stats run.
+ * 0 = off. */
+int mono_wasm_jit_pinvoke_aot = 1;
 /* MONO_WASM_JIT_LDADDR_ARG (R377): an address-taken scalar ARGUMENT (ldarga, e.g. Unsafe.As<TEnum,int>(ref value) in
  * Enum.IsDefined<TEnum>) is homed in an addr-frame slot the prologue fills, instead of failing the compile with "ldaddr
  * of arg local". Clause-free methods and ref-free scalars only. */
@@ -1477,7 +1491,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_s2_cold, "MONO_WASM_JIT_S2_COLD", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_s2_bb, "MONO_WASM_JIT_S2_BB", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_s3, "MONO_WASM_JIT_S3", 0, 31)
-	WJ_T2_KNOB (mono_wasm_jit_s4, "MONO_WASM_JIT_S4", 0, 15)
+	WJ_T2_KNOB (mono_wasm_jit_s4, "MONO_WASM_JIT_S4", 0, 127)
 	WJ_T2_KNOB (mono_wasm_jit_t2_strict, "MONO_WASM_JIT_T2_STRICT", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_strict_limit, "MONO_WASM_JIT_T2_STRICT_LIMIT", 1, 1000)
 	{ extern void mono_wasm_jit_s2_init (void); mono_wasm_jit_s2_init (); }
@@ -1490,6 +1504,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_tls_sd, "MONO_WASM_JIT_TLS_SD", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_cold_throw, "MONO_WASM_JIT_INLINE_COLD_THROW", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_inline_trivial, "MONO_WASM_JIT_INLINE_TRIVIAL", 0, 64)
+	WJ_T2_KNOB (mono_wasm_jit_inline_fwd, "MONO_WASM_JIT_INLINE_FWD", 0, 16)
 	WJ_T2_KNOB (mono_wasm_jit_inline_aggr_depth, "MONO_WASM_JIT_INLINE_AGGR_DEPTH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_newarr_inline, "MONO_WASM_JIT_NEWARR_INLINE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_img_dispatch, "MONO_WASM_JIT_IMG_DISPATCH", 0, 1)
@@ -1531,6 +1546,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_vcall_vret, "MONO_WASM_JIT_VCALL_VRET", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_direct_deps, "MONO_WASM_JIT_DIRECT_DEPS", 1, MONO_WASM_JIT_MAX_DIRECT_DEPS)
 	WJ_T2_KNOB (mono_wasm_jit_icall_aot, "MONO_WASM_JIT_ICALL_AOT", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_pinvoke_aot, "MONO_WASM_JIT_PINVOKE_AOT", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_ldaddr_arg, "MONO_WASM_JIT_LDADDR_ARG", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_trace_compile, "MONO_WASM_JIT_TRACE_COMPILE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_aggr_inline_blocks, "MONO_WASM_JIT_AGGR_INLINE_BLOCKS", 0, 10000000)
@@ -1545,6 +1561,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_cast_elim, "MONO_WASM_JIT_CAST_ELIM", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_hash_inline, "MONO_WASM_JIT_HASH_INLINE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_select, "MONO_WASM_JIT_SELECT", 0, 31)
 	WJ_T2_KNOB (mono_wasm_jit_arraycopy_on, "MONO_WASM_JIT_ARRAYCOPY", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
@@ -1785,6 +1802,13 @@ int mono_wasm_jit_pin_cold = 5;
  * against TeaVM's 1.5 (M16, 2026-11-23). mctick (M4, goal protocol, one binary, n=4 / n=3, both orders, 2026-11-23):
  * 15.72 -> 15.22 M cycles a tick (-3.2%), 3.930 -> 3.800 ms, disjoint; 254 sites. 0 = off. */
 int mono_wasm_jit_hash_inline = 1;
+/* MONO_WASM_JIT_SELECT (G1, findings M48), a bit mask: 1 = if-convert short diamonds and one-armed ifs of pure, non-faulting
+ * instructions into wasm `select`s in tier-2 compiles (wj_select_run, mini-wasm-ir.inc); 2 = in tier-1 compiles too; 4 =
+ * diamonds only; 8 = float compares only; 16 = arms of moves only. V8 does not if-convert (on arm64 a wasm select is fcsel /
+ * csel, the same if/else a branch), and jbox2d's mispredicts sit in such shapes (AABB.combine 19%, TimSort.binarySort 16% of
+ * discarded samples, M48). Every shape at once (3, before S4 ran first) was 1.4% slower on jbox2d: most converted branches
+ * were predictable, and combine was not converted (findings M50). 0 = off. */
+int mono_wasm_jit_select = 0;
 /* MONO_WASM_JIT_ARRAYCOPY: a call to IKVM.Runtime.ByteCodeHelper.arraycopy (System.arraycopy) calls
  * mono_wasm_jit_arraycopy first, which copies when both arrays have the same vtable (a vector: same type, so every element
  * is storable) and the bounds hold -- memmove, or the bulk ref copy + card marks -- and returns 0 otherwise, so IKVM's own
@@ -1896,7 +1920,11 @@ int mono_wasm_jit_t2_strict_limit = 20;   /* MONO_WASM_JIT_T2_STRICT_LIMIT: IL b
  * overlapping (R433); on Minecraft ~6,450 loads rewritten in ~960 tier-2 compiles per run, three clean runs (R433, R439).
  * 4 = a join whose predecessors are all processed starts from the entries every predecessor holds (without it a join
  * starts empty, so each guard diamond resets the table); 8 = a constant base (a CHA word, a static) matches another
- * vreg holding the same constant. Bits 4 and 8 are unmeasured (2026-11-25). Default 1. */
+ * vreg holding the same constant. Bits 4 and 8 measured null on both benches (findings M46). 16 (G2, findings M48) = a store of
+ * one value kind (f32 / f64 / i64 / 4-byte int-or-ref / sub-word) does not kill a cached load of another kind on an object base
+ * (wj_s4_kind; not in CoreLib methods). 64 (findings M53) = a load's base is matched through single-def copies. 32 (G3, findings M49) = a load the S4 loop summary proves invariant (no call, no
+ * aliasing store; the loop's own safepoint poll exempt) moves to the loop's preheader; its null check stays in the loop, since
+ * a wasm load from a null base reads low memory instead of trapping. Default 1. */
 int mono_wasm_jit_s4 = 1;
 /* MONO_WASM_JIT_S4_SEL="lo-hi" (diagnostic, R432): S4 applies only to methods whose full-name hash (g_str_hash % 4096)
  * lies in [lo, hi], and every compile it rewrote prints WASM_JIT_S4_APPLIED <tier> <loads> <hash> <method>. For

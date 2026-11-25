@@ -869,6 +869,11 @@ MINI_OP(OP_WASM_JIT_NEWARR_FAST, "wasm_jit_newarr_fast", IREG, IREG, NONE)
 /* ... the current thread's static_data array, for a ThreadStatic field's address (MONO_WASM_JIT_TLS_SD, M9): dreg = the
  * array, through the per-thread cache threads.c keeps, else thread -> static_data. Not a reference (a fixed root). */
 MINI_OP(OP_WASM_JIT_TLS_STATIC_DATA, "wasm_jit_tls_static_data", IREG, NONE, NONE)
+/* ... MONO_WASM_JIT_SELECT (mini-wasm-ir.inc wj_select_run): dreg = the condition of the conditional branch whose opcode is
+ * inst_c0, as 0/1, consuming the preceding compare exactly as that branch would. */
+MINI_OP(OP_WASM_JIT_SETCC_BR, "wasm_jit_setcc_br", IREG, NONE, NONE)
+/* ... and dreg = sreg3 ? sreg1 : sreg2 (a wasm `select`; any one valtype, the dreg's). */
+MINI_OP3(OP_WASM_JIT_SELECT, "wasm_jit_select", IREG, IREG, IREG, IREG)
 MINI_OP(OP_WASM_SIMD_BITMASK, "wasm_bitmask", IREG, XREG, NONE)
 MINI_OP3(OP_WASM_BITSELECT, "wasm_bitselect", XREG, XREG, XREG, XREG)
 MINI_OP3(OP_WASM_SIMD_SHUFFLE, "wasm_shuffle", XREG, XREG, XREG, XREG)

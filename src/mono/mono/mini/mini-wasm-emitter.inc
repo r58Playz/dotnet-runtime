@@ -2418,6 +2418,18 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	gint64 wj_gen_t0 = G_UNLIKELY (mono_wasm_jit_stats) ? mono_100ns_ticks () : 0;
 	double wj_inst_ms = 0;
 	MonoMethodSignature *sig = mono_method_signature_internal (cfg->method);
+	/* MONO_WASM_JIT_SELECT: before next_vreg is read below, so its temps and conditions are ordinary vregs. S4 runs first
+	 * when it applies to this tier: it turns an arm's reload (javac's `c ? a.f : b.f` re-reads the field) into a move, which
+	 * is what makes the arm speculable; the S4 call further down is then skipped. */
+	gboolean wj_s4_early = FALSE;
+	{ extern int mono_wasm_jit_select, mono_wasm_jit_s4, mono_wasm_jit_s4_sel_lo;
+	  if (G_UNLIKELY (mono_wasm_jit_select) && ((mono_wasm_jit_select & 2) || cfg->wasm_jit_tier >= 2)) {
+		if (mono_wasm_jit_s4 && ((mono_wasm_jit_s4 & 2) || cfg->wasm_jit_tier >= 2) && mono_wasm_jit_s4_sel_lo < 0) {
+			wj_s4_run (cfg, NULL, (int) cfg->next_vreg, TRUE, TRUE);
+			wj_s4_early = TRUE;
+		}
+		wj_select_run (cfg);
+	  } }
 	int nvreg = cfg->next_vreg;
 	int nargs = sig->hasthis + sig->param_count;
 	WasmValtype *vt = (WasmValtype *) mono_mempool_alloc0 (cfg->mempool, sizeof (WasmValtype) * nvreg);
@@ -2893,8 +2905,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			WasmValtype rt;
 			if (ins->opcode == OP_RREM)
 				has_rrem = TRUE;
-			if (wj_ins_is_move (ins->opcode))
-				continue;
+			if (wj_ins_is_move (ins->opcode) || ins->opcode == OP_WASM_JIT_SELECT)
+				continue;   /* typed from their operands: the unification below */
 			rt = wasm_valtype_of_opcode (ins->opcode);
 			if (!rt && (ins->opcode == OP_CALL || ins->opcode == OP_FCALL || ins->opcode == OP_LCALL || ins->opcode == OP_RCALL
 					|| ins->opcode == OP_CALL_REG || ins->opcode == OP_FCALL_REG || ins->opcode == OP_LCALL_REG || ins->opcode == OP_RCALL_REG
@@ -3168,6 +3180,21 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
 				MONO_BB_FOR_EACH_INS (bb, ins) {
 					int s, d;
+					if (ins->opcode == OP_WASM_JIT_SELECT) {
+						/* MONO_WASM_JIT_SELECT: dreg, sreg1 and sreg2 are one valtype (sreg3 is the i32 condition) */
+						int sv [3] = { ins->dreg, ins->sreg1, ins->sreg2 }, q, known = 0;
+						for (q = 0; q < 3; ++q)
+							if (sv [q] < 0 || sv [q] >= nvreg) { fail = "select vreg"; fail_op = ins->opcode; goto done; }
+						for (q = 0; q < 3; ++q)
+							if (vt [sv [q]]) {
+								if (known && vt [sv [q]] != known) { fail = "select valtype conflict"; fail_op = ins->opcode; goto done; }
+								known = vt [sv [q]];
+							}
+						if (known)
+							for (q = 0; q < 3; ++q)
+								if (!vt [sv [q]]) { vt [sv [q]] = (WasmValtype) known; changed = TRUE; }
+						continue;
+					}
 					if (!wj_ins_is_move (ins->opcode))
 						continue;
 					s = ins->sreg1; d = ins->dreg;
@@ -3228,7 +3255,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
 	 * fps; the V8 source closes that question. */
 	{ extern int mono_wasm_jit_s4, mono_wasm_jit_s4_sel_lo, mono_wasm_jit_s4_sel_hi;   /* plan2x S4: BEFORE local coalescing, the ref classifier and SLOTLIVE -- it gives a cached value a new use, and
 	                    * an interval computed without it lets coalescing hand that value's local to another vreg (R432) */
-	  if (G_UNLIKELY (mono_wasm_jit_s4) && !fail && ((mono_wasm_jit_s4 & 2) || cfg->wasm_jit_tier >= 2)) {
+	  if (G_UNLIKELY (mono_wasm_jit_s4) && !fail && !wj_s4_early && ((mono_wasm_jit_s4 & 2) || cfg->wasm_jit_tier >= 2)) {
 		int s4h = mname ? (int) (g_str_hash (mname) % 4096) : 0;
 		if (mono_wasm_jit_s4_sel_lo < 0 || (s4h >= mono_wasm_jit_s4_sel_lo && s4h <= mono_wasm_jit_s4_sel_hi)) {
 			int s4n = wj_s4_run (cfg, mname, nvreg, TRUE, TRUE);
@@ -3835,6 +3862,9 @@ co_ranges_done:
 						def_nonref = TRUE;   /* plan2x F4: a vtable, see above */
 					else if (ins->opcode == OP_MOVE)
 						def_nonref = (ins->sreg1 >= 0 && ins->sreg1 < nvreg && nonref [ins->sreg1]);
+					else if (ins->opcode == OP_WASM_JIT_SELECT)   /* MONO_WASM_JIT_SELECT: either value may be the result */
+						def_nonref = (ins->sreg1 >= 0 && ins->sreg1 < nvreg && nonref [ins->sreg1])
+							&& (ins->sreg2 >= 0 && ins->sreg2 < nvreg && nonref [ins->sreg2]);
 					else if ((ins->opcode == OP_IADD || ins->opcode == OP_ISUB)
 							&& ins->type != STACK_OBJ && ins->type != STACK_MP)
 						/* pointer arithmetic (OP_PADD/OP_PSUB alias these on wasm32): the result of
@@ -8093,6 +8123,86 @@ co_ranges_done:
 				terminated = TRUE;
 				break;
 			}
+			case OP_WASM_JIT_SETCC_BR: {
+				/* MONO_WASM_JIT_SELECT: dreg = the condition of the branch opcode in inst_c0, consuming the preceding
+				 * compare exactly as the OP_IB / OP_LB / OP_FB / OP_RB cases above do (same operand rules, same NaN
+				 * handling for the _UN float forms). */
+				int bop = (int) ins->inst_c0;
+				if (cmp_a < 0) { fail = "select setcc without compare"; goto done; }
+				switch (bop) {
+				case OP_FBEQ: case OP_RBEQ: case OP_FBNE_UN: case OP_RBNE_UN: case OP_FBLT: case OP_RBLT: case OP_FBLT_UN: case OP_RBLT_UN:
+				case OP_FBGT: case OP_RBGT: case OP_FBGT_UN: case OP_RBGT_UN: case OP_FBLE: case OP_RBLE: case OP_FBLE_UN: case OP_RBLE_UN:
+				case OP_FBGE: case OP_RBGE: case OP_FBGE_UN: case OP_RBGE_UN: {
+					int kind, neg = 0;
+					if (cmp_float == 0) { fail = "select float setcc without fcompare"; goto done; }
+					switch (bop) {
+					case OP_FBEQ: case OP_RBEQ:       kind = 0; break;
+					case OP_FBNE_UN: case OP_RBNE_UN: kind = 1; break;
+					case OP_FBLT: case OP_RBLT:       kind = 2; break;
+					case OP_FBGT: case OP_RBGT:       kind = 3; break;
+					case OP_FBLE: case OP_RBLE:       kind = 4; break;
+					case OP_FBGE: case OP_RBGE:       kind = 5; break;
+					case OP_FBLT_UN: case OP_RBLT_UN: kind = 5; neg = 1; break; /* !(a>=b) */
+					case OP_FBGT_UN: case OP_RBGT_UN: kind = 4; neg = 1; break; /* !(a<=b) */
+					case OP_FBLE_UN: case OP_RBLE_UN: kind = 3; neg = 1; break; /* !(a>b) */
+					default:                          kind = 2; neg = 1; break; /* (F|R)BGE_UN: !(a<b) */
+					}
+					FCMP_PUSH (cmp_float == WASM_F32, kind, neg, cmp_a, cmp_b);
+					break;
+				}
+				case OP_LBEQ: case OP_LBNE_UN: case OP_LBLT: case OP_LBLT_UN: case OP_LBGT: case OP_LBGT_UN:
+				case OP_LBLE: case OP_LBLE_UN: case OP_LBGE: case OP_LBGE_UN: {
+					WasmOpcode w;
+					if (!cmp_i64 || cmp_float) { fail = "select long setcc without lcompare"; goto done; }
+					switch (bop) {
+					case OP_LBEQ: w = WASM_OP_I64_EQ; break;
+					case OP_LBNE_UN: w = WASM_OP_I64_NE; break;
+					case OP_LBLT: w = WASM_OP_I64_LT_S; break;
+					case OP_LBLT_UN: w = WASM_OP_I64_LT_U; break;
+					case OP_LBGT: w = WASM_OP_I64_GT_S; break;
+					case OP_LBGT_UN: w = WASM_OP_I64_GT_U; break;
+					case OP_LBLE: w = WASM_OP_I64_LE_S; break;
+					case OP_LBLE_UN: w = WASM_OP_I64_LE_U; break;
+					case OP_LBGE: w = WASM_OP_I64_GE_S; break;
+					default: w = WASM_OP_I64_GE_U; break;
+					}
+					if (!wasm_ld (&body, &lc, cmp_a)) { fail = "select lcmp a"; goto done; }
+					if (cmp_imm_mode) wasm_i64_const (&body, cmp_imm64);
+					else if (!wasm_ld (&body, &lc, cmp_b)) { fail = "select lcmp b"; goto done; }
+					wasm_op (&body, w);
+					break;
+				}
+				default: {
+					WasmOpcode w;
+					if (cmp_i64 || cmp_float) { fail = "select int setcc on a long / float compare"; goto done; }
+					switch (bop) {
+					case OP_IBEQ: w = WASM_OP_I32_EQ; break;
+					case OP_IBNE_UN: w = WASM_OP_I32_NE; break;
+					case OP_IBLT: w = WASM_OP_I32_LT_S; break;
+					case OP_IBLT_UN: w = WASM_OP_I32_LT_U; break;
+					case OP_IBGT: w = WASM_OP_I32_GT_S; break;
+					case OP_IBGT_UN: w = WASM_OP_I32_GT_U; break;
+					case OP_IBLE: w = WASM_OP_I32_LE_S; break;
+					case OP_IBLE_UN: w = WASM_OP_I32_LE_U; break;
+					case OP_IBGE: w = WASM_OP_I32_GE_S; break;
+					case OP_IBGE_UN: w = WASM_OP_I32_GE_U; break;
+					default: fail = "select setcc branch opcode"; fail_op = bop; goto done;
+					}
+					if (!wasm_ld (&body, &lc, cmp_a)) { fail = "select cmp a"; goto done; }
+					if (cmp_imm_mode) wasm_i32_const (&body, cmp_imm);
+					else if (!wasm_ld (&body, &lc, cmp_b)) { fail = "select cmp b"; goto done; }
+					wasm_op (&body, w);
+					break;
+				}
+				}
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "select setcc dreg"; goto done; }
+				break;
+			}
+			case OP_WASM_JIT_SELECT:   /* MONO_WASM_JIT_SELECT: dreg = sreg3 ? sreg1 : sreg2 */
+				if (!wasm_ld (&body, &lc, ins->sreg1) || !wasm_ld (&body, &lc, ins->sreg2) || !wasm_ld (&body, &lc, ins->sreg3)) { fail = "select operand"; goto done; }
+				wasm_op (&body, WASM_OP_SELECT);
+				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "select dreg"; goto done; }
+				break;
 			case OP_ICEQ: case OP_ICNEQ: case OP_ICLT: case OP_ICLT_UN:
 			case OP_ICGT: case OP_ICGT_UN: case OP_ICLE: case OP_ICLE_UN:
 			case OP_ICGE: case OP_ICGE_UN: {

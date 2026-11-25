@@ -95,10 +95,20 @@ int64_t minipal_hires_tick_frequency(void)
     return tccSecondsToNanoSeconds;
 }
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
+
 int64_t minipal_hires_ticks(void)
 {
 #if HAVE_CLOCK_GETTIME_NSEC_NP
     return (int64_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#elif defined(__EMSCRIPTEN__)
+    // emscripten's clock_gettime(CLOCK_MONOTONIC) is WASI clock_time_get, which computes
+    // Math.round(emscripten_get_now() * 1e6) in JS and stores it through an i64 out-pointer.
+    // Reading the same clock directly gives the same value without that round trip
+    // (System.nanoTime under IKVM calls this on every Stopwatch.GetTimestamp).
+    return (int64_t)(emscripten_get_now() * (double)tccMilliSecondsToNanoSeconds + 0.5);
 #else
     struct timespec ts;
     int result;

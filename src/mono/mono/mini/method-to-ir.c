@@ -5592,6 +5592,31 @@ wj_il_is_call_free (const unsigned char *code, guint32 size)
  * unconditional transfer. Pure IL decoding, as wj_il_is_call_free: nothing here resolves a token. Anything
  * undecodable, out of range or longer than the scan bound answers the full size, i.e. changes nothing. */
 #define WJ_HOT_SCAN_MAX 1024
+/* MONO_WASM_JIT_INLINE_FWD (G6, findings M48): is this body only a forwarder -- `ldarg*; call|callvirt <m>; ret`? A wrapper,
+ * a bridge or an IKVM default-method forwarder (`ldarg*; call I::<default>m; ret`) has this shape; inlining one adds no code
+ * of its own, so it should not spend a level of the inline depth cap. Reads only the IL bytes. */
+static gboolean
+wj_il_is_forwarder (const unsigned char *code, guint32 size)
+{
+	guint32 i = 0;
+	if (!code)
+		return FALSE;
+	while (i < size) {
+		guint8 op = code [i];
+		if (op >= CEE_LDARG_0 && op <= CEE_LDARG_3)
+			i += 1;
+		else if (op == CEE_LDARG_S)
+			i += 2;
+		else if (op == CEE_PREFIX1 && i + 1 < size && code [i + 1] == (CEE_LDARG & 0xff))
+			i += 4;
+		else
+			break;
+	}
+	if (i + 6 != size || (code [i] != CEE_CALL && code [i] != CEE_CALLVIRT))
+		return FALSE;
+	return code [i + 5] == CEE_RET;
+}
+
 static guint32
 wj_il_hot_size (const unsigned char *code, guint32 size)
 {
@@ -6799,6 +6824,7 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	MonoMethodHeader *cheader;
 	MonoBasicBlock *ebblock, *sbblock;
 	int i, costs;
+	gboolean wj_fwd_skip = FALSE;
 	MonoInst **prev_locals, **prev_args;
 	MonoType **prev_arg_types;
 	guint prev_real_offset;
@@ -6922,7 +6948,17 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	prev_wasm_inline_im = cfg->wasm_cur_inline_im;
 
 	cfg->ret_var_set = FALSE;
-	cfg->inline_depth ++;
+#ifdef HOST_BROWSER
+	{ extern int mono_wasm_jit_inline_fwd;   /* MONO_WASM_JIT_INLINE_FWD: a forwarder takes no depth (bounded per stack) */
+	  wj_fwd_skip = COMPILE_WASM (cfg) && mono_wasm_jit_inline_fwd && cfg->wasm_inline_fwd_skips < mono_wasm_jit_inline_fwd &&
+		wj_il_is_forwarder (cheader->code, cheader->code_size); }
+#endif
+	if (wj_fwd_skip) {
+		cfg->wasm_inline_fwd_skips ++;
+		wj_p3_count (WJC_INLINE_FWD_SKIP);
+	} else {
+		cfg->inline_depth ++;
+	}
 	cfg->wasm_cur_inline_im = wj_inline_origin_imethod (cfg, cmethod);
 	/* plan2x S2: take the size gate's verdict for THIS site (it ran on this ip and callee, or it is stale), and give
 	 * the inlinee its context frequency; nested gates overwrite the cfg fields, so both live in locals here. */
@@ -7010,7 +7046,10 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
 	cfg->wasm_cur_inline_im = prev_wasm_inline_im;
 	cfg->wasm_s2_ctx = prev_s2_ctx;
 	cfg->wasm_eh_ctx = prev_eh_ctx;
-	cfg->inline_depth --;
+	if (wj_fwd_skip)
+		cfg->wasm_inline_fwd_skips --;
+	else
+		cfg->inline_depth --;
 
 	{ extern int mono_wasm_jit_s2_hot_cost;   /* plan2x S2: a hot site's cost cap, when it is the larger */
 	  s2_cap = COMPILE_WASM (cfg) && cfg->wasm_inline_cost_cap > 0 ? cfg->wasm_inline_cost_cap : 60;

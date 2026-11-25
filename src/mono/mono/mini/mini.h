@@ -1468,6 +1468,7 @@ typedef struct {
 	int              wasm_inline_limit;
 	int              wasm_inline_cost_cap;
 	int              wasm_inline_depth_cap;
+	int              wasm_inline_fwd_skips;   /* MONO_WASM_JIT_INLINE_FWD: forwarders on the inline stack that took no depth */
 	guint8           wasm_inline_allow_calls;
 	guint8           wasm_inline_used_calls;
 	guint8           wasm_jit_tier;          /* R316: 2 = tier-2 compile (policy below; no T2 sampling emitted) */

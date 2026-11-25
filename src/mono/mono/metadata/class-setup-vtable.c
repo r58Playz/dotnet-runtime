@@ -1004,6 +1004,7 @@ typedef struct _MonoChaRec {
 	MonoMethod *m;
 	volatile gint32 word;
 	struct _MonoChaRec *volatile next;
+	volatile gint32 *wordp;   /* &word, or a slot of the dense word arena (MONO_WASM_JIT_CHA_DENSE) */
 } MonoChaRec;
 
 #define CHA_BUCKETS 16384
@@ -1013,6 +1014,11 @@ static MonoChaRec *volatile cha_tab [CHA_BUCKETS];
 static pthread_mutex_t cha_mx = PTHREAD_MUTEX_INITIALIZER;
 static int cha_on = -1;
 static gint32 cha_nrec, cha_nmarked;
+/* MONO_WASM_JIT_CHA_DENSE (findings M53), read once: the words live in a dense arena of their own instead of inside their
+ * 12-byte records, so the words the JIT's guards read (handed out at JIT time, in compile order) share cache lines four to a
+ * record's one. A load-miss lever only: half of mctick's constant-address load misses are CHA guard words (M33). 0 = in the
+ * record. */
+static int cha_dense = -1;
 
 gboolean
 mono_class_cha_enabled (void)
@@ -1053,12 +1059,29 @@ cha_get (MonoMethod *m)
 		if (r->m == m)
 			break;
 	if (!r && cha_nrec < CHA_MAXREC) {
+		static volatile gint32 *warena;
+		static int wused = CHA_CHUNK * 4;
 		if (used == CHA_CHUNK) {
 			chunk = g_new0 (MonoChaRec, CHA_CHUNK);
 			used = 0;
 		}
 		r = &chunk [used++];
 		r->m = m;
+		if (G_UNLIKELY (cha_dense < 0)) {
+			char *v = g_getenv ("MONO_WASM_JIT_CHA_DENSE");
+			cha_dense = (v && *v && *v != '0') ? 1 : 0;
+			g_free (v);
+		}
+		if (cha_dense) {
+			/* never freed: emitted guards bake the word's address */
+			if (wused == CHA_CHUNK * 4) {
+				warena = g_new0 (gint32, CHA_CHUNK * 4);
+				wused = 0;
+			}
+			r->wordp = &warena [wused++];
+		} else {
+			r->wordp = &r->word;
+		}
 		r->next = cha_tab [h];
 		mono_memory_barrier ();
 		cha_tab [h] = r;
@@ -1076,7 +1099,7 @@ mono_class_cha_word (MonoMethod *m)
 	if (!m || !mono_class_cha_enabled ())
 		return NULL;
 	r = cha_get (m);
-	return r ? (gint32 *) &r->word : NULL;
+	return r ? (gint32 *) r->wordp : NULL;
 }
 
 void
@@ -1108,12 +1131,12 @@ cha_note_overrides (MonoClass *klass, MonoMethod **vtable)
 			g_warning ("MONO_WASM_JIT_S3: CHA table full -- every guard invalidated, recording is off");
 			for (b = 0; b < CHA_BUCKETS; ++b)
 				for (r = cha_tab [b]; r; r = r->next)
-					mono_atomic_store_i32 (&r->word, 1);
+					mono_atomic_store_i32 ((gint32 *) r->wordp, 1);
 			cha_on = 0;
 			return;
 		}
-		if (!r->word) {
-			mono_atomic_store_i32 (&r->word, 1);
+		if (!*r->wordp) {
+			mono_atomic_store_i32 ((gint32 *) r->wordp, 1);
 			mono_atomic_inc_i32 (&cha_nmarked);
 		}
 	}
