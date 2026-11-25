@@ -1947,11 +1947,14 @@ int mono_wasm_jit_b4_delay = 0;
 int mono_wasm_jit_b4_quiet = 5;
 int mono_wasm_jit_b4_quiet_win = 15000;
 /* MONO_WASM_JIT_B4_QUIET_SMALL=<bodies> (0 = off): while the edge-carrying tier holds fewer than this many bodies, a quiet
- * window is 250 samples, not 1000 and up. A short workload never got a second window: jbox2d's first closes ~5.5 s in at
- * "bodies 0 -> 56, GROWING" (growth from an empty tier always reads so) and the run ends before the next, so it framed no
- * group although its dry-run plan holds 97.9% of the edge weight in 7 groups (findings M25, M32); the game's tier is
- * thousands of bodies, past this bound. */
-int mono_wasm_jit_b4_quiet_small = 0;
+ * window is 250 samples, not 1000 and up, and is quiet only if the JIT registry also grew by at most 16 (mini-wasm-batching.inc
+ * wj_b4_delayed). A short workload never got a second window: jbox2d's first closes ~5.5 s in at "bodies 0 -> 56, GROWING"
+ * (growth from an empty tier always reads so) and the run ended before the next, so it framed no group although its dry-run
+ * plan holds 97.9% of the edge weight in 7 groups. Without the registry test a 26.2 boot's lull opened the gate at +8.6 s and
+ * framed 19 groups of boot code; with it the boot's windows read GROWING (registry +500 to +10,000 a window) and 262n frames
+ * nothing early (findings M37, M38). Measured (M4, one binary, d s s d d s s d, 2026-11-25): jbox2d 0.4257 -> 0.3993 ms/step
+ * (-6.2%, disjoint; 6 groups in one plan); mctick 3.699 -> 3.673 ms/tick (-0.7%, n=2). Default 128 since 2026-11-25. */
+int mono_wasm_jit_b4_quiet_small = 128;
 /* MONO_WASM_JIT_B4_SEED, a bit mask (2026-11-16, lever 7 of the levers3 round):
  *   1  the partition starts from the framed groups, each one set and frozen (wj_b4_partition), so a plan pairs fresh
  *      members with each other instead of spending a fresh callee on a framed caller the framing step will leave out;
