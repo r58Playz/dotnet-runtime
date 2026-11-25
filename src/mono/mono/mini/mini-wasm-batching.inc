@@ -1546,7 +1546,7 @@ static WjB4Group *wj_b4_pend;   /* the current plan's groups, framed one per vis
 static int wj_b4_npend, wj_b4_ipend;
 /* MONO_WASM_JIT_B4_QUIET's window: the planner clock and the tier's size at its start, and the last verdict (TRUE
  * until the first window closes: nothing is known yet). */
-static gint32 wj_b4_q_samples, wj_b4_q_bodies, wj_b4_q_windows;
+static gint32 wj_b4_q_samples, wj_b4_q_bodies, wj_b4_q_windows, wj_b4_q_reg;
 static gboolean wj_b4_noisy = TRUE;
 #define WJ_B4_QUIET_FLOOR 8
 /* MONO_WASM_JIT_B4_DELAY: nothing is planned or framed until that many seconds after the JIT came up.
@@ -1577,10 +1577,17 @@ wj_b4_delayed (void)
 			 * the next window and nothing was framed; a 26.2 boot's early windows add 19 and more). */
 			gboolean noisy = bd - wj_b4_q_bodies > WJ_B4_QUIET_FLOOR &&
 				(gint64) (bd - wj_b4_q_bodies) * 100 > (gint64) mono_wasm_jit_b4_quiet * MAX (wj_b4_q_bodies, 1);
+			/* A small tier's short window must also see the whole JIT quiet: a 26.2 boot has lulls in which its few
+			 * tier-2 bodies hold still (49 -> 56 over 250 samples) while it registers thousands of methods, and planning
+			 * there framed 19 groups of boot code (findings M38); a settled kernel registers nothing new. */
+			gint32 reg0 = wj_b4_q_reg;
+			if (win == 250 && wj_reg_n - reg0 > 2 * WJ_B4_QUIET_FLOOR)
+				noisy = TRUE;
+			wj_b4_q_reg = wj_reg_n;
 			if (G_UNLIKELY (mono_wasm_jit_stats) && (noisy != wj_b4_noisy || wj_b4_q_windows < 4 || (wj_b4_q_windows & 7) == 0))
-				printf ("[wasm-jit b4 quiet] +%.1fs window %d: bodies %d -> %d over %d samples (window of %d%s): %s (framed %lld)\n",
+				printf ("[wasm-jit b4 quiet] +%.1fs window %d: bodies %d -> %d, registry %d -> %d over %d samples (window of %d%s): %s (framed %lld)\n",
 					(double) (mono_msec_ticks () - mono_wasm_jit_start_ms) / 1000.0, wj_b4_q_windows, wj_b4_q_bodies, bd,
-					s - wj_b4_q_samples, win, win == 250 && mono_wasm_jit_b4_quiet_small > 0 ? ", small tier" : "",
+					reg0, (int) wj_reg_n, s - wj_b4_q_samples, win, win == 250 && mono_wasm_jit_b4_quiet_small > 0 ? ", small tier" : "",
 					noisy ? "GROWING, B4 holds" : "quiet", (long long) mono_wasm_jit_counters [WJC_B4_FRAMED]);
 			wj_b4_noisy = noisy; wj_b4_q_samples = s; wj_b4_q_bodies = bd; wj_b4_q_windows++;
 		}
