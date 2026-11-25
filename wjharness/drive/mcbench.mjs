@@ -15,7 +15,7 @@
 //
 // Usage:
 //   wj mcbench [--runs 1] [--bench-ms 60000] [--no-walk] [--headed]
-//                                  [--knob name=value ...] [--tag NAME] [--stats] [--gclog] [--force]
+//                                  [--knob name=value ...] [--tag NAME] [--stats] [--gclog] [--force] [--xcprof]
 //
 // Examples:
 //   wj mcbench --tag base
@@ -161,6 +161,9 @@ for (let i = 1; i <= RUNS; i++) {
                             * OPFS write path were outside every number this project ever took. It happens
                             * AFTER the measurement window, so it cannot affect the in-game figures. */
                            saveQuit: !has("no-save-quit"),
+                           /* --xcprof (darwin): Time Profiler over the in-game window, every renderer thread, + V8's perf map */
+                           xcprof: has("xcprof") ? join(OUT, `xcprof-${name}`) : null,
+                           jsFlags: has("xcprof") ? "--perf-basic-prof" : null,
                            extraArgs: has("verbose-console") ? ["--v=1"] : [] });
   } catch (e) {
     console.log(`  !! run threw: ${e && e.message}`);

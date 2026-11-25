@@ -490,6 +490,39 @@ const SANDBOXED_RENDERER_LIMIT = 8 * 1024 ** 3;
 
 /* The renderer is the process under this profile with the most threads -- the browser process also
  * matches the profile path on its own cmdline, and picking it would measure the wrong thing. */
+/* darwin: the renderer of this profile's browser with the most CPU (ps; no procfs). */
+function findRendererPidPs (profile) {
+  try {
+    const rows = execSync("ps -Ao pid=,pcpu=,command=", { encoding: "utf8", maxBuffer: 1 << 26 }).split("\n")
+      .map((l) => l.trim().match(/^(\d+)\s+([\d.]+)\s+(.*)$/)).filter(Boolean)
+      .filter((m) => m[3].includes("--type=renderer") && m[3].includes(profile))
+      .sort((a, b) => Number(b[2]) - Number(a[2]));
+    return rows.length ? Number(rows[0][1]) : null;
+  } catch { return null; }
+}
+
+/* An Instruments Time Profiler capture of the renderer over the in-game window (runSession's `xcprof`). */
+function startXcprof (profile, dir, log) {
+  const pid = findRendererPid(profile) ?? findRendererPidPs(profile);
+  if (!pid) { log("  xcprof: no renderer found"); return null; }
+  mkdirSync(dir, { recursive: true });
+  const out = join(dir, "profile.trace");
+  const p = spawn("xcrun", ["xctrace", "record", "--template", "Time Profiler", "--attach", String(pid), "--output", out, "--no-prompt"],
+    { stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const st = { p, pid, out, exited: false };
+  p.on("exit", () => { st.exited = true; });
+  log(`  xcprof: Time Profiler attached to renderer ${pid} -> ${out}`);
+  return st;
+}
+async function stopXcprof (st, dir, log) {
+  try { st.p.kill("SIGINT"); } catch { }
+  for (let i = 0; i < 1200 && !st.exited; i++) await new Promise((r) => setTimeout(r, 100));   /* saving a capture takes a while */
+  if (!st.exited) { try { process.kill(-st.p.pid, "SIGKILL"); } catch { } }
+  const pm = `/tmp/perf-${st.pid}.map`;
+  try { if (existsSync(pm)) execSync(`cp ${JSON.stringify(pm)} ${JSON.stringify(join(dir, "perf.map"))}`); } catch { }
+  log(`  xcprof: saved ${st.out}${existsSync(join(dir, "perf.map")) ? " + perf.map" : " (no perf map: pass --perf-basic-prof)"}`);
+}
+
 function findRendererPid (profile) {
   let best = null, bestN = 0;
   if (!existsSync("/proc")) return null;   /* darwin: no procfs; the memory sampler reports nothing */
@@ -2374,6 +2407,9 @@ export async function runSession ({
    * page -- guarded here, so the cost of leaving them on is a lost dump, not a lost run -- and because
    * they print thousands of lines through log.ts's DOM proxy right at the window boundary. */
   dumps = false,
+  /* darwin: a directory for an Instruments Time Profiler capture of the renderer over the in-game window (profile.trace,
+   * every thread) plus V8's perf map (perf.map, needs --perf-basic-prof in jsFlags); read with fe/xcprof.py --thread. null = none. */
+  xcprof = null,
   /* Seconds of TOTAL log silence that means the runtime wedged. 90s is comfortably above the longest
    * legitimate gap in a healthy boot or world load (chunk-gen percentage lines, class-loader lines and
    * chromium's own GL messages all keep it well under 30s) and well below the 420/480s budgets. */
@@ -3229,7 +3265,10 @@ export async function runSession ({
     /* +warmMs: the START marker is emitted AFTER the warm-up hold, so this wait has to cover the hold or it
      * times out before the window it is waiting for can possibly open. Cost three runs when warmMs landed. */
     if (!await waitFor("benchStart", 30 + Math.ceil(warmMs / 1000), "bench window open")) return finish();
-    if (!await waitFor("benchEnd", Math.ceil((benchMs + warmMs) / 1000) + 180, "bench window close")) return finish();
+    const xc = xcprof ? startXcprof(profile, xcprof, log) : null;
+    const windowOk = await waitFor("benchEnd", Math.ceil((benchMs + warmMs) / 1000) + 180, "bench window close");
+    if (xc) await stopXcprof(xc, xcprof, log);
+    if (!windowOk) return finish();
     hooks.onPhase?.({ name: "ingame", t0: marks.get("benchStart"), t1: marks.get("benchEnd") });
     threadWatch?.stop();   // before Save and Quit: a quitting server goes idle legitimately
     // The summary is printed right after the marker; give the tail a moment to see all of it.
