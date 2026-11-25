@@ -1611,6 +1611,8 @@ enum {
 	WJC_ARRAYCOPY_SITES,         /* MONO_WASM_JIT_ARRAYCOPY: ByteCodeHelper.arraycopy calls given the C copy first (compile time) */
 	WJC_ARRAYCOPY_FAST,          /* ... copies the C helper did (run time) */
 	WJC_ARRAYCOPY_DECLINED,      /* ... copies it handed back to IKVM's own (run time) */
+	WJC_S4_MEET,                 /* MONO_WASM_JIT_S4 & 4: joins that started with entries every predecessor held */
+	WJC_S4_CKEY,                 /* ... S4 & 8: rewrites whose entry came through another vreg holding the same constant */
 	WJC_MAX
 };
 

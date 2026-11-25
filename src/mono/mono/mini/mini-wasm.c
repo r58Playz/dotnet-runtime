@@ -1477,7 +1477,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_s2_cold, "MONO_WASM_JIT_S2_COLD", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_s2_bb, "MONO_WASM_JIT_S2_BB", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_s3, "MONO_WASM_JIT_S3", 0, 31)
-	WJ_T2_KNOB (mono_wasm_jit_s4, "MONO_WASM_JIT_S4", 0, 3)
+	WJ_T2_KNOB (mono_wasm_jit_s4, "MONO_WASM_JIT_S4", 0, 15)
 	WJ_T2_KNOB (mono_wasm_jit_t2_strict, "MONO_WASM_JIT_T2_STRICT", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_strict_limit, "MONO_WASM_JIT_T2_STRICT_LIMIT", 1, 1000)
 	{ extern void mono_wasm_jit_s2_init (void); mono_wasm_jit_s2_init (); }
@@ -1893,7 +1893,10 @@ int mono_wasm_jit_t2_strict_limit = 20;   /* MONO_WASM_JIT_T2_STRICT_LIMIT: IL b
 /* MONO_WASM_JIT_S4 (plan2x S4), a bit mask: 1 = rewrite the loads the S4 census proves redundant within an extended
  * basic block into moves, in tier-2 compiles; 2 = in tier-1 compiles too. See wj_s4_run (mini-wasm-ir.inc). It must run
  * before local coalescing (R433: after it, a rewritten load could read another vreg's local). jbox2d -1.3 to -1.7%,
- * overlapping (R433); on Minecraft ~6,450 loads rewritten in ~960 tier-2 compiles per run, three clean runs (R433, R439). */
+ * overlapping (R433); on Minecraft ~6,450 loads rewritten in ~960 tier-2 compiles per run, three clean runs (R433, R439).
+ * 4 = a join whose predecessors are all processed starts from the entries every predecessor holds (without it a join
+ * starts empty, so each guard diamond resets the table); 8 = a constant base (a CHA word, a static) matches another
+ * vreg holding the same constant. Bits 4 and 8 are unmeasured (2026-11-25). Default 1. */
 int mono_wasm_jit_s4 = 1;
 /* MONO_WASM_JIT_S4_SEL="lo-hi" (diagnostic, R432): S4 applies only to methods whose full-name hash (g_str_hash % 4096)
  * lies in [lo, hi], and every compile it rewrote prints WASM_JIT_S4_APPLIED <tier> <loads> <hash> <method>. For

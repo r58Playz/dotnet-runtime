@@ -1092,7 +1092,9 @@ wj_s4_is_load (int op)
 	}
 }
 enum { WJ_S4_UNK = 0, WJ_S4_OBJ = 1, WJ_S4_VT = 2, WJ_S4_KLASS = 3, WJ_S4_CONST = 4 };
-typedef struct { gint32 op, base, off, val; guint8 inv, cls; } WjS4Ent;
+/* ck: the base is a constant-address vreg keyed by its value cv (S4 & 8), so another vreg holding the same constant
+ * matches the entry; set only for a vreg with exactly one def, a PCONST / ICONST, that is not a variable. */
+typedef struct { gint32 op, base, off, val; guint8 inv, cls, ck; gssize cv; } WjS4Ent;
 #define WJ_S4_ENTS 64
 typedef struct { WjS4Ent e [WJ_S4_ENTS]; int n; } WjS4Tab;
 typedef struct { const char *meth; gint32 il; gint32 op; gint32 n, rem, hoist; guint8 mask; } WjS4Row;
@@ -1120,7 +1122,7 @@ wj_s4_invariant (const guint8 *cls, int base, gint32 off)
 	return FALSE;
 }
 static void
-wj_s4_kill_store (WjS4Tab *t, const guint8 *cls, int base, gint32 off, int sz)
+wj_s4_kill_store (WjS4Tab *t, const guint8 *cls, int base, gint32 off, int sz, gboolean keyed, gboolean sck, gssize scv)
 {
 	int i, j = 0;
 	gboolean objbase = cls [base] == WJ_S4_OBJ, constbase = cls [base] == WJ_S4_CONST;
@@ -1135,8 +1137,12 @@ wj_s4_kill_store (WjS4Tab *t, const guint8 *cls, int base, gint32 off, int sz)
 			kill = TRUE;                                   /* a store through a derived pointer can hit any field */
 		else if (objbase)
 			kill = e->cls == 1 && e->off < off + sz && off < e->off + wj_s4_size (e->op);
-		else
+		else if (!keyed)
 			kill = e->cls == 4 && e->base == base && e->off < off + sz && off < e->off + wj_s4_size (e->op);
+		else if (sck && e->ck)   /* S4 & 8: both addresses are known; kill on overlap of the absolute ranges */
+			kill = e->cls == 4 && e->cv + e->off < scv + off + sz && scv + off < e->cv + e->off + wj_s4_size (e->op);
+		else
+			kill = e->cls == 4;   /* S4 & 8 with an unknown constant on either side: any constant address may alias */
 		if (!kill)
 			t->e [j++] = *e;
 	}
@@ -1196,6 +1202,10 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 	int *order;
 	WjS4Row *rows;
 	gint64 tl = 0, tr = 0, th = 0;
+	extern int mono_wasm_jit_s4;
+	gboolean s4_meet = (mono_wasm_jit_s4 & 4) != 0, s4_ckey = (mono_wasm_jit_s4 & 8) != 0;
+	guint8 *kc = NULL;   /* S4 & 8: kc [v] = v is a constant base keyed by its value kv [v] */
+	gssize *kv = NULL;
 	if (nvreg <= 0 || !cfg->header)
 		return 0;
 	cls = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
@@ -1236,6 +1246,26 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 					if (nv != cls [i]) { cls [i] = nv; changed = 1; }
 				}
 		}
+	}
+	if (s4_ckey) {
+		/* exactly one def, a PCONST / ICONST, and not a variable (whose value may also come from an argument or an
+		 * address taken elsewhere): every use then sees that one value */
+		guint8 *nd = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+		kc = (guint8 *) mono_mempool_alloc0 (cfg->mempool, (gsize) nvreg);
+		kv = (gssize *) mono_mempool_alloc0 (cfg->mempool, sizeof (gssize) * (gsize) nvreg);
+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
+			MONO_BB_FOR_EACH_INS (bb, ins) {
+				int d = ins->dreg;
+				if (d < 0 || d >= nvreg || MONO_IS_STORE_MEMBASE (ins))
+					continue;
+				if (nd [d] < 2) nd [d]++;
+				if (ins->opcode == OP_ICONST || ins->opcode == OP_PCONST)
+					kv [d] = (gssize) ins->inst_c0;
+				else
+					nd [d] = 2;
+			}
+		for (i = 0; i < nvreg; ++i)
+			kc [i] = cls [i] == WJ_S4_CONST && nd [i] == 1 && !get_vreg_to_inst (cfg, i);
 	}
 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
 		nbb = MAX (nbb, bb->block_num + 1);
@@ -1310,13 +1340,47 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 			*cur = exits [bb->in_bb [0]->block_num];
 		else
 			cur->n = 0;
+		/* S4 & 4: a join whose predecessors are all done starts from what EVERY one of them holds, under the same
+		 * entry (base, offset, opcode, and the same value vreg): on each incoming path that vreg holds the load. */
+		if (!inherit && s4_meet && bb->in_count >= 2 && !(bb->flags & BB_EXCEPTION_HANDLER)) {
+			int p, ok = 1;
+			for (p = 0; p < bb->in_count && ok; ++p) {
+				MonoBasicBlock *pb = bb->in_bb [p];
+				ok = pb && pb->block_num < nbb && order [pb->block_num] >= 0 && order [pb->block_num] < order [bb->block_num];
+			}
+			if (ok) {
+				*cur = exits [bb->in_bb [0]->block_num];
+				for (p = 1; p < bb->in_count && cur->n; ++p) {
+					const WjS4Tab *o = &exits [bb->in_bb [p]->block_num];
+					int q, r, j = 0;
+					for (q = 0; q < cur->n; ++q) {
+						WjS4Ent *e = &cur->e [q];
+						for (r = 0; r < o->n; ++r) {
+							const WjS4Ent *f = &o->e [r];
+							if (f->op == e->op && f->base == e->base && f->off == e->off && f->val == e->val)
+								break;
+						}
+						if (r < o->n) {
+							e->inv = e->inv && o->e [r].inv;
+							cur->e [j++] = *e;
+						}
+					}
+					cur->n = j;
+				}
+				if (apply && cur->n)
+					wj_count (WJC_S4_MEET);
+			}
+		}
 		MONO_BB_FOR_EACH_INS (bb, ins) {
 			int hit = 0, hoist = 0;
 			if (wj_s4_is_load (ins->opcode) && ins->sreg1 >= 0 && ins->sreg1 < nvreg && !(ins->flags & MONO_INST_VOLATILE)) {
 				int b = ins->sreg1, k;
 				guint8 ec = wj_s4_entcls (cls, b, (gint32) ins->inst_offset);
+				gboolean lck = kc && kc [b];
+				gssize lcv = lck ? kv [b] : 0;
 				for (k = 0; k < cur->n; ++k)
-					if (cur->e [k].op == ins->opcode && cur->e [k].base == b && cur->e [k].off == (gint32) ins->inst_offset) { hit = 1; break; }
+					if (cur->e [k].op == ins->opcode && cur->e [k].off == (gint32) ins->inst_offset &&
+					    (cur->e [k].base == b || (lck && cur->e [k].ck && cur->e [k].cv == lcv))) { hit = 1; break; }
 				/* LICM: against the precomputed summary of bb's innermost natural loop */
 				if (!hit && inner && bb->block_num < nbb && inner [bb->block_num] >= 0) {
 					WjS4Loop *L = &loops [inner [bb->block_num]];
@@ -1372,6 +1436,8 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 						ins->inst_offset = 0;
 						ins->flags &= ~MONO_INST_FAULT;   /* the first load of this base already null-checked it */
 						wj_count (WJC_S4_REWRITTEN);
+						if (cur->e [k].base != b)
+							wj_count (WJC_S4_CKEY);
 					}
 				}
 				/* the def kills, then the load becomes available */
@@ -1381,6 +1447,7 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 					if (cur->n == WJ_S4_ENTS) { memmove (&cur->e [0], &cur->e [1], sizeof (WjS4Ent) * (WJ_S4_ENTS - 1)); cur->n--; }
 					e = &cur->e [cur->n++];
 					e->op = ins->opcode; e->base = b; e->off = (gint32) ins->inst_offset; e->val = ins->dreg;
+					e->ck = lck; e->cv = lcv;
 					e->inv = apply ? wj_s4_invariant_strict (cls, b, (gint32) ins->inst_offset) : wj_s4_invariant (cls, b, (gint32) ins->inst_offset);
 					e->cls = ec;
 				}
@@ -1389,7 +1456,7 @@ wj_s4_run (MonoCompile *cfg, const char *mname, int nvreg, gboolean apply, gbool
 			if (MONO_IS_STORE_MEMBASE (ins)) {
 				int sb = ins->dreg;
 				if (sb >= 0 && sb < nvreg)
-					wj_s4_kill_store (cur, cls, sb, (gint32) ins->inst_offset, wj_s4_size (ins->opcode));
+					wj_s4_kill_store (cur, cls, sb, (gint32) ins->inst_offset, wj_s4_size (ins->opcode), s4_ckey, kc && kc [sb], kc ? kv [sb] : 0);
 				else
 					wj_s4_kill_all (cur);
 				continue;   /* a store's dreg is its base, not a def */
