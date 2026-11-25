@@ -1099,19 +1099,52 @@ wj_iroute_note (InterpMethod *im)
 #define WJ_PROMOTE_Q 256
 static MonoMethod * volatile wj_promote_q [WJ_PROMOTE_Q];
 static volatile gint32 wj_promote_head, wj_promote_tail;
+/* One try-lock word guards head, tail and the slots. Pushers on every thread and drainers at every safe point used to
+ * update head and tail with plain stores, and a stale store could leave head past tail: every push then scanned from
+ * head to tail the long way round, ~2^32 slots with no safepoint poll, the GC's stop-the-world waited seconds for
+ * those threads, and the drainers walked head further past tail (M45: the 262n game's slow mode, 3 of 4 runs). The
+ * queue is best effort, so a push or a pop that finds the word taken gives up (WJC_PROMOTE_CONTENDED) and never
+ * spins; WJC_PROMOTE_INVERTED counts a head/tail pair found more than a queue apart and must read 0. */
+static volatile gint32 wj_promote_lock;
+
+static inline gboolean
+wj_promote_trylock (void)
+{
+	if (wj_promote_lock || mono_atomic_cas_i32 (&wj_promote_lock, 1, 0) != 0) {
+		mono_wasm_jit_counters [WJC_PROMOTE_CONTENDED]++;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* Under the lock: head and tail no more than a queue apart, else resynchronised (empty). */
+static inline gint32
+wj_promote_head_checked (gint32 t)
+{
+	gint32 h = wj_promote_head;
+	if ((guint32) (t - h) > WJ_PROMOTE_Q) {
+		mono_wasm_jit_counters [WJC_PROMOTE_INVERTED]++;
+		wj_promote_head = h = t;
+	}
+	return h;
+}
 
 static void
 wj_promote_push (MonoMethod *m)
 {
-	gint32 h = wj_promote_head;
-	gint32 t = wj_promote_tail;
-	gint32 i;
+	gint32 h, t, i;
+	if (!wj_promote_trylock ())
+		return;
+	t = wj_promote_tail;
+	h = wj_promote_head_checked (t);
 	for (i = h; i != t; ++i)
 		if (wj_promote_q [i & (WJ_PROMOTE_Q - 1)] == m)
-			return;   /* already queued */
-	if (t - wj_promote_head >= WJ_PROMOTE_Q) return;   /* full: drop */
-	wj_promote_q [t & (WJ_PROMOTE_Q - 1)] = m;
-	wj_promote_tail = t + 1;
+			break;   /* already queued */
+	if (i == t && t - h < WJ_PROMOTE_Q) {   /* else full: drop */
+		wj_promote_q [t & (WJ_PROMOTE_Q - 1)] = m;
+		wj_promote_tail = t + 1;
+	}
+	mono_atomic_store_release (&wj_promote_lock, 0);
 }
 
 /* --- RE-EMISSION IS DELETED. Its ring, pin, drain, four knobs and thirteen counters lived here. ------
@@ -5290,13 +5323,21 @@ wasm_jit_drain_promotions (void)
 	if (mono_wasm_jit_auto <= 0 || wj_promote_head == wj_promote_tail)
 		return;
 	for (n = 0; n < mono_wasm_jit_promotion_drain; ++n) {
-		gint32 h = wj_promote_head;
+		gint32 h, t;
 		MonoMethod *pm;
 		InterpMethod *pim;
 		int budget;
-		if (h == wj_promote_tail) break;
+		if (!wj_promote_trylock ())
+			break;
+		t = wj_promote_tail;
+		h = wj_promote_head_checked (t);
+		if (h == t) {
+			mono_atomic_store_release (&wj_promote_lock, 0);
+			break;
+		}
 		pm = wj_promote_q [h & (WJ_PROMOTE_Q - 1)];
 		wj_promote_head = h + 1;
+		mono_atomic_store_release (&wj_promote_lock, 0);
 		if (!pm) continue;
 		pim = mono_interp_get_imethod (pm);
 		if (pim->wasm_jit_fslot > 0 || pim->wasm_jit_slot == -1) continue;   /* already done / hopeless */

@@ -1613,6 +1613,8 @@ enum {
 	WJC_ARRAYCOPY_DECLINED,      /* ... copies it handed back to IKVM's own (run time) */
 	WJC_S4_MEET,                 /* MONO_WASM_JIT_S4 & 4: joins that started with entries every predecessor held */
 	WJC_S4_CKEY,                 /* ... S4 & 8: rewrites whose entry came through another vreg holding the same constant */
+	WJC_PROMOTE_CONTENDED,       /* Lever A's promotion queue: a push or a pop that found the lock taken and gave up (M45) */
+	WJC_PROMOTE_INVERTED,        /* ... head and tail found more than a queue apart and resynchronised: must read 0 (M45) */
 	WJC_MAX
 };
 
