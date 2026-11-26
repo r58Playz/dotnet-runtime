@@ -1287,7 +1287,36 @@ wj_sel_arm_kind (MonoInst *ins)
  * redundant (S4 turns an arm's reload into a move, and local cprop hands the check the original vreg), so the arm
  * may still be speculated and the check dropped with it. */
 #define WJ_SEL_NN 32
-typedef struct { int v [WJ_SEL_NN]; int n; } WjSelNN;
+#define WJ_SEL_LD 16
+/* NN also carries copy aliases (a vreg MOVEd from another) and the loads available since the block's last memory clobber, so an
+ * arm's re-read of a field (javac's `c ? a.f.x : b.f.x` re-reads in each arm; S4 turns the `a.f` re-read into a move, and the
+ * `.x` load then sits on the copy) counts as a move from the value the branch block already loaded. */
+typedef struct {
+	int v [WJ_SEL_NN]; int n;
+	int al_from [WJ_SEL_NN], al_to [WJ_SEL_NN]; int nal;
+	int ld_op [WJ_SEL_LD], ld_base [WJ_SEL_LD], ld_val [WJ_SEL_LD]; gint32 ld_off [WJ_SEL_LD]; int nld;
+} WjSelNN;
+static int
+wj_sel_resolve (const WjSelNN *nn, int v)
+{
+	int i, guard = 0;
+	for (i = nn->nal - 1; i >= 0 && guard < WJ_SEL_NN; --i)
+		if (nn->al_from [i] == v) { v = nn->al_to [i]; i = nn->nal; guard++; }
+	return v;
+}
+/* the value vreg of an available load matching INS (same opcode, offset, and base through copies), or -1 */
+static int
+wj_sel_ld_find (const WjSelNN *nn, MonoInst *ins)
+{
+	int i, b;
+	if (!wj_s4_is_load (ins->opcode) || ins->sreg1 < 0 || (ins->flags & MONO_INST_VOLATILE))
+		return -1;
+	b = wj_sel_resolve (nn, ins->sreg1);
+	for (i = nn->nld - 1; i >= 0; --i)
+		if (nn->ld_op [i] == ins->opcode && nn->ld_off [i] == (gint32) ins->inst_offset && nn->ld_base [i] == b)
+			return nn->ld_val [i];
+	return -1;
+}
 static gboolean
 wj_sel_nn_has (const WjSelNN *nn, int v)
 {
@@ -1316,20 +1345,53 @@ wj_sel_is_null_check (MonoInst *ins)
 	return (ins->opcode == OP_COMPARE_IMM || ins->opcode == OP_ICOMPARE_IMM) && ins->inst_imm == 0 && ins->next &&
 		(ins->next->opcode == OP_COND_EXC_EQ || ins->next->opcode == OP_COND_EXC_IEQ);
 }
-/* Update NN across one instruction (FALSE: not a shape this tracks, nothing changed but a def's kill). */
+/* Update NN across one instruction. */
 static void
 wj_sel_nn_step (WjSelNN *nn, MonoInst *ins)
 {
+	int d = ins->dreg, i, j, src = -1;
 	if (wj_sel_is_null_check (ins) || ins->opcode == OP_NOT_NULL) {
 		wj_sel_nn_add (nn, ins->sreg1);
 		return;
 	}
-	if (ins->dreg < 0 || MONO_IS_STORE_MEMBASE (ins))
+	if (MONO_IS_COND_EXC (ins))
 		return;
-	if (ins->opcode == OP_MOVE && wj_sel_nn_has (nn, ins->sreg1))
-		wj_sel_nn_add (nn, ins->dreg);
+	if (MONO_IS_STORE_MEMBASE (ins) || wj_ins_clobbers_mem (ins)) {
+		nn->nld = 0;   /* a store, call, atomic or barrier: no load stays available */
+		if (MONO_IS_STORE_MEMBASE (ins))
+			return;
+	}
+	if (d < 0)
+		return;
+	if (ins->opcode == OP_MOVE || ins->opcode == OP_LMOVE || ins->opcode == OP_FMOVE || ins->opcode == OP_RMOVE)
+		src = wj_sel_resolve (nn, ins->sreg1);
 	else
-		wj_sel_nn_kill (nn, ins->dreg);
+		src = wj_sel_ld_find (nn, ins);   /* a load the block already did: the same value */
+	/* the def kills what it overwrites */
+	wj_sel_nn_kill (nn, d);
+	for (i = j = 0; i < nn->nal; ++i)
+		if (nn->al_from [i] != d && nn->al_to [i] != d) { nn->al_from [j] = nn->al_from [i]; nn->al_to [j] = nn->al_to [i]; j++; }
+	nn->nal = j;
+	for (i = j = 0; i < nn->nld; ++i)
+		if (nn->ld_base [i] != d && nn->ld_val [i] != d) {
+			nn->ld_op [j] = nn->ld_op [i]; nn->ld_base [j] = nn->ld_base [i]; nn->ld_off [j] = nn->ld_off [i]; nn->ld_val [j] = nn->ld_val [i]; j++;
+		}
+	nn->nld = j;
+	if (src >= 0 && src != d) {
+		if (nn->nal < WJ_SEL_NN) { nn->al_from [nn->nal] = d; nn->al_to [nn->nal] = src; nn->nal++; }
+		if (wj_sel_nn_has (nn, src))
+			wj_sel_nn_add (nn, d);
+		return;
+	}
+	if (wj_s4_is_load (ins->opcode) && ins->sreg1 >= 0 && ins->sreg1 != d && !(ins->flags & MONO_INST_VOLATILE)) {
+		if (nn->nld == WJ_SEL_LD) {
+			memmove (&nn->ld_op [0], &nn->ld_op [1], sizeof (int) * (WJ_SEL_LD - 1)); memmove (&nn->ld_base [0], &nn->ld_base [1], sizeof (int) * (WJ_SEL_LD - 1));
+			memmove (&nn->ld_off [0], &nn->ld_off [1], sizeof (gint32) * (WJ_SEL_LD - 1)); memmove (&nn->ld_val [0], &nn->ld_val [1], sizeof (int) * (WJ_SEL_LD - 1));
+			nn->nld--;
+		}
+		nn->ld_op [nn->nld] = ins->opcode; nn->ld_base [nn->nld] = wj_sel_resolve (nn, ins->sreg1);
+		nn->ld_off [nn->nld] = (gint32) ins->inst_offset; nn->ld_val [nn->nld] = d; nn->nld++;
+	}
 }
 /* An arm instruction that is a redundant null check against NN (the compare, its COND_EXC, or an OP_NOT_NULL). */
 static gboolean
@@ -1368,7 +1430,7 @@ wj_sel_arm_ok (MonoCompile *cfg, MonoBasicBlock *a, MonoBasicBlock *arm, int *no
 			continue;
 		if (ins->flags & MONO_INST_VOLATILE)
 			return NULL;
-		k = wj_sel_arm_kind (ins);
+		k = wj_sel_ld_find (&nn, ins) >= 0 ? 1 : wj_sel_arm_kind (ins);
 		if (!k || ins->dreg < 0)
 			return NULL;
 		if (k == 2 && ++n > WJ_SEL_MAX_ARM_OPS)
@@ -1399,10 +1461,11 @@ wj_sel_lookup (const WjSelMap *m, int n, int v)
 /* Simulate (APPLY = FALSE) or perform (APPLY = TRUE) one arm's renaming: moves forward their source, arithmetic writes a
  * fresh temp and is hoisted before INSERT_BEFORE in A. Returns the map's size, or -1 if it overflows. */
 static int
-wj_sel_rename_arm (MonoCompile *cfg, MonoBasicBlock *a, MonoInst *insert_before, MonoBasicBlock *arm, WjSelMap *m, gboolean apply)
+wj_sel_rename_arm (MonoCompile *cfg, MonoBasicBlock *a, MonoInst *insert_before, MonoBasicBlock *arm, WjSelMap *m, gboolean apply, const WjSelNN *nn_a)
 {
 	MonoInst *ins, *next;
 	int n = 0, tmpn = 0;
+	WjSelNN nn = *nn_a;
 	if (!arm)
 		return 0;
 	for (ins = arm->code; ins; ins = next) {
@@ -1413,8 +1476,16 @@ wj_sel_rename_arm (MonoCompile *cfg, MonoBasicBlock *a, MonoInst *insert_before,
 		/* the redundant null checks wj_sel_arm_ok admitted leave with the arm */
 		if (ins->opcode == OP_NOT_NULL || ins->opcode == OP_COND_EXC_EQ || ins->opcode == OP_COND_EXC_IEQ || wj_sel_is_null_check (ins))
 			continue;
-		k = wj_sel_arm_kind (ins);
-		d = ins->dreg;
+		{
+			int lv = wj_sel_ld_find (&nn, ins);   /* a load the branch block already did (wj_sel_arm_ok admitted it) */
+			k = lv >= 0 ? 3 : wj_sel_arm_kind (ins);
+			d = ins->dreg;
+			wj_sel_nn_step (&nn, ins);
+			if (k == 3) {
+				v = lv;   /* the A-end value: the match proves the arm has not redefined it */
+				goto mapped;
+			}
+		}
 		if (k == 1) {
 			v = wj_sel_lookup (m, n, ins->sreg1);
 		} else {
@@ -1433,6 +1504,7 @@ wj_sel_rename_arm (MonoCompile *cfg, MonoBasicBlock *a, MonoInst *insert_before,
 				v = -2 - tmpn++;   /* a placeholder: a temp is never one of the selected variables */
 			}
 		}
+mapped:
 		for (i = 0; i < n; ++i)
 			if (m [i].orig == d)
 				break;
@@ -1472,6 +1544,27 @@ wj_select_run (MonoCompile *cfg)
 	gboolean trace;
 	if (!trace_init) { trace_sub = g_getenv ("MONO_WASM_JIT_SELECT_TRACE"); trace_init = 1; }
 	trace = trace_sub && *trace_sub && cfg->method && cfg->method->name && strstr (cfg->method->name, trace_sub);
+	/* where each vreg is used: one block's number, -1 nowhere, -2 several. An arm's def that is not a variable and is used only
+	 * in that arm dies with it and needs no select (mono makes a vreg used in several blocks a variable; this checks it). */
+	int nv0 = (int) cfg->next_vreg;
+	int *use_bb = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (gsize) (nv0 > 0 ? nv0 : 1));
+	{
+		MonoBasicBlock *ub; MonoInst *ui;
+		int q;
+		for (q = 0; q < nv0; ++q)
+			use_bb [q] = -1;
+		for (ub = cfg->bb_entry; ub; ub = ub->next_bb)
+			MONO_BB_FOR_EACH_INS (ub, ui) {
+				int srcs [MONO_MAX_SRC_REGS], ns = mono_inst_get_src_registers (ui, srcs), r;
+				for (r = 0; r < ns; ++r) {
+					int v = srcs [r];
+					if (v < 0 || v >= nv0) continue;
+					use_bb [v] = use_bb [v] == -1 || use_bb [v] == ub->block_num ? ub->block_num : -2;
+				}
+				if (MONO_IS_STORE_MEMBASE (ui) && ui->dreg >= 0 && ui->dreg < nv0)   /* a store's dreg is its base, a use */
+					use_bb [ui->dreg] = use_bb [ui->dreg] == -1 || use_bb [ui->dreg] == ub->block_num ? ub->block_num : -2;
+			}
+	}
 #define WJ_SEL_TR(why) do { if (G_UNLIKELY (trace)) { \
 		printf ("WASM_JIT_SELECT_TRACE %s tier=%d BB%d %s: %s\n", cfg->method->name, cfg->wasm_jit_tier, a->block_num, wj_opname (br->opcode), (why)); \
 		wj_sel_trace_bb ("A", a); wj_sel_trace_bb ("T", br->inst_true_bb); wj_sel_trace_bb ("F", br->inst_false_bb); } } while (0)
@@ -1495,9 +1588,10 @@ wj_select_run (MonoCompile *cfg)
 		t = br->inst_true_bb; f = br->inst_false_bb;
 		if (!t || !f || t == f)
 			continue;
-		nn.n = 0;
+		nn.n = nn.nal = nn.nld = 0;
 		MONO_BB_FOR_EACH_INS (a, ins)
-			wj_sel_nn_step (&nn, ins);
+			if (ins != br && ins != cmp)
+				wj_sel_nn_step (&nn, ins);
 		jt = wj_sel_arm_ok (cfg, a, t, &ot, &nn);
 		jf = wj_sel_arm_ok (cfg, a, f, &of, &nn);
 		if (jt && jf && jt == jf) {
@@ -1519,8 +1613,8 @@ wj_select_run (MonoCompile *cfg)
 			continue;
 		}
 		/* dry run: the values, and the refusals that need them */
-		nt = wj_sel_rename_arm (cfg, a, cmp, t, mt, FALSE);
-		nf = wj_sel_rename_arm (cfg, a, cmp, f, mf, FALSE);
+		nt = wj_sel_rename_arm (cfg, a, cmp, t, mt, FALSE, &nn);
+		nf = wj_sel_rename_arm (cfg, a, cmp, f, mf, FALSE, &nn);
 		if (nt < 0 || nf < 0 || nt + nf == 0) {
 			WJ_SEL_TR ("no values");
 			mono_wasm_jit_counters [WJC_SELECT_REFUSED]++;
@@ -1528,6 +1622,9 @@ wj_select_run (MonoCompile *cfg)
 		}
 		for (i = 0; i < nt + nf; ++i) {
 			int d = i < nt ? mt [i].orig : mf [i - nt].orig;
+			MonoBasicBlock *darm = i < nt ? t : f;
+			if (d >= 0 && d < nv0 && !get_vreg_to_inst (cfg, d) && (use_bb [d] == -1 || use_bb [d] == darm->block_num))
+				continue;   /* arm-local: dies with the arm */
 			for (k = 0; k < nv; ++k)
 				if (vd [k] == d)
 					break;
@@ -1548,8 +1645,8 @@ wj_select_run (MonoCompile *cfg)
 				goto refuse;
 		}
 		/* apply */
-		nt = wj_sel_rename_arm (cfg, a, cmp, t, mt, TRUE);
-		nf = wj_sel_rename_arm (cfg, a, cmp, f, mf, TRUE);
+		nt = wj_sel_rename_arm (cfg, a, cmp, t, mt, TRUE, &nn);
+		nf = wj_sel_rename_arm (cfg, a, cmp, f, mf, TRUE, &nn);
 		for (k = 0; k < nv; ++k) {
 			vtv [k] = wj_sel_lookup (mt, nt, vd [k]);
 			vfv [k] = wj_sel_lookup (mf, nf, vd [k]);
@@ -1574,7 +1671,7 @@ wj_select_run (MonoCompile *cfg)
 			mono_bblock_insert_after_ins (a, ins, s);
 			ins = s;
 		}
-		WJ_SEL_TR ("converted");
+		WJ_SEL_TR ("converted (arm loads matched through copies)");
 		mono_wasm_jit_counters [WJC_SELECT_VALUES] += nv;
 		mono_wasm_jit_counters [tri ? WJC_SELECT_TRIANGLES : WJC_SELECT_DIAMONDS]++;
 		/* the branch becomes a jump to the join; the arms leave the CFG */

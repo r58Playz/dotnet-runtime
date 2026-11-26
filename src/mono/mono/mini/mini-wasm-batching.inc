@@ -2001,6 +2001,11 @@ wj_b4_hot_partition (int *out_ngroups, int *out_ndesc, int *out_nedges, int *out
 		gint32 h = wj_b4_hot (i, take);
 		if (!re || !re->body || re->e <= 0 || re->f <= 0 || wj_desc_for_fslot (re->f) != i || h <= 0)
 			continue;
+		/* MONO_WASM_JIT_B4_HOT_T2: tier-2 bodies only. A framed member never moves, so a tier-1 body packed here never gets the
+		 * tier-2 recompile that would inline its hot callees: B4_HOT's +11% on mctick was those callees as frames (M57). */
+		{ extern int mono_wasm_jit_b4_hot_t2;
+		  if (mono_wasm_jit_b4_hot_t2 && !((re->body_tier & 0x80) && (re->body_tier & 0x0f) >= 2 && !(re->body_tier & 0x10)))
+			continue; }
 		allheat += (guint64) h;
 		if (wj_b4_size (re) > mono_wasm_jit_b4_anchor)
 			continue;

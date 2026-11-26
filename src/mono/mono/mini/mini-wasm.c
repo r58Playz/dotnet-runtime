@@ -1437,7 +1437,7 @@ mono_wasm_jit_auto_init (void)
 	            b4 = g_getenv ("MONO_WASM_JIT_B4_COPY_MAX"); if (b4 && *b4) { int v = atoi (b4); if (v > 0) mono_wasm_jit_b4_copy_max = v; }
 	            { extern int mono_wasm_jit_b4_hot, mono_wasm_jit_b4_hot_delay;
 	              b4 = g_getenv ("MONO_WASM_JIT_B4_HOT"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_hot = v; }
-	              b4 = g_getenv ("MONO_WASM_JIT_B4_HOT_DELAY"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_hot_delay = v; } } } } } } } }
+	              b4 = g_getenv ("MONO_WASM_JIT_B4_HOT_DELAY"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) mono_wasm_jit_b4_hot_delay = v; } b4 = g_getenv ("MONO_WASM_JIT_B4_HOT_T2"); if (b4 && *b4) { int v = atoi (b4); if (v >= 0) { extern int mono_wasm_jit_b4_hot_t2; mono_wasm_jit_b4_hot_t2 = v; } } } } } } } } }
 	{ extern int mono_wasm_jit_bytes_check; const char *bc = g_getenv ("MONO_WASM_JIT_BYTES_CHECK");
 	  if (bc && *bc) mono_wasm_jit_bytes_check = atoi (bc) != 0; }
 	{ extern int mono_wasm_jit_rrem_inline; const char *rr = g_getenv ("MONO_WASM_JIT_RREM"); if (rr && *rr) mono_wasm_jit_rrem_inline = atoi (rr); }
@@ -1806,9 +1806,12 @@ int mono_wasm_jit_hash_inline = 1;
  * instructions into wasm `select`s in tier-2 compiles (wj_select_run, mini-wasm-ir.inc); 2 = in tier-1 compiles too; 4 =
  * diamonds only; 8 = float compares only; 16 = arms of moves only. V8 does not if-convert (on arm64 a wasm select is fcsel /
  * csel, the same if/else a branch), and jbox2d's mispredicts sit in such shapes (AABB.combine 19%, TimSort.binarySort 16% of
- * discarded samples, M48). Every shape at once (3, before S4 ran first) was 1.4% slower on jbox2d: most converted branches
- * were predictable, and combine was not converted (findings M50). 0 = off. */
-int mono_wasm_jit_select = 0;
+ * discarded samples, M48). Every shape at once (3) was 1.4% slower on jbox2d: most converted branches were predictable
+ * (findings M50). 31 = tiers 1 and 2, float-compare diamonds whose arms are moves (an arm's re-read of a field the branch block
+ * already loaded counts as a move, M55): jbox2d (R440 protocol, one binary, knob only, n=3 a side, 2026-11-25, findings M56)
+ * 0.3930 -> 0.3693 ms/step (-6.0%, disjoint; AABB.combine's four min/max become fcsel); mctick (goal protocol, n=4 a side)
+ * 3.676 -> 3.638 ms/tick (-1.0%, overlapping); 262n / 262u / mcsr mcbench verdict ok; 16-run mctick fault gate clean. 0 = off. */
+int mono_wasm_jit_select = 31;
 /* MONO_WASM_JIT_ARRAYCOPY: a call to IKVM.Runtime.ByteCodeHelper.arraycopy (System.arraycopy) calls
  * mono_wasm_jit_arraycopy first, which copies when both arrays have the same vtable (a vector: same type, so every element
  * is storable) and the bounds hold -- memmove, or the bulk ref copy + card marks -- and returns 0 otherwise, so IKVM's own
@@ -2024,6 +2027,8 @@ int mono_wasm_jit_b4_copy_max = 32;
  * Run it with B4_MERGE=1 (a member framed at compile time brings its siblings) and B4_PER_PLAN >= its group count. */
 int mono_wasm_jit_bytes_check = 0;   /* MONO_WASM_JIT_BYTES_CHECK, R462: see wj_bytes_check */
 int mono_wasm_jit_b4_hot = 0;
+/* MONO_WASM_JIT_B4_HOT_T2: B4_HOT takes tier-2 bodies only (not downgrade recompiles); see wj_b4_hot_partition. 0 = tier 1 too. */
+int mono_wasm_jit_b4_hot_t2 = 0;
 int mono_wasm_jit_b4_hot_delay = 250;
 gint64 mono_wasm_jit_start_ms;
 /* Safepoint samples taken inside tier-2 bodies, process-wide (interp.c mono_wasm_jit_t2_sample): the planner's clock. */
