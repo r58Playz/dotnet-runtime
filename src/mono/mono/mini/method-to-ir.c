@@ -875,9 +875,10 @@ mono_wasm_jit_dump_t2_refusals (int topn)
 		for (j = 0; j < WJ_T2R_N; ++j)
 			tot [j] += wj_t2r [k].n [j];
 	}
-	printf ("[wasm-jit t2 refused] %d callees, site refusals in tier-2 compiles: size %lld cost %lld abort %lld other %lld\n",
+	extern int mono_wasm_jit_t2_limit, mono_wasm_jit_t2_gi_size;
+	printf ("[wasm-jit t2 refused] %d callees, site refusals in tier-2 compiles: size %lld cost %lld abort %lld other %lld (limit %d, gi_size %d)\n",
 		distinct, (long long) tot [WJ_T2R_SIZE], (long long) tot [WJ_T2R_COST], (long long) tot [WJ_T2R_ABORT],
-		(long long) tot [WJ_T2R_OTHER]);
+		(long long) tot [WJ_T2R_OTHER], mono_wasm_jit_t2_limit, mono_wasm_jit_t2_gi_size);
 	while (shown < topn) {
 		int best = -1, bestn = 0;
 		for (k = 0; k < WJ_T2R_SLOTS; ++k) {

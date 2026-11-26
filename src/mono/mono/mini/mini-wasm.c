@@ -757,7 +757,10 @@ int mono_wasm_jit_t2_count = 200000;
 int mono_wasm_jit_t2_limit = 60;
 int mono_wasm_jit_t2_cost = 400;
 int mono_wasm_jit_t2_depth = 9;          /* MONO_WASM_JIT_T2_DEPTH: inline depth cap at tier 2 */
-int mono_wasm_jit_t2_gi_size = 120;      /* MONO_WASM_JIT_T2_GI_SIZE: guarded-inline size cap at tier 2 */
+/* MONO_WASM_JIT_T2_GI_SIZE: guarded-inline IL-size cap at tier 2. 200 against 120 on jbox2d (R440 protocol, M4, one
+ * binary, 2026-11-26, findings M60/M61): 0.3428 against 0.3576 ms/step (n=2 a side, d g g d; with T2_LIMIT=120 too,
+ * -4.0% n=3 disjoint, while T2_LIMIT alone moves nothing). mctick flat (-0.4%, n=3, with T2_LIMIT=120). */
+int mono_wasm_jit_t2_gi_size = 200;
 /* MONO_WASM_JIT_PROF_ORIGIN (R316b, plan Phase 3.5): the emitter's devirt / delegate / IC-width reads at a call site
  * that came from an inlinee ask the INLINEE's record first, then the compiled method's. Affects only compiles under
  * the per-compile inline policy (tier 2, INLINE_CALLS); a tier-1 inlinee has no call sites to read for. */
