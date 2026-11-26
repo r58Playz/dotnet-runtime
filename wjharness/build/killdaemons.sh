@@ -20,6 +20,7 @@ for i in 1 2 3 4 5; do
   for p in $(pgrep -f 'BCSCompiler|MSBuild\.dll' 2>/dev/null); do
     [ "$p" = "$SELF" ] && continue
     c=$(ps -p "$p" -o comm= 2>/dev/null)
+    c=${c##*/}   # macOS prints comm as the full executable path; Linux as the name
     case "$c" in dotnet|VBCSCompiler|MSBuild) P="$P $p";; esac
   done
   P=$(echo $P)
