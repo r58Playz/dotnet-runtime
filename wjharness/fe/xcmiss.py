@@ -3,7 +3,9 @@
 -- where a CPU Counters SAMPLING mode's events land (j2d/run --xc-mode l1d_miss_sampling --xc-jit): the pmi-sample
 table's exact PCs, one per N events of a counter, grouped by counter id and resolved through V8's jitdump. Without
 --func: functions per counter; with --func: that function's instructions per counter (capstone, as fe/xchot.py).
-Counter ids are the mode's own (l1d_miss_sampling: tlb / load / store misses); the ids are printed with their counts."""
+Counter ids are the mode's own, in its trigger order (l1d_miss_sampling: 5 = L1D load misses, 6 = L1D store misses,
+7 = L1D TLB misses -- checked 2026-11-26 by the sampled instruction: 5 is 99% loads, 6 74% stores, 7 98% loads + 1% stores;
+do not identify them by population). The ids are printed with their counts."""
 import sys, os, argparse, collections, importlib.util
 import xml.etree.ElementTree as ET
 HERE = os.path.dirname(os.path.abspath(__file__))
