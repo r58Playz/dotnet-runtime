@@ -1941,9 +1941,13 @@ int mono_wasm_jit_s4_sel_lo = -1, mono_wasm_jit_s4_sel_hi = -1;
  * it (mono_wasm_jit_b4_step, B4_GROUPS budget). Minecraft tick -2.4% cycles / -1.4% instructions, jbox2d -1.5%, peak
  * VmData unchanged (R445, n=3); unbudgeted it cost +460 MiB (R444). */
 int mono_wasm_jit_b4 = 2;
-/* MONO_WASM_JIT_B4_MAX / _BYTES: plan B4's group bound, members (self included) and summed body bytes. */
-int mono_wasm_jit_b4_max = 16;
-int mono_wasm_jit_b4_bytes = 65536;
+/* MONO_WASM_JIT_B4_MAX / _BYTES: plan B4's group bound, members (self included) and summed body bytes. 64 / 262144 since
+ * 2026-11-26 (findings M64-M67): mctick (26.2 server tick, M4, one binary, three batches in both orders) 16 / 65536 n=12
+ * 3.416-3.617 (3.531) ms/tick against 64 / 262144 n=11 3.405-3.517 (3.471), -1.7%, overlapping, the same sign in every batch;
+ * jbox2d level (0.3484 vs 0.3478, n=4). Game smoke ok (262n 344 / 341 fps, 262u 59.7, mcsr 98.9); 16-run fault gate clean.
+ * B4_MERGE=1 on top read +3.4% (M65). */
+int mono_wasm_jit_b4_max = 64;
+int mono_wasm_jit_b4_bytes = 262144;
 /* MONO_WASM_JIT_B4_GROUPS: groups framed per process, then B4 stops (R445: unbudgeted framing cost +460 MiB peak
  * VmData, R444). MONO_WASM_JIT_B4_MERGE: 1 = a planned group absorbs the whole groups its members already sit in. */
 int mono_wasm_jit_b4_groups = 256;
