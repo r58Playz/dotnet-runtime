@@ -36,16 +36,21 @@ SEEDS="$WJ_STATE/seeds"
 
 total=0
 say () { printf '%s\n' "$*"; }
-bytes () { [ -e "$1" ] && du -sb --apparent-size "$1" 2>/dev/null | cut -f1 || echo 0; }
+# GNU and BSD (macOS) alike: realpath -m, du -sb and numfmt are GNU-only, and a guard whose realpath fails matches nothing.
+rpath () { realpath -m "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+bytes () { local b; [ -e "$1" ] || { echo 0; return; }
+           b=$(du -sb --apparent-size "$1" 2>/dev/null | cut -f1) || b=""
+           [ -n "$b" ] || b=$(( $(du -sk "$1" 2>/dev/null | cut -f1) * 1024 )); echo "${b:-0}"; }
+human () { numfmt --to=iec "$1" 2>/dev/null || awk -v b="$1" 'BEGIN { split("B K M G T", u); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } printf (i == 1 ? "%d%s\n" : "%.1f%s\n"), b, u[i] }'; }
 drop () {                                   # drop <path> <why>
   local p="$1" why="$2" b
   [ -e "$p" ] || return 0
-  case "$(realpath -m "$p")/" in
+  case "$(rpath "$p")/" in
     "$WJ_STATE"/*|"$WJ_NOTES"/*|"$WJ_HARNESS"/*) say "  REFUSING (state/notes/code): $p"; return 0 ;;
   esac
   b=$(bytes "$p"); total=$((total + b))
-  if [ "$APPLY" = 1 ]; then rm -rf -- "$p"; say "  removed  $(numfmt --to=iec "$b")  $p  [$why]"
-  else                       say "  would rm $(numfmt --to=iec "$b")  $p  [$why]"; fi
+  if [ "$APPLY" = 1 ]; then rm -rf -- "$p"; say "  removed  $(human "$b")  $p  [$why]"
+  else                       say "  would rm $(human "$b")  $p  [$why]"; fi
 }
 old () { [ -z "$(find "$1" -maxdepth 0 -mtime -"$2" 2>/dev/null)" ]; }   # old <path> <days>
 
@@ -89,6 +94,6 @@ if [ -n "$RUNDAYS" ]; then
 fi
 
 say
-if [ "$APPLY" = 1 ]; then say "reaped $(numfmt --to=iec "$total")"
-else say "would reap $(numfmt --to=iec "$total")   (re-run with --apply)"; fi
+if [ "$APPLY" = 1 ]; then say "reaped $(human "$total")"
+else say "would reap $(human "$total")   (re-run with --apply)"; fi
 df -h "$WJ_HOME" /tmp | grep -v ^Filesystem
