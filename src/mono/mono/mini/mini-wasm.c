@@ -2240,11 +2240,12 @@ int mono_wasm_jit_reframe_ms = 60000;
  * an NPE in EntityEquipment.tick) in ~50 runs against none of that family in ~110 without. On again only once both are explained. */
 int mono_wasm_jit_consol = 0;
 /* MONO_WASM_JIT_WALK_POLL_MS=<ms> (M78): the admission walk passes through a GC-safe bracket every <ms> ms (checked every 256 nodes),
- * so a long walk answers a stop-the-world promptly; 0 = off. Default 5 since 2026-11-27: mctick with CONSOL=3 (one binary, 24 runs,
- * w w c x8) -- with the poll 16 runs, 0 in-window GC stalls, 0 late suspend answers from a walk, 3.375 ms/tick; without 8 runs, 3
- * stalls of 1.2-1.5 s, 101 late answers from walks, 3.417 (3.312 over its 5 clean runs). With consolidation off walks are short
- * and it rarely fires. */
-int mono_wasm_jit_walk_poll_ms = 5;
+ * so a long walk answers a stop-the-world promptly; 0 = off. With CONSOL=3 it removed the walks' GC stalls (16 runs: 0 in-window stalls,
+ * against 3 in 8 without). Default back to 0 on 2026-11-27 (M79): build20, with it on for every run, faulted in 3 of its first 8
+ * mctick runs (two SGEN, one entity-tick ClassCastException), most of them with consolidation off -- a walk reached on a CALL path
+ * (a lazy install at first call) is inside a call its caller may have compiled as a non-GC point (a no-GC-credited callee), so a GC
+ * let in here can move references that caller holds unpinned. A walk inside a rendezvous drain is at a safepoint already. */
+int mono_wasm_jit_walk_poll_ms = 0;
 int mono_wasm_jit_consol_windows = 3;
 int mono_wasm_jit_consol_win = 3000;
 int mono_wasm_jit_consol_min_samples = 10000;
