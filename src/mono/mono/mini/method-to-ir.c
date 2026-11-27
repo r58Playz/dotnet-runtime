@@ -10872,11 +10872,28 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						/* plan2x S3: CHA GUARD -- one load of the base's word; the vtable load above stays as the
 						 * null check. */
 						int gi_areg = alloc_preg (cfg), gi_wreg = alloc_ireg (cfg);
-						if (!mono_wasm_jit_cha_trust) {   /* MONO_WASM_JIT_CHA_TRUST: an instrument (mini-wasm.c) */
+						if (mono_wasm_jit_cha_trust != 1) {   /* MONO_WASM_JIT_CHA_TRUST: an instrument (mini-wasm.c) */
+						MonoBasicBlock *gi_cha_miss = gi_fallback_bb;
+						if (mono_wasm_jit_cha_trust == 2) {
+							/* 2: the guard stays, its miss traps -- the fallback callvirt leaves the method */
+							MonoBasicBlock *gi_cont;
+							NEW_BBLOCK (cfg, gi_cha_miss);
+							NEW_BBLOCK (cfg, gi_cont);
+							MONO_EMIT_NEW_PCONST (cfg, gi_areg, gi_cha);
+							MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, gi_wreg, gi_areg, 0);
+							MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, gi_wreg, 0);
+							MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, gi_cha_miss);
+							MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_BR, gi_cont);
+							MONO_START_BB (cfg, gi_cha_miss);
+							gi_cha_miss->out_of_line = TRUE;
+							MONO_EMIT_NEW_UNALU (cfg, OP_NOT_REACHED, -1, -1);
+							MONO_START_BB (cfg, gi_cont);
+						} else {
 						MONO_EMIT_NEW_PCONST (cfg, gi_areg, gi_cha);
 						MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, gi_wreg, gi_areg, 0);
 						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, gi_wreg, 0);
-						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, gi_fallback_bb);
+						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, gi_cha_miss);
+						}
 						}
 						if (gi_recv && (mono_wasm_jit_recv_class & 8))
 							WJ_RECV_VERIFY (TRUE);

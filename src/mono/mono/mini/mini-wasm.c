@@ -868,9 +868,10 @@ gint32 mono_wasm_jit_recv_wrong;
  * load was dead -- V8 keeps it (every load is NotLoadEliminable) and it touches the header's cache line. Off under
  * RECV_CLASS & 8, whose verify reads the vtable. 0 = the vtable load. */
 int mono_wasm_jit_cha_novt = 0;
-/* MONO_WASM_JIT_CHA_TRUST: AN INSTRUMENT, NEVER A CONFIGURATION -- a CHA-guarded inline omits its guard word's load and
- * branch, as if no class could ever override the target. Wrong the moment one does; exists to price the guards (findings
- * M84, option 2's ceiling). 0 = guarded. */
+/* MONO_WASM_JIT_CHA_TRUST: AN INSTRUMENT, NEVER A CONFIGURATION -- 1: a CHA-guarded inline omits its guard word's load and
+ * branch, as if no class could ever override the target; 2: the guard stays and its miss traps (`unreachable`) instead of
+ * taking the fallback callvirt, which prices the fallback apart from the check. Wrong the moment a class overrides; exists to
+ * price the guards (findings M84, option 2's ceiling). 0 = guarded. */
 int mono_wasm_jit_cha_trust = 0;
 
 /* MONO_WASM_JIT_IDHASH, a bit mask (2026-11-17): a virtual call to System.Object::GetHashCode (1) or ::Equals(object) (2)
@@ -1589,7 +1590,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_recv_class, "MONO_WASM_JIT_RECV_CLASS", 0, 31)
 	WJ_T2_KNOB (mono_wasm_jit_cha_novt, "MONO_WASM_JIT_CHA_NOVT", 0, 1)
-	WJ_T2_KNOB (mono_wasm_jit_cha_trust, "MONO_WASM_JIT_CHA_TRUST", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_cha_trust, "MONO_WASM_JIT_CHA_TRUST", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_idhash, "MONO_WASM_JIT_IDHASH", 0, 3)
 	WJ_T2_KNOB (mono_wasm_jit_pred_verify, "MONO_WASM_JIT_PRED_VERIFY", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_prof_serial, "MONO_WASM_JIT_PROF_SERIAL", 0, 1)
