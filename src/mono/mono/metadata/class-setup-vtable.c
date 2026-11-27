@@ -1086,6 +1086,16 @@ cha_get (MonoMethod *m)
 		mono_memory_barrier ();
 		cha_tab [h] = r;
 		cha_nrec++;
+		{
+			/* MONO_WASM_JIT_ADDRMAP (findings M84; object.c prints the vtables): which method's CHA word lives where */
+			static int addrmap = -1;
+			if (G_UNLIKELY (addrmap < 0)) { char *e = g_getenv ("MONO_WASM_JIT_ADDRMAP"); addrmap = (e && *e && *e != '0') ? 1 : 0; g_free (e); }
+			if (G_UNLIKELY (addrmap)) {
+				MonoClass *k = m->klass;
+				printf ("WJ_AM cha %p %s%s%s::%s\n", (void *) r->wordp, m_class_get_name_space (k), *m_class_get_name_space (k) ? "." : "",
+					m_class_get_name (k), m->name);
+			}
+		}
 	}
 	pthread_mutex_unlock (&cha_mx);
 	return r;

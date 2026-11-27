@@ -108,6 +108,7 @@ gpointer mono_wasm_jit_prof_ancestor (MonoCompile *cfg, MonoMethod *base);   /* 
  * for a frame whose IL never writes an argument, so a load of the argument anywhere in the frame reads the value the
  * frame was entered with. Nothing here trusts MonoInst.klass: a stack merge types its temporary from the first branch. */
 extern int mono_wasm_jit_recv_class;
+extern int mono_wasm_jit_cha_novt, mono_wasm_jit_cha_trust;
 extern int mono_wasm_jit_idhash;   /* MONO_WASM_JIT_IDHASH (knob comment in mini-wasm.c) */
 extern gboolean mono_wasm_jit_recv_compatible (MonoClass *k, MonoMethod *target);
 
@@ -10819,6 +10820,11 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 					 * what the ordinary callvirt does one step later -- so this introduces no new null
 					 * deref. MONO_EMIT_NEW_LOAD_MEMBASE_FAULT marks it as the faulting access. */
 					gi_vtreg = alloc_preg (cfg);
+					if (gi_cha && mono_wasm_jit_cha_novt && !(mono_wasm_jit_recv_class & 8)) {
+						/* MONO_WASM_JIT_CHA_NOVT: the CHA guard never reads the vtable (only the verify does, off
+						 * here), so null-check without touching the header line */
+						MONO_EMIT_NULL_CHECK (cfg, gi_this->dreg, TRUE);   /* an explicit compare whatever explicit_null_checks says */
+					} else
 					MONO_EMIT_NEW_LOAD_MEMBASE_FAULT (cfg, gi_vtreg, gi_this->dreg,
 					                                  MONO_STRUCT_OFFSET (MonoObject, vtable));
 					/* COMPARE_IMM against the baked vtable, the same form the non-AOT array-store check
@@ -10866,10 +10872,12 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
 						/* plan2x S3: CHA GUARD -- one load of the base's word; the vtable load above stays as the
 						 * null check. */
 						int gi_areg = alloc_preg (cfg), gi_wreg = alloc_ireg (cfg);
+						if (!mono_wasm_jit_cha_trust) {   /* MONO_WASM_JIT_CHA_TRUST: an instrument (mini-wasm.c) */
 						MONO_EMIT_NEW_PCONST (cfg, gi_areg, gi_cha);
 						MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, gi_wreg, gi_areg, 0);
 						MONO_EMIT_NEW_BIALU_IMM (cfg, OP_ICOMPARE_IMM, -1, gi_wreg, 0);
 						MONO_EMIT_NEW_BRANCH_BLOCK (cfg, OP_IBNE_UN, gi_fallback_bb);
+						}
 						if (gi_recv && (mono_wasm_jit_recv_class & 8))
 							WJ_RECV_VERIFY (TRUE);
 						else if (gi_profcha_slot >= 0 && (mono_wasm_jit_recv_class & 8)) {

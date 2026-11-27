@@ -2530,6 +2530,29 @@ mono_class_create_runtime_vtable (MonoClass *klass, MonoError *error)
 		vt->has_static_fields = TRUE;
 		UnlockedAdd (&mono_stats.class_static_data_size, class_size);
 	}
+#ifdef HOST_BROWSER
+	{
+		/* MONO_WASM_JIT_ADDRMAP (findings M84): one line per runtime vtable -- the allocation (class record, IMT, vtable),
+		 * the static-field block and the instance size -- so a constant address or a guard's vtable constant in emitted
+		 * code can be named after a run. Names without allocation (name space, name, enclosing class). */
+		static int addrmap = -1;
+		if (G_UNLIKELY (addrmap < 0)) { char *e = g_getenv ("MONO_WASM_JIT_ADDRMAP"); addrmap = (e && *e && *e != '0') ? 1 : 0; g_free (e); }
+		if (G_UNLIKELY (addrmap)) {
+			MonoClass *outer = m_class_get_nested_in (klass);
+			char nm [512];
+			if (outer)
+				g_snprintf (nm, sizeof (nm), "%s%s%s/%s", m_class_get_name_space (outer), *m_class_get_name_space (outer) ? "." : "",
+					m_class_get_name (outer), m_class_get_name (klass));
+			else
+				g_snprintf (nm, sizeof (nm), "%s%s%s", m_class_get_name_space (klass), *m_class_get_name_space (klass) ? "." : "",
+					m_class_get_name (klass));
+			printf ("WJ_AM vt %p alloc %p+%u data %p+%u inst %d %s\n", (void *) vt,
+				(void *) ((char *) vt - imt_table_bytes - rec_pad), (unsigned) vtable_size,
+				class_size ? vt->vtable [m_class_get_vtable_size (klass)] : NULL, (unsigned) class_size,
+				m_class_get_instance_size (klass), nm);
+		}
+	}
+#endif
 
 	iter = NULL;
 	while ((field = mono_class_get_fields_internal (klass, &iter))) {

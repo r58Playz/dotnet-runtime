@@ -863,6 +863,15 @@ int mono_wasm_jit_t2_gi_bimorphic = 0;
  * (95.84-96.37) -1.8%, instructions -6.2%, near calls -17%; verify wrong=0 on the 262n and 262c censuses. */
 int mono_wasm_jit_recv_class = 7;
 gint32 mono_wasm_jit_recv_wrong;
+/* MONO_WASM_JIT_CHA_NOVT (findings M84): a CHA-guarded inline (plan2x S3) null-checks its receiver with a compare instead
+ * of loading the receiver's vtable for the null check: the CHA guard reads its own word, never the vtable, so the header
+ * load was dead -- V8 keeps it (every load is NotLoadEliminable) and it touches the header's cache line. Off under
+ * RECV_CLASS & 8, whose verify reads the vtable. 0 = the vtable load. */
+int mono_wasm_jit_cha_novt = 0;
+/* MONO_WASM_JIT_CHA_TRUST: AN INSTRUMENT, NEVER A CONFIGURATION -- a CHA-guarded inline omits its guard word's load and
+ * branch, as if no class could ever override the target. Wrong the moment one does; exists to price the guards (findings
+ * M84, option 2's ceiling). 0 = guarded. */
+int mono_wasm_jit_cha_trust = 0;
 
 /* MONO_WASM_JIT_IDHASH, a bit mask (2026-11-17): a virtual call to System.Object::GetHashCode (1) or ::Equals(object) (2)
  * that no profile or receiver class predicts gets System.Object's own method as its guarded-inline target, behind the
@@ -1579,6 +1588,8 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_slim, "MONO_WASM_JIT_EH_SLIM", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_recv_class, "MONO_WASM_JIT_RECV_CLASS", 0, 31)
+	WJ_T2_KNOB (mono_wasm_jit_cha_novt, "MONO_WASM_JIT_CHA_NOVT", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_cha_trust, "MONO_WASM_JIT_CHA_TRUST", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_idhash, "MONO_WASM_JIT_IDHASH", 0, 3)
 	WJ_T2_KNOB (mono_wasm_jit_pred_verify, "MONO_WASM_JIT_PRED_VERIFY", 0, 2)
 	WJ_T2_KNOB (mono_wasm_jit_prof_serial, "MONO_WASM_JIT_PROF_SERIAL", 0, 1)
