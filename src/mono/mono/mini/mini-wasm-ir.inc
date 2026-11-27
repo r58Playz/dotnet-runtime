@@ -1730,6 +1730,24 @@ wj_bchain_float_cmp (int op)
 {
 	return op == OP_FCOMPARE || op == OP_RCOMPARE;
 }
+/* NN through copies: a vreg copied from another before that one was null-checked (`move 171 <- 3`, then 3's check) is
+ * non-null too (M82's trace of DynamicTree.query). */
+static gboolean
+wj_bchain_nn (const WjSelNN *nn, int v)
+{
+	return v >= 0 && (wj_sel_nn_has (nn, v) || wj_sel_nn_has (nn, wj_sel_resolve (nn, v)));
+}
+static gboolean
+wj_bchain_redundant_check (const WjSelNN *nn, MonoInst *ins)
+{
+	if (ins->opcode == OP_NOT_NULL)
+		return wj_bchain_nn (nn, ins->sreg1);
+	if (wj_sel_is_null_check (ins))
+		return wj_bchain_nn (nn, ins->sreg1);
+	if ((ins->opcode == OP_COND_EXC_EQ || ins->opcode == OP_COND_EXC_IEQ) && ins->prev && wj_sel_is_null_check (ins->prev))
+		return wj_bchain_nn (nn, ins->prev->sreg1);
+	return FALSE;
+}
 static int
 wj_bchain_run (MonoCompile *cfg)
 {
@@ -1820,15 +1838,18 @@ wj_bchain_run (MonoCompile *cfg)
 				int d = ins->dreg, k;
 				if (ins->opcode == OP_NOP || ins->opcode == OP_IL_SEQ_POINT)
 					continue;
-				if (wj_sel_redundant_check (&nn, ins))
+				if (wj_bchain_redundant_check (&nn, ins))
 					continue;
 				if (ins->flags & MONO_INST_VOLATILE)
 					goto refuse;
 				if (wj_s4_is_load (ins->opcode)) {
-					if (ins->sreg1 < 0 || !wj_sel_nn_has (&nn, wj_sel_resolve (&nn, ins->sreg1)) ||
+					if (ins->sreg1 < 0 || !wj_bchain_nn (&nn, ins->sreg1) ||
 					    ins->inst_offset < 0 || ins->inst_offset >= 65536)
 						goto refuse;
 					k = 2;
+				} else if (ins->opcode == OP_RCONV_TO_R4 || ins->opcode == OP_RCONV_TO_R8 || ins->opcode == OP_FCONV_TO_R4 ||
+				           ins->opcode == OP_FCONV_TO_R8 || ins->opcode == OP_ICONV_TO_R4 || ins->opcode == OP_ICONV_TO_R8) {
+					k = 2;   /* to a float: never traps (javac's fcmpl leaves an r4 -> r4 here) */
 				} else {
 					k = wj_sel_arm_kind (ins);
 				}
