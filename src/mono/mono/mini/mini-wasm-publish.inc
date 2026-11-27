@@ -278,8 +278,26 @@ mono_wasm_jit_rendezvous_exhausted (void)
  * no-op; the outer drain is still walking the log and will finish the work.
  */
 void mono_wasm_jit_rendezvous_drain (void);
+static void wj_rendezvous_drain_body (void);
+/* M73/M74 instrument: consolidated runs stall GC stop-the-world for 0.6-1.1 s right after a large group's re-frame; the
+ * workers adopt it here, at a poll, and do not answer a suspend meanwhile. Ungated, rare: a drain of 150 ms or more. */
 void
 mono_wasm_jit_rendezvous_drain (void)
+{
+	if (G_LIKELY (wj_local_epoch == wj_global_epoch && wj_rv_retry_n == 0))
+		return;
+	gint64 t0 = mono_msec_ticks ();
+	wj_rendezvous_drain_body ();
+	gint64 dt = mono_msec_ticks () - t0;
+	if (dt >= 150) {
+		static gint32 nslow;
+		if (mono_atomic_inc_i32 (&nslow) <= 64)
+			printf ("[wasm-jit slowinst] rendezvous drain: %lld ms on thread 0x%x (epoch %d)\n", (long long) dt,
+				(unsigned) (gsize) mono_native_thread_id_get (), (int) wj_local_epoch);
+	}
+}
+static void
+wj_rendezvous_drain_body (void)
 {
 	gint32 target, i, completed;
 	gboolean pin = FALSE;

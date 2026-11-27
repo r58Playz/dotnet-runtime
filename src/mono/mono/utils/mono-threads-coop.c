@@ -153,7 +153,7 @@ mono_threads_state_poll (void)
 /* `[wasm-jit latesuspend]` (findings M36): the 262n game's slow mode is GC stop-the-world waiting seconds for a thread left
  * at STATE_ASYNC_SUSPEND_REQUESTED -- running, and reaching no safepoint (the render thread, in the dumps). The late thread
  * says so itself where it finally answers -- a poll, or entering a blocking region -- with the delay and its JS stack (V8
- * names the wasm frames), when the request waited more than 250 ms. At most 32 reports. */
+ * names the wasm frames), when the request waited more than 250 ms. At most 256 reports. */
 static const char *wj_late_where;
 /* Measure where the request is answered; report only later, once this thread is resumed or GC-safe: worker stdout is
  * proxied to the main thread, which can itself be parked by the same stop-the-world, so printing before answering could
@@ -178,7 +178,7 @@ wj_report_late_suspend (MonoThreadInfo *info)
 		return;
 	info->wj_suspend_req_ms = 0;
 	static gint32 nlate;
-	if (mono_atomic_inc_i32 (&nlate) > 32)
+	if (mono_atomic_inc_i32 (&nlate) > 256)
 		return;
 	printf ("[wasm-jit latesuspend] thread 0x%x answered a suspend request after %lld ms at %s\n",
 		(unsigned) (gsize) mono_thread_info_get_tid (info), (long long) -v, wj_late_where ? wj_late_where : "?");

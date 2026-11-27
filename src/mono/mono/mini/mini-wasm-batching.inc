@@ -1173,7 +1173,14 @@ mono_wasm_jit_refresh_batch (int desc_id, void **out_bytes, int *out_len, gboole
 	wj_reg_read_leave ();
 	if (!descs)
 		return 0;
-	ok = mono_wasm_jit_rebatch (descs, n, out_bytes, out_len);
+	{ gint64 t0 = mono_msec_ticks ();
+	  ok = mono_wasm_jit_rebatch (descs, n, out_bytes, out_len);
+	  if (n >= 32) {   /* M73: a re-frame of a large group, timed (ungated, rare) */
+		static gint32 nrf;
+		if (mono_atomic_inc_i32 (&nrf) <= 64)
+			printf ("[wasm-jit slowinst] re-frame (member re-emitted) of %d members: %lld ms on thread 0x%x (ok %d)\n", n,
+				(long long) (mono_msec_ticks () - t0), (unsigned) (gsize) mono_native_thread_id_get (), ok);
+	  } }
 	g_free (descs);
 	if (ok)
 		mono_wasm_jit_counters [WJC_REFRAME_OK]++;
@@ -2288,7 +2295,13 @@ mono_wasm_jit_b4_step (void)
 		bdescs = g_new (gint32, bn);
 		memcpy (bdescs, b->desc, sizeof (int) * (gsize) bn);
 		first = bdescs [0];
-		ok = mono_wasm_jit_rebatch ((const int *) bdescs, bn, NULL, NULL);
+		{ gint64 t0 = mono_msec_ticks ();
+		  ok = mono_wasm_jit_rebatch ((const int *) bdescs, bn, NULL, NULL);
+		  static gint32 nrf;   /* M73: a deferred re-frame, timed (ungated, rare) */
+		  if (mono_atomic_inc_i32 (&nrf) <= 64)
+			printf ("[wasm-jit slowinst] deferred re-frame of %d members: %lld ms on thread 0x%x (ok %d)\n", bn,
+				(long long) (mono_msec_ticks () - t0), (unsigned) (gsize) mono_native_thread_id_get (), ok);
+		}
 		wj_reg_read_leave ();
 		g_free (bdescs);
 		if (!ok) {

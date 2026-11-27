@@ -2233,11 +2233,11 @@ int mono_wasm_jit_reframe_ms = 60000;
  * promotion re-frames its group (REFRAME_MS). MONO_WASM_JIT_CONSOL_ONCE=1: no B4 plan after that one (B4_ONCE's
  * semantics, edge counters stop); 0: normal incremental B4 resumes for code that gets hot later. Independent of
  * MONO_WASM_JIT_B4_QUIET (which j2d/run turns off for mctick). 0 = incremental B4 only.
- * Default 3 since 2026-11-27 (findings M70-M72): mctick (26.2 server tick, M4, one binary, both orders, n=7 a side) 3.487 against
- * 3.341 ms/tick, -4.2% (one order disjoint); every run settled at +126-128 s, 77-90 groups of ~1,050 members; jbox2d level
- * (0.3518 / 0.3504, n=4; it settles in ~5 s on small-tier windows); 262n game server tick level (Time Profiler, n=5 a side, -1.3%),
- * settling at +95-142 s across 262n / 262u / mcsr, every game verdict ok; fault gate 24 short mctick runs, 0 faults either half. */
-int mono_wasm_jit_consol = 3;
+ * Measured at 3 (findings M70-M74): mctick -4.2% (n=7 a side, both orders), jbox2d level, the 262n server tick level, the game
+ * gate clean. Default back to 0 on 2026-11-27 (M74/M75): consolidated runs show 0.6-1.1 s GC stop-the-world stalls (4 of 35
+ * mctick runs, 0 of 100 without) and two entity-tick faults (a garbage-class trap under PersistentEntitySectionManager$Callback.onMove,
+ * an NPE in EntityEquipment.tick) in ~50 runs against none of that family in ~110 without. On again only once both are explained. */
+int mono_wasm_jit_consol = 0;
 int mono_wasm_jit_consol_windows = 3;
 int mono_wasm_jit_consol_win = 3000;
 int mono_wasm_jit_consol_min_samples = 10000;
@@ -3457,9 +3457,21 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int 
 int
 mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, int n, const void *bytes, int len, char *errbuf, int errcap, double *out_ms, guint32 payload)
 {
+	gint64 t0 = mono_msec_ticks ();
 	int ok = wj_instantiate_batch_local_once (e_slots, f_slots, n, bytes, len, errbuf, errcap, out_ms, payload);
 	if (!ok && errbuf && wj_vslow_repair (errbuf))
 		ok = wj_instantiate_batch_local_once (e_slots, f_slots, n, bytes, len, errbuf, errcap, out_ms, payload);
+	{
+		/* M73: consolidated runs show 0.6-1.1 s GC stop-the-world stalls, a worker answering the suspend "at blocking" after
+		 * ~750 ms; a group module compiled + instantiated synchronously is a candidate. Ungated, rare: slow ones only. */
+		gint64 dt = mono_msec_ticks () - t0;
+		if (dt >= 150) {
+			static gint32 nslow;
+			if (mono_atomic_inc_i32 (&nslow) <= 64)
+				printf ("[wasm-jit slowinst] group module of %d members, %d bytes: %lld ms on thread 0x%x (ok %d)\n",
+					n, len, (long long) dt, (unsigned) (gsize) mono_native_thread_id_get (), ok);
+		}
+	}
 	return ok;
 }
 
