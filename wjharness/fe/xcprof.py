@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""xcprof.py <trace> <perf.map> [--from-ms WALL] [--to-ms WALL] [--thread SUBSTR] [--top N] [--incl] [--json]
+"""xcprof.py <trace> <perf.map> [--from-ms WALL] [--to-ms WALL] [--thread SUBSTR] [--top N] [--incl] [--json] [--callers REGEX]
 -- where one thread's time goes, by function, from an Instruments "Time Profiler" capture (darwin; 1 ms samples with
 user backtraces) and V8's `--perf-basic-prof` map (`/tmp/perf-<renderer pid>.map`, which V8 writes on macOS too: wasm
 functions appear as `JS:<name>-<index>-turbofan|liftoff`). The macOS stand-in for perfraw's per-function split.
@@ -7,7 +7,8 @@ functions appear as `JS:<name>-<index>-turbofan|liftoff`). The macOS stand-in fo
 Frames Instruments symbolised (Chrome's own, libsystem) keep its name; JIT frames (hex names) resolve through the map,
 the LAST entry covering the address winning (V8 reuses code space after a tier-up or a GC; the map is append-only).
 The thread is the one with the most samples in the window unless --thread names one. --incl adds inclusive shares
-(each function counted once per sample it appears anywhere in)."""
+(each function counted once per sample it appears anywhere in). --callers REGEX: for the samples whose leaf matches,
+the share by immediate caller (leaf <- caller), i.e. which call edges a small function's self time comes through."""
 import sys, json, subprocess, argparse, re, bisect, datetime, collections
 import xml.etree.ElementTree as ET
 
@@ -58,6 +59,7 @@ def main():
     ap.add_argument("--from-ms", type=float); ap.add_argument("--to-ms", type=float)
     ap.add_argument("--thread"); ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--incl", action="store_true"); ap.add_argument("--json", action="store_true")
+    ap.add_argument("--callers")
     a = ap.parse_args()
     pm = PerfMap(a.map)
     base = start_epoch_ms(a.trace)
@@ -88,6 +90,13 @@ def main():
     if not per: print("no samples in the window"); return
     th = next((k for k in per if a.thread and a.thread in k), None) or max(per, key=lambda k: len(per[k]))
     smp = per[th]; n = len(smp)
+    if a.callers:
+        rx = re.compile(a.callers)
+        ec = collections.Counter((f[0], f[1] if len(f) > 1 else "-") for f in smp if f and rx.search(f[0]))
+        print(f"{th}: {n} samples; leaf ~ /{a.callers}/: {sum(ec.values())} ({sum(ec.values()) / n:.1%})")
+        for (lf, cl), v in ec.most_common(a.top):
+            print(f"  {v / n:6.2%}  {lf[:70]}  <-  {cl[:90]}")
+        return
     selfc = collections.Counter(f[0] for f in smp if f)
     inc = collections.Counter()
     if a.incl:

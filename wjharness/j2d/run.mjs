@@ -442,7 +442,8 @@ const win = {
   window: ok ? [batchT[WA], batchT[WB]] : null, steps, schedule: SCHED, window_batches: [WA, WB],
   // the bench's own timing of the windowed batches (WA+1..WB)
   window_ms_per_step: ok ? Array.from({ length: WB - WA }, (_, i) => batchMs[WA + 1 + i]).reduce((s, v) => s + v, 0) / steps : null,
-  batch_ms: batchMs, failed, perf_stderr_tail: perfErr.slice(-600),
+  batch_ms: batchMs, batch_wall_ms: batchWall, failed,   // batch_wall_ms: Date.now() at each batch line -- fe/xcprof.py --from-ms / --to-ms
+  perf_stderr_tail: perfErr.slice(-600),
 };
 if ((XCPROF || XC_JIT) && xct?.pid) {   // V8's map for the renderer, beside the capture; every map this browser wrote leaves /tmp
   const pm = `/tmp/perf-${xct.pid}.map`;
