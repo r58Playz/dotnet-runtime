@@ -2234,11 +2234,13 @@ int mono_wasm_jit_reframe_ms = 60000;
  * promotion re-frames its group (REFRAME_MS). MONO_WASM_JIT_CONSOL_ONCE=1: no B4 plan after that one (B4_ONCE's
  * semantics, edge counters stop); 0: normal incremental B4 resumes for code that gets hot later. Independent of
  * MONO_WASM_JIT_B4_QUIET (which j2d/run turns off for mctick). 0 = incremental B4 only.
- * Measured at 3 (findings M70-M74): mctick -4.2% (n=7 a side, both orders), jbox2d level, the 262n server tick level, the game
- * gate clean. Default back to 0 on 2026-11-27 (M74/M75): consolidated runs show 0.6-1.1 s GC stop-the-world stalls (4 of 35
- * mctick runs, 0 of 100 without) and two entity-tick faults (a garbage-class trap under PersistentEntitySectionManager$Callback.onMove,
- * an NPE in EntityEquipment.tick) in ~50 runs against none of that family in ~110 without. On again only once both are explained. */
-int mono_wasm_jit_consol = 0;
+ * Measured at 3 (findings M70-M79): mctick -4.7% with MONO_WASM_JIT_ADMIT_WALK=7 (3.301 against 3.462 ms/tick, n=6 a side,
+ * ranges disjoint, 2026-11-27, runs/2026-11-27-aw), jbox2d level, the game gate clean. Its two blockers were fixed: the
+ * entity-tick faults were M77's no-GC credit and re-frame-queue bugs (0 faults in 44 consolidated runs since, against ~5 in
+ * ~62 before), and the 0.6-2.1 s GC stop-the-world stalls were the consolidated groups' admission walks, which ADMIT_WALK=7
+ * keeps under ~100 ms (worst stw 44 ms in 6 runs, against 1.2-2.1 s in every run of CONSOL=3 alone). Do not run it with
+ * ADMIT_WALK=0. */
+int mono_wasm_jit_consol = 3;
 /* MONO_WASM_JIT_WALK_POLL_MS=<ms> (M78): the admission walk passes through a GC-safe bracket every <ms> ms (checked every 256 nodes),
  * so a long walk answers a stop-the-world promptly; 0 = off. With CONSOL=3 it removed the walks' GC stalls (16 runs: 0 in-window stalls,
  * against 3 in 8 without). Default back to 0 on 2026-11-27 (M79): build20, with it on for every run, faulted in 3 of its first 8
@@ -2503,8 +2505,10 @@ int mono_wasm_jit_stackprobe = 0;
  *      cycle break, so a group admission repeated the closure walk once per such edge.
  * One admission of a 512-member group took 6-12 s with every bit clear (2026-11-20, p4; minor collections waited
  * on it, `stw 1.9-12.3 s`). Install order inside a walk is irrelevant (a module's own lazy banks are ensured by its
- * instantiation, mono_wasm_jit_instantiate_local / _batch_local), so 1 and 2 change cost and stack only. */
-int mono_wasm_jit_admit_walk = 0;
+ * instantiation, mono_wasm_jit_instantiate_local / _batch_local), so 1 and 2 change cost and stack only.
+ * 7 since 2026-11-27 (findings M79): with MONO_WASM_JIT_CONSOL=3, mctick's walks visit 313 k nodes against 42.2 M, and the
+ * longest admission is 98 ms against 1.9 s (shorter than the unconsolidated defaults' 115 ms); adds no GC point. */
+int mono_wasm_jit_admit_walk = 7;
 /* Defined here (not in the HOST_BROWSER block) because mono_wasm_emit_method references it in BOTH the
  * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (HOST_BROWSER). */
 #ifndef HOST_BROWSER

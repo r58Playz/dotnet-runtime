@@ -2373,7 +2373,7 @@ mono_wasm_jit_b4_step (void)
 			return 0;
 		guint64 *hot = NULL;
 		extern int mono_wasm_jit_b4_per_plan;
-		extern int mono_wasm_jit_consol, mono_wasm_jit_consol_max, mono_wasm_jit_consol_bytes;
+		extern int mono_wasm_jit_consol, mono_wasm_jit_consol_max, mono_wasm_jit_consol_bytes, mono_wasm_jit_admit_walk;
 		/* MONO_WASM_JIT_CONSOL: the first plan after the tier settled is the consolidation plan -- the CONSOL caps for its
 		 * partition and its framing (b4_step's member and byte bounds read B4_MAX / B4_BYTES), every group it forms */
 		gboolean consol_plan = mono_wasm_jit_consol > 0 && wj_consol_phase == 0;
@@ -2396,9 +2396,10 @@ mono_wasm_jit_b4_step (void)
 			for (q = 0; q < wj_b4_npend; ++q)
 				nm += wj_b4_pend [q].n;
 			wj_consol_phase = 1;
-			printf ("[wasm-jit consol] settled at +%.1fs (%d windows): plan of %d groups, %d members, internal %.1f%% of the edge weight (cap %d / %d)\n",
+			printf ("[wasm-jit consol] settled at +%.1fs (%d windows): plan of %d groups, %d members, internal %.1f%% of the edge weight (cap %d / %d, admit walk %d)\n",
 				(double) wj_consol_at_ms / 1000.0, wj_consol_nwin, wj_b4_npend, nm,
-				total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes);
+				total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes,
+				mono_wasm_jit_admit_walk);
 		}
 		/* the hottest per_plan groups only: the budget is spread over the run, not spent by the first plans */
 		if (!consol_plan && wj_b4_npend > mono_wasm_jit_b4_per_plan) {
