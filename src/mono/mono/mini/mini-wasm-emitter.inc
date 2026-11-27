@@ -2429,6 +2429,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
 			wj_s4_early = TRUE;
 		}
 		wj_select_run (cfg);
+		if (mono_wasm_jit_select & 32)
+			wj_bchain_run (cfg);
 	  } }
 	int nvreg = cfg->next_vreg;
 	int nargs = sig->hasthis + sig->param_count;

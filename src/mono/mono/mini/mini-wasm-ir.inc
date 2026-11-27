@@ -1712,6 +1712,204 @@ refuse:
 	return done;
 }
 
+/* MONO_WASM_JIT_SELECT & 32 (branch chains): `if (c1) goto X; B: if (c2) goto X; else Y` -- A's fallthrough B branches to the
+ * same X -- becomes one branch on (c1 | c2) in A, with B's work speculated into A and B deleted. AABB.testOverlap's four
+ * `d > 0` exits are two such pairs (findings M81: 38% of DynamicTree.query's samples sit on their shared mispredict target).
+ * B qualifies when A is its only predecessor and everything in it but its compare and branch is speculable from the end of
+ * A: a redundant null check (its base was null-checked in A), a non-volatile load from a base A proved non-null (a field
+ * at a small offset: wasm loads do not trap, and a non-null object's field is always in bounds), or pure arithmetic
+ * (wj_sel_arm_kind) -- nothing that stores, calls, polls, raises or allocates. Every value B defines must die in B (not a
+ * variable, no use outside B), so computing it on the path that took X changes nothing. Both conditions keep their exact
+ * meaning (OP_WASM_JIT_SETCC_BR, NaN-exact for the _UN float forms); the branch to X on the false edge is negated with an
+ * xor. Bit 64 admits int and long compares as well as float ones (M50: converting predictable branches costs). Repeats
+ * on A, so a chain folds to one branch, at most WJ_BCHAIN_MAX links. */
+#define WJ_BCHAIN_MAX 4
+#define WJ_BCHAIN_OPS 8
+static gboolean
+wj_bchain_float_cmp (int op)
+{
+	return op == OP_FCOMPARE || op == OP_RCOMPARE;
+}
+static int
+wj_bchain_run (MonoCompile *cfg)
+{
+	extern int mono_wasm_jit_select;
+	gboolean any_cmp = (mono_wasm_jit_select & 64) != 0;
+	MonoBasicBlock *a;
+	int done = 0, nv0 = (int) cfg->next_vreg;
+	int *use_bb = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (gsize) (nv0 > 0 ? nv0 : 1));
+	{
+		MonoBasicBlock *ub; MonoInst *ui;
+		int q;
+		for (q = 0; q < nv0; ++q)
+			use_bb [q] = -1;
+		for (ub = cfg->bb_entry; ub; ub = ub->next_bb)
+			MONO_BB_FOR_EACH_INS (ub, ui) {
+				int srcs [MONO_MAX_SRC_REGS], ns = mono_inst_get_src_registers (ui, srcs), r;
+				for (r = 0; r < ns; ++r) {
+					int v = srcs [r];
+					if (v < 0 || v >= nv0) continue;
+					use_bb [v] = use_bb [v] == -1 || use_bb [v] == ub->block_num ? ub->block_num : -2;
+				}
+				if (MONO_IS_STORE_MEMBASE (ui) && ui->dreg >= 0 && ui->dreg < nv0)
+					use_bb [ui->dreg] = use_bb [ui->dreg] == -1 || use_bb [ui->dreg] == ub->block_num ? ub->block_num : -2;
+			}
+	}
+	for (a = cfg->bb_entry; a; a = a->next_bb) {
+		int links = 0;
+		gboolean a_combined = FALSE;   /* A's compare is the (c1 | c2) test this pass wrote */
+		while (links < WJ_BCHAIN_MAX) {
+			MonoInst *br1 = a->last_ins, *cmp1, *br2, *cmp2, *ins, *next, *setc1, *setc2, *at;
+			MonoBasicBlock *b, *x, *y;
+			gboolean p1_neg, p2_neg;
+			int side, nops, c1, c2, p1, p2, r;
+			WjSelNN nn;
+			if (!br1 || !wj_sel_is_br (br1->opcode) || a->out_count != 2)
+				break;
+			cmp1 = br1->prev;
+			if (!cmp1 || !wj_sel_is_cmp (cmp1->opcode))
+				break;
+			if (!a_combined && !any_cmp && !wj_bchain_float_cmp (cmp1->opcode))
+				break;
+			b = NULL; x = NULL; p1_neg = FALSE;
+			for (side = 0; side < 2 && !b; ++side) {
+				MonoBasicBlock *cand = side == 0 ? br1->inst_false_bb : br1->inst_true_bb;   /* B: the edge that is not X */
+				MonoBasicBlock *other = side == 0 ? br1->inst_true_bb : br1->inst_false_bb;
+				MonoInst *cbr;
+				if (!cand || !other || cand == other || cand == a || cand == cfg->bb_exit || cand == cfg->bb_entry ||
+				    cand->in_count != 1 || cand->in_bb [0] != a || cand->out_count != 2 || cand->region != a->region ||
+				    cand->out_of_line || cand->wasm_cold || (cand->flags & BB_EXCEPTION_HANDLER))
+					continue;
+				cbr = cand->last_ins;
+				if (!cbr || !wj_sel_is_br (cbr->opcode) || !cbr->prev || !wj_sel_is_cmp (cbr->prev->opcode))
+					continue;
+				if (!any_cmp && !wj_bchain_float_cmp (cbr->prev->opcode))
+					continue;
+				if (cbr->inst_true_bb != other && cbr->inst_false_bb != other)
+					continue;
+				b = cand; x = other; p1_neg = side == 1;   /* side 1: A reaches X on its false edge */
+			}
+			if (!b)
+				break;
+			br2 = b->last_ins; cmp2 = br2->prev;
+			p2_neg = br2->inst_false_bb == x;
+			y = p2_neg ? br2->inst_true_bb : br2->inst_false_bb;
+			if (!y || y == x || y == a || y == b || x == a || x == b)
+				break;
+			/* B's body: speculable from the end of A */
+			nn.n = nn.nal = nn.nld = 0;
+			MONO_BB_FOR_EACH_INS (a, ins)
+				if (ins != br1 && ins != cmp1)
+					wj_sel_nn_step (&nn, ins);
+			nops = 0;
+			for (ins = b->code; ins && ins != cmp2; ins = ins->next) {
+				int d = ins->dreg, k;
+				if (ins->opcode == OP_NOP || ins->opcode == OP_IL_SEQ_POINT)
+					continue;
+				if (wj_sel_redundant_check (&nn, ins))
+					continue;
+				if (ins->flags & MONO_INST_VOLATILE)
+					goto refuse;
+				if (wj_s4_is_load (ins->opcode)) {
+					if (ins->sreg1 < 0 || !wj_sel_nn_has (&nn, wj_sel_resolve (&nn, ins->sreg1)) ||
+					    ins->inst_offset < 0 || ins->inst_offset >= 65536)
+						goto refuse;
+					k = 2;
+				} else {
+					k = wj_sel_arm_kind (ins);
+				}
+				if (!k || d < 0 || d >= nv0 || get_vreg_to_inst (cfg, d) || (use_bb [d] != -1 && use_bb [d] != b->block_num))
+					goto refuse;
+				if (++nops > WJ_BCHAIN_OPS)
+					goto refuse;
+				wj_sel_nn_step (&nn, ins);
+			}
+			if (ins != cmp2)
+				goto refuse;
+			/* apply: A = ... cmp1 setcc(c1) [B's body] cmp2 setcc(c2) [xor] or icompare_imm br */
+			c1 = (int) alloc_ireg (cfg);
+			MONO_INST_NEW (cfg, setc1, OP_WASM_JIT_SETCC_BR);
+			setc1->dreg = c1; setc1->inst_c0 = br1->opcode; setc1->type = STACK_I4; setc1->cil_code = br1->cil_code;
+			mono_bblock_insert_after_ins (a, cmp1, setc1);
+			at = setc1;
+			for (ins = b->code; ins; ins = next) {
+				next = ins->next;
+				if (ins == br2)
+					break;
+				{
+					/* decided before unlinking (the null-check shape reads ins->next): the redundant checks the scan
+					 * admitted leave with B */
+					gboolean drop = ins->opcode == OP_NOP || ins->opcode == OP_IL_SEQ_POINT || ins->opcode == OP_NOT_NULL ||
+						ins->opcode == OP_COND_EXC_EQ || ins->opcode == OP_COND_EXC_IEQ ||
+						(ins != cmp2 && wj_sel_is_null_check (ins));
+					MONO_REMOVE_INS (b, ins);
+					if (drop)
+						continue;
+				}
+				mono_bblock_insert_after_ins (a, at, ins);
+				at = ins;
+			}
+			c2 = (int) alloc_ireg (cfg);
+			MONO_INST_NEW (cfg, setc2, OP_WASM_JIT_SETCC_BR);
+			setc2->dreg = c2; setc2->inst_c0 = br2->opcode; setc2->type = STACK_I4; setc2->cil_code = br2->cil_code;
+			mono_bblock_insert_after_ins (a, at, setc2);
+			at = setc2;
+			p1 = c1; p2 = c2;
+			if (p1_neg) {
+				MonoInst *xi;
+				MONO_INST_NEW (cfg, xi, OP_IXOR_IMM);
+				xi->dreg = p1 = (int) alloc_ireg (cfg); xi->sreg1 = c1; xi->inst_imm = 1; xi->type = STACK_I4;
+				mono_bblock_insert_after_ins (a, at, xi); at = xi;
+			}
+			if (p2_neg) {
+				MonoInst *xi;
+				MONO_INST_NEW (cfg, xi, OP_IXOR_IMM);
+				xi->dreg = p2 = (int) alloc_ireg (cfg); xi->sreg1 = c2; xi->inst_imm = 1; xi->type = STACK_I4;
+				mono_bblock_insert_after_ins (a, at, xi); at = xi;
+			}
+			{
+				MonoInst *oi, *ci;
+				r = (int) alloc_ireg (cfg);
+				MONO_INST_NEW (cfg, oi, OP_IOR);
+				oi->dreg = r; oi->sreg1 = p1; oi->sreg2 = p2; oi->type = STACK_I4;
+				mono_bblock_insert_after_ins (a, at, oi);
+				MONO_INST_NEW (cfg, ci, OP_ICOMPARE_IMM);
+				ci->sreg1 = r; ci->inst_imm = 0;
+				mono_bblock_insert_after_ins (a, oi, ci);
+			}
+			br1->opcode = OP_IBNE_UN;
+			br1->inst_true_bb = x;
+			br1->inst_false_bb = y;
+			mono_unlink_bblock (cfg, a, b);
+			mono_unlink_bblock (cfg, b, x);
+			mono_unlink_bblock (cfg, b, y);
+			mono_remove_bblock (cfg, b);
+			b->code = b->last_ins = NULL;
+			{
+				MonoBasicBlock *hb;
+				for (hb = cfg->bb_entry; hb; hb = hb->next_bb) {
+					GList *l;
+					for (l = hb->loop_blocks; l; l = l->next) {
+						if (l->data != b)
+							continue;
+						if (l->prev) l->prev->next = l->next; else hb->loop_blocks = l->next;
+						if (l->next) l->next->prev = l->prev;
+						break;   /* mempool links: unlinked, never freed */
+					}
+				}
+			}
+			mono_link_bblock (cfg, a, y);
+			mono_wasm_jit_counters [WJC_SELECT_CHAINS]++;
+			done++; links++;
+			a_combined = TRUE;
+			continue;
+refuse:
+			break;
+		}
+	}
+	return done;
+}
+
 /* APPLY = FALSE: the census (MONO_WASM_JIT_S4C), which prints. APPLY = TRUE: every load found available is rewritten
  * into a typed move from the vreg holding it, under the strict invariant set; nothing is printed. */
 static int

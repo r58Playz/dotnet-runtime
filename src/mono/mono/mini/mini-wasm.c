@@ -1573,7 +1573,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_cast_elim, "MONO_WASM_JIT_CAST_ELIM", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_pin_cold, "MONO_WASM_JIT_PIN_COLD", 0, 7)
 	WJ_T2_KNOB (mono_wasm_jit_hash_inline, "MONO_WASM_JIT_HASH_INLINE", 0, 1)
-	WJ_T2_KNOB (mono_wasm_jit_select, "MONO_WASM_JIT_SELECT", 0, 31)
+	WJ_T2_KNOB (mono_wasm_jit_select, "MONO_WASM_JIT_SELECT", 0, 127)
 	WJ_T2_KNOB (mono_wasm_jit_arraycopy_on, "MONO_WASM_JIT_ARRAYCOPY", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_cast_unfinished, "MONO_WASM_JIT_CAST_UNFINISHED", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_eh_rec, "MONO_WASM_JIT_EH_REC", 0, 1)
@@ -1822,7 +1822,9 @@ int mono_wasm_jit_hash_inline = 1;
  * (findings M50). 31 = tiers 1 and 2, float-compare diamonds whose arms are moves (an arm's re-read of a field the branch block
  * already loaded counts as a move, M55): jbox2d (R440 protocol, one binary, knob only, n=3 a side, 2026-11-25, findings M56)
  * 0.3930 -> 0.3693 ms/step (-6.0%, disjoint; AABB.combine's four min/max become fcsel); mctick (goal protocol, n=4 a side)
- * 3.676 -> 3.638 ms/tick (-1.0%, overlapping); 262n / 262u / mcsr mcbench verdict ok; 16-run mctick fault gate clean. 0 = off. */
+ * 3.676 -> 3.638 ms/tick (-1.0%, overlapping); 262n / 262u / mcsr mcbench verdict ok; 16-run mctick fault gate clean.
+ * 32 = also fold branch chains (`if (c1) goto X; if (c2) goto X`, the second block speculable) into one branch on c1 | c2
+ * (wj_bchain_run), float compares only unless 64 is set too: AABB.testOverlap's exits (findings M82). 0 = off. */
 int mono_wasm_jit_select = 31;
 /* MONO_WASM_JIT_ARRAYCOPY: a call to IKVM.Runtime.ByteCodeHelper.arraycopy (System.arraycopy) calls
  * mono_wasm_jit_arraycopy first, which copies when both arrays have the same vtable (a vector: same type, so every element
