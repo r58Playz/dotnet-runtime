@@ -1549,6 +1549,72 @@ static int wj_b4_npend, wj_b4_ipend;
 static gint32 wj_b4_q_samples, wj_b4_q_bodies, wj_b4_q_windows, wj_b4_q_reg;
 static gboolean wj_b4_noisy = TRUE;
 #define WJ_B4_QUIET_FLOOR 8
+/* MONO_WASM_JIT_CONSOL (plan v3): 0 = holding B4 until the tier settles, 1 = the consolidation plan is being framed (with
+ * the CONSOL caps swapped into B4_MAX / B4_BYTES, restored in 2), 2 = consolidated. Drainer-only state, like the quiet
+ * gate's. */
+static int wj_consol_phase;
+static gboolean wj_consol_ok;
+static gint32 wj_consol_s0, wj_consol_b0, wj_consol_r0, wj_consol_nwin;
+static int wj_consol_saved_max, wj_consol_saved_bytes;
+static gint64 wj_consol_at_ms;
+#define WJ_CONSOL_RING 128   /* > the knob's CONSOL_WINDOWS maximum (100) */
+static gint32 wj_consol_ring_b [WJ_CONSOL_RING], wj_consol_ring_r [WJ_CONSOL_RING];   /* bodies / registry at each window's start */
+/* The settle window: MONO_WASM_JIT_CONSOL_WIN samples, or 250 on a tier smaller than MONO_WASM_JIT_B4_QUIET_SMALL bodies, as the
+ * quiet gate's small-tier rule (a kernel's whole run is a few windows of the large size; jbox2d frames its groups this way). */
+static gint32
+wj_consol_win (void)
+{
+	extern int mono_wasm_jit_consol_win, mono_wasm_jit_b4_quiet_small;
+	return mono_wasm_jit_b4_quiet_small > 0 && mono_wasm_jit_b4_bodies < mono_wasm_jit_b4_quiet_small ? 250 : mono_wasm_jit_consol_win;
+}
+/* Has the tier settled? Windows of MONO_WASM_JIT_CONSOL_WIN tier-2-body samples (executed work, not wall time). Settled when,
+ * over the last CONSOL_WINDOWS windows TOGETHER, the edge-carrying tier grew by at most CONSOL_WINDOWS x CONSOL percent (or
+ * x WJ_B4_QUIET_FLOOR bodies) and the registry by at most CONSOL_WINDOWS x 0.5% (or x 32: lazy pool slots and IKVM's dynamic
+ * methods keep it creeping), after CONSOL_MIN_SAMPLES samples in all (a boot lull holds still for a while, M38; a small tier's
+ * short windows skip that floor) -- or at CONSOL_DEADLINE_S. */
+static gboolean
+wj_consol_settled (void)
+{
+	extern int mono_wasm_jit_consol, mono_wasm_jit_consol_windows, mono_wasm_jit_consol_win, mono_wasm_jit_consol_min_samples;
+	extern int mono_wasm_jit_consol_deadline_s, mono_wasm_jit_stats;
+	extern gint64 mono_wasm_jit_start_ms;
+	gint32 s, bd, rg;
+	gint64 el;
+	if (wj_consol_ok)
+		return TRUE;
+	s = mono_wasm_jit_b4_samples; bd = mono_wasm_jit_b4_bodies; rg = (gint32) wj_reg_n;
+	el = mono_msec_ticks () - mono_wasm_jit_start_ms;
+	if (mono_wasm_jit_consol_deadline_s > 0 && el >= (gint64) mono_wasm_jit_consol_deadline_s * 1000) {
+		wj_consol_ok = TRUE;
+	} else if (s - wj_consol_s0 >= wj_consol_win ()) {
+		/* AGGREGATE over the last K = CONSOL_WINDOWS windows (M72): the tier's late growth is bursty -- quiet and growing windows
+		 * alternate -- so K quiet windows IN A ROW settled mctick at +181 s, and K = 1 fired on one early dip (+82 s) that left
+		 * the bodies compiled after it ungrouped. The growth since K windows ago against K times the per-window bar smooths a
+		 * burst without firing on a single lull. */
+		int k = MIN (mono_wasm_jit_consol_windows, WJ_CONSOL_RING), kb, nk;
+		gboolean quiet;
+		wj_consol_ring_b [wj_consol_nwin % WJ_CONSOL_RING] = wj_consol_b0;
+		wj_consol_ring_r [wj_consol_nwin % WJ_CONSOL_RING] = wj_consol_r0;
+		wj_consol_nwin++;
+		nk = MIN (k, wj_consol_nwin);
+		kb = (wj_consol_nwin - nk) % WJ_CONSOL_RING;
+		quiet = nk == k &&
+		        (bd - wj_consol_ring_b [kb] <= WJ_B4_QUIET_FLOOR * k ||
+		         (gint64) (bd - wj_consol_ring_b [kb]) * 100 <= (gint64) mono_wasm_jit_consol * k * MAX (wj_consol_ring_b [kb], 1)) &&
+		        rg - wj_consol_ring_r [kb] <= k * MAX (32, wj_consol_ring_r [kb] / 200);
+		if (G_UNLIKELY (mono_wasm_jit_stats))
+			printf ("[wasm-jit consol] +%.1fs window %d: bodies %d -> %d (%d windows ago %d), registry %d -> %d (%d) over %d samples: %s\n",
+				(double) el / 1000.0, wj_consol_nwin - 1, wj_consol_b0, bd, nk, wj_consol_ring_b [kb], wj_consol_r0, rg,
+				wj_consol_ring_r [kb], s - wj_consol_s0, quiet ? "settled" : "growing");
+		wj_consol_s0 = s; wj_consol_b0 = bd; wj_consol_r0 = rg;
+		if (quiet && (s >= mono_wasm_jit_consol_min_samples || wj_consol_win () == 250))
+			wj_consol_ok = TRUE;
+	}
+	if (wj_consol_ok)
+		wj_consol_at_ms = el;
+	return wj_consol_ok;
+}
+
 /* MONO_WASM_JIT_B4_DELAY: nothing is planned or framed until that many seconds after the JIT came up.
  * MONO_WASM_JIT_B4_QUIET: nor while the tier is still growing. */
 static gboolean
@@ -1558,6 +1624,11 @@ wj_b4_delayed (void)
 	extern gint64 mono_wasm_jit_start_ms;
 	extern int mono_wasm_jit_b4_quiet, mono_wasm_jit_b4_quiet_win, mono_wasm_jit_b4_quiet_small;
 	extern int mono_wasm_jit_stats;
+	extern int mono_wasm_jit_consol;
+	if (mono_wasm_jit_consol > 0 && wj_consol_phase < 2)
+		/* MONO_WASM_JIT_CONSOL: hold every plan until the tier settles; then frame the consolidation plan whatever the
+		 * quiet gate says (the settle test is the gate for it) */
+		return wj_consol_phase == 0 ? !wj_consol_settled () : FALSE;
 	if (mono_wasm_jit_b4_delay > 0 && mono_msec_ticks () - mono_wasm_jit_start_ms < (gint64) mono_wasm_jit_b4_delay * 1000)
 		return TRUE;
 	if (mono_wasm_jit_b4_quiet > 0) {
@@ -1615,7 +1686,18 @@ gint32
 mono_wasm_jit_b4_due (void)
 {
 	extern int mono_wasm_jit_b4_final;
-	return wj_b4_ipend < wj_b4_npend || (!mono_wasm_jit_b4_final && wj_b4_grown ()) || wj_reframe_due ();
+	extern int mono_wasm_jit_consol, mono_wasm_jit_consol_win, mono_wasm_jit_consol_deadline_s;
+	extern gint64 mono_wasm_jit_start_ms;
+	/* MONO_WASM_JIT_CONSOL, holding: every thread calls this before the drainer's CAS, so it must not advance the settle
+	 * windows (wj_b4_grown -> wj_b4_delayed would). Read-only: due when a window has closed or the deadline passed; the
+	 * drainer evaluates it in b4_step. */
+	if (mono_wasm_jit_consol > 0 && wj_consol_phase == 0)
+		return wj_consol_ok || mono_wasm_jit_b4_samples - wj_consol_s0 >= wj_consol_win () ||
+		       (mono_wasm_jit_consol_deadline_s > 0 &&
+		        mono_msec_ticks () - mono_wasm_jit_start_ms >= (gint64) mono_wasm_jit_consol_deadline_s * 1000) ||
+		       wj_reframe_due ();
+	/* a consumed consolidation plan still owes b4_step its bookkeeping (restore the caps, end plans) */
+	return wj_b4_ipend < wj_b4_npend || wj_consol_phase == 1 || (!mono_wasm_jit_b4_final && wj_b4_grown ()) || wj_reframe_due ();
 }
 
 /* A member's own bytes. NOT re->len: batch_bind sets that to the whole GROUP module's length, so once a member is framed
@@ -2212,6 +2294,23 @@ mono_wasm_jit_b4_step (void)
 		}
 		return first;   /* published with the next rendezvous, as a B4 group is */
 	}
+	{ /* MONO_WASM_JIT_CONSOL: the consolidation plan, consumed, restores the B4 caps; with CONSOL_ONCE it is the last plan */
+	  extern int mono_wasm_jit_consol, mono_wasm_jit_consol_once, mono_wasm_jit_b4_final;
+	  extern gint64 mono_wasm_jit_start_ms;
+	  if (mono_wasm_jit_consol > 0 && wj_consol_phase == 1 && wj_b4_ipend >= wj_b4_npend) {
+		mono_wasm_jit_b4_max = wj_consol_saved_max;
+		mono_wasm_jit_b4_bytes = wj_consol_saved_bytes;
+		wj_consol_phase = 2;
+		if (mono_wasm_jit_consol_once)
+			mono_wasm_jit_b4_final = 1;
+		printf ("[wasm-jit consol] plan consumed at +%.1fs: %lld B4 groups framed in all, %lld refused; %s\n",
+			(double) (mono_msec_ticks () - mono_wasm_jit_start_ms) / 1000.0, (long long) mono_wasm_jit_counters [WJC_B4_FRAMED],
+			(long long) mono_wasm_jit_counters [WJC_B4_REFUSED], mono_wasm_jit_consol_once ? "no further plan" : "incremental B4 resumes");
+		return 0;
+	  }
+	  if (mono_wasm_jit_consol > 0 && wj_consol_phase == 2 && mono_wasm_jit_b4_final && wj_b4_ipend >= wj_b4_npend)
+		return 0;
+	}
 	if (mono_wasm_jit_counters [WJC_B4_FRAMED] >= mono_wasm_jit_b4_groups) {
 		wj_b4_ipend = wj_b4_npend;   /* the budget is spent: drop the rest of the plan */
 		return 0;
@@ -2235,6 +2334,16 @@ mono_wasm_jit_b4_step (void)
 			return 0;
 		guint64 *hot = NULL;
 		extern int mono_wasm_jit_b4_per_plan;
+		extern int mono_wasm_jit_consol, mono_wasm_jit_consol_max, mono_wasm_jit_consol_bytes;
+		/* MONO_WASM_JIT_CONSOL: the first plan after the tier settled is the consolidation plan -- the CONSOL caps for its
+		 * partition and its framing (b4_step's member and byte bounds read B4_MAX / B4_BYTES), every group it forms */
+		gboolean consol_plan = mono_wasm_jit_consol > 0 && wj_consol_phase == 0;
+		if (consol_plan) {
+			wj_consol_saved_max = mono_wasm_jit_b4_max;
+			wj_consol_saved_bytes = mono_wasm_jit_b4_bytes;
+			mono_wasm_jit_b4_max = MIN (mono_wasm_jit_consol_max, WJ_BATCH_MAX / 2);
+			mono_wasm_jit_b4_bytes = mono_wasm_jit_consol_bytes;
+		}
 		wj_b4_planned_at = mono_wasm_jit_b4_bodies;
 		wj_b4_samples_at = mono_wasm_jit_b4_samples;
 		wj_b4_free (wj_b4_pend, wj_b4_npend);
@@ -2242,8 +2351,18 @@ mono_wasm_jit_b4_step (void)
 		wj_b4_pend = wj_b4_partition (&wj_b4_npend, &nd, &ne, &nest, &total, &inside, TRUE, &hot, NULL);
 		wj_reg_read_leave ();
 		g_free (hot);
+		if (consol_plan) {
+			int q, nm = 0;
+			extern gint64 mono_wasm_jit_start_ms;
+			for (q = 0; q < wj_b4_npend; ++q)
+				nm += wj_b4_pend [q].n;
+			wj_consol_phase = 1;
+			printf ("[wasm-jit consol] settled at +%.1fs (%d windows): plan of %d groups, %d members, internal %.1f%% of the edge weight (cap %d / %d)\n",
+				(double) wj_consol_at_ms / 1000.0, wj_consol_nwin, wj_b4_npend, nm,
+				total ? 100.0 * (double) inside / (double) total : 0.0, mono_wasm_jit_b4_max, mono_wasm_jit_b4_bytes);
+		}
 		/* the hottest per_plan groups only: the budget is spread over the run, not spent by the first plans */
-		if (wj_b4_npend > mono_wasm_jit_b4_per_plan) {
+		if (!consol_plan && wj_b4_npend > mono_wasm_jit_b4_per_plan) {
 			int q;
 			for (q = mono_wasm_jit_b4_per_plan; q < wj_b4_npend; ++q)
 				g_free (wj_b4_pend [q].desc);
@@ -2254,6 +2373,7 @@ mono_wasm_jit_b4_step (void)
 		if (!wj_b4_npend)
 			return 0;
 	}
+	cap = MIN (2 * mono_wasm_jit_b4_max, WJ_BATCH_MAX);   /* a CONSOL plan swapped the caps since the entry */
 	g = &wj_b4_pend [wj_b4_ipend++];
 	descs = g_new (gint32, cap);
 	wj_reg_read_enter ();

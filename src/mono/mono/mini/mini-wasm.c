@@ -1513,6 +1513,14 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_img_dispatch, "MONO_WASM_JIT_IMG_DISPATCH", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_reframe_ms, "MONO_WASM_JIT_REFRAME_MS", 0, 3600000)
 	WJ_T2_KNOB (mono_wasm_jit_b4_once, "MONO_WASM_JIT_B4_ONCE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_consol, "MONO_WASM_JIT_CONSOL", 0, 100)
+	WJ_T2_KNOB (mono_wasm_jit_consol_windows, "MONO_WASM_JIT_CONSOL_WINDOWS", 1, 100)
+	WJ_T2_KNOB (mono_wasm_jit_consol_win, "MONO_WASM_JIT_CONSOL_WIN", 100, 1000000)
+	WJ_T2_KNOB (mono_wasm_jit_consol_min_samples, "MONO_WASM_JIT_CONSOL_MIN_SAMPLES", 0, 100000000)
+	WJ_T2_KNOB (mono_wasm_jit_consol_deadline_s, "MONO_WASM_JIT_CONSOL_DEADLINE_S", 0, 86400)
+	WJ_T2_KNOB (mono_wasm_jit_consol_max, "MONO_WASM_JIT_CONSOL_MAX", 2, 1024)
+	WJ_T2_KNOB (mono_wasm_jit_consol_bytes, "MONO_WASM_JIT_CONSOL_BYTES", 4096, 16777216)
+	WJ_T2_KNOB (mono_wasm_jit_consol_once, "MONO_WASM_JIT_CONSOL_ONCE", 0, 1)
 	WJ_T2_KNOB (mono_wasm_jit_t2_until_ms, "MONO_WASM_JIT_T2_UNTIL_MS", 0, 3600000)
 	WJ_T2_KNOB (mono_wasm_jit_gi_share, "MONO_WASM_JIT_GI_SHARE", 0, 100)
 	WJ_T2_KNOB (mono_wasm_jit_gi_min_n, "MONO_WASM_JIT_GI_MIN_N", 1, 65535)
@@ -2212,8 +2220,31 @@ int mono_wasm_jit_img_dispatch = 0;
  * least 32 members, a member re-emitted within this many ms of the group's framing is deferred -- its new body stays
  * registered on its descriptor, its old code keeps running in the group -- and the re-emission drainer re-frames the
  * group once when the interval has passed (mono_wasm_jit_b4_step), taking every deferred member. 0 = re-frame at once,
- * as before. Shipped B4 groups are at most 16 members, which this never touches. */
+ * as before. B4 groups reach this since B4_MAX became 64 (b4_step frames up to 2 x B4_MAX), and every MONO_WASM_JIT_CONSOL
+ * group can. */
 int mono_wasm_jit_reframe_ms = 60000;
+/* MONO_WASM_JIT_CONSOL=<pct> (plan v3, findings M70/M71): one-shot hot-set consolidation. B4 frames nothing until the tier
+ * SETTLES -- over the last MONO_WASM_JIT_CONSOL_WINDOWS windows of MONO_WASM_JIT_CONSOL_WIN tier-2-body samples together, the
+ * edge-carrying tier grew by at most that many times <pct> percent and the registry by that many times 0.5% (an aggregate:
+ * the late growth is bursty, M72), after at least MONO_WASM_JIT_CONSOL_MIN_SAMPLES samples, or MONO_WASM_JIT_CONSOL_DEADLINE_S
+ * seconds after the JIT came up if that is set -- and then frames ONE B4 plan with every group it forms, capped at
+ * MONO_WASM_JIT_CONSOL_MAX members /
+ * MONO_WASM_JIT_CONSOL_BYTES bytes (mini-wasm-batching.inc, wj_consol_*). Tiering goes on afterwards: a member's
+ * promotion re-frames its group (REFRAME_MS). MONO_WASM_JIT_CONSOL_ONCE=1: no B4 plan after that one (B4_ONCE's
+ * semantics, edge counters stop); 0: normal incremental B4 resumes for code that gets hot later. Independent of
+ * MONO_WASM_JIT_B4_QUIET (which j2d/run turns off for mctick). 0 = incremental B4 only.
+ * Default 3 since 2026-11-27 (findings M70-M72): mctick (26.2 server tick, M4, one binary, both orders, n=7 a side) 3.487 against
+ * 3.341 ms/tick, -4.2% (one order disjoint); every run settled at +126-128 s, 77-90 groups of ~1,050 members; jbox2d level
+ * (0.3518 / 0.3504, n=4; it settles in ~5 s on small-tier windows); 262n game server tick level (Time Profiler, n=5 a side, -1.3%),
+ * settling at +95-142 s across 262n / 262u / mcsr, every game verdict ok; fault gate 24 short mctick runs, 0 faults either half. */
+int mono_wasm_jit_consol = 3;
+int mono_wasm_jit_consol_windows = 3;
+int mono_wasm_jit_consol_win = 3000;
+int mono_wasm_jit_consol_min_samples = 10000;
+int mono_wasm_jit_consol_deadline_s = 0;
+int mono_wasm_jit_consol_max = 128;
+int mono_wasm_jit_consol_bytes = 524288;
+int mono_wasm_jit_consol_once = 1;
 /* MONO_WASM_JIT_B4_ONCE=1: after the first B4 plan's groups are framed, no further plan (deferred re-frames still run), and
  * modules assembled from then on carry no B4 edge counters (mono_wasm_jit_b4_final). A layout that keeps changing in a
  * timing window measures the changes: between the window's edges a layout-only mctick run re-planned twice and framed 7
