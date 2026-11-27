@@ -1570,8 +1570,8 @@ wj_consol_win (void)
 /* Has the tier settled? Windows of MONO_WASM_JIT_CONSOL_WIN tier-2-body samples (executed work, not wall time). Settled when,
  * over the last CONSOL_WINDOWS windows TOGETHER, the edge-carrying tier grew by at most CONSOL_WINDOWS x CONSOL percent (or
  * x WJ_B4_QUIET_FLOOR bodies) and the registry by at most CONSOL_WINDOWS x 0.5% (or x 32: lazy pool slots and IKVM's dynamic
- * methods keep it creeping), after CONSOL_MIN_SAMPLES samples in all (a boot lull holds still for a while, M38; a small tier's
- * short windows skip that floor) -- or at CONSOL_DEADLINE_S. */
+ * methods keep it creeping), after CONSOL_MIN_SAMPLES samples in all (a boot lull holds still for a while, M38). A small tier's
+ * short windows skip that floor and settle on one window. Or at CONSOL_DEADLINE_S. */
 static gboolean
 wj_consol_settled (void)
 {
@@ -1591,7 +1591,10 @@ wj_consol_settled (void)
 		 * alternate -- so K quiet windows IN A ROW settled mctick at +181 s, and K = 1 fired on one early dip (+82 s) that left
 		 * the bodies compiled after it ungrouped. The growth since K windows ago against K times the per-window bar smooths a
 		 * burst without firing on a single lull. */
-		int k = MIN (mono_wasm_jit_consol_windows, WJ_CONSOL_RING), kb, nk;
+		/* A small tier (short windows) settles on ONE window, as before the aggregate: its growth is not bursty, and its whole run
+		 * is a few windows -- the 3-window aggregate moved jbox2d's plan from 1.1 s before its timing window to 0.9 s into it,
+		 * +5% a step (goal batch 17, M73). */
+		int k = wj_consol_win () == 250 ? 1 : MIN (mono_wasm_jit_consol_windows, WJ_CONSOL_RING), kb, nk;
 		gboolean quiet;
 		wj_consol_ring_b [wj_consol_nwin % WJ_CONSOL_RING] = wj_consol_b0;
 		wj_consol_ring_r [wj_consol_nwin % WJ_CONSOL_RING] = wj_consol_r0;
