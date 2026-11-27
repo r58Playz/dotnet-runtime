@@ -1521,6 +1521,7 @@ mono_wasm_jit_auto_init (void)
 	WJ_T2_KNOB (mono_wasm_jit_consol_max, "MONO_WASM_JIT_CONSOL_MAX", 2, 1024)
 	WJ_T2_KNOB (mono_wasm_jit_consol_bytes, "MONO_WASM_JIT_CONSOL_BYTES", 4096, 16777216)
 	WJ_T2_KNOB (mono_wasm_jit_consol_once, "MONO_WASM_JIT_CONSOL_ONCE", 0, 1)
+	WJ_T2_KNOB (mono_wasm_jit_walk_poll_ms, "MONO_WASM_JIT_WALK_POLL_MS", 0, 1000)
 	WJ_T2_KNOB (mono_wasm_jit_t2_until_ms, "MONO_WASM_JIT_T2_UNTIL_MS", 0, 3600000)
 	WJ_T2_KNOB (mono_wasm_jit_gi_share, "MONO_WASM_JIT_GI_SHARE", 0, 100)
 	WJ_T2_KNOB (mono_wasm_jit_gi_min_n, "MONO_WASM_JIT_GI_MIN_N", 1, 65535)
@@ -2238,6 +2239,12 @@ int mono_wasm_jit_reframe_ms = 60000;
  * mctick runs, 0 of 100 without) and two entity-tick faults (a garbage-class trap under PersistentEntitySectionManager$Callback.onMove,
  * an NPE in EntityEquipment.tick) in ~50 runs against none of that family in ~110 without. On again only once both are explained. */
 int mono_wasm_jit_consol = 0;
+/* MONO_WASM_JIT_WALK_POLL_MS=<ms> (M78): the admission walk passes through a GC-safe bracket every <ms> ms (checked every 256 nodes),
+ * so a long walk answers a stop-the-world promptly; 0 = off. Default 5 since 2026-11-27: mctick with CONSOL=3 (one binary, 24 runs,
+ * w w c x8) -- with the poll 16 runs, 0 in-window GC stalls, 0 late suspend answers from a walk, 3.375 ms/tick; without 8 runs, 3
+ * stalls of 1.2-1.5 s, 101 late answers from walks, 3.417 (3.312 over its 5 clean runs). With consolidation off walks are short
+ * and it rarely fires. */
+int mono_wasm_jit_walk_poll_ms = 5;
 int mono_wasm_jit_consol_windows = 3;
 int mono_wasm_jit_consol_win = 3000;
 int mono_wasm_jit_consol_min_samples = 10000;
@@ -4613,7 +4620,18 @@ mono_wasm_jit_register (MonoMethod *method, int e_slot, int f_slot, void *bytes,
 			 * behaviour-preserving swap can reach here with credited callers -- a hookable method is never credited
 			 * (H4) -- so the old body is still a correct one. Permanent for this body, so the caller drops the
 			 * request rather than retrying. Both arms below: the batched one would otherwise publish it at re-frame. */
-			if (same_method && old_re && old_re->no_gc && old_re->nogc_credited && !no_gc) {
+			if (same_method && old_re && old_re->nogc_credited && !no_gc) {
+				/* NOT `old_re->no_gc &&` (M77): the batched re-registration arm below forces no_gc to 0 and nothing sets
+				 * it back for a grouped member, so once a member had re-registered in its group the old test let every
+				 * later GC-capable body through under callers still crediting it -- consolidation's entity-tick faults
+				 * (stale unpinned references after a collection inside a "no-GC" callee). nogc_credited is set only while
+				 * no_gc held (wj_fslot_is_nogc), so it alone says a caller relies on it. */
+				if (!old_re->no_gc) {
+					static gint32 nhole;
+					if (mono_atomic_inc_i32 (&nhole) <= 16)
+						printf ("[wasm-jit nogc] refused a GC-capable body for credited %s (its no_gc already cleared by a grouped re-registration)\n",
+							method->name ? method->name : "?");
+				}
 				mono_wasm_jit_counters [WJC_PRESERVE_NOGC_REFUSED]++;
 				mono_loader_unlock ();
 				return 0;
@@ -5887,6 +5905,28 @@ wj_walk_enter (int desc_id, gboolean *res)
 	return 1;
 }
 
+/* MONO_WASM_JIT_WALK_POLL_MS (M78): a walk over a large group's closure ran 0.4-2 s without answering a GC suspend (it answered only
+ * at the next instantiate's GC-safe entry), stalling every thread's stop-the-world. Every 256 nodes, once that many ms have passed,
+ * pass through the same GC-safe bracket the instantiates use: the walk is already suspendable there, and the drain run on leaving it
+ * refuses to nest inside a walk (RV_DRAIN_IN_ADMIT). Called per node by both walks (the recursive one, MONO_WASM_JIT_ADMIT_WALK bit
+ * 1 clear, is the default: the first build polled only the iterative one and read gc_polls=0). */
+static inline void
+wj_walk_gc_poll (void)
+{
+	extern int mono_wasm_jit_walk_poll_ms;
+	static __thread int wj_walk_poll_n;
+	static __thread gint64 wj_walk_poll_at;
+	if (mono_wasm_jit_walk_poll_ms > 0 && G_UNLIKELY ((++wj_walk_poll_n & 255) == 0)) {
+		gint64 now = mono_msec_ticks ();
+		if (now - wj_walk_poll_at >= mono_wasm_jit_walk_poll_ms) {
+			wj_walk_poll_at = now;
+			WJ_JS_BLOCKING_BEGIN (__wj_wcookie, __wj_wsd, __wj_wentered);
+			WJ_JS_BLOCKING_END (__wj_wcookie, __wj_wsd, __wj_wentered);
+			mono_wasm_jit_counters [WJC_WALK_GC_POLLS]++;
+		}
+	}
+}
+
 static gboolean
 wj_install_closure_iter (int root)
 {
@@ -5897,8 +5937,10 @@ wj_install_closure_iter (int root)
 	if (!wj_walk_enter (root, &res))
 		return res;
 	while (wj_walk_sp > base) {
-		WjWalkFrame *f = &wj_walk_stack [wj_walk_sp - 1];
+		WjWalkFrame *f;
 		int child = 0;
+		wj_walk_gc_poll ();
+		f = &wj_walk_stack [wj_walk_sp - 1];
 
 		if (f->phase == 0) {
 			WjDepSet *ds = f->snap_ds;
@@ -5969,6 +6011,7 @@ wj_install_closure (int desc_id)
 	gboolean r;
 	if (mono_wasm_jit_admit_walk & 1)
 		return wj_install_closure_iter (desc_id);
+	wj_walk_gc_poll ();   /* the recursive walk's per-node entry */
 	if (++wj_walk_rdepth > (int) mono_wasm_jit_counters [WJC_WALK_DEPTH_MAX])
 		mono_wasm_jit_counters [WJC_WALK_DEPTH_MAX] = wj_walk_rdepth;
 	wj_stack_probe ();

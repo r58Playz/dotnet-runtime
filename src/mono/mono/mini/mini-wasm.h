@@ -1621,6 +1621,7 @@ enum {
 	WJC_SELECT_REFUSED,          /* ... speculable shapes refused (a swap, a compare operand, a volatile variable, too many values) */
 	WJC_INLINE_FWD_SKIP,         /* MONO_WASM_JIT_INLINE_FWD: forwarders inlined without spending a level of the depth cap */
 	WJC_S4_HOISTED,              /* MONO_WASM_JIT_S4 & 32: loop-invariant loads moved to their loop's preheader */
+	WJC_WALK_GC_POLLS,           /* MONO_WASM_JIT_WALK_POLL_MS: GC-safe passes inside admission walks (M78) */
 	WJC_MAX
 };
 

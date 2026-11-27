@@ -155,6 +155,7 @@ mono_threads_state_poll (void)
  * says so itself where it finally answers -- a poll, or entering a blocking region -- with the delay and its JS stack (V8
  * names the wasm frames), when the request waited more than 250 ms. At most 256 reports. */
 static const char *wj_late_where;
+static int wj_late_activity;   /* mono_wasm_jit_thread_activity () where it answered (M76) */
 /* Measure where the request is answered; report only later, once this thread is resumed or GC-safe: worker stdout is
  * proxied to the main thread, which can itself be parked by the same stop-the-world, so printing before answering could
  * deadlock the rendezvous. The delay rides in wj_suspend_req_ms as a negative number until reported. */
@@ -166,8 +167,11 @@ wj_note_late_suspend (MonoThreadInfo *info, const char *where)
 		return;
 	gint64 waited = mono_wj_shared_ms () - req;
 	info->wj_suspend_req_ms = waited >= 250 ? -waited : 0;
-	if (waited >= 250)
+	if (waited >= 250) {
+		extern int mono_wasm_jit_thread_activity (void);
 		wj_late_where = where;
+		wj_late_activity = mono_wasm_jit_thread_activity ();
+	}
 }
 
 static void
@@ -180,8 +184,8 @@ wj_report_late_suspend (MonoThreadInfo *info)
 	static gint32 nlate;
 	if (mono_atomic_inc_i32 (&nlate) > 256)
 		return;
-	printf ("[wasm-jit latesuspend] thread 0x%x answered a suspend request after %lld ms at %s\n",
-		(unsigned) (gsize) mono_thread_info_get_tid (info), (long long) -v, wj_late_where ? wj_late_where : "?");
+	printf ("[wasm-jit latesuspend] thread 0x%x answered a suspend request after %lld ms at %s (activity %d: 1 walk, 2 drain, 4 compile)\n",
+		(unsigned) (gsize) mono_thread_info_get_tid (info), (long long) -v, wj_late_where ? wj_late_where : "?", wj_late_activity);
 	EM_ASM ({ console.log ("[wasm-jit latesuspend] stack: " + new Error ().stack); });
 }
 #endif

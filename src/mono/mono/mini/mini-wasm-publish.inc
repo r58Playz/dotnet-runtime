@@ -1154,3 +1154,20 @@ mono_wasm_jit_hook_wait (gint32 epoch)
 	if (us > mono_wasm_jit_counters [WJC_HOOK_WAIT_US_MAX])
 		mono_wasm_jit_counters [WJC_HOOK_WAIT_US_MAX] = us;
 }
+
+/* M76 instrument: what this thread is doing, for `[wasm-jit latesuspend]` (mono-threads-coop.c): 1 = in an admission walk,
+ * 2 = in a rendezvous drain, 4 = holds the compile section. */
+int mono_wasm_jit_thread_activity (void);
+int
+mono_wasm_jit_thread_activity (void)
+{
+	extern int mono_wasm_jit_compiling_here_get (void);
+	int a = 0;
+	if (wj_walk_sp > 0 || wj_walk_rdepth > 0 || wj_walk_epoch_timing)
+		a |= 1;
+	if (wj_draining)
+		a |= 2;
+	if (mono_wasm_jit_compiling_here_get ())
+		a |= 4;
+	return a;
+}

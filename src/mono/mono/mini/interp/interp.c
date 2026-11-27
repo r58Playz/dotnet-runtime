@@ -784,6 +784,12 @@ interp_lmf_mark_phantom (MonoLMFExt *ext, InterpFrame *frame)
  * "retriable" so the method is re-attempted later — never blocks, so coop-GC suspend can't deadlock. */
 static volatile gint32 wj_compiling = 0;
 static __thread gboolean wj_compiling_here;   /* THIS thread holds wj_compiling (a hook applied inside a compile, H5) */
+int mono_wasm_jit_compiling_here_get (void);
+int
+mono_wasm_jit_compiling_here_get (void)   /* M76 instrument: the latesuspend report's activity bits */
+{
+	return wj_compiling_here ? 1 : 0;
+}
 
 /*
  * Island/transition diagnostics (Part 3). Bounded, open-addressed lock-free tables. Slot ownership

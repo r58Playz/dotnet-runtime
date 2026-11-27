@@ -62,6 +62,28 @@ wj_img_same (const int *desc_ids, int n)
 static WjBatchDesc *wj_reframe_pend [WJ_REFRAME_PEND_MAX];
 static int wj_reframe_npend;
 
+/* M77: a queued group that is re-framed by another route (a mandatory swap, a re-emission past REFRAME_MS, a full queue) has
+ * its descriptor RETIRED by mono_wasm_jit_batch_bind and freed once readers leave -- while the queue still held it, and b4_step
+ * then wrote b->reframe_due = 0 into freed (possibly reused) memory: a heap-corruption writer, live only since B4 groups reach
+ * WJ_REFRAME_MIN members (B4_MAX 64, 2026-11-26) and on every consolidated run. Called where the descriptor is retired, on the
+ * drainer, before the retire. */
+static void
+wj_reframe_forget (WjBatchDesc *b)
+{
+	int q, k = 0;
+	for (q = 0; q < wj_reframe_npend; ++q) {
+		if (wj_reframe_pend [q] == b)
+			continue;
+		wj_reframe_pend [k++] = wj_reframe_pend [q];
+	}
+	if (k != wj_reframe_npend) {
+		static gint32 ndrop;
+		if (mono_atomic_inc_i32 (&ndrop) <= 16)
+			printf ("[wasm-jit reframe] a queued group of %d members was re-framed by another route; dropped from the queue before its retire\n", b->n);
+		wj_reframe_npend = k;
+	}
+}
+
 /* Is the oldest deferred group due (its interval passed)? */
 static gboolean
 wj_reframe_due (void)
@@ -672,6 +694,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
 						mono_atomic_store_i32 (saved [i].batch->guard, 1);
 						mono_wasm_jit_counters [WJC_S1_SUPERSEDED]++;
 					}
+					wj_reframe_forget (saved [i].batch);   /* M77: never leave a retired descriptor queued */
 					wj_retire_payload (saved [i].batch, WJ_RETIRED_BATCH);
 				}
 			}
