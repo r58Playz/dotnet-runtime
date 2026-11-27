@@ -1861,7 +1861,7 @@ wj_bchain_run (MonoCompile *cfg)
 			}
 			if (ins != cmp2)
 				goto refuse;
-			WJ_BC_TR ("folded");
+			WJ_BC_TR ("folded (copy-aware)");
 			/* apply: A = ... cmp1 setcc(c1) [B's body] cmp2 setcc(c2) [xor] or icompare_imm br */
 			c1 = (int) alloc_ireg (cfg);
 			MONO_INST_NEW (cfg, setc1, OP_WASM_JIT_SETCC_BR);
