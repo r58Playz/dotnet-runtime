@@ -1737,6 +1737,9 @@ wj_bchain_run (MonoCompile *cfg)
 	gboolean any_cmp = (mono_wasm_jit_select & 64) != 0;
 	MonoBasicBlock *a;
 	int done = 0, nv0 = (int) cfg->next_vreg;
+	const char *trace_sub = g_getenv ("MONO_WASM_JIT_SELECT_TRACE");
+	gboolean trace = trace_sub && *trace_sub && cfg->method && cfg->method->name && strstr (cfg->method->name, trace_sub);
+#define WJ_BC_TR(why) do { if (G_UNLIKELY (trace)) printf ("WASM_JIT_BCHAIN_TRACE %s tier=%d BB%d: %s\n", cfg->method->name, cfg->wasm_jit_tier, a->block_num, (why)); } while (0)
 	int *use_bb = (int *) mono_mempool_alloc (cfg->mempool, sizeof (int) * (gsize) (nv0 > 0 ? nv0 : 1));
 	{
 		MonoBasicBlock *ub; MonoInst *ui;
@@ -1772,6 +1775,13 @@ wj_bchain_run (MonoCompile *cfg)
 			if (!a_combined && !any_cmp && !wj_bchain_float_cmp (cmp1->opcode))
 				break;
 			b = NULL; x = NULL; p1_neg = FALSE;
+			if (G_UNLIKELY (trace)) {
+				MonoBasicBlock *tq = br1->inst_true_bb, *fq = br1->inst_false_bb;
+				printf ("WASM_JIT_BCHAIN_TRACE %s BB%d %s -> T BB%d (in %d out %d last %s) F BB%d (in %d out %d last %s)\n",
+					cfg->method->name, a->block_num, wj_opname (br1->opcode),
+					tq ? tq->block_num : -1, tq ? tq->in_count : -1, tq ? tq->out_count : -1, tq && tq->last_ins ? wj_opname (tq->last_ins->opcode) : "-",
+					fq ? fq->block_num : -1, fq ? fq->in_count : -1, fq ? fq->out_count : -1, fq && fq->last_ins ? wj_opname (fq->last_ins->opcode) : "-");
+			}
 			for (side = 0; side < 2 && !b; ++side) {
 				MonoBasicBlock *cand = side == 0 ? br1->inst_false_bb : br1->inst_true_bb;   /* B: the edge that is not X */
 				MonoBasicBlock *other = side == 0 ? br1->inst_true_bb : br1->inst_false_bb;
@@ -1789,13 +1799,17 @@ wj_bchain_run (MonoCompile *cfg)
 					continue;
 				b = cand; x = other; p1_neg = side == 1;   /* side 1: A reaches X on its false edge */
 			}
-			if (!b)
+			if (!b) {
+				WJ_BC_TR ("no successor branching to the same target");
 				break;
+			}
 			br2 = b->last_ins; cmp2 = br2->prev;
 			p2_neg = br2->inst_false_bb == x;
 			y = p2_neg ? br2->inst_true_bb : br2->inst_false_bb;
-			if (!y || y == x || y == a || y == b || x == a || x == b)
+			if (!y || y == x || y == a || y == b || x == a || x == b) {
+				WJ_BC_TR ("targets");
 				break;
+			}
 			/* B's body: speculable from the end of A */
 			nn.n = nn.nal = nn.nld = 0;
 			MONO_BB_FOR_EACH_INS (a, ins)
@@ -1826,6 +1840,7 @@ wj_bchain_run (MonoCompile *cfg)
 			}
 			if (ins != cmp2)
 				goto refuse;
+			WJ_BC_TR ("folded");
 			/* apply: A = ... cmp1 setcc(c1) [B's body] cmp2 setcc(c2) [xor] or icompare_imm br */
 			c1 = (int) alloc_ireg (cfg);
 			MONO_INST_NEW (cfg, setc1, OP_WASM_JIT_SETCC_BR);
@@ -1904,9 +1919,15 @@ wj_bchain_run (MonoCompile *cfg)
 			a_combined = TRUE;
 			continue;
 refuse:
+			if (G_UNLIKELY (trace)) {
+				printf ("WASM_JIT_BCHAIN_TRACE %s BB%d: B BB%d refused at %s(%d<-%d,%d)\n", cfg->method->name, a->block_num, b->block_num,
+					ins ? wj_opname (ins->opcode) : "-", ins ? ins->dreg : -1, ins ? ins->sreg1 : -1, ins ? ins->sreg2 : -1);
+				wj_sel_trace_bb ("B", b);
+			}
 			break;
 		}
 	}
+#undef WJ_BC_TR
 	return done;
 }
 
