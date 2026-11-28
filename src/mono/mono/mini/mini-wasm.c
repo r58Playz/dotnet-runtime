@@ -866,8 +866,11 @@ gint32 mono_wasm_jit_recv_wrong;
 /* MONO_WASM_JIT_CHA_NOVT (findings M84): a CHA-guarded inline (plan2x S3) null-checks its receiver with a compare instead
  * of loading the receiver's vtable for the null check: the CHA guard reads its own word, never the vtable, so the header
  * load was dead -- V8 keeps it (every load is NotLoadEliminable) and it touches the header's cache line. Off under
- * RECV_CLASS & 8, whose verify reads the vtable. 0 = the vtable load. */
-int mono_wasm_jit_cha_novt = 0;
+ * RECV_CLASS & 8, whose verify reads the vtable. 0 = the vtable load.
+ * 1 since 2026-11-27 (findings M84-M87): mctick -1.9% (3.270 vs 3.333 ms/tick, n=16 / n=15, four interleaved batches),
+ * jbox2d -0.5% (n=9 a side); faults 1 in 17 runs against 2 in 21 without in the same batches; game gate (262n x2, 262u,
+ * mcsr, run with CHA_DENSE too) clean. */
+int mono_wasm_jit_cha_novt = 1;
 /* MONO_WASM_JIT_CHA_TRUST: AN INSTRUMENT, NEVER A CONFIGURATION -- 1: a CHA-guarded inline omits its guard word's load and
  * branch, as if no class could ever override the target; 2: the guard stays and its miss traps (`unreachable`) instead of
  * taking the fallback callvirt, which prices the fallback apart from the check. Wrong the moment a class overrides; exists to

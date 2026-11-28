@@ -75,6 +75,9 @@ mono_class_cha_word (MonoMethod *m);
 void
 mono_class_cha_stats (gint32 *records, gint32 *marked);
 
+int
+mono_class_cha_dense (void);
+
 void
 mono_class_setup_parent    (MonoClass *klass, MonoClass *parent);
 

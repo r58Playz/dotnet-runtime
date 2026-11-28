@@ -1442,11 +1442,12 @@ mono_wasm_jit_dump_stats (void)
 	  printf ("[wasm-jit s4] seen=%lld rewritten=%lld meet=%lld ckey=%lld hoisted=%lld (s4=%d; 16 kinds, 32 hoist)\n", WJC_(WJC_S4_SEEN), WJC_(WJC_S4_REWRITTEN),
 	          WJC_(WJC_S4_MEET), WJC_(WJC_S4_CKEY), WJC_(WJC_S4_HOISTED), mono_wasm_jit_s4); }
 	{ extern void mono_wasm_jit_cha_wrong_dump (void); mono_wasm_jit_cha_wrong_dump (); }
-	{ extern int mono_wasm_jit_s3; extern gint32 mono_wasm_jit_cha_wrong; gint32 cr = 0, cm = 0;
+	{ extern int mono_wasm_jit_s3, mono_wasm_jit_cha_novt; extern gint32 mono_wasm_jit_cha_wrong; gint32 cr = 0, cm = 0;
 	  mono_class_cha_stats (&cr, &cm);
-	  printf ("[wasm-jit s3] records=%d marked=%d | gi pred=%lld static=%lld prof=%lld overridden=%lld emitted=%lld | arm pred=%lld overridden=%lld emitted=%lld verify=%lld | wrong=%d (s3=%d t2only=%d)\n",
+	  printf ("[wasm-jit s3] records=%d marked=%d | gi pred=%lld static=%lld prof=%lld overridden=%lld emitted=%lld | arm pred=%lld overridden=%lld emitted=%lld verify=%lld | wrong=%d (s3=%d t2only=%d novt=%d dense=%d)\n",
 		cr, cm, WJC_(WJC_S3_GI_PRED), WJC_(WJC_S3_GI_STATIC), WJC_(WJC_S3_GI_PROF), WJC_(WJC_S3_GI_OVERRIDDEN), WJC_(WJC_S3_GI_EMITTED), WJC_(WJC_S3_ARM_PRED),
-		WJC_(WJC_S3_ARM_OVERRIDDEN), WJC_(WJC_S3_ARM_EMITTED), WJC_(WJC_S3_VERIFY_SITES), mono_wasm_jit_cha_wrong, mono_wasm_jit_s3, (mono_wasm_jit_s3 & 8) ? 1 : 0); }
+		WJC_(WJC_S3_ARM_OVERRIDDEN), WJC_(WJC_S3_ARM_EMITTED), WJC_(WJC_S3_VERIFY_SITES), mono_wasm_jit_cha_wrong, mono_wasm_jit_s3, (mono_wasm_jit_s3 & 8) ? 1 : 0,
+		mono_wasm_jit_cha_novt, mono_class_cha_dense ()); }
 	{ extern int mono_wasm_jit_s2;
 	  printf ("[wasm-jit s2] sites=%lld entries=%lld full=%lld | unknown=%lld cold=%lld warm=%lld hot=%lld raised=%lld noprof=%lld budget_out=%lld inlined=%lld | ctx match=%lld miss=%lld (s2=%d)\n",
 		WJC_(WJC_S2_SITES), WJC_(WJC_S2_ENTRIES), WJC_(WJC_S2_FULL), WJC_(WJC_S2_UNKNOWN), WJC_(WJC_S2_COLD),

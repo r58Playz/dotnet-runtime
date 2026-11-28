@@ -1017,8 +1017,27 @@ static gint32 cha_nrec, cha_nmarked;
 /* MONO_WASM_JIT_CHA_DENSE (findings M53), read once: the words live in a dense arena of their own instead of inside their
  * 12-byte records, so the words the JIT's guards read (handed out at JIT time, in compile order) share cache lines four to a
  * record's one. A load-miss lever only: half of mctick's constant-address load misses are CHA guard words (M33). 0 = in the
- * record. */
+ * record. Null in M54; with MONO_WASM_JIT_CHA_NOVT on, mctick -2.6% more in one batch (M86) and -0.8% / +0.5% in two more,
+ * but runs with it faulted 4 in 25 (garbage-class OOBs, an SGEN assert, an entity-tick CCE) against 2 in 21 without in the same
+ * batches (findings M87): left off until that is explained. */
 static int cha_dense = -1;
+
+static void
+cha_dense_init (void)
+{
+	if (G_UNLIKELY (cha_dense < 0)) {
+		char *v = g_getenv ("MONO_WASM_JIT_CHA_DENSE");
+		cha_dense = (v && *v && *v != '0') ? 1 : 0;
+		g_free (v);
+	}
+}
+
+int
+mono_class_cha_dense (void)
+{
+	cha_dense_init ();
+	return cha_dense;
+}
 
 gboolean
 mono_class_cha_enabled (void)
@@ -1067,11 +1086,7 @@ cha_get (MonoMethod *m)
 		}
 		r = &chunk [used++];
 		r->m = m;
-		if (G_UNLIKELY (cha_dense < 0)) {
-			char *v = g_getenv ("MONO_WASM_JIT_CHA_DENSE");
-			cha_dense = (v && *v && *v != '0') ? 1 : 0;
-			g_free (v);
-		}
+		cha_dense_init ();
 		if (cha_dense) {
 			/* never freed: emitted guards bake the word's address */
 			if (wused == CHA_CHUNK * 4) {
